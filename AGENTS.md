@@ -13,8 +13,8 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W1_COMPLETE_W2_READY`。
-- 用户已批准按现有计划和 subagent 协议执行；W1 已冻结，可从 integration HEAD 启动 W2 实现 subagent。
+- 当前状态是 `EXECUTION_W2_IN_PROGRESS`。
+- 用户已批准按现有计划和 subagent 协议执行；W1 已冻结，W2 三个独立 task 已从 integration HEAD 启动。
 
 ## Git 与目录
 

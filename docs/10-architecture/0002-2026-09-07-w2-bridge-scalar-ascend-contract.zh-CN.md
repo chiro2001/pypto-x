@@ -18,6 +18,7 @@ Tensor frontend/PIL ── tensor-core-bridge ── CoreProgram
 ```
 
 W2 不实现 SIMD/SVE/GPU，不下载模型，不宣称无真机的 Ascend 回归通过。
+新增 Python 模块继续满足上游 `requires-python >=3.7`；使用 `Protocol` 等较新 typing API 时必须提供兼容路径，且不为此增加在线依赖。
 
 ## 2. Tensor Core bridge
 

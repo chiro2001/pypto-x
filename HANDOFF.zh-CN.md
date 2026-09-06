@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`EXECUTION_W1_COMPLETE_W2_READY`
+状态：`EXECUTION_W2_IN_PROGRESS`
 
-最后更新：2026-09-07 01:46 CST（Asia/Shanghai）
+最后更新：2026-09-07 01:59 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -65,7 +65,7 @@ upstream/                         # 五个嵌套 Git 仓库
 ```text
 branch = master
 HEAD   = 34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad
-linked worktree 数 = 10（基线、integration、五个只读调研 worktree 和三个 W1 task worktree）
+linked worktree 数 = 13（基线、integration、五个只读调研、三个 W1 和三个 W2 task worktree）
 工作树 = clean
 ```
 
@@ -169,7 +169,7 @@ poll=false
 - subagent 返回 commit SHA、修改路径、smoke 日志、测试和风险；
 - 集成由主 Agent 在 integration worktree 完成。
 
-W1 三个 task worktree 均已提交并保持 clean；当前没有正在运行的 subagent。实现冻结点与 task commit 见 `configs/development_lock.yaml`。
+W1 三个 task worktree 均已提交并保持 clean；W2 的 `tensor-core-bridge`、`ascend-adapter`、`cpu-scalar` 已按固定协议启动。实现冻结点与 task commit 见 `configs/development_lock.yaml`。
 
 ## 7. 建议的执行波次
 
