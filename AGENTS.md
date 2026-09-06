@@ -13,8 +13,8 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W3_AVX512_READY`。
-- 用户已批准按现有计划和 subagent 协议执行；`cpu-vector-common` 与 `cpu-avx2` 已冻结，下一步执行 AVX-512。
+- 当前状态是 `EXECUTION_W3_AVX512_IN_PROGRESS`。
+- 用户已批准按现有计划和 subagent 协议执行；`cpu-vector-common` 与 `cpu-avx2` 已冻结，W3 `cpu-avx512` 独立 task 正在执行。
 
 ## Git 与目录
 
