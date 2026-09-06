@@ -25,6 +25,7 @@ port/pypto-x-integration  → ../worktrees/pypto-x/integration
         ├── work/tensor-core-bridge  → ../worktrees/pypto-x/tensor-core-bridge
         ├── work/ascend-adapter      → ../worktrees/pypto-x/ascend-adapter
         ├── work/cpu-scalar          → ../worktrees/pypto-x/cpu-scalar
+        ├── work/portable-bootstrap  → ../worktrees/pypto-x/portable-bootstrap
         ├── work/cpu-vector-common   → ../worktrees/pypto-x/cpu-vector-common
         ├── work/cpu-avx2            → ../worktrees/pypto-x/cpu-avx2
         ├── work/cpu-avx512          → ../worktrees/pypto-x/cpu-avx512
@@ -64,6 +65,7 @@ scripts/worktree/create.sh \
 | W2 | `tensor-core-bridge` | Tensor PIL/native 结果 → Core IR adapter | `core-ir`、`verification` | 本地 | 实际 Tensor frontend 解析一次并导出，未支持节点明确失败 |
 | W2 | `ascend-adapter` | CCE backend/codegen/runtime adapter | `target-abi`、`core-ir` | CANN/NPU（若有） | 现有 Ascend 回归不退化 |
 | W2 | `cpu-scalar` | CPU lowering/compiler/runtime | `target-abi`、`core-ir` | 本地 x86_64 | add/reduce/matmul 正确 |
+| W2B | `portable-bootstrap` | 显式 portable-only package 初始化 | `target-abi`、`core-ir`、`cpu-scalar` | 本地 | 无 native/CANN 时可正常导入公共 Core/ABI/CPU 模块；默认 import 行为不变 |
 | W3 | `cpu-vector-common` | 目标无关 CPU vector lowering | `cpu-scalar` | 本地 | vector/tail 语义与 scalar 差分通过 |
 | W3 | `cpu-avx2` | AVX2 lowering | `cpu-vector-common` | 本地 | YMM 汇编、tail 和 dispatch 正确 |
 | W3 | `cpu-avx512` | AVX-512 lowering | `cpu-avx2` | 本地 | ZMM/mask 汇编与能力分层正确 |
@@ -85,6 +87,7 @@ core-ir          : python/pypto/core_ir、frontend/core_export.py、对应单测
 tensor-core-bridge: python/pypto/frontend/pil_core_bridge.py、core_export bridge、对应单测
 ascend-adapter   : backend/ascend、codegen/ascend、Ascend runtime
 cpu-scalar       : pypto/lowering/cpu、compiler/targets/cpu、backends/cpu
+portable-bootstrap: pypto/__init__.py、frontend/__init__.py、对应单测
 cpu-vector-common: cpu/vector（不改 Core IR）
 cpu-avx2/avx512  : cpu/x86（不改 Core IR）
 cpu-sve256       : cpu/aarch64/sve（不改 Core IR）

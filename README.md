@@ -8,6 +8,7 @@ PyPTO-X（PyPTO Cross-Architecture）是本项目的工作名称，目标是在�
 - [交接档案索引](docs/00-handoffs/README.md)：按序号和日期保存阶段交接快照。
 - [W1 公共接口 RFC](docs/10-architecture/0001-2026-09-07-w1-core-target-contract.zh-CN.md)：Tensor-first Core IR、Target/Compiler/Runtime ABI 的共同契约。
 - [W2 bridge/scalar/Ascend 契约](docs/10-architecture/0002-2026-09-07-w2-bridge-scalar-ascend-contract.zh-CN.md)：Tensor bridge、CPU scalar reference 和 Ascend adapter 的验收边界。
+- [portable bootstrap 契约](docs/10-architecture/0003-2026-09-07-portable-bootstrap-contract.zh-CN.md)：无 native 环境的显式轻量导入模式及默认兼容门禁。
 - [早期研究报告](research/PYPTO_PORTING_RESEARCH.zh-CN.md)：源码结构、可复用边界和方案比较；其中早期路线已由接手文档/RFC 的冻结决策取代。
 - [PyPTO 生态审计](research/audits/2026/0001-2026-09-06-pypto-ecosystem.zh-CN.md)：CANN 融合链路、classic/Pro 算子面、Gym/GDR 实况和版本锁定策略。
 - [PyPTO/Pro 关系审计](research/audits/2026/0002-2026-09-06-pypto-pypto-pro-relationship.zh-CN.md)：两种编程模式的共享基础、独立链路和 PyPTO-X 前端决策影响。
