@@ -143,3 +143,4 @@ hipcc --version
 - 5080 先用于 elementwise、softmax、matmul 和 GPU ABI，不直接从 9B 端到端开始。
 - QEMU 先验证 SVE 代码路径，鲲鹏拿到后再把性能结论迁移到真实硬件。
 - AMD 卡接入前不能把 HIP backend 标成“可运行”；最多标成“编译路径开发中”。
+- native compiler task 使用 `../worktrees/_meta/pypto-x/<task>/` 下独占的 `TMPDIR`、build、artifact 和日志目录，避免共享 `/tmp` 的容量/配额抖动，也避免不同 agent 共享未完成生成物。
