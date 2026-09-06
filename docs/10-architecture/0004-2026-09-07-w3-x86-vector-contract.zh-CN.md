@@ -1,6 +1,6 @@
 # W3：x86 CPU vector、AVX2 与 AVX-512 契约
 
-状态：`DRAFT_PENDING_W2B`
+状态：`FROZEN_FOR_W3`
 
 日期：2026-09-07（Asia/Shanghai）
 

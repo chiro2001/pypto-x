@@ -18,3 +18,4 @@ NNNN-YYYY-MM-DD-<阶段或主题>.zh-CN.md
 | 0001 | 2026-09-07 | 规划完成、执行获批 | [执行起点快照](0001-2026-09-07-execution-start.zh-CN.md) |
 | 0002 | 2026-09-07 | C0/W1 完成、W2 就绪 | [W1 完成快照](0002-2026-09-07-w1-complete.zh-CN.md) |
 | 0003 | 2026-09-07 | W2 完成、portable 门禁就绪 | [W2 完成快照](0003-2026-09-07-w2-complete.zh-CN.md) |
+| 0004 | 2026-09-07 | portable bootstrap 完成、W3 就绪 | [W2B 完成快照](0004-2026-09-07-w2b-portable-complete.zh-CN.md) |
