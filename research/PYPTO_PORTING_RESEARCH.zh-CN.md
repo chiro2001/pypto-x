@@ -1,5 +1,7 @@
 # PyPTO 跨平台移植研究
 
+> 历史说明：本文保留早期源码调研与方案比较，部分路线建议已被后续对齐结论取代。当前权威决策以根目录 `HANDOFF.zh-CN.md` 和 `docs/10-architecture/` 为准：Tensor frontend 是公共 Core IR 主入口，Pro 是 Ascend expert dialect；CPU 顺序为 scalar → AVX2 → AVX-512 → SVE256，不开发 NEON 优化后端；首个模型为 Qwen3.5-0.8B 的纯文本 BF16/W8A8-linear。
+
 更新日期：2026-09-03（Asia/Shanghai）
 
 ## 结论先行
