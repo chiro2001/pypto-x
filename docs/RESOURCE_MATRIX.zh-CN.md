@@ -6,7 +6,7 @@
 
 | 资源 | 当前状态 | 主要用途 | 当前实测/已知信息 | 限制 |
 |---|---|---|---|---|
-| 本地开发机 | 可用 | Core IR、ABI、CPU scalar、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8，CMake，QEMU 11.0.3；有 `aarch64-linux-gnu-gcc/g++` | 没有真实 NPU；本地 GPU 只有 Virtio 显示设备 |
+| 本地开发机 | 可用 | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8，GNU objdump 2.47，CMake，QEMU 11.0.3；暴露 AVX2/FMA、AVX-512F/BW/DQ/VL/VNNI/BF16 与 xsave/xgetbv；有 `aarch64-linux-gnu-gcc/g++` | `hypervisor`/KVM 环境，只用于功能、汇编和相对调试；当前数字不直接冻结为性能门槛；没有真实 NPU，本地 GPU 只有 Virtio 显示设备 |
 | RTX 5080（`192.168.101.5`） | SSH 可达 | NVIDIA CUDA/NVVM/HIP 公共层验证 | Windows + WSL2；WSL Ubuntu 24.04.4；RTX 5080 16,303 MiB；驱动 610.62 | 当前 WSL 没有 `nvcc`，Python 没有 torch，需要先装工具链；不下载模型作为 smoke 前置条件 |
 | AMD 6750GRE 12G | 暂未接入 | AMD HIP/ROCDL、wave 和显存测试 | 当前机器 `lspci` 未发现该卡，`rocminfo/rocm-smi` 不可用 | 接入前不能声明 ROCm 支持或性能；具体 gfx target 以 `rocminfo` 为准 |
 | 鲲鹏 920B（SVE256） | 待借用 | 原生 AArch64、SVE256、性能和 PMU | 用户预计可提供带 SVE256 的机器 | 型号/OS/编译器/NUMA 尚未确认；以机器能力探测为准 |
