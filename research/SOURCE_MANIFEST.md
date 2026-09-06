@@ -2,7 +2,7 @@
 
 当前 edge 快照时间：2026-09-06 23:14（Asia/Shanghai）
 
-本清单同时保留原始研究快照和最新 edge 快照。所有主仓库都是完整 Git clone，`git rev-parse --is-shallow-repository` 均为 `false`。上游仍在快速更新，因此 exact commit SHA 而不是浮动分支名才是可复现标识。
+本清单同时保留原始研究快照和最新 edge 快照。所有主仓库都是完整 Git clone，`git rev-parse --is-shallow-repository` 均为 `false`。2026-09-07 起，控制仓通过 `.gitmodules` 把五个现有 clone 就地登记为 submodule/gitlink；登记没有重建 `upstream/pypto`，其 linked worktree 关系保持不变。上游仍在快速更新，因此 exact commit SHA 而不是浮动分支名才是可复现标识。
 
 ## 2026-09-06 edge 快照
 
