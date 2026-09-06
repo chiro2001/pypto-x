@@ -13,8 +13,8 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W2_COMPLETE_W2B_READY`。
-- 用户已批准按现有计划和 subagent 协议执行；W2 已冻结，下一步执行 portable bootstrap 门禁。
+- 当前状态是 `EXECUTION_W2B_IN_PROGRESS`。
+- 用户已批准按现有计划和 subagent 协议执行；W2 已冻结，portable bootstrap 独立 task 正在执行。
 
 ## Git 与目录
 
