@@ -1,6 +1,6 @@
 # W2B：portable bootstrap 契约
 
-状态：`DRAFT_PENDING_W2`
+状态：`FROZEN_FOR_W2B`
 
 日期：2026-09-07（Asia/Shanghai）
 
