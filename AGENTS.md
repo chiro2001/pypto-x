@@ -13,8 +13,8 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_C0_COMPLETE_W1_READY`。
-- 用户已批准按现有计划和 subagent 协议执行；C0 控制仓治理完成后可启动 W1 实现 subagent。
+- 当前状态是 `EXECUTION_W1_COMPLETE_W2_READY`。
+- 用户已批准按现有计划和 subagent 协议执行；W1 已冻结，可从 integration HEAD 启动 W2 实现 subagent。
 
 ## Git 与目录
 

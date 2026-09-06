@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`EXECUTION_C0_COMPLETE_W1_READY`
+状态：`EXECUTION_W1_COMPLETE_W2_READY`
 
-最后更新：2026-09-07 01:19 CST（Asia/Shanghai）
+最后更新：2026-09-07 01:46 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -16,7 +16,7 @@
 - AMD GPU：GPU 公共层 → HIP/ROCDL；
 - 现有 Ascend CCE 路径保持为一个 target plugin，并避免功能回退。
 
-目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计和 C0 控制仓治理，没有开始实现新后端。已确认 Tensor frontend 作为跨架构主语义入口，Pro 作为 Ascend expert dialect 并后续提取 portable subset。用户已批准按计划与 subagent 协议执行。
+目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理和 W1 公共接口。integration 已包含 Core IR、Target/Compiler/Runtime ABI 和无设备验证 harness，尚未实现具体 CPU/GPU 指令后端。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect 并后续提取 portable subset。
 
 ## 2. 已经确定的技术决策
 
@@ -65,7 +65,7 @@ upstream/                         # 五个嵌套 Git 仓库
 ```text
 branch = master
 HEAD   = 34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad
-linked worktree 数 = 7（基线、integration 和五个 PyPTO 调研 worktree）
+linked worktree 数 = 10（基线、integration、五个只读调研 worktree 和三个 W1 task worktree）
 工作树 = clean
 ```
 
@@ -169,7 +169,7 @@ poll=false
 - subagent 返回 commit SHA、修改路径、smoke 日志、测试和风险；
 - 集成由主 Agent 在 integration worktree 完成。
 
-当前尚未创建 W1 task worktree，也没有正在运行的实现 subagent。
+W1 三个 task worktree 均已提交并保持 clean；当前没有正在运行的 subagent。实现冻结点与 task commit 见 `configs/development_lock.yaml`。
 
 ## 7. 建议的执行波次
 
@@ -179,16 +179,16 @@ poll=false
 port/pypto-x-integration → ../worktrees/pypto-x/integration
 ```
 
-然后 W1 最多并行三个 task，正好匹配“主 Agent + 3 个 subagent”的四槽并发：
+W1 已完成以下三个 task：
 
 1. `work/target-abi`：`TargetSpec`、Capability、CompilerBackend、RuntimeBackend、Artifact/Tensor ABI。
 2. `work/core-ir`：Parser 单次生成目标无关 CoreProgram、稳定 IR dump/serialization。
 3. `work/verification`：无设备/无模型测试门禁、IR snapshot 和 differential harness。
 
-W1 合并并评审后再进入：
+下一步进入：
 
 ```text
-W2: ascend-adapter + cpu-scalar
+W2: tensor-core-bridge + ascend-adapter + cpu-scalar
 W3: cpu-vector-common → cpu-avx2 → cpu-avx512
 W4: cpu-sve256 → gpu-common → cuda
 W5: hip
@@ -259,15 +259,19 @@ QEMU 只证明功能路径，不可用于性能结论。
 - 五个嵌套仓库都能从新路径解析；
 - community/PTOAS 的五个已初始化子模块正常；
 - PyPTO worktree 元数据自动更新到新路径；
-- 46 个本地 Markdown 链接全部有效；
+- 106 个本地 Markdown 链接全部有效；
 - YAML 任务配置可解析；
 - 三个 shell 脚本通过 `bash -n`；
 - host 无模型 smoke：`PASS`；
 - QEMU SVE256/SVE2 无模型 smoke：`PASS`；
 - 模型参数拒绝测试：`PASS`；
-- integration 与既有只读调研 worktree 均保留；尚未创建 W1 task worktree。
+- W1 三个 task smoke 均为 `PASS`，且每个只运行一次；
+- W1 同进程联合单测：`23 passed`；
+- W1 package discovery：`PASS`；
+- W1 integration smoke：`PASS`，同时覆盖 `python/pypto` 与 `python/pypto_pro`；
+- integration HEAD：`2ab2f2ca59bd86dee654b55a0e97b7d25af966e9`。
 
-smoke 日志位于临时 `/tmp` 目录，只用于本次验证，不应作为长期制品引用。
+W1 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保持只读，不重跑覆盖。
 
 ## 10. 许可证状态
 
@@ -290,7 +294,7 @@ smoke 日志位于临时 `/tmp` 目录，只用于本次验证，不应作为长
 3. CPU/加速器优先级为 AVX2 → AVX-512 → SVE256（无 NEON）→ NVIDIA → AMD。
 4. 上游默认分支已刷新为 edge 快照，版本策略为 release family + exact SHA 双轨 lock。
 5. Tensor frontend 作为跨架构主入口，Pro 作为 Ascend expert dialect + portable subset。
-6. 用户已批准执行开发计划并按协议启动 W1 subagent。
+6. 用户已批准执行开发计划；W1 已完成并可按同一协议继续 W2。
 
 C0 已完成：
 
@@ -299,7 +303,7 @@ C0 已完成：
 3. 接手文档已按序号和日期归档到 `docs/00-handoffs/`。
 4. stable lock 仍等待实际 CANN toolkit/NPU 环境做晋升验证，不影响目标无关 W1，但会门禁 Ascend 回归结论。
 
-下一步使用 `scripts/worktree/create.sh` 创建 W1 的 `target-abi`、`core-ir`、`verification` 独立 worktree，并按固定参数派发三个 subagent。
+下一步从 integration HEAD 创建 W2 的 `tensor-core-bridge`、`ascend-adapter`、`cpu-scalar` 独立 worktree，并按固定参数派发三个 subagent。Ascend 本地只验 adapter seam；stable CANN/NPU 回归继续保持 pending。
 
 ## 12. 快速自检命令
 

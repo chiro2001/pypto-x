@@ -140,21 +140,25 @@ else
                 if ! command -v python3 >/dev/null 2>&1; then
                     notes="缺少 python3"
                 else
-                    python_source=""
+                    python_sources=()
                     source_name=""
-                    if [[ -d "$worktree/python/pypto_pro" ]]; then
-                        python_source="$worktree/python/pypto_pro"
-                        source_name="pypto_pro"
+                    if [[ -d "$worktree/python/pypto" || -d "$worktree/python/pypto_pro" ]]; then
+                        [[ ! -d "$worktree/python/pypto" ]] || python_sources+=("$worktree/python/pypto")
+                        [[ ! -d "$worktree/python/pypto_pro" ]] || python_sources+=("$worktree/python/pypto_pro")
+                        source_name="pypto/pypto_pro"
                     elif [[ -d "$worktree/src/pypto_gym" ]]; then
-                        python_source="$worktree/src/pypto_gym"
+                        python_sources+=("$worktree/src/pypto_gym")
                         source_name="pypto_gym"
                     else
-                        notes="worktree 中没有可识别的 pypto_pro 或 pypto_gym Python 源码"
+                        notes="worktree 中没有可识别的 pypto、pypto_pro 或 pypto_gym Python 源码"
                     fi
-                    if [[ -n "$python_source" ]] && ! run_logged python3 -m compileall -q "$python_source"; then
-                        notes="$source_name Python 语法检查失败"
-                    fi
-                    for tool in git python3; do
+                    for python_source in "${python_sources[@]}"; do
+                        if ! run_logged python3 -m compileall -q "$python_source"; then
+                            notes="$source_name Python 语法检查失败"
+                            break
+                        fi
+                    done
+                    for tool in git clang cmake python3; do
                         if ! command -v "$tool" >/dev/null 2>&1; then
                             notes="缺少基础命令：$tool"
                             break
@@ -162,7 +166,7 @@ else
                     done
                     if [[ -z "$notes" ]]; then
                         status="PASS"
-                        notes="$source_name 源码、Git 和 Python 语法检查通过；未加载模型"
+                        notes="$source_name 源码、Git、基础工具链和 Python 语法检查通过；未加载模型"
                     fi
                 fi
                 ;;

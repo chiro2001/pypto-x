@@ -7,6 +7,7 @@ PyPTO-X（PyPTO Cross-Architecture）是本项目的工作名称，目标是在�
 - [新 Agent 接手文档](HANDOFF.zh-CN.md)：当前状态、冻结决策、远端漂移、资源、待确认事项和下一步。
 - [交接档案索引](docs/00-handoffs/README.md)：按序号和日期保存阶段交接快照。
 - [W1 公共接口 RFC](docs/10-architecture/0001-2026-09-07-w1-core-target-contract.zh-CN.md)：Tensor-first Core IR、Target/Compiler/Runtime ABI 的共同契约。
+- [W2 bridge/scalar/Ascend 契约](docs/10-architecture/0002-2026-09-07-w2-bridge-scalar-ascend-contract.zh-CN.md)：Tensor bridge、CPU scalar reference 和 Ascend adapter 的验收边界。
 - [完整研究报告](research/PYPTO_PORTING_RESEARCH.zh-CN.md)：源码结构、可复用边界、AArch64/x86/AMD/NVIDIA 路线、9B 案例和阶段计划。
 - [PyPTO 生态审计](research/audits/2026/0001-2026-09-06-pypto-ecosystem.zh-CN.md)：CANN 融合链路、classic/Pro 算子面、Gym/GDR 实况和版本锁定策略。
 - [PyPTO/Pro 关系审计](research/audits/2026/0002-2026-09-06-pypto-pypto-pro-relationship.zh-CN.md)：两种编程模式的共享基础、独立链路和 PyPTO-X 前端决策影响。
@@ -18,6 +19,7 @@ PyPTO-X（PyPTO Cross-Architecture）是本项目的工作名称，目标是在�
 - [资源矩阵](docs/RESOURCE_MATRIX.zh-CN.md)：5080 WSL、AMD 6750GRE、鲲鹏 920B 和 QEMU 的使用安排。
 - [无模型冒烟测试规范](docs/SMOKE_TEST_SPEC.zh-CN.md)：每个 subagent 只执行一次的测试契约。
 - [上游版本锁](configs/upstream_lock.yaml)：edge/stable 双轨仓库 SHA、release 锚点和晋升验证项。
+- [开发集成锁](configs/development_lock.yaml)：integration 冻结点、task commit 与验证证据。
 - [模型目标配置](configs/model_targets.yaml)：机器可读的 Qwen3.5-0.8B 与 BF16/W8A8 范围。
 - [离线参考资料](references/README.md)：两份公开讲稿、可检索文本和活动页面。
 - [官方 PyPTO 文档源码](upstream/pypto/docs/README.md)：固定快照内含 706 个 Markdown 文档文件及图片。

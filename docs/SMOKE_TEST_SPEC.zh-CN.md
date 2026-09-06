@@ -36,7 +36,7 @@
 - 检查 worktree 是 Git 仓库；
 - 记录 HEAD、branch 和工作树状态；
 - 执行 `git diff --check`；
-- PyPTO worktree 对 `python/pypto_pro` 做 Python 语法编译；PyPTO-Gym worktree 对 `src/pypto_gym` 做语法编译；
+- PyPTO worktree 同时对 `python/pypto` 与 `python/pypto_pro` 做 Python 语法编译；PyPTO-Gym worktree 对 `src/pypto_gym` 做语法编译；
 - 检查 `clang`、`cmake`、`python3` 等基础命令。
 
 ### `qemu-aarch64`

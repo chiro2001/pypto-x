@@ -93,7 +93,8 @@ python/pypto/                            [Tensor frontend：跨架构主入口]
 │   ├── artifact.py                      # Artifact、入口和 workspace 元数据
 │   ├── cache.py
 │   └── targets/{ascend,cpu,cuda,hip}.py
-└── abi/                                 [新增：TensorDesc/LaunchRequest/RuntimeBackend]
+├── abi/                                 [新增：TensorDesc/LaunchRequest/RuntimeBackend]
+└── backends/{ascend,cpu,cuda,hip}/      [新增：各 target runtime/compiler adapter]
 
 python/pypto_pro/                        [Professional：Ascend expert dialect]
 ├── language/、ir/                       [现有 CCE/A5 语义；不作为公共 Core IR]
