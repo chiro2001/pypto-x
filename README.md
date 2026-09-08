@@ -19,6 +19,7 @@ PyPTO-X（PyPTO Cross-Architecture）是本项目的工作名称，目标是在�
 - [Worktree 与 subagent 计划](docs/WORKTREE_AGENT_PLAN.zh-CN.md)：分支拓扑、任务依赖、启动参数和一小时长等待协议。
 - [Qwen3.5-0.8B BF16/W8A8 模型 MVP](docs/20-planning/0001-2026-09-07-qwen35-08b-bf16-w8a8-mvp.zh-CN.md)：模型 revision、算子闭包、量化契约、后端顺序和验收标准。
 - [资源矩阵](docs/RESOURCE_MATRIX.zh-CN.md)：5080 WSL、AMD 6750GRE、鲲鹏 920B 和 QEMU 的使用安排。
+- [本机重任务资源锁策略](docs/LOCAL_RESOURCE_POLICY.zh-CN.md)：跨项目 `local` 锁、cgroup 限制、运行时资源监控与安全停止规则。
 - [无模型冒烟测试规范](docs/SMOKE_TEST_SPEC.zh-CN.md)：每个 subagent 只执行一次的测试契约。
 - [上游版本锁](configs/upstream_lock.yaml)：edge/stable 双轨仓库 SHA、release 锚点和晋升验证项。
 - [开发集成锁](configs/development_lock.yaml)：integration 冻结点、task commit 与验证证据。

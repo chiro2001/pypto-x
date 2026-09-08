@@ -32,3 +32,4 @@ NNNN-YYYY-MM-DD-<阶段或主题>.zh-CN.md
 | 0015 | 2026-09-08 | Qwen3.5 M1C2a 完成、M1C2b SVE256 indexing 启动 | [Qwen3.5 M1C2a 完成与 M1C2b 起点](0015-2026-09-08-qwen35-m1c2a-complete-m1c2b-indexing-start.zh-CN.md) |
 | 0016 | 2026-09-08 | Qwen3.5 M1C2b 完成、M1D SVE256 composites 启动 | [Qwen3.5 M1C2b 完成与 M1D 起点](0016-2026-09-08-qwen35-m1c2b-complete-m1d-composites-start.zh-CN.md) |
 | 0017 | 2026-09-09 | Qwen3.5 M1D 完成、M1E SVE256 conv/state 启动 | [Qwen3.5 M1D 完成与 M1E 起点](0017-2026-09-09-qwen35-m1d-complete-m1e-conv-state-start.zh-CN.md) |
+| 0018 | 2026-09-09 | 本机异常重启恢复、全局资源锁与运行监控生效 | [本机资源治理快照](0018-2026-09-09-local-resource-lock-governance.zh-CN.md) |

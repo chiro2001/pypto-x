@@ -2,7 +2,7 @@
 
 状态：`EXECUTION_W6_QWEN35_08B_M1E_SVE256_CONV_STATE_IN_PROGRESS`
 
-最后更新：2026-09-09 00:44 CST（Asia/Shanghai）
+最后更新：2026-09-09 01:52 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -127,6 +127,7 @@ linked worktree 数 = 26（基线、integration、既有调研/W1-W4 task，以�
 - [项目文件布局](docs/PROJECT_LAYOUT.zh-CN.md)
 - [Worktree/subagent 计划](docs/WORKTREE_AGENT_PLAN.zh-CN.md)
 - [资源矩阵](docs/RESOURCE_MATRIX.zh-CN.md)
+- [本机重任务资源锁策略](docs/LOCAL_RESOURCE_POLICY.zh-CN.md)
 - [一次无模型 smoke 规范](docs/SMOKE_TEST_SPEC.zh-CN.md)
 - [机器可读任务配置](configs/agent_tasks.yaml)
 - [上游 edge/stable 版本锁](configs/upstream_lock.yaml)
@@ -211,6 +212,14 @@ aarch64-linux-gnu-gcc/g++
 ```
 
 适用于 Core IR、ABI、CPU scalar/x86 和 AArch64/QEMU 功能验证。
+
+本机 heavy 任务受跨项目全局锁约束。full pytest、大 shape lowering/compile、并行构建或预计使用至少 6/12 CPU、4 GiB 内存的任务，必须通过：
+
+```bash
+scripts/resource/run_local_heavy.sh --task <task> --agent <agent> -- <command> [args...]
+```
+
+包装器调用 `/home/chiro/projects/.resource-locks/resource-lock run local`，默认要求 8 GiB `MemAvailable`、保留 4 GiB，并限制到最多 6 CPU；cgroup 与 Python supervisor 同时监控任务。锁忙（75）或准入不足（69）时等待，禁止裸跑。详见 `docs/LOCAL_RESOURCE_POLICY.zh-CN.md`。
 
 ### RTX 5080
 
@@ -314,6 +323,7 @@ QEMU 只证明功能路径，不可用于性能结论。
 - Python 3.7 AST：累计 86 个变更 Python 文件；portable direct import 11 modules、package discovery 127 packages；
 - GPU common integration host smoke：`PASS`；
 - integration HEAD：`e00c12a498ac806bb8f51eb58b9603fb57bc82f7`。
+- 本机 heavy wrapper 已验证全局 `local` 锁可取得/释放、CPU affinity 生效、启动准入不足返回 69、动态 cgroup 配额生效，并能记录 `MemAvailable`、任务树 RSS/CPU、load 与 PSI；256 MiB cgroup 下申请 400 MiB 的受控测试仅终止任务并以 137 退出，主机正常且锁自动回到 FREE；资源日志位于 `../worktrees/_meta/pypto-x/resource-usage/`。
 - Qwen3.5-0.8B M0 task：`99 passed`，wheel/package-data、Python 3.9 AST、compileall、package discovery、diff/行宽均通过；task HEAD `bb776187a1e69897a97652b6317c6b6b44e802fd`；
 - PyPTO-Gym Qwen integration：HEAD `b0c1e621c886ffc4d84bdd002a6bc8c8fd5e9628`，integration smoke `PASS`；
 - 920B 标准库 shape harness：12 个 prefill/decode 场景 `PASS`，Python 3.9.9，RSS 约 14.8 MiB；未安装 torch/Transformers/NumPy，未访问权重；

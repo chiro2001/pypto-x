@@ -1,12 +1,12 @@
 # PyPTO-X 可用资源与测试矩阵
 
-更新日期：2026-09-08（Asia/Shanghai）
+更新日期：2026-09-09（Asia/Shanghai）
 
 ## 资源总览
 
 | 资源 | 当前状态 | 主要用途 | 当前实测/已知信息 | 限制 |
 |---|---|---|---|---|
-| 本地开发机 | 可用 | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8，GNU objdump 2.47，CMake，QEMU 11.0.3；暴露 AVX2/FMA、AVX-512F/BW/DQ/VL/VNNI/BF16 与 xsave/xgetbv；有 `aarch64-linux-gnu-gcc/g++` | `hypervisor`/KVM 环境，只用于功能、汇编和相对调试；当前数字不直接冻结为性能门槛；没有真实 NPU，本地 GPU 只有 Virtio 显示设备 |
+| 本地开发机 | 可用；heavy 需全局 `local` 锁 | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8，GNU objdump 2.47，CMake，QEMU 11.0.3；暴露 AVX2/FMA、AVX-512F/BW/DQ/VL/VNNI/BF16 与 xsave/xgetbv；有 `aarch64-linux-gnu-gcc/g++` | full pytest、大 shape lowering/compile 与并行构建必须走 `scripts/resource/run_local_heavy.sh`；默认保留 4 GiB、最多 6 CPU；`hypervisor`/KVM 数字不直接冻结为性能门槛 |
 | RTX 5080（`192.168.101.5`） | 当前关机 | NVIDIA CUDA/NVVM 验证 | 最近一次在线探测：Windows + WSL2、Ubuntu 24.04.4、RTX 5080 16,303 MiB、驱动 610.62 | 关机时不启动 CUDA task；最近一次 WSL 无 `nvcc`/torch，安装工具链需用户明确授权 |
 | AMD 6750GRE 12G | 暂未接入 | AMD HIP/ROCDL、wave 和显存测试 | 当前机器 `lspci` 未发现该卡，`rocminfo/rocm-smi` 不可用 | 接入前不能声明 ROCm 支持或性能；具体 gfx target 以 `rocminfo` 为准 |
 | 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；native runner/canary/add/reduce/matmul、M1C1 math 与 M1C2 layout/indexing 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；按量计费，状态见 `~/tools/ecs-920B/state.env` |
@@ -155,6 +155,9 @@ hipcc --version
 
 ## 资源使用原则
 
+- 跨项目锁的权威协议是 `/home/chiro/projects/.resource-locks/README.md`。`local`/`gamepc` 只有 `resource-lock run` 成功才算取得；`status` 不能替代申请。
+- 本机 full suite、大 shape lowering/compile、并行构建或预计使用至少一半 CPU/4 GiB 内存的任务必须经 `scripts/resource/run_local_heavy.sh`。返回 75/69 时等待，不能降级为裸跑。
+- heavy runner 默认以 user cgroup 限制 MemoryHigh/MemoryMax、禁用该任务 swap、限制 CPU quota/affinity，并由 supervisor 每 2 秒检查 `MemAvailable`、任务树 RSS/CPU、load 与 PSI；资源日志写入 `../worktrees/_meta/pypto-x/resource-usage/`。
 - Smoke 测试不加载模型、不需要模型路径、不产生大权重文件。
 - 5080 先用于 elementwise、softmax、matmul 和 GPU ABI，不直接从 9B 端到端开始。
 - SVE 已完成 QEMU 与鲲鹏 ECS native 功能验证；ECS KVM 数字暂不直接作为生产性能门槛。

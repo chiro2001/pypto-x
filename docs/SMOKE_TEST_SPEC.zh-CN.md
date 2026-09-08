@@ -1,12 +1,14 @@
 # PyPTO-X（PyPTO_PRO）无模型一次冒烟测试规范
 
-更新日期：2026-09-06（Asia/Shanghai）
+更新日期：2026-09-09（Asia/Shanghai）
 
 ## 目的
 
 冒烟测试用于确认 subagent 的 worktree、源码、基础工具链和目标资源可用。它不是模型测试，也不是性能基准。
 
 每个 subagent 在启动后只执行一次。测试结果必须记录启动时间，便于区分排队时间、编译时间和执行时间。
+
+统一 smoke 是轻量能力/源码探针，本身不申请 `local` heavy 锁。若任务把 smoke 扩展为 full pytest、多用例 QEMU、大 shape lowering 或并行编译，该扩展不再属于 smoke，必须单独通过 `scripts/resource/run_local_heavy.sh` 取得全局 `local` 锁并接受资源监控。
 
 ## 必填参数
 

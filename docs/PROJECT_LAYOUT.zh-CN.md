@@ -1,6 +1,6 @@
 # PyPTO-X（PyPTO Cross-Architecture）项目文件布局
 
-更新日期：2026-09-06（Asia/Shanghai）
+更新日期：2026-09-09（Asia/Shanghai）
 
 ## 目标
 
@@ -43,6 +43,9 @@ PyPTO-X 的目标是让 PyPTO_PRO 兼容鲲鹏 CPU、x86_64 CPU、NVIDIA GPU 和
 ├── references/                          # 外部讲稿和活动页离线副本
 ├── research/                            # PyPTO 调研和源码清单
 ├── scripts/
+│   ├── resource/
+│   │   ├── run_local_heavy.sh            # 申请全局 local 锁、建立 cgroup 并启动监控
+│   │   └── monitor_local_heavy.py         # MemAvailable/RSS/CPU/load/PSI 监督与安全停止
 │   ├── smoke/
 │   │   ├── pypto_pro_smoke.sh           # 统一冒烟测试入口
 │   │   └── aarch64_feature_probe.c      # QEMU/native SVE 能力探针

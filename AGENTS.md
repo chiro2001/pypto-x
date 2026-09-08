@@ -33,6 +33,9 @@
 - 启动时省略 `model`/`model_name`；使用默认模型。
 - 不下载或加载 LLM 权重。每个 subagent 启动后只执行一次无模型冒烟测试。
 - 派发后父 agent 使用一次 `wait_agent(timeout_ms=3600000)` 长等待，不做周期轮询。
+- 启动消息还必须包含 `resource_lock_root=/home/chiro/projects/.resource-locks`、`local_heavy_policy=locked`、`local_heavy_runner=/home/chiro/projects/pypto/pypto_x/scripts/resource/run_local_heavy.sh`、`local_min_available_mib=8192`、`local_safety_floor_mib=4096`、`local_max_cpus=6`。
+- full pytest、大 shape lowering/compile、并行构建或预计使用本机至少一半 CPU/4 GiB 内存的命令，必须由 `run_local_heavy.sh` 取得 `local` 锁并受 cgroup/运行时监控；禁止裸跑 heredoc 重任务。
+- 全局锁返回 75（BUSY）或 69（资源不足）时必须等待，不得绕过包装器、抢占 owner、删除 `.pid/.guard` 或改成无锁执行。
 
 ## 工程边界
 
@@ -46,6 +49,8 @@
 
 ## 资源安全
 
+- 本机共享重任务遵守 `/home/chiro/projects/.resource-locks/README.md`；运行前以 `resource-lock run` 实际取得锁才算获准，`status` 只供观察。
+- PyPTO-X 本机 heavy 命令统一经 `scripts/resource/run_local_heavy.sh`：默认启动至少 8 GiB `MemAvailable`、保留 4 GiB 系统余量、最多 6/12 CPU，使用动态 `MemoryHigh/MemoryMax`、`MemorySwapMax=0`、CPU quota/affinity，并持续记录内存、RSS、load 与 PSI；安全停止只作用于本任务进程组。
 - RTX 5080 主机 `192.168.101.5` 的 SSH 默认进入 Windows `cmd`；Linux 命令必须通过 `wsl.exe -e bash -lc`。
 - AMD 6750GRE 尚未接入，不得声称 HIP 已在真机运行。
 - QEMU 只用于 AArch64/SVE 功能验证，不得用其数字作性能结论。

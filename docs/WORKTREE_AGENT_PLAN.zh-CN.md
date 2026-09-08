@@ -1,6 +1,6 @@
 # PyPTO-X：Git worktree 与 subagent 并行开发计划
 
-更新日期：2026-09-06（Asia/Shanghai）
+更新日期：2026-09-09（Asia/Shanghai）
 
 ## 总体原则
 
@@ -108,6 +108,12 @@ started_at=<ISO-8601 UTC 时间>
 smoke_once=true
 wait_timeout_seconds=3600
 poll=false
+resource_lock_root=/home/chiro/projects/.resource-locks
+local_heavy_policy=locked
+local_heavy_runner=/home/chiro/projects/pypto/pypto_x/scripts/resource/run_local_heavy.sh
+local_min_available_mib=8192
+local_safety_floor_mib=4096
+local_max_cpus=6
 ```
 
 特别约定：
@@ -117,6 +123,9 @@ poll=false
 - subagent 启动后只执行一次统一冒烟测试，并把 `started_at` 原样写入日志。
 - 冒烟测试失败要记录失败原因，不循环重试；由协调者决定是否开新任务修复。
 - 派发完成后，父 agent 使用一次长等待（`3600s`），不做周期轮询。只有收到完成/失败事件或用户新指令时才继续处理。
+- 一次无模型 smoke 仍是轻量能力探针；full pytest、多用例 QEMU、大 shape lowering/compile 和并行构建属于本机 heavy，必须通过项目 heavy runner 取得跨项目 `local` 锁。
+- heavy runner 返回 75 或 69 时停止并等待协调者；禁止改为裸跑、后台化，或删除 `/home/chiro/projects/.resource-locks` 下的 owner/guard 文件。
+- 不得用 `python -u -`/heredoc 直接承载大 shape heavy 工作；先保存可审计 driver，再由 heavy runner 监督运行。
 
 如果使用本产品的 agent 工具，调用形态应遵守以下原则（示意，不包含 `model` 参数）：
 
