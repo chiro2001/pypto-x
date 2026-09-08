@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`EXECUTION_W4_SVE256_IN_PROGRESS`
+状态：`EXECUTION_W4_SVE256_COMPLETE_GPU_COMMON_READY`
 
-最后更新：2026-09-08 12:15 CST（Asia/Shanghai）
+最后更新：2026-09-08 13:53 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -16,7 +16,7 @@
 - AMD GPU：GPU 公共层 → HIP/ROCDL；
 - 现有 Ascend CCE 路径保持为一个 target plugin，并避免功能回退。
 
-目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理、W1/W2/W2B，以及完整 W3：ISA-neutral CPU vector common、真实 AVX2 和 AVX-512 后端。integration 已包含 Core IR、Target/Compiler/Runtime ABI、CPU scalar/vector common、Clang x86 compiler/runtime 和无设备验证 harness；SVE/GPU 尚未实现。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect 并后续提取 portable subset。
+目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理、W1/W2/W2B、完整 W3，以及 W4 SVE256。integration 已包含 Core IR、Target/Compiler/Runtime ABI、CPU scalar/vector common、Clang x86 compiler/runtime 和 AArch64 SVE256 compiler/QEMU runtime；GPU 尚未实现。SVE 当前只有 QEMU 功能与汇编证据，没有鲲鹏真机结论。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect 并后续提取 portable subset。
 
 ## 2. 已经确定的技术决策
 
@@ -169,7 +169,7 @@ poll=false
 - subagent 返回 commit SHA、修改路径、smoke 日志、测试和风险；
 - 集成由主 Agent 在 integration worktree 完成。
 
-W1/W2/W2B 七个 task，以及 W3 的 `cpu-vector-common`、`cpu-avx2`、`cpu-avx512` worktree 均已提交并保持 clean；W3 已按固定协议完成并冻结，`cpu-sve256` 已从该冻结点创建并进入执行。实现冻结点与 task commit 见 `configs/development_lock.yaml`。
+W1/W2/W2B 七个 task、W3 的三个 task 与 W4 `cpu-sve256` worktree 均已提交并保持 clean；W3 和 SVE256 已按固定协议完成并冻结。实现冻结点与 task commit 见 `configs/development_lock.yaml`。
 
 ## 7. 建议的执行波次
 
@@ -185,7 +185,7 @@ W1 已完成以下三个 task：
 2. `work/core-ir`：Parser 单次生成目标无关 CoreProgram、稳定 IR dump/serialization。
 3. `work/verification`：无设备/无模型测试门禁、IR snapshot 和 differential harness。
 
-W2/W2B 与完整 W3 已完成，下一步进入：
+W2/W2B、完整 W3 与 W4 SVE256 已完成，下一步进入：
 
 ```text
 W3: cpu-vector-common → cpu-avx2 → cpu-avx512
@@ -297,7 +297,14 @@ QEMU 只证明功能路径，不可用于性能结论。
 - AVX2 fallback artifact：YMM 396、ZMM 0、EVEX 0；
 - 全负数 reduce-max、BF16 full/tail RNE、VNNI golden 与分层 fallback：`PASS`；
 - W3 AVX-512 integration smoke：`PASS`；
-- integration HEAD：`79a7daa1052775651b22e797c346651c70b60070`。
+- W4 SVE256 task smoke：唯一一次 QEMU smoke `PASS`；
+- W4 SVE256 全量单测：`264 passed`，统一 x86/SVE artifact 目录下进程退出码 0；
+- W4 SVE256 Python 3.7 AST（累计 73 个新增 Python 文件）、compileall、package discovery：`PASS`；
+- QEMU probe：`emulated=true`、SVE/SVE2、VL=32 bytes；VL128/VL512 直接执行安全拒绝；
+- SVE 热点：`whilelo=7`、`ld1w=14`、`st1w=7`、z/p predicate 寄存器，NEON v/q=0；
+- guarded canary、全负 reduce-max、BF16 raw bits/零维与 scalar differential：`PASS`；
+- W4 SVE256 integration smoke：`PASS`；
+- integration HEAD：`5e42eed7c432034db02c2d339e67789afd419ae9`。
 
 W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保持只读，不重跑覆盖。
 
@@ -322,7 +329,7 @@ W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保�
 3. CPU/加速器优先级为 AVX2 → AVX-512 → SVE256（无 NEON）→ NVIDIA → AMD。
 4. 上游默认分支已刷新为 edge 快照，版本策略为 release family + exact SHA 双轨 lock。
 5. Tensor frontend 作为跨架构主入口，Pro 作为 Ascend expert dialect + portable subset。
-6. 用户已批准执行开发计划；W1/W2/W2B 与完整 W3 已完成，可按同一协议继续 SVE256。
+6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3 与 SVE256 已完成，可按同一协议继续 GPU common。
 
 C0 已完成：
 
@@ -331,7 +338,7 @@ C0 已完成：
 3. 接手文档已按序号和日期归档到 `docs/00-handoffs/`。
 4. stable lock 仍等待实际 CANN toolkit/NPU 环境做晋升验证，不影响目标无关 W1，但会门禁 Ascend 回归结论。
 
-当前在 `cpu-sve256` 独立 worktree 复用 vector plan，在 QEMU 上验证 SVE/SVE2、动态 VL/predicate/尾块与 scalar differential；QEMU 结果不用于性能结论，鲲鹏真机仍待资源到位。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
+下一步从 integration HEAD 创建 `gpu-common` 独立 worktree，冻结 NVIDIA/AMD 共用的 Grid/Block/Thread/Subgroup、address space、GPU artifact 与 launch ABI；不得提前引入 NVVM/ROCDL vendor 语义。之后再在 RTX 5080 上推进 CUDA。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
 
 ## 12. 快速自检命令
 
