@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`EXECUTION_W6_QWEN35_08B_M1E_SVE256_CONV_STATE_IN_PROGRESS`
+状态：`EXECUTION_W6_QWEN35_08B_M1E_COMPLETE_M1F_ATTENTION_KV_PLANNING`
 
-最后更新：2026-09-09 01:52 CST（Asia/Shanghai）
+最后更新：2026-09-09 02:53 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -16,7 +16,7 @@
 - AMD GPU：GPU 公共层 → HIP/ROCDL；
 - 现有 Ascend CCE 路径保持为一个 target plugin，并避免功能回退。
 
-目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理、W1/W2/W2B、完整 W3、W4 SVE256/GPU common、Qwen3.5-0.8B M0 无权重 closure、M1A/M1B scalar closure、M1C1/M1C2a/M1C2b 的 SVE256 数值/layout/indexing，以及 M1D portable composites。integration 已包含 Core IR、Target/Compiler/Runtime ABI、CPU scalar/vector common、Clang x86 compiler/runtime、AArch64 SVE256 compiler/runtime，以及 NVIDIA/AMD 共用的 vendor-neutral GPU IR/ABI 与无设备 simulator；CUDA/HIP vendor backend 尚未实现。SVE 已在 QEMU 与鲲鹏 920B ECS 原生执行验证，但 ECS 是 KVM guest，尚无性能门槛。用户决定保留 ECS，并在 GamePC 关机期间以 Qwen3.5-0.8B 纯文本闭包为主线推进 M1E depthwise causal Conv1D 与 conv state update。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect，并后续提取 portable subset。
+目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理、W1/W2/W2B、完整 W3、W4 SVE256/GPU common、Qwen3.5-0.8B M0 无权重 closure、M1A/M1B scalar closure、M1C1/M1C2a/M1C2b 的 SVE256 数值/layout/indexing、M1D portable composites，以及 M1E depthwise causal Conv1D/functional conv state。integration 已包含 Core IR、Target/Compiler/Runtime ABI、CPU scalar/vector common、Clang x86 compiler/runtime、AArch64 SVE256 compiler/runtime，以及 NVIDIA/AMD 共用的 vendor-neutral GPU IR/ABI 与无设备 simulator；CUDA/HIP vendor backend 尚未实现。M1E 已在 QEMU 与鲲鹏 920B ECS 原生验证，integration 全量为 `426 passed`；ECS 是 KVM guest，仍不形成性能门槛。用户于 2026-09-09 确认 RTX 5080 已恢复；CUDA 在 `gamepc` 锁释放并复核工具链后可与 Qwen M1F 并行恢复。Qwen 主线下一步规划 M1F batched/transpose attention matmul 与函数式 KV cache。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect，并后续提取 portable subset。
 
 ## 2. 已经确定的技术决策
 
@@ -169,6 +169,7 @@ poll=false
 - 父 agent 派发后只调用一次 `wait_agent(timeout_ms=3600000)`，不轮询；
 - subagent 返回 commit SHA、修改路径、smoke 日志、测试和风险；
 - 集成由主 Agent 在 integration worktree 完成。
+- 命令较多的阶段验收也使用独立 subagent：从 exact integration HEAD 创建专用验收 worktree，源码只读，只写独占 `_meta` 证据目录；验收失败返回原实现 worktree 修复，不直接修改 integration。
 
 W1/W2/W2B 七个 task、W3 的三个 task，以及 W4 `cpu-sve256`/`gpu-common` worktree 均已提交并保持 clean；W3、SVE256 与 GPU common 已按固定协议完成并冻结。实现冻结点与 task commit 见 `configs/development_lock.yaml`。
 
@@ -239,7 +240,7 @@ ssh 192.168.101.5 \
   'wsl.exe -e bash -lc "uname -a; nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader"'
 ```
 
-此前 WSL 可见 GPU、Git、CMake、Clang 和 Python，但没有 `nvcc`，Python 也没有 PyTorch；2026-09-08 用户确认 GamePC 已关机。CUDA 工作开始前先等待主机开机，再只读复核工具链；安装/配置 CUDA 仍需用户明确授权，smoke 本身不得下载模型。
+此前 WSL 可见 GPU、Git、CMake、Clang 和 Python，但没有 `nvcc`，Python 也没有 PyTorch。用户于 2026-09-09 确认 GamePC 已恢复；当前 `gamepc` 锁仍由其他项目持有，因此尚未执行恢复后的新探测。锁释放后先只读复核驱动、`nvcc`、Clang/CMake/Python 与 PyTorch；安装/配置 CUDA 仍需用户明确授权，smoke 本身不得下载模型。
 
 ### AMD 6750GRE 12G
 
@@ -363,6 +364,12 @@ QEMU 只证明功能路径，不可用于性能结论。
 - M1D integration 全量：`417 passed in 147.15s`；Python 3.7 AST 3 files、compileall、128-package discovery、portable `python -S` import、integration QEMU smoke 均 `PASS`；
 - 920B native：BF16 RMSNorm/Softmax/partial RoPE/GQA、decoder 与 attention 多操作分支、guarded canary 全部 `PASS`；组合仍走现有 runner primitive，不宣称 fused kernel 或性能；
 - M1D integration HEAD：`fe6b54a0f40e739d5ebed87baa5d608565171695`，证据目录 `../worktrees/_meta/pypto-x/integration-w6-qwen35-m1d-final/`。
+- Qwen M1E task commits：`be40610255a61f8c74f2e5306dc65d1cd8a8c1d4`、`8de5714a9b067d7e52a5f53453abae7a5ac5db5b`、`f63207e26dba6eb4f90ab04e74621288d49038c5`；唯一旧 QEMU smoke 保留且未重跑；
+- M1E 新增 kernel-size=4 depthwise causal Conv1D，使用 `[B,C,T] + prior_state[B,C,4] + weight[C,4] -> output,new_state` 的函数式 SSA contract；BF16 存储、FP32 累加与 SiLU，prefill/chunk/decode 共用同一图，并连接 GDR in-projection → reshape → transpose → Conv1D；
+- SVE256 lowering version 升至 v4，所有主/nested iteration domain 必须 compact；旧 v3 plan/artifact 明确拒绝并要求重编译；`[1,6144,1024]` 的 29 个 plan 不再物化逐元素 chunks，small/large ELF 均为 881,928 bytes；
+- M1E integration 全量：`426 passed in 113.34s`；Python 3.7 AST 94 files、compileall、128 namespace-package discovery、diff check 与 integration QEMU smoke 均 `PASS`；full suite 经 `local` 锁运行，任务 RSS 峰值 278 MiB、最低 `MemAvailable` 26,627 MiB；
+- 920B native 对 integration HEAD `41523cfc3341d47abb94a8e2d97111e2948ea501` 验收：SVE=1、SVE2=0、VL=32，concat/slice/cast/broadcast/mul/add/silu、guarded canary、Conv 输出与 `new_state` carry 均 `PASS`；未加载模型权重；
+- M1E integration HEAD：`41523cfc3341d47abb94a8e2d97111e2948ea501`，证据目录 `../worktrees/_meta/pypto-x/integration-w6-qwen35-m1e-final/`。
 
 W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保持只读，不重跑覆盖。
 
@@ -387,7 +394,7 @@ W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保�
 3. CPU/加速器优先级为 AVX2 → AVX-512 → SVE256（无 NEON）→ NVIDIA → AMD。
 4. 上游默认分支已刷新为 edge 快照，版本策略为 release family + exact SHA 双轨 lock。
 5. Tensor frontend 作为跨架构主入口，Pro 作为 Ascend expert dialect + portable subset。
-6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、Qwen3.5-0.8B M0 closure、M1A、M1B、M1C1、M1C2a、M1C2b 与 M1D 已完成。GamePC 关机期间继续执行 M1E SVE256 conv/state 闭包；CUDA 保持资源等待。
+6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、Qwen3.5-0.8B M0 closure、M1A、M1B、M1C1、M1C2a、M1C2b、M1D 与 M1E 已完成。下一主线是 M1F attention/KV；5080 已恢复，CUDA 等待 `gamepc` 锁和工具链复核后可并行恢复。
 
 C0 已完成：
 
@@ -396,7 +403,7 @@ C0 已完成：
 3. 接手文档已按序号和日期归档到 `docs/00-handoffs/`。
 4. stable lock 仍等待实际 CANN toolkit/NPU 环境做晋升验证，不影响目标无关 W1，但会门禁 Ascend 回归结论。
 
-GPU common 已冻结 NVIDIA/AMD 共用的 Grid/Workgroup/Thread/Subgroup、address space、GPU artifact 与 launch ABI；公共层没有 NVVM/ROCDL/WMMA/MFMA 语义。CUDA 等待 GamePC 恢复并复核 `nvcc`，不得擅自安装工具链。PyPTO-Gym M0 与 PyPTO M1A/M1B/M1C1/M1C2a/M1C2b/M1D 已完成并集成；当前任务是 PyPTO `work/qwen35-sve256-conv-state`，以显式 `new_state` 多输出而非 host mutation 表达 causal depthwise Conv1D prefill/decode。AVX/GPU 同类扩展分开验收。鲲鹏 920B ECS 当前 ACTIVE，用于 native 正确性和汇编验收；实际权重下载/加载仍未授权。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
+GPU common 已冻结 NVIDIA/AMD 共用的 Grid/Workgroup/Thread/Subgroup、address space、GPU artifact 与 launch ABI；公共层没有 NVVM/ROCDL/WMMA/MFMA 语义。5080 已由用户确认恢复，但 `gamepc` 锁当前 BUSY；锁释放后先复核 `nvcc`，不得擅自安装工具链。PyPTO-Gym M0 与 PyPTO M1A/M1B/M1C1/M1C2a/M1C2b/M1D/M1E 已完成并集成；下一任务 M1F 先闭包 batched/transpose attention matmul 和函数式 KV cache，随后是 GDR recurrent matrix state、compare/iota/position、AVX2/AVX-512 Qwen parity、BF16 实际模型，再进入 W8A8-linear。鲲鹏 920B ECS 当前 ACTIVE，用于 native 正确性和汇编验收；实际权重下载/加载仍未授权。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
 
 ## 12. 快速自检命令
 

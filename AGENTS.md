@@ -13,9 +13,9 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W6_QWEN35_08B_M1E_SVE256_CONV_STATE_IN_PROGRESS`。
-- Qwen3.5-0.8B M0、M1A、M1B、M1C1、M1C2a/M1C2b 与 M1D portable composites 已完成并冻结；当前用函数式 state 输出闭包 depthwise causal Conv1D 与 conv state update。
-- 用户决定在 RTX 5080 GamePC 关机期间保留并使用鲲鹏 920B ECS；CUDA 保持资源等待。
+- 当前状态是 `EXECUTION_W6_QWEN35_08B_M1E_COMPLETE_M1F_ATTENTION_KV_PLANNING`。
+- Qwen3.5-0.8B M0、M1A、M1B、M1C1、M1C2a/M1C2b、M1D portable composites 与 M1E functional Conv1D/state 已完成并冻结；下一步闭包 batched/transpose attention matmul 与函数式 KV cache。
+- 用户于 2026-09-09 确认 RTX 5080 GamePC 已恢复；CUDA 在取得 `gamepc` 锁并重新探测工具链后恢复执行，鲲鹏 920B ECS 继续承担 SVE256 验证。
 
 ## Git 与目录
 
@@ -33,6 +33,7 @@
 - 启动时省略 `model`/`model_name`；使用默认模型。
 - 不下载或加载 LLM 权重。每个 subagent 启动后只执行一次无模型冒烟测试。
 - 派发后父 agent 使用一次 `wait_agent(timeout_ms=3600000)` 长等待，不做周期轮询。
+- 命令较多的阶段验收也交给独立 subagent：从待验收 integration HEAD 创建专用验收 worktree，源码只读，只把日志/报告写入独占 `_meta` 目录；不得让验收 agent 与实现 agent 共用 worktree。
 - 启动消息还必须包含 `resource_lock_root=/home/chiro/projects/.resource-locks`、`local_heavy_policy=locked`、`local_heavy_runner=/home/chiro/projects/pypto/pypto_x/scripts/resource/run_local_heavy.sh`、`local_min_available_mib=8192`、`local_safety_floor_mib=4096`、`local_max_cpus=6`。
 - full pytest、大 shape lowering/compile、并行构建或预计使用本机至少一半 CPU/4 GiB 内存的命令，必须由 `run_local_heavy.sh` 取得 `local` 锁并受 cgroup/运行时监控；禁止裸跑 heredoc 重任务。
 - 全局锁返回 75（BUSY）或 69（资源不足）时必须等待，不得绕过包装器、抢占 owner、删除 `.pid/.guard` 或改成无锁执行。
@@ -51,7 +52,7 @@
 
 - 本机共享重任务遵守 `/home/chiro/projects/.resource-locks/README.md`；运行前以 `resource-lock run` 实际取得锁才算获准，`status` 只供观察。
 - PyPTO-X 本机 heavy 命令统一经 `scripts/resource/run_local_heavy.sh`：默认启动至少 8 GiB `MemAvailable`、保留 4 GiB 系统余量、最多 6/12 CPU，使用动态 `MemoryHigh/MemoryMax`、`MemorySwapMax=0`、CPU quota/affinity，并持续记录内存、RSS、load 与 PSI；安全停止只作用于本任务进程组。
-- RTX 5080 主机 `192.168.101.5` 的 SSH 默认进入 Windows `cmd`；Linux 命令必须通过 `wsl.exe -e bash -lc`。
+- RTX 5080 主机 `192.168.101.5` 已由用户确认恢复；连接前仍需成功取得 `gamepc` 锁。SSH 默认进入 Windows `cmd`；Linux 命令必须通过 `wsl.exe -e bash -lc`。
 - AMD 6750GRE 尚未接入，不得声称 HIP 已在真机运行。
 - QEMU 只用于 AArch64/SVE 功能验证，不得用其数字作性能结论。
 - 鲲鹏 920B ECS 已完成 native SVE256 功能与汇编验证：SVE=1、VL=32、SVE2=0；它是 2 vCPU KVM guest，尚未形成性能门槛。

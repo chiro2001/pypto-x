@@ -162,6 +162,19 @@ scripts/smoke/pypto_pro_smoke.sh \
 5. 发生冲突时由协调者解决；禁止 subagent 直接改别人的 worktree。
 6. 合并后再决定是否删除 task worktree；删除必须是明确的人工动作。
 
+## 独立验收 subagent
+
+命令较多的阶段验收也使用 subagent，但它与实现任务严格分离：
+
+1. 协调者先把待验收实现合入 integration，并固定 exact HEAD；
+2. 使用 `scripts/worktree/create.sh` 从该 HEAD 创建 `verify/<phase>` 分支和独立验收 worktree；
+3. 验收 agent 不修改源码，只执行 full suite、静态门禁、QEMU/真机验证和证据汇总；日志只写入其独占的 `../worktrees/_meta/pypto-x/<phase>/`；
+4. heavy 命令仍必须逐项通过 `run_local_heavy.sh` 取得 `local` 锁，GamePC 命令必须取得 `gamepc` 锁；
+5. 验收失败时返回复现证据，由原实现 worktree 修复；验收 agent 不直接改 integration；
+6. 父 agent 按同一协议只做一次一小时长等待，收到结果后审查 commit/日志并冻结开发锁。
+
+验收 agent 同样只能运行一次统一 smoke，禁止下载或加载模型权重。该角色解决“一个阶段需要运行大量命令”的上下文与审计负担，但不放宽一个 task/branch/worktree 的隔离原则。
+
 ## 跨仓库变更
 
 PyPTO_PRO 主体在 `upstream/pypto`。涉及 `pypto-gym` 的模型集成使用独立 worktree：
