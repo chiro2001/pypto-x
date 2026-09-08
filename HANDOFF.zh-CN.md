@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`EXECUTION_W3_COMPLETE_W4_SVE256_READY`
+状态：`EXECUTION_W4_SVE256_IN_PROGRESS`
 
-最后更新：2026-09-08 12:12 CST（Asia/Shanghai）
+最后更新：2026-09-08 12:15 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -65,7 +65,7 @@ upstream/                         # 五个嵌套 Git 仓库
 ```text
 branch = master
 HEAD   = 34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad
-linked worktree 数 = 17（基线、integration、五个只读调研、三个 W1、三个 W2、一个 W2B 和三个 W3 task worktree）
+linked worktree 数 = 18（基线、integration、五个只读调研、三个 W1、三个 W2、一个 W2B、三个 W3 和一个 W4 task worktree）
 工作树 = clean
 ```
 
@@ -169,7 +169,7 @@ poll=false
 - subagent 返回 commit SHA、修改路径、smoke 日志、测试和风险；
 - 集成由主 Agent 在 integration worktree 完成。
 
-W1/W2/W2B 七个 task，以及 W3 的 `cpu-vector-common`、`cpu-avx2`、`cpu-avx512` worktree 均已提交并保持 clean；W3 已按固定协议完成并冻结。实现冻结点与 task commit 见 `configs/development_lock.yaml`。
+W1/W2/W2B 七个 task，以及 W3 的 `cpu-vector-common`、`cpu-avx2`、`cpu-avx512` worktree 均已提交并保持 clean；W3 已按固定协议完成并冻结，`cpu-sve256` 已从该冻结点创建并进入执行。实现冻结点与 task commit 见 `configs/development_lock.yaml`。
 
 ## 7. 建议的执行波次
 
@@ -331,7 +331,7 @@ C0 已完成：
 3. 接手文档已按序号和日期归档到 `docs/00-handoffs/`。
 4. stable lock 仍等待实际 CANN toolkit/NPU 环境做晋升验证，不影响目标无关 W1，但会门禁 Ascend 回归结论。
 
-下一步从 integration HEAD 创建 `cpu-sve256` 独立 worktree，复用 vector plan，在 QEMU 上验证 SVE/SVE2、动态 VL/predicate/尾块与 scalar differential；QEMU 结果不用于性能结论，鲲鹏真机仍待资源到位。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
+当前在 `cpu-sve256` 独立 worktree 复用 vector plan，在 QEMU 上验证 SVE/SVE2、动态 VL/predicate/尾块与 scalar differential；QEMU 结果不用于性能结论，鲲鹏真机仍待资源到位。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
 
 ## 12. 快速自检命令
 
