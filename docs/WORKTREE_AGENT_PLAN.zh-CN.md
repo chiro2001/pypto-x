@@ -169,7 +169,7 @@ scripts/smoke/pypto_pro_smoke.sh \
 1. 协调者先把待验收实现合入 integration，并固定 exact HEAD；
 2. 使用 `scripts/worktree/create.sh` 从该 HEAD 创建 `verify/<phase>` 分支和独立验收 worktree；
 3. 验收 agent 不修改源码，只执行 full suite、静态门禁、QEMU/真机验证和证据汇总；日志只写入其独占的 `../worktrees/_meta/pypto-x/<phase>/`；
-4. heavy 命令仍必须逐项通过 `run_local_heavy.sh` 取得 `local` 锁，GamePC 命令必须取得 `gamepc` 锁；
+4. 本机 heavy 命令仍必须逐项通过 `run_local_heavy.sh` 取得 `local` 锁；RTX 5080 GPU-only 验收不申请 `gamepc`，只有 GamePC host CPU/内存 heavy 阶段才持有该锁；
 5. 验收失败时返回复现证据，由原实现 worktree 修复；验收 agent 不直接改 integration；
 6. 父 agent 按同一协议只做一次一小时长等待，收到结果后审查 commit/日志并冻结开发锁。
 

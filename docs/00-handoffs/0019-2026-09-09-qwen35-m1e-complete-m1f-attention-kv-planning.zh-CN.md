@@ -53,4 +53,6 @@ Qwen BF16 闭包按以下顺序推进：
 
 用户于 2026-09-09 确认 RTX 5080 已恢复。CUDA 从“关机等待”转为“等待 `gamepc` 锁内工具链复核”；最后一次已知环境仍缺 `nvcc`/PyTorch，安装动作需要用户明确授权。CUDA backend 可在 GPU common ABI 不变的前提下与 M1F 并行。
 
+> 后续勘误：用户在归档 `0022` 明确 RTX 5080 GPU 由 PyPTO-X 独占，GPU-only 工作不申请 `gamepc`；该锁只协调远端 heavy CPU/host-memory。
+
 命令较多的后续阶段验收使用独立 subagent：从 exact integration HEAD 建专用验收 worktree，源码只读，统一运行 full suite、静态门禁、QEMU/真机与证据汇总；父 agent 审查并冻结结果。

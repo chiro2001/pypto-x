@@ -51,3 +51,5 @@ SVE batched matmul 当前是 host batch/head loop 调用 rank-2 native runner，
 下一主线 M1G 闭包 Gated DeltaNet recurrent matrix state/update，覆盖 chunk prefill 与逐 token decode；之后依次为 compare/iota/position、AVX2/AVX-512 Qwen parity、获授权后的 BF16 实际模型和 W8A8-linear。
 
 RTX 5080 已由用户确认恢复；CUDA 等待 `gamepc` 锁释放后复核驱动、`nvcc` 与 Python/PyTorch 工具链，可与 M1G 并行。
+
+> 后续勘误：用户在归档 `0022` 明确 RTX 5080 GPU 由 PyPTO-X 独占，GPU-only 工作不申请 `gamepc`；该锁只协调远端 heavy CPU/host-memory。

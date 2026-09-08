@@ -7,7 +7,7 @@
 跨项目锁由 `/home/chiro/projects/.resource-locks/README.md` 定义：
 
 - `local` 独占本地主机 heavy 计算；
-- `gamepc` 独占远程 GamePC；
+- `gamepc` 独占远程 GamePC 的 heavy CPU/host-memory 计算；RTX 5080 GPU 由 PyPTO-X 独占，不由该锁表示；
 - `status` 只显示状态，只有 `resource-lock run` 成功才算取得资源；
 - 返回 75 表示 BUSY，返回 69 表示准入资源不足；两者都必须等待，不能裸跑；
 - 禁止抢占 owner、终止其他项目持有者、删除 `.pid` 或 `.guard`；
@@ -89,6 +89,8 @@ local_max_cpus=6
 
 subagent 可运行一次轻量统一 smoke；其后的 full tests、大 shape 探测和并行编译必须经 heavy runner。不要用 `python -u -` 或 heredoc 直接承载 heavy 大 shape 工作；先保存可审计 driver，再在锁内运行。锁忙或准入失败时报告并等待协调者。
 
-## GamePC
+## GamePC CPU 锁与独占 GPU
 
-GamePC 的远程 CUDA heavy 工作申请 `gamepc`；只有本机同时做 heavy 编译/计算时才申请 `local,gamepc`。SSH 必须同步等待远程任务结束，不能启动远程后台任务后立即释放锁。
+RTX 5080 GPU 当前由 PyPTO-X 独占。GPU-only 能力探测、driver 调用和低 host 开销的 GPU kernel 执行不申请 `gamepc`，即使另一项目正持有该锁做远端 CPU 工作也可并行；仍需记录显存、compute process 和 GPU 错误。
+
+CUDA host 编译、并行构建、大量 CPU 数据准备或其他明显占用 GamePC CPU/host memory 的阶段必须申请 `gamepc`，且只在该 heavy 阶段持续持有。若本机同时做 heavy 工作才申请 `local,gamepc`。受锁保护的 SSH 必须同步等待，不能后台化后提前释放。

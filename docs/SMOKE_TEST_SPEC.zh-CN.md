@@ -54,6 +54,7 @@
 - 记录 GPU 名称、显存和驱动；
 - 检查 `nvcc`/PyTorch 是否存在；
 - 缺少 CUDA 工具链时返回 `BLOCKED_TOOLCHAIN`，不下载模型。
+- 这是 GPU-only 轻量 probe，RTX 5080 已由 PyPTO-X 独占，因此不申请 `gamepc`；若扩展为 host-heavy CUDA 编译/并行构建，则扩展阶段必须单独持有 `gamepc`。
 
 ### `amd-6750gre`
 

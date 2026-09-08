@@ -2,7 +2,7 @@
 
 状态：`EXECUTION_W6_QWEN35_08B_M1G_COMPLETE_M1H_POSITION_CONTROL_PLANNING`
 
-最后更新：2026-09-09 04:42 CST（Asia/Shanghai）
+最后更新：2026-09-09 06:33 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -16,7 +16,7 @@
 - AMD GPU：GPU 公共层 → HIP/ROCDL；
 - 现有 Ascend CCE 路径保持为一个 target plugin，并避免功能回退。
 
-目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理、W1/W2/W2B、完整 W3、W4 SVE256/GPU common、Qwen3.5-0.8B M0 无权重 closure、M1A/M1B scalar closure、M1C1/M1C2a/M1C2b 的 SVE256 数值/layout/indexing、M1D portable composites、M1E depthwise causal Conv1D/functional conv state、M1F batched attention/functional KV cache，以及 M1G GDR recurrent matrix state。integration 已包含 Core IR、Target/Compiler/Runtime ABI、CPU scalar/vector common、Clang x86 compiler/runtime、AArch64 SVE256 compiler/runtime，以及 NVIDIA/AMD 共用的 vendor-neutral GPU IR/ABI 与无设备 simulator；CUDA/HIP vendor backend 尚未实现。M1G 独立验收为 `438 passed`，固定 Qwen 非零 state 的 QEMU/SVE 与鲲鹏 920B 原生功能均通过；ECS 是 KVM guest，仍不形成性能门槛。用户于 2026-09-09 确认 RTX 5080 已恢复；CUDA 在 `gamepc` 锁释放并复核工具链后可与 Qwen M1H 并行恢复。Qwen 主线下一步补齐 compare/iota/position 并连接无权重 text decoder graph。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect，并后续提取 portable subset。
+目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理、W1/W2/W2B、完整 W3、W4 SVE256/GPU common、Qwen3.5-0.8B M0 无权重 closure、M1A/M1B scalar closure、M1C1/M1C2a/M1C2b 的 SVE256 数值/layout/indexing、M1D portable composites、M1E depthwise causal Conv1D/functional conv state、M1F batched attention/functional KV cache，以及 M1G GDR recurrent matrix state。integration 已包含 Core IR、Target/Compiler/Runtime ABI、CPU scalar/vector common、Clang x86 compiler/runtime、AArch64 SVE256 compiler/runtime，以及 NVIDIA/AMD 共用的 vendor-neutral GPU IR/ABI 与无设备 simulator；CUDA/HIP vendor backend 尚未实现。M1G 独立验收为 `438 passed`，固定 Qwen 非零 state 的 QEMU/SVE 与鲲鹏 920B 原生功能均通过；ECS 是 KVM guest，仍不形成性能门槛。用户于 2026-09-09 确认 RTX 5080 已恢复且 GPU 由 PyPTO-X 独占；GPU-only 工作不需要 `gamepc` 锁，只有远端 host-heavy 阶段才持锁。恢复探测确认 `libcuda.so.1` 可用但缺少 CUDA Toolkit/PyTorch/Triton，因此 CUDA 可先走 Driver API + PTX JIT。Qwen 主线下一步补齐 compare/iota/position 并连接无权重 text decoder graph。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect，并后续提取 portable subset。
 
 ## 2. 已经确定的技术决策
 
@@ -240,7 +240,7 @@ ssh 192.168.101.5 \
   'wsl.exe -e bash -lc "uname -a; nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader"'
 ```
 
-此前 WSL 可见 GPU、Git、CMake、Clang 和 Python，但没有 `nvcc`，Python 也没有 PyTorch。用户于 2026-09-09 确认 GamePC 已恢复；当前 `gamepc` 锁仍由其他项目持有，因此尚未执行恢复后的新探测。锁释放后先只读复核驱动、`nvcc`、Clang/CMake/Python 与 PyTorch；安装/配置 CUDA 仍需用户明确授权，smoke 本身不得下载模型。
+用户于 2026-09-09 确认 GamePC 已恢复且 RTX 5080 由 PyPTO-X 独占。GPU-only probe/执行不申请 `gamepc`；CUDA host-heavy 编译、并行构建或大量远端 CPU/内存阶段才持续持锁。恢复探测确认：RTX 5080 16,303 MiB、compute capability 12.0、KMD 610.62/CUDA UMD 13.3；没有 compute process，后续瞬时探测可用 11,389 MiB；WSL 有 24 CPU、约 30 GiB `MemAvailable`、Clang 18.1.3、CMake 3.28.3、Python 3.12.3 和 `libcuda.so.1`。没有 `nvcc`、NVRTC、CUDART、CUDA SDK headers、PyTorch 或 Triton。首个 CUDA task 可先用 Driver API + PTX JIT + Python `ctypes`，无需安装；若后续需要 Toolkit，安装仍需用户明确授权。
 
 ### AMD 6750GRE 12G
 
@@ -384,6 +384,7 @@ QEMU 只证明功能路径，不可用于性能结论。
 - 固定 Qwen 16×128 非零 scalar/SVE differential 与 T=2 执行通过；T=64 编译得到 1,923 plans/2,307 iteration domains，全部 compact、chunks 为空，plan 约 1.87 MiB、ELF 881,928 bytes；
 - 920B native 以 48 次 rank-2 runner 调用验证非零 recurrent step，prediction/state/output 最大绝对误差约 `2.70e-8`/`5.04e-11`/`8.29e-9`，guarded canary 与输入不变性 `PASS`；这是功能证据，不是性能结论；
 - M1G integration HEAD：`962f422e18ee25fd37679687710edbd496b9f6ce`，证据目录 `../worktrees/_meta/pypto-x/integration-w6-qwen35-m1g-final/`。
+- 5080 恢复后 GPU-only 探测：设备在线、compute mode Default、GPU util 约 2%、无 compute process；`libcuda.so.1` 存在，完整 CUDA Toolkit/PyTorch/Triton 缺失。GPU 由 PyPTO-X 独占，`gamepc` 锁仅协调远端 heavy CPU/host-memory。
 
 W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保持只读，不重跑覆盖。
 
@@ -408,7 +409,7 @@ W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保�
 3. CPU/加速器优先级为 AVX2 → AVX-512 → SVE256（无 NEON）→ NVIDIA → AMD。
 4. 上游默认分支已刷新为 edge 快照，版本策略为 release family + exact SHA 双轨 lock。
 5. Tensor frontend 作为跨架构主入口，Pro 作为 Ascend expert dialect + portable subset。
-6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、Qwen3.5-0.8B M0 closure、M1A、M1B、M1C1、M1C2a、M1C2b、M1D、M1E、M1F 与 M1G 已完成。下一主线是 M1H position/control；5080 已恢复，CUDA 等待 `gamepc` 锁和工具链复核后可并行恢复。
+6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、Qwen3.5-0.8B M0 closure、M1A、M1B、M1C1、M1C2a、M1C2b、M1D、M1E、M1F 与 M1G 已完成。下一主线是 M1H position/control；5080 GPU 已恢复并可立即用于 GPU-only CUDA Driver/PTX 工作，host-heavy 阶段单独申请 `gamepc`。
 
 C0 已完成：
 
@@ -417,7 +418,7 @@ C0 已完成：
 3. 接手文档已按序号和日期归档到 `docs/00-handoffs/`。
 4. stable lock 仍等待实际 CANN toolkit/NPU 环境做晋升验证，不影响目标无关 W1，但会门禁 Ascend 回归结论。
 
-GPU common 已冻结 NVIDIA/AMD 共用的 Grid/Workgroup/Thread/Subgroup、address space、GPU artifact 与 launch ABI；公共层没有 NVVM/ROCDL/WMMA/MFMA 语义。5080 已由用户确认恢复，但 `gamepc` 锁当前 BUSY；锁释放后先复核 `nvcc`，不得擅自安装工具链。PyPTO-Gym M0 与 PyPTO M1A/M1B/M1C1/M1C2a/M1C2b/M1D/M1E/M1F/M1G 已完成并集成；下一任务 M1H 补齐 compare/iota/position 并连接无权重 text decoder，随后是 AVX2/AVX-512 Qwen parity、获授权后的 BF16 实际模型，再进入 W8A8-linear。M1G 仍是静态 sequential correctness graph，不是 fused WY/chunk kernel；T=128 尚未验收。鲲鹏 920B ECS 当前 ACTIVE，用于 native 正确性和汇编验收；实际权重下载/加载仍未授权。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
+GPU common 已冻结 NVIDIA/AMD 共用的 Grid/Workgroup/Thread/Subgroup、address space、GPU artifact 与 launch ABI；公共层没有 NVVM/ROCDL/WMMA/MFMA 语义。5080 GPU 已恢复并由 PyPTO-X 独占，GPU-only CUDA 工作无需等待当前 `gamepc` CPU 锁；现有环境缺 Toolkit，但可先实现 `libcuda` Driver API + PTX JIT backend，不得擅自安装软件。PyPTO-Gym M0 与 PyPTO M1A/M1B/M1C1/M1C2a/M1C2b/M1D/M1E/M1F/M1G 已完成并集成；下一任务 M1H 补齐 compare/iota/position 并连接无权重 text decoder，CUDA 可并行；随后是 AVX2/AVX-512 Qwen parity、获授权后的 BF16 实际模型，再进入 W8A8-linear。M1G 仍是静态 sequential correctness graph，不是 fused WY/chunk kernel；T=128 尚未验收。鲲鹏 920B ECS 当前 ACTIVE，用于 native 正确性和汇编验收；实际权重下载/加载仍未授权。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
 
 ## 12. 快速自检命令
 

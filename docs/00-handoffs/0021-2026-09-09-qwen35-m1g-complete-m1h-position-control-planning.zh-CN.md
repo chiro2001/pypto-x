@@ -65,3 +65,5 @@ state 是函数式 SSA 输出，无 host mutation；T=1 decode 与 T>1 chunk 共
 下一任务 M1H 补齐 compare/iota/position、从 position/cache offset 生成 causal mask，并连接无权重 24 层 text decoder graph。其后进入 AVX2/AVX-512 Qwen parity、获授权后的 BF16 实际模型、W8A8-linear。
 
 RTX 5080 已恢复，但 `gamepc` 锁截至本快照仍由其他项目持有；CUDA 工具链复核继续等待，不抢占。
+
+> 后续勘误：用户在归档 `0022` 明确 RTX 5080 GPU 由 PyPTO-X 独占，GPU-only 工作不申请 `gamepc`；该锁只协调远端 heavy CPU/host-memory，因此 CUDA GPU probe 无需等待该锁。

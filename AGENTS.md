@@ -15,7 +15,7 @@
 
 - 当前状态是 `EXECUTION_W6_QWEN35_08B_M1G_COMPLETE_M1H_POSITION_CONTROL_PLANNING`。
 - Qwen3.5-0.8B M0、M1A、M1B、M1C1、M1C2a/M1C2b、M1D composites、M1E Conv/state、M1F attention/KV 与 M1G GDR recurrent state 已完成并冻结；下一步补齐 compare/iota/position 并连接无权重 text decoder graph。
-- 用户于 2026-09-09 确认 RTX 5080 GamePC 已恢复；CUDA 在取得 `gamepc` 锁并重新探测工具链后恢复执行，鲲鹏 920B ECS 继续承担 SVE256 验证。
+- 用户于 2026-09-09 确认 RTX 5080 GamePC 已恢复并由 PyPTO-X 独占 GPU；GPU-only 工作无需 `gamepc` 锁，CUDA host-heavy 编译阶段才申请该锁。鲲鹏 920B ECS 继续承担 SVE256 验证。
 
 ## Git 与目录
 
@@ -52,7 +52,7 @@
 
 - 本机共享重任务遵守 `/home/chiro/projects/.resource-locks/README.md`；运行前以 `resource-lock run` 实际取得锁才算获准，`status` 只供观察。
 - PyPTO-X 本机 heavy 命令统一经 `scripts/resource/run_local_heavy.sh`：默认启动至少 8 GiB `MemAvailable`、保留 4 GiB 系统余量、最多 6/12 CPU，使用动态 `MemoryHigh/MemoryMax`、`MemorySwapMax=0`、CPU quota/affinity，并持续记录内存、RSS、load 与 PSI；安全停止只作用于本任务进程组。
-- RTX 5080 主机 `192.168.101.5` 已由用户确认恢复；连接前仍需成功取得 `gamepc` 锁。SSH 默认进入 Windows `cmd`；Linux 命令必须通过 `wsl.exe -e bash -lc`。
+- RTX 5080 主机 `192.168.101.5` 已恢复且 GPU 由 PyPTO-X 独占；GPU-only probe/执行不申请 `gamepc`，大量远端 CPU/内存阶段才持锁。SSH 默认进入 Windows `cmd`；Linux 命令必须通过 `wsl.exe -e bash -lc`。
 - AMD 6750GRE 尚未接入，不得声称 HIP 已在真机运行。
 - QEMU 只用于 AArch64/SVE 功能验证，不得用其数字作性能结论。
 - 鲲鹏 920B ECS 已完成 native SVE256 功能与汇编验证：SVE=1、VL=32、SVE2=0；它是 2 vCPU KVM guest，尚未形成性能门槛。
