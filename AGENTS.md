@@ -13,8 +13,8 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W6_QWEN35_08B_M1E_COMPLETE_M1F_ATTENTION_KV_PLANNING`。
-- Qwen3.5-0.8B M0、M1A、M1B、M1C1、M1C2a/M1C2b、M1D portable composites 与 M1E functional Conv1D/state 已完成并冻结；下一步闭包 batched/transpose attention matmul 与函数式 KV cache。
+- 当前状态是 `EXECUTION_W6_QWEN35_08B_M1F_COMPLETE_M1G_GDR_RECURRENT_STATE_PLANNING`。
+- Qwen3.5-0.8B M0、M1A、M1B、M1C1、M1C2a/M1C2b、M1D composites、M1E Conv1D/state 与 M1F attention/KV 已完成并冻结；下一步闭包 GDR recurrent matrix state/update。
 - 用户于 2026-09-09 确认 RTX 5080 GamePC 已恢复；CUDA 在取得 `gamepc` 锁并重新探测工具链后恢复执行，鲲鹏 920B ECS 继续承担 SVE256 验证。
 
 ## Git 与目录

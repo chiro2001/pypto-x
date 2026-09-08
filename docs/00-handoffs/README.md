@@ -34,3 +34,4 @@ NNNN-YYYY-MM-DD-<阶段或主题>.zh-CN.md
 | 0017 | 2026-09-09 | Qwen3.5 M1D 完成、M1E SVE256 conv/state 启动 | [Qwen3.5 M1D 完成与 M1E 起点](0017-2026-09-09-qwen35-m1d-complete-m1e-conv-state-start.zh-CN.md) |
 | 0018 | 2026-09-09 | 本机异常重启恢复、全局资源锁与运行监控生效 | [本机资源治理快照](0018-2026-09-09-local-resource-lock-governance.zh-CN.md) |
 | 0019 | 2026-09-09 | Qwen3.5 M1E 完成、M1F attention/KV 规划、5080 恢复 | [Qwen3.5 M1E 完成与 M1F 规划](0019-2026-09-09-qwen35-m1e-complete-m1f-attention-kv-planning.zh-CN.md) |
+| 0020 | 2026-09-09 | Qwen3.5 M1F 完成、独立验收生效、M1G GDR state 规划 | [Qwen3.5 M1F 完成与 M1G 规划](0020-2026-09-09-qwen35-m1f-complete-m1g-gdr-state-planning.zh-CN.md) |
