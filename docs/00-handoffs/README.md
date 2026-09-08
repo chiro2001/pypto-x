@@ -28,3 +28,4 @@ NNNN-YYYY-MM-DD-<阶段或主题>.zh-CN.md
 | 0011 | 2026-09-08 | Qwen3.5-0.8B M0 完成、M1A 公共原语启动 | [Qwen3.5 M0 完成与 M1A 起点](0011-2026-09-08-qwen35-m0-complete-m1a-start.zh-CN.md) |
 | 0012 | 2026-09-08 | Qwen3.5 M1A 完成、M1B shape/layout 启动 | [Qwen3.5 M1A 完成与 M1B 起点](0012-2026-09-08-qwen35-m1a-complete-m1b-start.zh-CN.md) |
 | 0013 | 2026-09-08 | Qwen3.5 M1B 完成、M1C1 SVE256 数值原语启动 | [Qwen3.5 M1B 完成与 M1C1 起点](0013-2026-09-08-qwen35-m1b-complete-m1c1-sve-start.zh-CN.md) |
+| 0014 | 2026-09-08 | Qwen3.5 M1C1 完成、M1C2a SVE256 layout 启动 | [Qwen3.5 M1C1 完成与 M1C2a 起点](0014-2026-09-08-qwen35-m1c1-complete-m1c2a-layout-start.zh-CN.md) |
