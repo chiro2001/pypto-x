@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`EXECUTION_W6_QWEN35_08B_M1C2B_SVE256_INDEXING_IN_PROGRESS`
+状态：`EXECUTION_W6_QWEN35_08B_M1D_SVE256_COMPOSITES_IN_PROGRESS`
 
-最后更新：2026-09-08 22:17 CST（Asia/Shanghai）
+最后更新：2026-09-08 23:36 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -16,7 +16,7 @@
 - AMD GPU：GPU 公共层 → HIP/ROCDL；
 - 现有 Ascend CCE 路径保持为一个 target plugin，并避免功能回退。
 
-目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理、W1/W2/W2B、完整 W3、W4 SVE256/GPU common、Qwen3.5-0.8B M0 无权重 closure、M1A/M1B scalar closure、M1C1 vector-common/SVE256 数值原语，以及 M1C2a reshape/view/transpose/contiguous/slice 数据移动。integration 已包含 Core IR、Target/Compiler/Runtime ABI、CPU scalar/vector common、Clang x86 compiler/runtime、AArch64 SVE256 compiler/runtime，以及 NVIDIA/AMD 共用的 vendor-neutral GPU IR/ABI 与无设备 simulator；CUDA/HIP vendor backend 尚未实现。SVE 已在 QEMU 与鲲鹏 920B ECS 原生执行验证，但 ECS 是 KVM guest，尚无性能门槛。用户决定保留 ECS，并在 GamePC 关机期间以 Qwen3.5-0.8B 纯文本闭包为主线推进 M1C2b split/concat/gather/embedding。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect，并后续提取 portable subset。
+目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理、W1/W2/W2B、完整 W3、W4 SVE256/GPU common、Qwen3.5-0.8B M0 无权重 closure、M1A/M1B scalar closure，以及 M1C1/M1C2a/M1C2b 的 SVE256 数值、layout 与 indexing 闭包。integration 已包含 Core IR、Target/Compiler/Runtime ABI、CPU scalar/vector common、Clang x86 compiler/runtime、AArch64 SVE256 compiler/runtime，以及 NVIDIA/AMD 共用的 vendor-neutral GPU IR/ABI 与无设备 simulator；CUDA/HIP vendor backend 尚未实现。SVE 已在 QEMU 与鲲鹏 920B ECS 原生执行验证，但 ECS 是 KVM guest，尚无性能门槛。用户决定保留 ECS，并在 GamePC 关机期间以 Qwen3.5-0.8B 纯文本闭包为主线推进 M1D RMSNorm/SwiGLU/Softmax/RoPE/GQA/mask 组合。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect，并后续提取 portable subset。
 
 ## 2. 已经确定的技术决策
 
@@ -65,7 +65,7 @@ upstream/                         # 五个嵌套 Git 仓库
 ```text
 branch = master
 HEAD   = 34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad
-linked worktree 数 = 24（基线、integration、既有调研/W1-W4 task，以及 Qwen M1A/M1B/M1C1/M1C2a/M1C2b task worktree）
+linked worktree 数 = 25（基线、integration、既有调研/W1-W4 task，以及 Qwen M1A/M1B/M1C1/M1C2a/M1C2b/M1D task worktree）
 工作树 = clean
 ```
 
@@ -341,6 +341,12 @@ QEMU 只证明功能路径，不可用于性能结论。
 - M1C2a integration 全量：`380 passed in 84.60s`；Python 3.7 AST 6 files、compileall、127-package discovery、integration QEMU smoke 均 `PASS`；
 - 920B native：FP32 transpose/slice 使用 SVE u32 indexed gather，BF16 identity copy 使用 SVE u16，BF16 reorder 为明确 scalar fallback；奇数 payload、tamper、v1 layout 拒绝和 guarded canary 均 `PASS`；
 - M1C2a integration HEAD：`202b045fba9b02b4982453eac42c648ecb49dbc9`，证据目录 `../worktrees/_meta/pypto-x/integration-w6-qwen35-m1c2a-final/`。
+- Qwen M1C2b task commits：`d8df8637ffe0fe3b26d45c6512278cc8cf03a066`、`eea99d332172fd06dc581531606eed4ea613173c`；唯一合规 QEMU smoke `PASS`，早期失败 pytest 已单独归档为开发日志；
+- M1C2b 已把 `split/concat/gather/embedding` 接入 vector-common/SVE256；dynamic indices 保持运行时 tensor，静态 descriptor 为 O(rank + segment count)，不保存逐元素 index map；
+- M1C2b integration 全量：`393 passed in 116.36s`；另有 12 个多轴/零长度 scalar differential；Python 3.7 AST 6 files、compileall、127-package discovery、integration QEMU smoke 均 `PASS`；
+- 920B native：split/concat FP32/BF16、gather/embedding int32/int64、bad index/hash/descriptor、wire v1/v3 compatibility、v4 pairing 和 canary 全部 `PASS`；`ptx_index_f32` 为 `whilelo1/ld1w2/st1w1/NEON0`；
+- M1C2b 明确 fallback/限制：BF16 gather/embedding 逐 lane；FP32 gather offset 为 uint32；split 当前每个输出调用一次 runner 并重复发送 source；Python runtime 仍把 tensor 暂存为 list/wire bytes；
+- M1C2b integration HEAD：`31a5c46b010a621e54b8dedaa81c97a98dfc4e3e`，证据目录 `../worktrees/_meta/pypto-x/integration-w6-qwen35-m1c2b-final/`。
 
 W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保持只读，不重跑覆盖。
 
@@ -365,7 +371,7 @@ W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保�
 3. CPU/加速器优先级为 AVX2 → AVX-512 → SVE256（无 NEON）→ NVIDIA → AMD。
 4. 上游默认分支已刷新为 edge 快照，版本策略为 release family + exact SHA 双轨 lock。
 5. Tensor frontend 作为跨架构主入口，Pro 作为 Ascend expert dialect + portable subset。
-6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、Qwen3.5-0.8B M0 closure、M1A、M1B、M1C1 与 M1C2a 已完成。GamePC 关机期间继续执行 M1C2b 的 SVE256 indexing 闭包；CUDA 保持资源等待。
+6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、Qwen3.5-0.8B M0 closure、M1A、M1B、M1C1、M1C2a 与 M1C2b 已完成。GamePC 关机期间继续执行 M1D SVE256 组合算子闭包；CUDA 保持资源等待。
 
 C0 已完成：
 
@@ -374,7 +380,7 @@ C0 已完成：
 3. 接手文档已按序号和日期归档到 `docs/00-handoffs/`。
 4. stable lock 仍等待实际 CANN toolkit/NPU 环境做晋升验证，不影响目标无关 W1，但会门禁 Ascend 回归结论。
 
-GPU common 已冻结 NVIDIA/AMD 共用的 Grid/Workgroup/Thread/Subgroup、address space、GPU artifact 与 launch ABI；公共层没有 NVVM/ROCDL/WMMA/MFMA 语义。CUDA 等待 GamePC 恢复并复核 `nvcc`，不得擅自安装工具链。PyPTO-Gym M0 与 PyPTO M1A/M1B/M1C1/M1C2a 已完成并集成；当前任务是 PyPTO `work/qwen35-sve256-indexing`，处理 split/concat/gather/embedding 的 vector/SVE256 lowering。AVX/GPU 同类扩展分开验收。鲲鹏 920B ECS 当前 ACTIVE，用于 native 正确性和汇编验收；实际权重下载/加载仍未授权。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
+GPU common 已冻结 NVIDIA/AMD 共用的 Grid/Workgroup/Thread/Subgroup、address space、GPU artifact 与 launch ABI；公共层没有 NVVM/ROCDL/WMMA/MFMA 语义。CUDA 等待 GamePC 恢复并复核 `nvcc`，不得擅自安装工具链。PyPTO-Gym M0 与 PyPTO M1A/M1B/M1C1/M1C2a/M1C2b 已完成并集成；当前任务是 PyPTO `work/qwen35-sve256-composites`，优先用已有 Core primitive 组合 RMSNorm、SwiGLU、stable Softmax、RoPE、GQA repeat-KV 和 causal mask，避免提前添加 target-specific fused opcode。AVX/GPU 同类扩展分开验收。鲲鹏 920B ECS 当前 ACTIVE，用于 native 正确性和汇编验收；实际权重下载/加载仍未授权。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
 
 ## 12. 快速自检命令
 

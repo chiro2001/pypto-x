@@ -30,3 +30,4 @@ NNNN-YYYY-MM-DD-<阶段或主题>.zh-CN.md
 | 0013 | 2026-09-08 | Qwen3.5 M1B 完成、M1C1 SVE256 数值原语启动 | [Qwen3.5 M1B 完成与 M1C1 起点](0013-2026-09-08-qwen35-m1b-complete-m1c1-sve-start.zh-CN.md) |
 | 0014 | 2026-09-08 | Qwen3.5 M1C1 完成、M1C2a SVE256 layout 启动 | [Qwen3.5 M1C1 完成与 M1C2a 起点](0014-2026-09-08-qwen35-m1c1-complete-m1c2a-layout-start.zh-CN.md) |
 | 0015 | 2026-09-08 | Qwen3.5 M1C2a 完成、M1C2b SVE256 indexing 启动 | [Qwen3.5 M1C2a 完成与 M1C2b 起点](0015-2026-09-08-qwen35-m1c2a-complete-m1c2b-indexing-start.zh-CN.md) |
+| 0016 | 2026-09-08 | Qwen3.5 M1C2b 完成、M1D SVE256 composites 启动 | [Qwen3.5 M1C2b 完成与 M1D 起点](0016-2026-09-08-qwen35-m1c2b-complete-m1d-composites-start.zh-CN.md) |

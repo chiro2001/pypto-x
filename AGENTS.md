@@ -13,8 +13,8 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W6_QWEN35_08B_M1C2B_SVE256_INDEXING_IN_PROGRESS`。
-- Qwen3.5-0.8B M0、M1A、M1B、M1C1 SVE256 数值原语与 M1C2a layout 数据移动已完成并冻结；当前实现 M1C2b split/concat/gather/embedding。
+- 当前状态是 `EXECUTION_W6_QWEN35_08B_M1D_SVE256_COMPOSITES_IN_PROGRESS`。
+- Qwen3.5-0.8B M0、M1A、M1B、M1C1 SVE256 数值原语及 M1C2a/M1C2b layout/indexing 已完成并冻结；当前用既有 primitive 组合 RMSNorm/SwiGLU/Softmax/RoPE/GQA/mask。
 - 用户决定在 RTX 5080 GamePC 关机期间保留并使用鲲鹏 920B ECS；CUDA 保持资源等待。
 
 ## Git 与目录
