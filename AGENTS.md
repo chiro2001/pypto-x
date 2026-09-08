@@ -13,8 +13,8 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W4_SVE256_COMPLETE_GPU_COMMON_READY`。
-- 用户已批准按现有计划和 subagent 协议执行；W3 与 W4 SVE256 已冻结，下一步执行 GPU common → CUDA。
+- 当前状态是 `EXECUTION_W4_GPU_COMMON_IN_PROGRESS`。
+- 用户已批准按现有计划和 subagent 协议执行；W3 与 W4 SVE256 已冻结，W4 `gpu-common` 独立 task 正在执行，之后进入 CUDA。
 
 ## Git 与目录
 
