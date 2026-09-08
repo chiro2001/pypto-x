@@ -13,8 +13,8 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W6_QWEN35_08B_M1A_PORTABLE_PRIMITIVES_IN_PROGRESS`。
-- Qwen3.5-0.8B M0 纯文本无权重 shape/operator/state closure 已完成并冻结；当前先实现 M1A 公共 scalar math，再进入 shape/layout 和 vector/SVE256。
+- 当前状态是 `EXECUTION_W6_QWEN35_08B_M1B_SHAPE_LAYOUT_IN_PROGRESS`。
+- Qwen3.5-0.8B M0 纯文本无权重 closure 与 M1A 公共 scalar math 已完成并冻结；当前实现 M1B shape/layout，再进入 vector/SVE256。
 - 用户决定在 RTX 5080 GamePC 关机期间保留并使用鲲鹏 920B ECS；CUDA 保持资源等待。
 
 ## Git 与目录
