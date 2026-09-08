@@ -13,8 +13,8 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W4_GPU_COMMON_COMPLETE_CUDA_WAITING_RESOURCE`。
-- 用户已批准按现有计划和 subagent 协议执行；W3、W4 SVE256 与 GPU common 已冻结。下一项是 CUDA，但 RTX 5080 GamePC 当前关机，且此前 WSL 尚无 `nvcc`。
+- 当前状态是 `EXECUTION_W6_QWEN35_08B_M0_CLOSURE_IN_PROGRESS`。
+- 用户决定在 RTX 5080 GamePC 关机期间保留并使用鲲鹏 920B ECS，优先推进 Qwen3.5-0.8B 纯文本无权重 shape/operator closure；CUDA 保持资源等待。
 
 ## Git 与目录
 
