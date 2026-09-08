@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`EXECUTION_W4_GPU_COMMON_IN_PROGRESS`
+状态：`EXECUTION_W4_GPU_COMMON_COMPLETE_CUDA_WAITING_RESOURCE`
 
-最后更新：2026-09-08 13:56 CST（Asia/Shanghai）
+最后更新：2026-09-08 16:03 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -16,7 +16,7 @@
 - AMD GPU：GPU 公共层 → HIP/ROCDL；
 - 现有 Ascend CCE 路径保持为一个 target plugin，并避免功能回退。
 
-目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理、W1/W2/W2B、完整 W3，以及 W4 SVE256。integration 已包含 Core IR、Target/Compiler/Runtime ABI、CPU scalar/vector common、Clang x86 compiler/runtime 和 AArch64 SVE256 compiler/QEMU runtime；GPU 尚未实现。SVE 当前只有 QEMU 功能与汇编证据，没有鲲鹏真机结论。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect 并后续提取 portable subset。
+目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理、W1/W2/W2B、完整 W3，以及 W4 SVE256 和 GPU common。integration 已包含 Core IR、Target/Compiler/Runtime ABI、CPU scalar/vector common、Clang x86 compiler/runtime、AArch64 SVE256 compiler/runtime，以及 NVIDIA/AMD 共用的 vendor-neutral GPU IR/ABI 与无设备 simulator；CUDA/HIP vendor backend 尚未实现。SVE 已在 QEMU 与鲲鹏 920B ECS 原生执行验证，但 ECS 是 KVM guest，尚无性能门槛。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect 并后续提取 portable subset。
 
 ## 2. 已经确定的技术决策
 
@@ -169,7 +169,7 @@ poll=false
 - subagent 返回 commit SHA、修改路径、smoke 日志、测试和风险；
 - 集成由主 Agent 在 integration worktree 完成。
 
-W1/W2/W2B 七个 task、W3 的三个 task 与 W4 `cpu-sve256` worktree 均已提交并保持 clean；W3 和 SVE256 已按固定协议完成并冻结，`gpu-common` 已从该冻结点创建并进入执行。实现冻结点与 task commit 见 `configs/development_lock.yaml`。
+W1/W2/W2B 七个 task、W3 的三个 task，以及 W4 `cpu-sve256`/`gpu-common` worktree 均已提交并保持 clean；W3、SVE256 与 GPU common 已按固定协议完成并冻结。实现冻结点与 task commit 见 `configs/development_lock.yaml`。
 
 ## 7. 建议的执行波次
 
@@ -185,7 +185,7 @@ W1 已完成以下三个 task：
 2. `work/core-ir`：Parser 单次生成目标无关 CoreProgram、稳定 IR dump/serialization。
 3. `work/verification`：无设备/无模型测试门禁、IR snapshot 和 differential harness。
 
-W2/W2B、完整 W3 与 W4 SVE256 已完成，下一步进入：
+W2/W2B、完整 W3、W4 SVE256 与 GPU common 已完成，下一步进入：
 
 ```text
 W3: cpu-vector-common → cpu-avx2 → cpu-avx512
@@ -230,7 +230,7 @@ ssh 192.168.101.5 \
   'wsl.exe -e bash -lc "uname -a; nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader"'
 ```
 
-当前 WSL 可见 GPU、Git、CMake、Clang 和 Python，但没有 `nvcc`，Python 也没有 PyTorch。CUDA 工作开始前需要用户授权安装/配置工具链；smoke 本身不得下载模型。
+此前 WSL 可见 GPU、Git、CMake、Clang 和 Python，但没有 `nvcc`，Python 也没有 PyTorch；2026-09-08 用户确认 GamePC 已关机。CUDA 工作开始前先等待主机开机，再只读复核工具链；安装/配置 CUDA 仍需用户明确授权，smoke 本身不得下载模型。
 
 ### AMD 6750GRE 12G
 
@@ -238,7 +238,7 @@ ssh 192.168.101.5 \
 
 ### 鲲鹏与 QEMU
 
-鲲鹏 920B/SVE256 机器尚未借到。拿到后先做 HWCAP/HWCAP2、实际 VL、NUMA 和编译器探测。
+已通过 `~/tools/ecs-920B` 创建按量鲲鹏 920B ECS，并完成 HWCAP/HWCAP2、实际 VL、编译器、原生 runner 与热点汇编验证。实例为 openEuler 22.03、2 vCPU、HiSilicon、KVM；报告 SVE=1、SVE2=0、VL=32 bytes。实例状态以 `~/tools/ecs-920B/state.env` 为准，删除前必须由用户确认。
 
 无真机时本地 QEMU 已验证：
 
@@ -304,7 +304,16 @@ QEMU 只证明功能路径，不可用于性能结论。
 - SVE 热点：`whilelo=7`、`ld1w=14`、`st1w=7`、z/p predicate 寄存器，NEON v/q=0；
 - guarded canary、全负 reduce-max、BF16 raw bits/零维与 scalar differential：`PASS`；
 - W4 SVE256 integration smoke：`PASS`；
-- integration HEAD：`5e42eed7c432034db02c2d339e67789afd419ae9`。
+- 鲲鹏 920B ECS native probe：SVE=1、SVE2=0、VL=32、`emulated=false`、GCC 10.3.1；
+- ECS 原生 FP32/BF16 19 元素 masked tail、guarded canary、全负 reduce-max、9×5×10 matmul：`PASS`；
+- ECS 原生热点：`whilelo=2`、`ld1w=3`、`st1w=4`、z=36、p=19、NEON v/q=0；
+- native ECS 首轮暴露的默认 cross sysroot 与 `cc` compiler-name 误拒已修复，并补入回归；
+- GPU common task 唯一 smoke：`BLOCKED_DEVICE`，未重跑；其余无设备门禁继续执行；
+- GPU common 专属测试：`45 passed`；覆盖 1–3D geometry、32/64 subgroup、uint64 overflow、zero-work、multi-kernel geometry sequence、严格 binding/barrier/address space、canonical artifact/tamper/cache key 与 FP32/BF16/reduce/matmul oracle；
+- W4 当前 integration 全量：`312 passed in 55.07s`；
+- Python 3.7 AST：累计 86 个变更 Python 文件；portable direct import 11 modules、package discovery 127 packages；
+- GPU common integration host smoke：`PASS`；
+- integration HEAD：`e00c12a498ac806bb8f51eb58b9603fb57bc82f7`。
 
 W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保持只读，不重跑覆盖。
 
@@ -329,7 +338,7 @@ W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保�
 3. CPU/加速器优先级为 AVX2 → AVX-512 → SVE256（无 NEON）→ NVIDIA → AMD。
 4. 上游默认分支已刷新为 edge 快照，版本策略为 release family + exact SHA 双轨 lock。
 5. Tensor frontend 作为跨架构主入口，Pro 作为 Ascend expert dialect + portable subset。
-6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3 与 SVE256 已完成，可按同一协议继续 GPU common。
+6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256 与 GPU common 已完成，CUDA 等待 RTX 5080 GamePC 恢复。
 
 C0 已完成：
 
@@ -338,7 +347,7 @@ C0 已完成：
 3. 接手文档已按序号和日期归档到 `docs/00-handoffs/`。
 4. stable lock 仍等待实际 CANN toolkit/NPU 环境做晋升验证，不影响目标无关 W1，但会门禁 Ascend 回归结论。
 
-当前在 `gpu-common` 独立 worktree 冻结 NVIDIA/AMD 共用的 Grid/Block/Thread/Subgroup、address space、GPU artifact 与 launch ABI；不得提前引入 NVVM/ROCDL vendor 语义。完成后再在 RTX 5080 上推进 CUDA。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
+GPU common 已冻结 NVIDIA/AMD 共用的 Grid/Workgroup/Thread/Subgroup、address space、GPU artifact 与 launch ABI；公共层没有 NVVM/ROCDL/WMMA/MFMA 语义。CUDA 是下一项，但 GamePC 当前关机，恢复后还需确认 `nvcc`；不得擅自安装工具链。鲲鹏 920B ECS 当前仍在按量运行，已完成 native 功能/汇编验证，尚未做性能门槛。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
 
 ## 12. 快速自检命令
 

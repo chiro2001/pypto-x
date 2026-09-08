@@ -1,15 +1,15 @@
 # PyPTO-X 可用资源与测试矩阵
 
-更新日期：2026-09-06（Asia/Shanghai）
+更新日期：2026-09-08（Asia/Shanghai）
 
 ## 资源总览
 
 | 资源 | 当前状态 | 主要用途 | 当前实测/已知信息 | 限制 |
 |---|---|---|---|---|
 | 本地开发机 | 可用 | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8，GNU objdump 2.47，CMake，QEMU 11.0.3；暴露 AVX2/FMA、AVX-512F/BW/DQ/VL/VNNI/BF16 与 xsave/xgetbv；有 `aarch64-linux-gnu-gcc/g++` | `hypervisor`/KVM 环境，只用于功能、汇编和相对调试；当前数字不直接冻结为性能门槛；没有真实 NPU，本地 GPU 只有 Virtio 显示设备 |
-| RTX 5080（`192.168.101.5`） | SSH 可达 | NVIDIA CUDA/NVVM/HIP 公共层验证 | Windows + WSL2；WSL Ubuntu 24.04.4；RTX 5080 16,303 MiB；驱动 610.62 | 当前 WSL 没有 `nvcc`，Python 没有 torch，需要先装工具链；不下载模型作为 smoke 前置条件 |
+| RTX 5080（`192.168.101.5`） | 当前关机 | NVIDIA CUDA/NVVM 验证 | 最近一次在线探测：Windows + WSL2、Ubuntu 24.04.4、RTX 5080 16,303 MiB、驱动 610.62 | 关机时不启动 CUDA task；最近一次 WSL 无 `nvcc`/torch，安装工具链需用户明确授权 |
 | AMD 6750GRE 12G | 暂未接入 | AMD HIP/ROCDL、wave 和显存测试 | 当前机器 `lspci` 未发现该卡，`rocminfo/rocm-smi` 不可用 | 接入前不能声明 ROCm 支持或性能；具体 gfx target 以 `rocminfo` 为准 |
-| 鲲鹏 920B（SVE256） | 待借用 | 原生 AArch64、SVE256、性能和 PMU | 用户预计可提供带 SVE256 的机器 | 型号/OS/编译器/NUMA 尚未确认；以机器能力探测为准 |
+| 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；native runner/canary/add/reduce/matmul 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；按量计费，状态见 `~/tools/ecs-920B/state.env` |
 | QEMU AArch64 | 可用 | AArch64/SVE/SVE2 功能和编译验证 | `qemu-aarch64` 11.0.3；已验证 `max,sve256=on` 可报告 SVE/SVE2，VL=32 bytes | 不能代表鲲鹏吞吐、缓存、内存带宽或指令时序 |
 
 ## 5080 WSL 连接方式
@@ -75,6 +75,20 @@ QEMU_CPU=max,sve256=on \
 - 鲲鹏缓存/NUMA/带宽结论；
 - 生产吞吐或功耗估计。
 
+## 鲲鹏 920B ECS 接入结果
+
+2026-09-08 已按接入清单完成首轮验证：
+
+- `aarch64` little-endian、HiSilicon、2 vCPU、openEuler 22.03、KVM；
+- `getauxval + prctl`：SVE=1、SVE2=0、VL=32 bytes；
+- 原生 GCC triple：`aarch64-linux-gnu`；
+- FP32/BF16 19 元素 masked tail、guarded canary、全负 reduce-max、9×5×10 matmul：`PASS`；
+- 原生热点反汇编：`whilelo=2`、`ld1w=3`、`st1w=4`、z=36、p=19、NEON v/q=0。
+
+证据见 `../worktrees/_meta/pypto-x/integration-w4-gpu-common-final/logs/20260908T080242Z-ecs-920b-native-validation.json`。
+
+接入时发现并修复了 native runtime 错误注入 cross sysroot、以及通过 compiler basename 误拒原生 `cc` 的问题。当前结果可作为原生功能与汇编证据；性能门槛仍需单独设计、固定 affinity/频率/工作集并重复测量。
+
 ## 鲲鹏机器接入清单
 
 拿到机器后先运行：
@@ -132,7 +146,7 @@ hipcc --version
 | Target ABI/Core IR | 本地 | 无 | IR snapshot、ABI 单测 |
 | CCE 回归 | 有 Ascend/CANN 的机器 | PTO-ISA simulator | 既有 Ascend 测试不退化 |
 | CPU scalar/x86 | 本地 | 无 | scalar golden、AVX 汇编检查 |
-| SVE256/SVE2 | QEMU（功能） | 鲲鹏（真实硬件） | VL/predicate/尾块 |
+| SVE256/SVE2 | 鲲鹏 920B ECS（native） | QEMU（功能） | VL/predicate/尾块；性能结论另行冻结 |
 | NVIDIA | 5080 WSL | 无 | CUDA artifact、运行结果 |
 | AMD | 6750GRE 接入后 | 无 | HIP artifact、gfx/wave 检查 |
 | 9B/GDR | 后期各目标 | 5080 或鲲鹏 | 先单算子，再报告模型覆盖率 |
@@ -141,6 +155,6 @@ hipcc --version
 
 - Smoke 测试不加载模型、不需要模型路径、不产生大权重文件。
 - 5080 先用于 elementwise、softmax、matmul 和 GPU ABI，不直接从 9B 端到端开始。
-- QEMU 先验证 SVE 代码路径，鲲鹏拿到后再把性能结论迁移到真实硬件。
+- SVE 已完成 QEMU 与鲲鹏 ECS native 功能验证；ECS KVM 数字暂不直接作为生产性能门槛。
 - AMD 卡接入前不能把 HIP backend 标成“可运行”；最多标成“编译路径开发中”。
 - native compiler task 使用 `../worktrees/_meta/pypto-x/<task>/` 下独占的 `TMPDIR`、build、artifact 和日志目录，避免共享 `/tmp` 的容量/配额抖动，也避免不同 agent 共享未完成生成物。

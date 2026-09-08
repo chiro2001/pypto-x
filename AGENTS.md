@@ -13,8 +13,8 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W4_GPU_COMMON_IN_PROGRESS`。
-- 用户已批准按现有计划和 subagent 协议执行；W3 与 W4 SVE256 已冻结，W4 `gpu-common` 独立 task 正在执行，之后进入 CUDA。
+- 当前状态是 `EXECUTION_W4_GPU_COMMON_COMPLETE_CUDA_WAITING_RESOURCE`。
+- 用户已批准按现有计划和 subagent 协议执行；W3、W4 SVE256 与 GPU common 已冻结。下一项是 CUDA，但 RTX 5080 GamePC 当前关机，且此前 WSL 尚无 `nvcc`。
 
 ## Git 与目录
 
@@ -48,4 +48,4 @@
 - RTX 5080 主机 `192.168.101.5` 的 SSH 默认进入 Windows `cmd`；Linux 命令必须通过 `wsl.exe -e bash -lc`。
 - AMD 6750GRE 尚未接入，不得声称 HIP 已在真机运行。
 - QEMU 只用于 AArch64/SVE 功能验证，不得用其数字作性能结论。
-- 鲲鹏机器尚未到位；拿到后先做能力探测，再跑原生性能测试。
+- 鲲鹏 920B ECS 已完成 native SVE256 功能与汇编验证：SVE=1、VL=32、SVE2=0；它是 2 vCPU KVM guest，尚未形成性能门槛。

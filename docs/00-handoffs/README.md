@@ -23,3 +23,4 @@ NNNN-YYYY-MM-DD-<阶段或主题>.zh-CN.md
 | 0006 | 2026-09-07 | AVX2 完成、AVX-512 就绪 | [W3 AVX2 完成快照](0006-2026-09-07-w3-avx2-complete.zh-CN.md) |
 | 0007 | 2026-09-08 | AVX-512/W3 完成、SVE256 就绪 | [W3 完成快照](0007-2026-09-08-w3-avx512-complete.zh-CN.md) |
 | 0008 | 2026-09-08 | SVE256 完成、GPU common 就绪 | [SVE256 完成快照](0008-2026-09-08-w4-sve256-complete.zh-CN.md) |
+| 0009 | 2026-09-08 | GPU common 完成、SVE256 ECS 原生验证、CUDA 等待资源 | [GPU common 与 SVE native 完成快照](0009-2026-09-08-w4-gpu-common-sve-native-complete.zh-CN.md) |
