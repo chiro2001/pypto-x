@@ -9,7 +9,7 @@
 | 本地开发机 | 可用 | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8，GNU objdump 2.47，CMake，QEMU 11.0.3；暴露 AVX2/FMA、AVX-512F/BW/DQ/VL/VNNI/BF16 与 xsave/xgetbv；有 `aarch64-linux-gnu-gcc/g++` | `hypervisor`/KVM 环境，只用于功能、汇编和相对调试；当前数字不直接冻结为性能门槛；没有真实 NPU，本地 GPU 只有 Virtio 显示设备 |
 | RTX 5080（`192.168.101.5`） | 当前关机 | NVIDIA CUDA/NVVM 验证 | 最近一次在线探测：Windows + WSL2、Ubuntu 24.04.4、RTX 5080 16,303 MiB、驱动 610.62 | 关机时不启动 CUDA task；最近一次 WSL 无 `nvcc`/torch，安装工具链需用户明确授权 |
 | AMD 6750GRE 12G | 暂未接入 | AMD HIP/ROCDL、wave 和显存测试 | 当前机器 `lspci` 未发现该卡，`rocminfo/rocm-smi` 不可用 | 接入前不能声明 ROCm 支持或性能；具体 gfx target 以 `rocminfo` 为准 |
-| 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；native runner/canary/add/reduce/matmul 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；按量计费，状态见 `~/tools/ecs-920B/state.env` |
+| 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；native runner/canary/add/reduce/matmul、M1C1 math 与 M1C2a layout 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；按量计费，状态见 `~/tools/ecs-920B/state.env` |
 | QEMU AArch64 | 可用 | AArch64/SVE/SVE2 功能和编译验证 | `qemu-aarch64` 11.0.3；已验证 `max,sve256=on` 可报告 SVE/SVE2，VL=32 bytes | 不能代表鲲鹏吞吐、缓存、内存带宽或指令时序 |
 
 ## 5080 WSL 连接方式
@@ -84,8 +84,9 @@ QEMU_CPU=max,sve256=on \
 - 原生 GCC triple：`aarch64-linux-gnu`；
 - FP32/BF16 19 元素 masked tail、guarded canary、全负 reduce-max、9×5×10 matmul：`PASS`；
 - 原生热点反汇编：`whilelo=2`、`ld1w=3`、`st1w=4`、z=36、p=19、NEON v/q=0。
+- M1C2a compact layout：FP32 transpose/slice SVE indexed gather、BF16 identity SVE u16 copy、BF16 reorder scalar fallback、未对齐 descriptor、tamper 与 canary 均 `PASS`。
 
-证据见 `../worktrees/_meta/pypto-x/integration-w4-gpu-common-final/logs/20260908T080242Z-ecs-920b-native-validation.json`。
+基础证据见 `../worktrees/_meta/pypto-x/integration-w4-gpu-common-final/logs/20260908T080242Z-ecs-920b-native-validation.json`；M1C2a 证据见 `../worktrees/_meta/pypto-x/integration-w6-qwen35-m1c2a-final/validation.json`。
 
 接入时发现并修复了 native runtime 错误注入 cross sysroot、以及通过 compiler basename 误拒原生 `cc` 的问题。当前结果可作为原生功能与汇编证据；性能门槛仍需单独设计、固定 affinity/频率/工作集并重复测量。
 
