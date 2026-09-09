@@ -73,7 +73,7 @@ scripts/worktree/create.sh \
 | W4 | `gpu-common` | Grid/Block/Subgroup、GPU ABI | `target-abi`、`core-ir`、`cpu-sve256` | 本地/RTX 5080 | 无厂商概念的 GPU IR 稳定 |
 | W4 | `cuda` | NVVM/CUDA/NVRTC backend | `gpu-common` | RTX 5080 | elementwise/softmax/matmul 通过 |
 | W5 | `hip` | ROCDL/HIP/HIPRTC backend | `gpu-common`、`cuda` | AMD 6750GRE（接入后） | gfx target 和 wave32/64 正确 |
-| W6 | `qwen35-08b-model` | 0.8B text harness、custom op/model wrapper | AVX-512 基线；前端过渡决策 | 按后端顺序 | 先 BF16 整网，再 W8A8-linear；9B/27B 做无权重 shape harness |
+| W6 | `qwen35-08b-model` | 0.8B text harness、custom op/model wrapper | AVX-512 基线；前端过渡决策 | 按后端顺序 | M1I 无权重 decoder connectivity 已完成；下一步 typed buffer/mmap 与获授权后的 BF16 整网，再做 W8A8-linear |
 
 W1 的 `target-abi` 和 `core-ir` 可以并行，但必须先评审同一份接口草案；W2 之前由协调者合并并解决接口冲突。CPU 路线按 AVX2 → AVX-512 → SVE256 验证共享 vector lowering；CUDA/HIP 不应在 GPU common ABI 冻结前各自发明 runtime 接口。
 
