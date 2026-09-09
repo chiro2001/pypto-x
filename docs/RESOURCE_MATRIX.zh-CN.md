@@ -6,7 +6,7 @@
 
 | 资源 | 当前状态 | 主要用途 | 当前实测/已知信息 | 限制 |
 |---|---|---|---|---|
-| 本地开发机 | 可用；heavy 需全局 `local` 锁；AVX2/AVX-512 Qwen parity 与 M1I decoder PASS | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8，GNU objdump 2.47；AVX2 `474 passed`；AVX-512 `483 passed, 7 skipped`；M1I 全量 `491 passed, 7 skipped`，真实 profile 4,532 ops 的 scalar/vector/AVX lowering+compile 与 synthetic 执行通过 | full pytest、大 shape lowering/compile 与并行构建必须走 `scripts/resource/run_local_heavy.sh`；默认保留 4 GiB、最多 6 CPU；当前仅为正确性/汇编证据，不形成性能门槛 |
+| 本地开发机 | 可用；heavy 需全局 `local` 锁；AVX parity、M1I decoder 与 M1J binding PASS | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8；M1I 全量 `491 passed, 7 skipped`；M1J 全量 `506 passed, 7 skipped`，external bytes/mmap binding 与 metadata-only 1.57GB packed layout 通过 | full pytest、大 shape lowering/compile 与并行构建必须走 `scripts/resource/run_local_heavy.sh`；默认保留 4 GiB、最多 6 CPU；当前仅为正确性/汇编证据，不形成性能门槛 |
 | RTX 5080（`192.168.101.5`） | 在线；GPU 由 PyPTO-X 独占；CUDA C2 与 M1I synthetic PASS | NVIDIA CUDA/PTX/NVVM 验证 | WSL2、RTX 5080 16,303 MiB、CC 12.0、KMD 610.62/CUDA UMD 13.3；Driver/PTX 已通过 math/layout/indexing/composites，并执行24层 synthetic decoder | GPU-only 无需 `gamepc` 锁；host-heavy 才持锁。无 `nvcc`/NVRTC/CUDART/SDK headers/PyTorch/Triton；当前是 correctness kernel，不是 fusion/性能结论 |
 | AMD 6750GRE 12G | 暂未接入 | AMD HIP/ROCDL、wave 和显存测试 | 当前机器 `lspci` 未发现该卡，`rocminfo/rocm-smi` 不可用 | 接入前不能声明 ROCm 支持或性能；具体 gfx target 以 `rocminfo` 为准 |
 | 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；M1C1–M1I 功能/contract 与24层 synthetic decoder 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；`iota/compare` 是 host-reference；按量计费，状态见 `~/tools/ecs-920B/state.env` |
@@ -52,6 +52,8 @@ CUDA C1 已完成并由独立验收代理在 5080 上确认：FP32/BF16 elementw
 CUDA C2 在此基础上补齐 math、compare/iota/position、broadcast/where、layout/indexing、多输出 split、rank-3/4 matmul、scalar SSA 和 Qwen portable composites。独立验收为 `476 passed, 7 skipped`，GPU common vendor/ABI 定向测试 `45 passed`，CPU 联合回归 `260 passed`；5080 前后无 compute process 残留。证据位于 `../worktrees/_meta/pypto-x/integration-w4-cuda-c2-final/validation.json`。数学仍使用 PTX approximate 指令，布局/索引/batched matmul 仍是通用 correctness kernel。
 
 M1I 在 exact integration HEAD `ec60f95979a56a9646d84f163912e677e9eb08ac` 上完成24层无权重 decoder connectivity。真实 `(B=1,T=1,past=4096)` profile 的 scalar、vector-common、AVX2、AVX-512、SVE256、GPU common 与 CUDA lowering/compile 均通过且 vector iteration domain 全部 compact；缩小但拓扑等价的24层 synthetic graph 已在 scalar、AVX2、AVX-512、QEMU SVE256、920B native 和 RTX 5080 Driver/PTX 实际执行通过。证据位于 `../worktrees/_meta/pypto-x/integration-w6-qwen35-decoder-connectivity-final-r3/validation.json`；这仍不代表带权整网推理或性能结论。
+
+M1J 在 exact integration HEAD `0bc15d06ee167d5b6b5c62cffec88083dabb2bdf` 上冻结 external bytes/mmap binding contract。真实 profile 只计算3/320/48 input schema、368个 packed region 和1,574,877,952 bytes的 storage-relative layout metadata，没有创建、映射或读取权重文件；现有 scalar/AVX2/CUDA 对 byte memoryview 均为安全拒绝，backend ingestion 尚待下一阶段。证据位于 `../worktrees/_meta/pypto-x/integration-w6-qwen35-bf16-runtime-binding-final-r2/validation.json`。
 
 ## QEMU SVE/SVE2 验证
 

@@ -13,9 +13,9 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W6_QWEN35_DECODER_CONNECTIVITY_COMPLETE_BF16_RUNTIME_BINDING_READY`。
-- Qwen3.5-0.8B M0–M1I 已完成并冻结；M1I 已把24层 identity shell 升级为无权重、非 identity 的完整参数化 decoder Core SSA graph。SVE `iota/compare` 仍是明确的 host-reference fallback，真实 profile 只完成 lowering/compile，尚不是带权整网执行。
-- AVX2、AVX-512 Qwen parity、CUDA C2 与 M1I decoder connectivity 均已独立验收通过；下一步是 typed buffer/mmap 参数绑定与 BF16 参考执行准备，下载或加载模型权重仍需用户明确授权。GPU-only 工作无需 `gamepc` 锁，CUDA host-heavy 编译阶段才申请该锁；鲲鹏 920B ECS 继续承担 SVE256 验证。
+- 当前状态是 `EXECUTION_W6_QWEN35_BF16_RUNTIME_BINDING_COMPLETE_BACKEND_INGESTION_READY`。
+- Qwen3.5-0.8B M0–M1J 已完成并冻结；M1I 是24层无权重、非 identity 参数化 decoder Core SSA graph，M1J 已冻结3/320/48 runtime/parameter/state 的 typed external buffer/mmap 与 launcher binding 契约。SVE `iota/compare` 仍是 host-reference fallback，尚不是带权整网执行。
+- AVX2、AVX-512 Qwen parity、CUDA C2、M1I decoder connectivity 与 M1J runtime binding 均已独立验收通过；下一步是 CPU/CUDA external byte-buffer ingestion adapter，下载或加载模型权重仍需用户明确授权。GPU-only 工作无需 `gamepc` 锁，CUDA host-heavy 编译阶段才申请该锁；鲲鹏 920B ECS 继续承担 SVE256 验证。
 
 ## Git 与目录
 
