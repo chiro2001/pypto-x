@@ -13,9 +13,9 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W6_QWEN35_08B_M1H_W4_CUDA_C1_COMPLETE_NEXT_AVX_PARITY_CUDA_C2`。
+- 当前状态是 `EXECUTION_W6_QWEN35_AVX2_W4_CUDA_C2_COMPLETE_AVX512_IN_PROGRESS`。
 - Qwen3.5-0.8B M0–M1H 已完成并冻结；M1H 已闭包 compare/iota/position 与无权重 24 层 structural manifest，但 SVE `iota/compare` 仍是明确的 host-reference fallback，manifest 仍不是带权整网执行。
-- CUDA C1 Driver API + PTX JIT 已在 RTX 5080 验收通过；下一步并行推进 AVX2（随后 AVX-512）Qwen M1A–M1H parity 与 CUDA C2 math/composites。GPU-only 工作无需 `gamepc` 锁，CUDA host-heavy 编译阶段才申请该锁；鲲鹏 920B ECS 继续承担 SVE256 验证。
+- AVX2 Qwen M1A–M1H parity 与 CUDA C2 math/layout/indexing/composites 已独立验收通过；AVX-512 parity 正在实现，随后连接无权重完整 decoder。GPU-only 工作无需 `gamepc` 锁，CUDA host-heavy 编译阶段才申请该锁；鲲鹏 920B ECS 继续承担 SVE256 验证。
 
 ## Git 与目录
 
