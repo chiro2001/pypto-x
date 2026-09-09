@@ -39,3 +39,4 @@ NNNN-YYYY-MM-DD-<阶段或主题>.zh-CN.md
 | 0022 | 2026-09-09 | GamePC GPU 独占规则、5080 恢复探测、CUDA Driver/PTX 路线 | [GamePC GPU 独占与 CUDA 恢复探测](0022-2026-09-09-gamepc-gpu-exclusive-cuda-probe.zh-CN.md) |
 | 0023 | 2026-09-09 | Qwen3.5 M1H 与 CUDA C1 完成、AVX parity/CUDA C2 就绪 | [M1H 与 CUDA C1 完成快照](0023-2026-09-09-qwen35-m1h-cuda-c1-complete.zh-CN.md) |
 | 0024 | 2026-09-09 | AVX2 Qwen parity 与 CUDA C2 完成、AVX-512 parity 启动 | [AVX2 parity 与 CUDA C2 完成快照](0024-2026-09-09-avx2-parity-cuda-c2-complete.zh-CN.md) |
+| 0025 | 2026-09-09 | AVX-512 Qwen parity 完成、无权重 decoder connectivity 就绪 | [AVX-512 parity 完成快照](0025-2026-09-09-avx512-parity-complete.zh-CN.md) |

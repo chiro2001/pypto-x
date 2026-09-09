@@ -6,7 +6,7 @@
 
 | 资源 | 当前状态 | 主要用途 | 当前实测/已知信息 | 限制 |
 |---|---|---|---|---|
-| 本地开发机 | 可用；heavy 需全局 `local` 锁；AVX2 Qwen parity PASS | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8，GNU objdump 2.47；AVX2 M1A–M1H parity `474 passed`，YMM/FMA/non-FMA 且无 ZMM/EVEX；AVX-512 parity 进行中 | full pytest、大 shape lowering/compile 与并行构建必须走 `scripts/resource/run_local_heavy.sh`；默认保留 4 GiB、最多 6 CPU；当前仅为正确性/汇编证据，不形成性能门槛 |
+| 本地开发机 | 可用；heavy 需全局 `local` 锁；AVX2/AVX-512 Qwen parity PASS | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8，GNU objdump 2.47；AVX2 `474 passed`，YMM/FMA；AVX-512 `483 passed, 7 skipped`，ZMM/opmask/FMA/BF16/VNNI | full pytest、大 shape lowering/compile 与并行构建必须走 `scripts/resource/run_local_heavy.sh`；默认保留 4 GiB、最多 6 CPU；当前仅为正确性/汇编证据，不形成性能门槛 |
 | RTX 5080（`192.168.101.5`） | 在线；GPU 由 PyPTO-X 独占；CUDA C2 PASS | NVIDIA CUDA/PTX/NVVM 验证 | WSL2、RTX 5080 16,303 MiB、CC 12.0、KMD 610.62/CUDA UMD 13.3；Driver/PTX 已通过 math、position、layout/indexing、rank-2/3/4 matmul、scalar SSA 和 Qwen composites 实测 | GPU-only 无需 `gamepc` 锁；host-heavy 才持锁。无 `nvcc`/NVRTC/CUDART/SDK headers/PyTorch/Triton；C2 是 correctness kernel，不是 fusion/性能结论 |
 | AMD 6750GRE 12G | 暂未接入 | AMD HIP/ROCDL、wave 和显存测试 | 当前机器 `lspci` 未发现该卡，`rocminfo/rocm-smi` 不可用 | 接入前不能声明 ROCm 支持或性能；具体 gfx target 以 `rocminfo` 为准 |
 | 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；M1C1–M1H 对应功能/contract 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；M1H `iota/compare` 是 host-reference；按量计费，状态见 `~/tools/ecs-920B/state.env` |

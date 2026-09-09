@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`EXECUTION_W6_QWEN35_AVX2_W4_CUDA_C2_COMPLETE_AVX512_IN_PROGRESS`
+状态：`EXECUTION_W6_QWEN35_AVX2_AVX512_W4_CUDA_C2_COMPLETE_DECODER_CONNECTIVITY_READY`
 
-最后更新：2026-09-09 09:43 CST（Asia/Shanghai）
+最后更新：2026-09-09 10:17 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -16,7 +16,7 @@
 - AMD GPU：GPU 公共层 → HIP/ROCDL；
 - 现有 Ascend CCE 路径保持为一个 target plugin，并避免功能回退。
 
-目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理、W1/W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2，以及 Qwen3.5-0.8B M0–M1H 与 AVX2 parity。integration 已包含 Core IR、Target/Compiler/Runtime ABI、CPU scalar/vector common、Clang x86 compiler/runtime、AArch64 SVE256 compiler/runtime、NVIDIA/AMD 共用的 vendor-neutral GPU IR/ABI，以及 NVIDIA CUDA Driver API + PTX JIT 后端；HIP 尚未实现。AVX2 parity 独立验收为 `474 passed`，M1A–M1H、Qwen composites、Conv/GDR/position 与真实 YMM 汇编均通过；libm lane、host-reference 和 batched host loop 仍显式记录。CUDA C2 独立验收为 `476 passed, 7 skipped`，RTX 5080 上 math、position、layout/indexing、rank-2/3/4 matmul、scalar SSA 与 Qwen composites 均通过。5080 GPU 由 PyPTO-X 独占；GPU-only 工作不需要 `gamepc` 锁，只有远端 host-heavy 阶段才持锁。AVX-512 parity 正在实现，随后连接无权重完整 decoder。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect，并后续提取 portable subset。
+目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理、W1/W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2，以及 Qwen3.5-0.8B M0–M1H 与 AVX2/AVX-512 parity。integration 已包含 Core IR、Target/Compiler/Runtime ABI、CPU scalar/vector common、Clang x86 compiler/runtime、AArch64 SVE256 compiler/runtime、NVIDIA/AMD 共用的 vendor-neutral GPU IR/ABI，以及 NVIDIA CUDA Driver API + PTX JIT 后端；HIP 尚未实现。AVX2 parity 独立验收为 `474 passed`；AVX-512 parity 为 `483 passed, 7 skipped`，ZMM/opmask、FMA、BF16 `vdpbf16ps`、VNNI `vpdpbusd`、rank-3/4 matmul、非零 GDR state 与 position 大 shape 均通过。CUDA C2 独立验收为 `476 passed, 7 skipped`，RTX 5080 上 math、position、layout/indexing、rank-2/3/4 matmul、scalar SSA 与 Qwen composites 均通过。5080 GPU 由 PyPTO-X 独占；GPU-only 工作不需要 `gamepc` 锁，只有远端 host-heavy 阶段才持锁。下一步把24层 identity shell 升级为无权重、非 identity 的完整 decoder connectivity。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect，并后续提取 portable subset。
 
 ## 2. 已经确定的技术决策
 
@@ -187,10 +187,10 @@ W1 已完成以下三个 task：
 2. `work/core-ir`：Parser 单次生成目标无关 CoreProgram、稳定 IR dump/serialization。
 3. `work/verification`：无设备/无模型测试门禁、IR snapshot 和 differential harness。
 
-W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2、W6 M0–M1H 与 AVX2 parity 已完成，下一步进入：
+W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2、W6 M0–M1H 与 AVX2/AVX-512 parity 已完成，下一步进入：
 
 ```text
-W3 parity: AVX-512 Qwen M1A–M1H（进行中）
+W3 parity: AVX2/AVX-512 Qwen M1A–M1H（完成）
 W4 CUDA: C2 correctness 已完成 → 后续性能/fusion
 W5: hip
 W6: 无权重完整 decoder connectivity → 获授权后 BF16 文本模型 → W8A8-linear
@@ -390,7 +390,8 @@ QEMU 只证明功能路径，不可用于性能结论。
 - CUDA C1 独立验收：`470 passed`；RTX 5080 的 Driver API + PTX JIT 执行 FP32/BF16 elementwise、BF16 RNE、reduction、all-negative max、rank-2 matmul、K=0、zero-work、canary、多操作链、empty sum 和重复 launch/cleanup 均 `PASS`，前后无残留 compute process；唯一 smoke 因无 `nvcc` 按规范为 `BLOCKED_TOOLCHAIN`，不影响不依赖 Toolkit 的实测路径；证据目录 `../worktrees/_meta/pypto-x/integration-w4-cuda-c1-final/`；
 - AVX2 parity task commit：`eb7e78f68fc87e92127f3e4d5b9de29478064883`；integration commit：`c0b0abead252b5d21b0dca0bc8376d1f77949b00`；独立验收 `474 passed`、focused `63 passed`，CPUID/OSXSAVE/XGETBV、YMM、FMA/non-FMA、无 ZMM/EVEX、20 个 composites、Conv/GDR/position 均 `PASS`；证据目录 `../worktrees/_meta/pypto-x/integration-w6-qwen35-avx2-parity-final/`；
 - CUDA C2 task commit：`6f2992f91f30f565222440896a1cd12fa6290096`；integration commit：`5b0474f0db26d611526070dc4298170672e264af`；独立验收 `476 passed, 7 skipped`，GPU common vendor/ABI `45 passed`、CPU 联合回归 `260 passed`，5080 math/position/layout/indexing/batched matmul/scalar SSA/Qwen composites 与 OOB/cleanup 均 `PASS`；证据目录 `../worktrees/_meta/pypto-x/integration-w4-cuda-c2-final/`；
-- 当前 integration HEAD：`5b0474f0db26d611526070dc4298170672e264af`，工作树 clean。GPU 由 PyPTO-X 独占，`gamepc` 锁仅协调远端 heavy CPU/host-memory。
+- AVX-512 parity task commit：`76325e3b863a4695c882c48932927d3c216c5e91`；integration commit：`63c9a4fdd6c1282aa8226b157d81dccbea6b6f21`；独立验收 `483 passed, 7 skipped`、focused `76 passed`，CPUID/OSXSAVE/XGETBV、ZMM/opmask/FMA/BF16/VNNI、rank-3/4 matmul、非零 GDR 与 position 大 shape 均 `PASS`；证据目录 `../worktrees/_meta/pypto-x/integration-w6-qwen35-avx512-parity-final/`；
+- 当前 integration HEAD：`63c9a4fdd6c1282aa8226b157d81dccbea6b6f21`，工作树 clean。GPU 由 PyPTO-X 独占，`gamepc` 锁仅协调远端 heavy CPU/host-memory。
 
 W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保持只读，不重跑覆盖。
 
@@ -415,7 +416,7 @@ W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保�
 3. CPU/加速器优先级为 AVX2 → AVX-512 → SVE256（无 NEON）→ NVIDIA → AMD。
 4. 上游默认分支已刷新为 edge 快照，版本策略为 release family + exact SHA 双轨 lock。
 5. Tensor frontend 作为跨架构主入口，Pro 作为 Ascend expert dialect + portable subset。
-6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、CUDA C1–C2、Qwen3.5-0.8B M0–M1H 与 AVX2 parity 已完成。AVX-512 parity 正在实现；其后连接无权重完整 decoder。5080 GPU-only 工作持续可用，host-heavy 阶段单独申请 `gamepc`。
+6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、CUDA C1–C2、Qwen3.5-0.8B M0–M1H 与 AVX2/AVX-512 parity 已完成。下一任务是无权重完整 decoder connectivity。5080 GPU-only 工作持续可用，host-heavy 阶段单独申请 `gamepc`。
 
 C0 已完成：
 
@@ -424,7 +425,7 @@ C0 已完成：
 3. 接手文档已按序号和日期归档到 `docs/00-handoffs/`。
 4. stable lock 仍等待实际 CANN toolkit/NPU 环境做晋升验证，不影响目标无关 W1，但会门禁 Ascend 回归结论。
 
-GPU common 已冻结 NVIDIA/AMD 共用的 Grid/Workgroup/Thread/Subgroup、address space、GPU artifact 与 launch ABI；公共层没有 NVVM/ROCDL/WMMA/MFMA 语义。CUDA C2 已用 `ctypes + libcuda.so.1 + PTX JIT` 在 5080 完成 Qwen math/layout/indexing/composites 正确性验收；它仍不是 NVVM、Tensor Core、fusion 或性能结论。PyPTO-Gym M0、PyPTO M1A–M1H 与 AVX2 parity 已完成并集成；AVX-512 parity 正在实现，随后连接无权重 decoder connectivity，并在取得权重/参考环境授权后进入 BF16 实际模型与 W8A8-linear。M1G 仍是静态 sequential correctness graph，不是 fused WY/chunk kernel；M1H decoder 仍是无权重 identity shell，SVE position/control 仍有 host fallback。鲲鹏 920B ECS 当前 ACTIVE，用于 native 正确性和汇编验收；实际权重下载/加载仍未授权。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
+GPU common 已冻结 NVIDIA/AMD 共用的 Grid/Workgroup/Thread/Subgroup、address space、GPU artifact 与 launch ABI；公共层没有 NVVM/ROCDL/WMMA/MFMA 语义。CUDA C2 已用 `ctypes + libcuda.so.1 + PTX JIT` 在 5080 完成 Qwen math/layout/indexing/composites 正确性验收；它仍不是 NVVM、Tensor Core、fusion 或性能结论。PyPTO-Gym M0、PyPTO M1A–M1H 与 AVX2/AVX-512 parity 已完成并集成；下一步连接无权重 decoder connectivity，并在取得权重/参考环境授权后进入 BF16 实际模型与 W8A8-linear。M1G 仍是静态 sequential correctness graph，不是 fused WY/chunk kernel；当前 M1H decoder 仍是无权重 identity shell，SVE position/control 仍有 host fallback。鲲鹏 920B ECS 当前 ACTIVE，用于 native 正确性和汇编验收；实际权重下载/加载仍未授权。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
 
 ## 12. 快速自检命令
 

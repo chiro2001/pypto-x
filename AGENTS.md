@@ -13,9 +13,9 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W6_QWEN35_AVX2_W4_CUDA_C2_COMPLETE_AVX512_IN_PROGRESS`。
+- 当前状态是 `EXECUTION_W6_QWEN35_AVX2_AVX512_W4_CUDA_C2_COMPLETE_DECODER_CONNECTIVITY_READY`。
 - Qwen3.5-0.8B M0–M1H 已完成并冻结；M1H 已闭包 compare/iota/position 与无权重 24 层 structural manifest，但 SVE `iota/compare` 仍是明确的 host-reference fallback，manifest 仍不是带权整网执行。
-- AVX2 Qwen M1A–M1H parity 与 CUDA C2 math/layout/indexing/composites 已独立验收通过；AVX-512 parity 正在实现，随后连接无权重完整 decoder。GPU-only 工作无需 `gamepc` 锁，CUDA host-heavy 编译阶段才申请该锁；鲲鹏 920B ECS 继续承担 SVE256 验证。
+- AVX2、AVX-512 Qwen M1A–M1H parity 与 CUDA C2 math/layout/indexing/composites 已独立验收通过；下一步把24层 identity shell 升级为无权重、非 identity 的完整 decoder connectivity。GPU-only 工作无需 `gamepc` 锁，CUDA host-heavy 编译阶段才申请该锁；鲲鹏 920B ECS 继续承担 SVE256 验证。
 
 ## Git 与目录
 
