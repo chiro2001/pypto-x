@@ -13,9 +13,9 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W6_QWEN35_08B_M1G_COMPLETE_M1H_POSITION_CONTROL_PLANNING`。
-- Qwen3.5-0.8B M0、M1A、M1B、M1C1、M1C2a/M1C2b、M1D composites、M1E Conv/state、M1F attention/KV 与 M1G GDR recurrent state 已完成并冻结；下一步补齐 compare/iota/position 并连接无权重 text decoder graph。
-- 用户于 2026-09-09 确认 RTX 5080 GamePC 已恢复并由 PyPTO-X 独占 GPU；GPU-only 工作无需 `gamepc` 锁，CUDA host-heavy 编译阶段才申请该锁。鲲鹏 920B ECS 继续承担 SVE256 验证。
+- 当前状态是 `EXECUTION_W6_QWEN35_08B_M1H_W4_CUDA_C1_COMPLETE_NEXT_AVX_PARITY_CUDA_C2`。
+- Qwen3.5-0.8B M0–M1H 已完成并冻结；M1H 已闭包 compare/iota/position 与无权重 24 层 structural manifest，但 SVE `iota/compare` 仍是明确的 host-reference fallback，manifest 仍不是带权整网执行。
+- CUDA C1 Driver API + PTX JIT 已在 RTX 5080 验收通过；下一步并行推进 AVX2（随后 AVX-512）Qwen M1A–M1H parity 与 CUDA C2 math/composites。GPU-only 工作无需 `gamepc` 锁，CUDA host-heavy 编译阶段才申请该锁；鲲鹏 920B ECS 继续承担 SVE256 验证。
 
 ## Git 与目录
 

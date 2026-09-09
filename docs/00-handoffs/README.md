@@ -37,3 +37,4 @@ NNNN-YYYY-MM-DD-<阶段或主题>.zh-CN.md
 | 0020 | 2026-09-09 | Qwen3.5 M1F 完成、独立验收生效、M1G GDR state 规划 | [Qwen3.5 M1F 完成与 M1G 规划](0020-2026-09-09-qwen35-m1f-complete-m1g-gdr-state-planning.zh-CN.md) |
 | 0021 | 2026-09-09 | Qwen3.5 M1G 完成、M1H position/control 规划 | [Qwen3.5 M1G 完成与 M1H 规划](0021-2026-09-09-qwen35-m1g-complete-m1h-position-control-planning.zh-CN.md) |
 | 0022 | 2026-09-09 | GamePC GPU 独占规则、5080 恢复探测、CUDA Driver/PTX 路线 | [GamePC GPU 独占与 CUDA 恢复探测](0022-2026-09-09-gamepc-gpu-exclusive-cuda-probe.zh-CN.md) |
+| 0023 | 2026-09-09 | Qwen3.5 M1H 与 CUDA C1 完成、AVX parity/CUDA C2 就绪 | [M1H 与 CUDA C1 完成快照](0023-2026-09-09-qwen35-m1h-cuda-c1-complete.zh-CN.md) |

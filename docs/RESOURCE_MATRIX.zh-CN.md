@@ -7,9 +7,9 @@
 | 资源 | 当前状态 | 主要用途 | 当前实测/已知信息 | 限制 |
 |---|---|---|---|---|
 | 本地开发机 | 可用；heavy 需全局 `local` 锁 | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8，GNU objdump 2.47，CMake，QEMU 11.0.3；暴露 AVX2/FMA、AVX-512F/BW/DQ/VL/VNNI/BF16 与 xsave/xgetbv；有 `aarch64-linux-gnu-gcc/g++` | full pytest、大 shape lowering/compile 与并行构建必须走 `scripts/resource/run_local_heavy.sh`；默认保留 4 GiB、最多 6 CPU；`hypervisor`/KVM 数字不直接冻结为性能门槛 |
-| RTX 5080（`192.168.101.5`） | 在线；GPU 由 PyPTO-X 独占 | NVIDIA CUDA/PTX/NVVM 验证 | 2026-09-09 复核：WSL2、RTX 5080 16,303 MiB、compute capability 12.0、KMD 610.62/CUDA UMD 13.3、无 compute process；`libcuda.so.1` 可用 | GPU-only 无需 `gamepc` 锁；host-heavy 才持锁。无 `nvcc`/NVRTC/CUDART/SDK headers/PyTorch/Triton；安装需用户明确授权 |
+| RTX 5080（`192.168.101.5`） | 在线；GPU 由 PyPTO-X 独占；CUDA C1 PASS | NVIDIA CUDA/PTX/NVVM 验证 | WSL2、RTX 5080 16,303 MiB、CC 12.0、KMD 610.62/CUDA UMD 13.3；`ctypes + libcuda.so.1 + PTX JIT` 已通过 FP32/BF16 elementwise/reduce/matmul/边界/cleanup 实测 | GPU-only 无需 `gamepc` 锁；host-heavy 才持锁。无 `nvcc`/NVRTC/CUDART/SDK headers/PyTorch/Triton；C1 是正确性 bootstrap，安装需用户明确授权 |
 | AMD 6750GRE 12G | 暂未接入 | AMD HIP/ROCDL、wave 和显存测试 | 当前机器 `lspci` 未发现该卡，`rocminfo/rocm-smi` 不可用 | 接入前不能声明 ROCm 支持或性能；具体 gfx target 以 `rocminfo` 为准 |
-| 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；M1C1 math、M1C2 layout/indexing、M1D composites、M1E Conv/state、M1F attention/KV 与 M1G GDR state 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；按量计费，状态见 `~/tools/ecs-920B/state.env` |
+| 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；M1C1–M1H 对应功能/contract 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；M1H `iota/compare` 是 host-reference；按量计费，状态见 `~/tools/ecs-920B/state.env` |
 | QEMU AArch64 | 可用 | AArch64/SVE/SVE2 功能和编译验证 | `qemu-aarch64` 11.0.3；已验证 `max,sve256=on` 可报告 SVE/SVE2，VL=32 bytes | 不能代表鲲鹏吞吐、缓存、内存带宽或指令时序 |
 
 ## 5080 WSL 连接方式
@@ -46,6 +46,8 @@ python3 -c 'import torch; print(torch.__version__, torch.cuda.is_available())'
 ```
 
 `nvcc`/NVRTC/PyTorch 缺失时，完整 Toolkit 路线标记 `BLOCKED_TOOLCHAIN`，但可以先用现有 `libcuda.so.1`、手写 PTX 和 Python `ctypes` 验证 CUDA Driver API 后端。不得把 Linux UAPI 的 `/usr/include/linux/cuda.h` 误认成 CUDA SDK header。
+
+CUDA C1 已完成并由独立验收代理在 5080 上确认：FP32/BF16 elementwise、BF16 RNE、非末轴 reduction、全负 reduce-max、rank-2 matmul、K=0、zero-work/canary、多操作链、empty reduce-sum、重复 launch 与 context/module/allocation cleanup 均通过；验收前后无 compute process 残留。证据位于 `../worktrees/_meta/pypto-x/integration-w4-cuda-c1-final/validation.json`。由于 `nvcc` 缺失，统一 smoke 仍按规范标记 `BLOCKED_TOOLCHAIN`；这不否定不依赖 Toolkit 的 Driver/PTX 实测，也不构成 NVVM/Tensor Core/性能结论。
 
 ## QEMU SVE/SVE2 验证
 
