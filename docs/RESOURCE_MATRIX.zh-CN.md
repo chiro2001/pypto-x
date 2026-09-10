@@ -188,7 +188,9 @@ Windows OpenCL/Vulkan 设备可见不等于 Linux HIP 可用；当前只做静�
 软件栈     CANN 9.0.0（/usr/local/Ascend，含 driver 25.2.0、nnal、bishengir-compile、ccec、llvm-objcopy）
            容器内**没有** torch / torch_npu / numpy / pypto（需要时自行 pip，pypi 可达）
 出网特征   443 仅 gitcode.com / pypi.org 可用；github.com 与所有 22 端口被封；无 TUN/NET_ADMIN
-接入路径   A2 ──(443 反向隧道)──> <relay-ip>:127.0.0.1:2222 ──> 本机（**用真实 IP，不用域名 <relay-host>**）
+接入路径   A2 ──(自建中继上的密钥反向隧道，端点用真实 IP)──> 本机
+           **端点、跳板凭据与访问脚本只在本地私有侧**（~/.ssh/a2-910b.env + ~/tools/a2-910b/），
+           不得提交进本仓（公开仓历史已清理）
            本机用 `scripts/remote/a2_910b.sh`（默认隧道优先；平台跳板 jt_xxx:token 仅作引导且短期有效）
            A2 侧保活脚本 /root/a2_tunnel.sh（源文件 scripts/remote/a2_tunnel.sh），每 5 s 自动重连
 运维命令   --status 看两条路径；--install-tunnel 重新上传并启动保活（**隧道活着就走隧道自举**，
