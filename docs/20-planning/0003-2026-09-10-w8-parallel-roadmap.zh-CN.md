@@ -1,251 +1,273 @@
-# PyPTO-X W8 并行执行路线图（资源与并发版）
+# PyPTO-X W8 并行执行路线图（资源与并发版）v2
 
 文档编号：`0003`
 
 日期：2026-09-10（Asia/Shanghai）
 
-状态：`DRAFT_FOR_EXTERNAL_REVIEW`
+状态：`REVISED_AFTER_EXTERNAL_REVIEW`
 
-用途：在**已知系统资源**与**全局资源锁协议**下，给出 W8 及后续波次的可执行计划、并发上限、每个任务的锁占用预算与验收口径。本文档自包含，供外部模型/评审者直接检查与优化。
+修订记录：v1（提交 `12cd196`）→ v2（本文）。v2 依据一次外部独立评审的 8 点意见修订，**8 点均已由父 agent 逐条核实为事实**，修订点见 §12。
 
----
-
-## 1. 评审者需要的背景（不看会话也能读）
-
-PyPTO-X 的目标是把官方 PyPTO（同仓 `pypto` Tensor 前端 + `pypto_pro` Professional 前端）的可移植语义抽成目标无关 Core IR，并逐步支持：x86 CPU（AVX2/AVX-512）→ AArch64 SVE256 → NVIDIA CUDA → AMD HIP；Ascend CCE/CANN 保持为一个 target plugin。首个真实模型固定为 `Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17`，首期只做纯文本 BF16 与 W8A8-linear。
-
-工作目录：
-
-```text
-控制仓        /home/chiro/projects/pypto/pypto_x           （docs/configs/scripts + 5 个 upstream submodule）
-实现主仓      /home/chiro/projects/pypto/pypto_x/upstream/pypto @ 34475e0d（只读；所有实现走 worktree）
-集成分支      port/pypto-x-integration → ../worktrees/pypto-x/integration
-              current HEAD = 37b76b929
-任务 worktree ../worktrees/pypto-x/<task>（每 subagent 一个）
-证据目录      ../worktrees/_meta/pypto-x/<task>/
-```
-
-必须遵守的既有规范：`AGENTS.md`（协议与工程边界）、`docs/LOCAL_RESOURCE_POLICY.zh-CN.md`（重任务锁）、`docs/WORKTREE_AGENT_PLAN.zh-CN.md`（每任务一 worktree、独立验收 agent）、`docs/SMOKE_TEST_SPEC.zh-CN.md`（每 subagent 只跑一次 smoke）。
+用途：在**已知系统资源**与**全局资源锁协议**下，给出 W8 及后续波次的可执行计划、并发上限、每任务锁占用预算与验收口径。本文自包含，供外部模型/评审者直接检查。
 
 ---
 
-## 2. 当前基线（W7 结束时）
+## 1. 背景（不看会话也能读）
 
-### 2.1 已冻结成果
-
-| 项 | 状态 | 证据/提交 |
-|---|---|---|
-| Core IR / Target ABI / CPU scalar / AVX2 / AVX-512 / SVE256 / GPU common / CUDA C1–C2 | 完成并冻结 | `configs/development_lock.yaml` W1–W4 |
-| Qwen3.5-0.8B M0–M1K（无权重 decoder、binding、CPU/CUDA ingestion） | 完成并冻结 | 同上 W6 |
-| AMD `gfx1036` 静态 C1–C3（math/任意轴 reduction/rank-2..4 matmul；Qwen 静态 4532/4532） | 完成；运行态判定架构性不可达 | 审计 `0004` |
-| 官方 gold 参考（3 prompt，prefill+4 步 greedy，逐层 hidden states） | 完成 | `52b7e3d7c`，`_meta/qwen35-bf16-reference` |
-| 权重接入（safetensors reader + 320 参数映射 + 真实 packed layout） | 完成 | `a63105eef` |
-| GDR T=128 验收（五后端 + 920B 原生） | 完成，已关闭 `gdr_t128_not_validated` | `dba3c9d2f` |
-| W8A8-linear 契约（D1–D12 已获用户批准） | 冻结 | `docs/20-planning/0002-*` |
-| 性能测量协议 + 门槛策略 | 冻结（提案未生效） | `docs/PERF_MEASUREMENT_PROTOCOL.zh-CN.md` |
-| CUDA Toolkit（nvcc 13.3.73 + cuBLAS 13.6，Driver/PTX 回归 PASS） | 完成 | GamePC WSL，`_meta/cuda-toolkit-wsl` |
-| PTO-ISA CPU_SIM 基线（125/125 PASS） | 完成 | 审计 `0006` |
-| 本机 CANN 9.2.0-beta.2 toolkit（cannsim/npusim 可用） | 完成 | `_meta/cann-toolkit-local-install` |
-| CANN CA-model 最小用例（PTO-ISA a5 tadd 跑通） | 完成 | 审计 `0007` |
-| CPU vector runtime liveness + AVX-512 packed cast/transpose/embedding | 完成（待合并） | `70af8ed2c` |
-
-### 2.2 关键未决问题（W8A 正在收口）
-
-1. **GDR decay 门公式错误**：图里写 `-A_log * softplus(a+dt_bias)`，官方（`transformers/models/qwen3_5/modeling_qwen3_5.py:619`）是 `-exp(A_log) * softplus(...)`。debug 副本证明修正后 prefill **argmax 5/5、cosine 0.99991、max_abs 0.234**（落在 gold 自身 dtype 误差带 0.2352 内）。修复正在落地。
-2. **S3 decode 疑为对比行错位**：已验证 gold `decode_logits[0] ≡ prefill_next_logits`（max_abs=0.0），故正确的对齐是「prefill 末位 ↔ `decode_logits[0]`，第 k 步 ↔ `decode_logits[k+1]`」。按此口径重跑。
-3. 真权重整网已能执行：T=5 prefill 峰值 RSS **3.79 GiB**、wall **134 s**（修复前模型值 7.66 GiB / 旧 list 路径 309.6 GiB）。
-
-### 2.3 已知边界（计划必须绕开或显式处理）
+PyPTO-X 把官方 PyPTO（同仓 `pypto` Tensor 前端 + `pypto_pro` Professional 前端）的可移植语义抽成目标无关 Core IR，并逐步支持：x86 CPU（AVX2/AVX-512）→ AArch64 SVE256 → NVIDIA CUDA → AMD HIP；Ascend CCE/CANN 保持为 target plugin。首个真实模型固定 `Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17`，首期只做纯文本 BF16 与 W8A8-linear。
 
 ```text
-- CPU 侧仍是逐 op 派发、零融合；标量 matmul 是纯 Python 三重循环
-- 本机是 KVM guest、无 cpufreq → 绝对性能门槛永久 UNGATED（见性能协议）
-- GamePC WSL 无时钟锁定手段；空闲 SM 时钟约为峰值 1/7，测性能必须 warmup + 断言
-- AMD 运行态不可达（用户已决定长期只保留静态证据）
-- CANN CAModel：单条 64x64 TADD 95 s、峰值 7.3 GiB → 只能做指令级细看，不能做模型级
-- npusim record 第二次运行卡死（复现性未解决）；report 后端缺 plotly
-- IR→PTO / IR→CCE 的桥不存在；Ascend adapter 仍只是 seam（PYPTO_X_ASCEND_HOOKS）
-- 920B ECS 只有 2 vCPU / 2.5 GiB / 34 GB，只能做 SVE 原生功能验收
+控制仓        /home/chiro/projects/pypto/pypto_x（docs/configs/scripts + 5 个 upstream submodule）
+实现主仓      upstream/pypto @ 34475e0d（只读；实现一律走 worktree）
+集成分支      port/pypto-x-integration（当前 HEAD 9aae4649e）
+任务 worktree ../worktrees/pypto-x/<task>；证据 ../worktrees/_meta/pypto-x/<task>/
+强制规范      AGENTS.md、docs/LOCAL_RESOURCE_POLICY.zh-CN.md、docs/WORKTREE_AGENT_PLAN.zh-CN.md、docs/SMOKE_TEST_SPEC.zh-CN.md
 ```
 
 ---
 
-## 3. 资源清单与实测基线
+## 2. 当前基线
+
+### 2.1 已冻结
+
+| 项 | 证据 |
+|---|---|
+| Core IR / Target ABI / CPU scalar / AVX2 / AVX-512 / SVE256 / GPU common / CUDA C1–C2 | `development_lock.yaml` W1–W4 |
+| Qwen M0–M1K（无权重 decoder、binding、CPU/CUDA ingestion） | W6 |
+| AMD `gfx1036` 静态 C1–C3；运行态判定架构性不可达（用户决定长期只保留静态证据） | 审计 `0004` |
+| 官方 gold 参考（3 prompt、prefill+4 步 greedy、逐层 hidden states；含 fp32/bf16 两变体） | `52b7e3d7c` |
+| 权重接入（safetensors reader、320 参数映射、真实 packed layout） | `a63105eef` |
+| GDR T=128 验收（五后端 + 920B 原生），`gdr_t128_not_validated` 已关闭 | `dba3c9d2f` |
+| W8A8-linear 契约（D1–D12 用户已批准） | `docs/20-planning/0002-*` |
+| 性能测量协议（提案态） | `docs/PERF_MEASUREMENT_PROTOCOL.zh-CN.md` |
+| CUDA Toolkit（nvcc 13.3.73 + cuBLAS 13.6；Driver/PTX 回归 PASS） | `_meta/cuda-toolkit-wsl` |
+| PTO-ISA CPU_SIM 基线（125/125 PASS）、CANN toolkit + CA-model 最小用例 | 审计 `0006`/`0007` |
+| CPU vector runtime liveness + AVX-512 packed cast/transpose/embedding + **GDR decay 修复** | `9aae4649e` |
+
+### 2.2 主线数值状态（实现侧完成，**独立验收进行中**）
+
+```text
+ERR-0001：图 v1/v2 的 GDR decay 门缺 exp(A_log)（官方为 -exp(A_log)·softplus），
+          FP32 状态指数爆炸（|state|max 0.60→2.8e4→2.36e16）被 gated RMSNorm 掩盖。
+修复后（真权重、AVX-512、公开图）：
+  prefill en_continuation T=5   argmax 5/5、cosine 0.9999136、max_abs 0.2338（gold dtype 带 0.2352）
+  decode（对齐口径）            11751 → 13 → 198 → 760 逐步与 gold 一致
+  峰值 RSS / wall               3.905 GiB / 131.6 s（修复前模型值 7.66 GiB / 旧 list 路径 309.6 GiB）
+图契约 v3：digest 66dd4077…、4,550 ops（(1,1,4096)）/ 6,728 ops（(1,5,0)）
+全量回归                      674 passed, 7 skipped
+```
+
+### 2.3 已知边界
+
+```text
+- CPU 侧逐 op 派发、零融合；标量 matmul 是纯 Python 三重循环
+- 本机 KVM guest 无 cpufreq → 绝对性能门槛永久 UNGATED；GamePC WSL 无锁频手段
+- CUDA 无 cuEvent 计时（cuEvent* 在 python/pypto 下 0 命中）→ kernel_seconds 必须为 null
+- CANN CAModel：单条 64x64 TADD 95 s / 峰值 7.3 GiB；npusim record 第二次卡死；report 缺 plotly
+- IR→PTO / IR→CCE 桥不存在；Ascend adapter 仍是 seam
+- 920B ECS：2 vCPU / 2.5 GiB / 34 GB，只能做 SVE 原生功能验收
+- 上游默认分支已漂移风险：本仓仍锁 34475e0d（edge lock），stable lock 待 CANN 配套验证
+```
+
+---
+
+## 3. 资源与锁（修正后的准确描述）
 
 ### 3.1 资源
 
-| 资源 | 规格 | 用途 | 独占方式 |
-|---|---|---|---|
-| 本机 | 12 vCPU（KVM guest，无 cpufreq）、29 GiB 内存（可用 ~23 GiB）、磁盘剩 82 GB | Core IR/ABI、CPU 后端、编译、QEMU、PTO-ISA CPU_SIM、CANN 仿真、全量 pytest | 全局 `local` 锁（排他） |
-| GamePC | Windows + WSL2：24 线程、WSL 30 GiB（宿主 61.4 GiB）、磁盘 865 GB；RTX 5080 16 GB（KMD 616.92 / CUDA UMD 13.4；nvcc 13.3.73 + cuBLAS 13.6 已装） | CUDA 正确性与性能、GamePC 上大量 CPU/内存阶段 | `gamepc` 锁（仅 host-heavy）；GPU-only 短探测不申请 |
-| 鲲鹏 920B ECS | 2 vCPU、2.5 GiB、34 GB；SVE=1/SVE2=0/VL=32；按量计费（约 0.278 元/时 + 磁盘/EIP） | SVE256 原生功能/汇编验收 | 无正式锁：**约定串行**（一次只派一个任务） |
-| QEMU AArch64 | 本机 qemu-aarch64 11.0.3 | SVE 功能验证（不作性能结论） | 随 `local` 锁 |
-| CANN 9.2.0-beta.2 | 本机 `/usr/local/Ascend`（3.9 GB，仅 toolkit，无驱动/无 950-ops） | CA-model/CostModel 仿真、ccec/bisheng 编译 | 随 `local` 锁（CAModel 峰值 7.3 GiB，需 `--memory-max-mib 8192` 以上） |
+| 资源 | 规格 | 独占方式 |
+|---|---|---|
+| 本机 | 12 vCPU（KVM guest，无 cpufreq）、29 GiB 内存（可用 ~23 GiB）、磁盘剩 82 GB | 全局 `local` 锁（排他） |
+| GamePC | WSL2：24 线程、WSL 30 GiB（宿主 61.4 GiB）、磁盘 865 GB；RTX 5080 16 GB；nvcc 13.3.73 + cuBLAS 13.6 | `gamepc` 锁（host-heavy）；GPU-only 短探测不申请 |
+| 鲲鹏 920B ECS | 2 vCPU、2.5 GiB、34 GB；SVE=1/SVE2=0/VL=32 | 无正式锁 → **约定串行** |
+| QEMU | 本机 qemu-aarch64 11.0.3 | 随 `local` 锁 |
+| CANN 9.2.0-beta.2 | 本机 `/usr/local/Ascend`（3.9 GB，仅 toolkit） | 随 `local` 锁 |
 
-### 3.2 锁的参数与语义（`scripts/resource/run_local_heavy.sh`）
+### 3.2 锁语义（**修正 v1 的表述错误**）
 
 ```text
-local 锁：全局排他；启动要求 MemAvailable ≥ 8192 MiB；系统保留 4096 MiB
-          默认 cgroup：MemoryHigh/MemoryMax 动态、MemorySwapMax=0、CPUQuota=600%（最多 6/12 CPU）
-          每 2 s 采样 MemAvailable / 任务树 RSS / CPU / load / PSI，日志在 _meta/pypto-x/resource-usage/
-返回码    75 = 锁被占（等待重试）；69 = 资源不足（等待重试）。禁止绕过/抢占/删除 .pid/.guard
+local 锁：全局排他；启动要求 MemAvailable ≥ 8192 MiB（这是"启动门槛"，不是 cgroup 上限）
+          系统安全余量 4096 MiB
+          默认 MemoryHigh/MemoryMax = 动态，MemoryMax = min(启动时 MemAvailable - 4096 MiB, 20480 MiB)
+          CPUQuota = 600%（6/12 CPU）、MemorySwapMax=0、affinity 限定、每 2 s 采样并落 resource-usage 日志
+返回码    75 = 锁被占；69 = 准入不足 → 都必须等待重试，禁止绕过/抢占/删 .pid/.guard/无锁执行
 ```
 
-### 3.3 实测耗时与内存（用于排期估算，全部来自本轮证据）
+**因此**：任务必须显式登记自己的 `min_available_mib`、`memory_max_mib`、超时与峰值余量（见 §5 每任务字段），不能笼统写"接近 8 GiB 上限"。
 
-| 活动 | 锁内时间 | 峰值 RSS | 备注 |
-|---|---|---|---|
-| 全量 `python/tests/ut/pypto_x` | ~170–206 s | 321–409 MiB | 668–608 passed |
-| Qwen T=5 整网 lower+compile+execute（AVX-512，真权重） | ~134 s | 3.79 GiB | 6,710 ops |
-| 同上（合成权重，仅 S1） | ~135 s | 3.82 GiB | — |
-| GDR T=128 lowering（单后端） | 0.6–2.0 s | ≤184 MiB | 3,843 plans |
-| GDR T=128 执行：scalar / avx2 / avx512 / SVE(QEMU) | 129 / 108 / 116 / 216 s | 5.6 GiB / 880 MiB / 915 MiB / 5.6 GiB | 每后端一次 launch |
-| GDR T=128 920B 原生 | 39 s（另加传输） | — | 远端 |
-| PTO-ISA CPU_SIM 构建 + 全量 125 用例 | 134 s + 1.75 s | 1.76 GiB | build dir 146 MB |
-| CANN CAModel 单条 64×64 TADD | 95 s | 7.3 GiB | 需 >8 GiB cgroup 余量 |
-| CANN toolkit 安装（下载+安装） | 下载 23 s + 安装 75 s | 159 MiB | 实测等锁 636 s（29 次重试） |
+### 3.3 实测耗时/内存（排期依据）
 
-**结论**：除 CAModel 与真权重整网外，绝大多数任务在锁内是**秒到几分钟**级；真正的排期瓶颈是**全局锁的串行性**与**CAModel/整网的 GiB 级内存**。
+| 活动 | 锁内时间 | 峰值 RSS |
+|---|---|---|
+| 全量 `python/tests/ut/pypto_x` | ~170–206 s | 321–409 MiB |
+| Qwen T=5 整网（真权重，AVX-512，lower+compile+execute） | ~132 s | 3.9 GiB |
+| Qwen T=1 decode 单步（含 state 回灌） | ~60–70 s | 3.9 GiB |
+| GDR T=128 lowering（单后端） | 0.6–2.0 s | ≤184 MiB |
+| GDR T=128 执行（scalar/avx2/avx512/SVE-QEMU） | 129 / 108 / 116 / 216 s | 5.6 GiB / 0.9 / 0.9 / 5.6 GiB |
+| GDR T=128 920B 原生 | 39 s（另加传输） | — |
+| PTO-ISA CPU_SIM 构建+125 用例 | 134 s + 1.75 s | 1.76 GiB |
+| CANN CAModel 单条 64×64 TADD | 95 s | 7.3 GiB |
+
+**外推（标注为估算）**：`ops(T) ≈ 6,728 + 378×(T−5)`（(1,T,0) 口径）→ T=8 ≈ 7,862 ops、T=18 ≈ 11,642 ops；wall 按 ops 近似线性，T=8 约 160–200 s、T=18 约 250–350 s（含绑定与编译开销）。
 
 ---
 
-## 4. 并发策略（本计划的核心约束）
+## 4. 并发策略（按评审意见修正）
 
-### 4.1 并发上限（建议）
+### 4.1 槽位（修正）
 
 ```text
-同时运行的 subagent 总数          ≤ 4
-其中持 local 锁的重任务           ≤ 1（硬约束：锁本身排他）
-其中持 gamepc 锁的重任务          ≤ 1
-920B 原生任务                     ≤ 1（约定串行）
-其余必须是"轻任务"：写代码、跑 focused 单测、读文档、准备证据、写脚本
+平台总活动 agent 槽位 = 4（含父 agent）
+  → 活动 subagent ≤ 3
+推荐组合：1 个 local-heavy  +  1 个 GamePC/远端  +  1 个轻任务  +  父 agent
 ```
 
-理由：全局锁是排他的，多派重任务只会让它们在锁上排队（实测 CANN 安装等了 636 s、主线一度被 CANN 探针饿死）。轻任务不占锁，与重任务并行才有意义。
+理由：全局锁排他；重任务多派只会排队（实测：CANN 安装等锁 636 s / 29 次重试；主线曾被 CANN 探针饿死）。
 
-### 4.2 每个任务的时间结构（用于错峰）
-
-建议把一个任务显式拆成三段，只有中段占锁：
+### 4.2 三段式错峰（每个任务）
 
 ```text
-① 轻段：读契约、写实现、跑 focused 单测（不占锁）           —— 可与其他任务的重段并行
-② 重段：lower/compile/execute/全量 pytest（必须持锁）        —— 全局串行，按到达顺序
-③ 收尾：写证据、commit、报告（不占锁）                        —— 可与其他任务的重段并行
+① 轻段：读契约、写实现、聚焦单测（不占锁）
+② 重段：lower/compile/execute/全量 pytest（持锁，全局串行）
+③ 收尾：证据、commit、报告（不占锁）
 ```
 
 调度规则：
 
-1. **重段尽量短且可预期**：把能预编译/预生成的产物提前在轻段做好；重段只做"必须独占资源"的事。
-2. **CAModel 与真权重整网不要同时排**：它们分别要 7.3 GiB 与 3.8 GiB，虽然锁会串行，但两者都接近 8 GiB cgroup 上限，连续运行时要留出 `MemAvailable ≥ 8 GiB` 的窗口。
-3. **920B 任务先本地编译、后远端执行**：远端只有 2 vCPU/2.5 GiB，本地不占锁的编译阶段可先做完。
-4. **验收 agent 单独占一个重段**：不要与实现 agent 共用 worktree，也不要与实现的重段叠在同一时间窗（否则互相等锁）。
-5. **父 agent 不再自己跑重任务**：父只做合并、审查与派发（本轮父 agent 曾用重段做过两次 metadata 探针，虽短但会挤掉子任务；后续改为派给子任务）。
-
-### 4.3 反模式（明确禁止）
-
-```text
-- 同一任务同时提交两个重命令（会自己排自己；实测 CANN 探针出现过）
-- 多个重任务"同时派发"期待并行（实际在锁上排队，只会拉长关键路径）
-- 父 agent 长占锁做自己的探针
-- 在锁内跑与本任务验收无关的命令（如顺手全量 pytest）
-- 绕过 runner、裸跑 heredoc 重任务
-```
+1. 重段尽量短且可预算；能预生成的产物提前在轻段做好。
+2. 大内存任务（CAModel 7.3 GiB、整网 3.9 GiB）显式登记 `memory_max_mib`，且两者不在同一时间窗紧邻排。
+3. 920B：本地编译、远端只跑 ELF。
+4. 验收 agent 的重段独立占一个时间窗，不与实现重段重叠（否则互相等锁）。
+5. **父 agent 不自己跑重任务**（只做合并/审查/派发）。
+6. 同一任务**禁止**同时提交两个重命令（会自己排自己）。
 
 ---
 
-## 5. 波次计划
+## 5. 波次计划（v2）
 
-估计口径：`锁占用` 指该任务在 `local` 锁内的累计时间（含重试等待之外的纯执行时间）。
+任务字段统一为：`资源 / 锁占用预算 / min_available_mib / memory_max_mib / 验收`。
 
-### W8A 主线收口（关键路径）
+### W8A 主线收口（关键路径，修正顺序）
 
-| ID | 任务 | 目标 | 资源 | 依赖 | 验收 | 锁占用估计 |
-|---|---|---|---|---|---|---|
-| A1 | `qwen35-gdr-decay-fix`（进行中） | 落地 `-exp(A_log)·softplus`；grep 全部 decay 点；修测试期望；记录 digest 连锁 | local | 无 | S2：argmax 5/5、cosine≥0.9999、max_abs≤0.24；S3 按正确对齐逐步一致；全量 pytest ≥668 passed | 3×~150 s + 210 s |
-| A2 | `verify-w8a`（独立验收 agent） | 从 A1 的 integration HEAD 建只读验收 worktree，独立复跑 S1/S2/S3 + 全量 pytest，核对 digest 变更与 M1J 证据作废标注 | local | A1 合并 | 验收报告 + `validation.json`；发现的问题回 A1 修 | ~2×150 s + 210 s |
-| A3 | `qwen35-weighted-multiprompt` | zh + chat 两个 prompt 的 prefill+decode 对齐（3/3 覆盖） | local | A2 | 两 prompt argmax/cosine 达标 | 2×~150 s |
-| A4 | 冻结与文档 | 0035 交接快照、`development_lock.yaml` 关项、HANDOFF/README 更新 | 无锁 | A2/A3 | 文档提交 | 0 |
+| ID | 任务 | 目标 | 依赖 | 验收（冻结口径） | 锁预算 |
+|---|---|---|---|---|---|
+| A0 | `integration-truth-normalization` | 收口当前 runtime 任务（合并 `70af8ed2c`/`d27a2cf33`/`11eceeb4a`，**已完成**）；**归一化配置真值**：删 `agent_tasks.yaml` 重复条目、同步 GDR/CUDA/W7 状态 | 无 | `yaml.safe_load` 通过 + 无重名 + 每条状态与 `development_lock.yaml` 一致 | 0 |
+| A1 | `qwen35-weighted-multiprompt` | 在**同一实现轮**内跑完 **T=5/T=8/T=18 三个 prompt 的 prefill + 4 步 decode**（共享一份 correction 后的图与 driver） | A0 | 每 prompt 每步：argmax 与 gold 一致；cosine ≥ 0.9995；max_abs ≤ 0.35；state 有限且不爆炸；产出逐层 hidden 对照（gold 有 25×T×1024） | 3×3 个 prompt×stage ≈ 6–8 个重段，累计 ~25–35 min |
+| A2 | `verify-w8a`（独立验收） | 从 **A1 的最终 integration HEAD** 建只读 worktree，独立复跑 S1/S2/S3 + 全量 pytest + liveness A/B + packed 内核抽样 | A1 完成并合并 | 见 §6 验收细则 | ~13–18 min（S1+S2+S3+pytest） |
+| A3 | 冻结与文档 | `development_lock` 关项、`0035` 快照、HANDOFF/README/ERRATA 同步 | A2 | 文档提交 + 链接检查 | 0 |
 
-**出口标准**：`BF16 真权重前向 = 官方 gold（3/3 prompt，prefill+decode）`，且证据可由第三方复跑。
+**出口标准（修正）**：三个 prompt 的 prefill 与 decode 均**达到冻结容差**（不是"等于 gold"）；逐层 hidden 与最终 logits 都有对照；独立验收 PASS。
 
-### W8B 硬化与补齐（无需新授权）
+**注意（评审点 2）**：decay 修复是在 `work/qwen35-vector-runtime-packed-liveness` 分支上、由父 agent 书面解除"不改 `qwen35.py`"约束后完成的。该事实必须在 `development_lock.yaml` 与 0035 快照里明确登记为**范围扩展**，不允许保留"任务名与所有权不一致"的模糊状态。
 
-| ID | 任务 | 目标 | 资源 | 依赖 | 验收 | 锁占用估计 |
-|---|---|---|---|---|---|---|
-| B1 | `avx2-packed-kernels` | AVX2 补 packed cast/transpose/embedding（现仍 host_reference+liveness），与 AVX-512 同口径 | local | A1 合并 | 单测逐位一致 + focused/full pytest 不减少 | ~150 s + 210 s |
-| B2 | `sve256-fallback-closure` | native `iota`/`compare`，消除 19 处 `to_values` host fallback；版本号+fail-closed | local（QEMU）+ 920B | A1 合并 | QEMU 差分 + 920B 原生执行与反汇编（含 whilelo/ld1w/p 寄存器、NEON=0） | local ≤300 s；920B 独立 |
-| B3 | `cuda-perf-baseline`（L0） | 用新装 nvcc/cuBLAS 建 G3 相对门槛：GEMM/elementwise/reduce 对比 cuBLAS 与本实现 | GamePC（GPU-only，短探测不持锁） | 无 | 按性能协议出 `dispatch_seconds` 差值、CV/p95 门槛、证据 JSON | 0（远端） |
-| B4 | `local-perf-baseline`（L0/L1） | 本机 AVX-512/scalar：算子 microbench + T=1 decode/T=5 prefill 模型级计时 | local | A1 合并 | 协议要求的统计与 INVALID_CLOCK/UNGATED 标注 | 3×~60 s + 210 s |
-| B5 | `perf-freeze` | 依据 B3/B4 冻结 G1–G3 键与阈值（G4 本机不做），写入 `configs/perf_lock.yaml` | 无锁 | B3/B4 | 用户批准 + 配置提交 | 0 |
+### W8B 硬化与性能（修正）
 
-### W8C 模型能力扩展（需要用户决策）
-
-| ID | 任务 | 目标 | 依赖 | 备注 |
+| ID | 任务 | 目标 | 验收 | 锁预算 |
 |---|---|---|---|---|
-| C1 | `w8a8-l0-core` | `QuantizedTensorDesc` + 4 个 opcode + scalar golden + Q1–Q6 边界（R1–R5） | A 完成 | 契约 §9 R1–R5 |
-| C2 | `w8a8-l1-binding` | binding schema v2 + packed layout v2 + scale region（R7–R9） | C1 | 旧版 fail-closed |
-| C3 | `w8a8-l2-single-layer` | 单层精度阶梯（cosine≥0.9995 / rel-L2≤1e-2） | C2 | 用已授权权重算 scale（D2） |
-| C4 | `w8a8-l3-layer-ladder` | 1→6→24 层替换，报逐层误差 | C3 | — |
-| C5 | `w8a8-l4-model` | 整网 logits 阈值（D5 在 BF16 基线后冻结） | C4 | 阈值需用户批准 |
-| C6 | `gdr-fused-wy` | 关闭 `gdr_chunk_is_sequential_reference_not_fused_wy_kernel` | A 完成 | 中大型 |
-| C7 | `long-prefill-eval` | T=64/128 静态展开代价实测（估 5.2 万 ops），决定是否 chunk/融合 | A 完成 | 先测量后决策 |
+| B1 | `avx2-packed-kernels` | AVX2 补 packed cast/transpose/embedding（现仍 host_reference+liveness） | 与 AVX-512 同口径逐位单测；focused+全量 pytest 收集数不减少 | ~150 s + 210 s |
+| B2 | `sve256-fallback-closure` | native `iota`/`compare` **以及 `broadcast`/`where`**（那 19 次 `to_values` 的来源），逐类清零或明确降级 | QEMU 差分 + 920B 原生；**报告必须按类给出"已 native / 仍 host"清单**，不得承诺整体清零 | local ≤300 s；920B 独立 |
+| B3a | `cuda-kernel-timing` | 实现 `cuEventCreate/Record/ElapsedTime` 的 kernel 计时，接进证据 schema；在此之前 CUDA 的 `kernel_seconds` 必须为 `null` | 计时器自证（同一 kernel 重复 R 次离散度）+ 协议字段齐全 | GamePC（host 编译期持 `gamepc`） |
+| B3b | `cuda-gemm-baseline` | **仅 GEMM** 与 cuBLAS 比（G3）；前置：G1 正确性、G2 稳定性、且非 dispatch-dominated | 五元组 key + 冻结中位数 + 证据 JSON | GamePC（持 `gamepc`） |
+| B3c | `local-perf-l0-l1` | 本机 AVX-512/scalar：L0 microbench + L1（T=1 decode / T=5 prefill） | elementwise/reduction 保持 `T2/T3`、标 `UNGATED`；报 `dispatch_seconds` 差值 | ~3×60 s + 210 s |
+| B4 | `perf-freeze` | 依据 B3b/B3c 冻结 G1–G3 键与阈值（G4 本机不做） | 用户批准 + `configs/perf_lock.yaml` | 0 |
 
-### W8D Ascend/CANN（需要用户定深度）
+### W8C W8A8-linear 实现（按契约附录 B 补全后端 DAG）
 
-| ID | 任务 | 目标 | 资源 | 备注 |
-|---|---|---|---|---|
-| D1 | `cann-report-enable` | 装 plotly（证据目录 venv）→ 打通 `npusim report` 泳道/流水产物 | local（轻） | 低风险、低价值密度 |
-| D2 | `npusim-record-reproducibility` | 定位"第二次 record 卡在 soc_ready"的根因 | local（重） | 现在不能把它当可自动化入口 |
-| D3 | `pypto-version-alignment` | CANN 自带 `pypto 0.2.1` vs 我们 edge 快照 `34475e0d` 的差异审计（stable lock 输入） | 无锁 + CANN | 版本策略 pending 项 |
-| D4 | `ir-to-pto-bridge` | Core IR → PTO C++ kernel codegen + external buffer→GlobalTensor/TASSIGN 绑定翻译 | local + CANN | **大**：让我们的图跑上 CA-model 的必经之路 |
-| D5 | `ascend-adapter-hooks` | 实现 `PYPTO_X_ASCEND_HOOKS` 的真实 hook（编译器/运行时） | 依赖 D4 | 现在只是 seam |
+| ID | 任务 | 目标 | 依赖 |
+|---|---|---|---|
+| C1 | `qwen35-w8a8-scheme` | `QuantizedTensorDesc` + 4 个 opcode + scalar golden（R1–R5） | A 完成 |
+| C2 | `qwen35-w8a8-binding` | binding schema v2 + packed layout v2 + 覆盖率 manifest（R7–R9） | C1 |
+| C3 | `qwen35-w8a8-cpu-avx2` | AVX2 widening 路径（R6） | C2 |
+| C4 | `qwen35-w8a8-cpu-avx512` | 接通 VNNI（含 s8 符号补偿）或 `vpdpwssd`（R6） | C3 |
+| C5 | `qwen35-w8a8-sve256` | widening fallback；SDOT 另附 HWCAP/反汇编证据（R6） | C4 |
+| C6 | `qwen35-w8a8-cuda` / `qwen35-w8a8-amd-static` | 各自能力门禁下的正确性 kernel | C5 |
+| C7 | `qwen35-w8a8-layer-ladder` | L2/L3 阶梯与报告（R10–R11） | 任一后端 |
+| C8 | `qwen35-w8a8-model-validation` | L4–L6 整网对比与覆盖率报告（R12–R14）；阈值 D5 在 BF16 基线后冻结 | 全部 |
 
-### W8E AMD 与杂项
+### W8D 其他能力扩展
 
 | ID | 任务 | 目标 | 备注 |
 |---|---|---|---|
-| E1 | `amd-evidence-register` | 登记第三方 wave32/2CU/Fast-F16 证据；修 `probe_amd_hip_runtime()` 对 ROCm-on-WSL 形态的假阴性门禁 | 低风险 |
-| E2 | `disk-evidence-policy` | 证据目录保留策略：大件（venv/build/.run/权重）只留哈希与重生成脚本 | 见 §7 |
+| D1 | `gdr-fused-wy` | 关闭 `gdr_chunk_is_sequential_reference_not_fused_wy_kernel` | 中大型 |
+| D2 | `long-prefill-eval` | T=64/128 静态展开代价实测（估 ~2.9 万/5.2 万 ops），再决定是否 chunk/融合 | 先测量后决策 |
+
+### W8E Ascend / CANN
+
+| ID | 任务 | 目标 | 备注 |
+|---|---|---|---|
+| E1 | `cann-report-enable` | 装 plotly（证据目录 venv）→ 打通 `npusim report` | 低风险 |
+| E2 | `npusim-record-reproducibility` | 定位第二次 record 卡死 | 未解决前不把 CANN 仿真放关键路径 |
+| E3 | `pypto-version-alignment` | CANN 自带 `pypto 0.2.1` vs 我们 edge `34475e0d` 差异审计 | stable lock 输入 |
+| E4 | `ir-to-pto-bridge` | Core IR → PTO C++ codegen + external buffer→GlobalTensor/TASSIGN | **大**，需独立预算 |
+| E5 | `ascend-adapter-hooks` | 实现 `PYPTO_X_ASCEND_HOOKS` 真实 hook | 依赖 E4 |
+
+### W8F AMD / 杂项
+
+| ID | 任务 | 目标 |
+|---|---|---|
+| F1 | `amd-evidence-register` | 登记第三方 wave32/2CU/Fast-F16 证据；修 `probe_amd_hip_runtime()` 假阴性门禁 |
+| F2 | `disk-evidence-policy` | 大件保留/删除策略（见 §8） |
 
 ---
 
-## 6. 关键路径与排期（建议的 4 并发节奏）
+## 6. 验收细则（修正，可直接抄进任务书）
 
 ```text
-时段 1   A1（唯一重任务，持锁）        + B3（GamePC GPU-only，不占 local 锁）
-时段 2   A2 验收（持锁）               + B1 轻段（写代码/单测，不占锁）
-时段 3   A3（持锁）                    + B1 重段（持锁，串在 A3 后）+ D3（无锁）
-时段 4   A4 冻结（无锁）+ B4 重段      + B2 轻段（本地编译不占锁 / 920B 另排）
-时段 5   B5 冻结                        + C1 轻段（W8A8 若获批准）+ D1
+通用
+  退出码 0；pytest：收集数不减少、无新增非预期 skip、失败为 0（不写"≥N passed"这种软口径）
+  证据：validation.json + brief.zh-CN.md + raw/ 原始日志 + runner 资源日志
+  独立验收不得复用实现方的 JSON 结论，须自行取数
+
+A1/A2 数值（真权重，逐 prompt）
+  prefill：逐行 argmax 与 gold 一致；cosine ≥ 0.9995；max|Δlogits| ≤ 0.35（gold 自身 fp32↔bf16 带宽 0.2352）
+  decode ：对齐口径 = prefill 末行 ↔ gold decode_logits[0]，第 k 步 ↔ decode_logits[k+1]；
+           每步报「输入 token / argmax / cosine / max_abs」，逐步 argmax 与 gold 一致
+  逐层   ：`hidden_states_layers`（25×T×1024）逐层 cosine ≥ 0.999（gold 已提供，不得只看 logits）
+  state  ：prefill 结束后的 recurrent state 必须有限且 |state|max 在 O(1) 量级（防再次指数爆炸）
+  资源   ：峰值 RSS 与 wall 必须记录；CC 上限按 §3.2 的实际 MemoryMax 计算余量
+
+性能（B3*）
+  G1 正确性 → G2 稳定性（3 轮 × R，中位数离散 ≤10%）→ G3 相对比值（仅 GEMM vs cuBLAS）
+  elementwise / reduction / 非 GEMM 的 matmul：保持 T2/T3，`UNGATED`
+  CUDA：cuEvent 计时未落地前 `kernel_seconds = null`，`gflops_scope = end_to_end`
 ```
 
-串行点（不可并行）：`local` 锁上的每一个重段、920B 原生执行、CAModel 运行、真权重整网运行、独立验收 agent 的重段。
-
 ---
 
-## 7. 磁盘与证据策略
-
-当前 `_meta/pypto-x` 主要占用：CANN 安装包 **2.1 GB**、权重资产 **1.7 GB**、gold 参考 venv **1.1 GB**、PTO-ISA 构建 **146 MB**、各任务证据 5–90 MB。磁盘剩 82 GB，短期无压力，但需要规则：
+## 7. 关键路径（修正后的推荐）
 
 ```text
-保留（不可删）    权重资产（含 sha256 清单）、gold 参考 npz、各任务 validation.json/brief/raw 日志与脚本
-可删（需批准）    安装包 .run（2.1 GB，有 URL+sha256 可重下）、参考 venv（1.1 GB，有 setup_venv.sh 可重建）、
-                  build/ 构建目录（可重编）、临时 npz 中间产物
-禁止              删除任何上游 checkout、任何 worktree、任何验证证据目录
+A0 配置真值归一化 + 当前 runtime 任务收口（已完成合并，仅剩配置）
+ → A1 decay 修复后一次跑齐 T5/T8/T18 的 prefill + 4 步 decode
+ → A2 从最终 HEAD 独立验收（只验一次）
+ → A3 development_lock / HANDOFF / 0035 冻结
+ → B1 / B2 后端硬化
+ → B3a → B3b / B3c → B4 性能分层与冻结
+ → W8C 完整后端 DAG（W8A8）
+ → W8D/D2 长序列评估、W8E Ascend（按用户决策）
+```
+
+4 槽位排期示例（父 agent 常驻）：
+
+```text
+时段1  A1 重段(持锁)            + 父 agent 合并/文档
+时段2  A2 验收重段(持锁)        + B3a 轻段(GamePC 准备)
+时段3  A3 冻结(无锁)            + B1 轻段 + E3(无锁)
+时段4  B1 重段(持锁)            + B3b(GamePC,持 gamepc) + E1(轻)
+时段5  B3c 重段(持锁)           + B2 轻段(本地编译) → 920B 另排
+时段6  B4 冻结 + C1 轻段        + E2/F1
 ```
 
 ---
 
-## 8. 验收与冻结流程（每个任务一致）
+## 8. 磁盘与证据策略
 
 ```text
-1. 任务在独立 worktree/branch 完成 → commit（task commit）
-2. 父 agent cherry-pick 进 integration（integration commit）
-3. 阶段级任务另派独立验收 agent：从该 integration HEAD 建 verify/<phase> worktree，源码只读，
-   只把日志/报告写进独占 _meta 目录
-4. 验收失败 → 回原实现 worktree 修，不由验收 agent 直接改 integration
-5. 通过后更新 configs/development_lock.yaml（任务、commit、验收数字、known_limits 增删）
-6. 阶段结束写 docs/00-handoffs/00NN-*.zh-CN.md 快照，并更新 HANDOFF.zh-CN.md 状态行
+当前 _meta/pypto-x 主要占用：CANN 安装包 2.1 GB、权重资产 1.7 GB、gold 参考 venv 1.1 GB、
+                            PTO-ISA 构建 146 MB、各任务证据 5–90 MB；磁盘剩 82 GB
+保留（不可删）  权重资产（含 sha256 清单）、gold 参考 npz、全部 validation/brief/raw/脚本
+可删（需批准）  .run 安装包、参考 venv、build/ 目录、临时 npz（都须留有 URL/脚本可重建）
+禁止            删上游 checkout、worktree、证据目录
 ```
 
 ---
@@ -254,32 +276,50 @@ local 锁：全局排他；启动要求 MemAvailable ≥ 8192 MiB；系统保留
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| 全局锁串行导致关键路径拉长 | 交付变慢 | §4.2 的三段式错峰；重段预算化（每任务明确锁内秒数） |
-| CAModel/整网内存接近 8 GiB cgroup 上限 | OOM 或频繁 69 | 这两类任务显式 `--memory-max-mib 8192+`，且不与另一个大内存任务紧邻排 |
-| 920B 只有 2 vCPU，编译放远端会很慢 | 验收超时 | 本地交叉编译、远端只跑 ELF |
-| `npusim record` 不可复现 | CANN 线自动化受阻 | 先做 D2，未解决前不把 CANN 仿真放进关键路径 |
-| 修复 decay 改变 graph digest | M1J/M1I 证据对新图作废，binding/layout digest 全变 | A1 显式记录连锁；A2 复核；文档加勘误 |
-| KVM guest 无 cpufreq / WSL 无锁频 | 性能数字不可作绝对门槛 | 按协议：本机 G4 永久 UNGATED；GamePC 强制 warmup+时钟断言 |
-| 并发的轻任务过多分散评审注意力 | 质量下降 | 并发总数 ≤4；每个任务验收后立即冻结，不长期挂起 |
+| 全局锁串行 | 关键路径变长 | 三段式错峰；重段预算化；父 agent 不占锁 |
+| 大内存任务撞 cgroup 上限 | OOM/69 | 每任务显式 `memory_max_mib`（按实际 MemoryMax 公式算余量） |
+| 验收 HEAD 被后续修改作废 | 重复验收 | A1 一次跑齐 3 prompt；A2 只验最终 HEAD（评审点 1） |
+| 配置真值与 Git 实况漂移 | 计划失真 | A0 归一化 + 每阶段同步（评审点 2） |
+| `npusim record` 不可复现 | CANN 线受阻 | E2 先修，未解决不进关键路径 |
+| 上游 master 漂移 | stable lock 风险 | 继续锁 `34475e0d`；E3 做版本对齐审计 |
+| 权重资产丢失 | 不可复现 | 已有 sha256 清单 + 下载脚本；列入"不可删" |
+| CANN 许可证（非华为处理器限制） | 对外发布风险 | 发布前取得新许可证/双许可证/书面例外 |
+| KVM/WSL 无锁频 | 性能数字不可作绝对门槛 | 本机 G4 永久 UNGATED；GamePC 强制 warmup + 时钟断言 |
 
 ---
 
 ## 10. 待决策（用户）
 
-1. **W8C 先做哪个**：W8A8 实现（C1–C5，工作量大但直接对应"首期 W8A8-linear"目标）／长序列 T=64–128（C7）／GDR fused WY（C6）？
-2. **W8D 走多深**：只做 D1+D2（打通 report、查复现性），还是启动 **D4 IR→PTO 桥**（让 Ascend 线真正跑起来，但属新波次，需要独立预算）？
-3. **是否接受 §4.1 的并发上限（≤4，且 local 重任务同时只 1 个）** 与 §4.2 的"父 agent 不自己跑重任务"？
-4. **是否批准 §7 的可删清单**（安装包 2.1 GB / 参考 venv 1.1 GB / build 目录）？
+1. **W8C 起点**：是否按 C1→C8 完整后端 DAG 推进（推荐），还是先只做 C1/C2 打契约底座？
+2. **W8D/E 深度**：D2 长序列评估、E4 IR→PTO 桥，是否现在启动？
+3. **是否确认采用 ≤3 subagent + 父 agent 的 4 槽并发模型**（评审建议）？
+4. **是否批准 §8 的可删清单**（安装包 / venv / build 目录）？
 
 ---
 
-## 11. 请外部评审者重点检查的点
+## 11. 请评审者重点检查
 
 ```text
-a) 并发上限是否合理：在"全局排他锁 + 单机 12 vCPU/23 GiB"的前提下，≤4 是否过于保守或过于激进？
-b) 关键路径排序：A→B→C/D 的顺序有没有更优解（例如把 B3/B4 提前以尽早拿到性能数字）？
-c) 三段式（轻-重-轻）错峰是否足够；是否建议引入"锁内任务批处理"（把多个小重段合并成一次持锁）？
-d) 验收 agent 的重段是否必要每次都跑全量 pytest，还是可以按风险分级（focused + 抽样全量）？
-e) 资源预算是否遗漏：CAModel 7.3 GiB、整网 3.8 GiB、920B 2 vCPU、GamePC WSL 30 GiB 的限制是否被正确转成排期约束？
-f) 风险清单是否漏项（例如上游 master 漂移、CANN 许可证、权重资产丢失后的可重建性）？
+a) A1 一次跑齐 3 prompt 是否确实是更优顺序（是否应把 T=18 拆成独立任务以缩短单次反馈环）？
+b) B2 的"逐类清零或明确降级"是否可验收；`broadcast/where` 的 native 化成本是否被低估？
+c) B3 分层（a 计时 / b GEMM / c 本机）是否还有遗漏的基线来源（例如 5080 上是否值得装 cuDNN/NCCL）？
+d) A2 的容差（cosine ≥0.9995 / max_abs ≤0.35 / 逐层 ≥0.999）是否过松或过紧，是否应改用相对 gold-dtype 带宽的比值？
+e) 4 槽并发在"验收也要占槽"的现实下是否仍够用；是否需要把 A2 与 B1 合并成一个 slot 顺序执行？
+f) 是否有被忽略的更短路径：例如先用 CUDA 后端跑真权重（VRAM 16 GB 足够放 1.5 GB 参数 + 中间值）来交叉验证数值？
 ```
+
+---
+
+## 12. v1 → v2 修订清单（对应外部评审 8 点）
+
+| # | 评审意见 | v2 处理 |
+|---|---|---|
+| 1 | W8A 验收顺序错误（A3 改动会让 A2 验收失效） | A1 一次跑齐 T5/T8/T18，A2 只验最终 HEAD，A3 冻结 |
+| 2 | 任务边界与 Git 实况不一致（decay 修复混在 runtime 任务） | A0 收口 + 在 lock/快照中登记为**范围扩展** |
+| 3 | 并发上限多算一个（含父 agent 共 4 槽） | §4.1 改为 subagent ≤3 |
+| 4 | W8A8 路线缺后端节点 | W8C 按契约附录 B 补 C3–C6（AVX2/AVX-512/SVE256/CUDA/AMD） |
+| 5 | 性能 G3 口径不成立（cuBLAS 不能做任意算子基线；cuEvent 缺失） | 拆 B3a/B3b/B3c；非 GEMM 保持 T2/T3 UNGATED；`kernel_seconds=null` |
+| 6 | 内存描述事实错误（8 GiB 是启动门槛不是上限） | §3.2 按 `LOCAL_RESOURCE_POLICY` 更正并强制每任务登记内存参数 |
+| 7 | 验收条件不冻结 | §6 给出逐项口径、预算与外推；pytest 改退出码口径；要求逐层 hidden/state |
+| 8 | B2 范围不足（19 次 fallback 含 broadcast/where） | B2 扩范围并要求按类给出清单，禁止整体清零承诺 |
+| + | 配置真值漂移（重复条目、状态滞后） | 新增 A0 配置归一化 |
