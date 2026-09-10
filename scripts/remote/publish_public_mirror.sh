@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PyPTO-X：把控制仓发布到公开镜像仓（默认 chiro2001/pypto-x-public）
+# PyPTO-X：把控制仓发布到公开主仓（默认 chiro2001/pypto-x；私有归档为 chiro2001/pypto-x-private）
 #
 # 做三件事（不改动私有仓）：
 #   1) 克隆控制仓到临时目录，用 git-filter-repo 从**历史**中剔除第三方离线副本
@@ -8,13 +8,13 @@
 #   3) force-push 到公开仓（默认分支 main）
 #
 # 用法：
-#   scripts/remote/publish_public_mirror.sh [--repo chiro2001/pypto-x-public] [--dry-run]
+#   scripts/remote/publish_public_mirror.sh [--repo chiro2001/pypto-x] [--dry-run]
 #
 # 依赖：git、python3（脚本会自建 venv 安装 git-filter-repo）、可推送公开仓的 gh/凭据
 set -euo pipefail
 
 PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-PUBLIC_REPO="chiro2001/pypto-x-public"
+PUBLIC_REPO="chiro2001/pypto-x"
 DRY_RUN=0
 
 while (($# > 0)); do
