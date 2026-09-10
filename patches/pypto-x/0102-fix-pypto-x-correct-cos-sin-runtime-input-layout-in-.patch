@@ -1,0 +1,264 @@
+From 5f479d1a1dfa79e6e9e355e6977a63cbb72b48a8 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Thu, 10 Sep 2026 21:26:59 +0800
+Subject: [PATCH 102/111] fix(pypto-x): correct cos/sin runtime input layout in
+ weighted execution driver
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+rope_bits_for_positions 之前按 [position][head][column] 展平 cos/sin，而图的
+运行时输入契约是 (batch, heads, steps, rotary_dim)（head-major：k 侧沿 axis=1
+切 head、q 侧逐元素相乘）。T != heads 时图会把 (h,t) 读到第
+floor((T*h+t)/heads) 个位置的表，位置信息整体错位：
+- T=18 时从首个 full-attention 层（layer_03）开始出现最大 ~2.3 的 logits
+  偏差，被误读为'累积分歧'；
+- T=8 时每个 head 只用单一位置的表；
+- T=1 decode 不受影响（单位置时两种展平等价）。
+
+修复：按 schema 的 head-major 顺序写 buffer（head 外层/position 内层），并在
+prompt 之外的复算分支保持同样顺序；DRIVER_VERSION 升到 2。图/权重/后端与图
+契约（graph_digest 001f32b7…）不变。
+
+附带聚焦回归测试 test_qwen35_weighted_driver_rope_layout.py（不依赖仓外证据，
+旧实现下 2 例失败）。
+---
+ python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py     |  38 +++++--
+ .../tests/ut/pypto_x/test_qwen35_weighted_driver_rope_layout.py | 148 ++++++++++++++++++++++++++++
+ 2 files changed, 178 insertions(+), 8 deletions(-)
+
+diff --git a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+index 439963fc2..d6a28f602 100644
+--- a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
++++ b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+@@ -83,7 +83,10 @@ try:  # numpy 只用于 gold 比较；执行路径本身不依赖它
+ except Exception:  # pragma: no cover - 远端执行机可能没有 numpy
+     HAS_NUMPY = False
+ 
+-DRIVER_VERSION = 1
++#: v2：修复 ``rope_bits_for_positions`` 的 cos/sin 展平顺序
++#: （position-major -> schema 要求的 head-major）；该缺陷在 T≠heads 时把
++#: RoPE 位置表整体错位，是 chat(T=18) "累积分歧" 的根因。
++DRIVER_VERSION = 2
+ CHECKPOINT_NAME = "model.safetensors-00001-of-00001.safetensors"
+ PROMPTS = ("en_continuation", "zh_continuation", "chat_zh_user")
+ PROMPT_STEPS = {"en_continuation": 5, "zh_continuation": 8, "chat_zh_user": 18}
+@@ -1015,7 +1018,12 @@ def rope_tables(rope_dir: Path, positions: Sequence[int]) -> Mapping[str, Any]:
+ 
+ def rope_bf16_bits(cos_rows: Sequence[Sequence[float]], sin_rows: Sequence[Sequence[float]],
+                    heads: int = 8) -> Tuple[List[int], List[int]]:
+-    """[T,64] → [1,8,T,64] 的 bf16 原始位（RNE）。"""
++    """[T,64] → 逐位置 × heads 的 bf16 位序列（按 [T][heads][64] 展平）。
++
++    注意：这是 ``verify_rope`` 与导出位序列比对用的顺序，**不是**运行时输入
++    ``cos``/``sin`` 的顺序；运行时输入必须是 ``rope_bits_for_positions`` 给出的
++    ``[heads][T][64]``（schema ``(batch, heads, steps, rotary_dim)``）。
++    """
+ 
+     cos_bits: List[int] = []
+     sin_bits: List[int] = []
+@@ -1029,7 +1037,16 @@ def rope_bf16_bits(cos_rows: Sequence[Sequence[float]], sin_rows: Sequence[Seque
+ def rope_bits_for_positions(
+     rope_dir: Path, prompt: str, positions: Sequence[int], heads: int = 8
+ ) -> Tuple[List[int], List[int], Mapping[str, Any]]:
+-    """按位置取 cos/sin 的 bf16 位。
++    """按位置取 cos/sin 的 bf16 位，并按 schema 声明的 head-major 顺序展平。
++
++    运行时输入 ``cos``/``sin`` 的 schema 是 ``(batch, heads, steps, rotary_dim)``：
++    图内 k 侧沿 ``axis=1`` 切 head、q 侧与 ``(batch, heads, steps, rotary_dim)``
++    逐元素相乘，所以扁平 buffer 必须是 ``[head][position][column]``。
++
++    历史缺陷（2026-09-10 本轮因果定位）：本函数曾按
++    ``[position][head][column]`` 写入，T 与 heads 不等时图会把 ``(h, t)``
++    读到第 ``floor((T*h+t)/heads)`` 个位置的表 —— T=18 时除首行外位置表整体
++    错位，表现为"从第 3 层（首个 full-attention）开始、随深度累积"的偏差。
+ 
+     导出表覆盖的位置直接用**导出位**（与官方 harness 完全一致，含其 bf16 舍入
+     边界）；prompt 之外（decode 续接）的位置用 ``rope_summary.json`` 的
+@@ -1043,22 +1060,27 @@ def rope_bits_for_positions(
+     sin_export = np.asarray(loaded["sin_bf16"], dtype=np.float64)
+     if cos_export.ndim != 4 or cos_export.shape[0] != 1 or cos_export.shape[1] != heads:
+         raise DriverError("exported cos_bf16 must be [1,{},T,64]".format(heads))
++    if cos_export.shape[3] != 64:
++        raise DriverError("exported cos_bf16 last axis must be 64")
+     exported_steps = int(cos_export.shape[2])
+     table = rope_tables(rope_dir, positions)
+     cos_bits: List[int] = []
+     sin_bits: List[int] = []
+     exported_positions: List[int] = []
+     recomputed_positions: List[int] = []
+-    for index, position in enumerate(positions):
++    for position in positions:
+         if position < exported_steps:
+             exported_positions.append(int(position))
+-            for head in range(heads):
++        else:
++            recomputed_positions.append(int(position))
++    # head 外层、position 内层：与 (batch, heads, steps, rotary_dim) 逐元素对齐。
++    for head in range(heads):
++        for index, position in enumerate(positions):
++            if position < exported_steps:
+                 for column in range(64):
+                     cos_bits.append(_bf16_bits(float(cos_export[0, head, position, column])))
+                     sin_bits.append(_bf16_bits(float(sin_export[0, head, position, column])))
+-        else:
+-            recomputed_positions.append(int(position))
+-            for head in range(heads):
++            else:
+                 for column in range(64):
+                     cos_bits.append(_bf16_bits(table["cos_rows"][index][column]))
+                     sin_bits.append(_bf16_bits(table["sin_rows"][index][column]))
+diff --git a/python/tests/ut/pypto_x/test_qwen35_weighted_driver_rope_layout.py b/python/tests/ut/pypto_x/test_qwen35_weighted_driver_rope_layout.py
+new file mode 100644
+index 000000000..53a37b8df
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_qwen35_weighted_driver_rope_layout.py
+@@ -0,0 +1,148 @@
++"""qwen35_weighted_execution_driver.rope_bits_for_positions 的布局契约回归测试。
++
++运行时输入 ``cos``/``sin`` 的 schema 是 ``(batch, heads, steps, rotary_dim)``：
++
++* 图内 q 侧把 cos/sin 与 ``(batch, heads, steps, rotary_dim)`` 的 q/k 逐元素相乘；
++* k 侧 ``cos_k = slice(cos, axes=[1], 0:kv_heads)``，axis=1 就是 head。
++
++因此扁平 buffer 必须是 ``[head][position][column]``。历史缺陷按
++``[position][head][column]`` 写入，T≠heads 时图会把 ``(h, t)`` 读到
++``floor((T*h+t)/heads)`` 位置的表（T=18 时位置表整体错位），是 chat(T=18)
++"累积分裂"的根因。本测试不依赖仓外真权重证据，用自造 rope 目录钉住契约。
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import json
++import math
++import struct
++from pathlib import Path
++
++import pytest
++
++np = pytest.importorskip("numpy")
++
++DRIVER_PATH = Path(__file__).resolve().parent / "qwen35_weighted_execution_driver.py"
++
++
++def _load_driver():
++    spec = importlib.util.spec_from_file_location(
++        "qwen35_weighted_execution_driver_rope_layout_test", str(DRIVER_PATH)
++    )
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def _bf16_bits(value: float) -> int:
++    bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++    if (bits & 0x7F800000) == 0x7F800000:
++        return bits >> 16
++    rounding = 0x7FFF + ((bits >> 16) & 1)
++    return ((bits + rounding) & 0xFFFF0000) >> 16
++
++
++def _make_rope_dir(path: Path, prompt: str, steps: int, heads: int = 8, rotary_dim: int = 64):
++    path.mkdir(parents=True, exist_ok=True)
++    summary = {
++        # 与真模型一致的 32 个 inv_freq；数值本身不影响布局断言。
++        "inv_freq": [1.0 / (10_000_000.0 ** (index / 64.0)) for index in range(0, 64, 2)],
++        "rope_type": "default",
++        "attention_scaling": 1.0,
++        "mrope_section": [11, 11, 10],
++    }
++    (path / "rope_summary.json").write_text(json.dumps(summary), encoding="utf-8")
++
++    rng = np.random.default_rng(20260910)
++    # 取 bf16 可精确表示的格点值（1/64 的整数倍），避免测试里的舍入噪声。
++    rows = np.round(rng.uniform(-1.0, 1.0, size=(steps, rotary_dim)) * 64.0) / 64.0
++    cos_head = rows.astype(np.float32)
++    sin_head = np.round(rng.uniform(-1.0, 1.0, size=(steps, rotary_dim)) * 64.0) / 64.0
++    sin_head = sin_head.astype(np.float32)
++    cos_export = np.repeat(cos_head[None, :, :], heads, axis=0)[None, ...]
++    sin_export = np.repeat(sin_head[None, :, :], heads, axis=0)[None, ...]
++    np.savez(
++        path / "{}.npz".format(prompt),
++        cos_fp32=cos_export,
++        sin_fp32=sin_export,
++        cos_bf16=cos_export,
++        sin_bf16=sin_export,
++        input_ids=np.arange(steps, dtype=np.int64),
++    )
++    return cos_export, sin_export, summary
++
++
++def test_rope_buffer_is_head_major(tmp_path):
++    driver = _load_driver()
++    prompt = "fixture_prompt"
++    heads, steps = 8, 18
++    cos_export, sin_export, _ = _make_rope_dir(tmp_path, prompt, steps, heads)
++
++    cos_bits, sin_bits, info = driver.rope_bits_for_positions(
++        tmp_path, prompt, list(range(steps)), heads=heads
++    )
++    assert len(cos_bits) == heads * steps * 64
++    assert len(sin_bits) == heads * steps * 64
++    assert info["exported_positions"] == list(range(steps))
++    assert info["recomputed_positions"] == []
++
++    # schema 顺序：[head][position][column]
++    got = np.asarray(cos_bits, dtype=np.uint16).reshape(heads, steps, 64)
++    for head in range(heads):
++        for position in range(steps):
++            for column in range(64):
++                assert int(got[head, position, column]) == _bf16_bits(
++                    float(cos_export[0, head, position, column])
++                )
++    got_sin = np.asarray(sin_bits, dtype=np.uint16).reshape(heads, steps, 64)
++    for head in range(heads):
++        for position in range(steps):
++            for column in range(64):
++                assert int(got_sin[head, position, column]) == _bf16_bits(
++                    float(sin_export[0, head, position, column])
++                )
++
++    # 回归护栏：steps != heads 时，position-major 的解释必须与导出不同。
++    wrong = np.asarray(cos_bits, dtype=np.uint16).reshape(steps, heads, 64)
++    wrong_values = (wrong.astype(np.uint32) << 16).view(np.float32)
++    assert not np.array_equal(wrong_values, cos_export[0])
++
++
++def test_rope_recomputed_positions_land_in_head_major_slots(tmp_path):
++    driver = _load_driver()
++    prompt = "fixture_prompt"
++    heads, exported_steps = 8, 5
++    _make_rope_dir(tmp_path, prompt, exported_steps, heads)
++    positions = list(range(exported_steps + 3))
++    cos_bits, sin_bits, info = driver.rope_bits_for_positions(
++        tmp_path, prompt, positions, heads=heads
++    )
++    assert info["exported_positions"] == list(range(exported_steps))
++    assert info["recomputed_positions"] == [exported_steps, exported_steps + 1, exported_steps + 2]
++
++    table = driver.rope_tables(tmp_path, positions)
++    got = np.asarray(cos_bits, dtype=np.uint16).reshape(heads, len(positions), 64)
++    for head in range(heads):
++        for index in range(exported_steps, len(positions)):
++            for column in range(64):
++                expected = _bf16_bits(float(table["cos_rows"][index][column]))
++                assert int(got[head, index, column]) == expected
++
++
++def test_rope_single_decode_position_is_layout_agnostic(tmp_path):
++    driver = _load_driver()
++    prompt = "fixture_prompt"
++    heads, exported_steps = 8, 5
++    _make_rope_dir(tmp_path, prompt, exported_steps, heads)
++    positions = [exported_steps + 1]
++    cos_bits, sin_bits, info = driver.rope_bits_for_positions(
++        tmp_path, prompt, positions, heads=heads
++    )
++    assert info["recomputed_positions"] == positions
++    table = driver.rope_tables(tmp_path, positions)
++    got = np.asarray(cos_bits, dtype=np.uint16).reshape(heads, 1, 64)
++    for head in range(heads):
++        for column in range(64):
++            expected = _bf16_bits(float(table["cos_rows"][0][column]))
++            assert int(got[head, 0, column]) == expected
