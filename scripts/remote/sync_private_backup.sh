@@ -22,7 +22,8 @@ PUSH_ARCHIVE=0
 [ -d "$BACKUP/.git" ] || { echo "备份仓不存在：$BACKUP（先 git clone 工作副本到该路径）" >&2; exit 1; }
 
 echo ">> 从公开主仓拉取 main 到备份仓"
-git -C "$BACKUP" fetch --no-tags "$PUBLIC_URL" main:refs/remotes/public/main
+# 公开历史可能被重写（例如清理敏感信息后），因此对 main 的跟踪引用用 --force 更新
+git -C "$BACKUP" fetch --no-tags --force "$PUBLIC_URL" "main:refs/remotes/public/main"
 git -C "$BACKUP" update-ref refs/heads/main refs/remotes/public/main
 echo "   公开 main -> $(git -C "$BACKUP" rev-parse --short refs/heads/main)"
 
