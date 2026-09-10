@@ -11,7 +11,8 @@ PyPTO-X（PyPTO Cross-Architecture）在保留官方 PyPTO Tensor / Professional
 ```text
 实现主仓        upstream/pypto @ 34475e0d（只读快照）
 集成分支        port/pypto-x-integration @ 9aae4649e
-控制仓远端      https://github.com/chiro2001/pypto-x（私有；本地与 origin/main 同步）
+控制仓远端      https://github.com/chiro2001/pypto-x（私有归档；含第三方离线副本）
+公开镜像        https://github.com/chiro2001/pypto-x-public（公开；历史中不含第三方 PDF/HTML）
 ```
 
 **首个真实模型已端到端跑通并对齐官方实现**：`Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17` 纯文本 BF16，真实权重，AVX-512 后端：
@@ -76,6 +77,17 @@ scripts/                  worktree、smoke、资源锁包装器、远端接入
 references/               外部公开资料离线副本
 ../worktrees/             linked worktree 与全部证据目录（_meta），**不在本仓**
 ```
+
+## 公开镜像与发布
+
+```text
+私有归档  chiro2001/pypto-x         完整历史，含 references/ 的第三方讲稿离线副本
+公开镜像  chiro2001/pypto-x-public  由脚本从私有仓生成：历史中剔除 references/*.pdf|*.html|*.txt，
+                                    并在 references/README.md 标注"公开镜像不再分发"
+生成脚本  scripts/remote/publish_public_mirror.sh [--repo <owner/name>] [--dry-run]
+```
+
+发布纪律：**推送到公开仓属于对外发布动作，需用户明确指示**；脚本默认只做 dry-run 之外的 force-push 到公开仓，绝不改私有仓历史。
 
 ## 本地路径约定
 

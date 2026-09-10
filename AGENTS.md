@@ -88,7 +88,9 @@ git -C /home/chiro/projects/pypto/worktrees/pypto-x/integration log --oneline -1
 - `upstream/pypto` 是 PyPTO-X 的实现主仓，当前 edge 快照 `34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad`；stable lock 仍待 CANN release 配套验证。
 - `upstream/*` 原则上只读；禁止直接在 `master`/`main` 开发，禁止向 gitcode 上游推送。
 - 实现必须使用 `scripts/worktree/create.sh` 创建的独立 worktree（默认 `../worktrees/pypto-x/<task>`）；跨仓库任务用各自仓库的 worktree，不要把两个仓混在一个 worktree。
-- 根目录是轻量控制仓（docs/configs/scripts + submodule gitlink）；远端为私有 GitHub `chiro2001/pypto-x`，**推送是发布动作，需用户明确指示**。
+- 根目录是轻量控制仓（docs/configs/scripts + submodule gitlink）；远端为私有归档 `chiro2001/pypto-x`，
+  公开镜像是 `chiro2001/pypto-x-public`（由 `scripts/remote/publish_public_mirror.sh` 生成，历史中剔除第三方 PDF/HTML）。
+  **推送到公开仓是发布动作，需用户明确指示**；不得把上游源码、权重或证据上传到公开仓。
 - 不清理或重置未知修改。`upstream/PTOAS/.codex/CLAUDE.md` 的 dirty 来自上游 CRLF/`.gitattributes` 不一致，不是人工改动。
 
 ## Subagent 协议
