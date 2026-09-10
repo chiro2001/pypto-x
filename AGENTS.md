@@ -132,5 +132,5 @@ git -C /home/chiro/projects/pypto/worktrees/pypto-x/integration log --oneline -1
 - AMD 核显 `gfx1036`：官方支持面不含该型号，WSL2 GPU-PV 下无 `/dev/kfd`；未经真机证据不得声称 HIP 已运行。
 - 本机 CANN：`/usr/local/Ascend`（仅 toolkit，无驱动、无 950-ops）；CA-model 运行会吃 7.3 GiB，须在锁内并显式提高 `memory_max_mib`。
 - 昇腾 A2（910B3）租用环境：容器 256 vCPU / 2 TB 内存 / 1×910B3（64 GB HBM）/ CANN 9.0.0 / 驱动 25.2.0。
-  访问用 `scripts/remote/a2_910b.sh`（**隧道优先**，经 <relay-host>:2222；平台 `jt_xxx:token` 短期有效、仅作引导，容器重建后用 `--install-tunnel` 重建隧道）。
+  访问用 `scripts/remote/a2_910b.sh`（**隧道优先**，经 **<relay-ip>**:2222，用 IP 不用域名；平台 `jt_xxx:token` 短期有效、仅作引导，容器重建后用 `--install-tunnel` 重建隧道）。
   该机是租用共享资源 → **约定串行**；出网仅 HTTPS(gitcode/pypi) 可达，无 22 出网、无 TUN/NET_ADMIN（VPN 不可行）。
