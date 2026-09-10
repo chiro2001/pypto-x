@@ -60,7 +60,8 @@ decode (4 步)       11751 → 13 → 198 → 760 逐步与官方 gold 一致
 **审计与研究**
 
 - [生态审计 0001](research/audits/2026/0001-2026-09-06-pypto-ecosystem.zh-CN.md)、[Tensor/Pro 关系 0002](research/audits/2026/0002-2026-09-06-pypto-pypto-pro-relationship.zh-CN.md)、[算子可移植率 0003](research/audits/2026/0003-2026-09-07-operator-portability-ratio.zh-CN.md)、[AMD 运行态可行性 0004](research/audits/2026/0004-2026-09-10-amd-gfx1036-runtime-feasibility.zh-CN.md)、[CANN 资源评估 0005](research/audits/2026/0005-2026-09-10-cann-resource-evaluation.zh-CN.md)、[PTO-ISA CPU_SIM 基线 0006](research/audits/2026/0006-2026-09-10-pto-isa-cpu-sim-baseline.zh-CN.md)、[CANN CA-model 探针 0007](research/audits/2026/0007-2026-09-10-cann-camodel-minimal-probe.zh-CN.md)。
-- [早期移植研究](research/PYPTO_PORTING_RESEARCH.zh-CN.md)、[源码清单](research/SOURCE_MANIFEST.md)、[离线参考资料](references/README.md)。
+- [早期移植研究](research/PYPTO_PORTING_RESEARCH.zh-CN.md)、[源码清单](research/SOURCE_MANIFEST.md)、[离线参考资料](references/README.md)（公开仓不分发副本）。
+- [实现补丁集](patches/README.md)：对上游 PyPTO 的 96 个补丁（基线 `34475e0d`）、应用/验证方法与许可边界。
 
 ## 目录
 
