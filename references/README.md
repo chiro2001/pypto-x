@@ -23,3 +23,7 @@
 - 用途：保存 PTO: Tile-first megakernel programming for AI 演讲摘要和原始讲稿链接。页面内的第三方脚本、样式或云端资源未做完整镜像，离线打开时外观可能不完整。
 
 全部文件的字节数和 SHA256 见 [源码与资料快照清单](../research/SOURCE_MANIFEST.md)。
+
+## 公开镜像说明
+
+本公开镜像**不再分发**讲稿 PDF、活动页 HTML 与其 pdftotext 摘录（著作权归原作者/发布方）；请通过上面的原始 URL 获取。私有归档仓保留离线副本以便全文检索。
