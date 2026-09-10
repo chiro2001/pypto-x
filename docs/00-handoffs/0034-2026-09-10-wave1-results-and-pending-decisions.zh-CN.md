@@ -68,3 +68,17 @@ float32 主参考 + bf16 对照：prefill max_abs 0.235/0.278/0.611，mean_abs 0
 - 本快照仍**没有**任何 PyPTO-X 后端的带权整网执行结果；gold 参考只证明官方实现可跑，不证明 PyPTO-X 可跑。
 - 性能协议是提案，`configs/perf_protocol.proposed.yaml` 尚未生效。
 - AMD 的 wave32/2CU/Fast F16 是第三方证据，不得写成项目实测能力。
+
+## 7. 用户决策更新（2026-09-10 追加）
+
+```text
+prefill 范围   采用自动模式：首个带权整网只做 gold 参考对应的 T=5/8/18 + 4 步 decode；
+               T=64/128 prefill 待首轮对齐通过后另立任务（避免一次进入约 5 万 ops 的静态展开）
+CUDA 工具链    授权现在安装 CUDA Toolkit（nvcc + cuBLAS），任务 cuda-toolkit-wsl 已派发；
+               范围仅限 toolkit 包，禁止任何驱动类包；性能数字在协议生效前仍是原始事实
+AMD 路线       接受 AMD 长期只有静态证据（静态 C1–C3 + host oracle 为唯一正式证据）；
+               不再在 WSL2 内寻找 /dev/kfd，不装 ROCm/HIP 赌 gfx1036，不启动 HIP runtime 实现工作
+```
+
+仍未决：6750GRE 是否物理在位（仅影响未来是否可能恢复 gfx1031 目标，不阻塞当前计划）；
+W8A8 的 L4–L6 具体阈值按 D5 在 BF16 整网基线之后冻结。
