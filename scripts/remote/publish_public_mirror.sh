@@ -75,8 +75,12 @@ if (cd "$WORK/repo" && git log --all --oneline -- 'references/*.pdf' 'references
   echo "!! 历史中仍存在第三方副本，中止"; exit 1
 fi
 echo "   校验通过；最大 blob："
-(cd "$WORK/repo" && git rev-list --objects --all | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' 2>/dev/null \
-  | awk '$1=="blob"' | sort -k2 -nr | head -1 | awk '{printf "   %8.1f KB  %s\n", $2/1024, $3}')
+# 注意：这里不能用 `| head -1`：head 提前关闭管道会让上游收 SIGPIPE，
+# 在 `set -o pipefail` 下整脚本会静默退出（曾导致发布没有 push 成功）。
+BIG=$(cd "$WORK/repo" && { git rev-list --objects --all \
+  | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' 2>/dev/null \
+  | awk '$1=="blob" { print $2, $3 }' | sort -rn | awk 'NR==1 { printf "   %8.1f KB  %s\n", $1/1024, $2 }'; } || true)
+[ -n "$BIG" ] && printf '%s\n' "$BIG" || echo "   （未取到 blob 统计，忽略）"
 
 if [ "$DRY_RUN" = "1" ]; then
   echo ">> --dry-run：不推送。镜像在 $WORK/repo（退出后删除）"; exit 0

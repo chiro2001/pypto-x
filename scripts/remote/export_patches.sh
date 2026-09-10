@@ -33,7 +33,7 @@ git -C "$UPSTREAM_REPO" format-patch --no-signature --stat=100 -o "$OUT" "$BASE_
 # SERIES：顺序 + 主题
 : > "$OUT/SERIES"
 for p in "$OUT"/*.patch; do
-  subj=$(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$p" | head -1)
+  subj=$(sed -n 's/^Subject: \[PATCH[^]]*\] //p' "$p" | awk 'NR==1 { print; exit }' || true)
   printf '%s  %s\n' "$(basename "$p")" "$subj" >> "$OUT/SERIES"
 done
 
