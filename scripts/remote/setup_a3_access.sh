@@ -4,7 +4,7 @@
 # 用法（在租用环境的 shell 里执行，无需下载本仓库）：
 #   bash setup_a3_access.sh direct                       # 环境有公网 SSH：只装 PyPTO-X agent 公钥
 #   bash setup_a3_access.sh tunnel <relay> [port]        # 环境在内网/只有出网：装公钥 + 反向隧道到中继
-#   例：bash setup_a3_access.sh tunnel chiro@<relay-host> 2222
+#   例：bash setup_a3_access.sh tunnel <relay-user>@<relay-host> <port>
 #
 # 设计要点：
 #   - 只做加法：追加 authorized_keys、安装 autossh、起一条反向隧道；不删不改系统其它配置
