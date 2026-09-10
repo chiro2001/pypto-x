@@ -12,6 +12,18 @@
 | 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；M1C1–M1I 功能/contract 与24层 synthetic decoder 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；`iota/compare` 是 host-reference；按量计费，状态见 `~/tools/ecs-920B/state.env` |
 | QEMU AArch64 | 可用 | AArch64/SVE/SVE2 功能和编译验证 | `qemu-aarch64` 11.0.3；已验证 `max,sve256=on` 可报告 SVE/SVE2，VL=32 bytes | 不能代表鲲鹏吞吐、缓存、内存带宽或指令时序 |
 
+## 网络代理
+
+用户提供的 HTTP/HTTPS 代理用于加速受限网络下的下载（2026-09-10 实测）：
+
+```text
+本机（控制机）         http://127.0.0.1:14514        （pypi/pytorch CPU index 均 200）
+GamePC Windows         http://127.0.0.1:14514        （curl.exe 实测 200）
+GamePC WSL（NAT 模式） http://172.28.48.1:14514      （Windows 宿主网关地址；WSL 内 127.0.0.1:14514 不通）
+```
+
+直连公网同样可用，代理只作为加速/回退。代理地址不写入仓库凭据，也不改变 smoke 的离线约定。
+
 ## 5080 WSL 连接方式
 
 SSH 默认 shell 是 Windows `cmd`，直接执行 `uname`、`true` 等 Unix 命令会失败。统一使用：
