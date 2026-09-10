@@ -8,7 +8,7 @@
 |---|---|---|---|---|
 | 本地开发机 | 可用；heavy 需全局 `local` 锁；M1K-CPU PASS | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8；M1K-CPU `516 passed, 7 skipped`，scalar/AVX2/AVX-512/QEMU SVE256 的24层 external-buffer graph 通过；2026-09-10 探测：本机是 **KVM guest**（`systemd-detect-virt=kvm`）、无 `/sys/.../cpufreq`，频率不可锁 | full pytest、大 shape lowering/compile 与并行构建必须走 `scripts/resource/run_local_heavy.sh`；默认保留 4 GiB、最多 6 CPU；**绝对性能门槛在本机永久 `UNGATED`**（见 `docs/PERF_MEASUREMENT_PROTOCOL.zh-CN.md`）；系统 libblas 是 netlib reference，唯一优化 BLAS 在 numpy 内 |
 | RTX 5080（`192.168.101.5`） | 在线；GPU 由 PyPTO-X 独占；M1K-CUDA PASS | NVIDIA CUDA/PTX/NVVM 验证 | WSL2、RTX 5080 16,303 MiB、CC 12.0；2026-09-10 复测 KMD **616.92** / CUDA UMD **13.4**（文档旧值 610.62/13.3，已漂移）；Driver/PTX 连续两次执行371-input/51-output external-buffer 24层图 | GPU-only 无需 `gamepc` 锁；host-heavy 才持锁。无 `nvcc`/NVRTC/CUDART/cuBLAS/SDK headers/PyTorch/Triton；空闲时钟约 427–487 MHz vs 峰值 3090 MHz，测性能前必须 warmup 并断言时钟；当前是 correctness kernel，不是 fusion/性能结论 |
-| AMD GamePC 核显 `gfx1036` | 静态 C3 PASS；HIP runtime 判定为**架构性不可达**（见审计 0004）；6750GRE 不在 PCI 总线 | AMDGPU LLVM static codegen；HIP 只能靠裸机 Linux 或换官方支持 dGPU | C3 math/reduction/batched matmul与Qwen 4,532/4,532 static lowering通过；2026-09-10 可行性审计：gfx1036 不在 ROCm 10.0.0 / Radeon / WSL / HIP SDK for Windows 任何官方表内；WSL2 GPU-PV 架构下没有 `/dev/kfd`；第三方一手证据显示 ROCm 7.1.1 裸机可跑 gfx1036 kernel（wave32、2 CU、Fast F16，仅第三方参考） | 静态 LLVM/ELF与host oracle不等于HIP执行；MFMA/WMMA/INT8 dot/XNACK 仍 unknown；WSL 经 Mesa d3d12 可跑 GL compute（已实测），但那是 GLSL→DXIL 路径，不能执行我们的 AMDHSA ELF，且无 bf16/int8/subgroup 扩展；不能代表6750GRE性能 |
+| AMD GamePC 核显 `gfx1036` | 静态 C3 PASS；HIP runtime 判定为**架构性不可达**（见审计 0004）；6750GRE 不在 PCI 总线 | AMDGPU LLVM static codegen；HIP 只能靠裸机 Linux 或换官方支持 dGPU | C3 math/reduction/batched matmul与Qwen 4,532/4,532 static lowering通过（graph v2 计数；v3 为 4,550，AMD 静态 compiler 尚未对新图重跑）；2026-09-10 可行性审计：gfx1036 不在 ROCm 10.0.0 / Radeon / WSL / HIP SDK for Windows 任何官方表内；WSL2 GPU-PV 架构下没有 `/dev/kfd`；第三方一手证据显示 ROCm 7.1.1 裸机可跑 gfx1036 kernel（wave32、2 CU、Fast F16，仅第三方参考） | 静态 LLVM/ELF与host oracle不等于HIP执行；MFMA/WMMA/INT8 dot/XNACK 仍 unknown；WSL 经 Mesa d3d12 可跑 GL compute（已实测），但那是 GLSL→DXIL 路径，不能执行我们的 AMDHSA ELF，且无 bf16/int8/subgroup 扩展；不能代表6750GRE性能 |
 | 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；M1C1–M1I 功能/contract 与24层 synthetic decoder 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；`iota/compare` 是 host-reference；按量计费，状态见 `~/tools/ecs-920B/state.env` |
 | QEMU AArch64 | 可用 | AArch64/SVE/SVE2 功能和编译验证 | `qemu-aarch64` 11.0.3；已验证 `max,sve256=on` 可报告 SVE/SVE2，VL=32 bytes | 不能代表鲲鹏吞吐、缓存、内存带宽或指令时序 |
 
@@ -154,6 +154,8 @@ NUMA 节点、CPU affinity、内存带宽工具
 4. 最后才做性能和 PMU 测量。
 
 ## AMD GamePC `gfx1036` 核显接入结果
+
+> **勘误（2026-09-10）**：本节的 `4,532`/`4,098`/`844` 等计数属于 graph contract v2；v3（GDR decay 门修复后）为 `4,550`，AMD 静态 compiler 尚未对 v3 重跑。详见 `docs/00-handoffs/ERRATA.zh-CN.md` ERR-0001。
 
 6750GRE 实测无法安装，当前以 GamePC 核显作为临时 AMD 目标。2026-09-10 轻量探测确认：
 

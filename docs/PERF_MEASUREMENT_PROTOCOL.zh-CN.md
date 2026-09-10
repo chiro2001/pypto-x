@@ -265,7 +265,7 @@ dispatch_seconds = (R 次独立 launch 的总时间 - 单次 launch 内 R 个 op
 
 ```yaml
 execution_model: op_by_op_dispatch   # 当前唯一可取值；fused 尚未存在
-dispatch_count: <图 op 数，T=1/past=4096 时为 4532>
+dispatch_count: <图 op 数；graph v3 (T=1/past=4096) 为 4550，v2 为 4532>
 dispatch_seconds: <float>
 kernel_seconds: <float|null>
 ```
@@ -648,7 +648,7 @@ environment_freeze:
 measurement:
   level: L0_op | L1_model | L2_compile
   execution_model: op_by_op_dispatch | fused | not_applicable
-  dispatch_count: 4532
+  dispatch_count: 4532   # graph v2；v3 为 4550
   dispatch_dominated: <bool>
   warmup_iterations: 5
   measured_iterations: 21
@@ -753,7 +753,7 @@ notes: []
 4. **阈值承载位置**：新建 `configs/perf_lock.yaml`，还是扩展 `configs/development_lock.yaml`？
 5. **prefill T 的范围**：`T>1` 的 GDR 是静态 SSA 展开，op 数线性增长。按
    `_gdr_step` 每步 21 个 op × 18 个 GDR 层测算：
-   `ops(T) ≈ 4532 + 378 × (T-1)` → `T=16 ≈ 10,200`、`T=128 ≈ 52,500`、`T=512 ≈ 197,700`。
+   `ops(T) ≈ 4550 + 378 × (T-1)`（graph v3；v2 基数为 4532）→ `T=16 ≈ 10,220`、`T=128 ≈ 52,556`、`T=512 ≈ 197,708`。
    （**这是估算，不是实测**；`_gdr_step` 在 `qwen35.py:3265-3445` 内恰有 21 个
    `builder.op(` 调用且无内部分支，已逐行核对。落地前应用一个只数 op、不做 lower 的
    轻量 driver 复核。）
