@@ -215,3 +215,28 @@ _meta/pypto-x/verify-w8a-decay-fix/ERRATUM.zh-CN.md
 **证据**：`_meta/pypto-x/verify-qwen35-t18-divergence-localization/{validation.json,brief.zh-CN.md,raw/}`
 （near-tie 明细 `raw/recompute_metrics.json`、T=1 口径 `raw/decode_invariance.json`、
 driver 盘点 `raw/evidence_inventory.json`）。
+
+## ERR-0003（2026-09-11）：W8A8 契约 §3.1 全开 region 计数 555 与 §3.4 lm_head 双 packing 算术不自洽
+
+**状态**：契约勘误（**不影响已实现行为**）。`qwen35-w8a8-binding`（C2）**未实现**该路径；
+遇到量化 tied `lm_head` 显式拒绝（fail-closed），因此不存在静默错误——本条只修正文档算术。
+
+**发现问题**：独立验收 `verify-qwen35-w8a8-scheme-binding`（agent `d640b1c6`），discrepancy **VD-3**。
+
+**算术核对**：
+
+```text
+契约 §3.1：全开权重 region 数写作 555
+契约 §3.4：lm_head 为 tied weight，量化后需要"双 packing"（+2 region）
+已实现口径：186 个线性层 → 554 region；再 +2 = 556
+即：555 只对应"lm_head +1"，与 §3.4 的"+2"不一致
+```
+
+**裁定**：以 §3.4 语义为准，全开应为 **556**，555 为文档笔误；本阶段未实现该路径，
+不改变已冻结的计数（BF16 368 / W8A8 默认 518 = 320 param + 150 quant_scale + 48 state）。
+
+**待办**：后续实现 §3.4/§3.5 路径（C3+ 或契约修订）时同步把 §3.1 的 555 修正为 556，
+并验证 lm_head 双 packing 的 region 与覆盖率口径。
+
+**证据**：`_meta/pypto-x/verify-qwen35-w8a8-scheme-binding/{validation-verifier.json}`（VD-3 明细）；
+契约 `docs/20-planning/0002-2026-09-10-qwen35-w8a8-linear-contract.zh-CN.md` §3.1/§3.4。

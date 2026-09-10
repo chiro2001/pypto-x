@@ -11,12 +11,12 @@
 ### 0. 状态行
 
 ```text
-W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED
+W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED_W8C_C1_C2_VERIFIED_W8B_B5_REDUCE_BROADCAST_VERIFIED_W8B_B3A_CUDA_EVENT_TIMING_VERIFIED
 ```
 
 ```text
 实现主仓     upstream/pypto @ 34475e0d（只读）
-集成分支     port/pypto-x-integration @ dca302ef4（W8G/A2 验收/W8H/RoPE 修复/W8I）
+集成分支     port/pypto-x-integration @ 8700f7416（W8G/A2 验收/W8H/W8I/RoPE 修复/C1+C2/B5/B3a）
 工作副本     /home/chiro/projects/pypto/pypto_x（= 公开主仓 chiro2001/pypto-x 的克隆，origin 指向公开仓）
 私有备份     ../pypto_x_private_bkp（archive 分支，含第三方离线副本）+ GitHub chiro2001/pypto-x-private
 证据目录     ../worktrees/_meta/pypto-x/<task>/（不在仓内；权重亦在仓外）
@@ -27,7 +27,7 @@ W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS
 
 本仓刻意做成**只靠仓内文件即可接手**：新会话先读本文件 → `HANDOFF.zh-CN.md` §0（恢复第一小时 TL;DR）→ ERRATA → 路线图，然后跑本文件 §3 自检（不重跑 smoke、不加载权重）。
 用户只说"继续"时，按 HANDOFF §0 的默认优先级行动；待用户决定的事项见路线图 §10。本机 `gh` 已认证为 `chiro2001`（可用于仓库元数据；推送仍按发布纪律）。
-拿不准就查 `_meta` 证据目录或问用户——**不要凭记忆编造阶段数字**，一切以 `configs/development_lock.yaml` 与 `docs/00-handoffs/0036-*` 为准。
+拿不准就查 `_meta` 证据目录或问用户——**不要凭记忆编造阶段数字**，一切以 `configs/development_lock.yaml` 与 `docs/00-handoffs/0037-*` 为准。
 
 ### 1. 必读顺序
 

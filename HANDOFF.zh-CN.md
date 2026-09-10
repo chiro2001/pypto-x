@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED`
+状态：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED_W8C_C1_C2_VERIFIED_W8B_B5_REDUCE_BROADCAST_VERIFIED_W8B_B3A_CUDA_EVENT_TIMING_VERIFIED`
 
-最后更新：2026-09-11 00:30 CST（Asia/Shanghai）
+最后更新：2026-09-11 01:35 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -14,7 +14,8 @@
 
 ```text
 1. 读：AGENTS.md → 本文件（§1–§2）→ ERRATA.zh-CN.md（含 ERR-0002）→ 路线图 §6/§10。
-2. 跑 §12 自检。预期：integration @ dca302ef4、111 个补丁、两把锁 FREE、CANN toolkit 在 /usr/local/Ascend。
+2. 跑 §12 自检。0036 冻结点为 integration @ dca302ef4、111 个补丁；**0037 波次后**为 integration @ 8700f7416、118 个补丁；
+   两把锁 FREE、CANN toolkit 在 /usr/local/Ascend。
    自检不重跑 smoke、不下载依赖、不加载权重。
 3. 不要做的事：不把 chat(T=18) 说成"真实数值累积分歧/失败"（ERR-0002 已定位为 driver 缺陷并修复；
    严格 argmax 17/18 + row 14 near-tie，按 2026-09-10 修订判据 PASS，但 17/18 必须同时可见）；
@@ -22,20 +23,23 @@
    不把静态 lowering 说成真机 PASS；不把 A2 的限定式关闭说成"PyPTO Ascend 后端已通"；
    不推公开仓/不改历史/不发权重证据，除非用户当次明确指示。
 4. 用户说"继续"时的默认动作（按优先级）：
-   a) W8H/W8I 独立验收已 PASS（verify-qwen35-a2-vllm-ascend-baselines，无返工）；下一步按路线图
-      §10 待决策选择 W8B 或 W8C；A2 NPU 任务必须遵守卡锁协议 /root/a2-npu-lock/（只保护 NPU 执行）。
-   b) W8B 硬化与 W8C W8A8-linear 起点（见路线图 §10 待决策）。
-   c) 可选：若用户要求 chat 严格 18/18，评估 327b17158（--debug-f32-residual，未合入、未采纳）。
+   a) 0037 波次已收口：W8B B5（reduce/broadcast 原生化，T=18 prefill 750.7s→208.2s）、
+      W8B B3a（CUDA cuEvent 计时）、W8C C1+C2（W8A8 scheme/binding）全部独立验收 PASS；
+      W8H/W8I 基线独立验收 PASS。
+   b) 下一批候选（见 0037 §7 与路线图 §10）：W8B B1/B2/B3b/B3c/B4；W8C C3→C8；
+      性能热点 matmul 65.9s / reshape 27.8s / slice 27.3s / transpose 20.7s（T=18 口径）。
+   c) 待用户裁决：Framework Adapter（W8J?）、W8D/E、W8H/W8I 后续范围、本机磁盘清理。
+   d) A2 NPU 任务必须遵守卡锁协议 /root/a2-npu-lock/（只保护 NPU 执行）。
 5. 并发与资源：活动 subagent ≤3；重任务一律经 scripts/resource/run_local_heavy.sh（返回 75/69 就等待重试，
    禁止绕过）；A2 与 920B 都是租用共享资源，约定串行；A2 只锁 NPU 执行（下载/编译/环境准备可并行）。
 6. 重任务需要用户批准才启动（AGENTS.md「Subagent 协议」第一条）。
 7. 提交纪律：公开主仓 = 本目录（origin）；改完实现 → cherry-pick 到 integration → 独立 verify → 更新
    development_lock/快照/ERRATA → scripts/remote/export_patches.sh → git push origin main → scripts/remote/sync_private_backup.sh。
-   （本批 0036 收口 commits 仍只在本地 main，尚未 push。）
+   （0036/0037 收口 commits 均只在本地 main，尚未 push；push 前需用户当次明确批准。）
 ```
 
 找不到答案时，先查 `_meta` 证据目录（`../worktrees/_meta/pypto-x/<task>/`）与 `docs/00-handoffs/` 的历史快照，
-再问用户；**不要凭记忆编造数字**——所有阶段性数字都应以 `configs/development_lock.yaml` 与 0036 快照为准。
+再问用户；**不要凭记忆编造数字**——所有阶段性数字都应以 `configs/development_lock.yaml` 与 0037 快照为准。
 
 ## 1. 接手摘要
 
@@ -47,7 +51,7 @@
 - AMD GPU：GPU 公共层 → HIP/ROCDL；
 - Ascend CCE/CANN 保持为一个 target plugin，避免功能回退。
 
-**当前进度一句话**：W1–W4（Core IR/ABI、CPU scalar/AVX2/AVX-512/SVE256、GPU common、CUDA C1–C2）与 AMD `gfx1036` 静态 C1–C3 已冻结；Qwen3.5-0.8B M0–M1K 已冻结；**W8A 真权重 BF16 整网对齐已收口**——en(T=5)/zh(T=8) strict PASS，chat(T=18) 严格 argmax 17/18、row 14 near-tie，按 2026-09-10 修订判据 PASS；期间修复 ERR-0001（decay 门缺 `exp(A_log)`）与 ERR-0002（driver cos/sin 布局缺陷，此前 chat"真实累积分歧"结论作废）；控制仓已公开化；**昇腾 A2(910B3) 真机验收 PASS**（限定式关闭 blocked），W8H/W8I vllm-ascend 基线**独立验收 PASS**。
+**当前进度一句话**：W1–W4（Core IR/ABI、CPU scalar/AVX2/AVX-512/SVE256、GPU common、CUDA C1–C2）与 AMD `gfx1036` 静态 C1–C3 已冻结；Qwen3.5-0.8B M0–M1K 已冻结；**W8A 真权重 BF16 整网对齐已收口**——en(T=5)/zh(T=8) strict PASS，chat(T=18) 严格 argmax 17/18、row 14 near-tie，按 2026-09-10 修订判据 PASS；期间修复 ERR-0001（decay 门缺 `exp(A_log)`）与 ERR-0002（driver cos/sin 布局缺陷，此前 chat"真实累积分歧"结论作废）；控制仓已公开化；**昇腾 A2(910B3) 真机验收 PASS**（限定式关闭 blocked），W8H/W8I vllm-ascend 基线**独立验收 PASS**；**0037 波次（2026-09-11）**：W8C C1+C2（W8A8 scheme/binding，R1–R5/R7–R9）独立验收 PASS，W8B B5（AVX-512 reduce 超线性修复 + broadcast 全 native）使 T=18 chat prefill 从 750.7s 降到 208.2s（整网位级一致），W8B B3a（CUDA cuEvent 计时）三轮验收后 PASS，并发现平台级 `wsl2_cuevent_rate_offset`（raw cuEvent 偏低 4.4–9.1%，run 内标定+corrected 字段已落地）。
 
 ## 2. 当前的量化状态（最重要）
 
@@ -139,16 +143,16 @@ chat(T=18)  PASS（修订判据）严格 argmax 17/18（唯一 mismatch row 14�
 ## 7. 建议的下一步波次（W8 及以后）
 
 ```text
-① W8H/W8I 已完成并通过独立验收（PASS，无返工；6 条非阻断 discrepancy 已登记）
-   （A2 NPU 任务一律走 /root/a2-npu-lock/ 卡锁；只保护 NPU 执行）
-② W8A-C 限定式关闭后的真实缺口：Core IR → PTO/CCE codegen（W8E/E4）；stable CANN 9.2.0-beta.2 未上卡
-③ W8B 硬化：AVX2 packed 参数级算子 / SVE fallback 分类清零（含 broadcast/where）/
-   CUDA cuEvent 计时 + GEMM vs cuBLAS 相对门槛 / 本机 L0–L1 性能基线 → 冻结 perf 协议
-④ W8C：W8A8-linear 实现（契约已冻结）：C1 scheme → C2 binding → C3 AVX2 → C4 AVX-512(VNNI) →
-   C5 SVE256 → C6 CUDA/AMD → C7 layer ladder → C8 model validation
-⑤ W8D/W8E：GDR fused WY、长序列 T=64/128 代价评估；CANN report（plotly）、npusim 复现性、
-   IR→PTO 桥与 Ascend hooks；AMD 静态 compiler 对 v3 重跑
-⑥ 可选：若用户要求 chat 严格 18/18，评估任务分支 327b17158（--debug-f32-residual，未合入）
+① 0037 波次已完成：W8C C1+C2、W8B B5、W8B B3a 全部独立验收 PASS（详见 0037 快照）
+② 性能续作：T=18 剩余热点 matmul 65.9s / reshape 27.8s / slice 27.3s / transpose 20.7s；
+   W8B B1（AVX2 packed）、B2（SVE fallback）、B3b（GEMM vs cuBLAS）、B3c（本机 L0/L1）、B4（perf freeze）
+③ W8C 续作：C3 AVX2 widening → C4 AVX-512(VNNI) → C5 SVE256 → C6 CUDA/AMD 静态 →
+   C7 layer ladder → C8 model validation（R6/R10–R14 未验；D5 阈值待 BF16 基线后冻结）
+④ 待用户裁决：Framework Adapter（是否立 W8J；torch custom-op / vLLM plugin / HF 集成）；
+   W8D/E：GDR fused WY、T=64/128 代价评估、Core IR→PTO/CCE codegen（E4）、stable CANN 9.2.0-beta.2 上卡
+⑤ 平台注记：GamePC WSL2 的 cuEvent rate offset（wsl2_cuevent_rate_offset）已写入 known limits；
+   CUDA 计时必须 raw + corrected + platform_flags 同报
+⑥ 可选：若用户要求 chat 严格 18/18，评估任务分支 327b17158（--debug-f32-residual，未合入、未采纳）
 ```
 
 ## 8. 可用资源实况
@@ -188,7 +192,13 @@ GamePC 192.168.101.5  WSL2 24 线程 / 30 GiB（宿主 61.4 GiB）/ RTX 5080 16 
   性能协议仍为提案，profiler 开销不得当模型性能引用；
 - CPU vector runtime liveness + AVX-512 packed cast/transpose/embedding：真权重整网峰值从 309.6 GiB 投影降到 3.9 GiB 实测；
 - GDR T=128：五后端 + 920B 原生 PASS，关闭 `gdr_t128_not_validated`；
-- 基础设施：CUDA Toolkit、本机 CANN toolkit、PTO-ISA CPU_SIM 125/125、CANN CA-model 最小用例（审计 0006/0007）。
+- 基础设施：CUDA Toolkit、本机 CANN toolkit、PTO-ISA CPU_SIM 125/125、CANN CA-model 最小用例（审计 0006/0007）；
+- **W8C C1+C2 独立验收 PASS**（R1–R5/R7–R9；QuantizedTensorDesc + 4 opcode + binding v2/layout v2/coverage；
+  `w8a8_linear_coverage=0.9988…`、`whole_net_int8_compute_ratio=0.9770…`，static shape model）；
+- **W8B B5 独立验收 PASS**：T=18 chat prefill 750.718s→208.174s（验收复跑 233.33s），reduce_sum 5963→2.45 ms/call、
+  broadcast 962/962 native；位级一致（58/315 与 43/265 两套独立用例）；全量 753/746/7/0；
+- **W8B B3a 独立验收 PASS（r3，0 discrepancy）**：raw cuEvent `kernel_seconds` + 平台速率标定 +
+  `kernel_seconds_corrected` + `platform_flags`；`wsl2_cuevent_rate_offset` 已进 known limits。
 
 ## 10. 许可证状态
 
@@ -202,7 +212,7 @@ GamePC 192.168.101.5  WSL2 24 线程 / 30 GiB（宿主 61.4 GiB）/ RTX 5080 16 
 2. 理解 §2 的判据口径：chat(T=18) 严格 argmax 17/18 + row 14 near-tie（修订判据 PASS），
    不得表述为"真实数值累积分歧"或"完全无保留的对齐"，17/18 必须同时可见；
 3. 理解 ERR-0002：T=1 算子层 no-op，但端到端 decode 因 state 继承而变，不得写"decode 端到端无变化"；
-4. 理解仓库布局（公开主仓为工作副本、私有备份、补丁 111 个、发布纪律）；
+4. 理解仓库布局（公开主仓为工作副本、私有备份、补丁 118 个、发布纪律）；
 5. 理解并发上限与资源锁纪律，以及 A2 卡锁协议（/root/a2-npu-lock/，只保护 NPU 执行）；
 6. 知道 A2(910B3) W8A-C 真机验收已 PASS（限定式），W8H/W8I 独立验收已 PASS；访问脚本在本地私有侧；
 7. 未经用户明确指示不推送公开仓、不发布权重/证据、不改写公开历史。
@@ -219,7 +229,7 @@ scripts/worktree/status.sh
 bash -n scripts/worktree/*.sh scripts/smoke/*.sh scripts/resource/*.sh scripts/remote/*.sh
 python3 -c "import yaml;[yaml.safe_load(open(p)) for p in ['configs/development_lock.yaml','configs/agent_tasks.yaml','configs/upstream_lock.yaml']];print('yaml ok')"
 /home/chiro/projects/.resource-locks/resource-lock status     # 只观察；取得锁必须用 run
-ls patches/pypto-x/*.patch | wc -l                            # 应为 111
+ls patches/pypto-x/*.patch | wc -l                            # 应为 118（0037 冻结点）
 ```
 
 除非用户明确要求，接手自检**不重跑** smoke、不下载依赖、不加载权重。

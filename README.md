@@ -6,11 +6,11 @@ PyPTO-X（PyPTO Cross-Architecture）在保留官方 PyPTO Tensor / Professional
 
 ## 当前状态（2026-09-10）
 
-状态行：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED`
+状态行：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED_W8C_C1_C2_VERIFIED_W8B_B5_REDUCE_BROADCAST_VERIFIED_W8B_B3A_CUDA_EVENT_TIMING_VERIFIED`
 
 ```text
 实现主仓        upstream/pypto @ 34475e0d（只读快照）
-集成分支        port/pypto-x-integration @ dca302ef4
+集成分支        port/pypto-x-integration @ 8700f7416
 私有归档        https://github.com/chiro2001/pypto-x-private（私有；含第三方离线副本）
 公开主仓        https://github.com/chiro2001/pypto-x（公开；历史中不含第三方 PDF/HTML）
 ```
@@ -71,7 +71,7 @@ decode (4 步)       11751 → 13 → 198 → 760 逐步与官方 gold 一致（
 
 - [生态审计 0001](research/audits/2026/0001-2026-09-06-pypto-ecosystem.zh-CN.md)、[Tensor/Pro 关系 0002](research/audits/2026/0002-2026-09-06-pypto-pypto-pro-relationship.zh-CN.md)、[算子可移植率 0003](research/audits/2026/0003-2026-09-07-operator-portability-ratio.zh-CN.md)、[AMD 运行态可行性 0004](research/audits/2026/0004-2026-09-10-amd-gfx1036-runtime-feasibility.zh-CN.md)、[CANN 资源评估 0005](research/audits/2026/0005-2026-09-10-cann-resource-evaluation.zh-CN.md)、[PTO-ISA CPU_SIM 基线 0006](research/audits/2026/0006-2026-09-10-pto-isa-cpu-sim-baseline.zh-CN.md)、[CANN CA-model 探针 0007](research/audits/2026/0007-2026-09-10-cann-camodel-minimal-probe.zh-CN.md)。
 - [早期移植研究](research/PYPTO_PORTING_RESEARCH.zh-CN.md)、[源码清单](research/SOURCE_MANIFEST.md)、[离线参考资料](references/README.md)（公开仓不分发副本）。
-- [实现补丁集](patches/README.md)：对上游 PyPTO 的 111 个补丁（基线 `34475e0d`，HEAD `dca302ef4`）、应用/验证方法与许可边界。
+- [实现补丁集](patches/README.md)：对上游 PyPTO 的 118 个补丁（基线 `34475e0d`，HEAD `8700f7416`）、应用/验证方法与许可边界。
 
 ## 目录
 
