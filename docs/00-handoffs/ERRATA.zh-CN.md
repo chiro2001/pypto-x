@@ -37,6 +37,10 @@
 - 无性能结论（本机 KVM guest 无 cpufreq，绝对门槛永久 UNGATED）
 ```
 
+> 更新（2026-09-10，见 [ERR-0002](#err-0002)）：`zh_continuation`/`chat_zh_user` 已由
+> `qwen35-weighted-multiprompt` 补齐，但其 prefill 数字受 driver 布局缺陷影响作废（替换值见 ERR-0002）；
+> decode 第 4 步仍无 gold 参考行；AMD 静态 compiler 仍未对 v3 重跑。
+
 
 **错在哪**：图 v1/v2 在 `python/pypto/portable/qwen35.py::_append_gdr_graph` 把 decay 门写成
 `-A_log ⊙ softplus(a + dt_bias)`，官方实现（`transformers/models/qwen3_5/modeling_qwen3_5.py:619`，
@@ -67,11 +71,15 @@
 
 **修复后的真实基线**：
 
+> **⚠ 勘误（2026-09-10，见 [ERR-0002](#err-0002)）**：本段数字产生于存在 cos/sin 布局缺陷的旧
+> `qwen35_weighted_execution_driver.py`，**已整体作废**；替换数字（en/zh/chat 三 prompt）与新的
+> near-tie 判据见下方 ERR-0002。图契约 v3 的 digest/ops 与 decode token 链仍有效。
+
 ```text
 graph contract version   3
 graph_digest(past=4096)  66dd4077...
 Core operations          4,550（(1,1,4096)）/ 6,728（(1,5,0)）
-prefill 对齐（真权重）    argmax 5/5、cosine 0.9999136、max_abs 0.2338（gold dtype 带 0.2352）
+prefill 对齐（真权重）    argmax 5/5、cosine 0.9999136、max_abs 0.2338（gold dtype 带 0.2352）  ← 作废（旧 driver）
 decode 对齐              11751 → 13 → 198 → 760 逐步与 gold 一致
 全量回归                 674 passed, 7 skipped
 ```
@@ -101,3 +109,109 @@ docs/20-planning/0003-...roadmap         排期数字按 v3 口径
 python/tests/ut/pypto_x/amd_gfx1036_c3_static_lower_driver.py   过时 docstring（由 A1 任务修）
 python/tests/ut/pypto_x/qwen35_weighted_execution_evidence.py   过时 plans 数字（由 A1 任务修）
 ```
+
+## ERR-0002（2026-09-10）：Qwen3.5 W8A prefill driver 的 cos/sin 运行时布局缺陷
+
+**状态**：修复已合入 integration `5f479d1a1`（cherry-pick 自 `work/qwen35-t18-divergence-localization @ d05e25734`，base `9aae4649e`），
+独立验收 **PASS**（worktree `verify/qwen35-t18-divergence-localization`，证据 `_meta/pypto-x/verify-qwen35-t18-divergence-localization/`）。
+验收期间 integration 前进到 `dca302ef4`，`5f479d1a1` 仍是其 ancestor 且 driver blob（`d6a28f602…`）未变。
+
+**错在哪**：`python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py::rope_bits_for_positions`
+把 cos/sin 运行时输入按 `[position][head][column]`（position-major）展平；但图契约
+（`python/pypto/portable/qwen35.py:1560-1561`）的输入 shape 是 `(batch, heads, steps, rotary_dim)`，
+图内 k 侧沿 `axis=1` 切 head（`:2190-2204`）、q 侧与该形状逐元素相乘，因此扁平 buffer 必须是
+`[head][position][column]`（head-major）。驱动侧少了 head/position 维换序，且字节长度校验只看 nbytes，
+缺陷长期未被发现。
+
+**后果**：T≠heads（T=5/8/18，heads=8）时位置表整体错位——图内 `(head h, token t)` 实际读到第
+`floor((T*h+t)/8)` 个位置行；T=18 时表现为位置表分块错位。**此前"chat(T=18) 真实数值累积分歧"
+（3.78×band、row 11 起放大、首个不达标层 gold index 8）的结论作废**；根因是**测试驱动缺陷**，
+不是模型/GDR/累加精度问题。
+
+**修复**：`d05e25734` → integration `5f479d1a1`；driver-only + 新增聚焦回归测试
+`python/tests/ut/pypto_x/test_qwen35_weighted_driver_rope_layout.py`（旧实现下 2 failed/1 passed，修复后 3 passed）；
+`DRIVER_VERSION = 2`。**图契约零改动**：digest `(1,1,4096)=66dd4077…/4,550 ops`、
+`(1,18,0)=001f32b7…/13,748 ops` 不变；无契约版本升级、无后端/权重改动。
+
+### 判据修订：near-tie 例外（2026-09-10 用户裁定，条件已验证）
+
+```text
+逐行 argmax 与 gold 一致为硬门槛；唯一例外：
+  若 gold 该行 top-1/top-2 margin ≤ 0.5×band 且 ours argmax == gold top-2 token，
+  则该行记为 near-tie flip，不判失败，但必须单列计数（严格口径结果必须同时可见）。
+实测 chat row 14（0-based）满足：
+  gold fp32 top1 271 = 19.956333160 / top2 198 = 19.841325760，margin 0.115007 = 0.18813×band；
+  阈值 0.5×band = 0.305655；ours argmax = 198 = gold runner-up（ours top1/top2 为 19.875 并列）
+  → 采纳后 chat = 17/17 有效行 + 1 near-tie = PASS。
+其他 margin ≤ 0.5×band 的行：chat row 3（margin 0.221712 = 0.3627×band，ours 与 gold 一致，本来 matched）；
+  en/zh 各 0 行。严格口径原始结果 chat 17/18（FAIL）必须保留可见，不得只报 17/17+1。
+```
+
+### 替换数字（pre-fix 全部作废）
+
+| prompt | T | argmax（严格） | cosine | max_abs | band | 逐层 min cos | 判定 |
+|---|---:|---|---:|---:|---:|---|---|
+| en_continuation | 5 | 5/5 | 0.99997235 | 0.159756（0.68×band） | 0.235212 | 0.99993098（layer_12_output） | PASS |
+| zh_continuation | 8 | 8/8 | 0.99993803 | 0.235296（0.85×band） | 0.277682 | 0.99993980（layer_21_output） | PASS |
+| chat_zh_user | 18 | **17/18**（唯一 row 14 near-tie） | 0.99989976 | 0.416867（0.68×band） | 0.611310 | 0.99988217（layer_23_output） | 修订后 PASS |
+
+```text
+final_hidden vs gold：en 0.99994485 / 0.334759；zh 0.99992611 / 0.290360；chat 0.99984263 / 0.430467
+decode token 链（不变）：en 11751→13→198→760→6511；zh 271→248068→271→248069→271；
+                          chat 109266→6115→103724→1167→16451
+state：有限；recurrent |state|max en 0.55–13.27 / zh 0.82–13.29 / chat 0.69–14.14
+全量 ut：694 collected / 687 passed / 7 skipped（7 个 skip 全为 test_cuda_qwen_c2.py 无 CUDA 驱动设备项）；
+         base 9aae4649e 为 674 passed/7 skipped（新增 13 = portability 10 + 修复测试 3）
+```
+
+**重要口径更正**：T=1/decode 在**算子/布局层是 no-op**（单 position cos/sin 位序列修复前后逐位相同），
+但**端到端 decode logits 会变**——decode 消费 prefill 产出的 KV/recurrent state；三个 prompt 各自的
+51 个 prefill 输出中 **43 个 sha256 改变**，最早改变的是 `layer_03_new_k`。因此
+**不得写"decode 端到端无变化"**，也不得把旧证据里的 decode cosine/max_abs 当作修复后数字
+（token 链不变，逐步 logits 数字以验收 `validation.json` 为准）。
+
+**未采纳的替代路线**：`327b17158`（`--debug-f32-residual` 调试变体，改 `python/pypto/portable/qwen35.py`）
+**未合入 integration、未采纳**，保留在任务分支 `work/qwen35-t18-divergence-localization`；
+仅作为"未来若要求严格 18/18"的可选后续路线，当前不进入任何冻结结论。
+
+### 受影响任务与作废数字清单
+
+```text
+qwen35-weighted-multiprompt           en/zh/chat 全量 prefill/逐层/误差带数字作废
+                                      （旧 en cos 0.99991364/max 0.233829；zh 0.99973494/0.463474；
+                                        chat 0.99799387/2.310620、row 11 起放大、layer_07/gold index 8 定位）
+qwen35-vector-runtime-packed-liveness en T=5 prefill logits 数字作废（旧 0.99991364/0.233829）
+                                      与 final_hidden 数字作废（旧 0.99984563/0.38160705）
+verify-w8a-decay-fix                  en T=5 prefill logits 数字作废（C3/C4 的 logits 部分，旧 0.9999136/0.2338）；
+                                      decode token 链仍有效
+qwen35-t18-divergence-localization    该任务自身 before/after 表：before 数字作废，after 以独立验收为准
+qwen35-bf16-weighted-execution        BLOCKED_CAPABILITY，未产出 prefill 数字（driver 拷贝更旧），无可勘误
+A2 vllm-ascend / portability 等       虽含旧 driver 拷贝，但未产出 Qwen prefill 数字，不受影响
+```
+
+**滚动文档/配置中的旧数字位置**（本批已就地更正）：`HANDOFF.zh-CN.md:56-58`、`README.md:21`、
+`AGENTS.md:48-49`、本文件 ERR-0001 段落、`0035` 快照 §2、路线图 `0003` §2/§6/§10、
+`configs/development_lock.yaml` 的 `wave8a_results` 与 `current_task`。
+
+**不受影响**：
+
+```text
+- portable 图 v3 / graph_digest 66dd4077… / 4,550（(1,1,4096)）/ 13,748 ops（(1,18,0)）/ 权重映射 / layout digests
+- ERR-0001 的 GDR decay exp(A_log) 修复本身（独立的真实缺陷）
+- 后端 lowering / packed 内核 / 非 Qwen-driver 证据（liveness A/B、AMD 静态、CUDA、SVE 等）
+- decode 单步的 RoPE 输入本身（但 decode 状态继承 prefill，需按修复后口径引用）
+```
+
+**历史快照的追加标注**：`docs/00-handoffs/0035-*.md` 文末追加勘误指引（不覆盖原文）。
+
+**就地勘误文件**（2026-09-10 追加，只新增、不改原文件）：
+
+```text
+_meta/pypto-x/qwen35-weighted-multiprompt/ERRATUM.zh-CN.md
+_meta/pypto-x/qwen35-vector-runtime-packed-liveness/ERRATUM.zh-CN.md
+_meta/pypto-x/verify-w8a-decay-fix/ERRATUM.zh-CN.md
+```
+
+**证据**：`_meta/pypto-x/verify-qwen35-t18-divergence-localization/{validation.json,brief.zh-CN.md,raw/}`
+（near-tie 明细 `raw/recompute_metrics.json`、T=1 口径 `raw/decode_invariance.json`、
+driver 盘点 `raw/evidence_inventory.json`）。

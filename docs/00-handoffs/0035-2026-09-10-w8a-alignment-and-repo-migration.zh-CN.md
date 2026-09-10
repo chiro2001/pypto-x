@@ -99,3 +99,13 @@ CPU_SIM       ../worktrees/_meta/pypto-x/pto-isa-cpu-sim-baseline/
 CUDA toolkit  ../worktrees/_meta/pypto-x/cuda-toolkit-wsl/
 CANN 安装     ../worktrees/_meta/pypto-x/cann-toolkit-local-install/
 ```
+
+---
+
+## 勘误指引（2026-09-10 追加，不覆盖上文）
+
+**ERR-0002**（W8A prefill driver cos/sin 运行时布局缺陷）使本快照 §2 的 en/zh/chat prefill 数字，
+以及"chat T=18 真实累积分歧（3.78×band、row 11 起放大、首个不达标层 gold index 8）"的结论**作废**；
+替换数字、near-tie 判据与受影响证据清单见 [`ERRATA.zh-CN.md`](ERRATA.zh-CN.md#err-0002) 与 `0036` 快照。
+图契约 v3 的 digest/ops、decode token 链、权重映射不受影响；A2(910B) 状态已从"在线待验收"更新为
+"W8A-C 真机验收 PASS（限定式关闭 blocked）"，W8H/W8I vllm-ascend 基线独立验收进行中。
