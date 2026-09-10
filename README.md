@@ -1,46 +1,82 @@
 # PyPTO-X：PyPTO 跨架构后端
 
-PyPTO-X（PyPTO Cross-Architecture）是本项目的工作名称，目标是在保留 PyPTO Tensor/Professional 双前端定位的前提下，抽取可移植 Core IR 与 target ABI，并逐步支持鲲鹏 CPU、x86_64 CPU、NVIDIA GPU 和 AMD GPU。Qwen3.5-0.8B M0–M1K 与 CPU/SVE/CUDA external-buffer correctness 已冻结；真实 BF16 带权模型等待授权。AMD `gfx1036` 静态 C3 已验证 math、任意轴 reduction 与 rank-2/3/4 exact-batch matmul，Qwen 静态 lowering 为4,532/4,532 ops（graph v2 计数；v3 为4,550，见 [勘误](docs/00-handoffs/ERRATA.zh-CN.md)）；WSL runtime 仍为 `BLOCKED_DEVICE`，没有 HIP 真机执行或性能结论。各后端能力只以对应验收证据为准。
+PyPTO-X（PyPTO Cross-Architecture）在保留官方 PyPTO Tensor / Professional 双前端定位的前提下，抽取目标无关 Core IR 与 Target/Compiler/Runtime ABI，并逐步支持 x86_64 CPU（AVX2/AVX-512）、鲲鹏 AArch64（SVE256）、NVIDIA GPU（CUDA/NVVM）与 AMD GPU（HIP/ROCDSL 方向）。Ascend CCE/CANN 保留为一个 target plugin。
 
-## 快速入口
+**Agent 的接手入口在 [`AGENTS.md`](AGENTS.md)** —— 状态行、必读顺序、快速自检和当前阶段都在那里；本文件只做项目概览与文档索引。
 
-- [新 Agent 接手文档](HANDOFF.zh-CN.md)：当前状态、冻结决策、远端漂移、资源、待确认事项和下一步。
-- [交接档案索引](docs/00-handoffs/README.md)：按序号和日期保存阶段交接快照。
-- [W1 公共接口 RFC](docs/10-architecture/0001-2026-09-07-w1-core-target-contract.zh-CN.md)：Tensor-first Core IR、Target/Compiler/Runtime ABI 的共同契约。
-- [W2 bridge/scalar/Ascend 契约](docs/10-architecture/0002-2026-09-07-w2-bridge-scalar-ascend-contract.zh-CN.md)：Tensor bridge、CPU scalar reference 和 Ascend adapter 的验收边界。
-- [portable bootstrap 契约](docs/10-architecture/0003-2026-09-07-portable-bootstrap-contract.zh-CN.md)：无 native 环境的显式轻量导入模式及默认兼容门禁。
-- [W3 x86 vector 契约](docs/10-architecture/0004-2026-09-07-w3-x86-vector-contract.zh-CN.md)：CPU vector common、AVX2/AVX-512 能力探测、尾块与汇编验收。
-- [早期研究报告](research/PYPTO_PORTING_RESEARCH.zh-CN.md)：源码结构、可复用边界和方案比较；其中早期路线已由接手文档/RFC 的冻结决策取代。
-- [PyPTO 生态审计](research/audits/2026/0001-2026-09-06-pypto-ecosystem.zh-CN.md)：CANN 融合链路、classic/Pro 算子面、Gym/GDR 实况和版本锁定策略。
-- [PyPTO/Pro 关系审计](research/audits/2026/0002-2026-09-06-pypto-pypto-pro-relationship.zh-CN.md)：两种编程模式的共享基础、独立链路和 PyPTO-X 前端决策影响。
-- [算子可移植占比审计](research/audits/2026/0003-2026-09-07-operator-portability-ratio.zh-CN.md)：classic、Pro 和 Gym 的语义可移植率、当前实现复用率与 MVP 含义。
-- [源码与资料清单](research/SOURCE_MANIFEST.md)：仓库 URL、固定提交、子模块、完整性验证、许可证状态和 SHA256。
-- [项目文件布局](docs/PROJECT_LAYOUT.zh-CN.md)：PyPTO-X 的模块边界、源码归属和许可证分层。
-- [Worktree 与 subagent 计划](docs/WORKTREE_AGENT_PLAN.zh-CN.md)：分支拓扑、任务依赖、启动参数和一小时长等待协议。
-- [Qwen3.5-0.8B BF16/W8A8 模型 MVP](docs/20-planning/0001-2026-09-07-qwen35-08b-bf16-w8a8-mvp.zh-CN.md)：模型 revision、算子闭包、量化契约、后端顺序和验收标准。
-- [Qwen3.5-0.8B 首期 W8A8-linear 契约](docs/20-planning/0002-2026-09-10-qwen35-w8a8-linear-contract.zh-CN.md)：量化 scheme、混合精度边界、binding/opcode 扩展、后端前置与 L0–L7 精度阶梯（D1–D12 已获用户批准）。
-- [W8 并行执行路线图（资源与并发版）](docs/20-planning/0003-2026-09-10-w8-parallel-roadmap.zh-CN.md)：波次任务、锁占用预算、并发上限与验收冻结流程（供外部评审）。
-- [性能测量协议与门槛策略](docs/PERF_MEASUREMENT_PROTOCOL.zh-CN.md)：三层测量对象、统计与方差门槛、FLOP 口径、G1–G4 门槛阶梯与 16 条反模式。
-- [AMD `gfx1036` 运行态可行性审计](research/audits/2026/0004-2026-09-10-amd-gfx1036-runtime-feasibility.zh-CN.md)：官方支持面、WSL2 GPU-PV 的结构性限制与可行替代路线。
-- [资源矩阵](docs/RESOURCE_MATRIX.zh-CN.md)：5080 WSL、AMD `gfx1036` 核显、鲲鹏 920B 和 QEMU 的使用安排。
-- [本机重任务资源锁策略](docs/LOCAL_RESOURCE_POLICY.zh-CN.md)：跨项目 `local` 锁、cgroup 限制、运行时资源监控与安全停止规则。
-- [无模型冒烟测试规范](docs/SMOKE_TEST_SPEC.zh-CN.md)：每个 subagent 只执行一次的测试契约。
-- [上游版本锁](configs/upstream_lock.yaml)：edge/stable 双轨仓库 SHA、release 锚点和晋升验证项。
-- [开发集成锁](configs/development_lock.yaml)：integration 冻结点、task commit 与验证证据。
-- [模型目标配置](configs/model_targets.yaml)：机器可读的 Qwen3.5-0.8B 与 BF16/W8A8 范围。
-- [离线参考资料](references/README.md)：两份公开讲稿、可检索文本和活动页面。
-- [官方 PyPTO 文档源码](upstream/pypto/docs/README.md)：固定快照内含 706 个 Markdown 文档文件及图片。
+## 当前状态（2026-09-10）
+
+状态行：`EXECUTION_W8A_DECAY_FIX_VERIFIED_MULTIPROMPT_IN_PROGRESS_AMD_RUNTIME_STATIC_ONLY`
+
+```text
+实现主仓        upstream/pypto @ 34475e0d（只读快照）
+集成分支        port/pypto-x-integration @ 9aae4649e
+控制仓远端      https://github.com/chiro2001/pypto-x（私有；本地与 origin/main 同步）
+```
+
+**首个真实模型已端到端跑通并对齐官方实现**：`Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17` 纯文本 BF16，真实权重，AVX-512 后端：
+
+```text
+prefill (en, T=5)   argmax 5/5 一致、cosine 0.9999136、max|Δlogits| 0.2338（gold 自身 fp32↔bf16 误差带 0.2352）
+decode (4 步)       11751 → 13 → 198 → 760 逐步与官方 gold 一致
+资源               峰值 RSS 3.9 GiB、单次前向约 132 s（6 CPU cgroup 内）
+独立验收           PASS_WITH_BOUNDARIES（§6 口径见 W8 路线图）
+```
+
+对齐过程中发现并修复了一个**冻结契约级 bug**（ERR-0001）：GDR decay 门缺 `exp(A_log)`，导致 recurrent state 指数爆炸、整网 logits 完全错位。详见 [`docs/00-handoffs/ERRATA.zh-CN.md`](docs/00-handoffs/ERRATA.zh-CN.md)。
+
+## 能力矩阵
+
+| 目标 | 状态 | 证据入口 |
+|---|---|---|
+| CPU scalar / AVX2 / AVX-512 | 正确性冻结；AVX-512 已支持真权重整网（liveness + packed cast/transpose/embedding） | `configs/development_lock.yaml` W3/W8 |
+| AVX2 packed 参数级算子 | 未实现（仍 host_reference + liveness） | 路线图 W8B/B1 |
+| AArch64 SVE256 | 功能与汇编冻结（QEMU + 鲲鹏 920B 原生）；`iota/compare/broadcast/where` 仍有 host-reference fallback | W4/W6 + 路线图 B2 |
+| NVIDIA CUDA | C1–C2 正确性冻结（Driver API + PTX JIT）；Toolkit（nvcc 13.3 + cuBLAS）已装，性能分层待做 | W4 + 路线图 B3a/B3b |
+| AMD `gfx1036` | 静态 C1–C3（math/reduction/matmul，Qwen 静态 4,532/4,532，v3 为 4,550）；运行态判定**架构性不可达**，按用户决定长期只保留静态证据 | 审计 0004 |
+| Ascend CCE/CANN | 仅有 adapter seam（不 import CANN，靠 `PYPTO_X_ASCEND_HOOKS` 注入）；真机回归仍 blocked；本机 CANN 9.2.0-beta.2 toolkit + CA-model 最小用例已验证 | 审计 0006/0007、路线图 W8E |
+| W8A8-linear | 契约已冻结（D1–D12 用户批准），**实现未开始** | [`docs/20-planning/0002-*`](docs/20-planning/0002-2026-09-10-qwen35-w8a8-linear-contract.zh-CN.md) |
+
+## 文档索引
+
+**状态与交接**
+
+- [`AGENTS.md`](AGENTS.md)：**agent 入口**（状态、必读顺序、自检、协议、边界）。
+- [`HANDOFF.zh-CN.md`](HANDOFF.zh-CN.md)：滚动接手文档（决策、资源、已验证结果、待确认事项）。
+- [`docs/00-handoffs/`](docs/00-handoffs/README.md)：阶段快照索引 + [`ERRATA`](docs/00-handoffs/ERRATA.zh-CN.md)（勘误总表）。
+- [`configs/development_lock.yaml`](configs/development_lock.yaml)：integration 冻结点、task commit、known_limits。
+
+**规划与契约**
+
+- [Qwen3.5-0.8B BF16/W8A8 MVP](docs/20-planning/0001-2026-09-07-qwen35-08b-bf16-w8a8-mvp.zh-CN.md)与[首期 W8A8-linear 契约](docs/20-planning/0002-2026-09-10-qwen35-w8a8-linear-contract.zh-CN.md)。
+- [W8 并行执行路线图（资源与并发）](docs/20-planning/0003-2026-09-10-w8-parallel-roadmap.zh-CN.md)：波次、锁占用预算、并发上限、验收冻结流程。
+- W1–W3 契约：[Core/Target ABI](docs/10-architecture/0001-2026-09-07-w1-core-target-contract.zh-CN.md)、[bridge/scalar/Ascend](docs/10-architecture/0002-2026-09-07-w2-bridge-scalar-ascend-contract.zh-CN.md)、[portable bootstrap](docs/10-architecture/0003-2026-09-07-portable-bootstrap-contract.zh-CN.md)、[x86 vector](docs/10-architecture/0004-2026-09-07-w3-x86-vector-contract.zh-CN.md)。
+
+**规范与流程**
+
+- [Worktree/subagent 计划](docs/WORKTREE_AGENT_PLAN.zh-CN.md)、[资源矩阵](docs/RESOURCE_MATRIX.zh-CN.md)、[本机重任务锁策略](docs/LOCAL_RESOURCE_POLICY.zh-CN.md)、[无模型冒烟规范](docs/SMOKE_TEST_SPEC.zh-CN.md)、[性能测量协议](docs/PERF_MEASUREMENT_PROTOCOL.zh-CN.md)（提案态）。
+
+**审计与研究**
+
+- [生态审计 0001](research/audits/2026/0001-2026-09-06-pypto-ecosystem.zh-CN.md)、[Tensor/Pro 关系 0002](research/audits/2026/0002-2026-09-06-pypto-pypto-pro-relationship.zh-CN.md)、[算子可移植率 0003](research/audits/2026/0003-2026-09-07-operator-portability-ratio.zh-CN.md)、[AMD 运行态可行性 0004](research/audits/2026/0004-2026-09-10-amd-gfx1036-runtime-feasibility.zh-CN.md)、[CANN 资源评估 0005](research/audits/2026/0005-2026-09-10-cann-resource-evaluation.zh-CN.md)、[PTO-ISA CPU_SIM 基线 0006](research/audits/2026/0006-2026-09-10-pto-isa-cpu-sim-baseline.zh-CN.md)、[CANN CA-model 探针 0007](research/audits/2026/0007-2026-09-10-cann-camodel-minimal-probe.zh-CN.md)。
+- [早期移植研究](research/PYPTO_PORTING_RESEARCH.zh-CN.md)、[源码清单](research/SOURCE_MANIFEST.md)、[离线参考资料](references/README.md)。
 
 ## 目录
 
-- upstream/pypto：GitCode 官方 PyPTO submodule，包含 Tensor `pypto` 与 Professional `pypto_pro`。
-- upstream/pypto-gym：官方算子、模型接入和 Qwen3.5-9B 案例。
-- upstream/pto-isa：PTO Tile ISA、设备实现、CPU simulator 和文档。
-- upstream/pypto-community：无共同 Git 祖先的 community implementation，含完整 simpler runtime 子模块。
-- upstream/PTOAS：PTO assembler/optimizer，含两个固定测试子模块。
-- research：本次分析和来源清单。
-- references：外部公开资料的离线副本。
+```text
+upstream/pypto            官方 PyPTO（Tensor pypto + Professional pypto_pro），固定 commit 的 submodule
+upstream/pypto-gym        官方算子/模型接入（含 Qwen3.5-9B 案例）
+upstream/pto-isa          PTO Tile ISA、设备实现、CPU_SIM 与 cost model
+upstream/pypto-community  无共同祖先的 community implementation
+upstream/PTOAS            PTO assembler/optimizer
+configs/                  任务 DAG、版本锁、开发集成锁、模型目标、性能协议提案
+docs/                     架构 RFC、规划、规范、阶段快照与勘误
+research/                 调研报告与审计
+scripts/                  worktree、smoke、资源锁包装器、远端接入
+references/               外部公开资料离线副本
+../worktrees/             linked worktree 与全部证据目录（_meta），**不在本仓**
+```
 
-## 一句话建议
+## 许可证与发布边界
 
-PyPTO-X 以 Tensor frontend 形成公共 Core IR，并冻结 Target/Compiler/Runtime ABI；Pro 保留为 Ascend expert dialect，并只通过显式 portable subset 接入公共层。CPU 开发优先级为 scalar reference → AVX2 → AVX-512 → SVE256，不开发 NEON 优化后端；之后再做 NVIDIA 和 AMD 共用的 GPU 中层及各自 codegen。许可证调整的积极意向应尽快落成正式文本或明确书面例外，再发布非华为处理器后端。
+本地快照的 CANN Open Software License 2.0 仍限制在华为 AI 处理器/软件场景；本仓只包含文档、配置与脚本（上游源码以 submodule 引用形式存在，权重与证据在仓外）。**对外发布非华为处理器衍生后端前，必须取得新许可证、双许可证或明确书面例外**；本文件不构成法律意见。
