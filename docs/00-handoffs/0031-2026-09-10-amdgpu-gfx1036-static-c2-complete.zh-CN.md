@@ -82,3 +82,9 @@ remaining gap        434
 本阶段没有HIP真机执行，没有整网native kernel，也没有模型权重；static artifact decode现在依赖同版LLVM工具链重推导，这是刻意的fail-closed边界。
 
 下一步C3实现math、任意轴reduction与rank-3/4 batched matmul，目标达到4,532/4,532静态lowerable。即使达到100%，在GamePC WSL提供 `/dev/kfd`、ROCm/HIP runtime并完成设备执行前，状态仍必须是 `BLOCKED_DEVICE`。
+
+---
+
+> **勘误（2026-09-10）**：本文中的 `4,532`（Core operations / 静态覆盖）属于 graph contract v2。
+> 后续发现 GDR decay 门缺 `exp(A_log)` 并已修复（契约升到 v3），新计数为 `4,550`（(1,1,4096)）/ `6,728`（(1,5,0)）。
+> 详见 `ERRATA.zh-CN.md` 的 ERR-0001。

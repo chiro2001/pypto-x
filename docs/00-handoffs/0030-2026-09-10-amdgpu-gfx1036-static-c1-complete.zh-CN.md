@@ -98,3 +98,9 @@ runtime 的 availability、load、workspace_size 与 launch 都返回 `BLOCKED_D
 ## 下一步
 
 进入 C2 layout/indexing/control 静态 codegen，优先闭包 Qwen gap 中数量最高且不依赖device library的 cast、reshape、transpose、broadcast、slice、concat/split、sub/div/neg、constant/iota/compare/where。每个新增op必须有真实LLVM/object门禁和独立host oracle审计；在ROCm/HIP runtime可用前仍不得声称真机执行。
+
+---
+
+> **勘误（2026-09-10）**：本文中的 `4,532`（Core operations / 静态覆盖）属于 graph contract v2。
+> 后续发现 GDR decay 门缺 `exp(A_log)` 并已修复（契约升到 v3），新计数为 `4,550`（(1,1,4096)）/ `6,728`（(1,5,0)）。
+> 详见 `ERRATA.zh-CN.md` 的 ERR-0001。

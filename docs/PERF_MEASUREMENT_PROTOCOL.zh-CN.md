@@ -93,7 +93,7 @@ CUDA 侧只能靠 `context_synchronize()` 前后 wall clock（`python/pypto/back
 
 ```text
 profile            = {batch: 1, steps: 1, past_length: 4096}
-operation_total    = 4532
+operation_total    = 4532   # graph v2；v3（decay 修复后）为 4550
 plan_total         = 4532
 llvm_ir_bytes      = 10510232
 resource.lower_seconds = 1.929875544999959

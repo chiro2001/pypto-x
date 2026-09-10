@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`EXECUTION_W6_QWEN35_BF16_WEIGHTED_EXECUTION_AUTHORIZED_WAVE1_PARTIAL_COMPLETE_AMD_RUNTIME_ARCHITECTURALLY_BLOCKED`
+状态：`EXECUTION_W8A_QWEN35_BF16_WEIGHTED_FORWARD_ALIGNED_PENDING_VERIFICATION_AMD_RUNTIME_STATIC_ONLY`
 
-最后更新：2026-09-10 16:45 CST（Asia/Shanghai）
+最后更新：2026-09-10 19:05 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -16,7 +16,7 @@
 - AMD GPU：GPU 公共层 → HIP/ROCDL；
 - 现有 Ascend CCE 路径保持为一个 target plugin，并避免功能回退。
 
-目前已完成 W1/W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2、Qwen3.5-0.8B M0–M1K，以及 AMD `gfx1036` 静态 C1–C3。C3 在 exact HEAD `bcf9516e6419d232338988238ffa8f79e59079c1` 上闭包 math、任意轴 reduction 与 rank-2/3/4 exact-batch matmul；独立验收 `577 passed, 7 skipped`，production LLVM host oracle 覆盖每算子718个FP32样本、65,536个BF16 raw输入和10个reduction/matmul case。Qwen真实profile的4,532个Core operations已全部进入当前静态compiler；没有生成整网object或冒充HIP运行。GamePC runtime仍为 `BLOCKED_DEVICE`，Qwen带权执行仍需授权。
+目前已完成 W1/W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2、Qwen3.5-0.8B M0–M1K，以及 AMD `gfx1036` 静态 C1–C3。C3 在 exact HEAD `bcf9516e6419d232338988238ffa8f79e59079c1` 上闭包 math、任意轴 reduction 与 rank-2/3/4 exact-batch matmul；独立验收 `577 passed, 7 skipped`，production LLVM host oracle 覆盖每算子718个FP32样本、65,536个BF16 raw输入和10个reduction/matmul case。Qwen真实profile的4,532个Core operations（**graph v2 计数；v3 修复 GDR decay 门后为4,550，见 `docs/00-handoffs/ERRATA.zh-CN.md` ERR-0001**）已全部进入当前静态compiler；没有生成整网object或冒充HIP运行。GamePC runtime仍为 `BLOCKED_DEVICE`，Qwen带权执行仍需授权。
 
 2026-09-10 用户授权下载/加载固定 revision 的 Qwen3.5-0.8B 权重后，W6 进入带权执行波次 1（见快照 `0033`、`0034`）：权重已下载校验（1,746,942,600 B，sha256 `04b1c301…`），官方 gold 参考已冻结并合入 integration（`52b7e3d7c`），W8A8-linear 契约已冻结（D1–D12 用户批准），性能测量协议已归档（本机绝对门槛永久 `UNGATED`），AMD 运行态审计判定 gfx1036 在 WSL2 形态下**架构性不可达**。权重接入与 GDR T=128 验收仍在进行；**尚无任何 PyPTO-X 后端的带权整网结果**。
 

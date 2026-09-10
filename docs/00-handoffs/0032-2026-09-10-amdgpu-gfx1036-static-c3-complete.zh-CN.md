@@ -77,3 +77,9 @@ peak RSS            about 95.4 MiB
 GamePC WSL当前没有 `/dev/kfd`、`rocminfo`、`hipcc`、`libamdhip64` 或HSA runtime；`/dev/dri`存在不能替代HIP。因此W5静态operator closure已完成，但AMD运行态仍为 `BLOCKED_DEVICE`，没有真机正确性或性能结论。
 
 项目下一条模型主线是获用户明确授权后执行固定revision的Qwen3.5-0.8B BF16纯文本模型，再规划W8A8-linear；AMD主线则等待可用ROCm/HIP设备环境。两者都不会因静态4,532/4,532而自动解锁。
+
+---
+
+> **勘误（2026-09-10）**：本文中的 `4,532`（Core operations / 静态覆盖）属于 graph contract v2。
+> 后续发现 GDR decay 门缺 `exp(A_log)` 并已修复（契约升到 v3），新计数为 `4,550`（(1,1,4096)）/ `6,728`（(1,5,0)）。
+> 详见 `ERRATA.zh-CN.md` 的 ERR-0001。

@@ -148,3 +148,9 @@ r2 的中间通过记录也保持只读，用于解释后续主审查为什么�
 ## 下一步
 
 进入 `qwen35-bf16-runtime-binding`：先在不触碰模型文件的前提下冻结 typed buffer/mmap、parameter manifest 校验、tied-storage alias、state buffer 与 launcher 绑定契约。完成这一层后，只有在用户明确授权下载/加载固定 revision 权重并确认参考环境时，才进入 BF16 带权文本模型执行；W8A8-linear 排在 BF16 之后。
+
+---
+
+> **勘误（2026-09-10）**：本文中的 `4,532`（Core operations / 静态覆盖）属于 graph contract v2。
+> 后续发现 GDR decay 门缺 `exp(A_log)` 并已修复（契约升到 v3），新计数为 `4,550`（(1,1,4096)）/ `6,728`（(1,5,0)）。
+> 详见 `ERRATA.zh-CN.md` 的 ERR-0001。
