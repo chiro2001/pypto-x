@@ -2,7 +2,18 @@
 set -euo pipefail
 
 PROJECT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-LOCK_TOOL=/home/chiro/projects/.resource-locks/resource-lock
+# 跨项目资源锁：优先 PYPTO_X_LOCK_TOOL / PYPTO_X_LOCK_ROOT，其次按"项目上两级/.resource-locks"推导，
+# 最后回退到本项目的约定路径。渠道可移植性见 README「本地路径约定」。
+LOCK_ROOT_DEFAULT="$(dirname -- "$(dirname -- "$PROJECT_ROOT")")/.resource-locks"
+if [ -n "${PYPTO_X_LOCK_TOOL:-}" ]; then
+  LOCK_TOOL="$PYPTO_X_LOCK_TOOL"
+elif [ -n "${PYPTO_X_LOCK_ROOT:-}" ]; then
+  LOCK_TOOL="${PYPTO_X_LOCK_ROOT}/resource-lock"
+elif [ -x "${LOCK_ROOT_DEFAULT}/resource-lock" ]; then
+  LOCK_TOOL="${LOCK_ROOT_DEFAULT}/resource-lock"
+else
+  LOCK_TOOL=/home/chiro/projects/.resource-locks/resource-lock
+fi
 MONITOR=${PROJECT_ROOT}/scripts/resource/monitor_local_heavy.py
 
 usage() {

@@ -77,6 +77,19 @@ references/               外部公开资料离线副本
 ../worktrees/             linked worktree 与全部证据目录（_meta），**不在本仓**
 ```
 
+## 本地路径约定
+
+文档与配置里出现的 `/home/chiro/...` 是**维护者本机布局**（控制仓、`../worktrees/`、跨项目资源锁），不是可移植假设：
+
+```text
+脚本            scripts/worktree/*、scripts/smoke/* 由 BASH_SOURCE 推导项目根；不写死路径
+锁包装器        scripts/resource/run_local_heavy.sh 支持 PYPTO_X_LOCK_TOOL / PYPTO_X_LOCK_ROOT 覆盖，
+                否则按"项目上两级/.resource-locks"推导，最后回退到约定路径
+驱动/工具       新增脚本应使用相对仓库或环境变量（如 --asset-dir、PYPTO_X_ASSET_DIR）而不是绝对路径
+配置            configs/*.yaml 中的 lock_root / resource_lock_root 记录的是跨项目协议的约定路径，可用环境变量覆盖
+证据            一律放在 ../worktrees/_meta/...（仓外），不引用本机绝对路径以外的机器
+```
+
 ## 许可证与发布边界
 
 本地快照的 CANN Open Software License 2.0 仍限制在华为 AI 处理器/软件场景；本仓只包含文档、配置与脚本（上游源码以 submodule 引用形式存在，权重与证据在仓外）。**对外发布非华为处理器衍生后端前，必须取得新许可证、双许可证或明确书面例外**；本文件不构成法律意见。
