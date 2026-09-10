@@ -108,7 +108,7 @@ local 锁：全局排他；启动要求 MemAvailable ≥ 8192 MiB（这是"启�
 | PTO-ISA CPU_SIM 构建+125 用例 | 134 s + 1.75 s | 1.76 GiB |
 | CANN CAModel 单条 64×64 TADD | 95 s | 7.3 GiB |
 
-**外推（标注为估算）**：`ops(T) ≈ 6,728 + 378×(T−5)`（(1,T,0) 口径）→ T=8 ≈ 7,862 ops、T=18 ≈ 11,642 ops；wall 按 ops 近似线性，T=8 约 160–200 s、T=18 约 250–350 s（含绑定与编译开销）。
+**实测（取代早先外推）**：`ops(T) = 6,728 + 540×(T−5)`（(1,T,0) 口径）→ T=8 = **8,348**、T=18 = **13,748**（T=5 的 6,728 一致）。wall 不随 ops 线性：T=5 prefill 132 s、T=8 约 377 s、T=18 约 932 s（含绑定/编译；单锁内 8 段重活合计约 46 min）。
 
 ---
 
@@ -218,12 +218,19 @@ local 锁：全局排他；启动要求 MemAvailable ≥ 8192 MiB（这是"启�
   证据：validation.json + brief.zh-CN.md + raw/ 原始日志 + runner 资源日志
   独立验收不得复用实现方的 JSON 结论，须自行取数
 
-A1/A2 数值（真权重，逐 prompt）
-  prefill：逐行 argmax 与 gold 一致；cosine ≥ 0.9995；max|Δlogits| ≤ 0.35（gold 自身 fp32↔bf16 带宽 0.2352）
+A1/A2 数值（真权重，逐 prompt）——判据已改为"相对 gold 自身 dtype 噪声底"（2026-09-10 用户裁定）
+  prefill：逐行 argmax 与 gold 一致（硬门槛）
+  band = gold 自身 fp32↔bf16 的 max_abs 与 cosine，随 prompt 变化：
+      en(T=5)  0.235212 / 0.999956
+      zh(T=8)  0.277682 / 0.999929
+      chat(T=18) 0.611310 / 0.999772
+  判据：max|Δlogits| ≤ 2×band 且 cosine ≥ band_cosine − 1e-4
+      （en 0.2338/cos 0.999914 PASS；zh 0.4635=1.67×band、cos 0.999735 PASS；
+        chat 2.3106=3.78×band、cos 0.997994 FAIL → 真实累积分歧，单列为精度任务）
   decode ：对齐口径 = prefill 末行 ↔ gold decode_logits[0]，第 k 步 ↔ decode_logits[k+1]；
            每步报「输入 token / argmax / cosine / max_abs」，逐步 argmax 与 gold 一致
   逐层   ：`hidden_states_layers`（25×T×1024）逐层 cosine ≥ 0.999（gold 已提供，不得只看 logits）
-  state  ：prefill 结束后的 recurrent state 必须有限且 |state|max 在 O(1) 量级（防再次指数爆炸）
+  state  ：prefill 结束后的 recurrent state 必须有限且 |state|max 在 O(1) 量级（实测三 prompt 12.4–14.2）
   资源   ：峰值 RSS 与 wall 必须记录；CC 上限按 §3.2 的实际 MemoryMax 计算余量
 
 性能（B3*）
