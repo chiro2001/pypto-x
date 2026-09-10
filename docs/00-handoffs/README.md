@@ -49,3 +49,4 @@ NNNN-YYYY-MM-DD-<阶段或主题>.zh-CN.md
 | 0032 | 2026-09-10 | AMD `gfx1036` 静态 C3 完成、HIP runtime 等待设备 | [AMDGPU 静态 C3 完成快照](0032-2026-09-10-amdgpu-gfx1036-static-c3-complete.zh-CN.md) |
 | 0033 | 2026-09-10 | 用户授权 Qwen3.5-0.8B 权重、W6 带权执行波次 1 派发 | [权重授权与波次 1 派发](0033-2026-09-10-bf16-weight-authorization-and-wave1-dispatch.zh-CN.md) |
 | 0034 | 2026-09-10 | 波次 1 部分完成：gold 参考、AMD 运行态审计、性能协议、W8A8 契约 | [波次 1 结果与待决策](0034-2026-09-10-wave1-results-and-pending-decisions.zh-CN.md) |
+| 0035 | 2026-09-10 | W8A 真权重对齐（en/zh PASS、chat T=18 分歧）、ERR-0001 修复与验收、仓库公开化迁移、A2(910B) 上线 | [W8A 对齐与仓库迁移快照](0035-2026-09-10-w8a-alignment-and-repo-migration.zh-CN.md) |

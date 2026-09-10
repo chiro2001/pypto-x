@@ -11,7 +11,7 @@
 ### 0. 状态行
 
 ```text
-EXECUTION_W8A_DECAY_FIX_VERIFIED_MULTIPROMPT_IN_PROGRESS_AMD_RUNTIME_STATIC_ONLY
+W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_PASS_CHAT_T18_DIVERGENT_ASCEND_A2_ONLINE
 ```
 
 ```text
@@ -38,7 +38,8 @@ EXECUTION_W8A_DECAY_FIX_VERIFIED_MULTIPROMPT_IN_PROGRESS_AMD_RUNTIME_STATIC_ONLY
 ```text
 Core IR / Target ABI / CPU scalar / AVX2 / AVX-512 / SVE256 / GPU common / CUDA C1–C2
 Qwen3.5-0.8B M0–M1K（无权重 decoder、3/320/48 binding、CPU/CUDA external ingestion）
-真权重 BF16 整网：AVX-512 上 prefill argmax 5/5、cosine 0.99991、峰值 RSS 3.9 GiB；decode 11751→13→198→760
+真权重 BF16 整网（图 v3）：en(T=5)/zh(T=8) 按"相对 gold dtype 带宽"判据 PASS（cos 0.99991/0.99973、
+  max_abs 0.99×/1.67×band），decode 三 prompt token 链全对、state 有限；chat(T=18) 仍 FAIL（3.78×band，真实累积分歧）
   → 独立验收 PASS_WITH_BOUNDARIES；图契约 v3（4,550 ops / digest 66dd4077…）
 GDR T=128：五后端 + 920B 原生 PASS（gdr_t128_not_validated 已关闭）
 AMD gfx1036 静态 C1–C3（运行态判定架构性不可达，用户决定长期只保留静态证据）
@@ -49,7 +50,8 @@ AMD gfx1036 静态 C1–C3（运行态判定架构性不可达，用户决定长
 **进行中 / 待办**
 
 ```text
-W8A-A1  qwen35-weighted-multiprompt：T=5/T=8/T=18 三 prompt 的 prefill + 4 步 decode 覆盖
+W8A-B   T≥8 精度攻坚：chat(T=18) 分歧（row 11 起、首个不达标层 gold index 8）
+W8A-C   Ascend 真机验收（**最高优先、可立即开始**）：A2(910B) 在线，PTO-ISA NPU ST → CANN 样例 → adapter hooks
 W8B     AVX2 packed 参数级算子 / SVE fallback 分类清零 / CUDA cuEvent 计时 + GEMM 基线 / 本机 L0-L1 性能
 W8C     W8A8-linear 实现（契约已冻结；按后端 DAG C1→C8）
 W8D     GDR fused WY、长序列 T=64/128 代价评估
