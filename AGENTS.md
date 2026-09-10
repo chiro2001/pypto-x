@@ -17,7 +17,8 @@ EXECUTION_W8A_DECAY_FIX_VERIFIED_MULTIPROMPT_IN_PROGRESS_AMD_RUNTIME_STATIC_ONLY
 ```text
 实现主仓     upstream/pypto @ 34475e0d（只读）
 集成分支     port/pypto-x-integration @ 9aae4649e
-控制仓远端   https://github.com/chiro2001/pypto-x（私有，本地与 origin/main 同步）
+控制仓远端   https://github.com/chiro2001/pypto-x（私有归档）
+公开镜像     https://github.com/chiro2001/pypto-x-public（公开；历史中不含第三方 PDF/HTML）
 证据目录     ../worktrees/_meta/pypto-x/<task>/（不在仓内；权重亦在仓外）
 ```
 
