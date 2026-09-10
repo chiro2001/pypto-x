@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`EXECUTION_W6_QWEN35_M1K_CPU_COMPLETE_CUDA_INGESTION_READY_AMD_GFX1036_IDENTIFIED`
+状态：`EXECUTION_W6_QWEN35_M1K_CPU_CUDA_COMPLETE_AMD_GFX1036_STATIC_HIP_READY`
 
-最后更新：2026-09-10 00:55 CST（Asia/Shanghai）
+最后更新：2026-09-10 10:40 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -16,7 +16,7 @@
 - AMD GPU：GPU 公共层 → HIP/ROCDL；
 - 现有 Ascend CCE 路径保持为一个 target plugin，并避免功能回退。
 
-目前已完成 W1/W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2，以及 Qwen3.5-0.8B M0–M1K-CPU 与 AVX2/AVX-512 parity。M1K-CPU 在 M1I decoder 与 M1J binding 之上新增共享 typed byte view：scalar 作为小 tensor reference 解码，AVX2/AVX-512 直接借用 buffer pointer，SVE256 在 wire 边界复制 raw bytes。exact HEAD `0bc662c6af9bdd32f587dbe2a0e9d0aec81290da` 的独立验收为 `516 passed, 7 skipped`；24层 synthetic external-buffer graph 已在 scalar、AVX2、AVX-512、QEMU SVE256 执行。AMD 临时目标改为 GamePC `gfx1036` 核显，但 WSL 缺少 `/dev/kfd` 和 ROCm/HIP runtime，当前为 `BLOCKED_DEVICE`。下一步是 CUDA byte-buffer ingestion；下载或加载模型权重仍需用户明确授权。
+目前已完成 W1/W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2，以及 Qwen3.5-0.8B M0–M1K 与 AVX2/AVX-512 parity。M1K-CPU 已让 scalar/AVX2/AVX-512/SVE256 摄取 typed byte views；M1K-CUDA 又增加同步 borrowed-address HtoD/DtoH staging。exact HEAD `fe6f3270b973b08be98cacfec04a6a4e9482e2b0` 的独立验收为 `522 passed, 7 skipped`，RTX 5080 连续两次执行24层、371-input/51-output external-buffer graph，输入不变、输出 canary 与资源清理均通过。Qwen BF16 带权执行仍需用户明确授权；当前转入 `amd-igpu-gfx1036` 静态 HIP/ROCDL backend，WSL runtime 继续标记 `BLOCKED_DEVICE`。
 
 ## 2. 已经确定的技术决策
 
@@ -65,7 +65,7 @@ upstream/                         # 五个嵌套 Git 仓库
 ```text
 branch = master
 HEAD   = 34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad
-linked worktree 数 = 52（基线、integration、既有调研/W1-W5、Qwen M1A–M1K、recovery、probe 与独立验收 worktree）
+linked worktree 数 = 54（基线、integration、既有调研/W1-W5、Qwen M1A–M1K、recovery、probe 与独立验收 worktree）
 工作树 = clean
 ```
 
@@ -187,13 +187,13 @@ W1 已完成以下三个 task：
 2. `work/core-ir`：Parser 单次生成目标无关 CoreProgram、稳定 IR dump/serialization。
 3. `work/verification`：无设备/无模型测试门禁、IR snapshot 和 differential harness。
 
-W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2、W6 M0–M1K-CPU 与 AVX2/AVX-512 parity 已完成，下一步进入：
+W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2、W6 M0–M1K 与 AVX2/AVX-512 parity 已完成，下一步进入：
 
 ```text
 W3 parity: AVX2/AVX-512 Qwen M1A–M1H（完成）
 W4 CUDA: C2 correctness 已完成 → 后续性能/fusion
-W5: `amd-igpu-gfx1036` 已识别；HIP runtime `BLOCKED_DEVICE`，先做静态 codegen
-W6: 无权重 decoder（完成）→ binding（完成）→ CPU ingestion（完成）→ CUDA ingestion → 获授权后 BF16 文本模型 → W8A8-linear
+W5: `amd-igpu-gfx1036` 已识别；HIP runtime `BLOCKED_DEVICE`，下一步静态 target/codegen
+W6: 无权重 decoder（完成）→ binding（完成）→ CPU/CUDA ingestion（完成）→ 获授权后 BF16 文本模型 → W8A8-linear
 ```
 
 完整文件所有权和依赖见 `configs/agent_tasks.yaml`，不要跳过 GPU common 直接让 CUDA/HIP 各自定义 ABI。
@@ -399,7 +399,9 @@ QEMU 只证明功能路径，不可用于性能结论。
 - M1K-CPU task commits：`8707cb653`、`78b39c62d`；integration commits：`e95591b94`、`0bc662c6a`；新增 BF16/FP32/INT32/INT64 typed byte view，AVX2/AVX-512 direct pointer、scalar reference decode 与 SVE raw wire staging；
 - M1K-CPU 首轮验收发现 `ctypes.pythonapi` reload 类型冲突与 NumPy `V2` 的 memoryview `2x` 格式遗漏；修复后的 r2 验收 `516 passed, 7 skipped`，连续6次 reload/lifetime、NumPy V2、371-input/51-output/43,200-byte external-buffer Qwen graph 在 scalar/AVX2/AVX-512/QEMU SVE256 均 `PASS`。SVE 仍有19次显式 host-reference `to_values` fallback；证据目录 `../worktrees/_meta/pypto-x/integration-w6-qwen35-bf16-cpu-buffer-ingestion-final-r2/`；
 - GamePC AMD 核显探测：Windows `AMD Radeon(TM) Graphics DEV_13C0` 状态 OK，OpenCL device `gfx1036`；WSL 无 `/dev/kfd`/ROCm/HIP，最终状态 `BLOCKED_DEVICE`。目标命名冻结为 `amd-igpu-gfx1036`，不得冒充6750GRE/gfx1031；
-- 当前 integration HEAD：`0bc662c6af9bdd32f587dbe2a0e9d0aec81290da`，工作树 clean。GPU-only 工作不申请 `gamepc`；该锁仅协调远端 heavy CPU/host-memory。
+- M1K-CUDA task/integration commits：`2eb578498` / `fe6f3270b`；CUDA Driver 新增同步 address+nbytes HtoD/DtoH，raw bytes/mmap 不再走 list pack/unpack，HostTensor/sequence/device pointer 兼容保留；
+- M1K-CUDA 独立验收 `522 passed, 7 skipped`；BF16/FP32/INT32/INT64、bytes/bytearray/read-only+writable mmap、错误/cleanup mock 均通过。RTX 5080 上371 inputs、51 outputs、48 states、43,200 bytes的24层图连续执行两次，logits finite/nonzero、position=0、输入不变、canary保持且前后无 compute process；证据目录 `../worktrees/_meta/pypto-x/integration-w6-qwen35-bf16-cuda-buffer-ingestion-final/`；
+- 当前 integration HEAD：`fe6f3270b973b08be98cacfec04a6a4e9482e2b0`，工作树 clean。GPU-only 工作不申请 `gamepc`；该锁仅协调远端 heavy CPU/host-memory。
 
 W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保持只读，不重跑覆盖。
 
@@ -424,7 +426,7 @@ W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保�
 3. CPU/加速器优先级为 AVX2 → AVX-512 → SVE256（无 NEON）→ NVIDIA → AMD。
 4. 上游默认分支已刷新为 edge 快照，版本策略为 release family + exact SHA 双轨 lock。
 5. Tensor frontend 作为跨架构主入口，Pro 作为 Ascend expert dialect + portable subset。
-6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、CUDA C1–C2、Qwen3.5-0.8B M0–M1K-CPU 与 AVX2/AVX-512 parity 已完成。下一任务是 CUDA external byte-buffer ingestion；实际权重下载/加载需要新的明确授权。AMD 临时目标是 `amd-igpu-gfx1036`，当前只能做静态 codegen。
+6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、CUDA C1–C2、Qwen3.5-0.8B M0–M1K 与 AVX2/AVX-512 parity 已完成。Qwen BF16 带权执行需要新的明确授权；当前任务是 `amd-igpu-gfx1036` 静态 HIP/ROCDL backend，运行态必须保持 `BLOCKED_DEVICE`。
 
 C0 已完成：
 
@@ -433,7 +435,7 @@ C0 已完成：
 3. 接手文档已按序号和日期归档到 `docs/00-handoffs/`。
 4. stable lock 仍等待实际 CANN toolkit/NPU 环境做晋升验证，不影响目标无关 W1，但会门禁 Ascend 回归结论。
 
-GPU common 已冻结 NVIDIA/AMD 共用的 Grid/Workgroup/Thread/Subgroup、address space、GPU artifact 与 launch ABI；公共层没有 NVVM/ROCDL/WMMA/MFMA 语义。M1K-CPU 已使 CPU backends 正确摄取 external byte views，下一步为 CUDA host-to-device staging；AMD `gfx1036` 在 WSL 暂无 HIP runtime，只做静态目标开发。之后在取得权重/参考环境授权后进入 BF16 实际模型与 W8A8-linear。M1G/M1I 的 T>1 GDR 仍是静态 sequential SSA 展开；SVE position/control 和部分复合路径仍有 host fallback。920B 继续承担 native 功能验证；Ascend stable CANN/NPU 回归仍 pending。
+GPU common 已冻结 NVIDIA/AMD 共用的 Grid/Workgroup/Thread/Subgroup、address space、GPU artifact 与 launch ABI；公共层没有 NVVM/ROCDL/WMMA/MFMA 语义。M1K 已闭包 CPU/CUDA external byte-buffer ingestion；Qwen BF16 带权执行等待用户授权。当前先实现 `amd-igpu-gfx1036` 静态 HIP/ROCDL target/backend，不伪造运行态。M1G/M1I 的 T>1 GDR 仍是静态 sequential SSA 展开；SVE position/control 和部分复合路径仍有 host fallback。920B 继续承担 native 功能验证；Ascend stable CANN/NPU 回归仍 pending。
 
 ## 12. 快速自检命令
 

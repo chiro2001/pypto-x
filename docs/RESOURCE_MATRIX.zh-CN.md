@@ -7,7 +7,7 @@
 | 资源 | 当前状态 | 主要用途 | 当前实测/已知信息 | 限制 |
 |---|---|---|---|---|
 | 本地开发机 | 可用；heavy 需全局 `local` 锁；M1K-CPU PASS | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8；M1K-CPU `516 passed, 7 skipped`，scalar/AVX2/AVX-512/QEMU SVE256 的24层 external-buffer graph 通过 | full pytest、大 shape lowering/compile 与并行构建必须走 `scripts/resource/run_local_heavy.sh`；默认保留 4 GiB、最多 6 CPU；当前仅为正确性/汇编证据，不形成性能门槛 |
-| RTX 5080（`192.168.101.5`） | 在线；GPU 由 PyPTO-X 独占；CUDA C2 与 M1I synthetic PASS | NVIDIA CUDA/PTX/NVVM 验证 | WSL2、RTX 5080 16,303 MiB、CC 12.0、KMD 610.62/CUDA UMD 13.3；Driver/PTX 已通过 math/layout/indexing/composites，并执行24层 synthetic decoder | GPU-only 无需 `gamepc` 锁；host-heavy 才持锁。无 `nvcc`/NVRTC/CUDART/SDK headers/PyTorch/Triton；当前是 correctness kernel，不是 fusion/性能结论 |
+| RTX 5080（`192.168.101.5`） | 在线；GPU 由 PyPTO-X 独占；M1K-CUDA PASS | NVIDIA CUDA/PTX/NVVM 验证 | WSL2、RTX 5080 16,303 MiB、CC 12.0；Driver/PTX 连续两次执行371-input/51-output external-buffer 24层图 | GPU-only 无需 `gamepc` 锁；host-heavy 才持锁。无 `nvcc`/NVRTC/CUDART/SDK headers/PyTorch/Triton；当前是 correctness kernel，不是 fusion/性能结论 |
 | AMD GamePC 核显 `gfx1036` | Windows 可见；WSL/HIP `BLOCKED_DEVICE`；6750GRE 暂缓 | AMD HIP/ROCDL 静态 target，后续真机功能 | Ryzen 9 9900X iGPU，Windows OpenCL device `gfx1036`、Vulkan integrated GPU；WSL 仅 `/dev/dxg`，无 `/dev/kfd`/ROCm/HIP | `gfx1036` 来自 OpenCL 而非 rocminfo；wave/BF16/INT8/MFMA/WMMA unknown；不能声明 HIP 已运行或代表6750GRE性能 |
 | 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；M1C1–M1I 功能/contract 与24层 synthetic decoder 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；`iota/compare` 是 host-reference；按量计费，状态见 `~/tools/ecs-920B/state.env` |
 | QEMU AArch64 | 可用 | AArch64/SVE/SVE2 功能和编译验证 | `qemu-aarch64` 11.0.3；已验证 `max,sve256=on` 可报告 SVE/SVE2，VL=32 bytes | 不能代表鲲鹏吞吐、缓存、内存带宽或指令时序 |
@@ -56,6 +56,8 @@ M1I 在 exact integration HEAD `ec60f95979a56a9646d84f163912e677e9eb08ac` 上完
 M1J 在 exact integration HEAD `0bc15d06ee167d5b6b5c62cffec88083dabb2bdf` 上冻结 external bytes/mmap binding contract。真实 profile 只计算3/320/48 input schema、368个 packed region 和1,574,877,952 bytes的 storage-relative layout metadata，没有创建、映射或读取权重文件；现有 scalar/AVX2/CUDA 对 byte memoryview 均为安全拒绝，backend ingestion 尚待下一阶段。证据位于 `../worktrees/_meta/pypto-x/integration-w6-qwen35-bf16-runtime-binding-final-r2/validation.json`。
 
 M1K-CPU 在 exact integration HEAD `0bc662c6af9bdd32f587dbe2a0e9d0aec81290da` 上完成 typed byte-view ingestion。24层 synthetic Qwen graph 通过371个 external descriptors和43,200-byte packed storage在 scalar、AVX2、AVX-512、QEMU SVE256实际执行；AVX直接借用pointer，SVE有363个raw-wire payload并保留19个显式host-reference fallback。证据位于 `../worktrees/_meta/pypto-x/integration-w6-qwen35-bf16-cpu-buffer-ingestion-final-r2/validation.json`。
+
+M1K-CUDA 在 exact integration HEAD `fe6f3270b973b08be98cacfec04a6a4e9482e2b0` 上完成同步 borrowed-address HtoD/DtoH。raw byte views 不经 list pack/unpack；5080 上24层 external-buffer 图连续执行两次，input immutable、output canary 和 cleanup 均通过，全量 `522 passed, 7 skipped`。证据位于 `../worktrees/_meta/pypto-x/integration-w6-qwen35-bf16-cuda-buffer-ingestion-final/validation.json`。
 
 ## QEMU SVE/SVE2 验证
 

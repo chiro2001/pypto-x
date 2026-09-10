@@ -43,3 +43,4 @@ NNNN-YYYY-MM-DD-<阶段或主题>.zh-CN.md
 | 0026 | 2026-09-09 | M1I decoder connectivity 完成、资源事故闭环、BF16 runtime binding 就绪 | [Decoder connectivity 与资源事故闭环](0026-2026-09-09-decoder-connectivity-complete-and-resource-incident.zh-CN.md) |
 | 0027 | 2026-09-09 | M1J BF16 external runtime binding 完成、backend ingestion 就绪 | [BF16 runtime binding 完成快照](0027-2026-09-09-qwen35-bf16-runtime-binding-complete.zh-CN.md) |
 | 0028 | 2026-09-10 | M1K-CPU ingestion 完成、AMD `gfx1036` 核显目标识别 | [CPU ingestion 与 AMD 核显快照](0028-2026-09-10-qwen35-bf16-cpu-ingestion-amd-igpu.zh-CN.md) |
+| 0029 | 2026-09-10 | M1K-CUDA ingestion 完成、AMD `gfx1036` 静态 backend 就绪 | [CUDA ingestion 完成快照](0029-2026-09-10-qwen35-bf16-cuda-ingestion-complete.zh-CN.md) |

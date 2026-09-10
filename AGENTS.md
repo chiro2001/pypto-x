@@ -13,9 +13,9 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W6_QWEN35_M1K_CPU_COMPLETE_CUDA_INGESTION_READY_AMD_GFX1036_IDENTIFIED`。
-- Qwen3.5-0.8B M0–M1K-CPU 已完成并冻结；M1I 是24层无权重 decoder，M1J 是3/320/48 external buffer binding，M1K-CPU 已让 scalar、AVX2/AVX-512 与 SVE256 正确摄取 typed byte views。SVE `iota/compare` 和部分复合路径仍有 host-reference fallback，尚不是带权整网执行。
-- 下一步是 CUDA host-to-device byte-buffer ingestion。AMD 临时目标改为 GamePC 核显 `amd-igpu-gfx1036`；Windows 可见，但 WSL 缺少 `/dev/kfd` 和 ROCm/HIP runtime，当前只允许静态 target/codegen 开发并标记 `BLOCKED_DEVICE`。下载或加载模型权重仍需用户明确授权。
+- 当前状态是 `EXECUTION_W6_QWEN35_M1K_CPU_CUDA_COMPLETE_AMD_GFX1036_STATIC_HIP_READY`。
+- Qwen3.5-0.8B M0–M1K 已完成并冻结；M1I 是24层无权重 decoder，M1J 是3/320/48 external buffer binding，M1K 已让 scalar、AVX2/AVX-512、SVE256 与 CUDA 正确摄取 typed byte views。SVE 部分复合路径仍有 host-reference fallback，真实带权整网仍未执行。
+- Qwen BF16 下一阶段需要用户明确授权下载/加载权重；在此之前转入 AMD `amd-igpu-gfx1036` 静态 HIP/ROCDL target/backend。Windows 可见该核显，但 WSL 缺少 `/dev/kfd` 和 ROCm/HIP runtime，运行态保持 `BLOCKED_DEVICE`，不得伪造真机 PASS。
 
 ## Git 与目录
 

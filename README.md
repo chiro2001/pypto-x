@@ -1,6 +1,6 @@
 # PyPTO-X：PyPTO 跨架构后端
 
-PyPTO-X（PyPTO Cross-Architecture）是本项目的工作名称，目标是在保留 PyPTO Tensor/Professional 双前端定位的前提下，抽取可移植 Core IR 与 target ABI，并逐步支持鲲鹏 CPU、x86_64 CPU、NVIDIA GPU 和 AMD GPU。当前已冻结 Qwen3.5-0.8B M0–M1K-CPU、AVX2/AVX-512 parity、SVE256、GPU common 与 RTX 5080 CUDA C2；24层无权重 decoder、external buffer binding 和 CPU typed byte-view ingestion 已独立验收通过。下一阶段是 CUDA byte-buffer staging，再进入获授权后的 BF16 带权参考执行。AMD 临时目标为 GamePC `gfx1036` 核显，当前 WSL 仍为 `BLOCKED_DEVICE`。各后端能力只以对应验收证据为准。
+PyPTO-X（PyPTO Cross-Architecture）是本项目的工作名称，目标是在保留 PyPTO Tensor/Professional 双前端定位的前提下，抽取可移植 Core IR 与 target ABI，并逐步支持鲲鹏 CPU、x86_64 CPU、NVIDIA GPU 和 AMD GPU。当前已冻结 Qwen3.5-0.8B M0–M1K、AVX2/AVX-512、SVE256、GPU common 与 CUDA external-buffer correctness；24层无权重 decoder 已在 CPU 与 RTX 5080 通过 typed buffer binding 执行。真实 BF16 带权模型等待授权，当前转入 GamePC `gfx1036` 核显的静态 HIP/ROCDL backend；其 WSL runtime 仍为 `BLOCKED_DEVICE`。各后端能力只以对应验收证据为准。
 
 ## 快速入口
 
