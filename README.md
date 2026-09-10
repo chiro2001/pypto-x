@@ -6,11 +6,11 @@ PyPTO-X（PyPTO Cross-Architecture）在保留官方 PyPTO Tensor / Professional
 
 ## 当前状态（2026-09-10）
 
-状态行：`EXECUTION_W8A_DECAY_FIX_VERIFIED_MULTIPROMPT_IN_PROGRESS_AMD_RUNTIME_STATIC_ONLY`
+状态行：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFYING`
 
 ```text
 实现主仓        upstream/pypto @ 34475e0d（只读快照）
-集成分支        port/pypto-x-integration @ 9aae4649e
+集成分支        port/pypto-x-integration @ dca302ef4
 私有归档        https://github.com/chiro2001/pypto-x-private（私有；含第三方离线副本）
 公开主仓        https://github.com/chiro2001/pypto-x（公开；历史中不含第三方 PDF/HTML）
 ```
@@ -18,13 +18,23 @@ PyPTO-X（PyPTO Cross-Architecture）在保留官方 PyPTO Tensor / Professional
 **首个真实模型已端到端跑通并对齐官方实现**：`Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17` 纯文本 BF16，真实权重，AVX-512 后端：
 
 ```text
-prefill (en, T=5)   argmax 5/5 一致、cosine 0.9999136、max|Δlogits| 0.2338（gold 自身 fp32↔bf16 误差带 0.2352）
-decode (4 步)       11751 → 13 → 198 → 760 逐步与官方 gold 一致
-资源               峰值 RSS 3.9 GiB、单次前向约 132 s（6 CPU cgroup 内）
-独立验收           PASS_WITH_BOUNDARIES（§6 口径见 W8 路线图）
+prefill (en, T=5)   argmax 5/5 一致、cosine 0.99997235、max|Δlogits| 0.159756（gold 自身 fp32↔bf16 误差带 0.235212）
+prefill (zh, T=8)   argmax 8/8 一致、cosine 0.99993803、max|Δlogits| 0.235296（band 0.277682）
+prefill (chat,T=18) 严格 argmax 17/18（唯一 row 14 为 near-tie）、cosine 0.99989976、max|Δlogits| 0.416867（band 0.611310）
+                    按 2026-09-10 near-tie 修订判据 PASS（17/17 有效行 + 1 near-tie；严格 17/18 仍可见）
+decode (4 步)       11751 → 13 → 198 → 760 逐步与官方 gold 一致（三 prompt token 链全对）
+独立验收           W8A 数值对齐 PASS（verify/qwen35-t18-divergence-localization；694 collected/687 passed/7 skipped）
 ```
 
-对齐过程中发现并修复了一个**冻结契约级 bug**（ERR-0001）：GDR decay 门缺 `exp(A_log)`，导致 recurrent state 指数爆炸、整网 logits 完全错位。详见 [`docs/00-handoffs/ERRATA.zh-CN.md`](docs/00-handoffs/ERRATA.zh-CN.md)。
+对齐过程中发现并修复了两个缺陷：**ERR-0001**（GDR decay 门缺 `exp(A_log)`，冻结契约级）与
+**ERR-0002**（W8A 测试 driver 的 cos/sin 运行时布局 position-major 错误，图契约零改动）。
+此前"chat(T=18) 真实数值累积分歧"的结论因 ERR-0002 作废。另：T=1/decode 在算子层是 no-op，
+但端到端 decode logits 因继承 prefill state 而变化。详见 [`docs/00-handoffs/ERRATA.zh-CN.md`](docs/00-handoffs/ERRATA.zh-CN.md)。
+
+**Ascend A2(910B3) 真机验收已 PASS**（PTO-ISA tassign NPU ST、CANN mspti aclnn Add、
+注入式最小 hook live 9/9 / 真机 max_abs_err=0.0），`ascend_cann_bisheng_npu_regression_blocked`
+**限定式关闭**（仅覆盖上述两条路径，不代表 Core IR→PTO 或模型级）；同时产出 W8H vllm-ascend E2E
+与 W8I profiling 基线（独立验收 in flight）。
 
 ## 能力矩阵
 
@@ -35,7 +45,7 @@ decode (4 步)       11751 → 13 → 198 → 760 逐步与官方 gold 一致
 | AArch64 SVE256 | 功能与汇编冻结（QEMU + 鲲鹏 920B 原生）；`iota/compare/broadcast/where` 仍有 host-reference fallback | W4/W6 + 路线图 B2 |
 | NVIDIA CUDA | C1–C2 正确性冻结（Driver API + PTX JIT）；Toolkit（nvcc 13.3 + cuBLAS）已装，性能分层待做 | W4 + 路线图 B3a/B3b |
 | AMD `gfx1036` | 静态 C1–C3（math/reduction/matmul，Qwen 静态 4,532/4,532，v3 为 4,550）；运行态判定**架构性不可达**，按用户决定长期只保留静态证据 | 审计 0004 |
-| Ascend CCE/CANN | 仅有 adapter seam（不 import CANN，靠 `PYPTO_X_ASCEND_HOOKS` 注入）；真机回归仍 blocked；本机 CANN 9.2.0-beta.2 toolkit + CA-model 最小用例已验证 | 审计 0006/0007、路线图 W8E |
+| Ascend CCE/CANN | adapter seam（不 import CANN，靠 `PYPTO_X_ASCEND_HOOKS` 注入）；**A2(910B3) 真机验收 PASS（限定式）**：PTO-ISA tassign NPU ST + 测试目录内最小 64×64 f32 add hook（bisheng + 910B3）；Core IR→PTO、classic/Pro JIT/OPC 与模型级**未验证**；本机 CANN 9.2.0-beta.2 toolkit + CA-model 最小用例已验证 | 审计 0006/0007、`verify-qwen35-ascend-npu-acceptance`、0036 快照 |
 | W8A8-linear | 契约已冻结（D1–D12 用户批准），**实现未开始** | [`docs/20-planning/0002-*`](docs/20-planning/0002-2026-09-10-qwen35-w8a8-linear-contract.zh-CN.md) |
 
 ## 文档索引
@@ -61,7 +71,7 @@ decode (4 步)       11751 → 13 → 198 → 760 逐步与官方 gold 一致
 
 - [生态审计 0001](research/audits/2026/0001-2026-09-06-pypto-ecosystem.zh-CN.md)、[Tensor/Pro 关系 0002](research/audits/2026/0002-2026-09-06-pypto-pypto-pro-relationship.zh-CN.md)、[算子可移植率 0003](research/audits/2026/0003-2026-09-07-operator-portability-ratio.zh-CN.md)、[AMD 运行态可行性 0004](research/audits/2026/0004-2026-09-10-amd-gfx1036-runtime-feasibility.zh-CN.md)、[CANN 资源评估 0005](research/audits/2026/0005-2026-09-10-cann-resource-evaluation.zh-CN.md)、[PTO-ISA CPU_SIM 基线 0006](research/audits/2026/0006-2026-09-10-pto-isa-cpu-sim-baseline.zh-CN.md)、[CANN CA-model 探针 0007](research/audits/2026/0007-2026-09-10-cann-camodel-minimal-probe.zh-CN.md)。
 - [早期移植研究](research/PYPTO_PORTING_RESEARCH.zh-CN.md)、[源码清单](research/SOURCE_MANIFEST.md)、[离线参考资料](references/README.md)（公开仓不分发副本）。
-- [实现补丁集](patches/README.md)：对上游 PyPTO 的 96 个补丁（基线 `34475e0d`）、应用/验证方法与许可边界。
+- [实现补丁集](patches/README.md)：对上游 PyPTO 的 111 个补丁（基线 `34475e0d`，HEAD `dca302ef4`）、应用/验证方法与许可边界。
 
 ## 目录
 

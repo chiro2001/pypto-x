@@ -19,7 +19,7 @@ PyPTO-X 把官方 PyPTO（同仓 `pypto` Tensor 前端 + `pypto_pro` Professiona
 ```text
 控制仓        /home/chiro/projects/pypto/pypto_x（docs/configs/scripts + 5 个 upstream submodule）
 实现主仓      upstream/pypto @ 34475e0d（只读；实现一律走 worktree）
-集成分支      port/pypto-x-integration（当前 HEAD 9aae4649e）
+集成分支      port/pypto-x-integration（当前 HEAD dca302ef4）
 任务 worktree ../worktrees/pypto-x/<task>；证据 ../worktrees/_meta/pypto-x/<task>/
 强制规范      AGENTS.md、docs/LOCAL_RESOURCE_POLICY.zh-CN.md、docs/WORKTREE_AGENT_PLAN.zh-CN.md、docs/SMOKE_TEST_SPEC.zh-CN.md
 ```
@@ -43,18 +43,30 @@ PyPTO-X 把官方 PyPTO（同仓 `pypto` Tensor 前端 + `pypto_pro` Professiona
 | CUDA Toolkit（nvcc 13.3.73 + cuBLAS 13.6；Driver/PTX 回归 PASS） | `_meta/cuda-toolkit-wsl` |
 | PTO-ISA CPU_SIM 基线（125/125 PASS）、CANN toolkit + CA-model 最小用例 | 审计 `0006`/`0007` |
 | CPU vector runtime liveness + AVX-512 packed cast/transpose/embedding + **GDR decay 修复** | `9aae4649e` |
+| **ERR-0002 修复**（W8A driver cos/sin 布局，图契约零改动）+ near-tie 判据修订 | `5f479d1a1` + `verify/qwen35-t18-divergence-localization` |
+| **W8A-C Ascend A2(910B3) 真机验收 PASS**（限定式关闭 `ascend_cann_bisheng_npu_regression_blocked`） | `0e5a51891` + `verify/qwen35-ascend-npu-acceptance` |
+| **W8G 可移植性清理**完成 + 独立验收 PASS | `c464927fa` + `verify/qwen35-portability-cleanup` |
+| **W8H/W8I A2 vllm-ascend E2E / profiling 基线**（原始事实；独立验收 in flight） | `9951a2fe7+a65a37cc3` / `cc1cc7178..dca302ef4` |
 
-### 2.2 主线数值状态（实现侧完成，**独立验收进行中**）
+### 2.2 主线数值状态（**已收口，ERR-0002 修复后口径**）
 
 ```text
 ERR-0001：图 v1/v2 的 GDR decay 门缺 exp(A_log)（官方为 -exp(A_log)·softplus），
-          FP32 状态指数爆炸（|state|max 0.60→2.8e4→2.36e16）被 gated RMSNorm 掩盖。
-修复后（真权重、AVX-512、公开图）：
-  prefill en_continuation T=5   argmax 5/5、cosine 0.9999136、max_abs 0.2338（gold dtype 带 0.2352）
-  decode（对齐口径）            11751 → 13 → 198 → 760 逐步与 gold 一致
-  峰值 RSS / wall               3.905 GiB / 131.6 s（修复前模型值 7.66 GiB / 旧 list 路径 309.6 GiB）
-图契约 v3：digest 66dd4077…、4,550 ops（(1,1,4096)）/ 6,728 ops（(1,5,0)）
-全量回归                      674 passed, 7 skipped
+          FP32 状态指数爆炸（|state|max 0.60→2.8e4→2.36e16）被 gated RMSNorm 掩盖。修复已验收。
+ERR-0002：W8A 测试 driver 的 cos/sin 运行时输入按 position-major 展平（图契约是 head-major
+          (batch,heads,steps,rotary_dim)），T≠heads 时位置表错位；此前 chat(T=18)"真实累积分歧"
+          （3.78×band、row 11 起、首个不达标层 gold index 8）结论作废。修复 `5f479d1a1`，图契约零改动。
+修复后独立验收（真权重、AVX-512、公开图 v3；2026-09-10 用户裁定 + near-tie 修订）：
+  en_continuation T=5   argmax 5/5、cosine 0.99997235、max_abs 0.159756（0.68×band 0.235212）
+  zh_continuation T=8   argmax 8/8、cosine 0.99993803、max_abs 0.235296（0.85×band 0.277682）
+  chat_zh_user   T=18   严格 argmax 17/18；唯一 mismatch row 14 为 near-tie（gold fp32 margin
+                        0.115007=0.18813×band ≤ 0.5×band，ours argmax=gold runner-up）
+                        → 17/17 有效行 + 1 near-tie，按修订判据 PASS；严格 17/18 保留可见
+  decode（对齐口径）    token 链三 prompt 全对：11751→13→198→760→6511 / 271→248068→271→248069→271 /
+                        109266→6115→103724→1167→16451；T=1 布局 no-op，但端到端 logits 因 state 继承而变
+  state                全部有限；recurrent |state|max en 0.55–13.27 / zh 0.82–13.29 / chat 0.69–14.14
+图契约 v3：digest 66dd4077…、4,550 ops（(1,1,4096)）/ 13,748 ops（(1,18,0)）；ops(T)=6,728+540×(T−5)
+全量回归                      694 collected / 687 passed / 7 skipped
 ```
 
 ### 2.3 已知边界
@@ -64,7 +76,8 @@ ERR-0001：图 v1/v2 的 GDR decay 门缺 exp(A_log)（官方为 -exp(A_log)·so
 - 本机 KVM guest 无 cpufreq → 绝对性能门槛永久 UNGATED；GamePC WSL 无锁频手段
 - CUDA 无 cuEvent 计时（cuEvent* 在 python/pypto 下 0 命中）→ kernel_seconds 必须为 null
 - CANN CAModel：单条 64x64 TADD 95 s / 峰值 7.3 GiB；npusim record 第二次卡死；report 缺 plotly
-- IR→PTO / IR→CCE 桥不存在；Ascend adapter 仍是 seam
+- IR→PTO / IR→CCE 桥不存在；Ascend adapter 仍是 seam（A2 真机 PASS 仅覆盖注入式最小 f32 add hook）
+- A2 真机只解锁限定范围；stable CANN 9.2.0-beta.2 未在带卡环境验证
 - 920B ECS：2 vCPU / 2.5 GiB / 34 GB，只能做 SVE 原生功能验收
 - 上游默认分支已漂移风险：本仓仍锁 34475e0d（edge lock），stable lock 待 CANN 配套验证
 ```
@@ -152,7 +165,7 @@ local 锁：全局排他；启动要求 MemAvailable ≥ 8192 MiB（这是"启�
 | ID | 任务 | 目标 | 依赖 | 验收（冻结口径） | 锁预算 |
 |---|---|---|---|---|---|
 | A0 | `integration-truth-normalization` | 收口当前 runtime 任务（合并 `70af8ed2c`/`d27a2cf33`/`11eceeb4a`，**已完成**）；**归一化配置真值**：删 `agent_tasks.yaml` 重复条目、同步 GDR/CUDA/W7 状态 | 无 | `yaml.safe_load` 通过 + 无重名 + 每条状态与 `development_lock.yaml` 一致 | 0 |
-| A1 | `qwen35-weighted-multiprompt` | 在**同一实现轮**内跑完 **T=5/T=8/T=18 三个 prompt 的 prefill + 4 步 decode**（共享一份 correction 后的图与 driver） | A0 | 每 prompt 每步：argmax 与 gold 一致；cosine ≥ 0.9995；max_abs ≤ 0.35；state 有限且不爆炸；产出逐层 hidden 对照（gold 有 25×T×1024） | 3×3 个 prompt×stage ≈ 6–8 个重段，累计 ~25–35 min |
+| A1 | `qwen35-weighted-multiprompt` | 在**同一实现轮**内跑完 **T=5/T=8/T=18 三个 prompt 的 prefill + 4 步 decode**（共享一份 correction 后的图与 driver） | A0 | 按 §6 修订后判据（相对 gold dtype band + near-tie 例外）；state 有限且不爆炸；产出逐层 hidden 对照（gold 有 25×T×1024）。**注意：其历史 prefill 数字因 ERR-0002 作废，替换值以独立验收为准** | 3×3 个 prompt×stage ≈ 6–8 个重段，累计 ~25–35 min |
 | A2 | `verify-w8a`（独立验收） | 从 **A1 的最终 integration HEAD** 建只读 worktree，独立复跑 S1/S2/S3 + 全量 pytest + liveness A/B + packed 内核抽样 | A1 完成并合并 | 见 §6 验收细则 | ~13–18 min（S1+S2+S3+pytest） |
 | A3 | 冻结与文档 | `development_lock` 关项、`0035` 快照、HANDOFF/README/ERRATA 同步 | A2 | 文档提交 + 链接检查 | 0 |
 
@@ -218,19 +231,27 @@ local 锁：全局排他；启动要求 MemAvailable ≥ 8192 MiB（这是"启�
   证据：validation.json + brief.zh-CN.md + raw/ 原始日志 + runner 资源日志
   独立验收不得复用实现方的 JSON 结论，须自行取数
 
-A1/A2 数值（真权重，逐 prompt）——判据已改为"相对 gold 自身 dtype 噪声底"（2026-09-10 用户裁定）
+A1/A2 数值（真权重，逐 prompt）——判据已改为"相对 gold 自身 dtype 噪声底"（2026-09-10 用户裁定），
+2026-09-10 同日追加 near-tie 例外：
   prefill：逐行 argmax 与 gold 一致（硬门槛）
+  near-tie 例外（2026-09-10 用户裁定）：若 gold 该行 top-1/top-2 margin ≤ 0.5×band 且
+      ours argmax == gold top-2 token，则该行记为 near-tie flip、不判失败，但必须单列计数；
+      严格口径结果（如 17/18）必须同时可见。
   band = gold 自身 fp32↔bf16 的 max_abs 与 cosine，随 prompt 变化：
       en(T=5)  0.235212 / 0.999956
       zh(T=8)  0.277682 / 0.999929
       chat(T=18) 0.611310 / 0.999772
   判据：max|Δlogits| ≤ 2×band 且 cosine ≥ band_cosine − 1e-4
-      （en 0.2338/cos 0.999914 PASS；zh 0.4635=1.67×band、cos 0.999735 PASS；
-        chat 2.3106=3.78×band、cos 0.997994 FAIL → 真实累积分歧，单列为精度任务）
+      （ERR-0002 修复后：en 0.159756=0.68×band/cos 0.99997235 PASS；
+        zh 0.235296=0.85×band/cos 0.99993803 PASS；
+        chat 0.416867=0.68×band/cos 0.99989976，严格 argmax 17/18，row14 near-tie → 修订判据 PASS）
   decode ：对齐口径 = prefill 末行 ↔ gold decode_logits[0]，第 k 步 ↔ decode_logits[k+1]；
-           每步报「输入 token / argmax / cosine / max_abs」，逐步 argmax 与 gold 一致
-  逐层   ：`hidden_states_layers`（25×T×1024）逐层 cosine ≥ 0.999（gold 已提供，不得只看 logits）
-  state  ：prefill 结束后的 recurrent state 必须有限且 |state|max 在 O(1) 量级（实测三 prompt 12.4–14.2）
+           每步报「输入 token / argmax / cosine / max_abs」，逐步 argmax 与 gold 一致；
+           注意 T=1 布局 no-op，但端到端 decode logits 因继承 prefill state 而变（不得写端到端无变化）
+  逐层   ：`hidden_states_layers`（25×T×1024）逐层 cosine ≥ 0.999（gold 已提供，不得只看 logits；
+           修复后实测逐层 min：en 0.99993098 / zh 0.99993980 / chat 0.99988217）
+  state  ：prefill 结束后的 recurrent state 必须有限且 |state|max 在 O(1) 量级
+           （修复后实测 en 0.55–13.27 / zh 0.82–13.29 / chat 0.69–14.14）
   资源   ：峰值 RSS 与 wall 必须记录；CC 上限按 §3.2 的实际 MemoryMax 计算余量
 
 性能（B3*）
@@ -255,10 +276,14 @@ A1/A2 数值（真权重，逐 prompt）——判据已改为"相对 gold 自身
 ## 7. 关键路径（修正后的推荐）
 
 ```text
-A0 配置真值归一化 + 当前 runtime 任务收口（已完成合并，仅剩配置）
- → A1 decay 修复后一次跑齐 T5/T8/T18 的 prefill + 4 步 decode
- → A2 从最终 HEAD 独立验收（只验一次）
- → A3 development_lock / HANDOFF / 0035 冻结
+状态（2026-09-11）：A0–A3 已完成；ERR-0002 修复 + near-tie 修订已收口；W8A-C + W8G 完成；
+W8H/W8I 基线已产出、独立验收 in flight；下一阶段起点待用户决策（§10）。
+
+A0 配置真值归一化 + 当前 runtime 任务收口（已完成）
+ → A1 decay 修复后一次跑齐 T5/T8/T18 的 prefill + 4 步 decode（已完成；数字经 ERR-0002 更正）
+ → A2 从最终 HEAD 独立验收（已完成：verify-qwen35-t18-divergence-localization）
+ → A3 0036 勘误/快照/配置/补丁收口（本批）
+ → W8A-C（已完成，限定式关闭）；W8H/W8I（验收 in flight）
  → B1 / B2 后端硬化
  → B3a → B3b / B3c → B4 性能分层与冻结
  → W8C 完整后端 DAG（W8A8）
@@ -308,20 +333,23 @@ A0 配置真值归一化 + 当前 runtime 任务收口（已完成合并，仅�
 
 ## 10. 待决策（用户）
 
-> 状态更新 2026-09-10：评审已通过（v1→v2，见 §12）；W8A 的 A0–A3 已完成并冻结（见快照 `0035`）。
+> 状态更新 2026-09-11（收口于 0036 快照）：评审通过（v1→v2，见 §12）；W8A 的 A0–A3 已完成（0035）；
+> ERR-0002（driver cos/sin 布局）已修复并重定义 chat 口径；**W8A-C A2 真机验收 PASS（限定式）**；
+> **W8G 已完成**；**W8H/W8I vllm-ascend 基线已产出、独立验收 in flight**（A2 卡锁协议已落地）。
 > 以下是**当前仍待用户决定**的项；新 agent 不要自行开工。
 
-1. **W8A-C Ascend 真机验收**：A2(910B3) 已在线，是否立即派发 `qwen35-ascend-npu-acceptance`
-   （PTO-ISA NPU ST → CANN 样例 → `backends/ascend/adapter.py` hooks）？
-   这是当前**最高优先、且不消耗本机重资源**的一项；访问脚本在本地私有侧 `~/tools/a2-910b/`。
-2. **W8A-B 优先级**：chat(T=18) 分歧攻坚（row 11 起、首个不达标层 gold index 8）是否先于 W8B？
-   预期手段：逐层 bf16/fp32 混合比对、定位首个放大点，再决定是修 lowering 还是记入 `known_limits`。
-3. **W8C 起点**：是否按 C1→C8 完整后端 DAG 推进（推荐），还是先只做 C1/C2 打契约底座？
-4. **W8D/E 深度**：D2 长序列 T=64/128 代价评估、E4 IR→PTO 桥与 Ascend hooks，是否现在启动？
-5. **是否批准 §8 的可删清单**（安装包 / venv / build 目录；本机磁盘约 78 GB 可用）？
-6. `qwen35-portability-cleanup`（W8G，绝对路径参数化）是否随下一次改动顺带做（当前 queued，无依赖阻塞）？
+1. **W8B vs W8C 优先级**：先做 W8B 硬化（AVX2 packed / SVE fallback / CUDA cuEvent 与 GEMM 基线 /
+   本机 L0–L1），还是先启动 W8C W8A8-linear（契约已冻结）？
+2. **W8C 起点**：按 C1→C8 完整后端 DAG 推进（推荐），还是先只做 C1/C2 打契约底座？
+3. **W8D/E 深度**：D2 长序列 T=64/128 代价评估、E4 Core IR→PTO/CCE codegen（A2 限定式关闭后的真实缺口），
+   是否现在启动？
+4. **是否要求 chat 严格 18/18**：若要求，需评估任务分支 `327b17158`（`--debug-f32-residual`，改 `qwen35.py`，
+   未合入、未采纳）的收益/代价；当前按 near-tie 修订判据已 PASS。
+5. **W8H/W8I 后续范围**：是否补做 ACL graph 口径精度复跑、并发 sweep、`logprobs=-1` 全词表往返？
+6. **是否批准 §8 的可删清单**（安装包 / venv / build 目录；本机磁盘约 78 GB 可用）？
 
-已决：并发采用 ≤3 subagent + 父 agent 四槽（评审建议 3）；验收口径改用**相对 gold dtype 带宽**（§6）。
+已决（2026-09-10，勿再开工）：并发采用 ≤3 subagent + 父 agent 四槽；验收口径 = 相对 gold dtype 带宽 +
+near-tie 例外；W8A-C 以"限定式关闭 blocked"记账；A2 NPU 任务走 `/root/a2-npu-lock/` 卡锁。
 若本节与 `HANDOFF.zh-CN.md` §0/§11 冲突，以 HANDOFF 为准。
 
 ---

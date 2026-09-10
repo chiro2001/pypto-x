@@ -11,12 +11,12 @@
 ### 0. 状态行
 
 ```text
-W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_PASS_CHAT_T18_DIVERGENT_ASCEND_A2_ONLINE
+W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFYING
 ```
 
 ```text
 实现主仓     upstream/pypto @ 34475e0d（只读）
-集成分支     port/pypto-x-integration @ 9aae4649e
+集成分支     port/pypto-x-integration @ dca302ef4（W8G/A2 验收/W8H/RoPE 修复/W8I）
 工作副本     /home/chiro/projects/pypto/pypto_x（= 公开主仓 chiro2001/pypto-x 的克隆，origin 指向公开仓）
 私有备份     ../pypto_x_private_bkp（archive 分支，含第三方离线副本）+ GitHub chiro2001/pypto-x-private
 证据目录     ../worktrees/_meta/pypto-x/<task>/（不在仓内；权重亦在仓外）
@@ -27,7 +27,7 @@ W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_PASS_CHAT_T18_DIVERGENT_ASCEND_A2_ONLINE
 
 本仓刻意做成**只靠仓内文件即可接手**：新会话先读本文件 → `HANDOFF.zh-CN.md` §0（恢复第一小时 TL;DR）→ ERRATA → 路线图，然后跑本文件 §3 自检（不重跑 smoke、不加载权重）。
 用户只说"继续"时，按 HANDOFF §0 的默认优先级行动；待用户决定的事项见路线图 §10。本机 `gh` 已认证为 `chiro2001`（可用于仓库元数据；推送仍按发布纪律）。
-拿不准就查 `_meta` 证据目录或问用户——**不要凭记忆编造阶段数字**，一切以 `configs/development_lock.yaml` 与 `docs/00-handoffs/0035-*` 为准。
+拿不准就查 `_meta` 证据目录或问用户——**不要凭记忆编造阶段数字**，一切以 `configs/development_lock.yaml` 与 `docs/00-handoffs/0036-*` 为准。
 
 ### 1. 必读顺序
 
@@ -45,9 +45,14 @@ W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_PASS_CHAT_T18_DIVERGENT_ASCEND_A2_ONLINE
 ```text
 Core IR / Target ABI / CPU scalar / AVX2 / AVX-512 / SVE256 / GPU common / CUDA C1–C2
 Qwen3.5-0.8B M0–M1K（无权重 decoder、3/320/48 binding、CPU/CUDA external ingestion）
-真权重 BF16 整网（图 v3）：en(T=5)/zh(T=8) 按"相对 gold dtype 带宽"判据 PASS（cos 0.99991/0.99973、
-  max_abs 0.99×/1.67×band），decode 三 prompt token 链全对、state 有限；chat(T=18) 仍 FAIL（3.78×band，真实累积分歧）
-  → 独立验收 PASS_WITH_BOUNDARIES；图契约 v3（4,550 ops / digest 66dd4077…）
+真权重 BF16 整网（图 v3）：ERR-0002 修复后 en(T=5)/zh(T=8) strict PASS（cos 0.99997235/0.99993803、
+  max_abs 0.68×/0.85×band）；chat(T=18) 严格 argmax 17/18 + row 14 near-tie，按 2026-09-10 修订判据 PASS；
+  decode 三 prompt token 链全对、state 有限；独立验收 PASS；图契约 v3（4,550 ops / digest 66dd4077…）
+W8A-C Ascend A2(910B3) 真机验收 PASS：PTO-ISA tassign NPU ST、CANN mspti aclnn Add 样例、
+  注入式最小 hook live 9/9（bisheng 22,728 B / sha256 4d7f704c…，真机 max_abs_err=0.0）；
+  ascend_cann_bisheng_npu_regression_blocked 限定式关闭（独立验收 PASS）
+W8G 可移植性清理完成 + 独立验收 PASS（integration c464927fa）
+W8H vllm-ascend E2E 基线 / W8I profiling 基线已产出（精度/性能原始事实），独立验收 in flight
 GDR T=128：五后端 + 920B 原生 PASS（gdr_t128_not_validated 已关闭）
 AMD gfx1036 静态 C1–C3（运行态判定架构性不可达，用户决定长期只保留静态证据）
 基础设施：GamePC CUDA Toolkit（nvcc 13.3.73 + cuBLAS 13.6）、本机 CANN 9.2.0-beta.2 toolkit（cannsim/npusim）、
@@ -57,18 +62,22 @@ AMD gfx1036 静态 C1–C3（运行态判定架构性不可达，用户决定长
 **进行中 / 待办**
 
 ```text
-W8A-B   T≥8 精度攻坚：chat(T=18) 分歧（row 11 起、首个不达标层 gold index 8）
-W8A-C   Ascend 真机验收（**最高优先、可立即开始**）：A2(910B) 在线，PTO-ISA NPU ST → CANN 样例 → adapter hooks
+W8H/W8I 独立验收收口（in flight：verify-qwen35-a2-vllm-ascend-baselines；A2 NPU 任务走 /root/a2-npu-lock/）
 W8B     AVX2 packed 参数级算子 / SVE fallback 分类清零 / CUDA cuEvent 计时 + GEMM 基线 / 本机 L0-L1 性能
 W8C     W8A8-linear 实现（契约已冻结；按后端 DAG C1→C8）
 W8D     GDR fused WY、长序列 T=64/128 代价评估
-W8E     CANN report（缺 plotly）、npusim record 复现性、IR→PTO 桥、Ascend hooks；910C 租用环境待到位
+W8E     CANN report（缺 plotly）、npusim record 复现性、IR→PTO 桥、Ascend hooks；stable 9.2.0-beta.2 未上卡
+可选    若用户要求 chat 严格 18/18：评估任务分支 327b17158（--debug-f32-residual，未合入、未采纳）
 ```
 
 **硬边界（不得夸大）**
 
 ```text
 - 静态 lowering ≠ 真机执行：AMD/ Ascend 的静态结论不得写成运行 PASS
+- A2 真机 PASS 是限定式的：仅 PTO-ISA tassign 单用例 + 注入式最小固定 64×64 f32 add hook；
+  不代表 Core IR→PTO、classic/Pro JIT/OPC 或模型级；stable CANN 9.2.0-beta.2 未上卡
+- T=1/decode 算子层是 no-op，但端到端 decode logits 因继承 prefill state 而变——不得写"decode 端到端无变化"
+- vLLM profiling 的 ×1.65–1.71 开销是真实 profiler 开销，不得当作模型性能引用
 - CPU 侧仍是逐 op 派发、零融合；本机是 KVM guest 无 cpufreq → 绝对性能门槛永久 UNGATED
 - CUDA 无 cuEvent 计时前，kernel_seconds 必须为 null
 - CANN CAModel 只适合指令级细看（单条 64×64 TADD 95 s / 7.3 GiB），不能做模型级评估
@@ -141,5 +150,7 @@ git -C /home/chiro/projects/pypto/worktrees/pypto-x/integration log --oneline -1
 - AMD 核显 `gfx1036`：官方支持面不含该型号，WSL2 GPU-PV 下无 `/dev/kfd`；未经真机证据不得声称 HIP 已运行。
 - 本机 CANN：`/usr/local/Ascend`（仅 toolkit，无驱动、无 950-ops）；CA-model 运行会吃 7.3 GiB，须在锁内并显式提高 `memory_max_mib`。
 - 昇腾 A2（910B3）租用环境：容器 256 vCPU / 2 TB 内存 / 1×910B3（64 GB HBM）/ CANN 9.0.0 / 驱动 25.2.0。
+  **NPU 执行必须走容器内固定卡锁 `/root/a2-npu-lock/`（`a2_card_lock.sh`）**：request→using→done（历史保留）、
+  180 s 轮询、TTL 6 h + PID 僵死判定；**只保护 NPU 执行**，下载权重/编译/环境准备可并行；A2 时钟约快 8 h。
   访问方式与访问脚本**只保存在本地私有侧**（`~/tools/a2-910b/`：辅助脚本 + 端点/凭据在 `~/.ssh/a2-910b.env`），**不得提交进本仓**；本仓只登记资源存在与使用纪律。
   该机是租用共享资源 → **约定串行**；出网仅 HTTPS(gitcode/pypi) 可达，无 22 出网、无 TUN/NET_ADMIN（VPN 不可行）。
