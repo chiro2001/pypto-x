@@ -13,9 +13,10 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W5_AMDGPU_GFX1036_STATIC_C3_COMPLETE_RUNTIME_BLOCKED_W6_M1K_COMPLETE`。
+- 当前状态是 `EXECUTION_W6_QWEN35_BF16_WEIGHTED_EXECUTION_AUTHORIZED_WAVE1_IN_PROGRESS_AMD_RUNTIME_BLOCKED_DEVICE`。
 - Qwen3.5-0.8B M0–M1K 已完成并冻结；M1I 是24层无权重 decoder，M1J 是3/320/48 external buffer binding，M1K 已让 scalar、AVX2/AVX-512、SVE256 与 CUDA 正确摄取 typed byte views。SVE 部分复合路径仍有 host-reference fallback，真实带权整网仍未执行。
-- Qwen BF16 下一阶段需要用户明确授权下载/加载权重；AMD `amd-igpu-gfx1036` 静态 C3 已覆盖 math、任意轴 reduction 与 rank-2/3/4 exact-batch matmul，Qwen 静态 lowering 为4,532/4,532 ops。WSL 运行态仍为 `BLOCKED_DEVICE`；完整静态 lowering 不得表述为 HIP 真机 PASS。
+- 用户已于 2026-09-10 明确授权下载/加载固定 revision 的 `Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17` 权重，用于纯文本 BF16 带权执行；权重位于 `../worktrees/_meta/pypto-x/assets/qwen35-0.8b/<revision>/`，未进入 Git。带权前向结果产生前，仍不得声称整网已运行。
+- AMD `amd-igpu-gfx1036` 静态 C3 已覆盖 math、任意轴 reduction 与 rank-2/3/4 exact-batch matmul，Qwen 静态 lowering 为4,532/4,532 ops。WSL 运行态仍为 `BLOCKED_DEVICE`（只有 `/dev/dxg`，无 `/dev/kfd`/ROCm/HIP）；完整静态 lowering 不得表述为 HIP 真机 PASS。
 
 ## Git 与目录
 
