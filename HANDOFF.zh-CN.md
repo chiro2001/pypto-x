@@ -8,6 +8,31 @@
 
 > 首次接手请按 `AGENTS.md` 的顺序读：本文件 → `docs/00-handoffs/ERRATA.zh-CN.md` → `docs/20-planning/0003-…roadmap.zh-CN.md` → 各规范。
 
+## 0. 恢复第一小时（零记忆 TL;DR）
+
+本仓的设计目标是**任意全新 agent 只靠仓内文档即可接手**；若你（或新上下文）什么都不知道，按此执行：
+
+```text
+1. 读：AGENTS.md → 本文件（§1–§2）→ ERRATA.zh-CN.md → 路线图 §6/§10。
+2. 跑 §12 自检。预期：integration @ 9aae4649e、96 个补丁、两把锁 FREE、CANN toolkit 在 /usr/local/Ascend。
+   自检不重跑 smoke、不下载依赖、不加载权重。
+3. 不要做的事：不把 chat(T=18) 说成"整网已对齐"（仍是 FAIL，§2）；不把静态 lowering 说成真机 PASS；
+   不推公开仓/不改历史/不发权重证据，除非用户当次明确指示。
+4. 用户说"继续"时的默认动作（按优先级）：
+   a) W8A-C Ascend 真机验收（A2 910B 已在线、最高优先）——访问脚本在本地私有侧 ~/tools/a2-910b/（先读其 README）；
+      若隧道不通，脚本会自动回退平台跳板，但**跳板 token 约 10 分钟失效，需要用户重新提供**；不要自己在仓内找凭据。
+   b) W8A-B chat(T=18) 数值分歧攻坚（row 11 起、首个不达标层 gold index 8）。
+   c) 然后才轮到 W8B/W8C（见路线图 §10 待决策）。
+5. 并发与资源：活动 subagent ≤3；重任务一律经 scripts/resource/run_local_heavy.sh（返回 75/69 就等待重试，
+   禁止绕过）；A2 与 920B 都是租用共享资源，约定串行。
+6. 重任务需要用户批准才启动（AGENTS.md「Subagent 协议」第一条）。
+7. 提交纪律：公开主仓 = 本目录（origin）；改完实现 → cherry-pick 到 integration → 独立 verify → 更新
+   development_lock/快照/ERRATA → scripts/remote/export_patches.sh → git push origin main → scripts/remote/sync_private_backup.sh。
+```
+
+找不到答案时，先查 `_meta` 证据目录（`../worktrees/_meta/pypto-x/<task>/`）与 `docs/00-handoffs/` 的历史快照，
+再问用户；**不要凭记忆编造数字**——所有阶段性数字都应以 `configs/development_lock.yaml` 与 0035 快照为准。
+
 ## 1. 接手摘要
 
 **PyPTO-X（PyPTO Cross-Architecture）** 以官方 PyPTO 同仓的 Tensor/Professional 双前端为基线，把可移植语义与 Ascend 专属 dialect 分层，逐步支持：

@@ -308,10 +308,21 @@ A0 配置真值归一化 + 当前 runtime 任务收口（已完成合并，仅�
 
 ## 10. 待决策（用户）
 
-1. **W8C 起点**：是否按 C1→C8 完整后端 DAG 推进（推荐），还是先只做 C1/C2 打契约底座？
-2. **W8D/E 深度**：D2 长序列评估、E4 IR→PTO 桥，是否现在启动？
-3. **是否确认采用 ≤3 subagent + 父 agent 的 4 槽并发模型**（评审建议）？
-4. **是否批准 §8 的可删清单**（安装包 / venv / build 目录）？
+> 状态更新 2026-09-10：评审已通过（v1→v2，见 §12）；W8A 的 A0–A3 已完成并冻结（见快照 `0035`）。
+> 以下是**当前仍待用户决定**的项；新 agent 不要自行开工。
+
+1. **W8A-C Ascend 真机验收**：A2(910B3) 已在线，是否立即派发 `qwen35-ascend-npu-acceptance`
+   （PTO-ISA NPU ST → CANN 样例 → `backends/ascend/adapter.py` hooks）？
+   这是当前**最高优先、且不消耗本机重资源**的一项；访问脚本在本地私有侧 `~/tools/a2-910b/`。
+2. **W8A-B 优先级**：chat(T=18) 分歧攻坚（row 11 起、首个不达标层 gold index 8）是否先于 W8B？
+   预期手段：逐层 bf16/fp32 混合比对、定位首个放大点，再决定是修 lowering 还是记入 `known_limits`。
+3. **W8C 起点**：是否按 C1→C8 完整后端 DAG 推进（推荐），还是先只做 C1/C2 打契约底座？
+4. **W8D/E 深度**：D2 长序列 T=64/128 代价评估、E4 IR→PTO 桥与 Ascend hooks，是否现在启动？
+5. **是否批准 §8 的可删清单**（安装包 / venv / build 目录；本机磁盘约 78 GB 可用）？
+6. `qwen35-portability-cleanup`（W8G，绝对路径参数化）是否随下一次改动顺带做（当前 queued，无依赖阻塞）？
+
+已决：并发采用 ≤3 subagent + 父 agent 四槽（评审建议 3）；验收口径改用**相对 gold dtype 带宽**（§6）。
+若本节与 `HANDOFF.zh-CN.md` §0/§11 冲突，以 HANDOFF 为准。
 
 ---
 

@@ -20,7 +20,14 @@ W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_PASS_CHAT_T18_DIVERGENT_ASCEND_A2_ONLINE
 工作副本     /home/chiro/projects/pypto/pypto_x（= 公开主仓 chiro2001/pypto-x 的克隆，origin 指向公开仓）
 私有备份     ../pypto_x_private_bkp（archive 分支，含第三方离线副本）+ GitHub chiro2001/pypto-x-private
 证据目录     ../worktrees/_meta/pypto-x/<task>/（不在仓内；权重亦在仓外）
+本机私有工具 ~/tools/a2-910b/（A2 访问，含 README）、~/tools/ecs-920B/（state.env）——不入仓，仓内只登记纪律
 ```
+
+### 0.1 全新上下文如何恢复（零记忆）
+
+本仓刻意做成**只靠仓内文件即可接手**：新会话先读本文件 → `HANDOFF.zh-CN.md` §0（恢复第一小时 TL;DR）→ ERRATA → 路线图，然后跑本文件 §3 自检（不重跑 smoke、不加载权重）。
+用户只说"继续"时，按 HANDOFF §0 的默认优先级行动；待用户决定的事项见路线图 §10。本机 `gh` 已认证为 `chiro2001`（可用于仓库元数据；推送仍按发布纪律）。
+拿不准就查 `_meta` 证据目录或问用户——**不要凭记忆编造阶段数字**，一切以 `configs/development_lock.yaml` 与 `docs/00-handoffs/0035-*` 为准。
 
 ### 1. 必读顺序
 
