@@ -48,3 +48,4 @@ NNNN-YYYY-MM-DD-<阶段或主题>.zh-CN.md
 | 0031 | 2026-09-10 | AMD `gfx1036` 静态 C2 完成、C3 math/reduction 就绪 | [AMDGPU 静态 C2 完成快照](0031-2026-09-10-amdgpu-gfx1036-static-c2-complete.zh-CN.md) |
 | 0032 | 2026-09-10 | AMD `gfx1036` 静态 C3 完成、HIP runtime 等待设备 | [AMDGPU 静态 C3 完成快照](0032-2026-09-10-amdgpu-gfx1036-static-c3-complete.zh-CN.md) |
 | 0033 | 2026-09-10 | 用户授权 Qwen3.5-0.8B 权重、W6 带权执行波次 1 派发 | [权重授权与波次 1 派发](0033-2026-09-10-bf16-weight-authorization-and-wave1-dispatch.zh-CN.md) |
+| 0034 | 2026-09-10 | 波次 1 部分完成：gold 参考、AMD 运行态审计、性能协议、W8A8 契约 | [波次 1 结果与待决策](0034-2026-09-10-wave1-results-and-pending-decisions.zh-CN.md) |

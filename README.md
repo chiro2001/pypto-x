@@ -18,7 +18,9 @@ PyPTO-X（PyPTO Cross-Architecture）是本项目的工作名称，目标是在�
 - [项目文件布局](docs/PROJECT_LAYOUT.zh-CN.md)：PyPTO-X 的模块边界、源码归属和许可证分层。
 - [Worktree 与 subagent 计划](docs/WORKTREE_AGENT_PLAN.zh-CN.md)：分支拓扑、任务依赖、启动参数和一小时长等待协议。
 - [Qwen3.5-0.8B BF16/W8A8 模型 MVP](docs/20-planning/0001-2026-09-07-qwen35-08b-bf16-w8a8-mvp.zh-CN.md)：模型 revision、算子闭包、量化契约、后端顺序和验收标准。
-- [Qwen3.5-0.8B 首期 W8A8-linear 契约](docs/20-planning/0002-2026-09-10-qwen35-w8a8-linear-contract.zh-CN.md)：量化 scheme、混合精度边界、binding/opcode 扩展、后端前置与 L0–L7 精度阶梯（第 8 节待用户拍板）。
+- [Qwen3.5-0.8B 首期 W8A8-linear 契约](docs/20-planning/0002-2026-09-10-qwen35-w8a8-linear-contract.zh-CN.md)：量化 scheme、混合精度边界、binding/opcode 扩展、后端前置与 L0–L7 精度阶梯（D1–D12 已获用户批准）。
+- [性能测量协议与门槛策略](docs/PERF_MEASUREMENT_PROTOCOL.zh-CN.md)：三层测量对象、统计与方差门槛、FLOP 口径、G1–G4 门槛阶梯与 16 条反模式。
+- [AMD `gfx1036` 运行态可行性审计](research/audits/2026/0004-2026-09-10-amd-gfx1036-runtime-feasibility.zh-CN.md)：官方支持面、WSL2 GPU-PV 的结构性限制与可行替代路线。
 - [资源矩阵](docs/RESOURCE_MATRIX.zh-CN.md)：5080 WSL、AMD `gfx1036` 核显、鲲鹏 920B 和 QEMU 的使用安排。
 - [本机重任务资源锁策略](docs/LOCAL_RESOURCE_POLICY.zh-CN.md)：跨项目 `local` 锁、cgroup 限制、运行时资源监控与安全停止规则。
 - [无模型冒烟测试规范](docs/SMOKE_TEST_SPEC.zh-CN.md)：每个 subagent 只执行一次的测试契约。
