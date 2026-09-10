@@ -10,6 +10,7 @@
 | RTX 5080（`192.168.101.5`） | 在线；GPU 由 PyPTO-X 独占；M1K-CUDA PASS | NVIDIA CUDA/PTX/NVVM 验证 | WSL2、RTX 5080 16,303 MiB、CC 12.0；2026-09-10 复测 KMD **616.92** / CUDA UMD **13.4**（文档旧值 610.62/13.3，已漂移）；Driver/PTX 连续两次执行371-input/51-output external-buffer 24层图 | GPU-only 无需 `gamepc` 锁；host-heavy 才持锁。无 `nvcc`/NVRTC/CUDART/cuBLAS/SDK headers/PyTorch/Triton；空闲时钟约 427–487 MHz vs 峰值 3090 MHz，测性能前必须 warmup 并断言时钟；当前是 correctness kernel，不是 fusion/性能结论 |
 | AMD GamePC 核显 `gfx1036` | 静态 C3 PASS；HIP runtime 判定为**架构性不可达**（见审计 0004）；6750GRE 不在 PCI 总线 | AMDGPU LLVM static codegen；HIP 只能靠裸机 Linux 或换官方支持 dGPU | C3 math/reduction/batched matmul与Qwen 4,532/4,532 static lowering通过（graph v2 计数；v3 为 4,550，AMD 静态 compiler 尚未对新图重跑）；2026-09-10 可行性审计：gfx1036 不在 ROCm 10.0.0 / Radeon / WSL / HIP SDK for Windows 任何官方表内；WSL2 GPU-PV 架构下没有 `/dev/kfd`；第三方一手证据显示 ROCm 7.1.1 裸机可跑 gfx1036 kernel（wave32、2 CU、Fast F16，仅第三方参考） | 静态 LLVM/ELF与host oracle不等于HIP执行；MFMA/WMMA/INT8 dot/XNACK 仍 unknown；WSL 经 Mesa d3d12 可跑 GL compute（已实测），但那是 GLSL→DXIL 路径，不能执行我们的 AMDHSA ELF，且无 bf16/int8/subgroup 扩展；不能代表6750GRE性能 |
 | 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；M1C1–M1I 功能/contract 与24层 synthetic decoder 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；`iota/compare` 是 host-reference；按量计费，状态见 `~/tools/ecs-920B/state.env` |
+| 昇腾 A2（910B3）租用环境 | 在线（HiDevLab）；容器 256 vCPU / 2014 GiB / 300 GB；CANN 9.0.0 + 驱动 25.2.0 | Ascend 真机验收：PTO-ISA NPU ST、CANN 样例、Ascend adapter 回归 | `npu-smi` 显示 1× 910B3、Health OK、HBM 3450/65536 MB；`acl.get_soc_name()=Ascend910B3`（需先 `source /usr/local/Ascend/ascend-toolkit/set_env.sh`）；容器内无 torch/pypto/numpy | 出网受限：HTTPS 仅 gitcode/pypi 可达、github 与一切 22 端口被封；无 `/dev/net/tun`、无 NET_ADMIN → **OpenVPN/反向 SSH 到自建中继都不可行**；访问走 <relay-host> 反向隧道（平台 token 短期有效，仅作引导）；租用共享资源 → **约定串行** |
 | QEMU AArch64 | 可用 | AArch64/SVE/SVE2 功能和编译验证 | `qemu-aarch64` 11.0.3；已验证 `max,sve256=on` 可报告 SVE/SVE2，VL=32 bytes | 不能代表鲲鹏吞吐、缓存、内存带宽或指令时序 |
 
 ## 网络代理
@@ -179,6 +180,24 @@ Windows OpenCL/Vulkan 设备可见不等于 Linux HIP 可用；当前只做静�
 静态 C2 在 exact integration HEAD `45e8459e79ea979beb58661eb77b30a50f133f75` 上增加cast/layout/indexing/control。18类artifact和23/23 tamper通过，Qwen capability为4,098/4,532；剩余434项是math、通用reduction、batched matmul。descriptor为O(rank+segments)，未生成整网kernel。证据见 `../worktrees/_meta/pypto-x/integration-w5-hip-gfx1036-static-c2-final-r2/validation.json`。
 
 静态 C3 在 exact integration HEAD `bcf9516e6419d232338988238ffa8f79e59079c1` 上补齐 `exp/rsqrt/sigmoid/silu/softplus`、任意合法轴的 `reduce_sum/max/mean` 和 rank-2/3/4 exact-batch matmul。独立验收为 `577 passed, 7 skipped`；每个数学算子执行718个FP32样本及65,536个BF16 raw storage输入，10个host-adapted production LLVM reduction/matmul case exact PASS。Qwen `(B=1,T=1,past=4096)` 一次完整lower得到4,532/4,532 plans，约10.51 MB LLVM IR、约95.4 MiB峰值RSS；没有整图object/link或模型权重。证据见 `../worktrees/_meta/pypto-x/integration-w5-hip-gfx1036-static-c3-final/validation.json`。HIP运行态仍为 `BLOCKED_DEVICE`。
+
+## 昇腾 A2（910B）租用环境接入
+
+```text
+计算资源   容器 256 vCPU / 2014 GiB 内存 / 300 GB 盘；1× Ascend 910B3（64 GB HBM）
+软件栈     CANN 9.0.0（/usr/local/Ascend，含 driver 25.2.0、nnal、bishengir-compile、ccec、llvm-objcopy）
+           容器内**没有** torch / torch_npu / numpy / pypto（需要时自行 pip，pypi 可达）
+出网特征   443 仅 gitcode.com / pypi.org 可用；github.com 与所有 22 端口被封；无 TUN/NET_ADMIN
+接入路径   A2 ──(443 反向隧道)──> <relay-host>:127.0.0.1:2222 ──> 本机
+           本机用 `scripts/remote/a2_910b.sh`（默认隧道优先；平台跳板 jt_xxx:token 仅作引导且短期有效）
+           A2 侧保活脚本 /root/a2_tunnel.sh（源文件 scripts/remote/a2_tunnel.sh），每 5 s 自动重连
+运维命令   --status 看两条路径；--install-tunnel 在容器重建后重新上传并启动保活；
+           --copy 走同一通道传文件；--mode jump 强制走平台跳板
+```
+
+**注意**：<relay-host> 上为此增开了**独立 sshd 实例** `<relay-ssh-service>.service`（配置文件 `/etc/ssh/sshd_config_443`），
+与主 sshd（22）互不影响；A2 的隧道公钥在 `~chiro/.ssh/authorized_keys` 中带
+`restrict,port-forwarding,permitlisten="127.0.0.1:2222"` 限制。
 
 ## 资源分配
 
