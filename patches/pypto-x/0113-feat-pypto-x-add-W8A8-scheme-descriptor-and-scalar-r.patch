@@ -1,0 +1,1096 @@
+From 61745243cd1c105814fc57aaa144e661084f4a44 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 00:17:28 +0800
+Subject: [PATCH 113/118] feat(pypto-x): add W8A8 scheme descriptor and scalar
+ reference goldens
+
+Contract 0002 C1 (qwen35-w8a8-scheme):
+- QuantizedTensorDesc in pypto.core_ir (fields per section 3.3);
+  per_group and BF16 scale fail closed; to_dict/from_dict round trip.
+- Scalar reference goldens for the four public opcodes:
+  quantize_per_token_s8, dequantize_s8, qmatmul_s8s8_s32,
+  dequantize_epilogue_bf16.
+- Q1-Q6 boundaries: all-zero row s=1.0/q=0, NaN/Inf rejection,
+  saturation count field, RNE ties-to-even shared with BF16 RNE,
+  K<=133144 limit, non-2D reshape to [rows, K].
+- R1-R5 focused tests in python/tests/ut/pypto_x/test_w8a8_scheme.py.
+
+No backend kernels, lowering or runtime changes.
+---
+ python/pypto/core_ir/__init__.py            |   6 +
+ python/pypto/core_ir/model.py               | 131 ++++++++++++
+ python/pypto/portable/__init__.py           |  34 ++++
+ python/pypto/portable/qwen35_w8a8_scheme.py | 518 ++++++++++++++++++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_w8a8_scheme.py | 304 ++++++++++++++++++++++++++++
+ 5 files changed, 993 insertions(+)
+
+diff --git a/python/pypto/core_ir/__init__.py b/python/pypto/core_ir/__init__.py
+index 136f85f2a..ff41a621e 100644
+--- a/python/pypto/core_ir/__init__.py
++++ b/python/pypto/core_ir/__init__.py
+@@ -6,6 +6,8 @@
+ """
+ 
+ from .model import (
++    QUANTIZED_ACTIVATION_LOGICAL_LAYOUT,
++    QUANTIZED_WEIGHT_LOGICAL_LAYOUT,
+     SCHEMA_VERSION,
+     Block,
+     CoreFunction,
+@@ -16,12 +18,15 @@ from .model import (
+     CoreType,
+     Effect,
+     Operation,
++    QuantizedTensorDesc,
+     Region,
+     UnsupportedSchemaVersionError,
+     ValueRef,
+ )
+ 
+ __all__ = [
++    "QUANTIZED_ACTIVATION_LOGICAL_LAYOUT",
++    "QUANTIZED_WEIGHT_LOGICAL_LAYOUT",
+     "SCHEMA_VERSION",
+     "Block",
+     "CoreFunction",
+@@ -32,6 +37,7 @@ __all__ = [
+     "CoreType",
+     "Effect",
+     "Operation",
++    "QuantizedTensorDesc",
+     "Region",
+     "UnsupportedSchemaVersionError",
+     "ValueRef",
+diff --git a/python/pypto/core_ir/model.py b/python/pypto/core_ir/model.py
+index d561af38c..ece73023d 100644
+--- a/python/pypto/core_ir/model.py
++++ b/python/pypto/core_ir/model.py
+@@ -214,6 +214,134 @@ class CoreType:
+         return cls(data["kind"], data["dtype"], tuple(shape))
+ 
+ 
++QUANTIZED_WEIGHT_LOGICAL_LAYOUT = "out_in_rowmajor"
++QUANTIZED_ACTIVATION_LOGICAL_LAYOUT = "row_then_k"
++_QUANTIZED_LOGICAL_LAYOUTS = frozenset(
++    (QUANTIZED_WEIGHT_LOGICAL_LAYOUT, QUANTIZED_ACTIVATION_LOGICAL_LAYOUT)
++)
++_QUANTIZED_GRANULARITIES = frozenset(("per_output_channel", "per_group"))
++_QUANTIZED_SCALE_DTYPES = frozenset(("float32",))
++_QUANTIZED_ZERO_POINT_POLICIES = frozenset(("fixed_zero",))
++
++
++@dataclass(frozen=True)
++class QuantizedTensorDesc:
++    """W8A8-linear 量化张量的目标无关描述符（契约 §3.3）。
++
++    只描述公共语义：signed INT8、对称 zero-point=0、FP32 scale。物理
++    packing（VNNI/SDOT/dp4a 等）不属于公共 IR，因此这里没有相关字段。
++
++    ``granularity="per_group"`` 在本期显式拒绝（fail-closed）：描述符预留了
++    ``group_size`` 字段，但后端 kernel 尚未实现，静默接受会产生“描述符支持
++    但运行时没有实现”的路径。
++    """
++
++    signed: bool = True
++    bits: int = 8
++    axis: int = 0
++    granularity: str = "per_output_channel"
++    group_size: Optional[int] = None
++    scale_dtype: str = "float32"
++    zero_point_policy: str = "fixed_zero"
++    logical_layout: str = QUANTIZED_WEIGHT_LOGICAL_LAYOUT
++
++    def __post_init__(self) -> None:
++        if self.signed is not True:
++            raise CoreIRValidationError("QuantizedTensorDesc 只支持 signed 量化")
++        if isinstance(self.bits, bool) or self.bits != 8:
++            raise CoreIRValidationError("QuantizedTensorDesc 只支持 8-bit 量化")
++        if isinstance(self.axis, bool) or self.axis not in (0, -1):
++            raise CoreIRValidationError(
++                "QuantizedTensorDesc.axis 只能是 0（weight per-output-channel）或 -1（activation per-row）"
++            )
++        if not isinstance(self.granularity, str) or self.granularity not in _QUANTIZED_GRANULARITIES:
++            raise CoreIRValidationError(
++                "QuantizedTensorDesc.granularity 必须是 per_output_channel 或 per_group"
++            )
++        if self.granularity == "per_group":
++            raise CoreIRValidationError(
++                "QuantizedTensorDesc per_group 本期显式拒绝（fail-closed）：group_size 仅预留字段，后端未实现"
++            )
++        if self.group_size is not None:
++            raise CoreIRValidationError(
++                "QuantizedTensorDesc.group_size 仅对 per_group 有意义；本期 per_output_channel 必须为 None"
++            )
++        if not isinstance(self.scale_dtype, str) or self.scale_dtype not in _QUANTIZED_SCALE_DTYPES:
++            raise CoreIRValidationError(
++                "QuantizedTensorDesc.scale_dtype 必须是 float32；BF16 scale 本期显式拒绝"
++            )
++        if self.zero_point_policy not in _QUANTIZED_ZERO_POINT_POLICIES:
++            raise CoreIRValidationError(
++                "QuantizedTensorDesc.zero_point_policy 必须是 fixed_zero（非对称量化不在本期范围）"
++            )
++        if self.logical_layout not in _QUANTIZED_LOGICAL_LAYOUTS:
++            raise CoreIRValidationError(
++                "QuantizedTensorDesc.logical_layout 必须是 {} 或 {}".format(
++                    QUANTIZED_WEIGHT_LOGICAL_LAYOUT, QUANTIZED_ACTIVATION_LOGICAL_LAYOUT
++                )
++            )
++        if self.axis == 0 and self.logical_layout != QUANTIZED_WEIGHT_LOGICAL_LAYOUT:
++            raise CoreIRValidationError(
++                "QuantizedTensorDesc axis=0（per-output-channel）必须搭配 out_in_rowmajor"
++            )
++        if self.axis == -1 and self.logical_layout != QUANTIZED_ACTIVATION_LOGICAL_LAYOUT:
++            raise CoreIRValidationError("QuantizedTensorDesc axis=-1（per-row）必须搭配 row_then_k")
++
++    @classmethod
++    def weight_per_output_channel(cls) -> "QuantizedTensorDesc":
++        """Weight per-output-channel 冻结默认值。"""
++
++        return cls()
++
++    @classmethod
++    def activation_per_row(cls) -> "QuantizedTensorDesc":
++        """Activation 动态 per-row（仅诊断用途）。"""
++
++        return cls(axis=-1, logical_layout=QUANTIZED_ACTIVATION_LOGICAL_LAYOUT)
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "signed": self.signed,
++            "bits": self.bits,
++            "axis": self.axis,
++            "granularity": self.granularity,
++            "group_size": self.group_size,
++            "scale_dtype": self.scale_dtype,
++            "zero_point_policy": self.zero_point_policy,
++            "logical_layout": self.logical_layout,
++        }
++
++    @classmethod
++    def from_dict(cls, value: Mapping[str, Any]) -> "QuantizedTensorDesc":
++        data = _ensure_mapping(value, "QuantizedTensorDesc")
++        fields = (
++            "signed",
++            "bits",
++            "axis",
++            "granularity",
++            "group_size",
++            "scale_dtype",
++            "zero_point_policy",
++            "logical_layout",
++        )
++        _ensure_keys(data, fields, "QuantizedTensorDesc")
++        unknown = [key for key in data if key not in fields]
++        if unknown:
++            raise CoreIRSerializationError(
++                "QuantizedTensorDesc 含未知字段: {}".format(", ".join(sorted(unknown)))
++            )
++        return cls(
++            signed=data["signed"],
++            bits=data["bits"],
++            axis=data["axis"],
++            granularity=data["granularity"],
++            group_size=data["group_size"],
++            scale_dtype=data["scale_dtype"],
++            zero_point_policy=data["zero_point_policy"],
++            logical_layout=data["logical_layout"],
++        )
++
++
+ @dataclass(frozen=True, init=False)
+ class ValueRef:
+     """函数内稳定的 SSA value 引用。"""
+@@ -707,6 +835,9 @@ __all__ = [
+     "CoreType",
+     "Effect",
+     "Operation",
++    "QUANTIZED_ACTIVATION_LOGICAL_LAYOUT",
++    "QUANTIZED_WEIGHT_LOGICAL_LAYOUT",
++    "QuantizedTensorDesc",
+     "Region",
+     "UnsupportedSchemaVersionError",
+     "ValueRef",
+diff --git a/python/pypto/portable/__init__.py b/python/pypto/portable/__init__.py
+index 386fb9d5d..0d8f416e7 100644
+--- a/python/pypto/portable/__init__.py
++++ b/python/pypto/portable/__init__.py
+@@ -87,6 +87,24 @@ from .runtime_binding import (
+     build_packed_layout,
+     ordered_input_descriptors,
+ )
++from .qwen35_w8a8_scheme import (
++    MAX_ACCUMULATOR_K,
++    OPCODE_DEQUANTIZE_EPILOGUE_BF16,
++    OPCODE_DEQUANTIZE_S8,
++    OPCODE_QMATMUL_S8S8_S32,
++    OPCODE_QUANTIZE_PER_TOKEN_S8,
++    SCALAR_REFERENCE_OPCODES,
++    W8A8_SCHEME,
++    W8A8QuantizationError,
++    W8A8SchemeError,
++    bf16_rne_bits,
++    dequantize_epilogue_bf16,
++    dequantize_s8,
++    qmatmul_s8s8_s32,
++    quantize_per_token_s8,
++    rne_float_to_int,
++    scalar_reference,
++)
+ 
+ __all__ = [
+     "QWEN35_08B_SHAPE_METADATA",
+@@ -162,4 +180,20 @@ __all__ = [
+     "build_binding_schema",
+     "build_packed_layout",
+     "ordered_input_descriptors",
++    "MAX_ACCUMULATOR_K",
++    "OPCODE_DEQUANTIZE_EPILOGUE_BF16",
++    "OPCODE_DEQUANTIZE_S8",
++    "OPCODE_QMATMUL_S8S8_S32",
++    "OPCODE_QUANTIZE_PER_TOKEN_S8",
++    "SCALAR_REFERENCE_OPCODES",
++    "W8A8_SCHEME",
++    "W8A8QuantizationError",
++    "W8A8SchemeError",
++    "bf16_rne_bits",
++    "dequantize_epilogue_bf16",
++    "dequantize_s8",
++    "qmatmul_s8s8_s32",
++    "quantize_per_token_s8",
++    "rne_float_to_int",
++    "scalar_reference",
+ ]
+diff --git a/python/pypto/portable/qwen35_w8a8_scheme.py b/python/pypto/portable/qwen35_w8a8_scheme.py
+new file mode 100644
+index 000000000..0fa380bd4
+--- /dev/null
++++ b/python/pypto/portable/qwen35_w8a8_scheme.py
+@@ -0,0 +1,518 @@
++"""W8A8-linear 量化 scheme 的 scalar reference golden（契约 §1.4 / §3.3）。
++
++本模块是 4 个公共 opcode 的**纯 Python、无后端**参考实现，用于在下沉到
++AVX2/AVX-512/SVE/CUDA 之前冻结整数 golden：
++
++* ``quantize_per_token_s8``     动态 per-row absmax 量化，产出 int8 + fp32 scale；
++* ``dequantize_s8``             诊断用 int8 + fp32 scale -> fp32；
++* ``qmatmul_s8s8_s32``          INT8×INT8->INT32，与 portable matmul 相同的 equal-prefix batch 规则；
++* ``dequantize_epilogue_bf16``  INT32 + (s_a ⊗ s_w) -> BF16，单次 RNE 舍入。
++
++边界规则（契约 §1.4，全部 fail-closed）：
++
++* Q1 整行全零：``s = 1.0``、``q = 0``，不得产生 NaN/Inf；
++* Q2 行内 NaN/Inf：显式抛错，不静默 clamp；
++* Q3 饱和：``q`` clamp 到 ``[-127, 127]``，饱和计数作为返回值/artifact 字段上报；
++* Q4 RNE：ties-to-even，与既有 BF16 RNE（``float32_bits_to_bfloat16_bits``）同一规则；
++* Q5 K 上限：``K <= floor((2^31-1)/(127*127)) = 133144``，超过显式拒绝；
++* Q6 非 2-D 输入：先 reshape 到 ``[rows, K]``，量化只在 2-D 视图上定义。
++
++Q5 对**符号 shape**（``str`` 维）的 fail-closed 口径：标量参考实现只接受具体
++整数维；``K`` 仍是符号时无法静态证明 ``K <= 133144``，因此直接拒绝，不允许
++“先放行、等运行时溢出”。图构建器必须在 K 具体化后调用本实现（静态拒绝
++优先），后端运行时对动态 K 再做一次同样上限的检查。
++
++本模块不依赖 numpy，也不需要任何设备 runtime。
++"""
++
++from __future__ import annotations
++
++import math
++import struct
++from dataclasses import dataclass
++from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
++
++from pypto.portable.qwen35_weight_layout import float32_bits_to_bfloat16_bits
++
++
++W8A8_SCHEME = "w8a8_linear"
++QUANT_BITS = 8
++QUANT_MIN = -127
++QUANT_MAX = 127
++ZERO_POINT = 0
++SCALE_DTYPE = "float32"
++
++# floor((2**31 - 1) / (127 * 127)) == 133144（契约 §1.4 Q5 / §1.5）。
++MAX_ACCUMULATOR_K = (2**31 - 1) // (QUANT_MAX * QUANT_MAX)
++INT32_MAX = 2**31 - 1
++
++OPCODE_QUANTIZE_PER_TOKEN_S8 = "quantize_per_token_s8"
++OPCODE_DEQUANTIZE_S8 = "dequantize_s8"
++OPCODE_QMATMUL_S8S8_S32 = "qmatmul_s8s8_s32"
++OPCODE_DEQUANTIZE_EPILOGUE_BF16 = "dequantize_epilogue_bf16"
++
++_F32 = struct.Struct("<f")
++_F32_BITS = struct.Struct("<I")
++
++
++class W8A8SchemeError(ValueError):
++    """W8A8 标量参考实现的输入违反冻结 scheme。"""
++
++
++class W8A8QuantizationError(W8A8SchemeError):
++    """量化 fail-closed：NaN/Inf、scale 下溢或 K 超上限。"""
++
++
++def float32_round(value: float) -> float:
++    """把 Python float 舍入到 IEEE-754 binary32，返回其精确 double 表示。"""
++
++    try:
++        return _F32.unpack(_F32.pack(float(value)))[0]
++    except (OverflowError, TypeError, ValueError) as exc:
++        raise W8A8SchemeError("value cannot be represented as float32") from exc
++
++
++def rne_float_to_int(value: float) -> int:
++    """round-to-nearest-even 的 float->int（Q4）。
++
++    与既有 BF16 RNE 使用同一 ties-to-even 规则：``rne(0.5)=0``、
++    ``rne(1.5)=2``、``rne(-0.5)=0``、``rne(2.5)=2``、``rne(3.5)=4``。
++    """
++
++    if not math.isfinite(value):
++        raise W8A8SchemeError("rne_float_to_int requires a finite value")
++    floor = math.floor(value)
++    fraction = value - floor
++    if fraction < 0.5:
++        return floor
++    if fraction > 0.5:
++        return floor + 1
++    # 恰好 0.5：向偶数取整（ties-to-even）。
++    return floor if floor % 2 == 0 else floor + 1
++
++
++def bf16_rne_bits(value: float) -> int:
++    """FP32 -> BF16 的 RNE 位模式，复用既有 BF16 RNE 实现（Q4 / R4）。"""
++
++    as_float32 = float32_round(value)
++    raw = _F32_BITS.unpack(_F32.pack(as_float32))[0]
++    return float32_bits_to_bfloat16_bits(raw)
++
++
++def _is_sequence(value: Any) -> bool:
++    return isinstance(value, (list, tuple))
++
++
++def _nested_from_flat(flat: Sequence[Any], shape: Sequence[int]) -> Tuple[Any, int]:
++    """把 row-major 一维序列还原成 shape 对应的规则嵌套 tuple。"""
++
++    if len(shape) == 1:
++        return tuple(flat[: shape[0]]), shape[0]
++    items = []
++    offset = 0
++    for _ in range(shape[0]):
++        item, consumed = _nested_from_flat(flat[offset:], shape[1:])
++        items.append(item)
++        offset += consumed
++    return tuple(items), offset
++
++
++def _flatten_nested(values: Any, context: str) -> Tuple[Tuple[Any, ...], Tuple[int, ...]]:
++    """把规则嵌套序列压平成 row-major 一维并返回 shape。"""
++
++    if _is_sequence(values):
++        if not values:
++            return (), (0,)
++        children = []
++        child_shape: Optional[Tuple[int, ...]] = None
++        for index, item in enumerate(values):
++            flat, shape = _flatten_nested(item, "{}[{}]".format(context, index))
++            if child_shape is None:
++                child_shape = shape
++            elif shape != child_shape:
++                raise W8A8SchemeError("{} is ragged: {} != {}".format(context, shape, child_shape))
++            children.append(flat)
++        assert child_shape is not None
++        combined: List[Any] = []
++        for flat in children:
++            combined.extend(flat)
++        return tuple(combined), (len(values),) + child_shape
++    return (values,), ()
++
++
++def _as_flat(values: Sequence[Any], shape: Optional[Sequence[int]], context: str) -> Tuple[Tuple[Any, ...], Tuple[int, ...]]:
++    if isinstance(values, (str, bytes)):
++        raise W8A8SchemeError("{} must be a numeric sequence".format(context))
++    flat, inferred = _flatten_nested(values, context)
++    if shape is not None:
++        try:
++            declared = tuple(int(dimension) for dimension in shape)
++        except (TypeError, ValueError) as exc:
++            raise W8A8SchemeError("{} shape must be a sequence of integers".format(context)) from exc
++        for index, dimension in enumerate(declared):
++            if isinstance(dimension, bool) or dimension < 0:
++                raise W8A8SchemeError("{} shape[{}] must be a non-negative integer".format(context, index))
++        if math.prod(declared) != len(flat):
++            raise W8A8SchemeError(
++                "{} shape {} does not match {} flattened elements".format(context, declared, len(flat))
++            )
++        return flat, declared
++    return flat, inferred
++
++
++def _checked_number(value: Any, context: str) -> float:
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        raise W8A8SchemeError("{} must be a real number".format(context))
++    number = float(value)
++    if math.isnan(number) or math.isinf(number):
++        raise W8A8QuantizationError("{} contains NaN/Inf; quantize_per_token_s8 fails closed (Q2)".format(context))
++    return number
++
++
++@dataclass(frozen=True)
++class QuantizePerTokenResult:
++    """``quantize_per_token_s8`` 的 artifact 字段（含饱和计数）。"""
++
++    codes: Tuple[int, ...]
++    scales: Tuple[float, ...]
++    saturation_count: int
++    rows: int
++    k: int
++
++    def code_rows(self) -> Tuple[Tuple[int, ...], ...]:
++        return tuple(tuple(self.codes[row * self.k : (row + 1) * self.k]) for row in range(self.rows))
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "opcode": OPCODE_QUANTIZE_PER_TOKEN_S8,
++            "rows": self.rows,
++            "k": self.k,
++            "codes": list(self.codes),
++            "scales": list(self.scales),
++            "saturation_count": self.saturation_count,
++            "scheme": W8A8_SCHEME,
++            "zero_point": ZERO_POINT,
++            "scale_dtype": SCALE_DTYPE,
++        }
++
++
++@dataclass(frozen=True)
++class ClampedInt8Result:
++    """``clamp_rne_int8`` 的结果：饱和计数与 clamp 后的码点。"""
++
++    codes: Tuple[int, ...]
++    saturation_count: int
++
++
++def clamp_rne_int8(ratios: Iterable[float]) -> ClampedInt8Result:
++    """把已缩放的 ratio 经 RNE 取整并 clamp 到 ``[-127, 127]``，统计饱和次数。
++
++    ``quantize_per_token_s8`` 每行都通过本函数产生码点；饱和计数是 artifact
++    必填字段（Q3）。由于 per-token absmax 是行内最大值，正常输入下 ratio 的
++    绝对值不超过约 127（仅受 FP32 scale 舍入影响），因此饱和计数通常为 0；
++    该函数保证一旦发生 clamp 就一定计数，绝不静默。
++    """
++
++    codes: List[int] = []
++    saturation_count = 0
++    for ratio in ratios:
++        quantized = rne_float_to_int(float(ratio))
++        if quantized < QUANT_MIN:
++            quantized = QUANT_MIN
++            saturation_count += 1
++        elif quantized > QUANT_MAX:
++            quantized = QUANT_MAX
++            saturation_count += 1
++        codes.append(quantized)
++    return ClampedInt8Result(tuple(codes), saturation_count)
++
++
++def quantize_per_token_s8(
++    values: Sequence[Any],
++    *,
++    shape: Optional[Sequence[int]] = None,
++) -> QuantizePerTokenResult:
++    """动态 per-row absmax 对称量化：``tensor[bf16/fp32] -> int8[rows,K] + fp32[rows]``。
++
++    ``values`` 可以是任意 rank 的规则嵌套序列（Q6：先 reshape 到
++    ``[prod(leading), last]``），也可以给出一维序列加显式 ``shape``。
++    """
++
++    flat, declared_shape = _as_flat(values, shape, "quantize_per_token_s8.values")
++    if len(declared_shape) == 0:
++        raise W8A8SchemeError("quantize_per_token_s8 requires at least a 1-D input")
++    k = declared_shape[-1]
++    rows = math.prod(declared_shape[:-1]) if len(declared_shape) > 1 else 1
++    if k == 0 or rows == 0:
++        raise W8A8SchemeError("quantize_per_token_s8 requires non-empty [rows, K]")
++    if k > MAX_ACCUMULATOR_K:
++        raise W8A8QuantizationError(
++            "K={} exceeds INT32 accumulation limit {} (Q5); INT64 accumulation is out of scope".format(
++                k, MAX_ACCUMULATOR_K
++            )
++        )
++    numbers = tuple(
++        _checked_number(value, "quantize_per_token_s8.values[{}]".format(index))
++        for index, value in enumerate(flat)
++    )
++
++    codes: List[int] = []
++    scales: List[float] = []
++    saturation_count = 0
++    for row in range(rows):
++        row_values = numbers[row * k : (row + 1) * k]
++        absmax = max(abs(value) for value in row_values)
++        if absmax == 0.0:
++            # Q1：整行全零 -> s=1.0、q=0，绝不产生 NaN/Inf。
++            scales.append(float32_round(1.0))
++            codes.extend([0] * k)
++            continue
++        scale = float32_round(absmax / float(QUANT_MAX))
++        if scale == 0.0:
++            # scale 下溢（§6 “scale=0 且非全零行”）：fail-closed，不产出 artifact。
++            raise W8A8QuantizationError(
++                "row {} absmax={!r} underflows float32 scale; refusing to quantize".format(row, absmax)
++            )
++        scales.append(scale)
++        row_result = clamp_rne_int8(value / scale for value in row_values)
++        codes.extend(row_result.codes)
++        saturation_count += row_result.saturation_count
++    return QuantizePerTokenResult(tuple(codes), tuple(scales), saturation_count, rows, k)
++
++
++def dequantize_s8(
++    codes: Sequence[Any],
++    scales: Sequence[float],
++    *,
++    shape: Optional[Sequence[int]] = None,
++) -> Tuple[float, ...]:
++    """``int8[..,K] + fp32[..] -> fp32``（诊断/单测用），返回 row-major 一维。"""
++
++    flat, declared_shape = _as_flat(codes, shape, "dequantize_s8.codes")
++    if len(declared_shape) < 1:
++        raise W8A8SchemeError("dequantize_s8 requires at least a 1-D input")
++    k = declared_shape[-1]
++    rows = math.prod(declared_shape[:-1]) if len(declared_shape) > 1 else 1
++    if k == 0 or rows == 0:
++        raise W8A8SchemeError("dequantize_s8 requires non-empty [rows, K]")
++    if len(scales) != rows:
++        raise W8A8SchemeError("dequantize_s8 expects {} per-row scales, got {}".format(rows, len(scales)))
++    scale_values = tuple(float32_round(float(scale)) for scale in scales)
++    output: List[float] = []
++    for row in range(rows):
++        scale = scale_values[row]
++        for column in range(k):
++            code = flat[row * k + column]
++            if isinstance(code, bool) or not isinstance(code, int):
++                raise W8A8SchemeError("dequantize_s8 codes must be integers")
++            if code < QUANT_MIN or code > QUANT_MAX:
++                raise W8A8SchemeError(
++                    "dequantize_s8 code {} outside [{}, {}]".format(code, QUANT_MIN, QUANT_MAX)
++                )
++            output.append(float32_round(code * scale))
++    return tuple(output)
++
++
++@dataclass(frozen=True)
++class QMatmulResult:
++    """``qmatmul_s8s8_s32`` 的 INT32 输出（row-major）与 batch 形状。"""
++
++    values: Tuple[int, ...]
++    shape: Tuple[int, ...]
++    batch_shape: Tuple[int, ...]
++    k: int
++
++    def grid(self) -> Tuple[Any, ...]:
++        """返回与输出 shape 一致的嵌套 tuple（batch 前缀 + (M, N)）。"""
++
++        return _nested_from_flat(self.values, self.shape)[0]
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "opcode": OPCODE_QMATMUL_S8S8_S32,
++            "shape": list(self.shape),
++            "batch_shape": list(self.batch_shape),
++            "k": self.k,
++            "accumulator_dtype": "int32",
++            "values": list(self.values),
++        }
++
++
++def _validate_int_codes(flat: Sequence[Any], context: str) -> None:
++    for index, code in enumerate(flat):
++        if isinstance(code, bool) or not isinstance(code, int):
++            raise W8A8SchemeError("{}[{}] must be an integer code".format(context, index))
++        if code < QUANT_MIN or code > QUANT_MAX:
++            raise W8A8SchemeError(
++                "{}[{}]={} outside [{}, {}]".format(context, index, code, QUANT_MIN, QUANT_MAX)
++            )
++
++
++def qmatmul_s8s8_s32(
++    left: Sequence[Any],
++    right: Sequence[Any],
++    *,
++    left_shape: Optional[Sequence[int]] = None,
++    right_shape: Optional[Sequence[int]] = None,
++) -> QMatmulResult:
++    """INT8×INT8->INT32，equal-prefix rank-2/3/4 batch 规则（与 portable matmul 一致）。
++
++    批前缀必须逐位相同，不做 NumPy 广播；K 上限复用 Q5。
++    """
++
++    left_flat, left_declared = _as_flat(left, left_shape, "qmatmul_s8s8_s32.left")
++    right_flat, right_declared = _as_flat(right, right_shape, "qmatmul_s8s8_s32.right")
++    if len(left_declared) != len(right_declared):
++        raise W8A8SchemeError("qmatmul_s8s8_s32 operands must have equal rank")
++    if len(left_declared) not in (2, 3, 4):
++        raise W8A8SchemeError("qmatmul_s8s8_s32 operands must have rank 2, 3, or 4")
++    if left_declared[:-2] != right_declared[:-2]:
++        raise W8A8SchemeError("qmatmul_s8s8_s32 operands must have identical batch prefixes")
++    if left_declared[-1] != right_declared[-2]:
++        raise W8A8SchemeError(
++            "qmatmul_s8s8_s32 reduction dimensions {} and {} do not match".format(
++                left_declared[-1], right_declared[-2]
++            )
++        )
++    _validate_int_codes(left_flat, "qmatmul_s8s8_s32.left")
++    _validate_int_codes(right_flat, "qmatmul_s8s8_s32.right")
++    batch_shape = left_declared[:-2]
++    m, k = left_declared[-2], left_declared[-1]
++    n = right_declared[-1]
++    if k > MAX_ACCUMULATOR_K:
++        raise W8A8QuantizationError(
++            "qmatmul_s8s8_s32 K={} exceeds INT32 accumulation limit {} (Q5)".format(k, MAX_ACCUMULATOR_K)
++        )
++    batch_count = math.prod(batch_shape) if batch_shape else 1
++    values: List[int] = []
++    for batch in range(batch_count):
++        left_base = batch * m * k
++        right_base = batch * k * n
++        for row in range(m):
++            for column in range(n):
++                accumulator = 0
++                for index in range(k):
++                    accumulator += left_flat[left_base + row * k + index] * right_flat[right_base + index * n + column]
++                values.append(accumulator)
++    return QMatmulResult(tuple(values), left_declared[:-2] + (m, n), batch_shape, k)
++
++
++@dataclass(frozen=True)
++class DequantizeEpilogueResult:
++    """``dequantize_epilogue_bf16`` 的单次舍入输入与输出。"""
++
++    fp32_values: Tuple[float, ...]
++    bf16_bits: Tuple[int, ...]
++    rows: int
++    columns: int
++
++    def value_rows(self) -> Tuple[Tuple[float, ...], ...]:
++        return tuple(
++            tuple(self.fp32_values[row * self.columns : (row + 1) * self.columns])
++            for row in range(self.rows)
++        )
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "opcode": OPCODE_DEQUANTIZE_EPILOGUE_BF16,
++            "rows": self.rows,
++            "columns": self.columns,
++            "fp32_values": list(self.fp32_values),
++            "bf16_bits": list(self.bf16_bits),
++            "rounding": "rne_bf16_single_cast",
++        }
++
++
++def dequantize_epilogue_bf16(
++    accumulator: Sequence[Any],
++    row_scales: Sequence[float],
++    column_scales: Sequence[float],
++    *,
++    shape: Optional[Sequence[int]] = None,
++) -> DequantizeEpilogueResult:
++    """``int32[m,n] + fp32[m] + fp32[n] -> bf16[m,n]``，FP32 乘完单次 RNE cast（R4）。
++
++    ``fp32_values`` 保存“FP32 乘完”的中间值，``bf16_bits`` 保存单次 RNE 后的
++    BF16 位模式；两者共同使“与 FP32 乘完再单次 cast 逐位一致”可差分验证。
++    """
++
++    flat, declared_shape = _as_flat(accumulator, shape, "dequantize_epilogue_bf16.accumulator")
++    if len(declared_shape) != 2:
++        raise W8A8SchemeError("dequantize_epilogue_bf16 requires a rank-2 int32 accumulator")
++    rows, columns = declared_shape
++    if rows == 0 or columns == 0:
++        raise W8A8SchemeError("dequantize_epilogue_bf16 requires non-empty [m, n]")
++    if len(row_scales) != rows:
++        raise W8A8SchemeError(
++            "dequantize_epilogue_bf16 expects {} row scales, got {}".format(rows, len(row_scales))
++        )
++    if len(column_scales) != columns:
++        raise W8A8SchemeError(
++            "dequantize_epilogue_bf16 expects {} column scales, got {}".format(columns, len(column_scales))
++        )
++    row_scale_values = tuple(float32_round(float(scale)) for scale in row_scales)
++    column_scale_values = tuple(float32_round(float(scale)) for scale in column_scales)
++    fp32_values: List[float] = []
++    bf16_bits: List[int] = []
++    for row in range(rows):
++        for column in range(columns):
++            value = flat[row * columns + column]
++            if isinstance(value, bool) or not isinstance(value, int):
++                raise W8A8SchemeError("dequantize_epilogue_bf16 accumulator must be INT32 integers")
++            if value < -INT32_MAX - 1 or value > INT32_MAX:
++                raise W8A8SchemeError("dequantize_epilogue_bf16 accumulator outside INT32 range")
++            # FP32 域：int32 -> fp32，乘 (s_a[r] * s_w[o])，再乘，全程 binary32。
++            scaled = float32_round(row_scale_values[row] * column_scale_values[column])
++            product = float32_round(float32_round(float(value)) * scaled)
++            fp32_values.append(product)
++            bf16_bits.append(bf16_rne_bits(product))
++    return DequantizeEpilogueResult(tuple(fp32_values), tuple(bf16_bits), rows, columns)
++
++
++SCALAR_REFERENCE_OPCODES: Mapping[str, Any] = {
++    OPCODE_QUANTIZE_PER_TOKEN_S8: quantize_per_token_s8,
++    OPCODE_DEQUANTIZE_S8: dequantize_s8,
++    OPCODE_QMATMUL_S8S8_S32: qmatmul_s8s8_s32,
++    OPCODE_DEQUANTIZE_EPILOGUE_BF16: dequantize_epilogue_bf16,
++}
++
++
++def scalar_reference(opcode: str) -> Any:
++    """按 opcode 名返回 scalar reference 实现（未注册即 fail-closed）。"""
++
++    try:
++        return SCALAR_REFERENCE_OPCODES[opcode]
++    except KeyError as exc:
++        raise W8A8SchemeError("no scalar reference registered for opcode {!r}".format(opcode)) from exc
++
++
++__all__ = [
++    "ClampedInt8Result",
++    "DequantizeEpilogueResult",
++    "INT32_MAX",
++    "MAX_ACCUMULATOR_K",
++    "OPCODE_DEQUANTIZE_EPILOGUE_BF16",
++    "OPCODE_DEQUANTIZE_S8",
++    "OPCODE_QMATMUL_S8S8_S32",
++    "OPCODE_QUANTIZE_PER_TOKEN_S8",
++    "QUANT_BITS",
++    "QUANT_MAX",
++    "QUANT_MIN",
++    "QMatmulResult",
++    "QuantizePerTokenResult",
++    "SCALAR_REFERENCE_OPCODES",
++    "SCALE_DTYPE",
++    "W8A8QuantizationError",
++    "W8A8SchemeError",
++    "W8A8_SCHEME",
++    "ZERO_POINT",
++    "bf16_rne_bits",
++    "clamp_rne_int8",
++    "dequantize_epilogue_bf16",
++    "dequantize_s8",
++    "float32_round",
++    "qmatmul_s8s8_s32",
++    "quantize_per_token_s8",
++    "rne_float_to_int",
++    "scalar_reference",
++]
+diff --git a/python/tests/ut/pypto_x/test_w8a8_scheme.py b/python/tests/ut/pypto_x/test_w8a8_scheme.py
+new file mode 100644
+index 000000000..cd1cda134
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_w8a8_scheme.py
+@@ -0,0 +1,304 @@
++"""W8A8-linear scheme / scalar reference 契约测试（R1–R5、Q1–Q6）。
++
++精确命令：
++
++``PYTHONPATH=python python3 -m pytest -q --confcutdir=python/tests/ut/pypto_x python/tests/ut/pypto_x/test_w8a8_scheme.py``
++"""
++
++from __future__ import annotations
++
++import math
++import struct
++
++import numpy as np
++import pytest
++
++from pypto.core_ir import (
++    QUANTIZED_ACTIVATION_LOGICAL_LAYOUT,
++    QUANTIZED_WEIGHT_LOGICAL_LAYOUT,
++    CoreIRSerializationError,
++    CoreIRValidationError,
++    QuantizedTensorDesc,
++)
++from pypto.portable.qwen35_weight_layout import float32_bits_to_bfloat16_bits
++from pypto.portable.qwen35_w8a8_scheme import (
++    MAX_ACCUMULATOR_K,
++    OPCODE_DEQUANTIZE_EPILOGUE_BF16,
++    OPCODE_DEQUANTIZE_S8,
++    OPCODE_QMATMUL_S8S8_S32,
++    OPCODE_QUANTIZE_PER_TOKEN_S8,
++    SCALAR_REFERENCE_OPCODES,
++    W8A8QuantizationError,
++    bf16_rne_bits,
++    clamp_rne_int8,
++    dequantize_epilogue_bf16,
++    dequantize_s8,
++    qmatmul_s8s8_s32,
++    quantize_per_token_s8,
++    rne_float_to_int,
++    scalar_reference,
++)
++
++_F32 = struct.Struct("<f")
++_F32_BITS = struct.Struct("<I")
++
++
++def _f32_bits(value: float) -> int:
++    return _F32_BITS.unpack(_F32.pack(float(value)))[0]
++
++
++def _flat(seq):
++    if isinstance(seq, (list, tuple)):
++        result = []
++        for item in seq:
++            result.extend(_flat(item))
++        return result
++    return [seq]
++
++
++# ---------------------------------------------------------------- R1 / Q-group
++
++
++def test_r1_quantized_tensor_desc_fields_and_roundtrip():
++    desc = QuantizedTensorDesc.weight_per_output_channel()
++    assert desc.to_dict() == {
++        "signed": True,
++        "bits": 8,
++        "axis": 0,
++        "granularity": "per_output_channel",
++        "group_size": None,
++        "scale_dtype": "float32",
++        "zero_point_policy": "fixed_zero",
++        "logical_layout": "out_in_rowmajor",
++    }
++    assert desc == QuantizedTensorDesc.from_dict(desc.to_dict())
++    assert QuantizedTensorDesc.from_dict(dict(desc.to_dict(), signed=True, bits=8)) == desc
++    activation = QuantizedTensorDesc.activation_per_row().to_dict()
++    assert activation["axis"] == -1
++    assert activation["logical_layout"] == "row_then_k"
++    assert QuantizedTensorDesc.from_dict(activation) == QuantizedTensorDesc.activation_per_row()
++    assert QUANTIZED_WEIGHT_LOGICAL_LAYOUT == "out_in_rowmajor"
++    assert QUANTIZED_ACTIVATION_LOGICAL_LAYOUT == "row_then_k"
++
++
++def test_r1_per_group_is_rejected_fail_closed():
++    with pytest.raises(CoreIRValidationError):
++        QuantizedTensorDesc(granularity="per_group", group_size=64)
++    with pytest.raises(CoreIRValidationError):
++        QuantizedTensorDesc.from_dict(dict(QuantizedTensorDesc().to_dict(), granularity="per_group", group_size=128))
++
++
++@pytest.mark.parametrize(
++    "tamper",
++    (
++        {"signed": False},
++        {"bits": 4},
++        {"bits": True},
++        {"axis": 1},
++        {"scale_dtype": "bf16"},
++        {"zero_point_policy": "per_tensor"},
++        {"logical_layout": "unknown"},
++        {"group_size": 64},
++    ),
++)
++def test_r1_invalid_fields_are_rejected(tamper):
++    payload = dict(QuantizedTensorDesc().to_dict())
++    payload.update(tamper)
++    with pytest.raises(CoreIRValidationError):
++        QuantizedTensorDesc.from_dict(payload)
++
++
++def test_r1_unknown_from_dict_keys_are_rejected():
++    payload = dict(QuantizedTensorDesc().to_dict())
++    payload["physical_packing"] = "vnni"
++    with pytest.raises(CoreIRSerializationError):
++        QuantizedTensorDesc.from_dict(payload)
++    with pytest.raises(CoreIRSerializationError):
++        QuantizedTensorDesc.from_dict({"signed": True})
++    with pytest.raises(CoreIRSerializationError):
++        QuantizedTensorDesc.from_dict({})
++
++
++# ------------------------------------------------------------ R2 / Q1..Q6
++
++
++def test_r2_scalar_reference_registry_has_exactly_four_opcodes():
++    assert set(SCALAR_REFERENCE_OPCODES) == {
++        OPCODE_QUANTIZE_PER_TOKEN_S8,
++        OPCODE_DEQUANTIZE_S8,
++        OPCODE_QMATMUL_S8S8_S32,
++        OPCODE_DEQUANTIZE_EPILOGUE_BF16,
++    }
++    for opcode, implementation in SCALAR_REFERENCE_OPCODES.items():
++        assert scalar_reference(opcode) is implementation
++    with pytest.raises(ValueError):
++        scalar_reference("qlinear_w8a8_fused")
++
++
++def test_q1_all_zero_row_gives_unit_scale_and_zero_codes():
++    result = quantize_per_token_s8([[0.0, 0.0, 0.0], [0.0, -0.0, 0.0]])
++    assert result.scales == (1.0, 1.0)
++    assert result.codes == (0,) * 6
++    assert result.saturation_count == 0
++    assert not any(math.isnan(value) or math.isinf(value) for value in result.scales)
++    assert result.to_dict()["saturation_count"] == 0
++
++
++@pytest.mark.parametrize("bad", (float("nan"), float("inf"), float("-inf")))
++def test_q2_nan_or_inf_row_fails_closed(bad):
++    with pytest.raises(W8A8QuantizationError):
++        quantize_per_token_s8([[1.0, bad, 0.5]])
++    with pytest.raises(W8A8QuantizationError):
++        quantize_per_token_s8([1.0, bad], shape=[1, 2])
++
++
++def test_q3_saturation_is_clamped_and_counted():
++    result = clamp_rne_int8([127.6, 200.0, -128.2, -300.0, 0.5, 126.5, -126.5])
++    assert result.codes == (127, 127, -127, -127, 0, 126, -126)
++    assert result.saturation_count == 4
++    # per-token absmax 正常输入下 ratio 不会超过 127，饱和计数为 0。
++    counts = {quantize_per_token_s8([[3.0, -3.0, 1.0]]).saturation_count}
++    assert counts == {0}
++
++
++def test_q4_rne_matches_existing_bfloat16_rne_ties():
++    # Q4 原文：rne(0.5)=0、rne(1.5)=2、rne(-0.5)=-0。
++    assert rne_float_to_int(0.5) == 0
++    assert rne_float_to_int(1.5) == 2
++    assert rne_float_to_int(-0.5) == 0
++    assert rne_float_to_int(2.5) == 2
++    assert rne_float_to_int(3.5) == 4
++    assert rne_float_to_int(-1.5) == -2
++    assert rne_float_to_int(-2.5) == -2
++    # 系统性 ties-to-even，与 Python round 的偶数取整一致。
++    for base in range(-64, 65):
++        assert rne_float_to_int(base + 0.5) == round(base + 0.5)
++    # 与既有 BF16 RNE 逐位一致：0x3F808000 舍向偶数 0x3F80，0x3F818000 进位到 0x3F82。
++    assert float32_bits_to_bfloat16_bits(0x3F808000) == 0x3F80
++    assert float32_bits_to_bfloat16_bits(0x3F818000) == 0x3F82
++    # epilogue 直接复用同一 BF16 RNE 实现。
++    assert bf16_rne_bits(1.0) == float32_bits_to_bfloat16_bits(_f32_bits(1.0))
++
++
++def test_q5_k_limit_is_explicitly_rejected():
++    assert MAX_ACCUMULATOR_K == 133144
++    assert MAX_ACCUMULATOR_K == (2**31 - 1) // (127 * 127)
++    with pytest.raises(W8A8QuantizationError):
++        quantize_per_token_s8([0.0] * (MAX_ACCUMULATOR_K + 1), shape=[1, MAX_ACCUMULATOR_K + 1])
++    result = quantize_per_token_s8([0.0] * MAX_ACCUMULATOR_K, shape=[1, MAX_ACCUMULATOR_K])
++    assert result.k == MAX_ACCUMULATOR_K
++    with pytest.raises(W8A8QuantizationError):
++        qmatmul_s8s8_s32(
++            [0] * (MAX_ACCUMULATOR_K + 1),
++            [0] * (MAX_ACCUMULATOR_K + 1),
++            left_shape=[1, MAX_ACCUMULATOR_K + 1],
++            right_shape=[MAX_ACCUMULATOR_K + 1, 1],
++        )
++
++
++def test_q5_symbolic_k_is_rejected_statically():
++    # 符号 K 无法静态证明 K <= 133144：标量参考实现 fail-closed 拒绝，
++    # 不允许“先放行、等运行时溢出”。
++    with pytest.raises(ValueError):
++        quantize_per_token_s8([0.0, 0.0], shape=[1, "K"])
++    with pytest.raises(ValueError):
++        qmatmul_s8s8_s32([0, 0], [0, 0], left_shape=[1, "K"], right_shape=["K", 1])
++
++
++def test_q6_non_2d_inputs_are_reshaped_to_rows_k():
++    rank3 = [[[1.0, -1.0], [0.0, 0.0]], [[2.0, -2.0], [0.5, -0.5]]]
++    result = quantize_per_token_s8(rank3)
++    assert (result.rows, result.k) == (4, 2)
++    assert result.codes[:2] == (127, -127)
++    assert result.codes[2:4] == (0, 0)
++    rank4 = [[[[1.0, 0.0]], [[0.0, 0.0]]], [[[0.0, 0.0]], [[0.0, 0.0]]]]
++    reshaped = quantize_per_token_s8(rank4)
++    assert (reshaped.rows, reshaped.k) == (4, 2)
++
++
++# ------------------------------------------------------------------ R3..R5
++
++
++@pytest.mark.parametrize("absmax", (1.0, 0.5, 7.0, 1e-3, 1e3, 3.25))
++def test_r3_symmetric_absmax_produces_pm_127(absmax):
++    row = [absmax, -absmax]
++    result = quantize_per_token_s8([row])
++    assert result.codes == (127, -127)
++    assert result.scales[0] > 0.0
++    dequantized = dequantize_s8(result.codes, result.scales, shape=(1, 2))
++    assert dequantized[0] == -dequantized[1]
++    assert dequantized[0] > 0.0
++
++
++def test_r4_epilogue_is_fp32_multiply_then_single_rne_cast():
++    accumulator = [[12345, -7, 2**31 - 1], [-2**31, 0, 99]]
++    row_scales = [0.25, 3.5]
++    column_scales = [1.5, 0.03125, 7.0]
++    result = dequantize_epilogue_bf16(accumulator, row_scales, column_scales)
++    assert (result.rows, result.columns) == (2, 3)
++    # 独立 oracle：numpy float32 完成乘法，再走既有 BF16 RNE 位变换。
++    acc = np.asarray(accumulator, dtype=np.int64).astype(np.float32)
++    sa = np.asarray(row_scales, dtype=np.float32).reshape(2, 1)
++    sw = np.asarray(column_scales, dtype=np.float32).reshape(1, 3)
++    expected = (acc * (sa * sw)).astype(np.float32)
++    for actual, reference in zip(result.fp32_values, _flat(expected.tolist())):
++        assert _f32_bits(actual) == _f32_bits(reference)
++    expected_bits = [float32_bits_to_bfloat16_bits(_f32_bits(value)) for value in _flat(expected.tolist())]
++    assert list(result.bf16_bits) == expected_bits
++    assert result.to_dict()["rounding"] == "rne_bf16_single_cast"
++
++
++def _random_int(shape, rng):
++    return rng.integers(-127, 128, size=shape).tolist()
++
++
++def _tupleize(value):
++    if isinstance(value, list):
++        return tuple(_tupleize(item) for item in value)
++    return value
++
++
++@pytest.mark.parametrize(
++    "left_shape,right_shape",
++    (
++        ((2, 3), (3, 4)),
++        ((2, 3, 4), (2, 4, 5)),
++        ((2, 2, 3, 4), (2, 2, 4, 3)),
++    ),
++)
++def test_r5_qmatmul_bitwise_matches_integer_golden(left_shape, right_shape):
++    rng = np.random.default_rng(20260910)
++    left = _random_int(left_shape, rng)
++    right = _random_int(right_shape, rng)
++    result = qmatmul_s8s8_s32(left, right)
++    expected = np.matmul(
++        np.asarray(left, dtype=np.int64), np.asarray(right, dtype=np.int64)
++    ).astype(np.int32)
++    assert list(expected.shape) == list(result.shape)
++    assert result.batch_shape == left_shape[:-2]
++    assert result.values == tuple(int(value) for value in expected.reshape(-1).tolist())
++    assert result.grid() == _tupleize(expected.tolist())
++
++
++def test_qmatmul_batch_and_rank_rules_fail_closed():
++    with pytest.raises(ValueError):
++        qmatmul_s8s8_s32([1, 2], [[1], [2]])  # rank 1
++    with pytest.raises(ValueError):
++        qmatmul_s8s8_s32([[1, 2, 3], [4, 5, 6]], [[1, 2], [3, 4]])  # reduction mismatch
++    with pytest.raises(ValueError):
++        # rank-3 batch prefix [1] != [2]
++        qmatmul_s8s8_s32([[[1, 2], [3, 4]]], [[[1, 2], [3, 4]], [[1, 2], [3, 4]]])
++    with pytest.raises(ValueError):
++        # 声明 shape 与嵌套元素数不符
++        qmatmul_s8s8_s32([[1, 2], [3, 4]], [[1, 2], [3, 4]], left_shape=[2, 3])
++
++
++def test_dequantize_s8_matches_manual_products():
++    codes = (127, -127, 64, 0)
++    scales = (0.5, 0.25)
++    values = dequantize_s8(codes, scales, shape=(2, 2))
++    assert values == (63.5, -63.5, 16.0, 0.0)
++    with pytest.raises(ValueError):
++        dequantize_s8((128,), (1.0,))
++    with pytest.raises(ValueError):
++        dequantize_s8((1, 2), (1.0, 2.0))  # 1 行却有 2 个 scale

@@ -1,0 +1,1392 @@
+From 030e68fe1d753f0f34aedd3ab94f6fa52cd1d69c Mon Sep 17 00:00:00 2001
+From: pypto-x-agent <pypto-x-agent@local>
+Date: Fri, 11 Sep 2026 00:23:27 +0800
+Subject: [PATCH 112/118] feat(cuda): add cuEvent kernel timing to the PTX
+ runtime
+
+Bind cuEventCreate/Record/Synchronize/ElapsedTime/Destroy in the CUDA
+driver adapter, expose CudaEvent with idempotent close, and record a
+start/stop event pair around the runtime launch path so kernel_seconds,
+dispatch_seconds and wall_seconds are reported for every launch.  Event
+timing degrades to kernel_seconds=null when the driver lacks the event
+API, and events are destroyed in the launch finally block even when a
+launch fails.
+
+Add ctypes/mock unit tests, a GamePC cuEvent timing smoke with p50/p95/CV
+dispersion and a batch event-vs-wall self-proof, and export the timing
+types from pypto.backends.cuda.
+---
+ python/pypto/backends/cuda/__init__.py            |   6 +-
+ python/pypto/backends/cuda/driver.py              | 155 +++++++++++++
+ python/pypto/backends/cuda/runtime.py             | 164 +++++++++++++-
+ python/tests/ut/pypto_x/test_cuda_driver_ptx.py   | 173 ++++++++++++++-
+ python/tests/ut/pypto_x/test_cuda_event_timing.py | 177 +++++++++++++++
+ scripts/smoke/cuda_event_timing_smoke.py          | 504 ++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 1173 insertions(+), 6 deletions(-)
+
+diff --git a/python/pypto/backends/cuda/__init__.py b/python/pypto/backends/cuda/__init__.py
+index 3235522f7..35ac458f7 100644
+--- a/python/pypto/backends/cuda/__init__.py
++++ b/python/pypto/backends/cuda/__init__.py
+@@ -7,6 +7,7 @@ from .driver import (
+     CudaDriver,
+     CudaDriverError,
+     CudaDriverUnavailable,
++    CudaEvent,
+     CudaModule,
+ )
+ from .runtime import (
+@@ -14,6 +15,7 @@ from .runtime import (
+     CudaBackend,
+     CudaDriverRuntime,
+     CudaExecutionError,
++    CudaLaunchTiming,
+     CudaRuntime,
+     CudaRuntimeError,
+     LoadedCudaArtifact,
+@@ -22,6 +24,6 @@ from .runtime import (
+ 
+ __all__ = [
+     "CUDA_SUCCESS", "CudaArtifactError", "CudaBackend", "CudaContext", "CudaDeviceInfo", "CudaDriver",
+-    "CudaDriverError", "CudaDriverRuntime", "CudaDriverUnavailable", "CudaExecutionError", "CudaModule",
+-    "CudaRuntime", "CudaRuntimeError", "LoadedCudaArtifact", "launch",
++    "CudaDriverError", "CudaDriverRuntime", "CudaDriverUnavailable", "CudaEvent", "CudaExecutionError",
++    "CudaLaunchTiming", "CudaModule", "CudaRuntime", "CudaRuntimeError", "LoadedCudaArtifact", "launch",
+ ]
+diff --git a/python/pypto/backends/cuda/driver.py b/python/pypto/backends/cuda/driver.py
+index aa9ddca0f..b0113844b 100644
+--- a/python/pypto/backends/cuda/driver.py
++++ b/python/pypto/backends/cuda/driver.py
+@@ -131,6 +131,65 @@ class CudaContext:
+         self.close()
+ 
+ 
++class CudaEvent:
++    """A Driver API event used for stream-ordered device timing.
++
++    Events are owned by the :class:`CudaDriver` that created them and must be
++    released with :meth:`close` (or by using the object as a context manager).
++    ``close`` is idempotent, and an exception raised while the event is in use
++    inside a ``with`` block still destroys the underlying handle.
++    """
++
++    def __init__(self, driver: "CudaDriver", handle: Any, flags: int = 0) -> None:
++        self.driver = driver
++        self.handle = handle
++        self.flags = int(flags)
++        self._closed = False
++
++    @property
++    def closed(self) -> bool:
++        return self._closed
++
++    def _ensure_open(self, operation: str) -> None:
++        if self._closed:
++            raise CudaDriverError(operation, 400, "CUDA_ERROR_INVALID_HANDLE", "event is closed")
++
++    def record(self, stream: Any = None) -> "CudaEvent":
++        """Record this event on ``stream`` (``None`` means the default stream)."""
++        self._ensure_open("cuEventRecord")
++        self.driver.event_record(self.handle, stream)
++        return self
++
++    def synchronize(self) -> "CudaEvent":
++        self._ensure_open("cuEventSynchronize")
++        self.driver.event_synchronize(self.handle)
++        return self
++
++    def elapsed_time_ms(self, end: Any) -> float:
++        """Return the elapsed milliseconds between this (start) and ``end``."""
++        self._ensure_open("cuEventElapsedTime")
++        if isinstance(end, CudaEvent):
++            end._ensure_open("cuEventElapsedTime")
++        return self.driver.event_elapsed_time_ms(self.handle, end)
++
++    def elapsed_time_seconds(self, end: Any) -> float:
++        return self.elapsed_time_ms(end) / 1000.0
++
++    def close(self) -> None:
++        if self._closed:
++            return
++        try:
++            self.driver.event_destroy(self.handle)
++        finally:
++            self._closed = True
++
++    def __enter__(self) -> "CudaEvent":
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback) -> None:
++        self.close()
++
++
+ class CudaDriver:
+     """Lazy, header-free binding for the subset of the CUDA Driver API used here."""
+ 
+@@ -201,6 +260,19 @@ class CudaDriver:
+             pass
+         return symbol
+ 
++    def _bind_optional(self, names: Sequence[str], restype: Any, argtypes: Sequence[Any]) -> Any:
++        """Bind a symbol when present; return ``None`` when the library lacks it.
++
++        Only the timing events use this path.  A driver without ``cuEvent*``
++        keeps every pre-existing operation working and simply reports that
++        event timing is unavailable.
++        """
++
++        try:
++            return self._bind(names, restype, argtypes)
++        except CudaDriverUnavailable:
++            return None
++
+     def _bind_symbols(self) -> None:
+         u32 = ctypes.c_uint
+         i32 = ctypes.c_int
+@@ -258,6 +330,40 @@ class CudaDriver:
+         self._cuGetErrorString = self._bind(
+             ("cuGetErrorString",), i32, (i32, ctypes.POINTER(ctypes.c_char_p))
+         )
++        # Timing events are optional so that a small fake library (or an
++        # unusually old driver) still supports every non-timing operation.
++        self._cuEventCreate = self._bind_optional(
++            ("cuEventCreate",), i32, (ctypes.POINTER(ptr), u32)
++        )
++        self._cuEventRecord = self._bind_optional(("cuEventRecord",), i32, (ptr, ptr))
++        self._cuEventSynchronize = self._bind_optional(("cuEventSynchronize",), i32, (ptr,))
++        self._cuEventElapsedTime = self._bind_optional(
++            ("cuEventElapsedTime",), i32, (ctypes.POINTER(ctypes.c_float), ptr, ptr)
++        )
++        self._cuEventDestroy = self._bind_optional(
++            ("cuEventDestroy_v2", "cuEventDestroy"), i32, (ptr,)
++        )
++
++    def _require_event_api(self, operation: str) -> None:
++        if not self.events_available():
++            raise CudaDriverUnavailable(
++                "CUDA Driver API symbol is unavailable for {}: cuEventCreate/cuEventRecord/"
++                "cuEventSynchronize/cuEventElapsedTime/cuEventDestroy".format(operation)
++            )
++
++    def events_available(self) -> bool:
++        """Return whether the bound library exposes the full timing-event API."""
++
++        return all(
++            symbol is not None
++            for symbol in (
++                self._cuEventCreate,
++                self._cuEventRecord,
++                self._cuEventSynchronize,
++                self._cuEventElapsedTime,
++                self._cuEventDestroy,
++            )
++        )
+ 
+     def _check(self, operation: str, result: Any) -> None:
+         code = _as_int(result)
+@@ -318,6 +424,54 @@ class CudaDriver:
+     def stream_synchronize(self, stream: Any = None) -> None:
+         self._check("cuStreamSynchronize", self._cuStreamSynchronize(_as_ptr(stream)))
+ 
++    @staticmethod
++    def _event_handle(event: Any) -> Any:
++        return event.handle if isinstance(event, CudaEvent) else event
++
++    def event_create(self, flags: int = 0) -> CudaEvent:
++        """Create a timing event (``flags=0`` keeps timing enabled)."""
++
++        self._require_event_api("cuEventCreate")
++        self.init()
++        handle = ctypes.c_void_p()
++        self._check("cuEventCreate", self._cuEventCreate(ctypes.byref(handle), ctypes.c_uint(int(flags))))
++        return CudaEvent(self, handle, flags)
++
++    def event_record(self, event: Any, stream: Any = None) -> None:
++        """Record ``event`` on ``stream`` (``None`` means the default stream)."""
++
++        self._require_event_api("cuEventRecord")
++        self._check(
++            "cuEventRecord",
++            self._cuEventRecord(_as_ptr(self._event_handle(event)), _as_ptr(stream)),
++        )
++
++    def event_synchronize(self, event: Any) -> None:
++        self._require_event_api("cuEventSynchronize")
++        self._check("cuEventSynchronize", self._cuEventSynchronize(_as_ptr(self._event_handle(event))))
++
++    def event_elapsed_time_ms(self, start: Any, end: Any) -> float:
++        """Return the device elapsed milliseconds between two recorded events."""
++
++        self._require_event_api("cuEventElapsedTime")
++        value = ctypes.c_float()
++        self._check(
++            "cuEventElapsedTime",
++            self._cuEventElapsedTime(
++                ctypes.byref(value),
++                _as_ptr(self._event_handle(start)),
++                _as_ptr(self._event_handle(end)),
++            ),
++        )
++        return float(value.value)
++
++    def event_elapsed_time_seconds(self, start: Any, end: Any) -> float:
++        return self.event_elapsed_time_ms(start, end) / 1000.0
++
++    def event_destroy(self, event: Any) -> None:
++        self._require_event_api("cuEventDestroy")
++        self._check("cuEventDestroy", self._cuEventDestroy(_as_ptr(self._event_handle(event))))
++
+     def module_load_data(self, ptx: str, *, log_bytes: int = 8192) -> CudaModule:
+         if not isinstance(ptx, str) or not ptx:
+             raise ValueError("PTX must be a non-empty string")
+@@ -513,5 +667,6 @@ __all__ = [
+     "CudaDriver",
+     "CudaDriverError",
+     "CudaDriverUnavailable",
++    "CudaEvent",
+     "CudaModule",
+ ]
+diff --git a/python/pypto/backends/cuda/runtime.py b/python/pypto/backends/cuda/runtime.py
+index ed7be8aac..9dfa364b3 100644
+--- a/python/pypto/backends/cuda/runtime.py
++++ b/python/pypto/backends/cuda/runtime.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import ctypes
+ import struct
++import time
+ from dataclasses import dataclass
+ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+ 
+@@ -47,6 +48,43 @@ class LoadedCudaArtifact:
+         return self.target_ir
+ 
+ 
++@dataclass(frozen=True)
++class CudaLaunchTiming:
++    """Timing decomposition of one :meth:`CudaRuntime.launch` call.
++
++    ``kernel_seconds`` is measured with CUDA events recorded on the launch
++    stream, so it covers the kernels plus any stream-ordered work the runtime
++    enqueues between them (for example the scalar-result synchronization in
++    the explicit orchestrator fallback).  ``wall_seconds`` is the full host
++    wall time of the call and ``dispatch_seconds`` is ``wall_seconds`` minus
++    ``kernel_seconds`` floored at zero, i.e. everything that is not device
++    execution (module JIT, allocations, host/device copies, Python dispatch).
++    ``timed_region_wall_seconds`` is a host-clock measurement anchored just
++    after the start event is armed and closed out after the stop event has
++    been synchronized; it exists so the event timer can be cross-checked
++    against the host clock on exactly the same device interval.
++    ``timing_error`` is only set when the driver event API failed and the
++    launch was allowed to continue without a ``kernel_seconds`` value.
++    """
++
++    kernel_seconds: Optional[float] = None
++    dispatch_seconds: Optional[float] = None
++    wall_seconds: Optional[float] = None
++    timed_region_wall_seconds: Optional[float] = None
++    device_event_timing: bool = False
++    timing_error: Optional[str] = None
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "kernel_seconds": self.kernel_seconds,
++            "dispatch_seconds": self.dispatch_seconds,
++            "wall_seconds": self.wall_seconds,
++            "timed_region_wall_seconds": self.timed_region_wall_seconds,
++            "device_event_timing": self.device_event_timing,
++            "timing_error": self.timing_error,
++        }
++
++
+ @dataclass
+ class _Allocation:
+     pointer: int
+@@ -289,8 +327,9 @@ class CudaRuntime:
+ 
+     name = "cuda.ptx"
+ 
+-    def __init__(self, driver: Any = None, device_index: int = 0) -> None:
++    def __init__(self, driver: Any = None, device_index: int = 0, *, timing: bool = True) -> None:
+         self.device_index = int(device_index)
++        self.timing = bool(timing)
+         self._driver_error: Optional[str] = None
+         if driver is not None:
+             self.driver = driver
+@@ -303,6 +342,7 @@ class CudaRuntime:
+         self._context: Optional[CudaContext] = None
+         self.last_jit_info_log = ""
+         self.last_jit_error_log = ""
++        self.last_timing: Optional[CudaLaunchTiming] = None
+ 
+     def availability(self) -> Availability:
+         if self.driver is None:
+@@ -327,6 +367,50 @@ class CudaRuntime:
+                 raise CudaExecutionError("CUDA context creation failed: {}".format(exc)) from exc
+         return self._context
+ 
++    def _event_timing_ready(self) -> bool:
++        """Return whether this runtime can record kernel time with events."""
++
++        if not self.timing or self.driver is None:
++            return False
++        probe = getattr(self.driver, "events_available", None)
++        if callable(probe):
++            try:
++                return bool(probe())
++            except Exception:
++                return False
++        # Pure-Python fakes and older adapters may only expose the methods.
++        return all(
++            callable(getattr(self.driver, name, None))
++            for name in (
++                "event_create",
++                "event_record",
++                "event_synchronize",
++                "event_elapsed_time_ms",
++                "event_destroy",
++            )
++        )
++
++    def _create_event_pair(self) -> Tuple[Any, Any, Optional[str]]:
++        """Create a start/stop event pair, returning ``None`` events on failure.
++
++        Timing is an observability layer; a driver that cannot create events
++        degrades to ``kernel_seconds=None`` with ``timing_error`` recorded
++        instead of changing the result of a correctness-critical launch.
++        """
++
++        start_event = None
++        try:
++            start_event = self.driver.event_create()
++            stop_event = self.driver.event_create()
++            return start_event, stop_event, None
++        except Exception as exc:
++            if start_event is not None:
++                try:
++                    start_event.close()
++                except Exception:
++                    pass
++            return None, None, "CUDA event creation failed: {}".format(exc)
++
+     def load(self, artifact: Artifact) -> LoadedCudaArtifact:
+         try:
+             target_ir = _decode_cuda_artifact(artifact)
+@@ -344,6 +428,18 @@ class CudaRuntime:
+         return 0
+ 
+     def launch(self, request: Any) -> Tuple[Any, ...]:
++        results, _timing = self.launch_timed(request)
++        return results
++
++    def launch_timed(self, request: Any) -> Tuple[Tuple[Any, ...], CudaLaunchTiming]:
++        """Launch ``request`` and return ``(results, timing)``.
++
++        ``kernel_seconds`` is recorded with CUDA events on the launch stream
++        when the bound driver exposes the timing-event API; otherwise it stays
++        ``None`` while ``wall_seconds`` is still reported.
++        """
++
++        wall_started = time.perf_counter()
+         loaded = self.load(request.artifact if isinstance(request, (LaunchRequest, GpuLaunchRequest)) else None)
+         gpu_request = _as_gpu_request(request, loaded.target_ir)
+         function = _find_function(loaded.target_ir, loaded.target_ir.entrypoint)
+@@ -354,7 +450,18 @@ class CudaRuntime:
+         values: Dict[str, Any] = {}
+         scalar_values: Dict[str, Any] = {}
+         output_allocations: Dict[str, _Allocation] = {}
++        timing_events: list = []
++        timing_error: Optional[str] = None
++        timed_region_started: Optional[float] = None
++        start_recorded = False
++        start_event = None
++        stop_event = None
+         try:
++            if self._event_timing_ready():
++                start_event, stop_event, timing_error = self._create_event_pair()
++                timing_events.extend(
++                    event for event in (start_event, stop_event) if event is not None
++                )
+             module = self.driver.module_load_data(loaded.target_ir.ptx)
+             self.last_jit_info_log = getattr(module, "info_log", "")
+             self.last_jit_error_log = getattr(module, "error_log", "")
+@@ -407,6 +514,22 @@ class CudaRuntime:
+                 for output, _allocation in output_allocations_for_operation:
+                     parameters.append(values[output.name])
+                 plan = loaded.target_ir.gpu_program.plans[index]
++                if start_event is not None and not start_recorded:
++                    # The start event is recorded immediately before the first
++                    # kernel so module JIT and buffer preparation stay out of
++                    # kernel_seconds.  Inter-op scalar synchronizations below
++                    # are intentionally inside the stream-ordered region.
++                    try:
++                        self.driver.event_record(start_event, gpu_request.stream_handle)
++                        start_recorded = True
++                        # Host anchor for the same device interval: the start
++                        # event is armed now, so this wall clock measures the
++                        # host wait for exactly what cuEventElapsedTime reports.
++                        timed_region_started = time.perf_counter()
++                    except Exception as exc:
++                        timing_error = "cuEventRecord(start) failed: {}".format(exc)
++                        start_event = None
++                        stop_event = None
+                 self.driver.launch_kernel(
+                     function_handle,
+                     plan.geometry.grid.dims,
+@@ -429,10 +552,27 @@ class CudaRuntime:
+                         )
+                         unpacked = _unpack(scalar_output.type.dtype, raw)
+                         scalar_values[scalar_output.name] = unpacked[0] if unpacked else 0
++            if start_recorded and stop_event is not None:
++                try:
++                    self.driver.event_record(stop_event, gpu_request.stream_handle)
++                except Exception as exc:
++                    timing_error = "cuEventRecord(stop) failed: {}".format(exc)
++                    stop_event = None
+             if gpu_request.stream_handle is not None and hasattr(self.driver, "stream_synchronize"):
+                 self.driver.stream_synchronize(gpu_request.stream_handle)
+             else:
+                 self.driver.context_synchronize()
++            kernel_seconds = None
++            timed_region_wall_seconds = None
++            if start_recorded and stop_event is not None:
++                try:
++                    self.driver.event_synchronize(stop_event)
++                    kernel_seconds = self.driver.event_elapsed_time_ms(start_event, stop_event) / 1000.0
++                    if timed_region_started is not None:
++                        timed_region_wall_seconds = time.perf_counter() - timed_region_started
++                except Exception as exc:
++                    timing_error = "CUDA event timing failed: {}".format(exc)
++                    kernel_seconds = None
+             results = []
+             tensor_return_index = 0
+             for ref in function.returns:
+@@ -463,7 +603,20 @@ class CudaRuntime:
+                     raw = self.driver.memcpy_dtoh(allocation.pointer, size)
+                     unpacked = _unpack(ref.type.dtype, raw)
+                     results.append(unpacked[0] if unpacked else 0.0)
+-            return tuple(results)
++            wall_seconds = time.perf_counter() - wall_started
++            dispatch_seconds = None
++            if kernel_seconds is not None:
++                dispatch_seconds = max(0.0, wall_seconds - kernel_seconds)
++            timing = CudaLaunchTiming(
++                kernel_seconds=kernel_seconds,
++                dispatch_seconds=dispatch_seconds,
++                wall_seconds=wall_seconds,
++                timed_region_wall_seconds=timed_region_wall_seconds,
++                device_event_timing=kernel_seconds is not None,
++                timing_error=timing_error,
++            )
++            self.last_timing = timing
++            return tuple(results), timing
+         except (CudaRuntimeError, CudaDriverError):
+             raise
+         except Exception as exc:
+@@ -480,6 +633,11 @@ class CudaRuntime:
+                         self.driver.mem_free(allocation.pointer)
+                     except Exception:
+                         pass
++            for event in reversed(timing_events):
++                try:
++                    event.close()
++                except Exception:
++                    pass
+ 
+     def _prepare_input(self, descriptor: TensorDesc, value_type: CoreType, allocations: list) -> int:
+         pointer = _pointer(_storage(descriptor))
+@@ -583,5 +741,5 @@ def launch(request: Any) -> Tuple[Any, ...]:
+ 
+ __all__ = [
+     "CudaArtifactError", "CudaBackend", "CudaDriverRuntime", "CudaExecutionError", "CudaRuntime",
+-    "CudaRuntimeError", "LoadedCudaArtifact", "launch",
++    "CudaLaunchTiming", "CudaRuntimeError", "LoadedCudaArtifact", "launch",
+ ]
+diff --git a/python/tests/ut/pypto_x/test_cuda_driver_ptx.py b/python/tests/ut/pypto_x/test_cuda_driver_ptx.py
+index 836ccc61c..77cc0254e 100644
+--- a/python/tests/ut/pypto_x/test_cuda_driver_ptx.py
++++ b/python/tests/ut/pypto_x/test_cuda_driver_ptx.py
+@@ -10,7 +10,7 @@ import pytest
+ from pypto.abi import GpuLaunchRequest, TensorDesc
+ from pypto.backends.cpu import HostTensor
+ from pypto.backends.cuda import CudaDeviceInfo
+-from pypto.backends.cuda.runtime import CudaArtifactError, CudaRuntime
++from pypto.backends.cuda.runtime import CudaArtifactError, CudaExecutionError, CudaRuntime
+ from pypto.compiler import Artifact
+ from pypto.compiler.targets.cuda import (
+     MAX_INLINE_CONSTANT_ELEMENTS,
+@@ -106,6 +106,64 @@ class _FakeDriver:
+         self.calls.append(("context_synchronize",))
+ 
+ 
++class _FakeEvent:
++    def __init__(self, driver, handle):
++        self.driver = driver
++        self.handle = handle
++        self.closed = False
++
++    def close(self):
++        if self.closed:
++            return
++        self.closed = True
++        self.driver.destroyed_events.append(self.handle)
++
++
++class _FakeEventDriver(_FakeDriver):
++    """Fake driver with an in-memory cuEvent timing surface."""
++
++    def __init__(self, elapsed_ms=2.5, fail_launch=False, fail_record=False, fail_create=False):
++        super().__init__()
++        self.elapsed_ms = elapsed_ms
++        self.fail_launch = fail_launch
++        self.fail_record = fail_record
++        self.fail_create = fail_create
++        self.created_events = []
++        self.destroyed_events = []
++        self.recorded_events = []
++        self.timing_enabled = True
++
++    def events_available(self):
++        return self.timing_enabled
++
++    def event_create(self):
++        if self.fail_create:
++            raise RuntimeError("event create failed")
++        handle = "event-{}".format(len(self.created_events) + 1)
++        event = _FakeEvent(self, handle)
++        self.created_events.append(event)
++        return event
++
++    def event_record(self, event, stream=None):
++        if self.fail_record:
++            raise RuntimeError("event record failed")
++        self.recorded_events.append((event, stream))
++
++    def event_synchronize(self, event):
++        self.calls.append(("event_synchronize", event.handle))
++
++    def event_elapsed_time_ms(self, start, end):
++        return self.elapsed_ms
++
++    def event_destroy(self, event):
++        event.close()
++
++    def launch_kernel(self, function, grid, block, parameters, stream=None, shared_memory=0):
++        if self.fail_launch:
++            raise RuntimeError("launch failed")
++        super().launch_kernel(function, grid, block, parameters, stream, shared_memory)
++
++
+ def _compile(program, driver=None, probe_jit=False):
+     compiler = CudaPtxCompiler(driver=driver, probe_jit=probe_jit)
+     target_ir = compiler.lower(program, TARGET)
+@@ -332,3 +390,116 @@ def test_large_constant_is_explicitly_bounded():
+     )
+     with pytest.raises(CudaPtxUnsupportedError, match="inline constant|limit"):
+         CudaPtxCompiler().lower(program, TARGET)
++
++
++def _timing_request(target_ir, artifact, stream=None):
++    left = HostTensor("float32", (5,), [1, 2, 3, 4, 5])
++    right = HostTensor("float32", (5,), [10, 20, 30, 40, 50])
++    output = HostTensor.zeros("float32", (5,))
++    request = GpuLaunchRequest(
++        artifact,
++        geometries=(target_ir.gpu_program.plans[0].geometry,),
++        inputs=(
++            TensorDesc("float32", (5,), device="gpu", handle=left, readonly=True),
++            TensorDesc("float32", (5,), device="gpu", handle=right, readonly=True),
++        ),
++        outputs=(TensorDesc("float32", (5,), device="gpu", handle=output),),
++        stream_handle=stream,
++    )
++    return request, output
++
++
++def test_runtime_launch_timed_reports_event_wall_and_dispatch_seconds():
++    driver = _FakeEventDriver(elapsed_ms=2.5)
++    _, target_ir, artifact = _compile(_program(), driver=driver)
++    request, output = _timing_request(target_ir, artifact, stream=0x99)
++    runtime = CudaRuntime(driver=driver)
++    results, timing = runtime.launch_timed(request)
++    assert results == (output,)
++    assert timing.device_event_timing is True
++    assert timing.kernel_seconds == pytest.approx(0.0025)
++    assert timing.wall_seconds > 0
++    assert timing.dispatch_seconds is not None and timing.dispatch_seconds >= 0
++    assert timing.timed_region_wall_seconds is not None and timing.timed_region_wall_seconds > 0
++    assert timing.timing_error is None
++    assert runtime.last_timing is timing
++    payload = timing.to_dict()
++    assert set(payload) == {
++        "kernel_seconds", "dispatch_seconds", "wall_seconds",
++        "timed_region_wall_seconds", "device_event_timing", "timing_error",
++    }
++    assert payload["kernel_seconds"] == pytest.approx(0.0025)
++    assert payload["device_event_timing"] is True
++    assert payload["timing_error"] is None
++    assert [stream for _event, stream in driver.recorded_events] == [0x99, 0x99]
++    assert len(driver.created_events) == 2
++    assert all(event.closed for event in driver.created_events)
++    assert len(driver.destroyed_events) == 2
++
++
++def test_runtime_launch_keeps_tuple_contract_and_updates_last_timing():
++    driver = _FakeEventDriver(elapsed_ms=1.0)
++    _, target_ir, artifact = _compile(_program(), driver=driver)
++    request, _ = _timing_request(target_ir, artifact)
++    runtime = CudaRuntime(driver=driver)
++    results = runtime.launch(request)
++    assert isinstance(results, tuple) and len(results) == 1
++    assert runtime.last_timing.kernel_seconds == pytest.approx(0.001)
++    assert runtime.last_timing.device_event_timing is True
++
++
++def test_runtime_without_event_api_still_reports_wall_seconds_only():
++    driver = _FakeDriver()
++    _, target_ir, artifact = _compile(_program(), driver=driver)
++    request, _ = _timing_request(target_ir, artifact)
++    runtime = CudaRuntime(driver=driver)
++    runtime.launch(request)
++    timing = runtime.last_timing
++    assert timing.kernel_seconds is None
++    assert timing.dispatch_seconds is None
++    assert timing.device_event_timing is False
++    assert timing.timing_error is None
++    assert timing.wall_seconds is not None and timing.wall_seconds >= 0
++
++
++def test_runtime_destroys_timing_events_when_launch_fails():
++    driver = _FakeEventDriver(fail_launch=True)
++    _, target_ir, artifact = _compile(_program(), driver=driver)
++    request, _ = _timing_request(target_ir, artifact)
++    runtime = CudaRuntime(driver=driver)
++    with pytest.raises(CudaExecutionError, match="CUDA launch failed"):
++        runtime.launch_timed(request)
++    assert len(driver.created_events) == 2
++    assert all(event.closed for event in driver.created_events)
++    assert len(driver.destroyed_events) == 2
++    assert runtime.last_timing is None
++
++
++def test_runtime_degrades_when_event_creation_or_record_fails():
++    driver = _FakeEventDriver(fail_create=True)
++    _, target_ir, artifact = _compile(_program(), driver=driver)
++    request, _ = _timing_request(target_ir, artifact)
++    runtime = CudaRuntime(driver=driver)
++    _, timing = runtime.launch_timed(request)
++    assert timing.kernel_seconds is None
++    assert "CUDA event creation failed" in timing.timing_error
++
++    driver = _FakeEventDriver(fail_record=True)
++    _, target_ir, artifact = _compile(_program(), driver=driver)
++    request, _ = _timing_request(target_ir, artifact)
++    runtime = CudaRuntime(driver=driver)
++    _, timing = runtime.launch_timed(request)
++    assert timing.kernel_seconds is None
++    assert "cuEventRecord(start) failed" in timing.timing_error
++    assert len(driver.created_events) == 2
++    assert all(event.closed for event in driver.created_events)
++
++
++def test_runtime_event_timing_can_be_disabled():
++    driver = _FakeEventDriver()
++    _, target_ir, artifact = _compile(_program(), driver=driver)
++    request, _ = _timing_request(target_ir, artifact)
++    runtime = CudaRuntime(driver=driver, timing=False)
++    runtime.launch(request)
++    assert runtime.last_timing.kernel_seconds is None
++    assert driver.created_events == []
+diff --git a/python/tests/ut/pypto_x/test_cuda_event_timing.py b/python/tests/ut/pypto_x/test_cuda_event_timing.py
+new file mode 100644
+index 000000000..f1ecc38f8
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cuda_event_timing.py
+@@ -0,0 +1,177 @@
++"""Driver-level CUDA event timing tests; no CUDA toolkit or GPU required.
++
++The tests fake the ``libcuda`` surface with plain Python callables, which is
++enough to exercise symbol binding, the ctypes argument marshalling and the
++event lifecycle.  Runtime-level wiring is covered next to the existing fake
++driver in ``test_cuda_driver_ptx.py``.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import types
++
++import pytest
++
++from pypto.backends.cuda.driver import (
++    CudaDriver,
++    CudaDriverError,
++    CudaDriverUnavailable,
++    CudaEvent,
++)
++
++
++_BASE_SYMBOLS = (
++    "cuInit",
++    "cuDeviceGet",
++    "cuDeviceGetName",
++    "cuDeviceComputeCapability",
++    "cuDeviceTotalMem_v2",
++    "cuCtxCreate_v2",
++    "cuCtxDestroy_v2",
++    "cuCtxSynchronize",
++    "cuStreamSynchronize",
++    "cuModuleLoadDataEx",
++    "cuModuleUnload",
++    "cuModuleGetFunction",
++    "cuMemAlloc_v2",
++    "cuMemFree_v2",
++    "cuMemcpyHtoD_v2",
++    "cuMemcpyDtoH_v2",
++    "cuLaunchKernel",
++    "cuGetErrorName",
++    "cuGetErrorString",
++)
++
++_EVENT_SYMBOLS = (
++    "cuEventCreate",
++    "cuEventRecord",
++    "cuEventSynchronize",
++    "cuEventElapsedTime",
++    "cuEventDestroy_v2",
++)
++
++
++class _FakeFunction:
++    """Callable with settable ``restype``/``argtypes`` like a CDLL symbol."""
++
++    def __init__(self, name, result=0, handler=None):
++        self.name = name
++        self.result = result
++        self.handler = handler
++        self.calls = []
++        self.restype = None
++        self.argtypes = None
++
++    def __call__(self, *args):
++        self.calls.append(args)
++        if self.handler is not None:
++            return self.handler(*args)
++        return self.result
++
++
++def _write_pointer(value, address):
++    ctypes.c_void_p.from_address(ctypes.cast(value, ctypes.c_void_p).value).value = address
++
++
++def _write_float(value, number):
++    ctypes.c_float.from_address(ctypes.cast(value, ctypes.c_void_p).value).value = number
++
++
++def _event_create(out, flags):
++    _write_pointer(out, 0xE1)
++    return 0
++
++
++def _fake_library(*, with_events=True, **overrides):
++    library = types.SimpleNamespace()
++    for name in _BASE_SYMBOLS + (_EVENT_SYMBOLS if with_events else ()):
++        setattr(library, name, _FakeFunction(name))
++    for name, function in overrides.items():
++        setattr(library, name, function)
++    return library
++
++
++def _pointer_value(value):
++    assert isinstance(value, ctypes.c_void_p)
++    return value.value
++
++
++def test_event_create_record_elapsed_and_destroy_are_bound():
++    library = _fake_library(
++        cuEventCreate=_FakeFunction("cuEventCreate", handler=_event_create),
++        cuEventElapsedTime=_FakeFunction(
++            "cuEventElapsedTime",
++            handler=lambda out, start, end: (_write_float(out, 2.5), 0)[1],
++        ),
++    )
++    driver = CudaDriver(library=library)
++    assert driver.events_available() is True
++    assert library.cuEventCreate.argtypes == [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
++
++    with driver.event_create() as start, driver.event_create() as stop:
++        start.record(stream=0x55)
++        stop.record()
++        start.synchronize()
++        assert start.elapsed_time_seconds(stop) == pytest.approx(0.0025)
++
++    record_args = library.cuEventRecord.calls[0]
++    assert _pointer_value(record_args[0]) == 0xE1
++    assert _pointer_value(record_args[1]) == 0x55
++    assert _pointer_value(library.cuEventRecord.calls[1][1]) is None
++    assert len(library.cuEventSynchronize.calls) == 1
++    assert _pointer_value(library.cuEventElapsedTime.calls[0][1]) == 0xE1
++
++    assert len(library.cuEventDestroy_v2.calls) == 2
++    start.close()
++    assert len(library.cuEventDestroy_v2.calls) == 2
++
++
++def test_event_destroys_handle_when_context_block_raises():
++    library = _fake_library(cuEventCreate=_FakeFunction("cuEventCreate", handler=_event_create))
++    driver = CudaDriver(library=library)
++    with pytest.raises(RuntimeError, match="boom"):
++        with driver.event_create() as event:
++            assert isinstance(event, CudaEvent)
++            raise RuntimeError("boom")
++    assert len(library.cuEventDestroy_v2.calls) == 1
++
++
++def test_closed_event_is_rejected_and_elapsed_requires_open_pair():
++    library = _fake_library(
++        cuEventCreate=_FakeFunction("cuEventCreate", handler=_event_create),
++        cuEventElapsedTime=_FakeFunction(
++            "cuEventElapsedTime",
++            handler=lambda out, start, end: (_write_float(out, 1.0), 0)[1],
++        ),
++    )
++    driver = CudaDriver(library=library)
++    start = driver.event_create()
++    stop = driver.event_create()
++    start.close()
++    with pytest.raises(CudaDriverError) as info:
++        start.record()
++    assert info.value.code == 400 and info.value.operation == "cuEventRecord"
++    with pytest.raises(CudaDriverError):
++        start.elapsed_time_ms(stop)
++    stop.close()
++    stop.close()
++    assert len(library.cuEventDestroy_v2.calls) == 2
++
++
++def test_event_creation_failure_raises_driver_error():
++    library = _fake_library(cuEventCreate=_FakeFunction("cuEventCreate", result=1))
++    driver = CudaDriver(library=library)
++    with pytest.raises(CudaDriverError) as info:
++        driver.event_create()
++    assert (info.value.operation, info.value.code) == ("cuEventCreate", 1)
++    assert info.value.name == "CUDA_ERROR_INVALID_VALUE"
++
++
++def test_driver_without_event_symbols_degrades_to_unavailable():
++    library = _fake_library(with_events=False)
++    driver = CudaDriver(library=library)
++    assert driver.events_available() is False
++    for method in (driver.event_create, lambda: driver.event_record(None)):
++        with pytest.raises(CudaDriverUnavailable, match="cuEvent"):
++            method()
+diff --git a/scripts/smoke/cuda_event_timing_smoke.py b/scripts/smoke/cuda_event_timing_smoke.py
+new file mode 100644
+index 000000000..5b73953df
+--- /dev/null
++++ b/scripts/smoke/cuda_event_timing_smoke.py
+@@ -0,0 +1,504 @@
++#!/usr/bin/env python3
++"""CUDA cuEvent kernel-timing smoke for the PyPTO-X RTX 5080 (no model/toolkit).
++
++The probe compiles one PTX matmul artifact, times repeated launches with the
++runtime's cuEvent-based ``launch_timed`` path, records nvidia-smi fingerprints
++before/after the measurement, samples ``clocks.sm`` while the GPU is under
++load, and writes a protocol-shaped evidence JSON.
++
++Run on GamePC WSL2:
++    PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=python python3 \
++        scripts/smoke/cuda_event_timing_smoke.py --json-out /tmp/evidence.json
++"""
++
++from __future__ import annotations
++
++import argparse
++import ctypes
++import json
++import math
++import platform
++import statistics
++import subprocess
++import sys
++import threading
++import time
++from pathlib import Path
++
++if __package__ in (None, ""):
++    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
++
++from pypto.abi import GpuLaunchRequest, TensorDesc  # noqa: E402
++from pypto.backends.cpu import HostTensor  # noqa: E402
++from pypto.backends.cuda import CudaRuntime  # noqa: E402
++from pypto.compiler.targets.cuda import CudaPtxCompiler  # noqa: E402
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef  # noqa: E402
++from pypto.target import TargetSpec  # noqa: E402
++
++
++GPU_QUERY = (
++    "name,driver_version,clocks.sm,clocks.max.sm,clocks.mem,clocks.max.memory,"
++    "power.draw,power.limit,temperature.gpu,utilization.gpu,memory.used,memory.total,"
++    "persistence_mode,compute_mode"
++)
++CLOCK_QUERY = "clocks.sm,clocks.max.sm"
++
++
++def _matmul_program(m, n, k, dtype):
++    left_type = CoreType.tensor(dtype, (m, k))
++    right_type = CoreType.tensor(dtype, (k, n))
++    output_type = CoreType.tensor(dtype, (m, n))
++    left = ValueRef("left", left_type)
++    right = ValueRef("right", right_type)
++    output = ValueRef("out", output_type)
++    return CoreProgram(
++        functions=(
++            CoreFunction(
++                "matmul",
++                (left, right),
++                (output,),
++                Region((Operation("matmul", (left, right), (output,)),)),
++            ),
++        )
++    )
++
++
++def _run(command, timeout=30):
++    completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
++    return completed.stdout.strip(), completed.stderr.strip(), completed.returncode
++
++
++def _gpu_fingerprint():
++    raw, _err, code = _run(["nvidia-smi", "--query-gpu=" + GPU_QUERY, "--format=csv,noheader"])
++    apps, _err, _code = _run(
++        ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"]
++    )
++    perf, _err, _code = _run(["nvidia-smi", "-q", "-d", "PERFORMANCE"])
++    version, _err, _code = _run(["nvidia-smi", "-q"])
++    kmd = cuda_umd = None
++    for line in version.splitlines():
++        stripped = line.strip()
++        if stripped.startswith("KMD Version"):
++            kmd = stripped.split(":", 1)[1].strip()
++        elif stripped.startswith("CUDA UMD Version"):
++            cuda_umd = stripped.split(":", 1)[1].strip()
++    return {
++        "query_command": "nvidia-smi --query-gpu={} --format=csv,noheader".format(GPU_QUERY),
++        "raw_csv": raw,
++        "query_returncode": code,
++        "compute_apps_command": "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader",
++        "compute_apps_raw": apps,
++        "performance_head": "\n".join(perf.splitlines()[:25]),
++        "driver_kmd": kmd,
++        "cuda_umd": cuda_umd,
++    }
++
++
++def _clock_sample():
++    raw, _err, code = _run(["nvidia-smi", "--query-gpu=" + CLOCK_QUERY, "--format=csv,noheader,nounits"])
++    if code != 0:
++        return None
++    parts = [part.strip() for part in raw.split(",")]
++    try:
++        return {"clocks_sm_mhz": int(float(parts[0])), "clocks_max_sm_mhz": int(float(parts[1]))}
++    except (IndexError, ValueError):
++        return None
++
++
++class _ClockSampler(threading.Thread):
++    """Poll nvidia-smi clocks while the main thread keeps the GPU loaded."""
++
++    def __init__(self, interval=0.4):
++        super().__init__(daemon=True)
++        self.interval = float(interval)
++        self.samples = []
++        self._stop_event = threading.Event()
++
++    def run(self):
++        while not self._stop_event.is_set():
++            sample = _clock_sample()
++            if sample is not None:
++                self.samples.append(sample)
++            self._stop_event.wait(self.interval)
++
++    def stop(self):
++        self._stop_event.set()
++        self.join(timeout=10)
++
++
++def _percentile(values, fraction):
++    ordered = sorted(values)
++    if not ordered:
++        return None
++    if len(ordered) == 1:
++        return ordered[0]
++    rank = fraction * (len(ordered) - 1)
++    lower = int(math.floor(rank))
++    upper = int(math.ceil(rank))
++    if lower == upper:
++        return ordered[lower]
++    return ordered[lower] + (ordered[upper] - ordered[lower]) * (rank - lower)
++
++
++def _dispersion(values):
++    if not values:
++        return {"n": 0}
++    mean = statistics.fmean(values)
++    return {
++        "n": len(values),
++        "min": min(values),
++        "p50": _percentile(values, 0.50),
++        "p95": _percentile(values, 0.95),
++        "max": max(values),
++        "mean": mean,
++        "stdev": statistics.stdev(values) if len(values) > 1 else 0.0,
++        "cv": (statistics.stdev(values) / mean) if len(values) > 1 and mean else 0.0,
++    }
++
++
++def _round(value, digits=9):
++    return None if value is None else round(float(value), digits)
++
++
++def _correctness_check():
++    """Small canonical matmul so the timed workload is known to be correct."""
++
++    program = _matmul_program(4, 6, 5, "float32")
++    target = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (128,)})
++    compiler = CudaPtxCompiler()
++    target_ir = compiler.lower(program, target)
++    artifact = compiler.compile(target_ir)
++    left = HostTensor("float32", (4, 5), [2.0] * 20)
++    right = HostTensor("float32", (5, 6), [3.0] * 30)
++    output = HostTensor.zeros("float32", (4, 6))
++    request = GpuLaunchRequest(
++        artifact,
++        geometries=(target_ir.gpu_program.plans[0].geometry,),
++        inputs=(
++            TensorDesc("float32", (4, 5), device="gpu", handle=left, readonly=True),
++            TensorDesc("float32", (5, 6), device="gpu", handle=right, readonly=True),
++        ),
++        outputs=(TensorDesc("float32", (4, 6), device="gpu", handle=output),),
++    )
++    runtime = CudaRuntime()
++    results, timing = runtime.launch_timed(request)
++    observed = output.flat()
++    expected = (30.0,) * 24
++    if observed != expected:
++        raise SystemExit("correctness check failed: {}".format(observed))
++    runtime.close()
++    return {"status": "PASS", "expected": 30.0, "kernel_seconds": timing.kernel_seconds, "results": len(results)}
++
++
++def _batch_self_proof(runtime, target_ir, plan, pointers, repeats):
++    """Time ``repeats`` back-to-back launches with one event pair and a host clock.
++
++    Per-launch event timing pays a fixed host driver-call latency around every
++    launch.  Wrapping all repeats in a single event pair amortizes that
++    latency over ``repeats * kernel`` seconds, so the device event span and the
++    host wall clock must agree to well under 5% for the timer to be trusted.
++    """
++
++    driver = runtime.driver
++    module = driver.module_load_data(target_ir.ptx)
++    try:
++        function = module.get_function("px_op0")
++        parameters = [ctypes.c_uint64(int(pointer)) for pointer in pointers]
++        grid = plan.geometry.grid.dims
++        block = plan.geometry.workgroup.dims
++        shared = plan.geometry.dynamic_workgroup_memory_bytes
++        start_event = driver.event_create()
++        stop_event = driver.event_create()
++        try:
++            start_event.record(None)
++            wall_started = time.perf_counter()
++            for _ in range(repeats):
++                driver.launch_kernel(function, grid, block, parameters, None, shared)
++            stop_event.record(None)
++            driver.context_synchronize()
++            wall_seconds = time.perf_counter() - wall_started
++            driver.event_synchronize(stop_event)
++            event_seconds = start_event.elapsed_time_seconds(stop_event)
++        finally:
++            for event in (start_event, stop_event):
++                try:
++                    event.close()
++                except Exception:
++                    pass
++    finally:
++        module.close()
++    diff_pct = abs(event_seconds - wall_seconds) / event_seconds * 100.0 if event_seconds else None
++    return {
++        "repeats": repeats,
++        "event_seconds": event_seconds,
++        "wall_seconds": wall_seconds,
++        "diff_pct": diff_pct,
++        "verdict": "PASS" if diff_pct is not None and diff_pct <= 5.0 else "FAIL",
++    }
++
++
++def _parse_args(argv):
++    parser = argparse.ArgumentParser(description="CUDA cuEvent kernel timing smoke")
++    parser.add_argument("--m", type=int, default=1024)
++    parser.add_argument("--n", type=int, default=1024)
++    parser.add_argument("--k", type=int, default=1024)
++    parser.add_argument("--dtype", default="bf16", choices=("bf16", "float32"))
++    parser.add_argument("--workgroup", type=int, default=256)
++    parser.add_argument("--warmup", type=int, default=3)
++    parser.add_argument("--repeats", type=int, default=15)
++    parser.add_argument("--clock-warmup-seconds", type=float, default=2.0)
++    parser.add_argument("--clock-tail-seconds", type=float, default=1.6)
++    parser.add_argument("--clock-interval", type=float, default=0.4)
++    parser.add_argument("--max-clock-launches", type=int, default=200)
++    parser.add_argument("--min-clock-ratio", type=float, default=0.9)
++    parser.add_argument("--json-out", default="")
++    parser.add_argument("--git-head", default="unknown")
++    parser.add_argument("--git-branch", default="work/cuda-kernel-timing")
++    parser.add_argument("--agent", default="cuda-kernel-timing")
++    return parser.parse_args(argv)
++
++
++def main(argv=None):
++    args = _parse_args(argv)
++    if args.repeats < 10:
++        raise SystemExit("--repeats must be >= 10 for a dispersion report")
++    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++
++    correctness = _correctness_check()
++
++    program = _matmul_program(args.m, args.n, args.k, args.dtype)
++    target = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (args.workgroup,)})
++    compiler = CudaPtxCompiler()
++    target_ir = compiler.lower(program, target)
++    artifact = compiler.compile(target_ir)
++    plan = target_ir.gpu_program.plans[0]
++
++    fingerprint_before = _gpu_fingerprint()
++
++    runtime = CudaRuntime()
++    if not runtime.is_available():
++        raise SystemExit("CUDA device unavailable: {}".format(runtime.availability().to_dict()))
++    runtime._ensure_context()
++    itemsize = 2 if args.dtype == "bf16" else 4
++    left_ptr = runtime.driver.mem_alloc(args.m * args.k * itemsize)
++    right_ptr = runtime.driver.mem_alloc(args.k * args.n * itemsize)
++    output_ptr = runtime.driver.mem_alloc(args.m * args.n * itemsize)
++    request = GpuLaunchRequest(
++        artifact,
++        geometries=(plan.geometry,),
++        inputs=(
++            TensorDesc(args.dtype, (args.m, args.k), device="gpu", address=left_ptr, readonly=True),
++            TensorDesc(args.dtype, (args.k, args.n), device="gpu", address=right_ptr, readonly=True),
++        ),
++        outputs=(TensorDesc(args.dtype, (args.m, args.n), device="gpu", address=output_ptr),),
++    )
++    jit_started = time.perf_counter()
++    probe_module = runtime.driver.module_load_data(target_ir.ptx)
++    jit_probe_seconds = time.perf_counter() - jit_started
++    probe_module.close()
++    warm_load_seconds = []
++    for _ in range(3):
++        started = time.perf_counter()
++        warm_module = runtime.driver.module_load_data(target_ir.ptx)
++        warm_load_seconds.append(time.perf_counter() - started)
++        warm_module.close()
++    module_load_warm_seconds_p50 = _percentile(warm_load_seconds, 0.5)
++
++    try:
++        for _ in range(max(0, args.warmup)):
++            runtime.launch(request)
++        # Clock warmup: keep the GPU busy for the protocol's 2 s before any
++        # clock sample is taken, so the samples reflect a boosted device.
++        clock_deadline = time.perf_counter() + max(0.0, args.clock_warmup_seconds)
++        clock_launches = 0
++        while time.perf_counter() < clock_deadline and clock_launches < max(1, args.max_clock_launches):
++            runtime.launch(request)
++            clock_launches += 1
++        sampler = _ClockSampler(interval=args.clock_interval)
++        sampler.start()
++        samples = []
++        for _ in range(args.repeats):
++            _results, timing = runtime.launch_timed(request)
++            samples.append(timing)
++        batch_proof = _batch_self_proof(
++            runtime, target_ir, plan, (left_ptr, right_ptr, output_ptr), args.repeats
++        )
++        # Keep the device loaded while the sampler polls, without perturbing
++        # the measured repeats above.
++        tail_deadline = time.perf_counter() + max(0.0, args.clock_tail_seconds)
++        while time.perf_counter() < tail_deadline:
++            runtime.launch(request)
++        sampler.stop()
++    finally:
++        for pointer in (left_ptr, right_ptr, output_ptr):
++            try:
++                runtime.driver.mem_free(pointer)
++            except Exception:
++                pass
++        runtime.close()
++
++    fingerprint_after = _gpu_fingerprint()
++    kernel = [sample.kernel_seconds for sample in samples]
++    wall = [sample.wall_seconds for sample in samples]
++    dispatch = [sample.dispatch_seconds for sample in samples if sample.dispatch_seconds is not None]
++    region_wall = [sample.timed_region_wall_seconds for sample in samples if sample.timed_region_wall_seconds is not None]
++    if any(value is None for value in kernel):
++        raise SystemExit("event timing did not produce kernel_seconds for every repeat")
++
++    kernel_disp = _dispersion(kernel)
++    wall_disp = _dispersion(wall)
++    dispatch_disp = _dispersion(dispatch)
++    region_disp = _dispersion(region_wall)
++    kernel_p50 = kernel_disp["p50"]
++    wall_p50 = wall_disp["p50"]
++    region_p50 = region_disp.get("p50")
++    kernel_vs_region_pct = (
++        abs(kernel_p50 - region_p50) / kernel_p50 * 100.0 if region_p50 and kernel_p50 else None
++    )
++    kernel_vs_wall_pct = abs(kernel_p50 - wall_p50) / kernel_p50 * 100.0 if kernel_p50 else None
++
++    clock_values = [sample["clocks_sm_mhz"] for sample in sampler.samples]
++    clock_max = max(
++        [sample["clocks_max_sm_mhz"] for sample in sampler.samples] or [0]
++    )
++    clock_sm = _percentile(clock_values, 0.50) if clock_values else None
++    clock_ratio = (clock_sm / clock_max) if clock_sm and clock_max else None
++    clock_verdict = "VALID" if clock_ratio is not None and clock_ratio >= args.min_clock_ratio else "INVALID_CLOCK"
++
++    flops = 2.0 * args.m * args.n * args.k
++    timing_self_proof = "PASS" if kernel_vs_region_pct is not None and kernel_vs_region_pct <= 5.0 else "FAIL"
++    wall_gap = None
++    if kernel_p50 is not None and wall_p50 is not None:
++        wall_gap = {
++            "kernel_vs_wall_diff_pct": kernel_vs_wall_pct,
++            "same_span_timed_region_wall_seconds_p50": region_p50,
++            "same_span_diff_pct": kernel_vs_region_pct,
++            "explanation": (
++                "wall_seconds covers the full runtime.launch call: each repeat re-loads the PTX module "
++                "(driver JIT cache) and pays host dispatch, which kernel_seconds excludes. "
++                "dispatch_seconds (= wall - kernel) is therefore the host overhead, with a warm module "
++                "load of ~{:.3f} ms per call measured separately. The same-span comparison "
++                "(kernel vs timed_region_wall_seconds, anchored after the start event was armed) "
++                "cross-checks the event timer on the identical device interval.".format(
++                    (module_load_warm_seconds_p50 or 0.0) * 1000.0
++                )
++            ),
++        }
++
++    evidence = {
++        "schema_version": 1,
++        "artifact_kind": "pypto-x.perf-evidence",
++        "task": "cuda-kernel-timing",
++        "agent": args.agent,
++        "started_at_utc": started_at,
++        "finished_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++        "git": {
++            "repository": "upstream/pypto",
++            "head": args.git_head,
++            "branch": args.git_branch,
++        },
++        "host": {
++            "class": "nvidia-5080-wsl2",
++            "uname": " ".join(platform.uname()),
++            "python": sys.version.split()[0],
++            "gpu": {
++                "name": (fingerprint_before.get("raw_csv") or "").split(",")[0].strip(),
++                "driver_kmd": (fingerprint_before.get("driver_kmd") or fingerprint_after.get("driver_kmd")),
++                "cuda_umd": (fingerprint_before.get("cuda_umd") or fingerprint_after.get("cuda_umd")),
++                "fingerprint_before": fingerprint_before,
++                "fingerprint_after": fingerprint_after,
++                "clock_samples": sampler.samples,
++                "clocks_sm_mhz_p50_under_load": clock_sm,
++                "clocks_sm_mhz_min_under_load": (min(clock_values) if clock_values else None),
++                "clocks_max_sm_mhz": clock_max,
++                "clock_ratio": clock_ratio,
++                "clock_verdict": clock_verdict,
++                "compute_processes_before_empty": not fingerprint_before.get("compute_apps_raw", "").strip(),
++                "compute_processes_after_empty": not fingerprint_after.get("compute_apps_raw", "").strip(),
++            },
++        },
++        "measurement": {
++            "level": "L0_op",
++            "execution_model": "op_by_op_dispatch",
++            "case": "matmul",
++            "dtype": args.dtype,
++            "shape_m_n_k": [args.m, args.n, args.k],
++            "workgroup": args.workgroup,
++            "warmup_iterations": args.warmup,
++            "measured_iterations": args.repeats,
++            "clock_warmup_seconds": args.clock_warmup_seconds,
++            "clock_tail_seconds": args.clock_tail_seconds,
++            "flop_accounting": "2 * B * M * N * K (B=1)",
++            "flops": flops,
++        },
++        "statistics": {
++            "unit": "seconds",
++            "kernel_seconds": kernel_disp,
++            "wall_seconds": wall_disp,
++            "dispatch_seconds": dispatch_disp,
++            "timed_region_wall_seconds": region_disp,
++            "verdict": "VALID" if clock_verdict == "VALID" else clock_verdict,
++        },
++        "metrics": {
++            "wall_seconds_median": wall_p50,
++            "kernel_seconds_median": kernel_p50,
++            "dispatch_seconds_median": dispatch_disp.get("p50"),
++            "gflops": (flops / kernel_p50 / 1.0e9) if kernel_p50 else None,
++            "gflops_scope": "kernel_only",
++            "flop_accounting": "2 * B * M * N * K (B=1)",
++        },
++        "timer_self_proof": {
++            "repeats": args.repeats,
++            "kernel_seconds_p50": kernel_p50,
++            "kernel_seconds_p95": kernel_disp["p95"],
++            "kernel_seconds_cv": kernel_disp["cv"],
++            "timed_region_wall_seconds_p50": region_p50,
++            "diff_pct": kernel_vs_region_pct,
++            "verdict": timing_self_proof,
++            "wall_gap": wall_gap,
++            "batch_span": batch_proof,
++        },
++        "diagnostics": {
++            "jit_probe_seconds": jit_probe_seconds,
++            "module_load_warm_seconds_p50": module_load_warm_seconds_p50,
++            "correctness": correctness,
++            "kernel_seconds_samples": [_round(value) for value in kernel],
++            "wall_seconds_samples": [_round(value) for value in wall],
++            "dispatch_seconds_samples": [_round(value) for value in dispatch],
++            "timed_region_wall_seconds_samples": [_round(value) for value in region_wall],
++        },
++        "status": (
++            "PASS"
++            if (
++                timing_self_proof == "PASS"
++                and batch_proof["verdict"] == "PASS"
++                and clock_verdict == "VALID"
++                and correctness["status"] == "PASS"
++            )
++            else "FAIL"
++        ),
++        "kernel_seconds": kernel_p50,
++    }
++    payload = json.dumps(evidence, indent=2, sort_keys=True)
++    if args.json_out:
++        Path(args.json_out).write_text(payload + "\n", encoding="utf-8")
++    print(payload)
++    print(
++        "kernel_seconds_p50={:.6f} p95={:.6f} cv={:.4f} wall_p50={:.6f} "
++        "same_span_diff_pct={} clock_ratio={} batch_span_diff_pct={} batch_verdict={} verdict={}".format(
++            kernel_p50,
++            kernel_disp["p95"],
++            kernel_disp["cv"],
++            wall_p50,
++            "{}".format(round(kernel_vs_region_pct, 3)) if kernel_vs_region_pct is not None else "n/a",
++            "{}".format(round(clock_ratio, 4)) if clock_ratio is not None else "n/a",
++            "{}".format(round(batch_proof["diff_pct"], 3)) if batch_proof["diff_pct"] is not None else "n/a",
++            batch_proof["verdict"],
++            evidence["status"],
++        )
++    )
++    return 0 if evidence["status"] == "PASS" else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

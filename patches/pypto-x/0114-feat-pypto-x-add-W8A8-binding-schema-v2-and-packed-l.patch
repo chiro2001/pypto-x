@@ -1,0 +1,1727 @@
+From 7e9067fceab28074be72dcde8ef17ee1d9c4ceb4 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 00:27:55 +0800
+Subject: [PATCH 114/118] feat(pypto-x): add W8A8 binding schema v2 and packed
+ layout v2
+
+Contract 0002 C2 (qwen35-w8a8-binding):
+- BINDING_SCHEMA_VERSION 1 -> 2: optional BindingEntry.quant mapping
+  (nine frozen keys, per_group/BF16-scale fail closed), quant_scale role,
+  from_dict/validate with dangling scale_entry and unknown-key rejection,
+  metadata-driven quantized_parameters construction in build_binding_schema.
+- PACKED_LAYOUT_VERSION 1 -> 2: every quantized weight expands to
+  <param>.int8 (quant_weight) + <param>.scale (quant_scale) regions;
+  v1 schema is rejected with reject_and_recompile. BF16 path keeps its
+  exact 368-region layout.
+- qwen35_decoder_exact_parameter_manifest / expand_decoder_parameter_manifest
+  expand the trusted compact manifest into the 320 exact names shared with
+  runtime_binding.
+- Coverage manifest: w8a8_linear_coverage and
+  whole_net_int8_compute_ratio, with 150/186 default coverage and a
+  documented static shape MAC model.
+- R7-R9 focused tests plus a metadata-only 518-region driver.
+
+No backend kernels, lowering, runtime execution or BF16 schema semantics
+were changed.
+---
+ python/pypto/portable/__init__.py                     |  32 +++
+ python/pypto/portable/qwen35.py                       |  75 +++++++
+ python/pypto/portable/qwen35_w8a8_coverage.py         | 312 ++++++++++++++++++++++++++
+ python/pypto/portable/runtime_binding.py              | 453 ++++++++++++++++++++++++++++++++++----
+ python/tests/ut/pypto_x/qwen35_w8a8_binding_driver.py | 263 ++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_w8a8_binding.py          | 317 ++++++++++++++++++++++++++
+ 6 files changed, 1409 insertions(+), 43 deletions(-)
+
+diff --git a/python/pypto/portable/__init__.py b/python/pypto/portable/__init__.py
+index 0d8f416e7..dfdf69f66 100644
+--- a/python/pypto/portable/__init__.py
++++ b/python/pypto/portable/__init__.py
+@@ -33,6 +33,17 @@ from .qwen35 import (
+     build_rope_rotate_half,
+     build_stable_softmax,
+     build_swiglu,
++    expand_decoder_parameter_manifest,
++    qwen35_decoder_exact_parameter_manifest,
++)
++from .qwen35_w8a8_coverage import (
++    QUANTIZED_LINEAR_COVERAGE_FIELD,
++    WHOLE_NET_INT8_COMPUTE_RATIO_FIELD,
++    W8A8CoverageError,
++    W8A8CoverageManifest,
++    build_qwen35_w8a8_coverage_manifest,
++    qwen35_default_quantized_linear_names,
++    qwen35_linear_parameter_names,
+ )
+ from .qwen35_weight_map import (
+     ExcludedGroup,
+@@ -71,6 +82,12 @@ from .safetensors_reader import (
+ )
+ from .runtime_binding import (
+     BINDING_SCHEMA_VERSION,
++    QUANT_ENTRY_KEYS,
++    QUANT_SCALE_DTYPE,
++    QUANT_SCALE_ROLE,
++    QUANT_SCHEME_NAME,
++    QUANT_WEIGHT_DTYPE,
++    QUANT_WEIGHT_REGION_ROLE,
+     BindingEntry,
+     BindingMismatchError,
+     BindingSchema,
+@@ -164,7 +181,22 @@ __all__ = [
+     "build_rope_rotate_half",
+     "build_stable_softmax",
+     "build_swiglu",
++    "expand_decoder_parameter_manifest",
++    "qwen35_decoder_exact_parameter_manifest",
++    "QUANTIZED_LINEAR_COVERAGE_FIELD",
++    "WHOLE_NET_INT8_COMPUTE_RATIO_FIELD",
++    "W8A8CoverageError",
++    "W8A8CoverageManifest",
++    "build_qwen35_w8a8_coverage_manifest",
++    "qwen35_default_quantized_linear_names",
++    "qwen35_linear_parameter_names",
+     "BINDING_SCHEMA_VERSION",
++    "QUANT_ENTRY_KEYS",
++    "QUANT_SCALE_DTYPE",
++    "QUANT_SCALE_ROLE",
++    "QUANT_SCHEME_NAME",
++    "QUANT_WEIGHT_DTYPE",
++    "QUANT_WEIGHT_REGION_ROLE",
+     "BindingEntry",
+     "BindingMismatchError",
+     "BindingSchema",
+diff --git a/python/pypto/portable/qwen35.py b/python/pypto/portable/qwen35.py
+index 5a8a96347..c4f651b76 100644
+--- a/python/pypto/portable/qwen35.py
++++ b/python/pypto/portable/qwen35.py
+@@ -525,6 +525,79 @@ def _decoder_parameter_manifest(profile: Mapping[str, int], dtype: str) -> Tuple
+     )
+ 
+ 
++def expand_decoder_parameter_manifest(
++    compact_manifest: Sequence[Mapping[str, Any]],
++    full_attention_indices: Sequence[int],
++    num_hidden_layers: int,
++) -> Tuple[Mapping[str, Any], ...]:
++    """把 compact per-storage manifest 展开成 320 条逐层精确参数条目。
++
++    展开规则与 ``runtime_binding._expected_qwen_parameter_manifest`` 的三方校验
++    完全一致（tied embedding 是单条；``layers.full_attention.*`` 与
++    ``layers.linear_attention.*`` 按 6/18 层路由；``layers.*`` 覆盖 24 层）。
++    返回条目带 ``elements_per_tensor``/``count=1``，可直接用于覆盖率统计。
++    """
++
++    full_indices = tuple(int(index) for index in full_attention_indices)
++    all_indices = tuple(range(int(num_hidden_layers)))
++    full_index_set = set(full_indices)
++    entries: List[Mapping[str, Any]] = []
++    for compact in compact_manifest:
++        pattern = compact.get("name")
++        if not isinstance(pattern, str) or not pattern:
++            raise ValueError("compact decoder manifest entry has no name")
++        if pattern == "embedding_lm_head_shared_weight":
++            names = (pattern,)
++        elif pattern == "final_norm.weight":
++            names = ("final_norm_weight",)
++        elif pattern.startswith("layers.full_attention.*."):
++            suffix = pattern.split("*.", 1)[1].replace(".", "_")
++            names = tuple("layer_{:02d}_{}".format(index, suffix) for index in full_indices)
++        elif pattern.startswith("layers.linear_attention.*."):
++            suffix = pattern.split("*.", 1)[1].replace(".", "_")
++            names = tuple("layer_{:02d}_{}".format(index, suffix) for index in all_indices if index not in full_index_set)
++        elif pattern.startswith("layers.*."):
++            suffix = pattern.split("*.", 1)[1].replace(".", "_")
++            names = tuple("layer_{:02d}_{}".format(index, suffix) for index in all_indices)
++        else:
++            raise ValueError("compact decoder manifest has an unknown name {!r}".format(pattern))
++        if len(names) != compact.get("count"):
++            raise ValueError("compact decoder manifest count is inconsistent for {!r}".format(pattern))
++        elements_per_tensor = int(compact["elements_per_tensor"])
++        for name in names:
++            entries.append(
++                {
++                    "name": name,
++                    "storage_id": pattern,
++                    "shape": tuple(compact["shape"]),
++                    "dtype": compact["dtype"],
++                    "count": 1,
++                    "elements_per_tensor": elements_per_tensor,
++                    "aliases": tuple(compact.get("aliases", ())),
++                }
++            )
++    if len({entry["name"] for entry in entries}) != len(entries):
++        raise ValueError("compact decoder manifest expands duplicate exact parameter names")
++    return tuple(entries)
++
++
++def qwen35_decoder_exact_parameter_manifest(
++    shape_profile: str = "model",
++    *,
++    query_heads: int = 8,
++    dtype: str = "bf16",
++) -> Tuple[Mapping[str, Any], ...]:
++    """返回 320 条逐层参数条目（name/shape/dtype），不包含任何权重字节。"""
++
++    dtype = _dtype(dtype, "dtype")
++    profile_values = _decoder_shape_profile(shape_profile, query_heads)
++    return expand_decoder_parameter_manifest(
++        _decoder_parameter_manifest(profile_values, dtype),
++        QWEN35_08B_SHAPE_METADATA["full_attention_indices_zero_based"],
++        QWEN35_08B_SHAPE_METADATA["num_hidden_layers"],
++    )
++
++
+ def _manifest_bytes(entries: Sequence[Mapping[str, Any]]) -> Tuple[int, int]:
+     total_elements = 0
+     total_bytes = 0
+@@ -3744,6 +3817,8 @@ __all__ = [
+     "build_qwen35_position_ids",
+     "build_qwen35_text_decoder_graph",
+     "qwen35_text_decoder_manifest",
++    "qwen35_decoder_exact_parameter_manifest",
++    "expand_decoder_parameter_manifest",
+     "qwen35_text_decoder_structural_manifest",
+     "build_qwen35_text_decoder_structural_shell",
+     "build_causal_conv1d",
+diff --git a/python/pypto/portable/qwen35_w8a8_coverage.py b/python/pypto/portable/qwen35_w8a8_coverage.py
+new file mode 100644
+index 000000000..d5b67628d
+--- /dev/null
++++ b/python/pypto/portable/qwen35_w8a8_coverage.py
+@@ -0,0 +1,312 @@
++"""Qwen3.5-0.8B W8A8 覆盖率 manifest（契约 §2.4 / §3.5 / §5.3，验收 R9）。
++
++本模块只做目标无关的 metadata 计算，不加载权重、不分配存储、不执行 kernel：
++
++* ``w8a8_linear_coverage`` = 已量化线性层参数量 / 全部线性层参数量；
++* ``whole_net_int8_compute_ratio`` = INT8 MAC / 总 MAC，分母包含未量化
++  线性层、attention QK/PV、conv1d 与 GDR 递推的浮点 matmul。
++
++``whole_net_int8_compute_ratio`` 依赖运行点（prefill 步数、cache 长度），
++因此 manifest 显式记录 ``compute_operating_point`` 与 ``measurement``。
++默认值是单 token、cache=1 的静态 shape 模型估算，最终整网报告必须用运行时
++实测值覆盖（契约 §5.4：不预设性能/收益数字）。
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
++
++from pypto.portable.qwen35 import QWEN35_08B_SHAPE_METADATA
++
++
++QUANTIZED_LINEAR_COVERAGE_FIELD = "w8a8_linear_coverage"
++WHOLE_NET_INT8_COMPUTE_RATIO_FIELD = "whole_net_int8_compute_ratio"
++
++# 186 个线性权重（契约 §1.5 表）按名字后缀分类；lm_head 与 embedding 共享
++# storage，默认不量化，因此不在 186 内。
++QWEN35_LINEAR_WEIGHT_SUFFIXES = (
++    "_mlp_gate_proj_weight",
++    "_mlp_up_proj_weight",
++    "_mlp_down_proj_weight",
++    "_q_proj_weight",
++    "_k_proj_weight",
++    "_v_proj_weight",
++    "_o_proj_weight",
++    "_in_proj_qkv_weight",
++    "_in_proj_z_weight",
++    "_in_proj_b_weight",
++    "_in_proj_a_weight",
++    "_out_proj_weight",
++)
++# 默认保持 BF16 的小通道线性层（契约 §1.3 / §8-D1）。条件开启后覆盖率为 186/186。
++QWEN35_DEFAULT_BF16_LINEAR_SUFFIXES = ("_in_proj_b_weight", "_in_proj_a_weight")
++
++DEFAULT_QWEN35_COMPUTE_OPERATING_POINT = {
++    "batch": 1,
++    "prefill_steps": 1,
++    "past_length": 1,
++    "note": "static decode-step shape model; runtime measurement overrides",
++}
++
++
++class W8A8CoverageError(ValueError):
++    """覆盖率 manifest 输入或计算结果违反契约。"""
++
++
++def _entry_name(entry: Mapping[str, Any]) -> str:
++    name = entry.get("name")
++    if not isinstance(name, str) or not name:
++        raise W8A8CoverageError("parameter manifest entry has no stable name")
++    return name
++
++
++def _entry_elements(entry: Mapping[str, Any]) -> int:
++    value = entry.get("elements_per_tensor")
++    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
++        raise W8A8CoverageError("parameter manifest entry {!r} has invalid elements_per_tensor".format(_entry_name(entry)))
++    count = entry.get("count", 1)
++    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
++        raise W8A8CoverageError("parameter manifest entry {!r} has invalid count".format(_entry_name(entry)))
++    return value * count
++
++
++def qwen35_linear_parameter_names(exact_entries: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
++    """从 320 条精确参数条目中筛出 186 个线性权重名（契约 §1.5）。"""
++
++    return tuple(
++        _entry_name(entry)
++        for entry in exact_entries
++        if _entry_name(entry).endswith(QWEN35_LINEAR_WEIGHT_SUFFIXES)
++    )
++
++
++def qwen35_default_quantized_linear_names(exact_entries: Sequence[Mapping[str, Any]]) -> Tuple[str, ...]:
++    """默认 W8A8 量化集合：186 个线性层中排除 in_proj_b / in_proj_a（150 个）。"""
++
++    return tuple(
++        name
++        for name in qwen35_linear_parameter_names(exact_entries)
++        if not name.endswith(QWEN35_DEFAULT_BF16_LINEAR_SUFFIXES)
++    )
++
++
++def _shape(entry: Mapping[str, Any]) -> Tuple[int, ...]:
++    value = entry.get("shape")
++    if isinstance(value, (str, bytes)):
++        raise W8A8CoverageError("parameter manifest entry {!r} has invalid shape".format(_entry_name(entry)))
++    try:
++        shape = tuple(value)
++    except TypeError as exc:
++        raise W8A8CoverageError("parameter manifest entry {!r} has invalid shape".format(_entry_name(entry))) from exc
++    for dimension in shape:
++        if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension < 0:
++            raise W8A8CoverageError("parameter manifest entry {!r} has invalid shape".format(_entry_name(entry)))
++    return shape
++
++
++def _mac_counts(
++    exact_entries: Sequence[Mapping[str, Any]],
++    quantized_names: Sequence[str],
++    operating_point: Mapping[str, int],
++) -> Dict[str, int]:
++    """静态 shape MAC 模型（MAC 数，不含 elementwise/norm/softmax）。
++
++    每层公式（单 forward，batch=B，本步 token=T，cache 长度=P）：
++
++    * 线性投影：``T * out * in``；
++    * full attention QKᵀ/PV：``2 * qh * head_dim * (P + T) * T``（非因果上界；
++      decode T=1 时即 ``2*qh*head_dim*(P+1)``）；
++    * GDR conv1d（depthwise causal）：``T * conv_channels * kernel``；
++    * GDR 递推：``T * (nv*nk*dk + nv*nk*dv + 2*nv*dk*dv)``
++      （q·k 打分 + 加权 v + 状态收缩 + outer product）。
++    """
++
++    entries_by_name = {_entry_name(entry): entry for entry in exact_entries}
++    quantized = set(quantized_names)
++    unknown = quantized - set(entries_by_name)
++    if unknown:
++        raise W8A8CoverageError("quantized names are absent from the parameter manifest: {}".format(tuple(sorted(unknown))))
++    linear_names = set(qwen35_linear_parameter_names(exact_entries))
++    if not quantized <= linear_names:
++        raise W8A8CoverageError("quantized names must be a subset of the 186 linear weights")
++    batch = int(operating_point["batch"])
++    steps = int(operating_point["prefill_steps"])
++    past = int(operating_point["past_length"])
++    for field, value in (("batch", batch), ("prefill_steps", steps), ("past_length", past)):
++        if value <= 0:
++            raise W8A8CoverageError("operating point {} must be positive".format(field))
++
++    model = QWEN35_08B_SHAPE_METADATA
++    full_layers = len(model["full_attention_indices_zero_based"])
++    gdr_layers = int(model["num_hidden_layers"]) - full_layers
++    hidden = int(model["hidden_size"])
++    qh = int(model["num_attention_heads"])
++    head_dim = int(model["head_dim"])
++    nk = int(model["linear_num_key_heads"])
++    nv = int(model["linear_num_value_heads"])
++    dk = int(model["linear_key_head_dim"])
++    dv = int(model["linear_value_head_dim"])
++    conv_channels = 2 * nk * dk + nv * dv
++    conv_kernel = int(model["linear_conv_kernel_dim"])
++
++    int8_macs = 0
++    bf16_linear_macs = 0
++    for name, entry in entries_by_name.items():
++        if name not in linear_names:
++            continue
++        shape = _shape(entry)
++        if len(shape) != 2:
++            raise W8A8CoverageError("linear weight {!r} must be rank 2".format(name))
++        macs = steps * shape[0] * shape[1]
++        if name in quantized:
++            int8_macs += macs
++        else:
++            bf16_linear_macs += macs
++
++    kv_length = past + steps
++    attention_macs = full_layers * batch * 2 * qh * head_dim * kv_length * steps
++    conv_macs = gdr_layers * batch * steps * conv_channels * conv_kernel
++    recurrent_macs = gdr_layers * batch * steps * (nv * nk * dk + nv * nk * dv + 2 * nv * dk * dv)
++    float_macs = bf16_linear_macs + attention_macs + conv_macs + recurrent_macs
++    return {
++        "int8_macs": int8_macs,
++        "bf16_linear_macs": bf16_linear_macs,
++        "attention_macs": attention_macs,
++        "conv1d_macs": conv_macs,
++        "gdr_recurrent_macs": recurrent_macs,
++        "float_macs": float_macs,
++        "total_macs": int8_macs + float_macs,
++        # 保持对 shape metadata 的显式引用，便于审计公式输入。
++        "hidden_size": hidden,
++    }
++
++
++@dataclass(frozen=True)
++class W8A8CoverageManifest:
++    """契约 §2.4 / §5.3 要求的覆盖率报告字段（R9 断言对象）。"""
++
++    w8a8_linear_coverage: float
++    whole_net_int8_compute_ratio: float
++    quantized_linear_tensor_count: int
++    total_linear_tensor_count: int
++    quantized_linear_parameter_elements: int
++    total_linear_parameter_elements: int
++    w8a8_linear_tensor_coverage: float
++    int8_macs_per_forward: int
++    total_macs_per_forward: int
++    mac_breakdown: Mapping[str, int]
++    compute_operating_point: Mapping[str, Any]
++    measurement: str
++    quantized_parameter_names: Tuple[str, ...]
++    bf16_island_names: Tuple[str, ...]
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            QUANTIZED_LINEAR_COVERAGE_FIELD: self.w8a8_linear_coverage,
++            WHOLE_NET_INT8_COMPUTE_RATIO_FIELD: self.whole_net_int8_compute_ratio,
++            "w8a8_linear_tensor_coverage": self.w8a8_linear_tensor_coverage,
++            "quantized_linear_tensor_count": self.quantized_linear_tensor_count,
++            "total_linear_tensor_count": self.total_linear_tensor_count,
++            "quantized_linear_parameter_elements": self.quantized_linear_parameter_elements,
++            "total_linear_parameter_elements": self.total_linear_parameter_elements,
++            "int8_macs_per_forward": self.int8_macs_per_forward,
++            "total_macs_per_forward": self.total_macs_per_forward,
++            "mac_breakdown": dict(self.mac_breakdown),
++            "compute_operating_point": dict(self.compute_operating_point),
++            "measurement": self.measurement,
++            "quantized_parameter_names": list(self.quantized_parameter_names),
++            "bf16_island_names": list(self.bf16_island_names),
++        }
++
++    def assert_nonzero(self) -> None:
++        """R9：两个必填字段必须存在且非零。"""
++
++        if not 0.0 < self.w8a8_linear_coverage <= 1.0:
++            raise W8A8CoverageError(
++                "{} must be in (0, 1]; got {!r}".format(
++                    QUANTIZED_LINEAR_COVERAGE_FIELD, self.w8a8_linear_coverage
++                )
++            )
++        if not 0.0 < self.whole_net_int8_compute_ratio <= 1.0:
++            raise W8A8CoverageError(
++                "{} must be in (0, 1]; got {!r}".format(
++                    WHOLE_NET_INT8_COMPUTE_RATIO_FIELD, self.whole_net_int8_compute_ratio
++                )
++            )
++
++
++def build_qwen35_w8a8_coverage_manifest(
++    exact_parameter_entries: Sequence[Mapping[str, Any]],
++    *,
++    quantized_names: Optional[Iterable[str]] = None,
++    operating_point: Optional[Mapping[str, Any]] = None,
++) -> W8A8CoverageManifest:
++    """从精确参数 manifest 构造覆盖率 manifest（默认 150/186 量化集合）。"""
++
++    entries = tuple(exact_parameter_entries)
++    default_quantized = qwen35_default_quantized_linear_names(entries)
++    if quantized_names is None:
++        quantized = default_quantized
++    else:
++        quantized = tuple(quantized_names)
++        if len(set(quantized)) != len(quantized):
++            raise W8A8CoverageError("quantized_names contains duplicates")
++    linear_names = qwen35_linear_parameter_names(entries)
++    if len(linear_names) != 186:
++        raise W8A8CoverageError(
++            "Qwen3.5 exact manifest must contain 186 linear weights; got {}".format(len(linear_names))
++        )
++    entries_by_name = {_entry_name(entry): entry for entry in entries}
++    total_elements = sum(_entry_elements(entries_by_name[name]) for name in linear_names)
++    quantized_elements = sum(_entry_elements(entries_by_name[name]) for name in quantized)
++    if total_elements <= 0 or quantized_elements <= 0:
++        raise W8A8CoverageError("linear parameter element totals must be positive")
++    coverage = quantized_elements / total_elements
++    tensor_coverage = len(quantized) / len(linear_names)
++
++    default_point = dict(DEFAULT_QWEN35_COMPUTE_OPERATING_POINT)
++    if operating_point is not None:
++        for key in ("batch", "prefill_steps", "past_length"):
++            if key in operating_point:
++                value = operating_point[key]
++                if isinstance(value, bool) or not isinstance(value, int):
++                    raise W8A8CoverageError("operating point {} must be an integer".format(key))
++                default_point[key] = value
++        default_point["note"] = str(operating_point.get("note", default_point["note"]))
++    macs = _mac_counts(entries, quantized, default_point)
++    ratio = macs["int8_macs"] / macs["total_macs"]
++
++    island_names = tuple(sorted(set(entries_by_name) - set(quantized)))
++    manifest = W8A8CoverageManifest(
++        w8a8_linear_coverage=coverage,
++        whole_net_int8_compute_ratio=ratio,
++        quantized_linear_tensor_count=len(quantized),
++        total_linear_tensor_count=len(linear_names),
++        quantized_linear_parameter_elements=quantized_elements,
++        total_linear_parameter_elements=total_elements,
++        w8a8_linear_tensor_coverage=tensor_coverage,
++        int8_macs_per_forward=macs["int8_macs"],
++        total_macs_per_forward=macs["total_macs"],
++        mac_breakdown=macs,
++        compute_operating_point=default_point,
++        measurement="static_shape_model",
++        quantized_parameter_names=tuple(quantized),
++        bf16_island_names=island_names,
++    )
++    manifest.assert_nonzero()
++    return manifest
++
++
++__all__ = [
++    "DEFAULT_QWEN35_COMPUTE_OPERATING_POINT",
++    "QWEN35_DEFAULT_BF16_LINEAR_SUFFIXES",
++    "QWEN35_LINEAR_WEIGHT_SUFFIXES",
++    "QUANTIZED_LINEAR_COVERAGE_FIELD",
++    "WHOLE_NET_INT8_COMPUTE_RATIO_FIELD",
++    "W8A8CoverageError",
++    "W8A8CoverageManifest",
++    "build_qwen35_w8a8_coverage_manifest",
++    "qwen35_default_quantized_linear_names",
++    "qwen35_linear_parameter_names",
++]
+diff --git a/python/pypto/portable/runtime_binding.py b/python/pypto/portable/runtime_binding.py
+index 3215c9124..4727366bf 100644
+--- a/python/pypto/portable/runtime_binding.py
++++ b/python/pypto/portable/runtime_binding.py
+@@ -22,14 +22,44 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+ 
+ from pypto.abi import LaunchRequest, TensorDesc
+ from pypto.compiler.artifact import Artifact
+-from pypto.core_ir import CoreProgram, ValueRef
++from pypto.core_ir import CoreIRError, CoreProgram, QuantizedTensorDesc, ValueRef
+ 
+ 
+ UINT64_MAX = (1 << 64) - 1
+-BINDING_SCHEMA_VERSION = 1
+-PACKED_LAYOUT_VERSION = 1
++# v2 增加 BindingEntry.quant / quant_scale role / packed v2 量化 region（契约 §3.1/§3.2）。
++BINDING_SCHEMA_VERSION = 2
++PACKED_LAYOUT_VERSION = 2
+ DEFAULT_PACK_ALIGNMENT = 64
+ 
++QUANT_SCHEME_NAME = "w8a8_linear"
++QUANT_WEIGHT_DTYPE = "int8"
++QUANT_SCALE_DTYPE = "float32"
++QUANT_SCALE_ROLE = "quant_scale"
++QUANT_WEIGHT_REGION_ROLE = "quant_weight"
++# BindingEntry.quant 的冻结键集合（契约 §3.2 第 2 条）。
++QUANT_ENTRY_KEYS = (
++    "scheme",
++    "signed",
++    "bits",
++    "axis",
++    "granularity",
++    "scale_dtype",
++    "zero_point",
++    "scale_entry",
++    "group_size",
++)
++_QUANT_DEFAULTS = {
++    "scheme": QUANT_SCHEME_NAME,
++    "signed": True,
++    "bits": 8,
++    "axis": 0,
++    "granularity": "per_output_channel",
++    "scale_dtype": QUANT_SCALE_DTYPE,
++    "zero_point": 0,
++    "scale_entry": None,
++    "group_size": None,
++}
++
+ _DTYPE_BYTES = {
+     "bool": 1,
+     "int8": 1,
+@@ -160,6 +190,54 @@ def _canonical_json(value: Any) -> str:
+     )
+ 
+ 
++def _canonical_quant_entry(value: Any, context: str) -> Optional[Mapping[str, Any]]:
++    """Validate and freeze one ``BindingEntry.quant`` mapping (contract §3.2).
++
++    ``None`` keeps the BF16 path byte-identical.  Any unknown/missing key,
++    ``per_group`` granularity or non-fixed zero point fails closed.  Field
++    level validation is delegated to the C1 ``QuantizedTensorDesc`` so the
++    scheme descriptor and the binding schema cannot drift apart.
++    """
++
++    if value is None:
++        return None
++    if not isinstance(value, Mapping):
++        raise BindingMismatchError("{} must be a JSON object or None".format(context))
++    unknown = [key for key in value if key not in QUANT_ENTRY_KEYS]
++    if unknown:
++        raise BindingMismatchError("{} contains unknown keys {}".format(context, tuple(sorted(unknown))))
++    missing = [key for key in QUANT_ENTRY_KEYS if key not in value]
++    if missing:
++        raise BindingMismatchError("{} is missing keys {}".format(context, tuple(missing)))
++    if value["scheme"] != QUANT_SCHEME_NAME:
++        raise BindingMismatchError(
++            "{} scheme must be {!r}; got {!r}".format(context, QUANT_SCHEME_NAME, value["scheme"])
++        )
++    scale_entry = value["scale_entry"]
++    if not isinstance(scale_entry, str) or not scale_entry:
++        raise BindingMismatchError("{}.scale_entry must be a non-empty string".format(context))
++    zero_point = value["zero_point"]
++    if isinstance(zero_point, bool) or zero_point != 0:
++        raise BindingMismatchError("{}.zero_point must be 0 (fixed_zero)".format(context))
++    try:
++        QuantizedTensorDesc(
++            signed=value["signed"],
++            bits=value["bits"],
++            axis=value["axis"],
++            granularity=value["granularity"],
++            group_size=value["group_size"],
++            scale_dtype=value["scale_dtype"],
++            zero_point_policy="fixed_zero",
++            logical_layout="out_in_rowmajor",
++        )
++    except CoreIRError as exc:
++        raise BindingMismatchError("{} is not a valid weight quant descriptor: {}".format(context, exc)) from exc
++    return MappingProxyType(dict(value))
++
++
++_BINDING_ENTRY_ROLES = frozenset(("runtime", "parameter", "state", "output", "state_output", QUANT_SCALE_ROLE))
++
++
+ def _mapping_copy(value: Mapping[str, Any]) -> Dict[str, Any]:
+     return {str(key): item for key, item in value.items()}
+ 
+@@ -345,7 +423,12 @@ class BufferBinding:
+ 
+ @dataclass(frozen=True)
+ class BindingEntry:
+-    """One exact function parameter or return contract entry."""
++    """One exact function parameter or return contract entry.
++
++    ``quant`` is the optional frozen W8A8 descriptor (contract §3.2).  It stays
++    ``None`` on the BF16 path, and :meth:`to_dict` omits the key entirely in
++    that case so existing BF16 schema JSON remains byte-identical.
++    """
+ 
+     ordinal: int
+     name: str
+@@ -355,9 +438,53 @@ class BindingEntry:
+     nbytes: int
+     storage_id: str
+     readonly: bool
++    quant: Optional[Mapping[str, Any]] = None
++
++    def __post_init__(self) -> None:
++        if isinstance(self.ordinal, bool) or not isinstance(self.ordinal, int) or self.ordinal < 0:
++            raise BindingMismatchError("BindingEntry.ordinal must be a non-negative integer")
++        if not isinstance(self.name, str) or not self.name:
++            raise BindingMismatchError("BindingEntry.name must be a non-empty string")
++        if self.role not in _BINDING_ENTRY_ROLES:
++            raise BindingMismatchError("BindingEntry.role {!r} is not a known role".format(self.role))
++        if not isinstance(self.storage_id, str) or not self.storage_id:
++            raise BindingMismatchError("BindingEntry.storage_id must be a non-empty string")
++        if not isinstance(self.readonly, bool):
++            raise BindingMismatchError("BindingEntry.readonly must be a bool")
++        dtype = _canonical_dtype(self.dtype)
++        shape = _checked_shape(self.shape, "BindingEntry.shape")
++        nbytes = _expected_nbytes(dtype, shape)
++        if self.nbytes != nbytes:
++            raise BindingMismatchError(
++                "BindingEntry {!r} nbytes {} does not match dtype/shape requirement {}".format(
++                    self.name, self.nbytes, nbytes
++                )
++            )
++        quant = _canonical_quant_entry(self.quant, "BindingEntry({!r}).quant".format(self.name))
++        if quant is not None:
++            if self.role != "parameter":
++                raise BindingMismatchError("quantized weight {!r} must keep role 'parameter'".format(self.name))
++            if dtype != QUANT_WEIGHT_DTYPE:
++                raise BindingMismatchError(
++                    "quantized weight {!r} must be int8; got {!r}".format(self.name, dtype)
++                )
++            if len(shape) != 2:
++                raise BindingMismatchError("quantized weight {!r} must be rank 2".format(self.name))
++        if self.role == QUANT_SCALE_ROLE:
++            if quant is not None:
++                raise BindingMismatchError("quant_scale entry {!r} cannot carry its own quant mapping".format(self.name))
++            if dtype != QUANT_SCALE_DTYPE:
++                raise BindingMismatchError(
++                    "quant_scale entry {!r} must be float32; got {!r}".format(self.name, dtype)
++                )
++            if len(shape) != 1:
++                raise BindingMismatchError("quant_scale entry {!r} must be rank 1".format(self.name))
++        object.__setattr__(self, "dtype", dtype)
++        object.__setattr__(self, "shape", shape)
++        object.__setattr__(self, "quant", quant)
+ 
+     def to_dict(self) -> Mapping[str, Any]:
+-        return {
++        payload = {
+             "ordinal": self.ordinal,
+             "name": self.name,
+             "role": self.role,
+@@ -367,6 +494,35 @@ class BindingEntry:
+             "storage_id": self.storage_id,
+             "readonly": self.readonly,
+         }
++        if self.quant is not None:
++            payload["quant"] = dict(self.quant)
++        return payload
++
++    @classmethod
++    def from_dict(cls, value: Mapping[str, Any]) -> "BindingEntry":
++        if not isinstance(value, Mapping):
++            raise BindingMismatchError("BindingEntry must be a JSON object")
++        required = ("ordinal", "name", "role", "dtype", "shape", "nbytes", "storage_id", "readonly")
++        missing = [key for key in required if key not in value]
++        if missing:
++            raise BindingMismatchError("BindingEntry is missing fields {}".format(tuple(missing)))
++        unknown = [key for key in value if key not in required + ("quant",)]
++        if unknown:
++            raise BindingMismatchError("BindingEntry contains unknown fields {}".format(tuple(sorted(unknown))))
++        shape = value["shape"]
++        if not isinstance(shape, (list, tuple)):
++            raise BindingMismatchError("BindingEntry.shape must be an array")
++        return cls(
++            ordinal=value["ordinal"],
++            name=value["name"],
++            role=value["role"],
++            dtype=value["dtype"],
++            shape=tuple(shape),
++            nbytes=value["nbytes"],
++            storage_id=value["storage_id"],
++            readonly=value["readonly"],
++            quant=value.get("quant"),
++        )
+ 
+ 
+ @dataclass(frozen=True)
+@@ -382,6 +538,78 @@ class BindingSchema:
+ 
+     def __post_init__(self) -> None:
+         object.__setattr__(self, "aliases", MappingProxyType(dict(self.aliases)))
++        self.validate()
++
++    def validate(self) -> None:
++        """Fail-closed structural validation, including quant linkage (R7).
++
++        Every ``quant.scale_entry`` must resolve to exactly one ``quant_scale``
++        input entry in the same schema; dangling or unreferenced scales are
++        rejected before any kernel or buffer allocation is attempted.
++        """
++
++        if isinstance(self.schema_version, bool) or not isinstance(self.schema_version, int) or self.schema_version <= 0:
++            raise BindingMismatchError("BindingSchema.schema_version must be a positive integer")
++        if not isinstance(self.function_name, str) or not self.function_name:
++            raise BindingMismatchError("BindingSchema.function_name must be a non-empty string")
++        if not isinstance(self.graph_digest, str) or not self.graph_digest:
++            raise BindingMismatchError("BindingSchema.graph_digest must be a non-empty string")
++        seen_names = set()
++        for group_name, entries in (("inputs", self.inputs), ("outputs", self.outputs)):
++            seen_ordinals = set()
++            for entry in entries:
++                if not isinstance(entry, BindingEntry):
++                    raise BindingMismatchError("BindingSchema.{} must contain BindingEntry objects".format(group_name))
++                if entry.name in seen_names:
++                    raise BindingMismatchError("BindingSchema contains duplicate entry name {!r}".format(entry.name))
++                seen_names.add(entry.name)
++                if entry.ordinal in seen_ordinals:
++                    raise BindingMismatchError(
++                        "BindingSchema.{} contains duplicate ordinal {}".format(group_name, entry.ordinal)
++                    )
++                seen_ordinals.add(entry.ordinal)
++        for alias, canonical in self.aliases.items():
++            if not isinstance(alias, str) or not alias:
++                raise BindingMismatchError("BindingSchema.aliases keys must be non-empty strings")
++            if not isinstance(canonical, str) or not canonical:
++                raise BindingMismatchError("BindingSchema.aliases values must be non-empty strings")
++            if alias in seen_names:
++                raise BindingMismatchError("BindingSchema alias {!r} collides with a schema entry".format(alias))
++        scale_entries = {}
++        for entry in self.inputs:
++            if entry.role == QUANT_SCALE_ROLE:
++                scale_entries[entry.name] = entry
++        referenced_scales = set()
++        for entry in self.inputs:
++            if entry.quant is None:
++                continue
++            scale_name = entry.quant["scale_entry"]
++            scale_entry = scale_entries.get(scale_name)
++            if scale_entry is None:
++                raise BindingMismatchError(
++                    "quantized weight {!r} has dangling scale_entry {!r}".format(entry.name, scale_name)
++                )
++            if scale_entry.name in referenced_scales:
++                raise BindingMismatchError(
++                    "quant_scale entry {!r} is referenced by more than one weight".format(scale_entry.name)
++                )
++            referenced_scales.add(scale_entry.name)
++            if scale_entry.shape != (entry.shape[0],):
++                raise BindingMismatchError(
++                    "quant_scale entry {!r} shape {} does not match weight {!r} out channels {}".format(
++                        scale_entry.name, scale_entry.shape, entry.name, entry.shape[0]
++                    )
++                )
++        unreferenced = tuple(sorted(set(scale_entries) - referenced_scales))
++        if unreferenced:
++            raise BindingMismatchError("unreferenced quant_scale entries {}".format(unreferenced))
++        parameter_dtypes = {
++            entry.dtype for entry in self.inputs if entry.role == "parameter" and entry.quant is None
++        }
++        if len(parameter_dtypes) > 1:
++            raise BindingMismatchError(
++                "non-quantized parameters must use one exact dtype; got {}".format(tuple(sorted(parameter_dtypes)))
++            )
+ 
+     @property
+     def runtime_inputs(self) -> Tuple[BindingEntry, ...]:
+@@ -395,6 +623,10 @@ class BindingSchema:
+     def states(self) -> Tuple[BindingEntry, ...]:
+         return tuple(entry for entry in self.inputs if entry.role == "state")
+ 
++    @property
++    def quant_scales(self) -> Tuple[BindingEntry, ...]:
++        return tuple(entry for entry in self.inputs if entry.role == QUANT_SCALE_ROLE)
++
+     @property
+     def state_outputs(self) -> Tuple[BindingEntry, ...]:
+         return tuple(entry for entry in self.outputs if entry.role == "state_output")
+@@ -418,6 +650,7 @@ class BindingSchema:
+             "counts": {
+                 "runtime_inputs": len(self.runtime_inputs),
+                 "parameters": len(self.parameters),
++                "quant_scales": len(self.quant_scales),
+                 "states": len(self.states),
+                 "outputs": len(self.regular_outputs),
+                 "state_outputs": len(self.state_outputs),
+@@ -430,6 +663,42 @@ class BindingSchema:
+     def canonical_json(self) -> str:
+         return _canonical_json(self.to_dict())
+ 
++    @classmethod
++    def from_dict(cls, value: Mapping[str, Any]) -> "BindingSchema":
++        """Deserialize a binding schema, rejecting stale versions fail-closed."""
++
++        if not isinstance(value, Mapping):
++            raise BindingMismatchError("BindingSchema must be a JSON object")
++        required = ("schema_version", "function_name", "graph_digest", "inputs", "outputs", "aliases")
++        missing = [key for key in required if key not in value]
++        if missing:
++            raise BindingMismatchError("BindingSchema is missing fields {}".format(tuple(missing)))
++        unknown = [key for key in value if key not in required + ("counts",)]
++        if unknown:
++            raise BindingMismatchError("BindingSchema contains unknown fields {}".format(tuple(sorted(unknown))))
++        version = value["schema_version"]
++        if version != BINDING_SCHEMA_VERSION:
++            raise BindingMismatchError(
++                "binding schema v{} requires reject_and_recompile; current version is v{}".format(
++                    version, BINDING_SCHEMA_VERSION
++                )
++            )
++        inputs = value["inputs"]
++        outputs = value["outputs"]
++        if not isinstance(inputs, (list, tuple)) or not isinstance(outputs, (list, tuple)):
++            raise BindingMismatchError("BindingSchema.inputs/outputs must be arrays")
++        aliases = value["aliases"]
++        if not isinstance(aliases, Mapping):
++            raise BindingMismatchError("BindingSchema.aliases must be a JSON object")
++        return cls(
++            function_name=value["function_name"],
++            graph_digest=value["graph_digest"],
++            inputs=tuple(BindingEntry.from_dict(entry) for entry in inputs),
++            outputs=tuple(BindingEntry.from_dict(entry) for entry in outputs),
++            aliases=dict(aliases),
++            schema_version=version,
++        )
++
+ 
+ def _as_names(value: Any, field_name: str) -> Tuple[str, ...]:
+     if value is None:
+@@ -470,9 +739,10 @@ def _entry_from_ref(
+     role: str,
+     storage_id: str,
+     readonly: bool,
++    quant: Optional[Mapping[str, Any]] = None,
+ ) -> BindingEntry:
+     dtype, shape, nbytes = _ref_contract(ref)
+-    return BindingEntry(ordinal, ref.name, role, dtype, shape, nbytes, storage_id, readonly)
++    return BindingEntry(ordinal, ref.name, role, dtype, shape, nbytes, storage_id, readonly, quant=quant)
+ 
+ 
+ def _parameter_entry_totals(entries: Sequence[BindingEntry]) -> Tuple[int, int]:
+@@ -508,7 +778,7 @@ def _expected_qwen_parameter_manifest(
+     compact names, storage IDs, counts and aliases.
+     """
+ 
+-    from .qwen35 import QWEN35_08B_SHAPE_METADATA, _decoder_parameter_manifest
++    from .qwen35 import QWEN35_08B_SHAPE_METADATA, _decoder_parameter_manifest, expand_decoder_parameter_manifest
+ 
+     parameters = tuple(parameter_entries)
+     shared = _qwen_entry(parameters, "embedding_lm_head_shared_weight", "parameter")
+@@ -605,34 +875,16 @@ def _expected_qwen_parameter_manifest(
+         "conv_kernel": conv_kernel,
+     }
+     expected_manifest = tuple(_decoder_parameter_manifest(profile, dtype))
++    try:
++        expanded = expand_decoder_parameter_manifest(expected_manifest, full_indices, 24)
++    except ValueError as exc:
++        raise BindingMismatchError("trusted Qwen manifest expansion failed: {}".format(exc)) from exc
+     expected_exact = {}
+-    for compact in expected_manifest:
+-        pattern = compact["name"]
+-        if pattern == "embedding_lm_head_shared_weight":
+-            names = (pattern,)
+-        elif pattern == "final_norm.weight":
+-            names = ("final_norm_weight",)
+-        elif pattern.startswith("layers.full_attention.*."):
+-            suffix = pattern.split("*.", 1)[1].replace(".", "_")
+-            names = tuple("layer_{:02d}_{}".format(index, suffix) for index in full_indices)
+-        elif pattern.startswith("layers.linear_attention.*."):
+-            suffix = pattern.split("*.", 1)[1].replace(".", "_")
+-            names = tuple(
+-                "layer_{:02d}_{}".format(index, suffix)
+-                for index in range(24)
+-                if index not in full_indices
+-            )
+-        elif pattern.startswith("layers.*."):
+-            suffix = pattern.split("*.", 1)[1].replace(".", "_")
+-            names = tuple("layer_{:02d}_{}".format(index, suffix) for index in range(24))
+-        else:
+-            raise BindingMismatchError("trusted Qwen manifest has an unknown compact name {!r}".format(pattern))
+-        if len(names) != compact["count"]:
+-            raise BindingMismatchError("trusted Qwen manifest count is inconsistent for {!r}".format(pattern))
+-        for name in names:
+-            if name in expected_exact:
+-                raise BindingMismatchError("trusted Qwen manifest expands duplicate parameter {!r}".format(name))
+-            expected_exact[name] = (dtype, tuple(compact["shape"]))
++    for exact in expanded:
++        name = exact["name"]
++        if name in expected_exact:
++            raise BindingMismatchError("trusted Qwen manifest expands duplicate parameter {!r}".format(name))
++        expected_exact[name] = (exact["dtype"], tuple(exact["shape"]))
+     actual_exact = {entry.name: (entry.dtype, entry.shape) for entry in parameters}
+     if set(actual_exact) != set(expected_exact):
+         raise BindingMismatchError("exact Core parameter names do not match fixed Qwen topology")
+@@ -826,6 +1078,72 @@ def build_binding_schema(program: CoreProgram, entrypoint: Optional[str] = None)
+     role_by_name.update({name: "runtime" for name in runtime_names})
+     role_by_name.update({name: "state" for name in state_names})
+     role_by_name.update({name: "parameter" for name in parameter_names})
++
++    # W8A8 扩展（契约 §3.2）：metadata 显式登记量化权重与其 scale 条目。
++    # 未登记即保持 BF16 单 dtype 路径；登记后由 BindingSchema.validate() 与
++    # BindingEntry 共同保证“权重 int8 + scale float32 + scale_entry 悬空即拒绝”。
++    quantized_metadata = metadata.get("quantized_parameters")
++    quant_by_name: Dict[str, Mapping[str, Any]] = {}
++    scale_to_weight: Dict[str, str] = {}
++    weight_to_scale: Dict[str, str] = {}
++    quant_aliases: Dict[str, Tuple[str, ...]] = {}
++    if quantized_metadata is not None:
++        if isinstance(quantized_metadata, (str, bytes)):
++            raise BindingMismatchError("quantized_parameters must be a sequence of objects")
++        try:
++            quantized_items = tuple(quantized_metadata)
++        except TypeError as exc:
++            raise BindingMismatchError("quantized_parameters must be a sequence of objects") from exc
++        for index, item in enumerate(quantized_items):
++            context = "quantized_parameters[{}]".format(index)
++            if not isinstance(item, Mapping):
++                raise BindingMismatchError("{} must be a mapping".format(context))
++            allowed_keys = ("name", "scale_entry", "aliases") + QUANT_ENTRY_KEYS
++            unknown_item_keys = [key for key in item if key not in allowed_keys]
++            if unknown_item_keys:
++                raise BindingMismatchError(
++                    "{} contains unknown keys {}".format(context, tuple(sorted(unknown_item_keys)))
++                )
++            name = item.get("name")
++            scale_name = item.get("scale_entry")
++            if not isinstance(name, str) or not name:
++                raise BindingMismatchError("{}.name must be a non-empty string".format(context))
++            if not isinstance(scale_name, str) or not scale_name:
++                raise BindingMismatchError("{}.scale_entry must be a non-empty string".format(context))
++            if name not in exact_set:
++                raise BindingMismatchError("{} {!r} is not an exact function parameter".format(context, name))
++            if scale_name not in exact_set:
++                raise BindingMismatchError("{} scale_entry {!r} is not an exact function parameter".format(context, scale_name))
++            if name in runtime_names or name in state_names or scale_name in runtime_names or scale_name in state_names:
++                raise BindingMismatchError("{} must reference parameter-group entries".format(context))
++            if scale_name == name:
++                raise BindingMismatchError("{} scale_entry must differ from the weight name".format(context))
++            if name in quant_by_name:
++                raise BindingMismatchError("duplicate quantized weight {!r}".format(name))
++            if scale_name in scale_to_weight or scale_name in quant_by_name:
++                raise BindingMismatchError("quant_scale {!r} is reused or overlaps a weight".format(scale_name))
++            if name in scale_to_weight:
++                raise BindingMismatchError("quantized weight {!r} is already used as a scale entry".format(name))
++            raw_quant = {key: item.get(key, _QUANT_DEFAULTS[key]) for key in QUANT_ENTRY_KEYS}
++            raw_quant["scale_entry"] = scale_name
++            quant_by_name[name] = _canonical_quant_entry(raw_quant, context + ".quant")
++            scale_to_weight[scale_name] = name
++            weight_to_scale[name] = scale_name
++            aliases = item.get("aliases", ())
++            if isinstance(aliases, (str, bytes)):
++                raise BindingMismatchError("{}.aliases must be a sequence of names".format(context))
++            alias_values = tuple(aliases)
++            for alias in alias_values:
++                if not isinstance(alias, str) or not alias:
++                    raise BindingMismatchError("{}.aliases must contain non-empty strings".format(context))
++            if alias_values:
++                quant_aliases[name] = alias_values
++    for scale_name, weight_name in scale_to_weight.items():
++        if weight_name not in parameter_names or scale_name not in parameter_names:
++            raise BindingMismatchError(
++                "quantized weight/scale must be listed in parameter_function_inputs or the exact remainder"
++            )
++        role_by_name[scale_name] = QUANT_SCALE_ROLE
+     if set(role_by_name) != exact_set or len(role_by_name) != len(exact_names):
+         raise BindingMismatchError("function parameters are not partitioned exactly into runtime/parameter/state")
+ 
+@@ -840,15 +1158,24 @@ def build_binding_schema(program: CoreProgram, entrypoint: Optional[str] = None)
+     entries = []
+     for ordinal, ref in enumerate(function.parameters):
+         role = role_by_name[ref.name]
++        quant = quant_by_name.get(ref.name)
+         if role == "runtime":
+             storage_id = "runtime:" + ref.name
+         elif role == "state":
+             storage_id = "state:" + ref.name
++        elif role == QUANT_SCALE_ROLE:
++            storage_id = "parameter:" + scale_to_weight[ref.name] + ".scale"
++        elif quant is not None:
++            if tied_name == ref.name and tied_storage:
++                raise BindingMismatchError(
++                    "quantized tied weight {!r} requires the section 3.4 dual-packing path".format(ref.name)
++                )
++            storage_id = "parameter:" + ref.name + ".int8"
+         elif tied_name == ref.name and tied_storage:
+             storage_id = tied_storage
+         else:
+             storage_id = "parameter:" + ref.name
+-        entries.append(_entry_from_ref(ref, ordinal, role, storage_id, True))
++        entries.append(_entry_from_ref(ref, ordinal, role, storage_id, True, quant=quant))
+ 
+         contract = _metadata_ref(metadata, ref.name)
+         if contract is not None:
+@@ -907,6 +1234,15 @@ def build_binding_schema(program: CoreProgram, entrypoint: Optional[str] = None)
+             if alias in aliases:
+                 raise BindingMismatchError("duplicate tied weight alias {!r}".format(alias))
+             aliases[alias] = tied_name
++    for weight_name, weight_aliases in quant_aliases.items():
++        for alias in weight_aliases:
++            for suffix, target in ((".qweight", weight_name), (".scales", weight_to_scale[weight_name])):
++                alias_name = alias + suffix
++                if alias_name in exact_set:
++                    raise BindingMismatchError("quant alias {!r} collides with an exact parameter".format(alias_name))
++                if alias_name in aliases:
++                    raise BindingMismatchError("duplicate quant alias {!r}".format(alias_name))
++                aliases[alias_name] = target
+ 
+     if graph_kind == "text_decoder_full_no_weight":
+         counts = (len(runtime_names), len(parameter_names), len(state_names))
+@@ -996,19 +1332,34 @@ def _align_up(value: int, alignment: int) -> int:
+ 
+ 
+ def build_packed_layout(schema: BindingSchema, alignment: int = DEFAULT_PACK_ALIGNMENT) -> PackedLayout:
+-    """Compute parameter/state offsets only; never allocate backing storage."""
++    """Compute parameter/state offsets only; never allocate backing storage.
++
++    Version 2 keeps the BF16 layout byte-identical (each non-quantized entry
++    contributes exactly one region) and expands each quantized weight into the
++    two regions frozen in contract §3.1: ``<param>.int8`` (role
++    ``quant_weight``) plus its ``quant_scale`` entry (role ``quant_scale``).
++    A v1 schema handed to this builder is rejected with an explicit
++    ``reject_and_recompile`` message.
++    """
+ 
+     if not isinstance(schema, BindingSchema):
+         raise RuntimeBindingError("schema must be BindingSchema")
++    if schema.schema_version != BINDING_SCHEMA_VERSION:
++        raise BindingMismatchError(
++            "packed layout v{} requires binding schema v{}; got v{} -> reject_and_recompile".format(
++                PACKED_LAYOUT_VERSION, BINDING_SCHEMA_VERSION, schema.schema_version
++            )
++        )
+     normalized_alignment = _positive_alignment(alignment)
+     offset = 0
+     regions = []
+     by_storage = {}
+     aliases_by_name = dict(schema.aliases)
+-    for entry in schema.parameters + schema.states:
++    for entry in schema.parameters + schema.quant_scales + schema.states:
++        region_role = QUANT_WEIGHT_REGION_ROLE if entry.quant is not None else entry.role
+         existing = by_storage.get(entry.storage_id)
+         if existing is not None:
+-            if existing.role != entry.role or existing.dtype != entry.dtype or existing.shape != entry.shape:
++            if existing.role != region_role or existing.dtype != entry.dtype or existing.shape != entry.shape:
+                 raise BindingMismatchError("storage_id {!r} is reused with incompatible contracts".format(entry.storage_id))
+             names = tuple(existing.logical_names) + (entry.name,)
+             replacement = PackedRegion(
+@@ -1027,7 +1378,7 @@ def build_packed_layout(schema: BindingSchema, alignment: int = DEFAULT_PACK_ALI
+         offset = _align_up(offset, normalized_alignment)
+         region = PackedRegion(
+             entry.storage_id,
+-            entry.role,
++            region_role,
+             entry.dtype,
+             entry.shape,
+             entry.nbytes,
+@@ -1077,7 +1428,7 @@ def bind_packed_region(
+ 
+     region = layout.region_for(logical_name)
+     if readonly is None:
+-        readonly = region.role in ("parameter", "state")
++        readonly = region.role in ("parameter", "state", QUANT_WEIGHT_REGION_ROLE, QUANT_SCALE_ROLE)
+     return BufferBinding.from_buffer(
+         buffer,
+         region.storage_id,
+@@ -1154,16 +1505,26 @@ def ordered_input_descriptors(
+     *,
+     device: str = "cpu",
+ ) -> Tuple[TensorDesc, ...]:
+-    """Validate groups and assemble descriptors in exact Core parameter order."""
++    """Validate groups and assemble descriptors in exact Core parameter order.
++
++    ``quant_scale`` entries are parameters in the Core function signature, so
++    they are normalized together with the parameter group; the returned
++    descriptors still follow the exact ordered ``schema.inputs`` tuple.
++    """
+ 
+     runtime = _normalize_bindings(schema, runtime_bindings, schema.runtime_inputs, "runtime")
+     parameters = _normalize_bindings(
+-        schema, parameter_bindings, schema.parameters, "parameter", allow_aliases=True
++        schema,
++        parameter_bindings,
++        schema.parameters + schema.quant_scales,
++        "parameter",
++        allow_aliases=True,
+     )
+     states = _normalize_bindings(schema, state_bindings, schema.states, "state")
+     result = []
++    by_role = {"runtime": runtime, "parameter": parameters, QUANT_SCALE_ROLE: parameters, "state": states}
+     for entry in schema.inputs:
+-        binding = {"runtime": runtime, "parameter": parameters, "state": states}[entry.role][entry.name]
++        binding = by_role[entry.role][entry.name]
+         result.append(binding.to_tensor_desc(device=device))
+     return tuple(result)
+ 
+@@ -1243,6 +1604,12 @@ __all__ = [
+     "PACKED_LAYOUT_VERSION",
+     "PackedLayout",
+     "PackedRegion",
++    "QUANT_ENTRY_KEYS",
++    "QUANT_SCALE_DTYPE",
++    "QUANT_SCALE_ROLE",
++    "QUANT_SCHEME_NAME",
++    "QUANT_WEIGHT_DTYPE",
++    "QUANT_WEIGHT_REGION_ROLE",
+     "RuntimeBindingError",
+     "UINT64_MAX",
+     "assemble_launch_request",
+diff --git a/python/tests/ut/pypto_x/qwen35_w8a8_binding_driver.py b/python/tests/ut/pypto_x/qwen35_w8a8_binding_driver.py
+new file mode 100644
+index 000000000..a41e8c053
+--- /dev/null
++++ b/python/tests/ut/pypto_x/qwen35_w8a8_binding_driver.py
+@@ -0,0 +1,263 @@
++"""W8A8 binding v2 / packed layout v2 metadata-only driver（R7–R9 证据）。
++
++驱动只展开 0.8B 的**符号**参数 manifest 并计算 region 计数与偏移：不打开任何
++checkpoint、不加载权重、不分配参数/state 存储。默认 150 个量化线性层按
++契约 §3.1 每个占 2 个 region，期望 region 数为 **518**。
++
++用法::
++
++    python3 qwen35_w8a8_binding_driver.py --output <path.json>
++
++生产环境的真实 0.8B graph metadata 体量较大，R8 证据通过
++``run_local_heavy.sh`` 运行本驱动；单元测试可只调用
++``build_default_w8a8_schema`` / ``collect_driver_result``（纯 metadata，轻）。
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++from pathlib import Path
++from typing import Any, Dict, List, Mapping, Sequence, Tuple
++
++from pypto.portable.qwen35 import QWEN35_08B_SHAPE_METADATA, qwen35_decoder_exact_parameter_manifest
++from pypto.portable.qwen35_w8a8_coverage import (
++    build_qwen35_w8a8_coverage_manifest,
++    qwen35_default_quantized_linear_names,
++)
++from pypto.portable.runtime_binding import (
++    BINDING_SCHEMA_VERSION,
++    PACKED_LAYOUT_VERSION,
++    QUANT_SCALE_ROLE,
++    QUANT_SCHEME_NAME,
++    QUANT_WEIGHT_REGION_ROLE,
++    BindingEntry,
++    BindingMismatchError,
++    BindingSchema,
++    build_packed_layout,
++)
++
++_ITEMSIZE = {"bool": 1, "int8": 1, "int16": 2, "int32": 4, "int64": 8, "bf16": 2, "float32": 4}
++
++
++def _nbytes(dtype: str, shape: Sequence[int]) -> int:
++    elements = 1
++    for dimension in shape:
++        elements *= int(dimension)
++    return elements * _ITEMSIZE[dtype]
++
++
++def _quant_mapping(scale_entry: str) -> Mapping[str, Any]:
++    return {
++        "scheme": QUANT_SCHEME_NAME,
++        "signed": True,
++        "bits": 8,
++        "axis": 0,
++        "granularity": "per_output_channel",
++        "scale_dtype": "float32",
++        "zero_point": 0,
++        "scale_entry": scale_entry,
++        "group_size": None,
++    }
++
++
++def _runtime_entries(batch: int = 1, steps: int = 1, query_heads: int = 8) -> Tuple[Tuple[str, str, Tuple[int, ...]], ...]:
++    rotary_dim = int(QWEN35_08B_SHAPE_METADATA["rotary_dim"])
++    return (
++        ("input_ids", "int64", (batch, steps)),
++        ("cos", "bf16", (batch, query_heads, steps, rotary_dim)),
++        ("sin", "bf16", (batch, query_heads, steps, rotary_dim)),
++    )
++
++
++def build_default_w8a8_schema(*, past_length: int = 1, batch: int = 1, steps: int = 1) -> BindingSchema:
++    """构造默认 W8A8（150 线性层）精确 binding schema（纯 metadata）。"""
++
++    model = QWEN35_08B_SHAPE_METADATA
++    exact_entries = qwen35_decoder_exact_parameter_manifest()
++    quantized_names = set(qwen35_default_quantized_linear_names(exact_entries))
++    full_indices = set(model["full_attention_indices_zero_based"])
++    nk = int(model["linear_num_key_heads"])
++    nv = int(model["linear_num_value_heads"])
++    dk = int(model["linear_key_head_dim"])
++    dv = int(model["linear_value_head_dim"])
++    conv_channels = 2 * nk * dk + nv * dv
++    conv_kernel = int(model["linear_conv_kernel_dim"])
++    kvh = int(model["num_key_value_heads"])
++    head_dim = int(model["head_dim"])
++
++    inputs: List[BindingEntry] = []
++    ordinal = 0
++    for name, dtype, shape in _runtime_entries(batch, steps):
++        inputs.append(BindingEntry(ordinal, name, "runtime", dtype, shape, _nbytes(dtype, shape), "runtime:" + name, True))
++        ordinal += 1
++    for entry in exact_entries:
++        name = str(entry["name"])
++        shape = tuple(int(dimension) for dimension in entry["shape"])
++        if name in quantized_names:
++            scale_name = name + "_scale"
++            inputs.append(
++                BindingEntry(
++                    ordinal,
++                    name,
++                    "parameter",
++                    "int8",
++                    shape,
++                    _nbytes("int8", shape),
++                    "parameter:" + name + ".int8",
++                    True,
++                    quant=_quant_mapping(scale_name),
++                )
++            )
++            ordinal += 1
++            scale_shape = (shape[0],)
++            inputs.append(
++                BindingEntry(
++                    ordinal,
++                    scale_name,
++                    QUANT_SCALE_ROLE,
++                    "float32",
++                    scale_shape,
++                    _nbytes("float32", scale_shape),
++                    "parameter:" + name + ".scale",
++                    True,
++                )
++            )
++            ordinal += 1
++        else:
++            inputs.append(
++                BindingEntry(
++                    ordinal,
++                    name,
++                    "parameter",
++                    entry["dtype"],
++                    shape,
++                    _nbytes(entry["dtype"], shape),
++                    "parameter:" + name,
++                    True,
++                )
++            )
++            ordinal += 1
++    for index in range(int(model["num_hidden_layers"])):
++        prefix = "layer_{:02d}".format(index)
++        if index in full_indices:
++            for suffix in ("prior_k", "prior_v"):
++                name = "{}_{}".format(prefix, suffix)
++                shape = (batch, kvh, past_length, head_dim)
++                inputs.append(
++                    BindingEntry(ordinal, name, "state", "bf16", shape, _nbytes("bf16", shape), "state:" + name, True)
++                )
++                ordinal += 1
++        else:
++            name = prefix + "_conv_state_in"
++            shape = (batch, conv_channels, conv_kernel)
++            inputs.append(
++                BindingEntry(ordinal, name, "state", "bf16", shape, _nbytes("bf16", shape), "state:" + name, True)
++            )
++            ordinal += 1
++            name = prefix + "_recurrent_state_in"
++            shape = (batch, nv, dk, dv)
++            inputs.append(
++                BindingEntry(
++                    ordinal, name, "state", "float32", shape, _nbytes("float32", shape), "state:" + name, True
++                )
++            )
++            ordinal += 1
++
++    digest = hashlib.sha256(
++        json.dumps(
++            {"graph_kind": "qwen35_text_decoder_w8a8", "quantized": sorted(quantized_names), "past_length": past_length},
++            sort_keys=True,
++            separators=(",", ":"),
++        ).encode("utf-8")
++    ).hexdigest()
++    return BindingSchema(
++        function_name="qwen35_text_decoder_w8a8_metadata_only",
++        graph_digest=digest,
++        inputs=tuple(inputs),
++        outputs=(),
++        aliases={},
++    )
++
++
++def _v1_rejection_probe(schema: BindingSchema) -> Dict[str, Any]:
++    v1 = BindingSchema(
++        function_name=schema.function_name,
++        graph_digest=schema.graph_digest,
++        inputs=schema.inputs,
++        outputs=schema.outputs,
++        aliases=dict(schema.aliases),
++        schema_version=1,
++    )
++    try:
++        build_packed_layout(v1)
++    except BindingMismatchError as exc:
++        message = str(exc)
++        return {"rejected": True, "message": message, "mentions_reject_and_recompile": "reject_and_recompile" in message}
++    return {"rejected": False, "message": "", "mentions_reject_and_recompile": False}
++
++
++def collect_driver_result(*, past_length: int = 1) -> Dict[str, Any]:
++    """收集 R7–R9 的 metadata-only 证据（不写文件、不分配存储）。"""
++
++    schema = build_default_w8a8_schema(past_length=past_length)
++    layout = build_packed_layout(schema)
++    coverage = build_qwen35_w8a8_coverage_manifest(qwen35_decoder_exact_parameter_manifest())
++    quant_regions = [region for region in layout.regions if region.role == QUANT_WEIGHT_REGION_ROLE]
++    scale_regions = [region for region in layout.regions if region.role == QUANT_SCALE_ROLE]
++    parameter_regions = [region for region in layout.regions if region.role == "parameter"]
++    state_regions = [region for region in layout.regions if region.role == "state"]
++    return {
++        "status": "PASS",
++        "weights_loaded": False,
++        "buffers_allocated": False,
++        "schema_version": schema.schema_version,
++        "layout_version": layout.layout_version,
++        "expected_schema_version": BINDING_SCHEMA_VERSION,
++        "expected_layout_version": PACKED_LAYOUT_VERSION,
++        "counts": {
++            "runtime_inputs": len(schema.runtime_inputs),
++            "parameters": len(schema.parameters),
++            "quant_scales": len(schema.quant_scales),
++            "states": len(schema.states),
++            "quant_weight_regions": len(quant_regions),
++            "quant_scale_regions": len(scale_regions),
++            "parameter_regions": len(parameter_regions),
++            "state_regions": len(state_regions),
++            "packed_region_count": len(layout.regions),
++        },
++        "packed_region_count_expected": 518,
++        "packed_region_count_formula": "368 - 150 + 150*2",
++        "packed_region_count_matches": len(layout.regions) == 518,
++        "packed_total_nbytes": layout.total_nbytes,
++        "packed_alignment": layout.alignment,
++        "quant_weight_region_example": (
++            quant_regions[0].to_dict() if quant_regions else None
++        ),
++        "quant_scale_region_example": (scale_regions[0].to_dict() if scale_regions else None),
++        "v1_rejection": _v1_rejection_probe(schema),
++        "coverage_manifest": coverage.to_dict(),
++        "coverage_manifest_summary": {
++            "w8a8_linear_coverage": coverage.w8a8_linear_coverage,
++            "whole_net_int8_compute_ratio": coverage.whole_net_int8_compute_ratio,
++            "quantized_linear_tensor_count": coverage.quantized_linear_tensor_count,
++            "total_linear_tensor_count": coverage.total_linear_tensor_count,
++        },
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--past-length", type=int, default=1)
++    args = parser.parse_args()
++    result = collect_driver_result(past_length=args.past_length)
++    output = Path(args.output)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    output.write_text(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
++    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/tests/ut/pypto_x/test_w8a8_binding.py b/python/tests/ut/pypto_x/test_w8a8_binding.py
+new file mode 100644
+index 000000000..489f88f84
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_w8a8_binding.py
+@@ -0,0 +1,317 @@
++"""W8A8 binding schema v2 / packed layout v2 / coverage manifest 测试（R7–R9）。
++
++精确命令：
++
++``PYTHONPATH=python python3 -m pytest -q --confcutdir=python/tests/ut/pypto_x python/tests/ut/pypto_x/test_w8a8_binding.py``
++"""
++
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++
++import pytest
++
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.portable.qwen35 import build_qwen35_text_decoder_graph, qwen35_decoder_exact_parameter_manifest
++from pypto.portable.runtime_binding import (
++    BINDING_SCHEMA_VERSION,
++    PACKED_LAYOUT_VERSION,
++    QUANT_SCALE_ROLE,
++    QUANT_WEIGHT_REGION_ROLE,
++    BindingMismatchError,
++    BindingSchema,
++    bind_packed_region,
++    build_binding_schema,
++    build_packed_layout,
++)
++from pypto.portable.qwen35_w8a8_coverage import (
++    QUANTIZED_LINEAR_COVERAGE_FIELD,
++    WHOLE_NET_INT8_COMPUTE_RATIO_FIELD,
++    build_qwen35_w8a8_coverage_manifest,
++    qwen35_default_quantized_linear_names,
++    qwen35_linear_parameter_names,
++)
++
++
++DRIVER_PATH = Path(__file__).with_name("qwen35_w8a8_binding_driver.py")
++
++
++def _load_driver():
++    spec = importlib.util.spec_from_file_location("qwen35_w8a8_binding_driver", DRIVER_PATH)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++driver = _load_driver()
++
++
++def _quant_program(*, weight_dtype="int8", granularity="per_output_channel", scale_shape=(2,), scale_entry="layer_weight_scale"):
++    activation = ValueRef("activation", CoreType.tensor("int8", (2, 3)))
++    weight = ValueRef("layer_weight", CoreType.tensor(weight_dtype, (2, 3)))
++    scale = ValueRef("layer_weight_scale", CoreType.tensor("float32", tuple(scale_shape)))
++    output = ValueRef("qmatmul_out", CoreType.tensor("int32", (2, 2)))
++    body = Region((Operation("qmatmul_s8s8_s32", inputs=(activation, weight), outputs=(output,)),))
++    function = CoreFunction(
++        "qmatmul_demo",
++        parameters=(activation, weight, scale),
++        returns=(output,),
++        body=body,
++    )
++    metadata = {
++        "runtime_inputs": [{"name": "activation", "shape": [2, 3], "dtype": "int8"}],
++        "state_input_names": [],
++        "parameter_function_inputs": ["layer_weight", "layer_weight_scale"],
++        "quantized_parameters": [
++            {
++                "name": "layer_weight",
++                "scale_entry": scale_entry,
++                "granularity": granularity,
++                "group_size": 64 if granularity == "per_group" else None,
++                "aliases": ["demo.weight"],
++            }
++        ],
++    }
++    return CoreProgram(functions=(function,), metadata=metadata)
++
++
++def _quant_schema():
++    return build_binding_schema(_quant_program())
++
++
++# ------------------------------------------------------------------ R7
++
++
++def test_r7_quantized_schema_has_weight_scale_and_aliases():
++    schema = _quant_schema()
++    assert schema.schema_version == BINDING_SCHEMA_VERSION == 2
++    assert len(schema.parameters) == 1
++    assert len(schema.quant_scales) == 1
++    weight = schema.entry_for("layer_weight")
++    scale = schema.entry_for("layer_weight_scale")
++    assert weight.dtype == "int8"
++    assert weight.shape == (2, 3)
++    assert weight.storage_id == "parameter:layer_weight.int8"
++    assert dict(weight.quant) == {
++        "scheme": "w8a8_linear",
++        "signed": True,
++        "bits": 8,
++        "axis": 0,
++        "granularity": "per_output_channel",
++        "scale_dtype": "float32",
++        "zero_point": 0,
++        "scale_entry": "layer_weight_scale",
++        "group_size": None,
++    }
++    assert scale.role == QUANT_SCALE_ROLE
++    assert scale.dtype == "float32"
++    assert scale.shape == (2,)
++    assert scale.storage_id == "parameter:layer_weight.scale"
++    assert schema.entry_for("demo.weight.qweight") is weight
++    assert schema.entry_for("demo.weight.scales") is scale
++    # to_dict/from_dict 往返（含 quant）。
++    assert BindingSchema.from_dict(schema.to_dict()) == schema
++    assert BindingSchema.from_dict(schema.to_dict()).canonical_json() == schema.canonical_json()
++
++
++def test_r7_dangling_scale_entry_is_rejected():
++    payload = _quant_schema().to_dict()
++    # 篡改 1：scale 条目被改名，权重的 scale_entry 成为悬空引用。
++    payload["inputs"][2]["name"] = "ghost_scale"
++    with pytest.raises(BindingMismatchError):
++        BindingSchema.from_dict(payload)
++    payload = _quant_schema().to_dict()
++    # 篡改 2：scale_entry 指向不存在的条目。
++    payload["inputs"][1]["quant"]["scale_entry"] = "ghost_scale"
++    with pytest.raises(BindingMismatchError):
++        BindingSchema.from_dict(payload)
++    # 篡改 3：quant 增加未知键（物理 packing 不得进入公共 schema）。
++    payload = _quant_schema().to_dict()
++    payload["inputs"][1]["quant"]["physical_packing"] = "vnni"
++    with pytest.raises(BindingMismatchError):
++        BindingSchema.from_dict(payload)
++    # 篡改 4：scale 条目被删除。
++    payload = _quant_schema().to_dict()
++    payload["inputs"] = [payload["inputs"][0], payload["inputs"][1]]
++    with pytest.raises(BindingMismatchError):
++        BindingSchema.from_dict(payload)
++
++
++def test_r7_unreferenced_scale_and_wrong_shape_are_rejected():
++    payload = _quant_schema().to_dict()
++    payload["inputs"][1]["quant"]["scale_entry"] = "layer_weight_scale"
++    payload["inputs"].append(
++        {
++            "ordinal": 3,
++            "name": "extra_scale",
++            "role": QUANT_SCALE_ROLE,
++            "dtype": "float32",
++            "shape": [2],
++            "nbytes": 8,
++            "storage_id": "parameter:extra.scale",
++            "readonly": True,
++        }
++    )
++    with pytest.raises(BindingMismatchError):
++        BindingSchema.from_dict(payload)
++    with pytest.raises(BindingMismatchError):
++        build_binding_schema(_quant_program(scale_shape=(3,)))
++
++
++def test_r7_quant_weight_dtype_and_per_group_fail_closed():
++    with pytest.raises(BindingMismatchError):
++        build_binding_schema(_quant_program(weight_dtype="bf16"))
++    with pytest.raises(BindingMismatchError):
++        build_binding_schema(_quant_program(granularity="per_group"))
++    with pytest.raises(BindingMismatchError):
++        payload = _quant_schema().to_dict()
++        payload["inputs"][0]["quantified"] = True
++        BindingSchema.from_dict(payload)
++
++
++def test_r7_quantized_descriptor_assembly_is_zero_copy():
++    from pypto.portable.runtime_binding import BufferBinding, ordered_input_descriptors
++
++    schema = _quant_schema()
++    layout = build_packed_layout(schema)
++    packed = bytearray(layout.total_nbytes)
++    runtime = {
++        entry.name: BufferBinding.from_buffer(
++            bytearray(entry.nbytes), entry.storage_id, entry.dtype, entry.shape, readonly=True
++        )
++        for entry in schema.runtime_inputs
++    }
++    parameters = {
++        entry.name: bind_packed_region(layout, entry.name, packed)
++        for entry in schema.parameters + schema.quant_scales
++    }
++    descriptors = ordered_input_descriptors(schema, runtime, parameters, {})
++    assert [descriptor.dtype for descriptor in descriptors] == ["int8", "int8", "float32"]
++    assert descriptors[1].handle is not None
++
++
++def test_r7_quantized_metadata_unknown_keys_are_rejected():
++    program = _quant_program()
++    metadata = dict(program.metadata)
++    metadata["quantized_parameters"] = [
++        dict(metadata["quantized_parameters"][0], physical_packing="vnni")
++    ]
++    with pytest.raises(BindingMismatchError):
++        build_binding_schema(CoreProgram(functions=program.functions, metadata=metadata))
++
++
++def test_r7_schema_version_1_is_rejected():
++    payload = _quant_schema().to_dict()
++    payload["schema_version"] = 1
++    with pytest.raises(BindingMismatchError, match="reject_and_recompile"):
++        BindingSchema.from_dict(payload)
++    v1 = BindingSchema(
++        function_name=_quant_schema().function_name,
++        graph_digest=_quant_schema().graph_digest,
++        inputs=_quant_schema().inputs,
++        outputs=_quant_schema().outputs,
++        aliases={},
++        schema_version=1,
++    )
++    with pytest.raises(BindingMismatchError, match="reject_and_recompile"):
++        build_packed_layout(v1)
++
++
++# ------------------------------------------------------------------ R8
++
++
++def test_r8_quantized_packed_layout_expands_to_two_regions():
++    schema = _quant_schema()
++    layout = build_packed_layout(schema)
++    assert layout.layout_version == PACKED_LAYOUT_VERSION == 2
++    assert [region.role for region in layout.regions] == [QUANT_WEIGHT_REGION_ROLE, QUANT_SCALE_ROLE]
++    weight_region, scale_region = layout.regions
++    assert weight_region.storage_id == "parameter:layer_weight.int8"
++    assert weight_region.dtype == "int8"
++    assert weight_region.shape == (2, 3)
++    assert weight_region.nbytes == 6
++    assert scale_region.storage_id == "parameter:layer_weight.scale"
++    assert scale_region.dtype == "float32"
++    assert scale_region.shape == (2,)
++    assert scale_region.nbytes == 8
++    assert weight_region.offset == 0
++    assert scale_region.offset == 64
++    assert weight_region.alignment == scale_region.alignment == 64
++    assert layout.region_for("layer_weight") is weight_region
++    assert layout.region_for("demo.weight.qweight") is weight_region
++    assert layout.region_for("layer_weight_scale") is scale_region
++    assert layout.region_for("demo.weight.scales") is scale_region
++    assert layout.total_nbytes == 64 + 8
++    # metadata-only 绑定：只切片已有 buffer，不分配、不拷贝。
++    packed = bytearray(layout.total_nbytes)
++    binding = bind_packed_region(layout, "layer_weight", packed)
++    assert binding.storage_id == "parameter:layer_weight.int8"
++    assert binding.dtype == "int8"
++    assert binding.byte_offset == 0
++    assert binding.nbytes == 6
++    assert binding.readonly is True
++    scale_binding = bind_packed_region(layout, "layer_weight_scale", packed)
++    assert scale_binding.readonly is True
++    assert scale_binding.byte_offset == 64
++
++
++def test_r8_bf16_path_is_byte_identical_368_regions():
++    bf16_schema = build_binding_schema(build_qwen35_text_decoder_graph(1, 1, shape_profile="synthetic_test"))
++    assert bf16_schema.schema_version == 2
++    assert len(bf16_schema.quant_scales) == 0
++    bf16_layout = build_packed_layout(bf16_schema)
++    assert bf16_layout.layout_version == 2
++    assert len(bf16_layout.regions) == 368
++    assert {region.role for region in bf16_layout.regions} == {"parameter", "state"}
++    assert all("quant" not in entry.to_dict() for entry in bf16_schema.inputs)
++
++
++def test_r8_default_qwen_w8a8_layout_has_518_regions_metadata_only():
++    result = driver.collect_driver_result()
++    assert result["weights_loaded"] is False
++    assert result["buffers_allocated"] is False
++    assert result["schema_version"] == 2
++    assert result["layout_version"] == 2
++    assert result["counts"]["parameters"] == 320
++    assert result["counts"]["quant_scales"] == 150
++    assert result["counts"]["states"] == 48
++    assert result["counts"]["quant_weight_regions"] == 150
++    assert result["counts"]["quant_scale_regions"] == 150
++    assert result["counts"]["packed_region_count"] == 518
++    assert result["packed_region_count_matches"] is True
++    assert result["v1_rejection"] == {
++        "rejected": True,
++        "message": "packed layout v2 requires binding schema v2; got v1 -> reject_and_recompile",
++        "mentions_reject_and_recompile": True,
++    }
++
++
++# ------------------------------------------------------------------ R9
++
++
++def test_r9_coverage_manifest_fields_exist_and_are_nonzero():
++    exact_entries = qwen35_decoder_exact_parameter_manifest()
++    linear = qwen35_linear_parameter_names(exact_entries)
++    quantized = qwen35_default_quantized_linear_names(exact_entries)
++    assert len(linear) == 186
++    assert len(quantized) == 150
++    manifest = build_qwen35_w8a8_coverage_manifest(exact_entries)
++    payload = manifest.to_dict()
++    assert QUANTIZED_LINEAR_COVERAGE_FIELD in payload
++    assert WHOLE_NET_INT8_COMPUTE_RATIO_FIELD in payload
++    assert payload[QUANTIZED_LINEAR_COVERAGE_FIELD] > 0.0
++    assert payload[WHOLE_NET_INT8_COMPUTE_RATIO_FIELD] > 0.0
++    assert payload[QUANTIZED_LINEAR_COVERAGE_FIELD] <= 1.0
++    assert payload[WHOLE_NET_INT8_COMPUTE_RATIO_FIELD] < 1.0
++    assert manifest.quantized_linear_tensor_count == 150
++    assert manifest.total_linear_tensor_count == 186
++    assert manifest.int8_macs_per_forward > 0
++    assert manifest.total_macs_per_forward > manifest.int8_macs_per_forward
++    assert "in_proj_b" in " ".join(manifest.bf16_island_names)
++    manifest.assert_nonzero()
++    # 字段必须真实来自 manifest 断言（默认 150/186 与参数量加权）。
++    assert payload[QUANTIZED_LINEAR_COVERAGE_FIELD] == pytest.approx(
++        manifest.quantized_linear_parameter_elements / manifest.total_linear_parameter_elements
++    )
++    assert manifest.w8a8_linear_tensor_coverage == pytest.approx(150 / 186)
