@@ -13,9 +13,9 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W5_AMDGPU_GFX1036_STATIC_C1_COMPLETE_C2_READY_W6_M1K_COMPLETE`。
+- 当前状态是 `EXECUTION_W5_AMDGPU_GFX1036_STATIC_C2_COMPLETE_C3_READY_W6_M1K_COMPLETE`。
 - Qwen3.5-0.8B M0–M1K 已完成并冻结；M1I 是24层无权重 decoder，M1J 是3/320/48 external buffer binding，M1K 已让 scalar、AVX2/AVX-512、SVE256 与 CUDA 正确摄取 typed byte views。SVE 部分复合路径仍有 host-reference fallback，真实带权整网仍未执行。
-- Qwen BF16 下一阶段需要用户明确授权下载/加载权重；当前 AMD `amd-igpu-gfx1036` 静态 C1 已支持 identity/add/mul/full reduce-sum/rank-2 matmul 的真实 LLVM/AMDGPU object codegen，Qwen 静态覆盖844/4,532 ops。下一步扩展 C2 layout/indexing/control；WSL 运行态保持 `BLOCKED_DEVICE`，不得伪造真机 PASS。
+- Qwen BF16 下一阶段需要用户明确授权下载/加载权重；AMD `amd-igpu-gfx1036` 静态 C2 已覆盖 layout/indexing/control，Qwen 静态覆盖4,098/4,532 ops。下一步 C3 闭包 math、通用 reduction 与 batched matmul；WSL 运行态保持 `BLOCKED_DEVICE`，静态完整 lowering 也不得表述为真机 PASS。
 
 ## Git 与目录
 

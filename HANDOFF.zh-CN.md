@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`EXECUTION_W5_AMDGPU_GFX1036_STATIC_C1_COMPLETE_C2_READY_W6_M1K_COMPLETE`
+状态：`EXECUTION_W5_AMDGPU_GFX1036_STATIC_C2_COMPLETE_C3_READY_W6_M1K_COMPLETE`
 
-最后更新：2026-09-10 11:47 CST（Asia/Shanghai）
+最后更新：2026-09-10 13:34 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -16,7 +16,7 @@
 - AMD GPU：GPU 公共层 → HIP/ROCDL；
 - 现有 Ascend CCE 路径保持为一个 target plugin，并避免功能回退。
 
-目前已完成 W1/W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2、Qwen3.5-0.8B M0–M1K，以及 AMD `gfx1036` 静态 C1。AMDGPU C1 在 exact HEAD `e6e8360702d39da9f11e6352b94714c6ed23901a` 上为 identity/add/mul/full reduce-sum/rank-2 matmul 生成真实 `llvm.amdgcn` IR、assembly 与 ELF object；独立验收 `538 passed, 7 skipped`。Qwen真实 profile 的4,532个Core operations中844个满足当前 exact-shape C1 contract，3,688个明确列为 gap；没有生成整网 kernel或冒充运行。GamePC WSL仍无 `/dev/kfd`/ROCm/HIP，runtime为 `BLOCKED_DEVICE`。下一步扩展静态 C2 layout/indexing/control；Qwen带权执行仍需用户授权。
+目前已完成 W1/W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2、Qwen3.5-0.8B M0–M1K，以及 AMD `gfx1036` 静态 C1–C2。C2 在 exact HEAD `45e8459e79ea979beb58661eb77b30a50f133f75` 上闭包 cast、layout、indexing、concat/split、iota/compare/where 等18类静态 LLVM/ELF，独立验收 `557 passed, 7 skipped`，23/23 artifact tamper拒绝。Qwen真实 profile 的4,532个Core operations中4,098个可完整进入当前静态compiler，剩余434个为math、通用reduction和batched matmul；没有生成整网object或冒充HIP运行。下一步C3闭包剩余静态lowering；GamePC runtime仍为 `BLOCKED_DEVICE`，Qwen带权执行仍需授权。
 
 ## 2. 已经确定的技术决策
 
@@ -65,7 +65,7 @@ upstream/                         # 五个嵌套 Git 仓库
 ```text
 branch = master
 HEAD   = 34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad
-linked worktree 数 = 56（基线、integration、既有调研/W1-W5、Qwen M1A–M1K、recovery、probe 与独立验收 worktree）
+linked worktree 数 = 59（基线、integration、既有调研/W1-W5、Qwen M1A–M1K、recovery、probe 与独立验收 worktree）
 工作树 = clean
 ```
 
@@ -192,7 +192,7 @@ W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2、W6 M0–M1K 与 AVX2/AV
 ```text
 W3 parity: AVX2/AVX-512 Qwen M1A–M1H（完成）
 W4 CUDA: C2 correctness 已完成 → 后续性能/fusion
-W5: `amd-igpu-gfx1036` 静态 C1（完成）→ C2 layout/indexing/control；HIP runtime `BLOCKED_DEVICE`
+W5: `amd-igpu-gfx1036` 静态 C1/C2（完成）→ C3 math/reduction/batched matmul；HIP runtime `BLOCKED_DEVICE`
 W6: 无权重 decoder（完成）→ binding（完成）→ CPU/CUDA ingestion（完成）→ 获授权后 BF16 文本模型 → W8A8-linear
 ```
 
@@ -403,7 +403,9 @@ QEMU 只证明功能路径，不可用于性能结论。
 - M1K-CUDA 独立验收 `522 passed, 7 skipped`；BF16/FP32/INT32/INT64、bytes/bytearray/read-only+writable mmap、错误/cleanup mock 均通过。RTX 5080 上371 inputs、51 outputs、48 states、43,200 bytes的24层图连续执行两次，logits finite/nonzero、position=0、输入不变、canary保持且前后无 compute process；证据目录 `../worktrees/_meta/pypto-x/integration-w6-qwen35-bf16-cuda-buffer-ingestion-final/`；
 - AMD static C1 task commits：`51d2bd49b`、`fc0ba3694`；integration commits：`4f5f31d0c`、`e6e836070`；exact target 为 `amdgcn-amd-amdhsa/gfx1036`，wave/XNACK/BF16/INT8/MFMA/WMMA 保持 unknown；
 - AMD C1 独立验收 `538 passed, 7 skipped`，5类 FP32/BF16-storage kernel 均通过 `llvm-as`、`llc -mcpu=gfx1036` 和 `llvm-objdump`，有真实 global load/ALU/store/bounds；12类artifact篡改安全拒绝。Qwen gap为 `4,532 = 844 supported + 3,688 unsupported`；runtime availability/load/launch保持 `BLOCKED_DEVICE`；证据目录 `../worktrees/_meta/pypto-x/integration-w5-hip-gfx1036-static-final/`；
-- 当前 integration HEAD：`e6e8360702d39da9f11e6352b94714c6ed23901a`，工作树 clean。GPU-only 工作不申请 `gamepc`；该锁仅协调远端 heavy CPU/host-memory。
+- AMD C2 task commits：`5fe946173`、`8369a7ff6`；integration commits：`237a27614`、`45e8459e7`；实现layout/indexing/control并把LLVM/artifact版本升至v2；
+- C2首轮验收发现transpose逆置换、split多输出、zero/rank门禁、dtype parity、BF16 sNaN和artifact重推导共6类问题；r2修复后 `557 passed, 7 skipped`，18类LLVM/ELF与23/23篡改全部通过。Qwen静态覆盖 `4,098/4,532`，descriptor保持O(rank+segments)，runtime仍 `BLOCKED_DEVICE`；证据目录 `../worktrees/_meta/pypto-x/integration-w5-hip-gfx1036-static-c2-final-r2/`；
+- 当前 integration HEAD：`45e8459e79ea979beb58661eb77b30a50f133f75`，工作树 clean。GPU-only 工作不申请 `gamepc`；该锁仅协调远端 heavy CPU/host-memory。
 
 W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保持只读，不重跑覆盖。
 
@@ -428,7 +430,7 @@ W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保�
 3. CPU/加速器优先级为 AVX2 → AVX-512 → SVE256（无 NEON）→ NVIDIA → AMD。
 4. 上游默认分支已刷新为 edge 快照，版本策略为 release family + exact SHA 双轨 lock。
 5. Tensor frontend 作为跨架构主入口，Pro 作为 Ascend expert dialect + portable subset。
-6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、CUDA C1–C2、Qwen3.5-0.8B M0–M1K 与 AMD `gfx1036` 静态 C1 已完成。Qwen BF16 带权执行需要新的明确授权；当前任务是 AMD C2 layout/indexing/control，运行态必须保持 `BLOCKED_DEVICE`。
+6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、CUDA C1–C2、Qwen3.5-0.8B M0–M1K 与 AMD `gfx1036` 静态 C1–C2 已完成。Qwen BF16 带权执行需要新的明确授权；当前任务是 AMD C3 math/reduction/batched matmul，运行态必须保持 `BLOCKED_DEVICE`。
 
 C0 已完成：
 
@@ -437,7 +439,7 @@ C0 已完成：
 3. 接手文档已按序号和日期归档到 `docs/00-handoffs/`。
 4. stable lock 仍等待实际 CANN toolkit/NPU 环境做晋升验证，不影响目标无关 W1，但会门禁 Ascend 回归结论。
 
-GPU common 已冻结 NVIDIA/AMD 共用 IR/ABI，公共层没有 AMDGPU/ROCDL/MFMA 语义。M1K 已闭包 CPU/CUDA external ingestion；Qwen带权执行等待授权。AMD C1 已从GPU common下降到普通 `llvm.amdgcn`，但不是MLIR ROCDL，也没有HIP运行证据；当前继续C2 layout/indexing/control。M1G/M1I的T>1 GDR仍是静态SSA展开；SVE仍有host fallback；Ascend stable CANN/NPU回归仍pending。
+GPU common 已冻结 NVIDIA/AMD 共用 IR/ABI，公共层没有 AMDGPU/ROCDL/MFMA 语义。M1K 已闭包 CPU/CUDA external ingestion；Qwen带权执行等待授权。AMD C1/C2 已从GPU common下降到普通 `llvm.amdgcn`，但不是MLIR ROCDL，也没有HIP运行证据；当前继续C3 math/reduction/batched matmul。M1G/M1I的T>1 GDR仍是静态SSA展开；SVE仍有host fallback；Ascend stable CANN/NPU回归仍pending。
 
 ## 12. 快速自检命令
 

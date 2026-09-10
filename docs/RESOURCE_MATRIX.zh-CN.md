@@ -8,7 +8,7 @@
 |---|---|---|---|---|
 | 本地开发机 | 可用；heavy 需全局 `local` 锁；M1K-CPU PASS | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8；M1K-CPU `516 passed, 7 skipped`，scalar/AVX2/AVX-512/QEMU SVE256 的24层 external-buffer graph 通过 | full pytest、大 shape lowering/compile 与并行构建必须走 `scripts/resource/run_local_heavy.sh`；默认保留 4 GiB、最多 6 CPU；当前仅为正确性/汇编证据，不形成性能门槛 |
 | RTX 5080（`192.168.101.5`） | 在线；GPU 由 PyPTO-X 独占；M1K-CUDA PASS | NVIDIA CUDA/PTX/NVVM 验证 | WSL2、RTX 5080 16,303 MiB、CC 12.0；Driver/PTX 连续两次执行371-input/51-output external-buffer 24层图 | GPU-only 无需 `gamepc` 锁；host-heavy 才持锁。无 `nvcc`/NVRTC/CUDART/SDK headers/PyTorch/Triton；当前是 correctness kernel，不是 fusion/性能结论 |
-| AMD GamePC 核显 `gfx1036` | 静态 C1 PASS；WSL/HIP runtime `BLOCKED_DEVICE`；6750GRE 暂缓 | AMDGPU LLVM static codegen，后续 HIP 真机功能 | 5类 kernel 通过 LLVM 22 `llvm-as/llc/objdump`；Qwen 844/4,532 ops；Windows OpenCL device `gfx1036`，WSL 无 `/dev/kfd`/ROCm/HIP | 静态 ELF 不等于执行；wave/BF16/INT8/MFMA/WMMA unknown；不能代表6750GRE性能 |
+| AMD GamePC 核显 `gfx1036` | 静态 C2 PASS；WSL/HIP runtime `BLOCKED_DEVICE`；6750GRE 暂缓 | AMDGPU LLVM static codegen，后续 HIP 真机功能 | C2 18类 kernel通过LLVM/ELF；Qwen 4,098/4,532 ops；Windows OpenCL device `gfx1036`，WSL无 `/dev/kfd`/ROCm/HIP | 静态 ELF不等于执行；wave/BF16/INT8/MFMA/WMMA unknown；不能代表6750GRE性能 |
 | 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；M1C1–M1I 功能/contract 与24层 synthetic decoder 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；`iota/compare` 是 host-reference；按量计费，状态见 `~/tools/ecs-920B/state.env` |
 | QEMU AArch64 | 可用 | AArch64/SVE/SVE2 功能和编译验证 | `qemu-aarch64` 11.0.3；已验证 `max,sve256=on` 可报告 SVE/SVE2，VL=32 bytes | 不能代表鲲鹏吞吐、缓存、内存带宽或指令时序 |
 
@@ -161,6 +161,8 @@ NUMA 节点、CPU affinity、内存带宽工具
 Windows OpenCL/Vulkan 设备可见不等于 Linux HIP 可用；当前只做静态 codegen，不做执行或性能承诺。证据见 `../worktrees/_meta/pypto-x/gamepc-amd-igpu-probe-20260910/validation.json`。
 
 静态 C1 已在 exact integration HEAD `e6e8360702d39da9f11e6352b94714c6ed23901a` 上完成 identity/add/mul/full reduce-sum/rank-2 matmul 的 FP32/BF16-storage LLVM/AMDGPU codegen。5个 artifact 都是 `elf64-amdgpu/gfx1036`，含 global load/ALU/store/bounds；Qwen metadata-only capability 为844/4,532 ops。runtime仍为 `BLOCKED_DEVICE`。证据见 `../worktrees/_meta/pypto-x/integration-w5-hip-gfx1036-static-final/validation.json`。
+
+静态 C2 在 exact integration HEAD `45e8459e79ea979beb58661eb77b30a50f133f75` 上增加cast/layout/indexing/control。18类artifact和23/23 tamper通过，Qwen capability为4,098/4,532；剩余434项是math、通用reduction、batched matmul。descriptor为O(rank+segments)，未生成整网kernel。证据见 `../worktrees/_meta/pypto-x/integration-w5-hip-gfx1036-static-c2-final-r2/validation.json`。
 
 ## 资源分配
 

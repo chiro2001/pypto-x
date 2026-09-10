@@ -72,7 +72,7 @@ scripts/worktree/create.sh \
 | W4 | `cpu-sve256` | AArch64 SVE lowering，不做 NEON | `cpu-avx512` | QEMU → 鲲鹏 | QEMU 功能通过；真机结果单独标记 |
 | W4 | `gpu-common` | Grid/Block/Subgroup、GPU ABI | `target-abi`、`core-ir`、`cpu-sve256` | 本地/RTX 5080 | 无厂商概念的 GPU IR 稳定 |
 | W4 | `cuda` | NVVM/CUDA/NVRTC backend | `gpu-common` | RTX 5080 | elementwise/softmax/matmul 通过 |
-| W5 | `hip` | AMDGPU LLVM；后续 HIP runtime | `gpu-common`、`cuda` | GamePC `amd-igpu-gfx1036`；当前 WSL `BLOCKED_DEVICE` | 静态 C1 已完成844/4,532 Qwen ops；C2 扩展 layout/indexing/control，待 ROCm 后真机执行 |
+| W5 | `hip` | AMDGPU LLVM；后续 HIP runtime | `gpu-common`、`cuda` | GamePC `amd-igpu-gfx1036`；当前 WSL `BLOCKED_DEVICE` | 静态 C2 已完成4,098/4,532 Qwen ops；C3 闭包 math/reduction/batched matmul，待 ROCm 后真机执行 |
 | W6 | `qwen35-08b-model` | 0.8B text harness、custom op/model wrapper | AVX-512 基线；前端过渡决策 | 按后端顺序 | M1I decoder、M1J binding、M1K CPU/CUDA ingestion 已完成；获授权后执行 BF16 整网，再做 W8A8-linear |
 
 W1 的 `target-abi` 和 `core-ir` 可以并行，但必须先评审同一份接口草案；W2 之前由协调者合并并解决接口冲突。CPU 路线按 AVX2 → AVX-512 → SVE256 验证共享 vector lowering；CUDA/HIP 不应在 GPU common ABI 冻结前各自发明 runtime 接口。

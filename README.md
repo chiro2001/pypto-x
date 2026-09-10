@@ -1,6 +1,6 @@
 # PyPTO-X：PyPTO 跨架构后端
 
-PyPTO-X（PyPTO Cross-Architecture）是本项目的工作名称，目标是在保留 PyPTO Tensor/Professional 双前端定位的前提下，抽取可移植 Core IR 与 target ABI，并逐步支持鲲鹏 CPU、x86_64 CPU、NVIDIA GPU 和 AMD GPU。Qwen3.5-0.8B M0–M1K、CPU/SVE/CUDA external-buffer correctness 已冻结；真实 BF16 带权模型等待授权。AMD `gfx1036` 静态 C1 已生成并验证5类真实 LLVM/AMDGPU ELF，Qwen capability coverage 为844/4,532 ops；WSL runtime 仍为 `BLOCKED_DEVICE`，下一步扩展 layout/indexing/control 静态 codegen。各后端能力只以对应验收证据为准。
+PyPTO-X（PyPTO Cross-Architecture）是本项目的工作名称，目标是在保留 PyPTO Tensor/Professional 双前端定位的前提下，抽取可移植 Core IR 与 target ABI，并逐步支持鲲鹏 CPU、x86_64 CPU、NVIDIA GPU 和 AMD GPU。Qwen3.5-0.8B M0–M1K 与 CPU/SVE/CUDA external-buffer correctness 已冻结；真实 BF16 带权模型等待授权。AMD `gfx1036` 静态 C2 已验证 layout/indexing/control LLVM/ELF，Qwen capability coverage 为4,098/4,532 ops；WSL runtime 仍为 `BLOCKED_DEVICE`，下一步闭包 math/reduction/batched matmul。各后端能力只以对应验收证据为准。
 
 ## 快速入口
 

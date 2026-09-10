@@ -45,3 +45,4 @@ NNNN-YYYY-MM-DD-<阶段或主题>.zh-CN.md
 | 0028 | 2026-09-10 | M1K-CPU ingestion 完成、AMD `gfx1036` 核显目标识别 | [CPU ingestion 与 AMD 核显快照](0028-2026-09-10-qwen35-bf16-cpu-ingestion-amd-igpu.zh-CN.md) |
 | 0029 | 2026-09-10 | M1K-CUDA ingestion 完成、AMD `gfx1036` 静态 backend 就绪 | [CUDA ingestion 完成快照](0029-2026-09-10-qwen35-bf16-cuda-ingestion-complete.zh-CN.md) |
 | 0030 | 2026-09-10 | AMD `gfx1036` 静态 C1 完成、C2 layout/indexing 就绪 | [AMDGPU 静态 C1 完成快照](0030-2026-09-10-amdgpu-gfx1036-static-c1-complete.zh-CN.md) |
+| 0031 | 2026-09-10 | AMD `gfx1036` 静态 C2 完成、C3 math/reduction 就绪 | [AMDGPU 静态 C2 完成快照](0031-2026-09-10-amdgpu-gfx1036-static-c2-complete.zh-CN.md) |
