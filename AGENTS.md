@@ -17,8 +17,8 @@ EXECUTION_W8A_DECAY_FIX_VERIFIED_MULTIPROMPT_IN_PROGRESS_AMD_RUNTIME_STATIC_ONLY
 ```text
 实现主仓     upstream/pypto @ 34475e0d（只读）
 集成分支     port/pypto-x-integration @ 9aae4649e
-私有归档     https://github.com/chiro2001/pypto-x-private（私有）
-公开主仓     https://github.com/chiro2001/pypto-x（公开；历史中不含第三方 PDF/HTML）
+工作副本     /home/chiro/projects/pypto/pypto_x（= 公开主仓 chiro2001/pypto-x 的克隆，origin 指向公开仓）
+私有备份     ../pypto_x_private_bkp（archive 分支，含第三方离线副本）+ GitHub chiro2001/pypto-x-private
 证据目录     ../worktrees/_meta/pypto-x/<task>/（不在仓内；权重亦在仓外）
 ```
 
@@ -73,8 +73,7 @@ cd /home/chiro/projects/pypto/pypto_x
 
 git -C upstream/pypto status --short && git -C upstream/pypto rev-parse HEAD
 scripts/worktree/status.sh
-bash -n scripts/worktree/create.sh scripts/worktree/status.sh \
-        scripts/smoke/pypto_pro_smoke.sh scripts/remote/setup_a3_access.sh
+bash -n scripts/worktree/*.sh scripts/smoke/*.sh scripts/resource/*.sh scripts/remote/*.sh
 /home/chiro/projects/.resource-locks/resource-lock status     # 只观察；取得锁必须用 run
 
 python3 -c "import yaml;[yaml.safe_load(open(p)) for p in ['configs/development_lock.yaml','configs/agent_tasks.yaml','configs/upstream_lock.yaml']];print('yaml ok')"
@@ -89,9 +88,10 @@ git -C /home/chiro/projects/pypto/worktrees/pypto-x/integration log --oneline -1
 - `upstream/pypto` 是 PyPTO-X 的实现主仓，当前 edge 快照 `34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad`；stable lock 仍待 CANN release 配套验证。
 - `upstream/*` 原则上只读；禁止直接在 `master`/`main` 开发，禁止向 gitcode 上游推送。
 - 实现必须使用 `scripts/worktree/create.sh` 创建的独立 worktree（默认 `../worktrees/pypto-x/<task>`）；跨仓库任务用各自仓库的 worktree，不要把两个仓混在一个 worktree。
-- 根目录是轻量控制仓（docs/configs/scripts + submodule gitlink）；远端为私有归档 `chiro2001/pypto-x-private`，
-  公开主仓是 `chiro2001/pypto-x`（由 `scripts/remote/publish_public_mirror.sh` 生成，历史中剔除第三方 PDF/HTML）。
-  **推送到公开仓是发布动作，需用户明确指示**；不得把上游源码、权重或证据上传到公开仓。
+- 根目录是轻量控制仓（docs/configs/scripts/patches + submodule gitlink）。**日常开发的推送目标是公开主仓
+  `chiro2001/pypto-x`（origin）**；私有备份是本地 `../pypto_x_private_bkp`（`archive` 分支含 references/ 第三方离线副本）
+  与远端 `chiro2001/pypto-x-private`，用 `scripts/remote/sync_private_backup.sh` 同步。
+  公开仓历史中**不含**第三方离线副本；把上游源码、权重或证据推上公开仓、或改写公开历史，属发布动作，需用户明确指示。
 - 许可与补丁：本仓自有内容为 Apache-2.0（`LICENSE`/`NOTICE`）；`patches/pypto-x/` 是**机器生成**的补丁集，
   改动实现后需重跑 `scripts/remote/export_patches.sh` 再提交，不要手工编辑补丁文件。
 - 不清理或重置未知修改。`upstream/PTOAS/.codex/CLAUDE.md` 的 dirty 来自上游 CRLF/`.gitattributes` 不一致，不是人工改动。

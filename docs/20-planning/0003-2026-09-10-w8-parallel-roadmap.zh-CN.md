@@ -237,8 +237,10 @@ A1/A2 数值（真权重，逐 prompt）
   3. 更新 configs/development_lock.yaml（task/integration commit、验收数字、known_limits 增删）
   4. 写 docs/00-handoffs/00NN-*.zh-CN.md 快照 + 更新 HANDOFF.zh-CN.md 状态行 + ERRATA（如有勘误）
   5. 重跑 `scripts/remote/export_patches.sh` 刷新 `patches/`（机器生成，禁止手工编辑）
-  6. `scripts/remote/publish_public_mirror.sh` 发布公开主仓（同样机器生成）
+  6. `git push origin main` 推送公开主仓（origin = chiro2001/pypto-x）；再 `scripts/remote/sync_private_backup.sh`
+     同步本地私有备份（archive 分支保留第三方离线副本）
   7. 涉及许可/发布边界的改动同步 `LICENSE` / `NOTICE` / `patches/README.md`
+  8. 仅当需要从归档重建公开树时，才用 `scripts/remote/publish_public_mirror.sh`（应急路径）
 ```
 
 ---

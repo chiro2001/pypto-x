@@ -89,14 +89,16 @@ references/               外部公开资料离线副本
 ## 公开镜像与发布
 
 ```text
-私有归档  chiro2001/pypto-x-private  完整历史，含 references/ 的第三方讲稿离线副本
-公开主仓  chiro2001/pypto-x          由脚本从私有仓生成：历史中剔除 references/*.pdf|*.html|*.txt，
-                                    并在 references/README.md 标注"公开镜像不再分发"
-生成脚本  scripts/remote/publish_public_mirror.sh [--repo <owner/name>] [--dry-run]
-补丁导出  scripts/remote/export_patches.sh [<base-sha>] [<branch>]   → patches/pypto-x/*.patch + SERIES
+工作副本  /home/chiro/projects/pypto/pypto_x   = 公开主仓 chiro2001/pypto-x 的克隆（origin 指向公开仓，日常开发在此）
+私有备份  ../pypto_x_private_bkp               archive 分支保留私有历史与 references/ 第三方离线副本；main 跟踪公开仓
+          GitHub: chiro2001/pypto-x-private    远端私有归档
+补丁导出  scripts/remote/export_patches.sh      → patches/pypto-x/*.patch + SERIES（冻结流水线的一步）
+备份同步  scripts/remote/sync_private_backup.sh [--push-archive]
+应急重建  scripts/remote/publish_public_mirror.sh   仅当需要从 archive 重新生成公开树时使用
 ```
 
-发布纪律：**推送到公开仓属于对外发布动作，需用户明确指示**；脚本默认只做 dry-run 之外的 force-push 到公开仓，绝不改私有仓历史。
+发布纪律：改动经 `git push origin main` 直接进公开主仓；**把上游源码、权重、证据推上公开仓，或改写公开历史，
+属于发布动作，需用户明确指示**。公开仓历史自生成之日起即不含第三方离线副本（`references/*.pdf|*.html|*.txt`）。
 
 ## 本地路径约定
 
