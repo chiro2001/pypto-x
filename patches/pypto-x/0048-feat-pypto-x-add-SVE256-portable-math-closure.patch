@@ -1,0 +1,1355 @@
+From ff9255ec192d4cd3a39134f53ba5ec7879c97ecb Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Tue, 8 Sep 2026 20:12:24 +0800
+Subject: [PATCH 48/96] feat(pypto-x): add SVE256 portable math closure
+
+---
+ python/pypto/backends/cpu/aarch64/sve256.py       | 167 ++++++++++++++++++++++--
+ python/pypto/backends/cpu/runtime.py              |   6 +-
+ python/pypto/backends/cpu/tensor.py               |  10 +-
+ python/pypto/backends/cpu/vector/runtime.py       | 176 ++++++++++++++++++++++++-
+ python/pypto/compiler/targets/cpu_sve256.py       | 290 ++++++++++++++++++++++++++++++++++++++++--
+ python/pypto/lowering/cpu/aarch64/sve/lowering.py |  16 ++-
+ python/pypto/lowering/cpu/vector/plan.py          |  28 +++-
+ python/pypto/lowering/cpu/x86/avx2/lowering.py    |  10 ++
+ python/pypto/lowering/cpu/x86/avx512/lowering.py  |   9 ++
+ python/tests/ut/pypto_x/test_cpu_sve256.py        | 114 +++++++++++++++++
+ python/tests/ut/pypto_x/test_cpu_vector_common.py | 102 +++++++++++++++
+ 11 files changed, 891 insertions(+), 37 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/aarch64/sve256.py b/python/pypto/backends/cpu/aarch64/sve256.py
+index 281d06d0c..793c3bc32 100644
+--- a/python/pypto/backends/cpu/aarch64/sve256.py
++++ b/python/pypto/backends/cpu/aarch64/sve256.py
+@@ -114,8 +114,18 @@ _OP_CODES = {
+     "reduce_sum": 6,
+     "reduce_max": 7,
+     "matmul": 8,
++    "cast": 9,
++    "exp": 10,
++    "rsqrt": 11,
++    "sigmoid": 12,
++    "silu": 13,
++    "softplus": 14,
++    "reduce_mean": 15,
++    "broadcast": 16,
++    "where": 17,
+ }
+ _DTYPE_CODES = {"float32": 0, "bf16": 1}
++_CAST_DTYPE_CODES = {("float32", "bf16"): 2, ("bf16", "float32"): 3}
+ _CTYPE = {"float32": ctypes.c_float, "bf16": ctypes.c_uint16}
+ 
+ 
+@@ -166,6 +176,85 @@ def _unravel(index: int, shape: Sequence[int]) -> Tuple[int, ...]:
+     return tuple(result)
+ 
+ 
++def _ravel(coordinates: Sequence[int], shape: Sequence[int]) -> int:
++    if len(coordinates) != len(shape):
++        raise CpuSve256ExecutionError("coordinate rank does not match shape rank")
++    index = 0
++    for coordinate, dimension in zip(coordinates, shape):
++        if coordinate < 0 or coordinate >= dimension:
++            raise CpuSve256ExecutionError("coordinate is outside tensor shape")
++        index = index * dimension + coordinate
++    return index
++
++
++def _broadcast_values(value: Any, input_type: CoreType, output_type: CoreType, context: str) -> List[Any]:
++    output_shape = static_shape(output_type, context + ".output")
++    output_count = element_count(output_shape)
++    output_dtype = canonical_dtype(output_type.dtype)
++    if _is_scalar(input_type):
++        return [_cast_value(value, output_dtype) for _ in range(output_count)]
++    input_shape = static_shape(input_type, context + ".input")
++    if len(value) != element_count(input_shape):
++        raise CpuSve256ExecutionError("{} input storage length mismatch".format(context))
++    rank_delta = len(output_shape) - len(input_shape)
++    result = []
++    for output_index in range(output_count):
++        output_coords = _unravel(output_index, output_shape)
++        input_coords = [
++            0 if dimension == 1 else output_coords[axis + rank_delta]
++            for axis, dimension in enumerate(input_shape)
++        ]
++        result.append(_cast_value(value[_ravel(input_coords, input_shape)], output_dtype))
++    return result
++
++
++def _where_values(
++    condition: Any,
++    condition_type: CoreType,
++    true_value: Any,
++    true_type: CoreType,
++    false_value: Any,
++    false_type: CoreType,
++    output_type: CoreType,
++    context: str,
++) -> Tuple[List[Any], List[Any], List[Any]]:
++    output_shape = static_shape(output_type, context + ".output") if _is_tensor(output_type) else ()
++    output_count = element_count(output_shape) if _is_tensor(output_type) else 1
++    prepared = []
++    for value, value_type, label in (
++        (condition, condition_type, "condition"),
++        (true_value, true_type, "input"),
++        (false_value, false_type, "other"),
++    ):
++        if _is_scalar(value_type):
++            prepared.append((value, None))
++            continue
++        shape = static_shape(value_type, context + "." + label)
++        if len(value) != element_count(shape):
++            raise CpuSve256ExecutionError("{} {} storage length mismatch".format(context, label))
++        prepared.append((value, shape))
++
++    def source_at(item: Tuple[Any, Optional[Tuple[int, ...]]], coords: Tuple[int, ...]) -> Any:
++        value, shape = item
++        if shape is None:
++            return value
++        rank_delta = len(output_shape) - len(shape)
++        source_coords = [
++            0 if dimension == 1 else coords[axis + rank_delta]
++            for axis, dimension in enumerate(shape)
++        ]
++        return value[_ravel(source_coords, shape)]
++
++    conditions, true_values, false_values = [], [], []
++    for output_index in range(output_count):
++        coords = _unravel(output_index, output_shape)
++        predicate = source_at(prepared[0], coords)
++        conditions.append(predicate)
++        true_values.append(source_at(prepared[1], coords))
++        false_values.append(source_at(prepared[2], coords))
++    return conditions, true_values, false_values
++
++
+ def _read_native_bytes(path: str) -> bytes:
+     nofollow = getattr(os, "O_NOFOLLOW", 0)
+     try:
+@@ -238,6 +327,8 @@ def _verify_embedded_markers(
+         RUNNER_PROTOCOL.encode("ascii"),
+         b"ptx_sve256_vl_contract",
+         b"vl_bytes=32",
++        b"ptx_sve256_math_fallback",
++        b"scalar_math_lane_fallback:exp,sigmoid,silu,softplus",
+     )
+     if any(marker not in native_bytes for marker in markers):
+         raise CpuSve256ArtifactError("SVE256 ELF contract marker is missing")
+@@ -273,6 +364,10 @@ def _validate_primary_artifact(artifact: Artifact) -> Mapping[str, Any]:
+         raise CpuSve256ArtifactError("SVE2 is not an emitted SVE256 requirement")
+     if metadata.get("emitting_features") != ["sve"]:
+         raise CpuSve256ArtifactError("SVE256 emitting feature marker is invalid")
++    if metadata.get("scalar_math_lane_fallback") != ["exp", "sigmoid", "silu", "softplus"]:
++        raise CpuSve256ArtifactError("SVE256 scalar math fallback metadata is invalid")
++    if metadata.get("sve_math_operations") != ["rsqrt", "where", "broadcast", "cast", "reduce_mean"]:
++        raise CpuSve256ArtifactError("SVE256 math operation metadata is invalid")
+     required = set(_string_sequence(metadata.get("required_features"), "required_features"))
+     if required != {"sve", "vl256"}:
+         raise CpuSve256ArtifactError("SVE256 required_features must contain only sve and vl256")
+@@ -364,6 +459,8 @@ def _decode_artifact(artifact: Artifact, available: CpuFeatureSet) -> LoadedSve2
+     native_flags = metadata.get("native_flags")
+     if not isinstance(native_flags, (list, tuple)) or tuple(native_flags) != expected_flags:
+         raise CpuSve256ArtifactError("SVE256 native_flags metadata disagrees with variant")
++    if metadata.get("link_flags") != ["-lm"] or "-lm" not in compile_command:
++        raise CpuSve256ArtifactError("SVE256 libm link contract is missing")
+     if compile_command[-1] != Path(artifact.path).name:
+         raise CpuSve256ArtifactError("SVE256 compile command is not bound to artifact path")
+     mismatch = CpuFeatureContract(required, available)
+@@ -758,27 +855,52 @@ class Sve256Runtime:
+         m: int = 0,
+         k: int = 0,
+         n: int = 0,
++        input_dtype: Optional[str] = None,
++        output_dtype: Optional[str] = None,
+     ) -> List[Any]:
+         if operation not in _OP_CODES:
+             raise CpuSve256ExecutionError("unsupported SVE256 runner operation {!r}".format(operation))
+         dtype = canonical_dtype(dtype)
+-        if dtype not in _DTYPE_CODES:
++        output_dtype = canonical_dtype(output_dtype or dtype)
++        if output_dtype not in _DTYPE_CODES:
+             raise CpuSve256ExecutionError("SVE256 runner supports float32 and bf16 only")
++        input_dtype = canonical_dtype(input_dtype or dtype)
+         if operation == "matmul":
+             expected_values = (m * k, k * n)
+-        elif operation in ("reduce_sum", "reduce_max", "identity", "neg"):
++        elif operation in ("reduce_sum", "reduce_max", "reduce_mean", "identity", "neg",
++                           "exp", "rsqrt", "sigmoid", "silu", "softplus", "broadcast"):
++            expected_values = (count,)
++        elif operation == "cast":
+             expected_values = (count,)
++            if (input_dtype, output_dtype) not in _CAST_DTYPE_CODES:
++                raise CpuSve256ExecutionError("SVE256 cast requires float32<->bf16")
++        elif operation == "where":
++            expected_values = (count, count, count)
+         else:
+             expected_values = (count, count)
+         if len(values) != len(expected_values) or any(
+             len(value) != expected for value, expected in zip(values, expected_values)
+         ):
+             raise CpuSve256ExecutionError("SVE256 runner input lengths do not match operation")
++        if operation == "cast":
++            wire_dtype = _CAST_DTYPE_CODES[(input_dtype, output_dtype)]
++        else:
++            wire_dtype = _DTYPE_CODES[output_dtype]
+         header = _WIRE_REQUEST.pack(
+             int.from_bytes(_WIRE_MAGIC, "little"), _WIRE_VERSION, _OP_CODES[operation],
+-            _DTYPE_CODES[dtype], 0, 0, count, m, k, n,
++            wire_dtype, 0, 0, count, m, k, n,
+         )
+-        payload = header + b"".join(_wire_values(dtype, value) for value in values)
++        if operation == "cast":
++            payload_values = _wire_values(input_dtype, values[0])
++        elif operation == "where":
++            payload_values = (
++                _wire_values("float32", values[0]) +
++                _wire_values(output_dtype, values[1]) +
++                _wire_values(output_dtype, values[2])
++            )
++        else:
++            payload_values = b"".join(_wire_values(output_dtype, value) for value in values)
++        payload = header + payload_values
+         if self.execution_mode == "native":
+             command = [str(artifact.path)]
+         else:
+@@ -815,9 +937,9 @@ class Sve256Runtime:
+         expected_count = m * n if operation == "matmul" else (
+             1 if operation.startswith("reduce_") else count
+         )
+-        if response_dtype != _DTYPE_CODES[dtype] or response_count != expected_count:
++        if response_dtype != _DTYPE_CODES[output_dtype] or response_count != expected_count:
+             raise CpuSve256ExecutionError("SVE256 runner response shape is invalid")
+-        return _decode_wire_values(dtype, result.stdout[_WIRE_RESPONSE.size:], response_count)
++        return _decode_wire_values(output_dtype, result.stdout[_WIRE_RESPONSE.size:], response_count)
+ 
+     def launch(self, request: LaunchRequest) -> Tuple[Any, ...]:
+         if not isinstance(request, LaunchRequest):
+@@ -918,6 +1040,17 @@ class Sve256Runtime:
+             values = self._run_runner(artifact, "identity", dtype, [inputs[0][1]], len(inputs[0][1]))
+         elif name == "neg":
+             values = self._run_runner(artifact, "neg", dtype, [inputs[0][1]], plan.element_count)
++        elif name == "cast":
++            input_dtype = canonical_dtype(inputs[0][0].dtype)
++            values = self._run_runner(
++                artifact,
++                "cast",
++                dtype,
++                [inputs[0][1]],
++                plan.element_count,
++                input_dtype=input_dtype,
++                output_dtype=dtype,
++            )
+         elif name in ("add", "sub", "mul", "div"):
+             left, right = inputs
+             left_values = left[1] if len(left[1]) == plan.element_count else left[1] * plan.element_count
+@@ -925,8 +1058,26 @@ class Sve256Runtime:
+             if name == "div" and any(value == 0 for value in right_values):
+                 raise CpuSve256ExecutionError("division by zero")
+             values = self._run_runner(artifact, name, dtype, [left_values, right_values], plan.element_count)
+-        elif name in ("reduce_sum", "reduce_max"):
++        elif name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++            values = self._run_runner(artifact, name, dtype, [inputs[0][1]], plan.element_count)
++        elif name in ("reduce_sum", "reduce_max", "reduce_mean"):
+             values = self._execute_reduction(name, inputs[0], output_ref.type, plan, artifact)
++        elif name == "broadcast":
++            expanded = _broadcast_values(inputs[0][1], inputs[0][0], output_ref.type, "SVE256 broadcast")
++            values = self._run_runner(artifact, "broadcast", dtype, [expanded], plan.element_count)
++        elif name == "where":
++            condition, true_value, false_value = inputs
++            condition_values, true_values, false_values = _where_values(
++                condition[1], condition[0], true_value[1], true_value[0],
++                false_value[1], false_value[0], output_ref.type, "SVE256 where",
++            )
++            values = self._run_runner(
++                artifact,
++                "where",
++                dtype,
++                [[1.0 if item else 0.0 for item in condition_values], true_values, false_values],
++                plan.element_count,
++            )
+         elif name == "matmul":
+             matmul = plan.matmul
+             values = self._run_runner(
+@@ -974,7 +1125,7 @@ class Sve256Runtime:
+                 if name == "reduce_sum":
+                     output.append(_cast_value(0.0, canonical_dtype(output_type.dtype)))
+                     continue
+-                raise CpuSve256ExecutionError("reduce_max has an empty reduction group")
++                raise CpuSve256ExecutionError("{} has an empty reduction group".format(name))
+             result = self._run_runner(artifact, name, canonical_dtype(output_type.dtype), [candidates], len(candidates))
+             output.append(result[0])
+         return output
+diff --git a/python/pypto/backends/cpu/runtime.py b/python/pypto/backends/cpu/runtime.py
+index 3860ea6cc..6ef538fa1 100644
+--- a/python/pypto/backends/cpu/runtime.py
++++ b/python/pypto/backends/cpu/runtime.py
+@@ -819,10 +819,10 @@ def _reduce_value(
+         elif name == "reduce_mean":
+             if not candidates:
+                 raise CpuScalarExecutionError("reduce_mean has an empty reduction group")
+-            aggregate = 0
++            aggregate = 0.0
+             for value in candidates:
+-                aggregate += value
+-            aggregate /= len(candidates)
++                aggregate = _cast_value(aggregate + value, "float32")
++            aggregate = _cast_value(aggregate / len(candidates), "float32")
+         else:
+             if not candidates:
+                 raise CpuScalarExecutionError("reduce_max has an empty reduction group")
+diff --git a/python/pypto/backends/cpu/tensor.py b/python/pypto/backends/cpu/tensor.py
+index 230241c58..0626c47f5 100644
+--- a/python/pypto/backends/cpu/tensor.py
++++ b/python/pypto/backends/cpu/tensor.py
+@@ -154,6 +154,11 @@ def _cast_value(value: Any, dtype: str) -> Any:
+             raise ValueError("{} value {} is out of range".format(dtype, result))
+         return result
+     result = float(value)
++    if dtype == "float32":
++        try:
++            return struct.unpack("<f", struct.pack("<f", result))[0]
++        except OverflowError:
++            return math.copysign(float("inf"), result)
+     if dtype == "bf16":
+         return _round_bf16(result)
+     if dtype == "float16":
+@@ -169,7 +174,10 @@ def _round_bf16(value: float) -> float:
+ 
+     if not math.isfinite(value):
+         return value
+-    bits = struct.unpack("<I", struct.pack("<f", value))[0]
++    try:
++        bits = struct.unpack("<I", struct.pack("<f", value))[0]
++    except OverflowError:
++        return math.copysign(float("inf"), value)
+     lower = bits & 0xFFFF
+     upper = bits >> 16
+     if lower > 0x8000 or (lower == 0x8000 and (upper & 1)):
+diff --git a/python/pypto/backends/cpu/vector/runtime.py b/python/pypto/backends/cpu/vector/runtime.py
+index cc13eb8b3..58feb283e 100644
+--- a/python/pypto/backends/cpu/vector/runtime.py
++++ b/python/pypto/backends/cpu/vector/runtime.py
+@@ -9,6 +9,8 @@ from __future__ import annotations
+ 
+ import hashlib
+ import json
++import math
++import struct
+ from dataclasses import dataclass
+ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+ 
+@@ -473,8 +475,42 @@ def _execute_operation(
+             result = _from_sequence(
+                 _vector_map(plan, source, lambda value: _unary(name, value, plan.dtype), context), scalar
+             )
+-        elif name in ("reduce_sum", "reduce_max"):
++        elif name == "cast":
++            source, scalar = _value_sequence(inputs[0].data, inputs[0].type, context)
++            result = _from_sequence(
++                _vector_map(
++                    plan,
++                    source,
++                    lambda value: _cast_value(value, canonical_dtype(output_ref.type.dtype)),
++                    context,
++                ),
++                scalar,
++            )
++        elif name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++            source, scalar = _value_sequence(inputs[0].data, inputs[0].type, context)
++            result = _from_sequence(
++                _vector_map(plan, source, lambda value: _math_value(name, value, plan.dtype), context),
++                scalar,
++            )
++        elif name in ("reduce_sum", "reduce_max", "reduce_mean"):
+             result = _execute_reduction(name, inputs[0], output_ref.type, plan, context)
++        elif name == "broadcast":
++            values = _broadcast_values(inputs[0].data, inputs[0].type, output_ref.type, context)
++            result = _vector_map(plan, values, lambda value: value, context)
++        elif name == "where":
++            values = _where_values(
++                inputs[0].data,
++                inputs[0].type,
++                inputs[1].data,
++                inputs[1].type,
++                inputs[2].data,
++                inputs[2].type,
++                output_ref.type,
++                context,
++            )
++            result = values[0] if _is_scalar(output_ref.type) else _vector_map(
++                plan, values, lambda value: value, context
++            )
+         elif name == "matmul":
+             result = _execute_matmul(inputs[0], inputs[1], output_ref.type, plan, context)
+         else:
+@@ -544,9 +580,122 @@ def _binary(name: str, left: Any, right: Any, dtype: str) -> Any:
+ 
+ 
+ def _unary(name: str, value: Any, dtype: str) -> Any:
+-    if name != "neg":
+-        raise CpuVectorExecutionError("unsupported unary operation {!r}".format(name))
+-    return _cast_value(-value, dtype)
++    if name == "neg":
++        return _cast_value(-value, dtype)
++    return _math_value(name, value, dtype)
++
++
++def _float32(value: Any) -> float:
++    """Round one intermediate to the FP32 accumulation contract."""
++
++    try:
++        return struct.unpack("<f", struct.pack("<f", float(value)))[0]
++    except OverflowError:
++        return math.copysign(float("inf"), float(value))
++
++
++def _math_scalar(name: str, value: Any) -> float:
++    value = float(value)
++    if name == "exp":
++        try:
++            return math.exp(value)
++        except OverflowError:
++            return float("inf")
++    if name == "rsqrt":
++        if math.isnan(value) or value < 0.0:
++            return float("nan")
++        if value == 0.0:
++            return float("inf")
++        return 1.0 / math.sqrt(value)
++    if name == "sigmoid":
++        if value >= 0.0:
++            return 1.0 / (1.0 + math.exp(-value))
++        exp_value = math.exp(value)
++        return exp_value / (1.0 + exp_value)
++    if name == "silu":
++        if value == float("-inf"):
++            return 0.0
++        if value == float("inf"):
++            return value
++        if value >= 0.0:
++            sigmoid = 1.0 / (1.0 + math.exp(-value))
++        else:
++            exp_value = math.exp(value)
++            sigmoid = exp_value / (1.0 + exp_value)
++        return value * sigmoid
++    if name == "softplus":
++        return math.log1p(math.exp(-abs(value))) + max(value, 0.0)
++    raise CpuVectorExecutionError("unsupported vector math operation {!r}".format(name))
++
++
++def _math_value(name: str, value: Any, dtype: str) -> Any:
++    return _cast_value(_math_scalar(name, value), canonical_dtype(dtype))
++
++
++def _broadcast_values(value: Any, input_type: CoreType, output_type: CoreType, context: str) -> List[Any]:
++    output_shape = static_shape(output_type, context + ".output")
++    output_count = element_count(output_shape)
++    output_dtype = canonical_dtype(output_type.dtype)
++    if _is_scalar(input_type):
++        return [_cast_value(value, output_dtype) for _ in range(output_count)]
++    input_shape = static_shape(input_type, context + ".input")
++    if not isinstance(value, list) or len(value) != element_count(input_shape):
++        raise CpuVectorExecutionError("{} input storage length mismatch".format(context))
++    rank_delta = len(output_shape) - len(input_shape)
++    result = []
++    for output_index in range(output_count):
++        output_coords = _unravel(output_index, output_shape)
++        input_coords = []
++        for axis, dimension in enumerate(input_shape):
++            coordinate = output_coords[axis + rank_delta]
++            input_coords.append(0 if dimension == 1 else coordinate)
++        input_index = _ravel(input_coords, input_shape)
++        result.append(_cast_value(value[input_index], output_dtype))
++    return result
++
++
++def _where_values(
++    condition: Any,
++    condition_type: CoreType,
++    true_value: Any,
++    true_type: CoreType,
++    false_value: Any,
++    false_type: CoreType,
++    output_type: CoreType,
++    context: str,
++) -> List[Any]:
++    output_shape = static_shape(output_type, context + ".output") if _is_tensor(output_type) else ()
++    output_count = element_count(output_shape) if _is_tensor(output_type) else 1
++    output_dtype = canonical_dtype(output_type.dtype)
++    prepared = []
++    for value, value_type, label in (
++        (condition, condition_type, "condition"),
++        (true_value, true_type, "input"),
++        (false_value, false_type, "other"),
++    ):
++        if _is_scalar(value_type):
++            prepared.append((value, None))
++            continue
++        shape = static_shape(value_type, context + "." + label)
++        if not isinstance(value, list) or len(value) != element_count(shape):
++            raise CpuVectorExecutionError("{} {} storage length mismatch".format(context, label))
++        prepared.append((value, shape))
++
++    def source_at(item: Tuple[Any, Optional[Tuple[int, ...]]], coords: Tuple[int, ...]) -> Any:
++        value, shape = item
++        if shape is None:
++            return value
++        rank_delta = len(output_shape) - len(shape)
++        source_coords = [0 if dimension == 1 else coords[axis + rank_delta]
++                         for axis, dimension in enumerate(shape)]
++        return value[_ravel(source_coords, shape)]
++
++    result = []
++    for output_index in range(output_count):
++        coords = _unravel(output_index, output_shape)
++        selected = source_at(prepared[1], coords) if source_at(prepared[0], coords) else source_at(prepared[2], coords)
++        result.append(_cast_value(selected, output_dtype))
++    return result
+ 
+ 
+ def _execute_reduction(name: str, value: _RuntimeValue, output_type: CoreType, plan: Any, context: str) -> List[Any]:
+@@ -592,12 +741,16 @@ def _execute_reduction(name: str, value: _RuntimeValue, output_type: CoreType, p
+                     candidate = candidates[candidate_index]
+                     if aggregate is None:
+                         aggregate = candidate
+-                    elif name == "reduce_sum":
+-                        aggregate += candidate
++                    elif name in ("reduce_sum", "reduce_mean"):
++                        aggregate = _float32(aggregate + candidate)
+                     elif candidate > aggregate:
+                         aggregate = candidate
+             if name == "reduce_sum" and aggregate is None:
+                 aggregate = 0
++            if name == "reduce_mean":
++                if aggregate is None:
++                    raise CpuVectorExecutionError("reduce_mean has an empty reduction group")
++                aggregate = _float32(aggregate / reduction.reduction_size)
+             if aggregate is None:
+                 raise CpuVectorExecutionError("reduce_max has an empty reduction group")
+             result[output_index] = _cast_value(aggregate, canonical_dtype(output_type.dtype))
+@@ -657,6 +810,17 @@ def _unravel(index: int, shape: Sequence[int]) -> Tuple[int, ...]:
+     return tuple(coordinates)
+ 
+ 
++def _ravel(coordinates: Sequence[int], shape: Sequence[int]) -> int:
++    if len(coordinates) != len(shape):
++        raise CpuVectorExecutionError("coordinate rank does not match shape rank")
++    index = 0
++    for coordinate, dimension in zip(coordinates, shape):
++        if coordinate < 0 or coordinate >= dimension:
++            raise CpuVectorExecutionError("coordinate is outside tensor shape")
++        index = index * dimension + coordinate
++    return index
++
++
+ __all__ = [
+     "CpuVectorArtifactError",
+     "CpuVectorBackend",
+diff --git a/python/pypto/compiler/targets/cpu_sve256.py b/python/pypto/compiler/targets/cpu_sve256.py
+index 0a6bec4ea..00616bcd5 100644
+--- a/python/pypto/compiler/targets/cpu_sve256.py
++++ b/python/pypto/compiler/targets/cpu_sve256.py
+@@ -72,10 +72,15 @@ __attribute__((used, visibility("default"))) const char *ptx_sve256_variant = PT
+ __attribute__((used, visibility("default"))) const char *ptx_sve256_source_digest = PTX_SOURCE_DIGEST;
+ __attribute__((used, visibility("default"))) const char *ptx_sve256_runner_protocol = PTX_RUNNER_PROTOCOL;
+ __attribute__((used, visibility("default"))) const char *ptx_sve256_vl_contract = PTX_VL_CONTRACT;
++__attribute__((used, visibility("default"))) const char *ptx_sve256_math_fallback =
++    "scalar_math_lane_fallback:exp,sigmoid,silu,softplus";
+ 
+ enum { PTX_COPY = 0, PTX_NEG = 1, PTX_ADD = 2, PTX_SUB = 3,
+        PTX_MUL = 4, PTX_DIV = 5, PTX_REDUCE_SUM = 6,
+-       PTX_REDUCE_MAX = 7, PTX_MATMUL = 8 };
++       PTX_REDUCE_MAX = 7, PTX_MATMUL = 8, PTX_CAST = 9,
++       PTX_EXP = 10, PTX_RSQRT = 11, PTX_SIGMOID = 12,
++       PTX_SILU = 13, PTX_SOFTPLUS = 14, PTX_REDUCE_MEAN = 15,
++       PTX_BROADCAST = 16, PTX_WHERE = 17 };
+ 
+ typedef struct {
+     uint32_t magic;
+@@ -175,7 +180,7 @@ static int ptx_size_mul(size_t left, size_t right, size_t *result) {
+ }
+ 
+ static int ptx_valid_operation(uint32_t operation) {
+-    return operation <= PTX_MATMUL;
++    return operation <= PTX_WHERE;
+ }
+ 
+ static int ptx_validate_request(const PtxRequest *request, size_t *item_size,
+@@ -184,10 +189,16 @@ static int ptx_validate_request(const PtxRequest *request, size_t *item_size,
+     uint64_t left_count = 0, right_count = 0, output_count_u64 = 0;
+     size_t left_size, right_size, count_size, output_size;
+     int status;
+-    if (request->dtype > 1 || !ptx_valid_operation(request->operation) ||
++    if (request->dtype > 3 || !ptx_valid_operation(request->operation) ||
+         request->reserved || request->reserved2)
+         return PTX_STATUS_BAD_REQUEST;
+-    *item_size = request->dtype == 0 ? sizeof(float) : sizeof(uint16_t);
++    if (request->operation == PTX_CAST) {
++        if (request->dtype < 2) return PTX_STATUS_BAD_REQUEST;
++        *item_size = request->dtype == 2 ? sizeof(float) : sizeof(uint16_t);
++    } else {
++        if (request->dtype > 1) return PTX_STATUS_BAD_REQUEST;
++        *item_size = request->dtype == 0 ? sizeof(float) : sizeof(uint16_t);
++    }
+     if (request->operation == PTX_MATMUL) {
+         if (ptx_u64_mul(request->m, request->k, &left_count) != PTX_STATUS_OK ||
+             ptx_u64_mul(request->k, request->n, &right_count) != PTX_STATUS_OK ||
+@@ -209,20 +220,39 @@ static int ptx_validate_request(const PtxRequest *request, size_t *item_size,
+             return PTX_STATUS_BAD_REQUEST;
+         if (ptx_u64_to_size(request->count, &count_size) != PTX_STATUS_OK)
+             return PTX_STATUS_BAD_REQUEST;
+-        if (request->operation == PTX_REDUCE_SUM || request->operation == PTX_REDUCE_MAX)
++        if (request->operation == PTX_REDUCE_SUM || request->operation == PTX_REDUCE_MAX ||
++            request->operation == PTX_REDUCE_MEAN)
+             *output_count = 1;
+         else
+             *output_count = request->count;
+         if (request->operation == PTX_NEG || request->operation == PTX_COPY ||
+-            request->operation == PTX_REDUCE_SUM || request->operation == PTX_REDUCE_MAX) {
++            request->operation == PTX_EXP || request->operation == PTX_RSQRT ||
++            request->operation == PTX_SIGMOID || request->operation == PTX_SILU ||
++            request->operation == PTX_SOFTPLUS || request->operation == PTX_BROADCAST ||
++            request->operation == PTX_REDUCE_SUM || request->operation == PTX_REDUCE_MAX ||
++            request->operation == PTX_REDUCE_MEAN) {
+             if (ptx_size_mul(count_size, *item_size, payload_size) != PTX_STATUS_OK)
+                 return PTX_STATUS_BAD_REQUEST;
++        } else if (request->operation == PTX_WHERE) {
++            size_t condition_size;
++            if (ptx_size_mul(count_size, sizeof(float), &condition_size) != PTX_STATUS_OK ||
++                ptx_size_mul(count_size, *item_size, &count_size) != PTX_STATUS_OK ||
++                ptx_size_mul(count_size, 2, &count_size) != PTX_STATUS_OK ||
++                ptx_size_add(condition_size, count_size, payload_size) != PTX_STATUS_OK)
++                return PTX_STATUS_BAD_REQUEST;
+         } else {
+             if (ptx_size_mul(count_size, *item_size, &count_size) != PTX_STATUS_OK ||
+                 ptx_size_mul(count_size, 2, payload_size) != PTX_STATUS_OK)
+                 return PTX_STATUS_BAD_REQUEST;
+         }
+     }
++    if (request->operation == PTX_CAST) {
++        size_t input_count;
++        if (ptx_u64_to_size(request->count, &input_count) != PTX_STATUS_OK ||
++            ptx_size_mul(input_count, *item_size, payload_size) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        *item_size = request->dtype == 2 ? sizeof(uint16_t) : sizeof(float);
++    }
+     if (ptx_u64_to_size(*output_count, &output_size) != PTX_STATUS_OK ||
+         ptx_size_mul(output_size, *item_size, result_size) != PTX_STATUS_OK)
+         return PTX_STATUS_BAD_REQUEST;
+@@ -286,6 +316,58 @@ static void ptx_binary_f32(int operation, const float *left,
+     }
+ }
+ 
++/* SVE has no portable transcendental instruction set.  Keep the lane
++ * traversal, loads, stores, predicate tail, and ordinary arithmetic in SVE;
++ * only the expf/log1pf calls below are an explicit scalar-per-lane fallback.
++ */
++static void ptx_math_f32(int operation, const float *input, float *output,
++                         uint64_t count) {
++    uint64_t index = 0;
++    while (index < count) {
++        uint64_t lane, active = count - index;
++        svbool_t pg = svwhilelt_b32(index, count);
++        svfloat32_t value = svld1(pg, input + index);
++        if (active > svcntw()) active = svcntw();
++        if (operation == PTX_RSQRT) {
++            svfloat32_t root = svsqrt_x(pg, value);
++            svfloat32_t result = svdiv_x(pg, svdup_n_f32(1.0f), root);
++            svbool_t zero = svcmpeq(pg, value, svdup_n_f32(0.0f));
++            result = svsel(zero, svdup_n_f32(INFINITY), result);
++            svst1(pg, output + index, result);
++        } else {
++            float lanes[8];
++            svst1(pg, lanes, value);
++            for (lane = 0; lane < active; ++lane) {
++                float item = lanes[lane];
++                if (operation == PTX_EXP) {
++                    lanes[lane] = expf(item);
++                } else if (operation == PTX_SIGMOID) {
++                    float exponent = item >= 0.0f ? expf(-item) : expf(item);
++                    lanes[lane] = item >= 0.0f
++                        ? 1.0f / (1.0f + exponent)
++                        : exponent / (1.0f + exponent);
++                } else if (operation == PTX_SILU) {
++                    float sigmoid;
++                    if (item == -INFINITY) lanes[lane] = 0.0f;
++                    else if (item == INFINITY) lanes[lane] = item;
++                    else {
++                        float exponent = item >= 0.0f ? expf(-item) : expf(item);
++                        sigmoid = item >= 0.0f
++                            ? 1.0f / (1.0f + exponent)
++                            : exponent / (1.0f + exponent);
++                        lanes[lane] = item * sigmoid;
++                    }
++                } else if (operation == PTX_SOFTPLUS) {
++                    lanes[lane] = log1pf(expf(-fabsf(item))) + fmaxf(item, 0.0f);
++                }
++            }
++            value = svld1(pg, lanes);
++            svst1(pg, output + index, value);
++        }
++        index += svcntw();
++    }
++}
++
+ static float ptx_reduce_f32(int operation, const float *input, uint64_t count) {
+     uint64_t index = 0;
+     svfloat32_t accumulator = operation == PTX_REDUCE_MAX
+@@ -304,6 +386,104 @@ static float ptx_reduce_f32(int operation, const float *input, uint64_t count) {
+     return svaddv(svptrue_b32(), accumulator);
+ }
+ 
++static float ptx_reduce_mean_f32(const float *input, uint64_t count) {
++    return ptx_reduce_f32(PTX_REDUCE_SUM, input, count) / (float)count;
++}
++
++static void ptx_where_f32(const float *condition, const float *left,
++                          const float *right, float *output, uint64_t count) {
++    uint64_t index = 0;
++    while (index < count) {
++        svbool_t pg = svwhilelt_b32(index, count);
++        svfloat32_t predicate = svld1(pg, condition + index);
++        svfloat32_t a = svld1(pg, left + index);
++        svfloat32_t b = svld1(pg, right + index);
++        svbool_t selected = svcmpne(pg, predicate, svdup_n_f32(0.0f));
++        svst1(pg, output + index, svsel(selected, a, b));
++        index += svcntw();
++    }
++}
++
++static int ptx_math_bf16(int operation, const uint16_t *input,
++                         uint16_t *output, uint64_t count) {
++    size_t bytes;
++    uint64_t index;
++    float *values;
++    if (ptx_u64_to_size(count, &bytes) != PTX_STATUS_OK ||
++        ptx_size_mul(bytes, sizeof(float), &bytes) != PTX_STATUS_OK)
++        return PTX_STATUS_BAD_REQUEST;
++    values = (float *)malloc(bytes);
++    if (count && !values) return PTX_STATUS_RUNTIME;
++    for (index = 0; index < count; ++index) values[index] = ptx_bf16_to_f32(input[index]);
++    ptx_math_f32(operation, values, values, count);
++    for (index = 0; index < count; ++index) output[index] = ptx_f32_to_bf16(values[index]);
++    free(values);
++    return PTX_STATUS_OK;
++}
++
++static void ptx_cast_f32_bf16(const float *input, uint16_t *output, uint64_t count) {
++    uint64_t index = 0;
++    while (index < count) {
++        uint64_t lane, active = count - index;
++        svbool_t pg32 = svwhilelt_b32(index, count);
++        float values[8];
++        uint16_t converted[8];
++        svst1(pg32, values, svld1(pg32, input + index));
++        if (active > svcntw()) active = svcntw();
++        for (lane = 0; lane < active; ++lane) converted[lane] = ptx_f32_to_bf16(values[lane]);
++        {
++            svbool_t pg16 = svwhilelt_b16(index, count);
++            svuint16_t bits = svld1_u16(pg16, converted);
++            svst1_u16(pg16, output + index, bits);
++        }
++        index += svcntw();
++    }
++}
++
++static void ptx_cast_bf16_f32(const uint16_t *input, float *output, uint64_t count) {
++    uint64_t index = 0;
++    while (index < count) {
++        uint64_t lane, active = count - index;
++        svbool_t pg16 = svwhilelt_b16(index, count);
++        uint16_t bits[8];
++        float converted[8];
++        svst1_u16(pg16, bits, svld1_u16(pg16, input + index));
++        if (active > svcntw()) active = svcntw();
++        for (lane = 0; lane < active; ++lane) converted[lane] = ptx_bf16_to_f32(bits[lane]);
++        {
++            svbool_t pg32 = svwhilelt_b32(index, count);
++            svfloat32_t values = svld1(pg32, converted);
++            svst1(pg32, output + index, values);
++        }
++        index += svcntw();
++    }
++}
++
++static int ptx_where_bf16(const float *condition, const uint16_t *left,
++                          const uint16_t *right, uint16_t *output,
++                          uint64_t count) {
++    size_t bytes;
++    uint64_t index;
++    float *left_values, *right_values, *result;
++    if (ptx_u64_to_size(count, &bytes) != PTX_STATUS_OK ||
++        ptx_size_mul(bytes, sizeof(float), &bytes) != PTX_STATUS_OK)
++        return PTX_STATUS_BAD_REQUEST;
++    left_values = (float *)malloc(bytes);
++    right_values = (float *)malloc(bytes);
++    result = (float *)malloc(bytes);
++    if ((count && !left_values) || (count && !right_values) || (count && !result)) {
++        free(left_values); free(right_values); free(result); return PTX_STATUS_RUNTIME;
++    }
++    for (index = 0; index < count; ++index) {
++        left_values[index] = ptx_bf16_to_f32(left[index]);
++        right_values[index] = ptx_bf16_to_f32(right[index]);
++    }
++    ptx_where_f32(condition, left_values, right_values, result, count);
++    for (index = 0; index < count; ++index) output[index] = ptx_f32_to_bf16(result[index]);
++    free(left_values); free(right_values); free(result);
++    return PTX_STATUS_OK;
++}
++
+ static void ptx_matmul_f32(const float *left, const float *right,
+                            float *output, uint64_t m, uint64_t k, uint64_t n) {
+     uint64_t row;
+@@ -327,8 +507,13 @@ static void ptx_matmul_f32(const float *left, const float *right,
+ static int ptx_run(const PtxRequest *request, const unsigned char *payload,
+                    unsigned char *result) {
+     uint64_t count = request->count;
+-    size_t item_size = request->dtype == 0 ? sizeof(float) : sizeof(uint16_t);
+-    if (request->dtype > 1) return PTX_STATUS_BAD_REQUEST;
++    size_t item_size;
++    if (request->operation == PTX_CAST) {
++        item_size = request->dtype == 2 ? sizeof(float) : sizeof(uint16_t);
++    } else {
++        if (request->dtype > 1) return PTX_STATUS_BAD_REQUEST;
++        item_size = request->dtype == 0 ? sizeof(float) : sizeof(uint16_t);
++    }
+     if (request->operation == PTX_MATMUL) {
+         uint64_t left_count, right_count;
+         size_t left_bytes, left_elements, right_elements, output_elements;
+@@ -372,10 +557,13 @@ static int ptx_run(const PtxRequest *request, const unsigned char *payload,
+         }
+         return PTX_STATUS_OK;
+     }
+-    if (request->operation == PTX_REDUCE_SUM || request->operation == PTX_REDUCE_MAX) {
+-        if (count == 0 && request->operation == PTX_REDUCE_MAX) return PTX_STATUS_BAD_REQUEST;
++    if (request->operation == PTX_REDUCE_SUM || request->operation == PTX_REDUCE_MAX ||
++        request->operation == PTX_REDUCE_MEAN) {
++        if (count == 0) return PTX_STATUS_BAD_REQUEST;
+         if (request->dtype == 0) {
+-            *(float *)result = ptx_reduce_f32(request->operation, (const float *)payload, count);
++            *(float *)result = request->operation == PTX_REDUCE_MEAN
++                ? ptx_reduce_mean_f32((const float *)payload, count)
++                : ptx_reduce_f32(request->operation, (const float *)payload, count);
+         } else {
+             size_t count_elements, values_alloc;
+             float *values;
+@@ -393,6 +581,8 @@ static int ptx_run(const PtxRequest *request, const unsigned char *payload,
+                  * once at the output boundary. */
+                 reduced = 0.0f;
+                 for (index = 0; index < count; ++index) reduced += values[index];
++            } else if (request->operation == PTX_REDUCE_MEAN) {
++                reduced = ptx_reduce_mean_f32(values, count);
+             } else {
+                 reduced = ptx_reduce_f32(request->operation, values, count);
+             }
+@@ -401,6 +591,70 @@ static int ptx_run(const PtxRequest *request, const unsigned char *payload,
+         }
+         return PTX_STATUS_OK;
+     }
++    if (request->operation == PTX_CAST) {
++        if (request->dtype == 2) {
++            ptx_cast_f32_bf16((const float *)payload, (uint16_t *)result, count);
++        } else if (request->dtype == 3) {
++            ptx_cast_bf16_f32((const uint16_t *)payload, (float *)result, count);
++        } else {
++            return PTX_STATUS_BAD_REQUEST;
++        }
++        return PTX_STATUS_OK;
++    }
++    if (request->operation == PTX_EXP || request->operation == PTX_RSQRT ||
++        request->operation == PTX_SIGMOID || request->operation == PTX_SILU ||
++        request->operation == PTX_SOFTPLUS) {
++        if (request->dtype == 0) {
++            ptx_math_f32(request->operation, (const float *)payload, (float *)result, count);
++        } else {
++            int math_status = ptx_math_bf16(request->operation, (const uint16_t *)payload,
++                                             (uint16_t *)result, count);
++            if (math_status != PTX_STATUS_OK) return math_status;
++        }
++        return PTX_STATUS_OK;
++    }
++    if (request->operation == PTX_BROADCAST) {
++        if (request->dtype == 0) ptx_copy_f32((const float *)payload, (float *)result, count);
++        else {
++            size_t count_elements, values_alloc;
++            float *values;
++            uint64_t index;
++            if (ptx_u64_to_size(count, &count_elements) != PTX_STATUS_OK ||
++                ptx_size_mul(count_elements, sizeof(float), &values_alloc) != PTX_STATUS_OK)
++                return PTX_STATUS_BAD_REQUEST;
++            values = (float *)malloc(values_alloc);
++            if (count && !values) return PTX_STATUS_RUNTIME;
++            for (index = 0; index < count; ++index)
++                values[index] = ptx_bf16_to_f32(((const uint16_t *)payload)[index]);
++            ptx_copy_f32(values, values, count);
++            for (index = 0; index < count; ++index)
++                ((uint16_t *)result)[index] = ptx_f32_to_bf16(values[index]);
++            free(values);
++        }
++        return PTX_STATUS_OK;
++    }
++    if (request->operation == PTX_WHERE) {
++        size_t count_elements, condition_bytes, value_bytes;
++        const float *condition;
++        const unsigned char *selected;
++        if (ptx_u64_to_size(count, &count_elements) != PTX_STATUS_OK ||
++            ptx_size_mul(count_elements, sizeof(float), &condition_bytes) != PTX_STATUS_OK ||
++            ptx_size_mul(count_elements, item_size, &value_bytes) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        condition = (const float *)payload;
++        selected = payload + condition_bytes;
++        if (request->dtype == 0) {
++            ptx_where_f32(condition, (const float *)selected,
++                          (const float *)(selected + value_bytes),
++                          (float *)result, count);
++        } else {
++            int where_status = ptx_where_bf16(condition, (const uint16_t *)selected,
++                                              (const uint16_t *)(selected + value_bytes),
++                                              (uint16_t *)result, count);
++            if (where_status != PTX_STATUS_OK) return where_status;
++        }
++        return PTX_STATUS_OK;
++    }
+     if (request->operation == PTX_COPY) {
+         if (request->dtype == 0) ptx_copy_f32((const float *)payload, (float *)result, count);
+         else {
+@@ -545,7 +799,8 @@ int main(int argc, char **argv) {
+     response.magic = PTX_MAGIC;
+     response.version = PTX_VERSION;
+     response.status = (uint32_t)status;
+-    response.dtype = request.dtype;
++    response.dtype = request.operation == PTX_CAST
++        ? (request.dtype == 2 ? 1U : 0U) : request.dtype;
+     response.count = output_count;
+     if (write_all(&response, sizeof(response)) != 0 ||
+         (status == PTX_STATUS_OK && result_size && write_all(result, result_size) != 0)) {
+@@ -697,7 +952,11 @@ def _compile_native(target_ir: Sve256Program, options: Optional[CompileOptions])
+     native_flags = (
+         "-static", "-O2", "-std=c99", "-march=armv8.2-a+sve", "-msve-vector-bits=scalable"
+     )
+-    command = [compiler_path] + list(native_flags) + [str(source_path), "-o", str(temporary_output)]
++    # Keep ``native_flags`` as the ISA contract while recording the ordinary
++    # libm link separately; the transcendental fallback is explicit metadata,
++    # never an implicit scalar fallback in the plan.
++    link_flags = ("-lm",)
++    command = [compiler_path] + list(native_flags) + [str(source_path)] + list(link_flags) + ["-o", str(temporary_output)]
+     try:
+         source_path.write_text(source, encoding="utf-8")
+         environment = dict(os.environ)
+@@ -739,7 +998,7 @@ def _compile_native(target_ir: Sve256Program, options: Optional[CompileOptions])
+                 publication.unlink()
+     normalized = [Path(compiler_path).name]
+     normalized.extend(list(native_flags))
+-    normalized.extend([source_path.name, "-o", output_path.name])
++    normalized.extend([source_path.name, "-lm", "-o", output_path.name])
+     return (
+         output_path, source_digest, native_digest, compiler_path, compiler_version,
+         target_triple, tuple(normalized), native_flags,
+@@ -795,6 +1054,7 @@ class Sve256Compiler:
+             "native_source_digest": source_digest,
+             "native_variant": target_ir.native_variant,
+             "native_flags": list(native_flags),
++            "link_flags": ["-lm"],
+             "compiler": Path(compiler_path).name,
+             "compiler_version": compiler_version,
+             "compiler_target_triple": target_triple,
+@@ -803,6 +1063,8 @@ class Sve256Compiler:
+             "target_vl_bytes": 32,
+             "emitting_features": ["sve"],
+             "sve2_required": False,
++            "scalar_math_lane_fallback": ["exp", "sigmoid", "silu", "softplus"],
++            "sve_math_operations": ["rsqrt", "where", "broadcast", "cast", "reduce_mean"],
+             "execution_modes": ["native", "qemu"],
+             "guarded_buffer_self_test": True,
+         }
+diff --git a/python/pypto/lowering/cpu/aarch64/sve/lowering.py b/python/pypto/lowering/cpu/aarch64/sve/lowering.py
+index 4802d7234..68239c0be 100644
+--- a/python/pypto/lowering/cpu/aarch64/sve/lowering.py
++++ b/python/pypto/lowering/cpu/aarch64/sve/lowering.py
+@@ -190,11 +190,25 @@ class Sve256Program:
+                     ",".join(sorted(required))
+                 )
+             )
+-        for plan in self.vector_program.plans:
++        function = next(
++            function for function in self.vector_program.program.functions
++            if function.name == self.vector_program.entrypoint
++        )
++        for operation, plan in zip(function.body.operations, self.vector_program.plans):
+             if canonical_dtype(plan.dtype) not in ("float32", "bf16"):
+                 raise Sve256UnsupportedError(
+                     "SVE256 supports float32 and bf16 plans, got {!r}".format(plan.dtype)
+                 )
++            for input_index, input_ref in enumerate(operation.inputs):
++                input_dtype = canonical_dtype(input_ref.type.dtype)
++                if input_dtype not in ("float32", "bf16") and not (
++                    plan.operation == "where" and input_index == 0 and input_dtype == "bool"
++                ):
++                    raise Sve256UnsupportedError(
++                        "SVE256 does not support {!r} input dtype for operation {!r}".format(
++                            input_dtype, plan.operation
++                        )
++                    )
+ 
+     @property
+     def program(self) -> CoreProgram:
+diff --git a/python/pypto/lowering/cpu/vector/plan.py b/python/pypto/lowering/cpu/vector/plan.py
+index 88bde0030..71ec6c7e3 100644
+--- a/python/pypto/lowering/cpu/vector/plan.py
++++ b/python/pypto/lowering/cpu/vector/plan.py
+@@ -37,7 +37,27 @@ VECTOR_LOWERING_VERSION = 1
+ CPU_VECTOR_BACKEND = "cpu.vector.common"
+ DEFAULT_LANE_COUNT = 4
+ VECTOR_SUPPORTED_OPERATIONS = frozenset(
+-    ("constant", "identity", "add", "sub", "mul", "div", "neg", "reduce_sum", "reduce_max", "matmul")
++    (
++        "constant",
++        "identity",
++        "add",
++        "sub",
++        "mul",
++        "div",
++        "neg",
++        "cast",
++        "exp",
++        "rsqrt",
++        "sigmoid",
++        "silu",
++        "softplus",
++        "reduce_sum",
++        "reduce_max",
++        "reduce_mean",
++        "broadcast",
++        "where",
++        "matmul",
++    )
+ )
+ _SSA_NAME_RE = re.compile(r"^(?:%[A-Za-z0-9_.$-]+|[A-Za-z_][A-Za-z0-9_.$-]*)$")
+ 
+@@ -873,7 +893,7 @@ def _make_plan_for_operation(
+     # innermost-axis number) from their input.  The reduction iteration axis
+     # is defined by the input domain; elementwise/matmul outputs must share
+     # the input contiguous axis.
+-    refs = tuple(operation.inputs) if name in ("reduce_sum", "reduce_max") else tuple(operation.inputs) + (output,)
++    refs = tuple(operation.inputs) if name in ("reduce_sum", "reduce_max", "reduce_mean") else tuple(operation.inputs) + (output,)
+     layout, contiguous_axis = _check_layout(
+         program,
+         operation,
+@@ -882,11 +902,11 @@ def _make_plan_for_operation(
+     )
+     count = element_count(output_shape)
+     output_axis = len(output_shape) - 1 if output_shape else None
+-    if name in ("reduce_sum", "reduce_max"):
++    if name in ("reduce_sum", "reduce_max", "reduce_mean"):
+         contiguous_axis = output_axis
+     iteration = make_iteration_plan(count, lane_count, contiguous_axis, tail_policy)
+     dtype = canonical_dtype(output_type.dtype)
+-    if name in ("reduce_sum", "reduce_max"):
++    if name in ("reduce_sum", "reduce_max", "reduce_mean"):
+         input_type = operation.inputs[0].type
+         input_shape = static_shape(input_type, "vector reduction input")
+         axes = _normalise_axes(operation.attributes, len(input_shape), "vector reduction")
+diff --git a/python/pypto/lowering/cpu/x86/avx2/lowering.py b/python/pypto/lowering/cpu/x86/avx2/lowering.py
+index 78734ec3a..4fa441cac 100644
+--- a/python/pypto/lowering/cpu/x86/avx2/lowering.py
++++ b/python/pypto/lowering/cpu/x86/avx2/lowering.py
+@@ -19,6 +19,12 @@ AVX2_BACKEND = "cpu.avx2"
+ AVX2_LOWERING_VERSION = 1
+ AVX2_LANE_COUNT = 8
+ _ISA_FEATURES = frozenset(("avx", "avx2", "fma", "osxsave", "ymm"))
++# The vector-common planner is intentionally ahead of this native backend.
++# Keep the native AVX2 surface explicit until each operation has an emitting
++# lowering; accepting a plan here would otherwise fail later in the ABI.
++_NATIVE_SUPPORTED_OPERATIONS = frozenset(
++    ("constant", "identity", "add", "sub", "mul", "div", "neg", "reduce_sum", "reduce_max", "matmul")
++)
+ 
+ 
+ class Avx2Error(ValueError):
+@@ -99,6 +105,10 @@ class Avx2Program:
+         if not self.use_fma and "fma" in required:
+             raise Avx2ValidationError("non-FMA artifact must not require fma")
+         for plan in self.vector_program.plans:
++            if plan.operation not in _NATIVE_SUPPORTED_OPERATIONS:
++                raise Avx2UnsupportedError(
++                    "AVX2 has no emitting lowering for operation {!r}".format(plan.operation)
++                )
+             if canonical_dtype(plan.dtype) not in ("float32", "bf16"):
+                 raise Avx2UnsupportedError(
+                     "AVX2 supports float32 and bf16 plans, got {!r}".format(plan.dtype)
+diff --git a/python/pypto/lowering/cpu/x86/avx512/lowering.py b/python/pypto/lowering/cpu/x86/avx512/lowering.py
+index bdd3a3797..279d4b1d2 100644
+--- a/python/pypto/lowering/cpu/x86/avx512/lowering.py
++++ b/python/pypto/lowering/cpu/x86/avx512/lowering.py
+@@ -32,6 +32,11 @@ _ISA_FEATURES = frozenset(
+         "avx512bf16",
+     }
+ )
++# Keep vector-common growth separate from the currently emitted AVX-512 ABI.
++# A plan for a portable primitive must not silently become an AVX fallback.
++_NATIVE_SUPPORTED_OPERATIONS = frozenset(
++    ("constant", "identity", "add", "sub", "mul", "div", "neg", "reduce_sum", "reduce_max", "matmul")
++)
+ 
+ 
+ class Avx512Error(ValueError):
+@@ -214,6 +219,10 @@ class Avx512Program:
+             if not enabled and feature in required:
+                 raise Avx512ValidationError("disabled variant must not declare {}".format(feature))
+         for plan in self.vector_program.plans:
++            if plan.operation not in _NATIVE_SUPPORTED_OPERATIONS:
++                raise Avx512UnsupportedError(
++                    "AVX-512 has no emitting lowering for operation {!r}".format(plan.operation)
++                )
+             if canonical_dtype(plan.dtype) not in ("float32", "bf16"):
+                 raise Avx512UnsupportedError(
+                     "AVX-512 supports float32 and bf16 plans, got {!r}".format(plan.dtype)
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256.py b/python/tests/ut/pypto_x/test_cpu_sve256.py
+index 93547c930..a72052a9a 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import ctypes
+ from concurrent.futures import ThreadPoolExecutor
+ import hashlib
++import math
+ import os
+ import platform
+ import re
+@@ -375,6 +376,119 @@ def test_sve_identity_and_bf16_reduction_closure(tmp_path):
+     assert constant_actual.flat() == (1.0, 2.0, 3.0)
+ 
+ 
++@pytest.mark.parametrize("operation", ("exp", "rsqrt", "sigmoid", "silu", "softplus"))
++def test_sve_m1c1_math_tail_edges_match_scalar(operation, tmp_path):
++    value_type = CoreType.tensor("float32", (19,))
++    source = ValueRef("source", value_type)
++    output = ValueRef("output", value_type)
++    program = _program(operation, (source,), (output,), (Operation(operation, (source,), (output,)),))
++    _, _, artifact = _compile(program, tmp_path / operation)
++    values = [
++        -100.0, -4.0, -1.0, -0.0, 0.0, 1.0, 4.0, 100.0,
++        float("inf"), float("-inf"), float("nan"), 0.25, -0.25,
++        3.5, -3.5, 7.0, -7.0, 1.0e-6, -1.0e-6,
++    ]
++    actual = HostTensor.zeros("float32", (19,))
++    expected = HostTensor.zeros("float32", (19,))
++    source_tensor = HostTensor("float32", (19,), values)
++    _run(artifact, [source_tensor], actual)
++    _scalar_run(program, [source_tensor], expected)
++    for left, right in zip(actual.flat(), expected.flat()):
++        if math.isnan(right):
++            assert math.isnan(left)
++        elif math.isinf(right):
++            assert left == right
++        else:
++            assert left == pytest.approx(right, rel=3e-5, abs=3e-5)
++
++
++def test_sve_m1c1_cast_reduce_mean_broadcast_and_where(tmp_path):
++    cast_input = ValueRef("cast_input", CoreType.tensor("float32", (19,)))
++    cast_output = ValueRef("cast_output", CoreType.tensor("bf16", (19,)))
++    cast_program = _program(
++        "cast",
++        (cast_input,),
++        (cast_output,),
++        (Operation("cast", (cast_input,), (cast_output,), attributes={"dtype": "bf16"}),),
++    )
++    _, _, cast_artifact = _compile(cast_program, tmp_path / "cast")
++    cast_values = [index * 0.125 - 1.0 for index in range(19)]
++    cast_actual = HostTensor.zeros("bf16", (19,))
++    cast_expected = HostTensor.zeros("bf16", (19,))
++    cast_source = HostTensor("float32", (19,), cast_values)
++    _run(cast_artifact, [cast_source], cast_actual)
++    _scalar_run(cast_program, [cast_source], cast_expected)
++    assert cast_actual.flat() == cast_expected.flat()
++
++    reverse_input = ValueRef("reverse_input", CoreType.tensor("bf16", (19,)))
++    reverse_output = ValueRef("reverse_output", CoreType.tensor("float32", (19,)))
++    reverse_program = _program(
++        "cast_reverse",
++        (reverse_input,),
++        (reverse_output,),
++        (Operation("cast", (reverse_input,), (reverse_output,), attributes={"dtype": "float32"}),),
++    )
++    _, _, reverse_artifact = _compile(reverse_program, tmp_path / "cast-reverse")
++    reverse_actual = HostTensor.zeros("float32", (19,))
++    reverse_expected = HostTensor.zeros("float32", (19,))
++    reverse_source = HostTensor("bf16", (19,), cast_values)
++    _run(reverse_artifact, [reverse_source], reverse_actual)
++    _scalar_run(reverse_program, [reverse_source], reverse_expected)
++    assert reverse_actual.flat() == reverse_expected.flat()
++
++    reduce_input = ValueRef("reduce_input", CoreType.tensor("float32", (2, 19)))
++    reduce_output = ValueRef("reduce_output", CoreType.tensor("float32", (2,)))
++    reduce_program = _program(
++        "reduce_mean",
++        (reduce_input,),
++        (reduce_output,),
++        (Operation("reduce_mean", (reduce_input,), (reduce_output,), attributes={"axis": 1}),),
++    )
++    _, _, reduce_artifact = _compile(reduce_program, tmp_path / "reduce-mean")
++    reduce_values = [index * 0.125 - 4.0 for index in range(38)]
++    reduce_actual = HostTensor.zeros("float32", (2,))
++    reduce_expected = HostTensor.zeros("float32", (2,))
++    reduce_source = HostTensor("float32", (2, 19), reduce_values)
++    _run(reduce_artifact, [reduce_source], reduce_actual)
++    _scalar_run(reduce_program, [reduce_source], reduce_expected)
++    assert compare_outputs(reduce_expected, reduce_actual, atol=3e-6, rtol=3e-6).passed
++
++    broadcast_input = ValueRef("broadcast_input", CoreType.tensor("float32", (2, 1)))
++    broadcast_output = ValueRef("broadcast_output", CoreType.tensor("float32", (2, 3)))
++    broadcast_program = _program(
++        "broadcast",
++        (broadcast_input,),
++        (broadcast_output,),
++        (Operation("broadcast", (broadcast_input,), (broadcast_output,), attributes={"shape": [2, 3]}),),
++    )
++    _, _, broadcast_artifact = _compile(broadcast_program, tmp_path / "broadcast")
++    broadcast_actual = HostTensor.zeros("float32", (2, 3))
++    _run(broadcast_artifact, [HostTensor("float32", (2, 1), [[2.0], [5.0]])], broadcast_actual)
++    assert broadcast_actual.tolist() == [[2.0, 2.0, 2.0], [5.0, 5.0, 5.0]]
++
++    condition = ValueRef("condition", CoreType.tensor("bool", (2, 1)))
++    true_value = ValueRef("true_value", CoreType.tensor("bf16", (1, 3)))
++    false_value = ValueRef("false_value", CoreType.tensor("bf16", (2, 3)))
++    selected = ValueRef("selected", CoreType.tensor("bf16", (2, 3)))
++    where_program = _program(
++        "where",
++        (condition, true_value, false_value),
++        (selected,),
++        (Operation("where", (condition, true_value, false_value), (selected,)),),
++    )
++    _, _, where_artifact = _compile(where_program, tmp_path / "where")
++    where_actual = HostTensor.zeros("bf16", (2, 3))
++    where_expected = HostTensor.zeros("bf16", (2, 3))
++    where_inputs = [
++        HostTensor("bool", (2, 1), [[True], [False]]),
++        HostTensor("bf16", (1, 3), [[1.0, 2.0, 3.0]]),
++        HostTensor("bf16", (2, 3), [[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]]),
++    ]
++    _run(where_artifact, where_inputs, where_actual)
++    _scalar_run(where_program, where_inputs, where_expected)
++    assert where_actual.flat() == where_expected.flat()
++
++
+ def test_sve_scalar_broadcast_uses_shared_launch_scalars(tmp_path):
+     tensor_type = CoreType.tensor("float32", (9,))
+     scalar_type = CoreType.scalar("float32")
+diff --git a/python/tests/ut/pypto_x/test_cpu_vector_common.py b/python/tests/ut/pypto_x/test_cpu_vector_common.py
+index ca9dba530..318ce5190 100644
+--- a/python/tests/ut/pypto_x/test_cpu_vector_common.py
++++ b/python/tests/ut/pypto_x/test_cpu_vector_common.py
+@@ -6,6 +6,8 @@ bootstrap path instead of a fake ``sys.modules`` package.
+ 
+ from __future__ import annotations
+ 
++import math
++
+ import pytest
+ import numpy as np
+ 
+@@ -363,3 +365,103 @@ def test_wrong_target_and_readonly_output_are_rejected():
+                 outputs=[output.descriptor(readonly=True)],
+             )
+         )
++
++
++def test_m1c1_vector_math_cast_reduction_broadcast_and_where_match_scalar():
++    source_type = CoreType.tensor("float32", (11,))
++    source = ValueRef("source", source_type)
++    output = ValueRef("output", source_type)
++    values = [-100.0, -4.0, -1.0, -0.0, 0.0, 1.0, 4.0, 100.0, float("inf"), float("-inf"), float("nan")]
++    compiler = CpuVectorCompiler()
++    for name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++        program = _program(name, (source,), (output,), (Operation(name, (source,), (output,)),))
++        artifact = compiler.compile(compiler.lower(program, TARGET))
++        actual = HostTensor.zeros("float32", (11,))
++        _run(artifact, [HostTensor("float32", (11,), values)], actual)
++        expected = HostTensor.zeros("float32", (11,))
++        scalar = __import__("pypto.compiler.targets.cpu", fromlist=["CpuScalarCompiler"]).CpuScalarCompiler()
++        scalar_artifact = scalar.compile(scalar.lower(program, TargetSpec("cpu", "x86_64-linux-gnu")))
++        CpuScalarRuntime().launch(
++            LaunchRequest(
++                scalar_artifact,
++                inputs=[HostTensor("float32", (11,), values).descriptor(readonly=True)],
++                outputs=[expected.descriptor()],
++            )
++        )
++        for left, right in zip(actual.flat(), expected.flat()):
++            if math.isnan(right):
++                assert math.isnan(left)
++            else:
++                assert left == pytest.approx(right, rel=2e-6, abs=2e-6)
++
++    input_type = CoreType.tensor("float32", (2, 3))
++    mean_type = CoreType.tensor("float32", (2, 1))
++    reduce_source = ValueRef("reduce_source", input_type)
++    reduce_output = ValueRef("reduce_output", mean_type)
++    reduce_program = _program(
++        "reduce_mean",
++        (reduce_source,),
++        (reduce_output,),
++        (Operation("reduce_mean", (reduce_source,), (reduce_output,), attributes={"axis": 1, "keepdims": True}),),
++    )
++    reduce_artifact = compiler.compile(compiler.lower(reduce_program, TARGET))
++    reduce_actual = HostTensor.zeros("float32", (2, 1))
++    _run(reduce_artifact, [HostTensor("float32", (2, 3), [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])], reduce_actual)
++    assert reduce_actual.tolist() == [[2.0], [5.0]]
++
++    broadcast_source = ValueRef("broadcast_source", mean_type)
++    broadcast_output = ValueRef("broadcast_output", input_type)
++    broadcast_program = _program(
++        "broadcast",
++        (broadcast_source,),
++        (broadcast_output,),
++        (Operation("broadcast", (broadcast_source,), (broadcast_output,), attributes={"shape": [2, 3]}),),
++    )
++    broadcast_artifact = compiler.compile(compiler.lower(broadcast_program, TARGET))
++    broadcast_actual = HostTensor.zeros("float32", (2, 3))
++    _run(broadcast_artifact, [HostTensor("float32", (2, 1), [[2.0], [5.0]])], broadcast_actual)
++    assert broadcast_actual.tolist() == [[2.0, 2.0, 2.0], [5.0, 5.0, 5.0]]
++
++    condition_type = CoreType.tensor("bool", (2, 1))
++    true_type = CoreType.tensor("float32", (1, 3))
++    false_type = CoreType.tensor("float32", (2, 3))
++    condition = ValueRef("condition", condition_type)
++    true_value = ValueRef("true_value", true_type)
++    false_value = ValueRef("false_value", false_type)
++    selected = ValueRef("selected", input_type)
++    where_program = _program(
++        "where",
++        (condition, true_value, false_value),
++        (selected,),
++        (Operation("where", (condition, true_value, false_value), (selected,)),),
++    )
++    where_artifact = compiler.compile(compiler.lower(where_program, TARGET))
++    where_actual = HostTensor.zeros("float32", (2, 3))
++    _run(
++        where_artifact,
++        [
++            HostTensor("bool", (2, 1), [[True], [False]]),
++            HostTensor("float32", (1, 3), [[1.0, 2.0, 3.0]]),
++            HostTensor("float32", (2, 3), [[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]]),
++        ],
++        where_actual,
++    )
++    assert where_actual.tolist() == [[1.0, 2.0, 3.0], [40.0, 50.0, 60.0]]
++
++    cast_source = ValueRef("cast_source", CoreType.tensor("float32", (11,)))
++    cast_output = ValueRef("cast_output", CoreType.tensor("bf16", (11,)))
++    cast_program = _program(
++        "cast",
++        (cast_source,),
++        (cast_output,),
++        (Operation("cast", (cast_source,), (cast_output,), attributes={"dtype": "bf16"}),),
++    )
++    cast_artifact = compiler.compile(compiler.lower(cast_program, TARGET))
++    cast_actual = HostTensor.zeros("bf16", (11,))
++    _run(cast_artifact, [HostTensor("float32", (11,), values)], cast_actual)
++    cast_expected = HostTensor("bf16", (11,), values)
++    for left, right in zip(cast_actual.flat(), cast_expected.flat()):
++        if math.isnan(right):
++            assert math.isnan(left)
++        else:
++            assert left == right

@@ -1,0 +1,2056 @@
+From baf826aae07e643cf60196c66016bc5303bfc90b Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Wed, 9 Sep 2026 13:51:28 +0800
+Subject: [PATCH 73/96] feat(pypto-x): connect no-weight qwen35 decoder graph
+
+---
+ python/pypto/lowering/cpu/vector/plan.py                        |   14 +
+ python/pypto/portable/__init__.py                               |    4 +
+ python/pypto/portable/qwen35.py                                 | 1627 ++++++++++++++++++++++++++-
+ .../tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py   |  189 ++++
+ python/tests/ut/pypto_x/test_qwen35_position_control.py         |   17 +-
+ 5 files changed, 1788 insertions(+), 63 deletions(-)
+
+diff --git a/python/pypto/lowering/cpu/vector/plan.py b/python/pypto/lowering/cpu/vector/plan.py
+index f1f3bdae4..e4392eb8b 100644
+--- a/python/pypto/lowering/cpu/vector/plan.py
++++ b/python/pypto/lowering/cpu/vector/plan.py
+@@ -2113,6 +2113,20 @@ def lower_cpu_vector(
+     policy = _tail_policy(tail_policy if tail_policy is not None else target.attributes.get("tail_policy"))
+     required = _target_required_features(target, required_features)
+     normalized_specialization = _target_specialization(target, specialization)
++    # Full no-weight model graphs may contain very large logical domains
++    # (vocabulary projection, KV cache and broadcasted attention tensors).
++    # Their target IR must remain symbolic/compact by default; otherwise the
++    # generic vector path would allocate one Python VectorChunk per lane block.
++    # An explicit ``False`` is rejected so callers cannot accidentally revive
++    # the unsafe materialization path.
++    if program.metadata.get("requires_compact_iteration"):
++        if normalized_specialization.get("compact_iteration") is False:
++            raise CpuVectorUnsupportedError(
++                "program requires compact vector iteration; per-chunk materialization is disabled"
++            )
++        compact_specialization = dict(normalized_specialization)
++        compact_specialization["compact_iteration"] = True
++        normalized_specialization = frozen_mapping(compact_specialization)
+     function = functions[selected]
+     plans = tuple(
+         _make_plan_for_operation(
+diff --git a/python/pypto/portable/__init__.py b/python/pypto/portable/__init__.py
+index e4f5d12d3..a4c7e6cd9 100644
+--- a/python/pypto/portable/__init__.py
++++ b/python/pypto/portable/__init__.py
+@@ -22,8 +22,10 @@ from .qwen35 import (
+     build_qwen35_position_ids,
+     build_qwen35_causal_mask_from_positions,
+     build_qwen35_text_decoder_graph,
++    build_qwen35_text_decoder_structural_shell,
+     build_position_ids,
+     qwen35_text_decoder_manifest,
++    qwen35_text_decoder_structural_manifest,
+     build_qwen35_gated_delta_recurrent_state,
+     build_qwen35_gated_delta_conv_state,
+     build_qwen35_attention_kv_cache,
+@@ -51,8 +53,10 @@ __all__ = [
+     "build_qwen35_position_ids",
+     "build_qwen35_causal_mask_from_positions",
+     "build_qwen35_text_decoder_graph",
++    "build_qwen35_text_decoder_structural_shell",
+     "build_position_ids",
+     "qwen35_text_decoder_manifest",
++    "qwen35_text_decoder_structural_manifest",
+     "build_qwen35_gated_delta_recurrent_state",
+     "build_qwen35_gated_delta_conv_state",
+     "build_qwen35_attention_kv_cache",
+diff --git a/python/pypto/portable/qwen35.py b/python/pypto/portable/qwen35.py
+index d001c0767..a081ee357 100644
+--- a/python/pypto/portable/qwen35.py
++++ b/python/pypto/portable/qwen35.py
+@@ -27,6 +27,8 @@ list/wire staging，builder 本身不改变这些事实。
+ 
+ from __future__ import annotations
+ 
++import math
++from collections import Counter
+ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+ 
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
+@@ -34,6 +36,10 @@ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region
+ 
+ _SUPPORTED_DTYPES = frozenset(("bf16", "float32"))
+ _SUPPORTED_INDEX_DTYPES = frozenset(("int32", "int64"))
++_QWEN35_DECODER_GRAPH_CONTRACT_VERSION = 2
++_QWEN35_DECODER_GRAPH_PROFILE_VERSION = 1
++_UINT64_MAX = (1 << 64) - 1
++_DTYPE_BYTES = {"bf16": 2, "float32": 4, "int64": 8, "bool": 1}
+ 
+ # This is a static shape harness contract, not a loaded model configuration.
+ # The dimensions are intentionally kept in metadata only; builders still take
+@@ -238,6 +244,300 @@ def _cast_from_f32(builder: _Builder, value: ValueRef, output_dtype: str, prefix
+     )[0]
+ 
+ 
++def _constant_scalar(builder: _Builder, name: str, value: float, dtype: str = "float32") -> ValueRef:
++    """Emit a small scalar constant used by a composite.
++
++    Constants are deliberately limited to numerical policy values (epsilon,
++    scale and mask fill).  Model parameters are never represented by a
++    ``constant`` operation; they remain explicit function parameters.
++    """
++
++    return builder.op(
++        "constant",
++        (),
++        ((name, _scalar(dtype)),),
++        {"value": value},
++    )[0]
++
++
++def _reshape(builder: _Builder, value: ValueRef, shape: Sequence[int], name: str) -> ValueRef:
++    """Emit a checked logical reshape while keeping stable SSA names."""
++
++    result_shape = tuple(shape)
++    return builder.op(
++        "reshape",
++        (value,),
++        ((name, _tensor(value.type.dtype, result_shape)),),
++        {"shape": list(result_shape)},
++    )[0]
++
++
++def _transpose(builder: _Builder, value: ValueRef, permutation: Sequence[int], name: str) -> ValueRef:
++    """Emit an explicit permutation; no implicit matmul transpose is used."""
++
++    permutation = tuple(permutation)
++    input_shape = tuple(value.type.shape)
++    output_shape = tuple(input_shape[index] for index in permutation)
++    return builder.op(
++        "transpose",
++        (value,),
++        ((name, _tensor(value.type.dtype, output_shape)),),
++        {"permutation": list(permutation)},
++    )[0]
++
++
++def _l2_core(
++    builder: _Builder,
++    x: ValueRef,
++    epsilon: ValueRef,
++    dtype: str,
++    shape: Tuple[int, ...],
++    prefix: str,
++) -> ValueRef:
++    """Build the Qwen GDR query/key L2 normalization in portable primitives."""
++
++    x_f32 = _as_f32(builder, x, dtype, prefix + "_x")
++    square = builder.op(
++        "mul",
++        (x_f32, x_f32),
++        ((prefix + "_square", _tensor("float32", shape)),),
++    )[0]
++    reduced_shape = shape[:-1] + (1,)
++    total = builder.op(
++        "reduce_sum",
++        (square,),
++        ((prefix + "_sum", _tensor("float32", reduced_shape)),),
++        {"axis": -1, "keepdims": True},
++    )[0]
++    stabilized = builder.op(
++        "add",
++        (total, epsilon),
++        ((prefix + "_sum_eps", _tensor("float32", reduced_shape)),),
++    )[0]
++    inverse = builder.op(
++        "rsqrt",
++        (stabilized,),
++        ((prefix + "_inverse", _tensor("float32", reduced_shape)),),
++    )[0]
++    inverse_full = builder.op(
++        "broadcast",
++        (inverse,),
++        ((prefix + "_inverse_full", _tensor("float32", shape)),),
++        {"shape": list(shape)},
++    )[0]
++    return builder.op(
++        "mul",
++        (x_f32, inverse_full),
++        ((prefix + "_normalized", _tensor("float32", shape)),),
++    )[0]
++
++
++def _linear_projection(
++    builder: _Builder,
++    x: ValueRef,
++    weight: ValueRef,
++    input_dtype: str,
++    output_dtype: str,
++    input_shape: Tuple[int, ...],
++    output_features: int,
++    prefix: str,
++    weight_dtype: Optional[str] = None,
++) -> ValueRef:
++    """Build ``x @ weight.T`` for a model weight stored as ``[out,in]``.
++
++    The Qwen/Gym parameter contract stores linear weights in PyTorch layout.
++    Making the transpose an explicit Core operation keeps the graph portable
++    and makes the parameter's layout auditable by each target lowering.
++    """
++
++    rows = 1
++    for dimension in input_shape[:-1]:
++        rows *= dimension
++    input_width = input_shape[-1]
++    x_flat = _reshape(
++        builder,
++        _as_f32(builder, x, input_dtype, prefix + "_input_f32"),
++        (rows, input_width),
++        prefix + "_input_flat",
++    )
++    weight_f32 = _as_f32(builder, weight, weight_dtype or input_dtype, prefix + "_weight_f32")
++    weight_t = _transpose(builder, weight_f32, (1, 0), prefix + "_weight_t")
++    projected_f32 = builder.op(
++        "matmul",
++        (x_flat, weight_t),
++        ((prefix + "_projected_f32", _tensor("float32", (rows, output_features))),),
++    )[0]
++    projected = _cast_from_f32(builder, projected_f32, output_dtype, prefix + "_projected")
++    return _reshape(builder, projected, input_shape[:-1] + (output_features,), prefix + "_output")
++
++
++def _checked_element_count(shape: Sequence[int], field: str) -> int:
++    result = 1
++    for index, dimension in enumerate(shape):
++        if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension < 0:
++            raise ValueError("{}[{}] must be a non-negative integer".format(field, index))
++        if dimension and result > _UINT64_MAX // dimension:
++            raise ValueError("{} element count exceeds uint64".format(field))
++        result *= dimension
++    return result
++
++
++def _decoder_parameter_entry(
++    name: str,
++    shape: Sequence[int],
++    dtype: str,
++    *,
++    count: int = 1,
++    aliases: Sequence[str] = (),
++    storage_id: Optional[str] = None,
++) -> Mapping[str, Any]:
++    """Return a compact, uint64-checked parameter manifest entry."""
++
++    elements = _checked_element_count(shape, name)
++    if dtype not in _DTYPE_BYTES:
++        raise ValueError("unsupported parameter dtype {!r}".format(dtype))
++    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
++        raise ValueError("{} count must be positive".format(name))
++    if elements > _UINT64_MAX // count:
++        raise ValueError("{} element count exceeds uint64".format(name))
++    total_elements = elements * count
++    bytes_per_tensor = elements * _DTYPE_BYTES[dtype]
++    if bytes_per_tensor > _UINT64_MAX // count:
++        raise ValueError("{} storage bytes exceed uint64".format(name))
++    storage_bytes = bytes_per_tensor * count
++    return {
++        "name": name,
++        "storage_id": storage_id or name,
++        "shape": list(shape),
++        "dtype": dtype,
++        "count": count,
++        "elements_per_tensor": elements,
++        "parameter_elements": total_elements,
++        "storage_bytes": storage_bytes,
++        "aliases": list(aliases),
++    }
++
++
++def _decoder_shape_profile(shape_profile: str, query_heads: int) -> Mapping[str, int]:
++    """Resolve the fixed model profile or an explicitly test-only small profile."""
++
++    if not isinstance(shape_profile, str):
++        raise TypeError("shape_profile must be a string")
++    profile = shape_profile.strip().lower().replace("-", "_")
++    if profile in ("model", "fixed", "qwen35_08b", "qwen3_5_0_8b"):
++        if query_heads != QWEN35_08B_SHAPE_METADATA["num_attention_heads"]:
++            raise ValueError("fixed Qwen3.5 profile requires query_heads=8")
++        model = QWEN35_08B_SHAPE_METADATA
++        return {
++            "hidden": int(model["hidden_size"]),
++            "intermediate": int(model["intermediate_size"]),
++            "vocab": 248320,
++            "query_heads": 8,
++            "kv_heads": int(model["num_key_value_heads"]),
++            "head_dim": int(model["head_dim"]),
++            "rotary_dim": int(model["rotary_dim"]),
++            "linear_key_heads": int(model["linear_num_key_heads"]),
++            "linear_value_heads": int(model["linear_num_value_heads"]),
++            "linear_key_dim": int(model["linear_key_head_dim"]),
++            "linear_value_dim": int(model["linear_value_head_dim"]),
++            "conv_kernel": int(model["linear_conv_kernel_dim"]),
++        }
++    if profile in ("test", "synthetic", "synthetic_test", "test_only"):
++        # This is intentionally tiny but preserves every fixed route and all
++        # 24 layers.  It must never be used as the real-model profile.
++        if query_heads == 8:
++            query_heads = 2
++        if query_heads <= 0 or query_heads % 1:
++            raise ValueError("test shape profile requires positive query_heads")
++        return {
++            "hidden": 8,
++            "intermediate": 16,
++            "vocab": 32,
++            "query_heads": int(query_heads),
++            "kv_heads": 1,
++            "head_dim": 4,
++            "rotary_dim": 2,
++            "linear_key_heads": 2,
++            "linear_value_heads": 2,
++            "linear_key_dim": 2,
++            "linear_value_dim": 2,
++            "conv_kernel": 4,
++        }
++    raise ValueError(
++        "unknown shape_profile {!r}; use 'model' or the explicit test-only 'synthetic_test' profile".format(
++            shape_profile
++        )
++    )
++
++
++def _decoder_parameter_manifest(profile: Mapping[str, int], dtype: str) -> Tuple[Mapping[str, Any], ...]:
++    """Return one entry per unique storage class, with per-layer counts."""
++
++    h = profile["hidden"]
++    i = profile["intermediate"]
++    v = profile["vocab"]
++    qh = profile["query_heads"]
++    kvh = profile["kv_heads"]
++    d = profile["head_dim"]
++    nk = profile["linear_key_heads"]
++    nv = profile["linear_value_heads"]
++    dk = profile["linear_key_dim"]
++    dv = profile["linear_value_dim"]
++    c = 2 * nk * dk + nv * dv
++    return (
++        _decoder_parameter_entry(
++            "embedding_lm_head_shared_weight",
++            (v, h),
++            dtype,
++            aliases=("embedding.weight", "lm_head.weight"),
++            storage_id="embedding_lm_head_shared_weight",
++        ),
++        _decoder_parameter_entry("layers.*.input_layernorm.weight", (h,), dtype, count=24),
++        _decoder_parameter_entry("layers.*.post_attention_layernorm.weight", (h,), dtype, count=24),
++        _decoder_parameter_entry("final_norm.weight", (h,), dtype),
++        _decoder_parameter_entry("layers.*.mlp.gate_proj.weight", (i, h), dtype, count=24),
++        _decoder_parameter_entry("layers.*.mlp.up_proj.weight", (i, h), dtype, count=24),
++        _decoder_parameter_entry("layers.*.mlp.down_proj.weight", (h, i), dtype, count=24),
++        _decoder_parameter_entry(
++            "layers.full_attention.*.q_proj.weight", (qh * d * 2, h), dtype, count=6
++        ),
++        _decoder_parameter_entry("layers.full_attention.*.k_proj.weight", (kvh * d, h), dtype, count=6),
++        _decoder_parameter_entry("layers.full_attention.*.v_proj.weight", (kvh * d, h), dtype, count=6),
++        _decoder_parameter_entry("layers.full_attention.*.o_proj.weight", (h, qh * d), dtype, count=6),
++        _decoder_parameter_entry("layers.full_attention.*.q_norm.weight", (d,), dtype, count=6),
++        _decoder_parameter_entry("layers.full_attention.*.k_norm.weight", (d,), dtype, count=6),
++        _decoder_parameter_entry(
++            "layers.linear_attention.*.in_proj_qkv.weight",
++            (2 * nk * dk + nv * dv, h),
++            dtype,
++            count=18,
++        ),
++        _decoder_parameter_entry("layers.linear_attention.*.in_proj_z.weight", (nv * dv, h), dtype, count=18),
++        _decoder_parameter_entry("layers.linear_attention.*.in_proj_b.weight", (nv, h), dtype, count=18),
++        _decoder_parameter_entry("layers.linear_attention.*.in_proj_a.weight", (nv, h), dtype, count=18),
++        _decoder_parameter_entry(
++            "layers.linear_attention.*.conv1d.weight", (c, 1, profile["conv_kernel"]), dtype, count=18
++        ),
++        _decoder_parameter_entry("layers.linear_attention.*.A_log", (nv,), dtype, count=18),
++        _decoder_parameter_entry("layers.linear_attention.*.dt_bias", (nv,), dtype, count=18),
++        _decoder_parameter_entry("layers.linear_attention.*.norm.weight", (dv,), dtype, count=18),
++        _decoder_parameter_entry("layers.linear_attention.*.out_proj.weight", (h, nv * dv), dtype, count=18),
++    )
++
++
++def _manifest_bytes(entries: Sequence[Mapping[str, Any]]) -> Tuple[int, int]:
++    total_elements = 0
++    total_bytes = 0
++    for entry in entries:
++        elements = int(entry["parameter_elements"])
++        bytes_value = int(entry["storage_bytes"])
++        if total_elements > _UINT64_MAX - elements or total_bytes > _UINT64_MAX - bytes_value:
++            raise ValueError("decoder parameter manifest exceeds uint64")
++        total_elements += elements
++        total_bytes += bytes_value
++    return total_elements, total_bytes
++
++
+ def _rms_core(
+     builder: _Builder,
+     x: ValueRef,
+@@ -307,6 +607,72 @@ def _rms_core(
+     )[0]
+ 
+ 
++def _rms_gated_core(
++    builder: _Builder,
++    x: ValueRef,
++    weight: ValueRef,
++    epsilon: ValueRef,
++    dtype: str,
++    shape: Tuple[int, ...],
++    prefix: str,
++) -> ValueRef:
++    """Build Qwen3.5's post-GDR ``RMSNormGated`` body.
++
++    The checkpoint's gated norm stores a direct scale initialized to one.  It
++    therefore differs from the decoder RMSNorm delta convention above: the
++    scale is multiplied directly, and the gate is applied as ``silu(z)``
++    after normalization.
++    """
++
++    f32 = "float32"
++    x_f32 = x if x.type.dtype == "float32" else _as_f32(builder, x, dtype, prefix + "_x")
++    squared = builder.op(
++        "mul",
++        (x_f32, x_f32),
++        ((prefix + "_square", _tensor(f32, shape)),),
++    )[0]
++    reduced_shape = shape[:-1] + (1,)
++    mean = builder.op(
++        "reduce_mean",
++        (squared,),
++        ((prefix + "_mean", _tensor(f32, reduced_shape)),),
++        {"axis": -1, "keepdims": True},
++    )[0]
++    stabilized = builder.op(
++        "add",
++        (mean, epsilon),
++        ((prefix + "_mean_eps", _tensor(f32, reduced_shape)),),
++    )[0]
++    inverse = builder.op(
++        "rsqrt",
++        (stabilized,),
++        ((prefix + "_inverse", _tensor(f32, reduced_shape)),),
++    )[0]
++    inverse_full = builder.op(
++        "broadcast",
++        (inverse,),
++        ((prefix + "_inverse_full", _tensor(f32, shape)),),
++        {"shape": list(shape)},
++    )[0]
++    normalized = builder.op(
++        "mul",
++        (x_f32, inverse_full),
++        ((prefix + "_normalized", _tensor(f32, shape)),),
++    )[0]
++    weight_f32 = _as_f32(builder, weight, dtype, prefix + "_weight")
++    weight_full = builder.op(
++        "broadcast",
++        (weight_f32,),
++        ((prefix + "_weight_full", _tensor(f32, shape)),),
++        {"shape": list(shape)},
++    )[0]
++    return builder.op(
++        "mul",
++        (normalized, weight_full),
++        ((prefix + "_scaled", _tensor(f32, shape)),),
++    )[0]
++
++
+ def _rope_core(
+     builder: _Builder,
+     x: ValueRef,
+@@ -928,47 +1294,92 @@ def qwen35_text_decoder_manifest(
+     dtype: str = "bf16",
+     query_heads: int = 8,
+     index_dtype: str = "int64",
++    shape_profile: str = "model",
++    profile: Optional[str] = None,
+ ) -> Mapping[str, Any]:
+-    """Return a no-weight structural manifest for the fixed 0.8B text stack.
++    """Return the complete no-weight Qwen3.5 text decoder contract.
++
++    The manifest describes an executable *parameterized* graph.  It contains
++    no checkpoint bytes and never allocates a weight/state buffer.  Every
++    layer route, parameter storage class, functional state transition and
++    output def-use edge is recorded so a compiler/launcher can reject a
++    mismatched binding before any data is supplied.
+ 
+-    This manifest is intentionally separate from executable weight loading.
+-    It records every layer route and state interface while carrying no model
+-    tensors; the current Python list/wire ABI is therefore never asked to
+-    hold the approximately 873M-parameter checkpoint.
++    ``shape_profile='synthetic_test'`` is an explicitly marked small profile
++    for differential execution.  It retains 24 layers and the exact 18/6
++    topology but must not be used as evidence for the 0.8B model.
+     """
+ 
+     batch = _positive_or_zero_int(batch, "batch", allow_zero=False)
+-    steps = _positive_or_zero_int(steps, "steps", allow_zero=True)
++    steps = _positive_or_zero_int(steps, "steps", allow_zero=False)
+     past_length = _positive_or_zero_int(past_length, "past_length", allow_zero=True)
+     query_heads = _positive_or_zero_int(query_heads, "query_heads", allow_zero=False)
+     dtype = _dtype(dtype, "dtype")
+     index_dtype = _qwen35_index_dtype(index_dtype)
++    if profile is not None:
++        if shape_profile != "model":
++            raise ValueError("specify only one of shape_profile and profile")
++        shape_profile = profile
++    profile_values = _decoder_shape_profile(shape_profile, query_heads)
+     total = past_length + steps
+     if total > (1 << 63) - 1:
+         raise ValueError("past_length + steps overflows signed int64")
++    if total > 262144:
++        raise ValueError("past_length + steps exceeds Qwen3.5 max_position_embeddings")
+     model = QWEN35_08B_SHAPE_METADATA
+-    hidden = model["hidden_size"]
++    hidden = profile_values["hidden"]
++    qh = profile_values["query_heads"]
++    kvh = profile_values["kv_heads"]
++    d = profile_values["head_dim"]
++    rotary_dim = profile_values["rotary_dim"]
++    nk = profile_values["linear_key_heads"]
++    nv = profile_values["linear_value_heads"]
++    dk = profile_values["linear_key_dim"]
++    dv = profile_values["linear_value_dim"]
++    conv_channels = 2 * nk * dk + nv * dv
++    parameter_entries = _decoder_parameter_manifest(profile_values, dtype)
++    parameter_elements, parameter_bytes = _manifest_bytes(parameter_entries)
+     layers = []
+     for index in range(model["num_hidden_layers"]):
+         is_full = index in model["full_attention_indices_zero_based"]
++        layer_prefix = "layer_{:02d}".format(index)
++        common_parameters = [
++            "{}.input_layernorm.weight".format(layer_prefix),
++            "{}.post_attention_layernorm.weight".format(layer_prefix),
++            "{}.mlp.gate_proj.weight".format(layer_prefix),
++            "{}.mlp.up_proj.weight".format(layer_prefix),
++            "{}.mlp.down_proj.weight".format(layer_prefix),
++        ]
+         if is_full:
+             layers.append(
+                 {
+                     "index": index,
+                     "kind": "full_attention",
+                     "route": "full_attention",
+-                    "attention_input_shape": [batch, query_heads, steps, model["head_dim"]],
+-                    "causal_mask_shape": [batch, query_heads, steps, total],
++                    "hidden_input": "layer_{:02d}_input".format(index),
++                    "hidden_output": "layer_{:02d}_output".format(index),
++                    "attention_input_shape": [batch, qh, steps, d],
++                    "causal_mask_shape": [batch, qh, steps, total],
++                    "cos_sin_shape": [batch, qh, steps, rotary_dim],
+                     "kv_state_inputs": {
+-                        "prior_k": [batch, model["num_key_value_heads"], past_length, model["head_dim"]],
+-                        "prior_v": [batch, model["num_key_value_heads"], past_length, model["head_dim"]],
++                        "prior_k": [batch, kvh, past_length, d],
++                        "prior_v": [batch, kvh, past_length, d],
+                     },
+                     "kv_state_outputs": {
+-                        "new_k": [batch, model["num_key_value_heads"], total, model["head_dim"]],
+-                        "new_v": [batch, model["num_key_value_heads"], total, model["head_dim"]],
++                        "new_k": [batch, kvh, total, d],
++                        "new_v": [batch, kvh, total, d],
+                     },
++                    "parameter_routes": common_parameters
++                    + [
++                        "{}.q_proj.weight".format(layer_prefix),
++                        "{}.k_proj.weight".format(layer_prefix),
++                        "{}.v_proj.weight".format(layer_prefix),
++                        "{}.o_proj.weight".format(layer_prefix),
++                        "{}.q_norm.weight".format(layer_prefix),
++                        "{}.k_norm.weight".format(layer_prefix),
++                    ],
+                     "state_semantics": "functional_pure_ssa_output",
+-                    "implemented_branch": "m1f_functional_attention_kv",
++                    "implemented_branch": "full_attention_core_ssa",
+                 }
+             )
+         else:
+@@ -977,22 +1388,59 @@ def qwen35_text_decoder_manifest(
+                     "index": index,
+                     "kind": "gdr",
+                     "route": "linear_attention",
+-                    "conv_state_input": [batch, model["linear_num_key_heads"] * 3 * model["linear_key_head_dim"], model["linear_conv_kernel_dim"]],
+-                    "conv_state_output": [batch, model["linear_num_key_heads"] * 3 * model["linear_key_head_dim"], model["linear_conv_kernel_dim"]],
+-                    "recurrent_state_input": [batch, model["linear_num_value_heads"], model["linear_key_head_dim"], model["linear_value_head_dim"]],
+-                    "recurrent_state_output": [batch, model["linear_num_value_heads"], model["linear_key_head_dim"], model["linear_value_head_dim"]],
++                    "hidden_input": "layer_{:02d}_input".format(index),
++                    "hidden_output": "layer_{:02d}_output".format(index),
++                    "conv_state_input": [batch, conv_channels, profile_values["conv_kernel"]],
++                    "conv_state_output": [batch, conv_channels, profile_values["conv_kernel"]],
++                    "recurrent_state_input": [batch, nv, dk, dv],
++                    "recurrent_state_output": [batch, nv, dk, dv],
++                    "projection_shapes": {
++                        "qkv": [batch, steps, 2 * nk * dk + nv * dv],
++                        "z": [batch, steps, nv * dv],
++                        "b": [batch, steps, nv],
++                        "a": [batch, steps, nv],
++                    },
++                    "parameter_routes": common_parameters
++                    + [
++                        "{}.in_proj_qkv.weight".format(layer_prefix),
++                        "{}.in_proj_z.weight".format(layer_prefix),
++                        "{}.in_proj_b.weight".format(layer_prefix),
++                        "{}.in_proj_a.weight".format(layer_prefix),
++                        "{}.conv1d.weight".format(layer_prefix),
++                        "{}.A_log".format(layer_prefix),
++                        "{}.dt_bias".format(layer_prefix),
++                        "{}.norm.weight".format(layer_prefix),
++                        "{}.out_proj.weight".format(layer_prefix),
++                    ],
+                     "state_semantics": "functional_pure_ssa_output",
+-                    "implemented_branch": "m1e_conv_state+m1g_gdr_recurrent_state",
++                    "implemented_branch": "gdr_core_ssa",
+                 }
+             )
+     return {
+         "model_id": model["model_id"],
+         "revision": model["revision"],
+-        "graph_kind": "text_decoder_structural_no_weight",
++        "graph_kind": "text_decoder_full_no_weight",
++        "graph_contract_version": _QWEN35_DECODER_GRAPH_CONTRACT_VERSION,
++        "graph_profile_version": _QWEN35_DECODER_GRAPH_PROFILE_VERSION,
++        "shape_profile": shape_profile,
++        "synthetic_profile": shape_profile.strip().lower().replace("-", "_")
++        in ("test", "synthetic", "synthetic_test", "test_only"),
+         "weights_embedded": False,
+         "weight_execution": False,
+-        "parameter_storage": "not_materialized; typed_buffer_or_mmap_required",
++        "weight_execution_contract": "explicit_function_parameters; no values materialized by builder",
++        "parameter_storage": "explicit_typed_parameters; typed_buffer_or_mmap_required",
+         "parameter_count_estimate": "approximately_873m; shape_only",
++        "parameter_manifest": list(parameter_entries),
++        "parameter_storage_count": len(parameter_entries),
++        "parameter_element_count": parameter_elements,
++        "parameter_byte_count": parameter_bytes,
++        "parameter_bytes_uint64": parameter_bytes <= _UINT64_MAX,
++        "tied_weight": {
++            "storage_id": "embedding_lm_head_shared_weight",
++            "function_parameter": "embedding_lm_head_shared_weight",
++            "aliases": ["embedding.weight", "lm_head.weight"],
++            "storage_count": 1,
++        },
+         "dtype": dtype,
+         "batch": batch,
+         "steps": steps,
+@@ -1002,21 +1450,44 @@ def qwen35_text_decoder_manifest(
+         "hidden_output_shape": [batch, steps, hidden],
+         "position_ids_shape": [batch, steps],
+         "position_ids_dtype": index_dtype,
+-        "causal_mask_shape": [batch, query_heads, steps, total],
++        "causal_mask_shape": [batch, qh, steps, total],
+         "causal_mask_rule": "key_position <= query_position",
++        "cos_sin_runtime_inputs": True,
++        "cos_sin_shape": [batch, qh, steps, rotary_dim],
++        "attention": {
++            "query_heads": qh,
++            "kv_heads": kvh,
++            "head_dim": d,
++            "rotary_dim": rotary_dim,
++            "gqa": "slice_concat_repeat_interleave",
++            "qk_softmax_pv": "connected_core_primitives",
++        },
++        "gdr": {
++            "key_heads": nk,
++            "value_heads": nv,
++            "key_dim": dk,
++            "value_dim": dv,
++            "conv_kernel": profile_values["conv_kernel"],
++            "conv_channels": conv_channels,
++            "recurrence": "sequential_ssa_unroll",
++        },
+         "num_hidden_layers": len(layers),
+         "gdr_layer_indices": [item["index"] for item in layers if item["kind"] == "gdr"],
+         "full_attention_layer_indices": [item["index"] for item in layers if item["kind"] == "full_attention"],
+         "layers": layers,
+         "state_interfaces": {
+-            "gdr": ["conv_state", "recurrent_state"],
++            "gdr": ["conv_state_in", "recurrent_state_in", "conv_state_out", "recurrent_state_out"],
+             "full_attention": ["prior_k", "prior_v", "new_k", "new_v"],
+         },
+         "branch_execution": {
+-            "gdr": "small_branch_graphs_only_until_typed_state_abi",
+-            "full_attention": "small_branch_graphs_only_until_typed_kv_abi",
+-            "whole_model": "structural_manifest_only",
++            "gdr": "connected_core_ssa",
++            "full_attention": "connected_core_ssa",
++            "whole_model": "parameterized_core_ssa",
+         },
++        "identity_shell": False,
++        "dead_branch": False,
++        "state_mutation": "none; all state transitions are explicit SSA returns",
++        "state_route": "per_layer_function_parameters_to_per_layer_function_returns",
+         "visual_encoder": "excluded_by_mvp",
+         "host_mutation": False,
+     }
+@@ -1030,15 +1501,30 @@ def build_qwen35_text_decoder_graph(
+     dtype: str = "bf16",
+     query_heads: int = 8,
+     index_dtype: str = "int64",
++    shape_profile: str = "model",
++    profile: Optional[str] = None,
+ ) -> CoreProgram:
+-    """Build a no-weight executable shell plus the complete layer manifest.
++    """Build the complete 24-layer, no-weight Qwen3.5 text decoder graph.
+ 
+-    The only executable operation is an input/output identity.  This is
+-    deliberate: it makes shape/ABI validation possible without loading 873M
+-    parameters, while the metadata gives the coordinator an auditable route
+-    for the 18 GDR and 6 full-attention layers.
++    The graph has explicit parameter/state inputs but no parameter values.  A
++    caller can therefore lower/serialize the fixed 0.8B graph without ever
++    allocating an 873M-parameter checkpoint.  Use ``shape_profile='model'``
++    for real 0.8B shapes, or the explicitly marked ``'synthetic_test'``
++    profile for small scalar/vector/GPU differential execution.
+     """
+ 
++    batch = _positive_or_zero_int(batch, "batch", allow_zero=False)
++    steps = _positive_or_zero_int(steps, "steps", allow_zero=False)
++    past_length = _positive_or_zero_int(past_length, "past_length", allow_zero=True)
++    dtype = _dtype(dtype, "dtype")
++    if dtype != "bf16":
++        raise ValueError("Qwen3.5 full text decoder graph currently requires dtype='bf16'")
++    index_dtype = _qwen35_index_dtype(index_dtype)
++    if profile is not None:
++        if shape_profile != "model":
++            raise ValueError("specify only one of shape_profile and profile")
++        shape_profile = profile
++    profile_values = _decoder_shape_profile(shape_profile, query_heads)
+     manifest = qwen35_text_decoder_manifest(
+         batch,
+         steps,
+@@ -1046,35 +1532,1058 @@ def build_qwen35_text_decoder_graph(
+         dtype=dtype,
+         query_heads=query_heads,
+         index_dtype=index_dtype,
++        shape_profile=shape_profile,
+     )
+-    input_shape = tuple(manifest["hidden_input_shape"])
+-    builder = _Builder("qwen35_text_decoder_structural", "text_decoder_structural_no_weight", input_shape)
+-    hidden_states = builder.parameter("hidden_states", _tensor(dtype, input_shape))
+-    position_ids = builder.parameter(
+-        "position_ids",
+-        _tensor(manifest["position_ids_dtype"], tuple(manifest["position_ids_shape"])),
+-    )
+-    causal_mask = builder.parameter(
+-        "causal_mask",
+-        _tensor("bool", tuple(manifest["causal_mask_shape"])),
+-    )
+-    output = builder.op(
+-        "identity",
+-        (hidden_states,),
+-        (("output", _tensor(dtype, input_shape)),),
++    h = profile_values["hidden"]
++    i = profile_values["intermediate"]
++    v = profile_values["vocab"]
++    qh = profile_values["query_heads"]
++    kvh = profile_values["kv_heads"]
++    d = profile_values["head_dim"]
++    rotary_dim = profile_values["rotary_dim"]
++    nk = profile_values["linear_key_heads"]
++    nv = profile_values["linear_value_heads"]
++    dk = profile_values["linear_key_dim"]
++    dv = profile_values["linear_value_dim"]
++    kernel = profile_values["conv_kernel"]
++    conv_channels = 2 * nk * dk + nv * dv
++    value_dim = nv * dv
++    key_dim = nk * dk
++    total = past_length + steps
++    input_shape = (batch, steps, h)
++    builder = _Builder("qwen35_text_decoder", "text_decoder_full_no_weight", input_shape)
++
++    # Runtime inputs are activations, pre-expanded RoPE tables and each
++    # layer's prior state.  No input named position_ids/causal_mask exists:
++    # both are generated below by Core iota/compare operations.
++    input_ids = builder.parameter("input_ids", _tensor("int64", (batch, steps)))
++    cos = builder.parameter("cos", _tensor(dtype, (batch, qh, steps, rotary_dim)))
++    sin = builder.parameter("sin", _tensor(dtype, (batch, qh, steps, rotary_dim)))
++    shared_weight = builder.parameter("embedding_lm_head_shared_weight", _tensor(dtype, (v, h)))
++
++    # Internal position/control graph.  Position ids are returned as an
++    # explicit control result (and therefore cannot be mistaken for a host
++    # supplied input); the causal mask is used directly in every full-
++    # attention softmax.
++    position_ids = builder.op(
++        "iota",
++        (),
++        (("position_ids", _tensor(index_dtype, (batch, steps))),),
++        {"axis": 1, "start": past_length, "step": 1},
+     )[0]
+-    extra = dict(manifest)
+-    extra.update(
+-        {
+-            "control_inputs": [
+-                {"name": "position_ids", "shape": list(manifest["position_ids_shape"]), "dtype": manifest["position_ids_dtype"]},
+-                {"name": "causal_mask", "shape": list(manifest["causal_mask_shape"]), "dtype": "bool"},
+-            ],
+-            "executable_operations": ["identity"],
+-            "whole_model_execution": "not_claimed",
+-        }
+-    )
+-    return builder.finish((output,), extra)
++    query_positions = builder.op(
++        "iota",
++        (),
++        (("query_positions", _tensor(index_dtype, (batch, qh, steps, 1))),),
++        {"axis": 2, "start": past_length, "step": 1},
++    )[0]
++    key_positions = builder.op(
++        "iota",
++        (),
++        (("key_positions", _tensor(index_dtype, (batch, qh, 1, total))),),
++        {"axis": 3, "start": 0, "step": 1},
++    )[0]
++    causal_mask = builder.op(
++        "compare",
++        (key_positions, query_positions),
++        (("causal_mask", _tensor("bool", (batch, qh, steps, total))),),
++        {"predicate": "le", "broadcast": "trailing_singleton"},
++    )[0]
++
++    embedded = builder.op(
++        "embedding",
++        (shared_weight, input_ids),
++        (("embedded", _tensor(dtype, input_shape)),),
++        {"axis": 0},
++    )[0]
++    embedded_f32 = _as_f32(builder, embedded, dtype, "embedded_f32")
++    hidden = embedded_f32
++    hidden = _cast_from_f32(builder, hidden, dtype, "hidden_input")
++
++    # Constant policy values are shared by all layers.  They carry no model
++    # data and make the exact accumulation/causal contracts explicit.
++    epsilon = _constant_scalar(builder, "rms_epsilon", 1.0e-6)
++    qk_epsilon = _constant_scalar(builder, "qk_norm_epsilon", 1.0e-6)
++    qk_scale = _constant_scalar(builder, "qk_scale", 1.0 / math.sqrt(float(d)))
++    fill_value = _constant_scalar(builder, "causal_fill_value", -10000.0)
++    gdr_scale = _constant_scalar(builder, "gdr_scale", 1.0 / math.sqrt(float(dk)))
++    layer_hidden_inputs: List[str] = []
++    layer_hidden_outputs: List[str] = []
++    state_inputs: List[str] = []
++    state_outputs: List[str] = []
++    layer_metadata: List[Mapping[str, Any]] = []
++    model_full_attention_indices = set(QWEN35_08B_SHAPE_METADATA["full_attention_indices_zero_based"])
++
++    def layer_parameter(layer_index: int, suffix: str, shape: Sequence[int]) -> ValueRef:
++        return builder.parameter(
++            "layer_{:02d}_{}".format(layer_index, suffix),
++            _tensor(dtype, tuple(shape)),
++        )
++
++    for layer_index in range(24):
++        prefix = "layer_{:02d}".format(layer_index)
++        layer_hidden_inputs.append(hidden.name)
++        input_norm_weight = layer_parameter(layer_index, "input_layernorm_weight", (h,))
++        post_norm_weight = layer_parameter(layer_index, "post_attention_layernorm_weight", (h,))
++        gate_weight = layer_parameter(layer_index, "mlp_gate_proj_weight", (i, h))
++        up_weight = layer_parameter(layer_index, "mlp_up_proj_weight", (i, h))
++        down_weight = layer_parameter(layer_index, "mlp_down_proj_weight", (h, i))
++
++        normalized = _rms_core(
++            builder,
++            hidden,
++            input_norm_weight,
++            epsilon,
++            dtype,
++            input_shape,
++            prefix + "_input_norm",
++        )
++        if layer_index in model_full_attention_indices:
++            q_weight = layer_parameter(layer_index, "q_proj_weight", (qh * d * 2, h))
++            k_weight = layer_parameter(layer_index, "k_proj_weight", (kvh * d, h))
++            v_weight = layer_parameter(layer_index, "v_proj_weight", (kvh * d, h))
++            o_weight = layer_parameter(layer_index, "o_proj_weight", (h, qh * d))
++            q_norm_weight = layer_parameter(layer_index, "q_norm_weight", (d,))
++            k_norm_weight = layer_parameter(layer_index, "k_norm_weight", (d,))
++            prior_k = builder.parameter(
++                prefix + "_prior_k",
++                _tensor(dtype, (batch, kvh, past_length, d)),
++            )
++            prior_v = builder.parameter(
++                prefix + "_prior_v",
++                _tensor(dtype, (batch, kvh, past_length, d)),
++            )
++            state_inputs.extend((prior_k.name, prior_v.name))
++            branch, new_k, new_v = _append_full_attention_graph(
++                builder,
++                normalized,
++                prior_k,
++                prior_v,
++                q_weight,
++                k_weight,
++                v_weight,
++                o_weight,
++                q_norm_weight,
++                k_norm_weight,
++                cos,
++                sin,
++                causal_mask,
++                qk_scale,
++                fill_value,
++                epsilon,
++                dtype,
++                input_shape,
++                batch,
++                steps,
++                past_length,
++                qh,
++                kvh,
++                d,
++                rotary_dim,
++                prefix,
++            )
++            state_outputs.extend((new_k.name, new_v.name))
++            layer_metadata.append(
++                {
++                    "index": layer_index,
++                    "kind": "full_attention",
++                    "state_outputs": [new_k.name, new_v.name],
++                }
++            )
++        else:
++            qkv_weight = layer_parameter(layer_index, "in_proj_qkv_weight", (2 * key_dim + value_dim, h))
++            z_weight = layer_parameter(layer_index, "in_proj_z_weight", (value_dim, h))
++            b_weight = layer_parameter(layer_index, "in_proj_b_weight", (nv, h))
++            a_weight = layer_parameter(layer_index, "in_proj_a_weight", (nv, h))
++            conv_weight = layer_parameter(layer_index, "conv1d_weight", (conv_channels, 1, kernel))
++            a_log_weight = layer_parameter(layer_index, "A_log", (nv,))
++            dt_bias_weight = layer_parameter(layer_index, "dt_bias", (nv,))
++            gdr_norm_weight = layer_parameter(layer_index, "norm_weight", (dv,))
++            out_weight = layer_parameter(layer_index, "out_proj_weight", (h, value_dim))
++            conv_state = builder.parameter(
++                prefix + "_conv_state_in",
++                _tensor(dtype, (batch, conv_channels, kernel)),
++            )
++            recurrent_state = builder.parameter(
++                prefix + "_recurrent_state_in",
++                _tensor("float32", (batch, nv, dk, dv)),
++            )
++            state_inputs.extend((conv_state.name, recurrent_state.name))
++            branch, new_conv_state, new_recurrent_state = _append_gdr_graph(
++                builder,
++                normalized,
++                conv_state,
++                recurrent_state,
++                qkv_weight,
++                z_weight,
++                b_weight,
++                a_weight,
++                conv_weight,
++                a_log_weight,
++                dt_bias_weight,
++                gdr_norm_weight,
++                out_weight,
++                gdr_scale,
++                qk_epsilon,
++                dtype,
++                input_shape,
++                batch,
++                steps,
++                nk,
++                nv,
++                dk,
++                dv,
++                kernel,
++                conv_channels,
++                prefix,
++            )
++            state_outputs.extend((new_conv_state.name, new_recurrent_state.name))
++            layer_metadata.append(
++                {
++                    "index": layer_index,
++                    "kind": "gdr",
++                    "state_outputs": [new_conv_state.name, new_recurrent_state.name],
++                }
++            )
++        residual = builder.op(
++            "add",
++            (hidden, _cast_from_f32(builder, branch, dtype, prefix + "_branch_output")),
++            ((prefix + "_attention_residual", _tensor(dtype, input_shape)),),
++        )[0]
++        post_norm = _rms_core(
++            builder,
++            residual,
++            post_norm_weight,
++            epsilon,
++            dtype,
++            input_shape,
++            prefix + "_post_attention_norm",
++        )
++        gate = _linear_projection(builder, post_norm, gate_weight, dtype, dtype, input_shape, i, prefix + "_mlp_gate")
++        up = _linear_projection(builder, post_norm, up_weight, dtype, dtype, input_shape, i, prefix + "_mlp_up")
++        gate_f32 = _as_f32(builder, gate, dtype, prefix + "_mlp_gate")
++        up_f32 = _as_f32(builder, up, dtype, prefix + "_mlp_up")
++        gate_silu = builder.op(
++            "silu",
++            (gate_f32,),
++            ((prefix + "_mlp_gate_silu", _tensor("float32", (batch, steps, i))),),
++        )[0]
++        mlp_product = builder.op(
++            "mul",
++            (gate_silu, up_f32),
++            ((prefix + "_mlp_product", _tensor("float32", (batch, steps, i))),),
++        )[0]
++        down = _linear_projection(
++            builder,
++            mlp_product,
++            down_weight,
++            "float32",
++            dtype,
++            (batch, steps, i),
++            h,
++            prefix + "_mlp_down",
++            weight_dtype=dtype,
++        )
++        hidden = builder.op(
++            "add",
++            (hidden, down),
++            ((prefix + "_output", _tensor(dtype, input_shape)),),
++        )[0]
++        layer_hidden_outputs.append(hidden.name)
++
++    final_norm_weight = builder.parameter("final_norm_weight", _tensor(dtype, (h,)))
++    final_hidden_f32 = _rms_core(builder, hidden, final_norm_weight, epsilon, dtype, input_shape, "final_norm")
++    final_hidden = _cast_from_f32(builder, final_hidden_f32, dtype, "final_hidden")
++    final_flat = _reshape(builder, final_hidden, (batch * steps, h), "final_hidden_flat")
++    shared_f32 = _as_f32(builder, shared_weight, dtype, "lm_head_shared_weight")
++    shared_t = _transpose(builder, shared_f32, (1, 0), "lm_head_shared_weight_t")
++    logits_flat = builder.op(
++        "matmul",
++        (_as_f32(builder, final_flat, dtype, "lm_head_input_f32"), shared_t),
++        (("logits_flat_f32", _tensor("float32", (batch * steps, v))),),
++    )[0]
++    logits = _reshape(
++        builder,
++        _cast_from_f32(builder, logits_flat, dtype, "logits_bf16"),
++        (batch, steps, v),
++        "logits",
++    )
++
++    operation_counts = Counter(operation.name for operation in builder.operations)
++    extra = dict(manifest)
++    extra.update(
++        {
++            "contract_version": _QWEN35_DECODER_GRAPH_CONTRACT_VERSION,
++            "control_inputs": [],
++            "runtime_inputs": [
++                {"name": "input_ids", "shape": [batch, steps], "dtype": "int64"},
++                {"name": "cos", "shape": [batch, qh, steps, rotary_dim], "dtype": dtype},
++                {"name": "sin", "shape": [batch, qh, steps, rotary_dim], "dtype": dtype},
++            ],
++            "state_input_names": state_inputs,
++            "state_output_names": state_outputs,
++            "layer_hidden_inputs": layer_hidden_inputs,
++            "layer_hidden_outputs": layer_hidden_outputs,
++            "layer_routes": layer_metadata,
++            "def_use_connectivity": {
++                "embedding_to_layer_0": hidden if False else layer_hidden_inputs[0],
++                "layer_hidden_chain": list(layer_hidden_outputs),
++                "final_hidden": final_hidden.name,
++                "logits": logits.name,
++                "logits_depends_on_all_layers": True,
++                "state_outputs_are_ssa": True,
++            },
++            "operation_counts": dict(sorted(operation_counts.items())),
++            "operation_total": sum(operation_counts.values()),
++            "executable_operations": sorted(operation_counts),
++            "identity_shell": False,
++            "dead_branch": False,
++            "whole_model_execution": "parameterized_graph_no_weight_values",
++            "no_embedded_weight_values": True,
++            "no_state_allocation": True,
++            # Vector lowerers must describe large domains (especially the
++            # shared 248320-vocabulary projection and 4096-token KV shapes)
++            # without expanding one Python chunk object per lane block.
++            "requires_compact_iteration": True,
++            "large_shape_policy": "metadata_only_until_explicit_backend_driver",
++            "t_gt_1_gdr": "static_sequential_ssa_unroll",
++            "t_gt_1_gdr_warning": "not_chunk_or_fused; operation count grows linearly with steps",
++            "state_transition": "all prior state inputs remain immutable; new state is returned",
++            "tied_weight_use_sites": ["embedding", "lm_head"],
++            "parameter_function_inputs": [
++                ref.name
++                for ref in builder.parameters
++                if "weight" in ref.name or ref.name in ("final_norm_weight",)
++            ],
++        }
++    )
++    # State values are retained while the layer loop runs; resolve them by
++    # stable name from the builder's operation outputs.  This avoids adding
++    # identity/copy operations merely to rename functional state results.
++    all_values = {ref.name: ref for ref in builder.parameters}
++    for operation in builder.operations:
++        all_values.update({ref.name: ref for ref in operation.outputs})
++    returns = (logits, final_hidden, position_ids) + tuple(all_values[name] for name in state_outputs)
++    program = builder.finish(returns, extra)
++    # Finish() already verifies the direct operation body; retain a compact
++    # return contract for launchers and independent graph auditors.
++    return program
++
++
++def qwen35_text_decoder_structural_manifest(
++    batch: int,
++    steps: int,
++    past_length: int = 0,
++    *,
++    dtype: str = "bf16",
++    query_heads: int = 8,
++    index_dtype: str = "int64",
++) -> Mapping[str, Any]:
++    """Compatibility manifest for the pre-M1I identity shell.
++
++    This API is intentionally explicit and is never selected by
++    :func:`build_qwen35_text_decoder_graph`.  It exists only for consumers
++    that need to audit the old shape/state manifest without pretending it is
++    executable model connectivity.
++    """
++
++    batch = _positive_or_zero_int(batch, "batch", allow_zero=False)
++    steps = _positive_or_zero_int(steps, "steps", allow_zero=True)
++    past_length = _positive_or_zero_int(past_length, "past_length", allow_zero=True)
++    query_heads = _positive_or_zero_int(query_heads, "query_heads", allow_zero=False)
++    dtype = _dtype(dtype, "dtype")
++    index_dtype = _qwen35_index_dtype(index_dtype)
++    total = past_length + steps
++    if total > (1 << 63) - 1:
++        raise ValueError("past_length + steps overflows signed int64")
++    model = QWEN35_08B_SHAPE_METADATA
++    layers = []
++    for index in range(model["num_hidden_layers"]):
++        is_full = index in model["full_attention_indices_zero_based"]
++        if is_full:
++            layers.append(
++                {
++                    "index": index,
++                    "kind": "full_attention",
++                    "route": "full_attention",
++                    "attention_input_shape": [batch, query_heads, steps, model["head_dim"]],
++                    "causal_mask_shape": [batch, query_heads, steps, total],
++                    "kv_state_inputs": {
++                        "prior_k": [batch, model["num_key_value_heads"], past_length, model["head_dim"]],
++                        "prior_v": [batch, model["num_key_value_heads"], past_length, model["head_dim"]],
++                    },
++                    "kv_state_outputs": {
++                        "new_k": [batch, model["num_key_value_heads"], total, model["head_dim"]],
++                        "new_v": [batch, model["num_key_value_heads"], total, model["head_dim"]],
++                    },
++                    "state_semantics": "functional_pure_ssa_output",
++                    "implemented_branch": "m1f_functional_attention_kv",
++                }
++            )
++        else:
++            layers.append(
++                {
++                    "index": index,
++                    "kind": "gdr",
++                    "route": "linear_attention",
++                    "conv_state_input": [
++                        batch,
++                        model["linear_num_key_heads"] * 3 * model["linear_key_head_dim"],
++                        model["linear_conv_kernel_dim"],
++                    ],
++                    "conv_state_output": [
++                        batch,
++                        model["linear_num_key_heads"] * 3 * model["linear_key_head_dim"],
++                        model["linear_conv_kernel_dim"],
++                    ],
++                    "recurrent_state_input": [
++                        batch,
++                        model["linear_num_value_heads"],
++                        model["linear_key_head_dim"],
++                        model["linear_value_head_dim"],
++                    ],
++                    "recurrent_state_output": [
++                        batch,
++                        model["linear_num_value_heads"],
++                        model["linear_key_head_dim"],
++                        model["linear_value_head_dim"],
++                    ],
++                    "state_semantics": "functional_pure_ssa_output",
++                    "implemented_branch": "m1e_conv_state+m1g_gdr_recurrent_state",
++                }
++            )
++    return {
++        "model_id": model["model_id"],
++        "revision": model["revision"],
++        "graph_kind": "text_decoder_structural_no_weight",
++        "graph_contract_version": 1,
++        "weights_embedded": False,
++        "weight_execution": False,
++        "parameter_storage": "not_materialized; typed_buffer_or_mmap_required",
++        "parameter_count_estimate": "approximately_873m; shape_only",
++        "dtype": dtype,
++        "batch": batch,
++        "steps": steps,
++        "past_length": past_length,
++        "total_length": total,
++        "hidden_input_shape": [batch, steps, model["hidden_size"]],
++        "hidden_output_shape": [batch, steps, model["hidden_size"]],
++        "position_ids_shape": [batch, steps],
++        "position_ids_dtype": index_dtype,
++        "causal_mask_shape": [batch, query_heads, steps, total],
++        "causal_mask_rule": "key_position <= query_position",
++        "num_hidden_layers": len(layers),
++        "gdr_layer_indices": [item["index"] for item in layers if item["kind"] == "gdr"],
++        "full_attention_layer_indices": [item["index"] for item in layers if item["kind"] == "full_attention"],
++        "layers": layers,
++        "state_interfaces": {
++            "gdr": ["conv_state", "recurrent_state"],
++            "full_attention": ["prior_k", "prior_v", "new_k", "new_v"],
++        },
++        "branch_execution": {
++            "gdr": "small_branch_graphs_only_until_typed_state_abi",
++            "full_attention": "small_branch_graphs_only_until_typed_kv_abi",
++            "whole_model": "structural_manifest_only",
++        },
++        "identity_shell": True,
++        "visual_encoder": "excluded_by_mvp",
++        "host_mutation": False,
++    }
++
++
++def build_qwen35_text_decoder_structural_shell(
++    batch: int,
++    steps: int,
++    past_length: int = 0,
++    *,
++    dtype: str = "bf16",
++    query_heads: int = 8,
++    index_dtype: str = "int64",
++) -> CoreProgram:
++    """Build the explicitly named legacy identity shell for compatibility."""
++
++    manifest = qwen35_text_decoder_structural_manifest(
++        batch,
++        steps,
++        past_length,
++        dtype=dtype,
++        query_heads=query_heads,
++        index_dtype=index_dtype,
++    )
++    input_shape = tuple(manifest["hidden_input_shape"])
++    builder = _Builder("qwen35_text_decoder_structural", "text_decoder_structural_no_weight", input_shape)
++    hidden_states = builder.parameter("hidden_states", _tensor(dtype, input_shape))
++    position_ids = builder.parameter(
++        "position_ids",
++        _tensor(manifest["position_ids_dtype"], tuple(manifest["position_ids_shape"])),
++    )
++    causal_mask = builder.parameter(
++        "causal_mask",
++        _tensor("bool", tuple(manifest["causal_mask_shape"])),
++    )
++    output = builder.op(
++        "identity",
++        (hidden_states,),
++        (("output", _tensor(dtype, input_shape)),),
++    )[0]
++    extra = dict(manifest)
++    extra.update(
++        {
++            "control_inputs": [
++                {
++                    "name": "position_ids",
++                    "shape": list(manifest["position_ids_shape"]),
++                    "dtype": manifest["position_ids_dtype"],
++                },
++                {"name": "causal_mask", "shape": list(manifest["causal_mask_shape"]), "dtype": "bool"},
++            ],
++            "executable_operations": ["identity"],
++            "whole_model_execution": "not_claimed",
++        }
++    )
++    return builder.finish((output,), extra)
++
++
++def _repeat_kv_heads(
++    builder: _Builder,
++    value: ValueRef,
++    query_heads: int,
++    kv_heads: int,
++    prefix: str,
++) -> ValueRef:
++    """Repeat KV heads with shape/layout primitives and no integer index ABI.
++
++    A constant integer index tensor would be a target-specific host-reference
++    plan on SVE/GPU.  Explicit slice/concat repetition keeps the GQA mapping
++    entirely in the portable graph and preserves the fixed repeat-interleave
++    semantics for both the model and synthetic profiles.
++    """
++
++    if query_heads % kv_heads:
++        raise ValueError("query_heads must be divisible by kv_heads")
++    repeat = query_heads // kv_heads
++    batch, _heads, sequence, head_dim = value.type.shape
++    chunks = []
++    for head in range(kv_heads):
++        one = builder.op(
++            "slice",
++            (value,),
++            (("{}_source_{}".format(prefix, head), _tensor(value.type.dtype, (batch, 1, sequence, head_dim))),),
++            {"starts": [head], "stops": [head + 1], "axes": [1], "steps": [1]},
++        )[0]
++        chunks.extend([one] * repeat)
++    return builder.op(
++        "concat",
++        tuple(chunks),
++        ((prefix, _tensor(value.type.dtype, (batch, query_heads, sequence, head_dim))),),
++        {"axis": 1},
++    )[0]
++
++
++def _append_full_attention_graph(
++    builder: _Builder,
++    hidden: ValueRef,
++    prior_k: ValueRef,
++    prior_v: ValueRef,
++    q_weight: ValueRef,
++    k_weight: ValueRef,
++    v_weight: ValueRef,
++    o_weight: ValueRef,
++    q_norm_weight: ValueRef,
++    k_norm_weight: ValueRef,
++    cos: ValueRef,
++    sin: ValueRef,
++    causal_mask: ValueRef,
++    qk_scale: ValueRef,
++    fill_value: ValueRef,
++    qk_epsilon: ValueRef,
++    dtype: str,
++    input_shape: Tuple[int, ...],
++    batch: int,
++    steps: int,
++    past_length: int,
++    query_heads: int,
++    kv_heads: int,
++    head_dim: int,
++    rotary_dim: int,
++    prefix: str,
++) -> Tuple[ValueRef, ValueRef, ValueRef]:
++    """Append one Qwen full-attention block and functional KV transition."""
++
++    total = past_length + steps
++    query_packed = _linear_projection(
++        builder,
++        hidden,
++        q_weight,
++        dtype,
++        dtype,
++        input_shape,
++        query_heads * head_dim * 2,
++        prefix + "_q_projection",
++        weight_dtype=dtype,
++    )
++    query_packed = _reshape(
++        builder,
++        query_packed,
++        (batch, steps, query_heads, 2 * head_dim),
++        prefix + "_q_gate_packed",
++    )
++    query_raw, gate_raw = builder.op(
++        "split",
++        (query_packed,),
++        (
++            (prefix + "_query_raw", _tensor(dtype, (batch, steps, query_heads, head_dim))),
++            (prefix + "_output_gate_raw", _tensor(dtype, (batch, steps, query_heads, head_dim))),
++        ),
++        {"sizes": [head_dim, head_dim], "axis": -1},
++    )
++    query = _transpose(builder, query_raw, (0, 2, 1, 3), prefix + "_query_heads")
++    output_gate = _transpose(builder, gate_raw, (0, 2, 1, 3), prefix + "_output_gate")
++    query_norm = _rms_core(
++        builder,
++        query,
++        q_norm_weight,
++        qk_epsilon,
++        dtype,
++        (batch, query_heads, steps, head_dim),
++        prefix + "_q_norm",
++    )
++    cos_f32 = _as_f32(builder, cos, dtype, prefix + "_cos")
++    sin_f32 = _as_f32(builder, sin, dtype, prefix + "_sin")
++    query_rotated = _rope_core(
++        builder,
++        query_norm,
++        cos_f32,
++        sin_f32,
++        "float32",
++        (batch, query_heads, steps, head_dim),
++        rotary_dim,
++        prefix + "_q_rope",
++    )
++
++    current_k = _linear_projection(
++        builder,
++        hidden,
++        k_weight,
++        dtype,
++        dtype,
++        input_shape,
++        kv_heads * head_dim,
++        prefix + "_k_projection",
++        weight_dtype=dtype,
++    )
++    current_k = _reshape(builder, current_k, (batch, steps, kv_heads, head_dim), prefix + "_k_time")
++    current_k = _transpose(builder, current_k, (0, 2, 1, 3), prefix + "_k_heads")
++    current_k = _rms_core(
++        builder,
++        current_k,
++        k_norm_weight,
++        qk_epsilon,
++        dtype,
++        (batch, kv_heads, steps, head_dim),
++        prefix + "_k_norm",
++    )
++    cos_k = builder.op(
++        "slice",
++        (cos_f32,),
++        ((prefix + "_cos_k", _tensor("float32", (batch, kv_heads, steps, rotary_dim))),),
++        {"starts": [0], "stops": [kv_heads], "axes": [1], "steps": [1]},
++    )[0]
++    sin_k = builder.op(
++        "slice",
++        (sin_f32,),
++        ((prefix + "_sin_k", _tensor("float32", (batch, kv_heads, steps, rotary_dim))),),
++        {"starts": [0], "stops": [kv_heads], "axes": [1], "steps": [1]},
++    )[0]
++    current_k = _rope_core(
++        builder,
++        current_k,
++        cos_k,
++        sin_k,
++        "float32",
++        (batch, kv_heads, steps, head_dim),
++        rotary_dim,
++        prefix + "_k_rope",
++    )
++    current_k = _cast_from_f32(builder, current_k, dtype, prefix + "_current_k")
++
++    current_v = _linear_projection(
++        builder,
++        hidden,
++        v_weight,
++        dtype,
++        dtype,
++        input_shape,
++        kv_heads * head_dim,
++        prefix + "_v_projection",
++        weight_dtype=dtype,
++    )
++    current_v = _reshape(builder, current_v, (batch, steps, kv_heads, head_dim), prefix + "_v_time")
++    current_v = _transpose(builder, current_v, (0, 2, 1, 3), prefix + "_v_heads")
++    new_k = builder.op(
++        "concat",
++        (prior_k, current_k),
++        ((prefix + "_new_k", _tensor(dtype, (batch, kv_heads, total, head_dim))),),
++        {"axis": 2},
++    )[0]
++    new_v = builder.op(
++        "concat",
++        (prior_v, current_v),
++        ((prefix + "_new_v", _tensor(dtype, (batch, kv_heads, total, head_dim))),),
++        {"axis": 2},
++    )[0]
++    repeated_k = _repeat_kv_heads(builder, new_k, query_heads, kv_heads, prefix + "_gqa_k")
++    repeated_v = _repeat_kv_heads(builder, new_v, query_heads, kv_heads, prefix + "_gqa_v")
++    query_f32 = query_rotated
++    key_f32 = _as_f32(builder, repeated_k, dtype, prefix + "_k_cache_f32")
++    key_t = _transpose(builder, key_f32, (0, 1, 3, 2), prefix + "_k_cache_transposed")
++    logits = builder.op(
++        "matmul",
++        (query_f32, key_t),
++        ((prefix + "_qk_logits", _tensor("float32", (batch, query_heads, steps, total))),),
++    )[0]
++    scaled = builder.op(
++        "mul",
++        (logits, qk_scale),
++        ((prefix + "_qk_scaled", _tensor("float32", (batch, query_heads, steps, total))),),
++    )[0]
++    masked = builder.op(
++        "where",
++        (causal_mask, scaled, fill_value),
++        ((prefix + "_masked_logits", _tensor("float32", (batch, query_heads, steps, total))),),
++    )[0]
++    reduced_shape = (batch, query_heads, steps, 1)
++    maximum = builder.op(
++        "reduce_max",
++        (masked,),
++        ((prefix + "_softmax_max", _tensor("float32", reduced_shape)),),
++        {"axis": -1, "keepdims": True},
++    )[0]
++    maximum_full = builder.op(
++        "broadcast",
++        (maximum,),
++        ((prefix + "_softmax_max_full", _tensor("float32", (batch, query_heads, steps, total))),),
++        {"shape": [batch, query_heads, steps, total]},
++    )[0]
++    shifted = builder.op(
++        "sub",
++        (masked, maximum_full),
++        ((prefix + "_softmax_shifted", _tensor("float32", (batch, query_heads, steps, total))),),
++    )[0]
++    exponent = builder.op(
++        "exp",
++        (shifted,),
++        ((prefix + "_softmax_exp", _tensor("float32", (batch, query_heads, steps, total))),),
++    )[0]
++    total_exp = builder.op(
++        "reduce_sum",
++        (exponent,),
++        ((prefix + "_softmax_sum", _tensor("float32", reduced_shape)),),
++        {"axis": -1, "keepdims": True},
++    )[0]
++    total_full = builder.op(
++        "broadcast",
++        (total_exp,),
++        ((prefix + "_softmax_sum_full", _tensor("float32", (batch, query_heads, steps, total))),),
++        {"shape": [batch, query_heads, steps, total]},
++    )[0]
++    probabilities = builder.op(
++        "div",
++        (exponent, total_full),
++        ((prefix + "_probabilities", _tensor("float32", (batch, query_heads, steps, total))),),
++    )[0]
++    value_f32 = _as_f32(builder, repeated_v, dtype, prefix + "_v_cache_f32")
++    context = builder.op(
++        "matmul",
++        (probabilities, value_f32),
++        ((prefix + "_context", _tensor("float32", (batch, query_heads, steps, head_dim))),),
++    )[0]
++    gate_sigmoid = builder.op(
++        "sigmoid",
++        (_as_f32(builder, output_gate, dtype, prefix + "_output_gate_f32"),),
++        ((prefix + "_output_gate_sigmoid", _tensor("float32", (batch, query_heads, steps, head_dim))),),
++    )[0]
++    gated_context = builder.op(
++        "mul",
++        (context, gate_sigmoid),
++        ((prefix + "_gated_context", _tensor("float32", (batch, query_heads, steps, head_dim))),),
++    )[0]
++    merged = _transpose(builder, gated_context, (0, 2, 1, 3), prefix + "_merged_heads")
++    merged = _reshape(builder, merged, (batch, steps, query_heads * head_dim), prefix + "_merged")
++    output = _linear_projection(
++        builder,
++        merged,
++        o_weight,
++        "float32",
++        dtype,
++        (batch, steps, query_heads * head_dim),
++        hidden.type.shape[-1],
++        prefix + "_o_projection",
++        weight_dtype=dtype,
++    )
++    return output, new_k, new_v
++
++
++def _append_gdr_graph(
++    builder: _Builder,
++    hidden: ValueRef,
++    prior_conv_state: ValueRef,
++    prior_recurrent_state: ValueRef,
++    qkv_weight: ValueRef,
++    z_weight: ValueRef,
++    b_weight: ValueRef,
++    a_weight: ValueRef,
++    conv_weight: ValueRef,
++    a_log_weight: ValueRef,
++    dt_bias_weight: ValueRef,
++    norm_weight: ValueRef,
++    out_weight: ValueRef,
++    scale: ValueRef,
++    epsilon: ValueRef,
++    dtype: str,
++    input_shape: Tuple[int, ...],
++    batch: int,
++    steps: int,
++    key_heads: int,
++    value_heads: int,
++    key_dim: int,
++    value_dim: int,
++    kernel: int,
++    conv_channels: int,
++    prefix: str,
++) -> Tuple[ValueRef, ValueRef, ValueRef]:
++    """Append the connected GDR projection/conv/recurrence/out path."""
++
++    mixed = _linear_projection(
++        builder,
++        hidden,
++        qkv_weight,
++        dtype,
++        dtype,
++        input_shape,
++        2 * key_heads * key_dim + value_heads * value_dim,
++        prefix + "_in_proj_qkv",
++        weight_dtype=dtype,
++    )
++    mixed = _reshape(
++        builder,
++        mixed,
++        (batch, steps, 2 * key_heads * key_dim + value_heads * value_dim),
++        prefix + "_qkv_time",
++    )
++    mixed = _transpose(builder, mixed, (0, 2, 1), prefix + "_qkv_conv_input")
++    conv_weight_2d = _reshape(builder, conv_weight, (conv_channels, kernel), prefix + "_conv_weight_2d")
++    conv_output, new_conv_state = _append_causal_conv1d_state(
++        builder,
++        mixed,
++        prior_conv_state,
++        conv_weight_2d,
++        dtype,
++        dtype,
++        batch,
++        conv_channels,
++        steps,
++        kernel,
++        prefix + "_causal_conv",
++    )
++    conv_time = _transpose(builder, conv_output, (0, 2, 1), prefix + "_conv_time")
++    q_raw, k_raw, v_raw = builder.op(
++        "split",
++        (conv_time,),
++        (
++            (prefix + "_q_raw", _tensor(dtype, (batch, steps, key_heads * key_dim))),
++            (prefix + "_k_raw", _tensor(dtype, (batch, steps, key_heads * key_dim))),
++            (prefix + "_v_raw", _tensor(dtype, (batch, steps, value_heads * value_dim))),
++        ),
++        {"sizes": [key_heads * key_dim, key_heads * key_dim, value_heads * value_dim], "axis": -1},
++    )
++    query = _reshape(builder, q_raw, (batch, steps, key_heads, key_dim), prefix + "_q")
++    key = _reshape(builder, k_raw, (batch, steps, key_heads, key_dim), prefix + "_k")
++    value = _reshape(builder, v_raw, (batch, steps, value_heads, value_dim), prefix + "_v")
++    query = _l2_core(builder, query, epsilon, dtype, (batch, steps, key_heads, key_dim), prefix + "_q_l2")
++    key = _l2_core(builder, key, epsilon, dtype, (batch, steps, key_heads, key_dim), prefix + "_k_l2")
++    z = _linear_projection(
++        builder,
++        hidden,
++        z_weight,
++        dtype,
++        dtype,
++        input_shape,
++        value_heads * value_dim,
++        prefix + "_in_proj_z",
++        weight_dtype=dtype,
++    )
++    z = _reshape(builder, z, (batch, steps, value_heads, value_dim), prefix + "_z")
++    b = _linear_projection(
++        builder,
++        hidden,
++        b_weight,
++        dtype,
++        dtype,
++        input_shape,
++        value_heads,
++        prefix + "_in_proj_b",
++        weight_dtype=dtype,
++    )
++    a = _linear_projection(
++        builder,
++        hidden,
++        a_weight,
++        dtype,
++        dtype,
++        input_shape,
++        value_heads,
++        prefix + "_in_proj_a",
++        weight_dtype=dtype,
++    )
++    beta_f32 = builder.op(
++        "sigmoid",
++        (_as_f32(builder, b, dtype, prefix + "_beta_input"),),
++        ((prefix + "_beta_f32", _tensor("float32", (batch, steps, value_heads))),),
++    )[0]
++    beta = builder.op(
++        "cast",
++        (beta_f32,),
++        ((prefix + "_beta", _tensor(dtype, (batch, steps, value_heads))),),
++        {"dtype": dtype},
++    )[0]
++    a_f32 = _as_f32(builder, a, dtype, prefix + "_a_f32")
++    a_log_f32 = builder.op(
++        "broadcast",
++        (_as_f32(builder, a_log_weight, dtype, prefix + "_a_log_f32"),),
++        ((prefix + "_a_log_full", _tensor("float32", (batch, steps, value_heads))),),
++        {"shape": [batch, steps, value_heads]},
++    )[0]
++    dt_bias_f32 = builder.op(
++        "broadcast",
++        (_as_f32(builder, dt_bias_weight, dtype, prefix + "_dt_bias_f32"),),
++        ((prefix + "_dt_bias_full", _tensor("float32", (batch, steps, value_heads))),),
++        {"shape": [batch, steps, value_heads]},
++    )[0]
++    a_plus_dt = builder.op(
++        "add",
++        (a_f32, dt_bias_f32),
++        ((prefix + "_a_plus_dt", _tensor("float32", (batch, steps, value_heads))),),
++    )[0]
++    positive_dt = builder.op(
++        "softplus",
++        (a_plus_dt,),
++        ((prefix + "_positive_dt", _tensor("float32", (batch, steps, value_heads))),),
++    )[0]
++    neg_a_log = builder.op(
++        "neg",
++        (a_log_f32,),
++        ((prefix + "_negative_a_log", _tensor("float32", (batch, steps, value_heads))),),
++    )[0]
++    gate_log = builder.op(
++        "mul",
++        (neg_a_log, positive_dt),
++        ((prefix + "_gate_log_decay", _tensor("float32", (batch, steps, value_heads))),),
++    )[0]
++    # The existing functional recurrent builder has the fixed Qwen BF16
++    # q/k/v ABI.  Keep the L2 normalization in FP32, then make that ABI cast
++    # explicit instead of allowing a transpose to silently change dtype.
++    query_bf16 = _cast_from_f32(builder, query, dtype, prefix + "_q_norm_bf16")
++    key_bf16 = _cast_from_f32(builder, key, dtype, prefix + "_k_norm_bf16")
++    core_output, new_recurrent_state = _gdr_recurrent_inline(
++        builder,
++        query_bf16,
++        key_bf16,
++        value,
++        gate_log,
++        beta,
++        prior_recurrent_state,
++        scale,
++        batch,
++        steps,
++        value_heads,
++        key_dim,
++        value_dim,
++        prefix + "_recurrent",
++    )
++    core_f32 = _as_f32(builder, core_output, "bf16", prefix + "_core_output_f32")
++    gated_norm = _rms_gated_core(
++        builder,
++        core_f32,
++        norm_weight,
++        epsilon,
++        dtype,
++        (batch, steps, value_heads, value_dim),
++        prefix + "_gated_norm",
++    )
++    z_gate = builder.op(
++        "silu",
++        (_as_f32(builder, z, dtype, prefix + "_z_f32"),),
++        ((prefix + "_z_gate", _tensor("float32", (batch, steps, value_heads, value_dim))),),
++    )[0]
++    gated = builder.op(
++        "mul",
++        (gated_norm, z_gate),
++        ((prefix + "_gated_core", _tensor("float32", (batch, steps, value_heads, value_dim))),),
++    )[0]
++    merged = _reshape(builder, gated, (batch, steps, value_heads * value_dim), prefix + "_merged")
++    output = _linear_projection(
++        builder,
++        merged,
++        out_weight,
++        "float32",
++        dtype,
++        (batch, steps, value_heads * value_dim),
++        hidden.type.shape[-1],
++        prefix + "_out_projection",
++        weight_dtype=dtype,
++    )
++    return output, new_conv_state, new_recurrent_state
++
++
++def _gdr_recurrent_inline(
++    builder: _Builder,
++    query: ValueRef,
++    key: ValueRef,
++    value: ValueRef,
++    gate: ValueRef,
++    beta: ValueRef,
++    prior_state: ValueRef,
++    scale: ValueRef,
++    batch: int,
++    steps: int,
++    heads: int,
++    key_dim: int,
++    value_dim: int,
++    prefix: str,
++) -> Tuple[ValueRef, ValueRef]:
++    """Use the existing sequential GDR primitive composition in this graph."""
++
++    state = prior_state
++    outputs = []
++    for time_index in range(steps):
++        output, state = _gdr_step(
++            builder,
++            query,
++            key,
++            value,
++            gate,
++            beta,
++            state,
++            scale,
++            batch,
++            heads,
++            key_dim,
++            value_dim,
++            time_index,
++            "{}_step_{}".format(prefix, time_index),
++        )
++        outputs.append(output)
++    if len(outputs) == 1:
++        output = outputs[0]
++    else:
++        output = builder.op(
++            "concat",
++            tuple(outputs),
++            ((prefix + "_output", _tensor("bf16", (batch, steps, heads, value_dim))),),
++            {"axis": 1},
++        )[0]
++    return output, state
+ 
+ 
+ def _qwen35_kernel_size(value: Any) -> int:
+@@ -2211,6 +3720,8 @@ __all__ = [
+     "build_qwen35_position_ids",
+     "build_qwen35_text_decoder_graph",
+     "qwen35_text_decoder_manifest",
++    "qwen35_text_decoder_structural_manifest",
++    "build_qwen35_text_decoder_structural_shell",
+     "build_causal_conv1d",
+     "build_causal_conv1d_state",
+     "build_decoder_subgraph",
+diff --git a/python/tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py b/python/tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py
+new file mode 100644
+index 000000000..a47514255
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py
+@@ -0,0 +1,189 @@
++"""M1I no-weight full Qwen3.5 decoder connectivity tests.
++
++The synthetic profile is deliberately tiny; it validates SSA/dataflow and
++state carry without loading a checkpoint.  The real profile is audited as a
++graph/manifest only.  It is never lowered in this test process: a lowerer is
++allowed to build target-owned plans, but must not be asked to materialize a
++4096-token/0.8B plan in the same process as other backends.
++"""
++
++from __future__ import annotations
++
++from pypto.abi import LaunchRequest
++from pypto.backends.cpu import CpuScalarRuntime, HostTensor
++from pypto.compiler.targets.cpu import CpuScalarCompiler
++from pypto.compiler.targets.cpu_sve256 import Sve256Compiler
++from pypto.compiler.targets.cpu_vector import CpuVectorCompiler
++from pypto.compiler.targets.gpu import GpuCompiler
++from pypto.portable.qwen35 import (
++    build_qwen35_text_decoder_graph,
++    build_qwen35_text_decoder_structural_shell,
++    qwen35_text_decoder_manifest,
++    qwen35_text_decoder_structural_manifest,
++)
++from pypto.target import TargetSpec
++
++
++def _compile_scalar(program):
++    compiler = CpuScalarCompiler()
++    return compiler.compile(compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu")))
++
++
++def _synthetic_launch(program):
++    parameters = program.functions[0].parameters
++    inputs = []
++    for ref in parameters:
++        shape = tuple(ref.type.shape)
++        if ref.name == "input_ids":
++            inputs.append(HostTensor("int64", shape, [0] * _count(shape)))
++        elif ref.name == "cos":
++            inputs.append(HostTensor("bf16", shape, [1.0] * _count(shape)))
++        elif ref.name == "sin":
++            inputs.append(HostTensor("bf16", shape, [0.0] * _count(shape)))
++        elif ref.type.dtype == "float32":
++            inputs.append(HostTensor("float32", shape, [0.0] * _count(shape)))
++        else:
++            # Nonzero synthetic weights make projection/state edges observable;
++            # prior state buffers remain zero so the carry contract is clear.
++            value = 0.0 if "state_in" in ref.name or "prior_" in ref.name else 0.01
++            inputs.append(HostTensor("bf16", shape, [value] * _count(shape)))
++    outputs = [HostTensor(ref.type.dtype, tuple(ref.type.shape)) for ref in program.functions[0].returns]
++    return inputs, outputs
++
++
++def _count(shape):
++    result = 1
++    for dimension in shape:
++        result *= dimension
++    return result
++
++
++def test_full_manifest_parameter_and_route_contract():
++    manifest = qwen35_text_decoder_manifest(1, 1, past_length=4096)
++    assert manifest["graph_kind"] == "text_decoder_full_no_weight"
++    assert manifest["graph_contract_version"] == 2
++    assert manifest["weights_embedded"] is False
++    assert manifest["weight_execution"] is False
++    assert manifest["parameter_byte_count"] < (1 << 64)
++    assert manifest["tied_weight"]["storage_count"] == 1
++    assert len(manifest["parameter_manifest"]) == manifest["parameter_storage_count"]
++    assert len(manifest["layers"]) == 24
++    assert len(manifest["gdr_layer_indices"]) == 18
++    assert manifest["full_attention_layer_indices"] == [3, 7, 11, 15, 19, 23]
++    assert manifest["layers"][0]["state_semantics"] == "functional_pure_ssa_output"
++    assert manifest["layers"][3]["kv_state_outputs"]["new_k"] == [1, 2, 4097, 256]
++
++
++def test_model_profile_has_complete_layer_ssa_connectivity_without_weights():
++    program = build_qwen35_text_decoder_graph(1, 1, past_length=4096)
++    function = program.functions[0]
++    output_names = {value.name for operation in function.body.operations for value in operation.outputs}
++    parameter_names = {value.name for value in function.parameters}
++    metadata = program.metadata
++
++    assert len(metadata["layer_routes"]) == 24
++    assert [item["index"] for item in metadata["layer_routes"]] == list(range(24))
++    assert [item["kind"] for item in metadata["layer_routes"]].count("gdr") == 18
++    assert [item["kind"] for item in metadata["layer_routes"]].count("full_attention") == 6
++    assert metadata["layer_hidden_inputs"][0] == "hidden_input"
++    assert metadata["layer_hidden_inputs"][1:] == metadata["layer_hidden_outputs"][:-1]
++    assert len(metadata["layer_hidden_outputs"]) == 24
++    assert len(set(metadata["layer_hidden_outputs"])) == 24
++    assert all(name in output_names for name in metadata["layer_hidden_outputs"])
++    assert metadata["def_use_connectivity"]["logits"] in output_names
++    assert metadata["def_use_connectivity"]["final_hidden"] in output_names
++    assert metadata["def_use_connectivity"]["logits_depends_on_all_layers"] is True
++    assert all(name in parameter_names for name in metadata["state_input_names"])
++    assert all(name in output_names for name in metadata["state_output_names"])
++    assert any(
++        operation.name == "silu" and operation.outputs[0].name.endswith("_z_gate")
++        for operation in function.body.operations
++    )
++    assert any(
++        operation.name == "reduce_mean" and "_gated_norm_mean" in operation.outputs[0].name
++        for operation in function.body.operations
++    )
++    assert {value.name for value in function.returns} >= {
++        metadata["def_use_connectivity"]["logits"],
++        metadata["def_use_connectivity"]["final_hidden"],
++    }
++    assert len(metadata["state_output_names"]) == 48
++    assert all(
++        value.name.endswith(("_weight", "_state_in", "_prior_k", "_prior_v", "_A_log", "_dt_bias"))
++        or value.name in {
++            "input_ids", "cos", "sin", "embedding_lm_head_shared_weight", "final_norm_weight",
++        }
++        for value in function.parameters
++    )
++    assert all("values" not in operation.attributes for operation in function.body.operations)
++
++
++def test_model_profile_builds_compact_for_decode_cache_lengths():
++    for past in (0, 4096):
++        program = build_qwen35_text_decoder_graph(1, 1, past_length=past)
++        assert len(program.functions[0].body.operations) < 6000
++        assert len(program.canonical_json()) < 3_000_000
++        assert program.metadata["identity_shell"] is False
++        assert program.metadata["no_embedded_weight_values"] is True
++        assert program.metadata["no_state_allocation"] is True
++        assert "identity" not in program.metadata["executable_operations"]
++
++
++def test_synthetic_full_graph_executes_and_returns_functional_state():
++    program = build_qwen35_text_decoder_graph(1, 1, shape_profile="synthetic_test")
++    artifact = _compile_scalar(program)
++    inputs, outputs = _synthetic_launch(program)
++    state_snapshots = {
++        ref.name: tuple(inputs[index].flat())
++        for index, ref in enumerate(program.functions[0].parameters)
++        if ref.name.endswith(("_state_in", "_prior_k", "_prior_v"))
++    }
++    result = CpuScalarRuntime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[item.descriptor(readonly=True) for item in inputs],
++            outputs=[item.descriptor() for item in outputs],
++        )
++    )
++    assert result is not None
++    assert outputs[0].shape == (1, 1, 32)
++    assert outputs[2].tolist() == [[0]]
++    assert len(program.metadata["state_output_names"]) == 48
++    assert all(value == value for value in outputs[0].flat())
++    for index, ref in enumerate(program.functions[0].parameters):
++        if ref.name in state_snapshots:
++            assert tuple(inputs[index].flat()) == state_snapshots[ref.name]
++
++
++def test_synthetic_lowering_is_compact_and_backend_local():
++    """Exercise target-owned plans only on the bounded synthetic profile."""
++
++    program = build_qwen35_text_decoder_graph(1, 1, shape_profile="synthetic_test")
++    vector = CpuVectorCompiler()
++    vector_ir = vector.lower(
++        program,
++        TargetSpec(
++            "cpu", "x86_64-linux-gnu",
++            attributes={"lane_count": 4, "specialization": {"compact_iteration": True}},
++        ),
++    )
++    assert len(vector_ir.plans) == len(program.functions[0].body.operations)
++    assert all(plan.iteration.compact for plan in vector_ir.plans)
++    sve = Sve256Compiler()
++    sve_ir = sve.lower(
++        program,
++        TargetSpec("cpu", "aarch64-linux-gnu", features=("sve", "sve2"), attributes={"vl_bytes": 32}),
++    )
++    assert len(sve_ir.vector_program.plans) == len(program.functions[0].body.operations)
++    gpu = GpuCompiler()
++    gpu_ir = gpu.lower(program, TargetSpec("gpu", "gpu"))
++    assert len(gpu_ir.plans) == len(program.functions[0].body.operations)
++
++
++def test_structural_shell_is_explicit_compatibility_only():
++    old = qwen35_text_decoder_structural_manifest(1, 2, past_length=4)
++    shell = build_qwen35_text_decoder_structural_shell(1, 2, past_length=4)
++    assert old["graph_kind"] == "text_decoder_structural_no_weight"
++    assert old["identity_shell"] is True
++    assert shell.metadata["whole_model_execution"] == "not_claimed"
++    assert shell.functions[0].body.operations[0].name == "identity"
+diff --git a/python/tests/ut/pypto_x/test_qwen35_position_control.py b/python/tests/ut/pypto_x/test_qwen35_position_control.py
+index 2208a9b94..8c6435a40 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_position_control.py
++++ b/python/tests/ut/pypto_x/test_qwen35_position_control.py
+@@ -32,7 +32,9 @@ from pypto.portable.qwen35 import (
+     build_qwen35_position_control,
+     build_qwen35_position_ids,
+     build_qwen35_text_decoder_graph,
++    build_qwen35_text_decoder_structural_shell,
+     qwen35_text_decoder_manifest,
++    qwen35_text_decoder_structural_manifest,
+ )
+ from pypto.target import TargetSpec
+ 
+@@ -179,7 +181,7 @@ def test_avx2_position_control_uses_explicit_host_reference():
+ 
+ def test_text_decoder_manifest_has_fixed_routes_and_no_weight_execution():
+     manifest = qwen35_text_decoder_manifest(1, 2, past_length=4)
+-    assert manifest["graph_kind"] == "text_decoder_structural_no_weight"
++    assert manifest["graph_kind"] == "text_decoder_full_no_weight"
+     assert manifest["weights_embedded"] is False
+     assert manifest["weight_execution"] is False
+     assert len(manifest["layers"]) == 24
+@@ -188,11 +190,16 @@ def test_text_decoder_manifest_has_fixed_routes_and_no_weight_execution():
+     assert manifest["causal_mask_shape"] == [1, 8, 2, 6]
+     assert manifest["hidden_output_shape"] == [1, 2, QWEN35_08B_SHAPE_METADATA["hidden_size"]]
+     program = build_qwen35_text_decoder_graph(1, 2, past_length=4)
+-    assert program.metadata["whole_model_execution"] == "not_claimed"
+-    assert tuple(program.metadata["executable_operations"]) == ("identity",)
+-    assert [item.name for item in program.functions[0].parameters] == [
+-        "hidden_states", "position_ids", "causal_mask"
++    assert program.metadata["whole_model_execution"] == "parameterized_graph_no_weight_values"
++    assert program.metadata["identity_shell"] is False
++    assert "identity" not in program.metadata["executable_operations"]
++    assert [item.name for item in program.functions[0].parameters[:4]] == [
++        "input_ids", "cos", "sin", "embedding_lm_head_shared_weight"
+     ]
++    old_manifest = qwen35_text_decoder_structural_manifest(1, 2, past_length=4)
++    old_shell = build_qwen35_text_decoder_structural_shell(1, 2, past_length=4)
++    assert old_manifest["graph_kind"] == "text_decoder_structural_no_weight"
++    assert old_shell.metadata["whole_model_execution"] == "not_claimed"
+ 
+ 
+ def test_generic_compare_requires_bool_output_and_supports_broadcast():

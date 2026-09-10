@@ -1,0 +1,3069 @@
+From a63105eefc15e4959f4ac667c5542a3359607000 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Thu, 10 Sep 2026 16:34:44 +0800
+Subject: [PATCH 91/96] feat(pypto-x): ingest qwen35 bf16 checkpoint into
+ binding contract
+
+Add a dependency-free safetensors reader plus a programmatic mapping from the
+frozen Qwen3.5-0.8B text decoder contract to the official checkpoint tensors,
+and emit an auditable storage-relative packed layout for the 320 parameters.
+
+- safetensors_reader: 8-byte length + JSON header, 13 dtypes, strict
+  contiguity/no-overlap/coverage validation, read-only mmap or pread views,
+  streaming sha256; never materializes the data section.
+- qwen35_weight_map: expands the 22 compact manifest storage classes into
+  official HuggingFace names, checks contract/manifest/checkpoint three-way
+  agreement, records the tie_word_embeddings fallback to embed_tokens, and
+  lists the vision tower (153 tensors) and MTP (15 tensors) exclusions with
+  counts and bytes.
+- qwen35_weight_layout: merges the frozen 368-region packed layout with real
+  checkpoint file offsets, verifies the align_up chain, and quantifies the one
+  real contract difference: 36 F32 tensors (A_log, linear_attn.norm.weight)
+  against the all-bf16 contract. Conversion uses IEEE-754 RNE, not truncation;
+  measured A_log round-trip is exact and norm.weight stays within 2^-8.
+- tests: synthetic safetensors fixtures with negative cases, 320/320 mapping,
+  byte decomposition, layout reproducibility and the real checkpoint (skipped
+  when the pinned revision asset is absent).
+- python/pypto/portable/__init__.py: the only pre-existing file touched; it
+  only re-exports the new public symbols.
+---
+ python/pypto/portable/__init__.py                         |  64 ++++
+ python/pypto/portable/qwen35_weight_layout.py             | 634 +++++++++++++++++++++++++++++++
+ python/pypto/portable/qwen35_weight_map.py                | 685 ++++++++++++++++++++++++++++++++++
+ python/pypto/portable/safetensors_reader.py               | 469 +++++++++++++++++++++++
+ python/tests/ut/pypto_x/qwen35_weight_fixture.py          | 173 +++++++++
+ python/tests/ut/pypto_x/qwen35_weight_ingestion_driver.py | 334 +++++++++++++++++
+ python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py   | 319 ++++++++++++++++
+ python/tests/ut/pypto_x/test_safetensors_reader.py        | 292 +++++++++++++++
+ 8 files changed, 2970 insertions(+)
+
+diff --git a/python/pypto/portable/__init__.py b/python/pypto/portable/__init__.py
+index 24455c348..386fb9d5d 100644
+--- a/python/pypto/portable/__init__.py
++++ b/python/pypto/portable/__init__.py
+@@ -34,6 +34,41 @@ from .qwen35 import (
+     build_stable_softmax,
+     build_swiglu,
+ )
++from .qwen35_weight_map import (
++    ExcludedGroup,
++    ParameterMapping,
++    TensorSource,
++    TiedEmbedding,
++    WeightMapError,
++    WeightMapMismatchError,
++    WeightMapping,
++    assert_manifest_reproducible,
++    build_weight_mapping,
++    manifest_profile_from_metadata,
++    tie_word_embeddings_from_config,
++)
++from .qwen35_weight_layout import (
++    RegionConversion,
++    WeightLayout,
++    WeightLayoutError,
++    WeightLayoutRegion,
++    audit_precision_boundary,
++    build_weight_layout,
++    convert_f32_view_to_bf16_rne,
++    convert_region_bytes,
++    float32_bits_to_bfloat16_bits,
++)
++from .safetensors_reader import (
++    SAFETENSORS_DTYPES,
++    SafetensorsBoundsError,
++    SafetensorsClosedError,
++    SafetensorsError,
++    SafetensorsFormatError,
++    SafetensorsLayoutError,
++    SafetensorsReader,
++    SafetensorsTensor,
++    read_tensor_catalog,
++)
+ from .runtime_binding import (
+     BINDING_SCHEMA_VERSION,
+     BindingEntry,
+@@ -55,6 +90,35 @@ from .runtime_binding import (
+ 
+ __all__ = [
+     "QWEN35_08B_SHAPE_METADATA",
++    "ExcludedGroup",
++    "ParameterMapping",
++    "RegionConversion",
++    "SAFETENSORS_DTYPES",
++    "SafetensorsBoundsError",
++    "SafetensorsClosedError",
++    "SafetensorsError",
++    "SafetensorsFormatError",
++    "SafetensorsLayoutError",
++    "SafetensorsReader",
++    "SafetensorsTensor",
++    "TensorSource",
++    "TiedEmbedding",
++    "WeightLayout",
++    "WeightLayoutError",
++    "WeightLayoutRegion",
++    "WeightMapError",
++    "WeightMapMismatchError",
++    "WeightMapping",
++    "assert_manifest_reproducible",
++    "audit_precision_boundary",
++    "build_weight_layout",
++    "build_weight_mapping",
++    "convert_f32_view_to_bf16_rne",
++    "convert_region_bytes",
++    "float32_bits_to_bfloat16_bits",
++    "manifest_profile_from_metadata",
++    "read_tensor_catalog",
++    "tie_word_embeddings_from_config",
+     "build_attention_kv_cache",
+     "build_attention_subgraph",
+     "build_batched_matmul",
+diff --git a/python/pypto/portable/qwen35_weight_layout.py b/python/pypto/portable/qwen35_weight_layout.py
+new file mode 100644
+index 000000000..f0c618c84
+--- /dev/null
++++ b/python/pypto/portable/qwen35_weight_layout.py
+@@ -0,0 +1,634 @@
++"""Qwen3.5-0.8B 真实权重的 storage-relative packed layout。
++
++该模块把 :func:`pypto.portable.runtime_binding.build_packed_layout` 冻结的
++368 个 region（320 文本参数 + 48 状态）与 :mod:`pypto.portable.qwen35_weight_map`
++得到的官方 checkpoint file offset 合并成一份可复现、无重叠、无歧义空洞的
++JSON 描述。
++
++region 的 ``offset`` 是 **storage-relative** packed 偏移（M1J 冻结契约，64 字节
++对齐）；``source.file_offset`` 是该参数在 safetensors 文件中的真实绝对偏移。
++两者是不同的坐标系，绝不混用。状态 region 没有 checkpoint 来源，显式标记为
++``source: null``。
++
++布局校验：
++
++* 相邻 region 的 ``offset`` 必须恰好等于 ``align_up(previous_end, alignment)``，
++  因此既无重叠，也不存在未被记录的 padding；
++* 所有 parameter region 必须各自绑定唯一一个官方张量，且官方 file 区间两两不重叠；
++* dtype 与契约不一致的 region 会被标记 ``requires_dtype_conversion=true``，
++  由调用方决定是否转换，本模块不静默改写契约 dtype。
++
++**精度边界**：Qwen3.5-0.8B checkpoint 的 ``linear_attn.A_log`` 与
++``linear_attn.norm.weight`` 是 F32，而冻结契约要求全部 320 个参数为 bf16。
++:func:`convert_region_bytes` 按 IEEE-754 round-to-nearest-even 把它们降为
++BF16（不是截断），:func:`audit_precision_boundary` 用真实权重测出逐张量误差，
++把这一步量化成可复核的数字，而不是一句"有损"。
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import struct
++from dataclasses import dataclass
++from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
++
++from .qwen35 import build_qwen35_text_decoder_graph
++from .qwen35_weight_map import (
++    WeightMapping,
++    build_weight_mapping,
++    tie_word_embeddings_from_config,
++)
++from .runtime_binding import (
++    DEFAULT_PACK_ALIGNMENT,
++    BindingSchema,
++    PackedRegion,
++    build_binding_schema,
++    build_packed_layout,
++)
++from .safetensors_reader import SafetensorsReader
++
++
++class WeightLayoutError(ValueError):
++    """真实权重 layout 构造失败。"""
++
++
++@dataclass(frozen=True)
++class WeightLayoutRegion:
++    """packed region 与其官方 checkpoint 来源的合并描述。"""
++
++    storage_id: str
++    role: str
++    dtype: str
++    shape: Tuple[int, ...]
++    nbytes: int
++    offset: int
++    alignment: int
++    logical_names: Tuple[str, ...]
++    source_name: Optional[str]
++    source_file_offset: Optional[int]
++    source_data_offset: Optional[int]
++    source_dtype: Optional[str]
++    source_nbytes: Optional[int]
++    source_elements: Optional[int]
++    requires_dtype_conversion: bool
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "storage_id": self.storage_id,
++            "role": self.role,
++            "dtype": self.dtype,
++            "shape": list(self.shape),
++            "nbytes": self.nbytes,
++            "offset": self.offset,
++            "alignment": self.alignment,
++            "logical_names": list(self.logical_names),
++            "requires_dtype_conversion": self.requires_dtype_conversion,
++            "source": None
++            if self.source_name is None
++            else {
++                "tensor": self.source_name,
++                "file_offset": self.source_file_offset,
++                "data_offset": self.source_data_offset,
++                "dtype": self.source_dtype,
++                "nbytes": self.source_nbytes,
++                "elements": self.source_elements,
++            },
++        }
++
++
++@dataclass(frozen=True)
++class WeightLayout:
++    """完整的 368-region 真实权重 layout。"""
++
++    schema_digest: str
++    checkpoint_path: str
++    alignment: int
++    regions: Tuple[WeightLayoutRegion, ...]
++    total_nbytes: int
++    dtype_conversion_storage_ids: Tuple[str, ...]
++    source_text_bytes: int
++    source_file_nbytes: int
++
++    @property
++    def parameter_regions(self) -> Tuple[WeightLayoutRegion, ...]:
++        return tuple(region for region in self.regions if region.role == "parameter")
++
++    @property
++    def state_regions(self) -> Tuple[WeightLayoutRegion, ...]:
++        return tuple(region for region in self.regions if region.role == "state")
++
++    @property
++    def padding_nbytes(self) -> int:
++        return self.total_nbytes - sum(region.nbytes for region in self.regions)
++
++    def region_for(self, logical_name: str) -> WeightLayoutRegion:
++        for region in self.regions:
++            if logical_name in region.logical_names:
++                return region
++        raise WeightLayoutError("weight layout has no logical name {!r}".format(logical_name))
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "layout_kind": "qwen35_text_decoder_weight_layout",
++            "layout_version": 1,
++            "schema_digest": self.schema_digest,
++            "checkpoint_path": self.checkpoint_path,
++            "alignment": self.alignment,
++            "region_count": len(self.regions),
++            "parameter_region_count": len(self.parameter_regions),
++            "state_region_count": len(self.state_regions),
++            "total_nbytes": self.total_nbytes,
++            "parameter_nbytes": sum(region.nbytes for region in self.parameter_regions),
++            "state_nbytes": sum(region.nbytes for region in self.state_regions),
++            "padding_nbytes": self.padding_nbytes,
++            "source_file_nbytes": self.source_file_nbytes,
++            "source_text_bytes": self.source_text_bytes,
++            "dtype_conversion_region_count": len(self.dtype_conversion_storage_ids),
++            "dtype_conversion_storage_ids": list(self.dtype_conversion_storage_ids),
++            "state_regions_without_source": [region.storage_id for region in self.state_regions],
++            "regions": [region.to_dict() for region in self.regions],
++        }
++
++    def canonical_json(self) -> str:
++        return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
++
++    def layout_digest(self) -> str:
++        return hashlib.sha256(self.canonical_json().encode("utf-8")).hexdigest()
++
++
++def _align_up(value: int, alignment: int) -> int:
++    remainder = value % alignment
++    return value if not remainder else value + alignment - remainder
++
++
++def _source_by_storage(weight_mapping: WeightMapping) -> Mapping[str, Any]:
++    table: Dict[str, Any] = {}
++    for item in weight_mapping.mappings:
++        existing = table.get(item.storage_id)
++        if existing is not None and existing.source.official_name != item.source.official_name:
++            raise WeightLayoutError(
++                "storage {!r} is shared by {} and {}".format(
++                    item.storage_id, existing.source.official_name, item.source.official_name
++                )
++            )
++        table[item.storage_id] = item
++    return table
++
++
++def _verify_region_chain(regions: Sequence[PackedRegion], alignment: int) -> None:
++    cursor = 0
++    for region in regions:
++        if region.offset != _align_up(cursor, alignment):
++            raise WeightLayoutError(
++                "region {!r} offset {} is not align_up({}, {})".format(
++                    region.storage_id, region.offset, cursor, alignment
++                )
++            )
++        if region.alignment != alignment:
++            raise WeightLayoutError(
++                "region {!r} alignment {} differs from layout alignment {}".format(
++                    region.storage_id, region.alignment, alignment
++                )
++            )
++        cursor = region.offset + region.nbytes
++
++
++def _verify_source_disjoint(regions: Sequence[WeightLayoutRegion]) -> None:
++    spans = sorted(
++        (region.source_file_offset, region.source_file_offset + region.source_nbytes, region.storage_id)
++        for region in regions
++        if region.source_file_offset is not None
++    )
++    cursor = -1
++    for begin, end, storage_id in spans:
++        if begin < cursor:
++            raise WeightLayoutError(
++                "checkpoint range [{}, {}) for {!r} overlaps a previous tensor".format(begin, end, storage_id)
++            )
++        cursor = end
++
++
++def build_weight_layout(
++    schema: BindingSchema,
++    weight_mapping: WeightMapping,
++    checkpoint: SafetensorsReader,
++    *,
++    alignment: int = DEFAULT_PACK_ALIGNMENT,
++) -> WeightLayout:
++    """把冻结的 packed layout 与真实 checkpoint offset 合并成可审计 layout。"""
++
++    if not isinstance(schema, BindingSchema):
++        raise WeightLayoutError("schema must be a BindingSchema")
++    if not isinstance(weight_mapping, WeightMapping):
++        raise WeightLayoutError("weight_mapping must be a WeightMapping")
++    if weight_mapping.graph_digest != schema.graph_digest:
++        raise WeightLayoutError("weight mapping was built for a different graph digest")
++    packed = build_packed_layout(schema, alignment)
++    _verify_region_chain(packed.regions, packed.alignment)
++
++    source_by_storage = _source_by_storage(weight_mapping)
++    regions: List[WeightLayoutRegion] = []
++    for region in packed.regions:
++        if region.role == "parameter":
++            item = source_by_storage.get(region.storage_id)
++            if item is None:
++                raise WeightLayoutError(
++                    "parameter region {!r} has no checkpoint source".format(region.storage_id)
++                )
++            source = item.source
++            if item.dtype_conforms:
++                if source.nbytes != region.nbytes:
++                    raise WeightLayoutError(
++                        "parameter region {!r} nbytes {} differs from conforming source {}".format(
++                            region.storage_id, region.nbytes, source.nbytes
++                        )
++                    )
++            elif source.nbytes != region.nbytes * 2:
++                raise WeightLayoutError(
++                    "non-conforming region {!r} must halve source bytes ({} -> {})".format(
++                        region.storage_id, source.nbytes, region.nbytes
++                    )
++                )
++            regions.append(
++                WeightLayoutRegion(
++                    region.storage_id,
++                    region.role,
++                    region.dtype,
++                    region.shape,
++                    region.nbytes,
++                    region.offset,
++                    region.alignment,
++                    region.logical_names,
++                    source.official_name,
++                    source.file_offset,
++                    source.data_offset,
++                    source.dtype,
++                    source.nbytes,
++                    source.elements,
++                    not item.dtype_conforms,
++                )
++            )
++        elif region.role == "state":
++            regions.append(
++                WeightLayoutRegion(
++                    region.storage_id,
++                    region.role,
++                    region.dtype,
++                    region.shape,
++                    region.nbytes,
++                    region.offset,
++                    region.alignment,
++                    region.logical_names,
++                    None,
++                    None,
++                    None,
++                    None,
++                    None,
++                    None,
++                    False,
++                )
++            )
++        else:
++            raise WeightLayoutError("unexpected packed region role {!r}".format(region.role))
++
++    _verify_source_disjoint(regions)
++    parameter_regions = tuple(region for region in regions if region.role == "parameter")
++    if len(parameter_regions) != weight_mapping.mapped_count:
++        raise WeightLayoutError(
++            "layout has {} parameter regions but mapping has {} parameters".format(
++                len(parameter_regions), weight_mapping.mapped_count
++            )
++        )
++    used_storage = set(region.storage_id for region in parameter_regions)
++    missing = set(item.storage_id for item in weight_mapping.mappings) - used_storage
++    if missing:
++        raise WeightLayoutError("{} mapped storages are absent from the layout".format(len(missing)))
++
++    return WeightLayout(
++        schema.graph_digest,
++        checkpoint.path,
++        packed.alignment,
++        tuple(regions),
++        packed.total_nbytes,
++        tuple(sorted(region.storage_id for region in regions if region.requires_dtype_conversion)),
++        sum(region.source_nbytes for region in parameter_regions),
++        checkpoint.file_nbytes,
++    )
++
++
++BF16_EXPONENT_MASK = 0x7F800000
++BF16_DEFAULT_CHUNK_ELEMENTS = 1 << 16
++
++
++def float32_bits_to_bfloat16_bits(value: int) -> int:
++    """IEEE-754 binary32 位模式按 RNE 舍入到 binary16(bfloat16) 位模式。
++
++    规则与 TensorFlow/PyTorch 的 ``float_to_bfloat16`` 一致：加上
++    ``0x7FFF + lsb`` 后右移 16 位，因此是 round-to-nearest-even，不是截断。
++    NaN/Inf（指数全 1）单独处理，避免把 NaN 静默变成 Inf。
++    """
++
++    if value < 0 or value > 0xFFFFFFFF:
++        raise WeightLayoutError("float32 bit pattern out of range")
++    if (value & BF16_EXPONENT_MASK) == BF16_EXPONENT_MASK:
++        high = value >> 16
++        if value & 0x007FFFFF:
++            return high | 0x0040
++        return high
++    rounding_bias = 0x7FFF + ((value >> 16) & 1)
++    return ((value + rounding_bias) >> 16) & 0xFFFF
++
++
++def convert_f32_view_to_bf16_rne(view: memoryview, chunk_elements: int = BF16_DEFAULT_CHUNK_ELEMENTS) -> bytearray:
++    """把 F32 只读视图按 RNE 转成 BF16 字节序列。
++
++    按 chunk 处理，峰值内存是 ``chunk_elements * 8`` 字节量级，与输入长度无关。
++    """
++
++    if view.itemsize != 1 or view.nbytes % 4:
++        raise WeightLayoutError("float32 source view must be a byte view of length divisible by 4")
++    if isinstance(chunk_elements, bool) or not isinstance(chunk_elements, int) or chunk_elements <= 0:
++        raise WeightLayoutError("chunk_elements must be a positive integer")
++    elements = view.nbytes // 4
++    output = bytearray(elements * 2)
++    position = 0
++    while position < elements:
++        count = min(chunk_elements, elements - position)
++        values = struct.unpack_from("<{}I".format(count), view, position * 4)
++        packed = [float32_bits_to_bfloat16_bits(value) for value in values]
++        struct.pack_into("<{}H".format(count), output, position * 2, *packed)
++        position += count
++    return output
++
++
++def float32_view_to_float_list(view: memoryview) -> List[float]:
++    """把 F32 视图解成 Python float 列表（只用于小张量误差审计）。"""
++
++    elements = view.nbytes // 4
++    return list(struct.unpack_from("<{}f".format(elements), view, 0))
++
++
++def bfloat16_bytes_to_float_list(data: bytes) -> List[float]:
++    elements = len(data) // 2
++    bits = struct.unpack_from("<{}H".format(elements), data, 0)
++    return list(struct.unpack_from("<{}f".format(elements), struct.pack("<{}I".format(elements), *[value << 16 for value in bits]), 0))
++
++
++@dataclass(frozen=True)
++class RegionConversion:
++    """一个 parameter region 的存储字节来源与（必要时）降精度证据。"""
++
++    storage_id: str
++    source_name: str
++    source_dtype: str
++    contract_dtype: str
++    source_nbytes: int
++    contract_nbytes: int
++    elements: int
++    status: str
++    source_sha256: Optional[str]
++    converted_sha256: Optional[str]
++    max_abs_error: Optional[float]
++    max_relative_error: Optional[float]
++    exact_elements: Optional[int]
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "storage_id": self.storage_id,
++            "source_name": self.source_name,
++            "source_dtype": self.source_dtype,
++            "contract_dtype": self.contract_dtype,
++            "source_nbytes": self.source_nbytes,
++            "contract_nbytes": self.contract_nbytes,
++            "elements": self.elements,
++            "status": self.status,
++            "source_sha256": self.source_sha256,
++            "converted_sha256": self.converted_sha256,
++            "max_abs_error": self.max_abs_error,
++            "max_relative_error": self.max_relative_error,
++            "exact_elements": self.exact_elements,
++        }
++
++
++def convert_region_bytes(reader: SafetensorsReader, region: WeightLayoutRegion) -> bytes:
++    """返回一个 parameter region 存入 packed storage 时应有的**契约 dtype** 字节。
++
++    dtype 一致的 region 直接返回源字节；F32 源按 RNE 降为 BF16，字节数减半。
++    状态 region 与缺失来源都会 fail closed。
++    """
++
++    if region.source_name is None:
++        raise WeightLayoutError("region {!r} has no checkpoint source".format(region.storage_id))
++    view = reader.view(region.source_name)
++    try:
++        if not region.requires_dtype_conversion:
++            if view.nbytes != region.nbytes:
++                raise WeightLayoutError(
++                    "region {!r} source bytes {} differ from contract {}".format(
++                        region.storage_id, view.nbytes, region.nbytes
++                    )
++                )
++            return view.tobytes()
++        if region.source_dtype != "F32" or region.dtype != "bf16":
++            raise WeightLayoutError(
++                "region {!r} conversion {} -> {} is not supported".format(
++                    region.storage_id, region.source_dtype, region.dtype
++                )
++            )
++        if view.nbytes != region.nbytes * 2:
++            raise WeightLayoutError(
++                "region {!r} expects {} F32 bytes for {} BF16 bytes but source has {}".format(
++                    region.storage_id, region.nbytes * 2, region.nbytes, view.nbytes
++                )
++            )
++        return bytes(convert_f32_view_to_bf16_rne(view))
++    finally:
++        view.release()
++
++
++def audit_precision_boundary(
++    reader: SafetensorsReader,
++    layout: WeightLayout,
++) -> Tuple[RegionConversion, ...]:
++    """逐 region 记录存储来源；只对需要降精度的 region 读取真实权重并测误差。
++
++    dtype 一致的 region 不做任何数据读取（因此 1.5 GB 的 BF16 参数不会被触碰），
++    只有几百字节到几十 KB 的 F32 异常张量被读入并量化误差。
++    """
++
++    results: List[RegionConversion] = []
++    for region in layout.parameter_regions:
++        if not region.requires_dtype_conversion:
++            results.append(
++                RegionConversion(
++                    region.storage_id,
++                    region.source_name,
++                    region.source_dtype,
++                    region.dtype,
++                    region.source_nbytes,
++                    region.nbytes,
++                    region.source_elements,
++                    "identity",
++                    None,
++                    None,
++                    None,
++                    None,
++                    None,
++                )
++            )
++            continue
++        if region.source_nbytes != region.nbytes * 2:
++            raise WeightLayoutError(
++                "region {!r} conversion must halve bytes ({} -> {})".format(
++                    region.storage_id, region.source_nbytes, region.nbytes
++                )
++            )
++        view = reader.view(region.source_name)
++        try:
++            source_bytes = view.tobytes()
++            converted = convert_region_bytes(reader, region)
++        finally:
++            view.release()
++        if len(converted) != region.nbytes:
++            raise WeightLayoutError(
++                "region {!r} converted to {} bytes, contract requires {}".format(
++                    region.storage_id, len(converted), region.nbytes
++                )
++            )
++        originals = float32_view_to_float_list(memoryview(source_bytes))
++        restored = bfloat16_bytes_to_float_list(converted)
++        if len(originals) != len(restored):
++            raise WeightLayoutError("region {!r} round-trip length mismatch".format(region.storage_id))
++        max_abs = 0.0
++        max_rel = 0.0
++        exact = 0
++        for original, rounded in zip(originals, restored):
++            if original == rounded:
++                exact += 1
++            delta = abs(rounded - original)
++            if delta > max_abs:
++                max_abs = delta
++            if original != 0.0:
++                relative = delta / abs(original)
++                if relative > max_rel:
++                    max_rel = relative
++        results.append(
++            RegionConversion(
++                region.storage_id,
++                region.source_name,
++                region.source_dtype,
++                region.dtype,
++                region.source_nbytes,
++                region.nbytes,
++                region.source_elements,
++                "converted_rne",
++                hashlib.sha256(source_bytes).hexdigest(),
++                hashlib.sha256(converted).hexdigest(),
++                max_abs,
++                max_rel,
++                exact,
++            )
++        )
++    return tuple(results)
++
++
++def _positive_alignment(value: str) -> int:
++    try:
++        alignment = int(value, 10)
++    except ValueError as exc:
++        raise argparse.ArgumentTypeError("alignment must be an integer") from exc
++    if alignment <= 0 or alignment & (alignment - 1):
++        raise argparse.ArgumentTypeError("alignment must be a positive power of two")
++    return alignment
++
++
++def main(argv: Optional[Sequence[str]] = None) -> int:
++    """CLI：产出真实权重 layout JSON（只读 header，不物化权重）。"""
++
++    parser = argparse.ArgumentParser(description="Emit the Qwen3.5-0.8B text decoder weight layout")
++    parser.add_argument("--checkpoint", required=True, help="safetensors file path")
++    parser.add_argument("--output", required=True, help="layout JSON output path")
++    parser.add_argument("--config", default=None, help="optional official config.json for tie_word_embeddings")
++    parser.add_argument("--alignment", type=_positive_alignment, default=DEFAULT_PACK_ALIGNMENT)
++    parser.add_argument("--batch", type=int, default=1)
++    parser.add_argument("--steps", type=int, default=1)
++    parser.add_argument("--past-length", type=int, default=0)
++    args = parser.parse_args(argv)
++
++    tie_word_embeddings = True
++    if args.config:
++        tie_word_embeddings = tie_word_embeddings_from_config(args.config)
++    program = build_qwen35_text_decoder_graph(
++        args.batch, args.steps, past_length=args.past_length, shape_profile="model"
++    )
++    schema = build_binding_schema(program)
++    with SafetensorsReader(args.checkpoint, mode="pread") as checkpoint:
++        mapping = build_weight_mapping(
++            schema, program.metadata, checkpoint, tie_word_embeddings=tie_word_embeddings
++        )
++        layout = build_weight_layout(schema, mapping, checkpoint, alignment=args.alignment)
++        conversions = audit_precision_boundary(checkpoint, layout)
++        payload = {
++            "status": "PASS",
++            "schema_digest": schema.graph_digest,
++            "layout_digest": layout.layout_digest(),
++            "mapping": {
++                "parameter_count": mapping.parameter_count,
++                "mapped_count": mapping.mapped_count,
++                "dtype_discrepancies": len(mapping.dtype_discrepancies),
++                "excluded": [
++                    {"group": group.group, "tensor_count": group.tensor_count, "nbytes": group.nbytes}
++                    for group in mapping.excluded
++                ],
++                "tied": mapping.tied.to_dict(),
++                "totals": dict(mapping.totals),
++            },
++            "conversion": {
++                "region_count": len(conversions),
++                "converted_region_count": sum(1 for item in conversions if item.status == "converted_rne"),
++                "converted_source_bytes": sum(
++                    item.source_nbytes for item in conversions if item.status == "converted_rne"
++                ),
++                "converted_contract_bytes": sum(
++                    item.contract_nbytes for item in conversions if item.status == "converted_rne"
++                ),
++                "max_relative_error": max(
++                    [item.max_relative_error for item in conversions if item.max_relative_error is not None]
++                    or [0.0]
++                ),
++                "regions": [
++                    item.to_dict() for item in conversions if item.status == "converted_rne"
++                ],
++            },
++            "layout": layout.to_dict(),
++        }
++        output = args.output
++        with open(output, "w", encoding="utf-8") as stream:
++            json.dump(payload, stream, ensure_ascii=False, sort_keys=True, indent=2)
++            stream.write("\n")
++    summary = {
++        "status": "PASS",
++        "output": args.output,
++        "region_count": len(layout.regions),
++        "total_nbytes": layout.total_nbytes,
++        "mapped_count": mapping.mapped_count,
++        "dtype_conversion_region_count": len(layout.dtype_conversion_storage_ids),
++        "layout_digest": layout.layout_digest(),
++    }
++    print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
++    return 0
++
++
++__all__ = [
++    "WeightLayout",
++    "WeightLayoutError",
++    "WeightLayoutRegion",
++    "build_weight_layout",
++    "main",
++]
++
++
++if __name__ == "__main__":  # pragma: no cover - CLI 入口
++    raise SystemExit(main())
+diff --git a/python/pypto/portable/qwen35_weight_map.py b/python/pypto/portable/qwen35_weight_map.py
+new file mode 100644
+index 000000000..a6d8fa023
+--- /dev/null
++++ b/python/pypto/portable/qwen35_weight_map.py
+@@ -0,0 +1,685 @@
++"""Qwen3.5-0.8B 官方 checkpoint 张量名到 PyPTO-X 文本 decoder 参数的映射。
++
++映射是**程序化推导**的，不是逐张量硬编码：PyPTO-X 侧的 compact manifest
++（:func:`pypto.portable.qwen35.qwen35_text_decoder_manifest` 的
++``parameter_manifest``）已经用 ``layers.full_attention.*`` /
++``layers.linear_attention.*`` / ``layers.*`` 三类模式描述了 22 个存储类；
++本模块只把这三类模式展开成官方 HuggingFace 命名，再与 graph metadata 的
++``layers[].parameter_routes`` 和 :class:`~pypto.portable.runtime_binding.BindingSchema`
++的 320 个精确函数参数逐一对照。
++
++三类名字必须同时成立，任何一方不匹配都 fail closed：
++
++* **contract**：Core graph 的精确函数参数（顺序、dtype、shape）；
++* **manifest**：compact 存储类的 dtype/shape/count/字节数；
++* **checkpoint**：safetensors header 里的官方 dtype/shape/data_offsets。
++
++``tie_word_embeddings=true`` 时官方 checkpoint 没有 ``lm_head.weight``，映射显式
++回退到 ``model.language_model.embed_tokens.weight`` 并在结果里记录，不做静默
++猜测。vision tower（``model.visual.*``）与 MTP 层（``mtp.*``）被显式列为排除组，
++带张量数、字节数和完整名字列表，绝不进入文本图。
++
++本模块不读取权重数据，只用 header 元数据。
++"""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from types import MappingProxyType
++from typing import Any, Dict, List, Mapping, Sequence, Tuple
++
++from .qwen35 import _decoder_parameter_manifest
++from .runtime_binding import _DTYPE_BYTES, BindingSchema, _canonical_dtype
++from .safetensors_reader import SafetensorsReader, SafetensorsTensor
++
++#: 官方 checkpoint 里文本 decoder 的根前缀。
++QWEN35_TEXT_PREFIX = "model.language_model."
++#: 官方 checkpoint 里视觉塔的根前缀（本任务显式排除）。
++QWEN35_VISION_PREFIX = "model.visual."
++#: 官方 checkpoint 里 MTP 层的根前缀（本任务显式排除）。
++QWEN35_MTP_PREFIX = "mtp."
++#: tied embedding 的官方张量名。
++QWEN35_EMBED_TOKENS_TENSOR = QWEN35_TEXT_PREFIX + "embed_tokens.weight"
++#: tied embedding 对应的 lm_head 别名（checkpoint 中可能不存在）。
++QWEN35_LM_HEAD_TENSOR = "lm_head.weight"
++
++_EXCLUSION_GROUPS = (
++    ("vision_tower", QWEN35_VISION_PREFIX),
++    ("mtp", QWEN35_MTP_PREFIX),
++)
++
++_MODULE_BY_PREFIX = {
++    "layers.full_attention.": "self_attn",
++    "layers.linear_attention.": "linear_attn",
++    "layers.": None,
++}
++
++_SHARED_OFFICIAL_NAMES = {
++    "embedding_lm_head_shared_weight": QWEN35_EMBED_TOKENS_TENSOR,
++    "final_norm.weight": QWEN35_TEXT_PREFIX + "norm.weight",
++}
++
++_SHARED_FUNCTION_PARAMETERS = {
++    "embedding_lm_head_shared_weight": "embedding_lm_head_shared_weight",
++    "final_norm.weight": "final_norm_weight",
++}
++
++
++class WeightMapError(ValueError):
++    """权重映射失败基类。"""
++
++
++class WeightMapMismatchError(WeightMapError):
++    """contract / manifest / checkpoint 三方不一致。"""
++
++
++def tie_word_embeddings_from_config(path: str) -> bool:
++    """从官方 ``config.json`` 读取 tie_word_embeddings（text_config 优先）。"""
++
++    with open(path, "r", encoding="utf-8") as stream:
++        config = json.load(stream)
++    if not isinstance(config, dict):
++        raise WeightMapError("{} must contain a JSON object".format(path))
++    text_config = config.get("text_config")
++    if isinstance(text_config, dict) and isinstance(text_config.get("tie_word_embeddings"), bool):
++        return bool(text_config["tie_word_embeddings"])
++    if isinstance(config.get("tie_word_embeddings"), bool):
++        return bool(config["tie_word_embeddings"])
++    raise WeightMapError("{} does not declare tie_word_embeddings".format(path))
++
++
++@dataclass(frozen=True)
++class TensorSource:
++    """官方 checkpoint 中一个张量的 header 元数据。"""
++
++    official_name: str
++    dtype: str
++    pypto_dtype: str
++    shape: Tuple[int, ...]
++    elements: int
++    nbytes: int
++    data_offset: int
++    file_offset: int
++
++    @classmethod
++    def from_tensor(cls, tensor: SafetensorsTensor) -> "TensorSource":
++        return cls(
++            tensor.name,
++            tensor.dtype,
++            tensor.pypto_dtype,
++            tensor.shape,
++            tensor.elements,
++            tensor.nbytes,
++            tensor.data_offset,
++            tensor.file_offset,
++        )
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "official_name": self.official_name,
++            "dtype": self.dtype,
++            "pypto_dtype": self.pypto_dtype,
++            "shape": list(self.shape),
++            "elements": self.elements,
++            "nbytes": self.nbytes,
++            "data_offset": self.data_offset,
++            "file_offset": self.file_offset,
++        }
++
++
++@dataclass(frozen=True)
++class ParameterMapping:
++    """一个 PyPTO-X 函数参数到官方张量的完整三方对照。"""
++
++    ordinal: int
++    parameter: str
++    storage_id: str
++    manifest_pattern: str
++    manifest_dtype: str
++    shape: Tuple[int, ...]
++    elements: int
++    manifest_bytes: int
++    source: TensorSource
++    dtype_conforms: bool
++    tied: bool
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "ordinal": self.ordinal,
++            "parameter": self.parameter,
++            "storage_id": self.storage_id,
++            "manifest_pattern": self.manifest_pattern,
++            "manifest_dtype": self.manifest_dtype,
++            "shape": list(self.shape),
++            "elements": self.elements,
++            "manifest_bytes": self.manifest_bytes,
++            "dtype_conforms": self.dtype_conforms,
++            "tied": self.tied,
++            "source": self.source.to_dict(),
++        }
++
++
++@dataclass(frozen=True)
++class ExcludedGroup:
++    """显式排除在文本图之外的 checkpoint 张量组。"""
++
++    group: str
++    prefix: str
++    tensor_count: int
++    nbytes: int
++    dtype_counts: Mapping[str, int]
++    names: Tuple[str, ...]
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "group": self.group,
++            "prefix": self.prefix,
++            "tensor_count": self.tensor_count,
++            "nbytes": self.nbytes,
++            "dtype_counts": dict(self.dtype_counts),
++            "names": list(self.names),
++        }
++
++
++@dataclass(frozen=True)
++class TiedEmbedding:
++    """tied embedding / lm_head 的显式回退记录。"""
++
++    tie_word_embeddings: bool
++    storage_id: str
++    function_parameter: str
++    checkpoint_tensor: str
++    lm_head_alias: str
++    lm_head_present: bool
++    fallback_used: bool
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "tie_word_embeddings": self.tie_word_embeddings,
++            "storage_id": self.storage_id,
++            "function_parameter": self.function_parameter,
++            "checkpoint_tensor": self.checkpoint_tensor,
++            "lm_head_alias": self.lm_head_alias,
++            "lm_head_present": self.lm_head_present,
++            "fallback_used": self.fallback_used,
++        }
++
++
++@dataclass(frozen=True)
++class WeightMapping:
++    """320 个文本参数到官方 checkpoint 的完整映射与排除清单。"""
++
++    graph_digest: str
++    checkpoint_path: str
++    tie_word_embeddings: bool
++    parameter_count: int
++    mapped_count: int
++    unmapped: Tuple[str, ...]
++    unexpected_checkpoint_tensors: Tuple[str, ...]
++    mappings: Tuple[ParameterMapping, ...]
++    excluded: Tuple[ExcludedGroup, ...]
++    tied: TiedEmbedding
++    totals: Mapping[str, Any]
++
++    @property
++    def dtype_discrepancies(self) -> Tuple[ParameterMapping, ...]:
++        return tuple(item for item in self.mappings if not item.dtype_conforms)
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "graph_digest": self.graph_digest,
++            "checkpoint_path": self.checkpoint_path,
++            "tie_word_embeddings": self.tie_word_embeddings,
++            "parameter_count": self.parameter_count,
++            "mapped_count": self.mapped_count,
++            "unmapped": list(self.unmapped),
++            "unexpected_checkpoint_tensors": list(self.unexpected_checkpoint_tensors),
++            "tied": self.tied.to_dict(),
++            "excluded": [group.to_dict() for group in self.excluded],
++            "totals": dict(self.totals),
++            "dtype_discrepancies": [
++                {
++                    "parameter": item.parameter,
++                    "manifest_pattern": item.manifest_pattern,
++                    "manifest_dtype": item.manifest_dtype,
++                    "checkpoint_dtype": item.source.dtype,
++                    "checkpoint_name": item.source.official_name,
++                    "elements": item.elements,
++                    "manifest_bytes": item.manifest_bytes,
++                    "checkpoint_bytes": item.source.nbytes,
++                }
++                for item in self.dtype_discrepancies
++            ],
++            "mappings": [item.to_dict() for item in self.mappings],
++        }
++
++    def canonical_json(self) -> str:
++        return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
++
++
++def _layer_route_table(program_metadata: Mapping[str, Any]) -> Dict[str, Tuple[int, str, str]]:
++    """从 graph metadata 的 ``layers[].parameter_routes`` 建立路由表。"""
++
++    layers = program_metadata.get("layers")
++    if not isinstance(layers, Sequence) or isinstance(layers, (str, bytes)) or not layers:
++        raise WeightMapMismatchError("graph metadata must declare a non-empty layers sequence")
++    table: Dict[str, Tuple[int, str, str]] = {}
++    for layer in layers:
++        if not isinstance(layer, Mapping):
++            raise WeightMapMismatchError("graph metadata layers entries must be mappings")
++        index = layer.get("index")
++        kind = layer.get("kind")
++        routes = layer.get("parameter_routes")
++        if isinstance(index, bool) or not isinstance(index, int) or index < 0:
++            raise WeightMapMismatchError("graph metadata layer index must be a non-negative integer")
++        if not isinstance(kind, str) or not kind:
++            raise WeightMapMismatchError("graph metadata layer {!r} kind must be a string".format(index))
++        if not isinstance(routes, Sequence) or isinstance(routes, (str, bytes)):
++            raise WeightMapMismatchError("graph metadata layer {!r} parameter_routes must be a sequence".format(index))
++        for route in routes:
++            if not isinstance(route, str) or "." not in route:
++                raise WeightMapMismatchError("parameter route {!r} must be 'layer_NN.<suffix>'".format(route))
++            prefix, suffix = route.split(".", 1)
++            if prefix != "layer_{:02d}".format(index):
++                raise WeightMapMismatchError(
++                    "parameter route {!r} does not belong to layer {:02d}".format(route, index)
++                )
++            function_parameter = route.replace(".", "_")
++            if function_parameter in table:
++                raise WeightMapMismatchError("duplicate parameter route {!r}".format(route))
++            table[function_parameter] = (index, kind, suffix)
++    return table
++
++
++def _expand_manifest_entry(
++    entry: Mapping[str, Any],
++    full_indices: Tuple[int, ...],
++    gdr_indices: Tuple[int, ...],
++) -> Tuple[Tuple[str, str, str], ...]:
++    """把一个 compact manifest 存储类展开成 (function_parameter, official_name, pattern) 三元组。"""
++
++    pattern = entry.get("name")
++    if not isinstance(pattern, str) or not pattern:
++        raise WeightMapMismatchError("parameter_manifest entry name must be a non-empty string")
++    count = entry.get("count")
++    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
++        raise WeightMapMismatchError("parameter_manifest {!r} count must be a positive integer".format(pattern))
++
++    if pattern in _SHARED_OFFICIAL_NAMES:
++        expanded = ((_SHARED_FUNCTION_PARAMETERS[pattern], _SHARED_OFFICIAL_NAMES[pattern], pattern),)
++    elif ".*." in pattern:
++        head, suffix = pattern.split("*.", 1)
++        if not head.endswith(".") or head not in _MODULE_BY_PREFIX:
++            raise WeightMapMismatchError("parameter_manifest pattern {!r} has an unknown prefix".format(pattern))
++        module = _MODULE_BY_PREFIX[head]
++        if module == "self_attn":
++            indices = tuple(full_indices)
++        elif module == "linear_attn":
++            indices = tuple(gdr_indices)
++        else:
++            indices = tuple(sorted(tuple(full_indices) + tuple(gdr_indices)))
++        expanded_list: List[Tuple[str, str, str]] = []
++        for index in indices:
++            function_parameter = "layer_{:02d}_{}".format(index, suffix.replace(".", "_"))
++            if module is None:
++                official_name = "{}layers.{}.{}".format(QWEN35_TEXT_PREFIX, index, suffix)
++            else:
++                official_name = "{}layers.{}.{}.{}".format(QWEN35_TEXT_PREFIX, index, module, suffix)
++            expanded_list.append((function_parameter, official_name, pattern))
++        expanded = tuple(expanded_list)
++    else:
++        raise WeightMapMismatchError("parameter_manifest has an unknown storage class {!r}".format(pattern))
++
++    if len(expanded) != count:
++        raise WeightMapMismatchError(
++            "parameter_manifest {!r} declares count {} but expands to {} tensors".format(
++                pattern, count, len(expanded)
++            )
++        )
++    return expanded
++
++
++def _dtype_counts(tensors: Sequence[SafetensorsTensor]) -> Mapping[str, int]:
++    counts: Dict[str, int] = {}
++    for tensor in tensors:
++        counts[tensor.dtype] = counts.get(tensor.dtype, 0) + 1
++    return MappingProxyType(counts)
++
++
++def build_weight_mapping(
++    schema: BindingSchema,
++    program_metadata: Mapping[str, Any],
++    checkpoint: SafetensorsReader,
++    *,
++    tie_word_embeddings: bool = True,
++) -> WeightMapping:
++    """把 320 个 Core 参数映射到官方 checkpoint 张量。
++
++    任何未映射参数、缺失张量、未预期张量或 shape/元素数不一致都会抛出
++    :class:`WeightMapMismatchError`。dtype 差异**不**抛异常，而是逐条记录在
++    :attr:`WeightMapping.dtype_discrepancies` 中，因为契约由父 agent 冻结，
++    本模块无权改写。
++    """
++
++    if not isinstance(schema, BindingSchema):
++        raise WeightMapError("schema must be a BindingSchema")
++    if not isinstance(checkpoint, SafetensorsReader):
++        raise WeightMapError("checkpoint must be a SafetensorsReader")
++
++    raw_manifest = program_metadata.get("parameter_manifest")
++    if not isinstance(raw_manifest, Sequence) or isinstance(raw_manifest, (str, bytes)) or not raw_manifest:
++        raise WeightMapMismatchError("graph metadata parameter_manifest must be a non-empty sequence")
++    full_indices = program_metadata.get("full_attention_layer_indices")
++    gdr_indices = program_metadata.get("gdr_layer_indices")
++    if not isinstance(full_indices, Sequence) or isinstance(full_indices, (str, bytes)):
++        raise WeightMapMismatchError("graph metadata full_attention_layer_indices must be a sequence")
++    if not isinstance(gdr_indices, Sequence) or isinstance(gdr_indices, (str, bytes)):
++        raise WeightMapMismatchError("graph metadata gdr_layer_indices must be a sequence")
++    full_indices = tuple(full_indices)
++    gdr_indices = tuple(gdr_indices)
++    route_table = _layer_route_table(program_metadata)
++
++    parameters = {entry.name: entry for entry in schema.parameters}
++    if len(parameters) != len(schema.parameters):
++        raise WeightMapMismatchError("binding schema contains duplicate parameter names")
++
++    tensor_catalog = checkpoint.tensors()
++    mapped_names = set()
++    mappings: List[ParameterMapping] = []
++    seen_parameters = set()
++
++    for entry in raw_manifest:
++        if not isinstance(entry, Mapping):
++            raise WeightMapMismatchError("parameter_manifest entries must be mappings")
++        manifest_dtype = _canonical_dtype(entry.get("dtype"))
++        manifest_shape = tuple(entry.get("shape") or ())
++        manifest_elements = entry.get("elements_per_tensor")
++        manifest_class_bytes = entry.get("storage_bytes")
++        count = entry.get("count")
++        for name, value in (
++            ("elements_per_tensor", manifest_elements),
++            ("storage_bytes", manifest_class_bytes),
++            ("count", count),
++        ):
++            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
++                raise WeightMapMismatchError("parameter_manifest {}.{} must be positive".format(entry.get("name"), name))
++        per_tensor_bytes = manifest_elements * _DTYPE_BYTES[manifest_dtype]
++        if per_tensor_bytes * count != manifest_class_bytes:
++            raise WeightMapMismatchError(
++                "parameter_manifest {!r} storage_bytes {} is not count {} x {} per tensor".format(
++                    entry.get("name"), manifest_class_bytes, count, per_tensor_bytes
++                )
++            )
++        for function_parameter, official_name, pattern in _expand_manifest_entry(
++            entry, full_indices, gdr_indices
++        ):
++            if function_parameter in seen_parameters:
++                raise WeightMapMismatchError("manifest expands duplicate parameter {!r}".format(function_parameter))
++            seen_parameters.add(function_parameter)
++            exact = parameters.get(function_parameter)
++            if exact is None:
++                raise WeightMapMismatchError(
++                    "manifest parameter {!r} is not an exact Core function parameter".format(function_parameter)
++                )
++            if exact.dtype != manifest_dtype:
++                raise WeightMapMismatchError(
++                    "parameter {!r} dtype {} does not match manifest dtype {}".format(
++                        function_parameter, exact.dtype, manifest_dtype
++                    )
++                )
++            if tuple(exact.shape) != manifest_shape:
++                raise WeightMapMismatchError(
++                    "parameter {!r} shape {} does not match manifest shape {}".format(
++                        function_parameter, list(exact.shape), list(manifest_shape)
++                    )
++                )
++            if _shape_elements(manifest_shape) != manifest_elements:
++                raise WeightMapMismatchError(
++                    "parameter {!r} elements_per_tensor is inconsistent with shape".format(function_parameter)
++                )
++            if ".*." in pattern and function_parameter not in route_table:
++                raise WeightMapMismatchError(
++                    "parameter {!r} is absent from graph layer parameter_routes".format(function_parameter)
++                )
++            tensor = tensor_catalog.get(official_name)
++            if tensor is None:
++                raise WeightMapMismatchError(
++                    "checkpoint is missing tensor {!r} for parameter {!r}".format(official_name, function_parameter)
++                )
++            if tensor.name in mapped_names:
++                raise WeightMapMismatchError(
++                    "checkpoint tensor {!r} is claimed by more than one parameter".format(official_name)
++                )
++            mapped_names.add(tensor.name)
++            if tuple(tensor.shape) != manifest_shape:
++                raise WeightMapMismatchError(
++                    "checkpoint tensor {!r} shape {} does not match contract shape {}".format(
++                        official_name, list(tensor.shape), list(manifest_shape)
++                    )
++                )
++            if tensor.elements != manifest_elements:
++                raise WeightMapMismatchError(
++                    "checkpoint tensor {!r} element count {} does not match contract {}".format(
++                        official_name, tensor.elements, manifest_elements
++                    )
++                )
++            if tensor.nbytes % tensor.itemsize:
++                raise WeightMapMismatchError(
++                    "checkpoint tensor {!r} byte count is not a multiple of its itemsize".format(official_name)
++                )
++            source = TensorSource.from_tensor(tensor)
++            mappings.append(
++                ParameterMapping(
++                    exact.ordinal,
++                    function_parameter,
++                    exact.storage_id,
++                    pattern,
++                    manifest_dtype,
++                    manifest_shape,
++                    manifest_elements,
++                    per_tensor_bytes,
++                    source,
++                    tensor.pypto_dtype == manifest_dtype,
++                    pattern == "embedding_lm_head_shared_weight",
++                )
++            )
++
++    unmapped = tuple(sorted(set(parameters) - seen_parameters))
++    if unmapped:
++        raise WeightMapMismatchError("{} Core parameters are unmapped: {}".format(len(unmapped), list(unmapped[:8])))
++    mapped_layer_parameters = set(
++        item.parameter for item in mappings if ".*." in item.manifest_pattern
++    )
++    if mapped_layer_parameters != set(route_table):
++        missing_routes = set(route_table) - mapped_layer_parameters
++        extra_routes = mapped_layer_parameters - set(route_table)
++        raise WeightMapMismatchError(
++            "manifest expansion does not match graph parameter_routes: missing {}, extra {}".format(
++                sorted(missing_routes)[:4], sorted(extra_routes)[:4]
++            )
++        )
++
++    # tied embedding / lm_head 显式决策
++    lm_head_present = QWEN35_LM_HEAD_TENSOR in tensor_catalog
++    if not tie_word_embeddings:
++        raise WeightMapMismatchError(
++            "PyPTO-X contract declares one shared embedding/lm_head storage; "
++            "tie_word_embeddings=false is not representable by this ingestion path"
++        )
++    if QWEN35_EMBED_TOKENS_TENSOR not in mapped_names:
++        raise WeightMapMismatchError(
++            "tied checkpoint must map {!r} to the shared embedding parameter".format(QWEN35_EMBED_TOKENS_TENSOR)
++        )
++    tied = TiedEmbedding(
++        bool(tie_word_embeddings),
++        "embedding_lm_head_shared_weight",
++        "embedding_lm_head_shared_weight",
++        QWEN35_EMBED_TOKENS_TENSOR,
++        QWEN35_LM_HEAD_TENSOR,
++        lm_head_present,
++        bool(tie_word_embeddings),
++    )
++
++    excluded: List[ExcludedGroup] = []
++    excluded_names = set()
++    for group, prefix in _EXCLUSION_GROUPS:
++        members = tuple(sorted(name for name in tensor_catalog if name.startswith(prefix)))
++        for name in members:
++            if name in mapped_names:
++                raise WeightMapMismatchError(
++                    "excluded tensor {!r} is also mapped into the text graph".format(name)
++                )
++        excluded_names.update(members)
++        excluded.append(
++            ExcludedGroup(
++                group,
++                prefix,
++                len(members),
++                sum(tensor_catalog[name].nbytes for name in members),
++                _dtype_counts([tensor_catalog[name] for name in members]),
++                members,
++            )
++        )
++
++    unexpected = tuple(sorted(set(tensor_catalog) - mapped_names - excluded_names))
++    if unexpected:
++        raise WeightMapMismatchError(
++            "checkpoint contains {} unclassified tensors: {}".format(len(unexpected), list(unexpected[:8]))
++        )
++
++    text_tensors = [tensor_catalog[item.source.official_name] for item in mappings]
++    text_bytes_by_dtype: Dict[str, int] = {}
++    for tensor in text_tensors:
++        text_bytes_by_dtype[tensor.dtype] = text_bytes_by_dtype.get(tensor.dtype, 0) + tensor.nbytes
++    discrepancies = tuple(item for item in mappings if not item.dtype_conforms)
++    element_total = sum(item.elements for item in mappings)
++    manifest_total = sum(item.manifest_bytes for item in mappings)
++    declared_elements = program_metadata.get("parameter_element_count")
++    declared_bytes = program_metadata.get("parameter_byte_count")
++    if element_total != declared_elements or manifest_total != declared_bytes:
++        raise WeightMapMismatchError(
++            "mapped totals ({}, {}) do not match graph metadata ({}, {})".format(
++                element_total, manifest_total, declared_elements, declared_bytes
++            )
++        )
++    tensor_count_by_dtype: Dict[str, int] = {}
++    for item in mappings:
++        key = item.source.dtype
++        tensor_count_by_dtype[key] = tensor_count_by_dtype.get(key, 0) + 1
++    discrepancy_groups: List[Mapping[str, Any]] = []
++    for pattern in sorted(set(item.manifest_pattern for item in discrepancies)):
++        members = [item for item in discrepancies if item.manifest_pattern == pattern]
++        checkpoint_bytes = sum(item.source.nbytes for item in members)
++        contract_bytes = sum(item.manifest_bytes for item in members)
++        discrepancy_groups.append(
++            {
++                "manifest_pattern": pattern,
++                "checkpoint_dtype": members[0].source.dtype,
++                "contract_dtype": members[0].manifest_dtype,
++                "tensor_count": len(members),
++                "elements_per_tensor": members[0].elements,
++                "checkpoint_bytes": checkpoint_bytes,
++                "contract_bytes": contract_bytes,
++                "delta_bytes": checkpoint_bytes - contract_bytes,
++            }
++        )
++    totals = MappingProxyType(
++        {
++            "checkpoint_tensor_total": len(tensor_catalog),
++            "text_tensor_count": len(mappings),
++            "text_element_count": element_total,
++            "text_tensor_count_by_checkpoint_dtype": dict(sorted(tensor_count_by_dtype.items())),
++            "conforming_tensor_count": len(mappings) - len(discrepancies),
++            "conversion_tensor_count": len(discrepancies),
++            "manifest_parameter_bytes": manifest_total,
++            "checkpoint_text_bytes": sum(text_bytes_by_dtype.values()),
++            "checkpoint_text_bytes_by_dtype": dict(sorted(text_bytes_by_dtype.items())),
++            "conversion_reclaim_bytes": sum(item.source.nbytes - item.manifest_bytes for item in discrepancies),
++            "excluded_tensor_count": sum(group.tensor_count for group in excluded),
++            "excluded_bytes": sum(group.nbytes for group in excluded),
++            "dtype_discrepancy_count": len(discrepancies),
++            "dtype_discrepancy_bytes": sum(
++                item.source.nbytes - item.manifest_bytes for item in discrepancies
++            ),
++            "dtype_discrepancy_groups": discrepancy_groups,
++        }
++    )
++
++    return WeightMapping(
++        schema.graph_digest,
++        checkpoint.path,
++        bool(tie_word_embeddings),
++        len(parameters),
++        len(mappings),
++        unmapped,
++        unexpected,
++        tuple(mappings),
++        tuple(excluded),
++        tied,
++        totals,
++    )
++
++
++def _shape_elements(shape: Sequence[int]) -> int:
++    total = 1
++    for dimension in shape:
++        total *= int(dimension)
++    return total
++
++
++def manifest_profile_from_metadata(program_metadata: Mapping[str, Any]) -> Mapping[str, int]:
++    """从 graph metadata 反推出 :func:`_decoder_parameter_manifest` 的 profile。
++
++    仅用于交叉审计：把 metadata 的 attention/gdr 维度还原成 profile，再与
++    compact manifest 重新生成结果逐字段比较。
++    """
++
++    attention = program_metadata.get("attention")
++    gdr = program_metadata.get("gdr")
++    hidden_input_shape = program_metadata.get("hidden_input_shape")
++    if not isinstance(attention, Mapping) or not isinstance(gdr, Mapping):
++        raise WeightMapMismatchError("graph metadata must declare attention and gdr profiles")
++    if not isinstance(hidden_input_shape, Sequence) or len(hidden_input_shape) != 3:
++        raise WeightMapMismatchError("graph metadata hidden_input_shape must be rank 3")
++    parameters = program_metadata.get("parameter_manifest")
++    if not isinstance(parameters, Sequence) or not parameters:
++        raise WeightMapMismatchError("graph metadata must declare a parameter_manifest")
++    by_pattern = {entry["name"]: entry for entry in parameters}
++    return {
++        "hidden": int(hidden_input_shape[-1]),
++        "intermediate": int(by_pattern["layers.*.mlp.gate_proj.weight"]["shape"][0]),
++        "vocab": int(by_pattern["embedding_lm_head_shared_weight"]["shape"][0]),
++        "query_heads": int(attention["query_heads"]),
++        "kv_heads": int(attention["kv_heads"]),
++        "head_dim": int(attention["head_dim"]),
++        "rotary_dim": int(attention["rotary_dim"]),
++        "linear_key_heads": int(gdr["key_heads"]),
++        "linear_value_heads": int(gdr["value_heads"]),
++        "linear_key_dim": int(gdr["key_dim"]),
++        "linear_value_dim": int(gdr["value_dim"]),
++        "conv_kernel": int(gdr["conv_kernel"]),
++    }
++
++
++def assert_manifest_reproducible(program_metadata: Mapping[str, Any], dtype: str = "bf16") -> Tuple[Mapping[str, Any], ...]:
++    """用反推 profile 重新生成 compact manifest 并逐字段比对，返回重生成结果。"""
++
++    profile = manifest_profile_from_metadata(program_metadata)
++    regenerated = tuple(_decoder_parameter_manifest(profile, dtype))
++    declared = tuple(program_metadata["parameter_manifest"])
++    if len(regenerated) != len(declared):
++        raise WeightMapMismatchError("regenerated manifest length differs from declared manifest")
++    for index, (actual, expected) in enumerate(zip(declared, regenerated)):
++        for field in ("name", "storage_id", "dtype", "count", "elements_per_tensor", "parameter_elements", "storage_bytes"):
++            if actual.get(field) != expected.get(field):
++                raise WeightMapMismatchError(
++                    "manifest[{}].{} declared {!r} but regenerated {!r}".format(
++                        index, field, actual.get(field), expected.get(field)
++                    )
++                )
++        if tuple(actual.get("shape") or ()) != tuple(expected.get("shape") or ()):
++            raise WeightMapMismatchError("manifest[{}].shape is not reproducible".format(index))
++        if tuple(actual.get("aliases") or ()) != tuple(expected.get("aliases") or ()):
++            raise WeightMapMismatchError("manifest[{}].aliases is not reproducible".format(index))
++    return regenerated
+diff --git a/python/pypto/portable/safetensors_reader.py b/python/pypto/portable/safetensors_reader.py
+new file mode 100644
+index 000000000..f3fa020ba
+--- /dev/null
++++ b/python/pypto/portable/safetensors_reader.py
+@@ -0,0 +1,469 @@
++"""无第三方依赖的 safetensors 只读读取器。
++
++该模块只做一件事：把 safetensors 的 8 字节 header 长度 + JSON header 解析成
++经过完整结构校验的 tensor 目录，并在调用方需要时给出**只读** ``memoryview``
++切片。它不导入 numpy/torch，也从不把数据段整体物化成 Python 对象或 ``bytes``：
++
++* ``mode="mmap"``（默认）用 ``mmap.ACCESS_READ`` 映射整个文件，切片是零拷贝视图；
++* ``mode="pread"`` 只预读 header，之后按需 ``os.pread`` 出请求的那一段。
++
++两份实现都只按调用方给出的范围触碰数据段，因此进程峰值 RSS 与文件大小无关。
++``sha256()`` 是例外中唯一需要顺序读完文件的接口，它使用固定大小缓冲区流式读取。
++
++校验是 fail-closed 的，异常类型分工如下：
++
++* :class:`SafetensorsFormatError`：header/JSON/dtype/shape/重复键等结构性错误；
++* :class:`SafetensorsBoundsError`：offset 越过文件或切片请求越界；
++* :class:`SafetensorsLayoutError`：数据段 offset 空洞、重叠或总长不一致。
++
++``FP8_*`` 不在本模块承诺的 dtype 集合内，遇到时按不支持 dtype 拒绝。
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import mmap
++import os
++import struct
++from dataclasses import dataclass
++from typing import Any, Dict, Mapping, Optional, Tuple
++
++SAFETENSORS_HEADER_BYTES = 8
++DEFAULT_MAX_HEADER_BYTES = 128 * 1024 * 1024
++DEFAULT_HASH_CHUNK_BYTES = 8 * 1024 * 1024
++SUPPORTED_MODES = ("mmap", "pread")
++
++#: safetensors dtype -> (itemsize, PyPTO-X canonical dtype name)
++SAFETENSORS_DTYPES = {
++    "BOOL": (1, "bool"),
++    "U8": (1, "uint8"),
++    "I8": (1, "int8"),
++    "I16": (2, "int16"),
++    "U16": (2, "uint16"),
++    "F16": (2, "float16"),
++    "BF16": (2, "bf16"),
++    "I32": (4, "int32"),
++    "U32": (4, "uint32"),
++    "F32": (4, "float32"),
++    "I64": (8, "int64"),
++    "U64": (8, "uint64"),
++    "F64": (8, "float64"),
++}
++
++_METADATA_KEY = "__metadata__"
++
++
++class SafetensorsError(ValueError):
++    """safetensors 读取失败基类。"""
++
++
++class SafetensorsFormatError(SafetensorsError):
++    """header、JSON、dtype 或 shape 不符合 safetensors 契约。"""
++
++
++class SafetensorsBoundsError(SafetensorsError):
++    """offset 或切片请求越过文件边界。"""
++
++
++class SafetensorsLayoutError(SafetensorsError):
++    """数据段 offset 存在空洞、重叠或总长与文件不一致。"""
++
++
++class SafetensorsClosedError(SafetensorsError):
++    """读取器已关闭后继续使用。"""
++
++
++def _reject_duplicate_keys(pairs):
++    result = {}
++    for key, value in pairs:
++        if key in result:
++            raise SafetensorsFormatError(
++                "safetensors header contains duplicate key {!r}".format(key)
++            )
++        result[key] = value
++    return result
++
++
++def _checked_non_negative_int(value: Any, field_name: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
++        raise SafetensorsFormatError("{} must be a non-negative integer".format(field_name))
++    return value
++
++
++def _checked_shape(value: Any, field_name: str) -> Tuple[int, ...]:
++    if isinstance(value, (str, bytes)):
++        raise SafetensorsFormatError("{} must be a sequence of non-negative integers".format(field_name))
++    try:
++        dimensions = tuple(value)
++    except TypeError as exc:
++        raise SafetensorsFormatError(
++            "{} must be a sequence of non-negative integers".format(field_name)
++        ) from exc
++    for index, dimension in enumerate(dimensions):
++        _checked_non_negative_int(dimension, "{}[{}]".format(field_name, index))
++    return dimensions
++
++
++def element_count(shape: Tuple[int, ...]) -> int:
++    """返回 shape 的元素数；空 shape（标量）为 1。"""
++
++    total = 1
++    for dimension in shape:
++        total *= dimension
++    return total
++
++
++@dataclass(frozen=True)
++class SafetensorsTensor:
++    """一个经过校验的 tensor 目录项。"""
++
++    name: str
++    dtype: str
++    pypto_dtype: str
++    shape: Tuple[int, ...]
++    elements: int
++    itemsize: int
++    data_offset: int
++    nbytes: int
++    header_nbytes: int
++
++    @property
++    def file_offset(self) -> int:
++        """该 tensor 在文件中的绝对起始字节。"""
++
++        return SAFETENSORS_HEADER_BYTES + self.header_nbytes + self.data_offset
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "name": self.name,
++            "dtype": self.dtype,
++            "pypto_dtype": self.pypto_dtype,
++            "shape": list(self.shape),
++            "elements": self.elements,
++            "itemsize": self.itemsize,
++            "data_offset": self.data_offset,
++            "file_offset": self.file_offset,
++            "nbytes": self.nbytes,
++        }
++
++
++def _parse_header(raw_header: bytes) -> Tuple[Dict[str, SafetensorsTensor], Dict[str, str], int]:
++    try:
++        text = raw_header.decode("utf-8")
++    except UnicodeDecodeError as exc:
++        raise SafetensorsFormatError("safetensors header is not valid UTF-8") from exc
++    try:
++        header = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
++    except SafetensorsFormatError:
++        raise
++    except ValueError as exc:
++        raise SafetensorsFormatError("safetensors header is not valid JSON") from exc
++    if not isinstance(header, dict):
++        raise SafetensorsFormatError("safetensors header must be a JSON object")
++
++    metadata: Dict[str, str] = {}
++    raw_metadata = header.pop(_METADATA_KEY, None)
++    if raw_metadata is not None:
++        if not isinstance(raw_metadata, dict):
++            raise SafetensorsFormatError("safetensors __metadata__ must be a JSON object")
++        for key, value in raw_metadata.items():
++            if not isinstance(value, str):
++                raise SafetensorsFormatError("safetensors __metadata__ values must be strings")
++            metadata[key] = value
++
++    header_nbytes = len(raw_header)
++    tensors: Dict[str, SafetensorsTensor] = {}
++    for name, entry in header.items():
++        if not isinstance(name, str) or not name:
++            raise SafetensorsFormatError("safetensors tensor names must be non-empty strings")
++        if not isinstance(entry, dict):
++            raise SafetensorsFormatError("safetensors tensor {!r} must be a JSON object".format(name))
++        unknown = set(entry) - {"dtype", "shape", "data_offsets"}
++        if unknown:
++            raise SafetensorsFormatError(
++                "safetensors tensor {!r} has unknown fields {}".format(name, sorted(unknown))
++            )
++        for field_name in ("dtype", "shape", "data_offsets"):
++            if field_name not in entry:
++                raise SafetensorsFormatError(
++                    "safetensors tensor {!r} is missing {}".format(name, field_name)
++                )
++        dtype = entry["dtype"]
++        if not isinstance(dtype, str) or dtype not in SAFETENSORS_DTYPES:
++            raise SafetensorsFormatError(
++                "safetensors tensor {!r} uses unsupported dtype {!r}".format(name, dtype)
++            )
++        itemsize, pypto_dtype = SAFETENSORS_DTYPES[dtype]
++        shape = _checked_shape(entry["shape"], "{}.shape".format(name))
++        offsets = entry["data_offsets"]
++        if isinstance(offsets, (str, bytes)):
++            raise SafetensorsFormatError("safetensors tensor {!r}.data_offsets must be a sequence".format(name))
++        try:
++            offsets = tuple(offsets)
++        except TypeError as exc:
++            raise SafetensorsFormatError(
++                "safetensors tensor {!r}.data_offsets must be a sequence".format(name)
++            ) from exc
++        if len(offsets) != 2:
++            raise SafetensorsFormatError(
++                "safetensors tensor {!r}.data_offsets must contain exactly two integers".format(name)
++            )
++        begin = _checked_non_negative_int(offsets[0], "{}.data_offsets[0]".format(name))
++        end = _checked_non_negative_int(offsets[1], "{}.data_offsets[1]".format(name))
++        if begin > end:
++            raise SafetensorsFormatError(
++                "safetensors tensor {!r} has inverted data_offsets {} > {}".format(name, begin, end)
++            )
++        elements = element_count(shape)
++        expected_nbytes = elements * itemsize
++        if end - begin != expected_nbytes:
++            raise SafetensorsFormatError(
++                "safetensors tensor {!r} dtype/shape require {} bytes but data_offsets span {}".format(
++                    name, expected_nbytes, end - begin
++                )
++            )
++        tensors[name] = SafetensorsTensor(
++            name, dtype, pypto_dtype, shape, elements, itemsize, begin, expected_nbytes, header_nbytes
++        )
++    return tensors, metadata, header_nbytes
++
++
++def _validate_data_layout(tensors: Mapping[str, SafetensorsTensor], data_nbytes: int) -> None:
++    """校验数据段被 tensor 范围**恰好**覆盖：无空洞、无重叠、总长一致。"""
++
++    ranges = sorted((tensor.data_offset, tensor.data_offset + tensor.nbytes, tensor.name) for tensor in tensors.values())
++    cursor = 0
++    for begin, end, name in ranges:
++        if end > data_nbytes:
++            raise SafetensorsBoundsError(
++                "safetensors tensor {!r} ends at {} beyond data section of {} bytes".format(name, end, data_nbytes)
++            )
++        if begin < cursor:
++            raise SafetensorsLayoutError(
++                "safetensors tensor {!r} at [{}, {}) overlaps previous range ending at {}".format(
++                    name, begin, end, cursor
++                )
++            )
++        if begin > cursor:
++            raise SafetensorsLayoutError(
++                "safetensors data section has a {} byte gap before tensor {!r}".format(begin - cursor, name)
++            )
++        cursor = end
++    if cursor != data_nbytes:
++        raise SafetensorsLayoutError(
++            "safetensors tensors cover {} bytes but data section is {} bytes".format(cursor, data_nbytes)
++        )
++
++
++class SafetensorsReader:
++    """只读 safetensors 句柄；支持上下文管理器，必须显式 ``close()``。
++
++    已返回的 ``memoryview`` 会持有底层 mmap，必须在 ``close()`` 之前释放，
++    否则 CPython 会以 ``BufferError`` 拒绝关闭映射——这是有意的 fail-closed
++    行为，避免调用方在视图仍存活时悄悄换掉 backing store。
++    """
++
++    def __init__(self, path: str, mode: str = "mmap", max_header_bytes: int = DEFAULT_MAX_HEADER_BYTES):
++        if mode not in SUPPORTED_MODES:
++            raise SafetensorsError("mode must be one of {}".format(SUPPORTED_MODES))
++        if isinstance(max_header_bytes, bool) or not isinstance(max_header_bytes, int) or max_header_bytes <= 0:
++            raise SafetensorsError("max_header_bytes must be a positive integer")
++        self._path = os.fspath(path)
++        self._mode = mode
++        self._fd = -1
++        self._mmap = None
++        self._closed = False
++        self._tensors: Dict[str, SafetensorsTensor] = {}
++        self._metadata: Dict[str, str] = {}
++        self._file_nbytes = 0
++        self._header_nbytes = 0
++        fd = os.open(self._path, os.O_RDONLY)
++        try:
++            self._load(fd, max_header_bytes)
++            if mode == "mmap":
++                self._mmap = mmap.mmap(fd, 0, access=mmap.ACCESS_READ)
++        except BaseException:
++            os.close(fd)
++            raise
++        self._fd = fd
++
++    def _load(self, fd: int, max_header_bytes: int) -> None:
++        stat = os.fstat(fd)
++        self._file_nbytes = stat.st_size
++        if self._file_nbytes < SAFETENSORS_HEADER_BYTES:
++            raise SafetensorsFormatError("safetensors file is shorter than the 8 byte length prefix")
++        prefix = os.pread(fd, SAFETENSORS_HEADER_BYTES, 0)
++        if len(prefix) != SAFETENSORS_HEADER_BYTES:
++            raise SafetensorsFormatError("safetensors file is truncated before the header length")
++        (header_nbytes,) = struct.unpack("<Q", prefix)
++        if header_nbytes < 2:
++            raise SafetensorsFormatError("safetensors header length {} is too small".format(header_nbytes))
++        if header_nbytes > max_header_bytes:
++            raise SafetensorsFormatError(
++                "safetensors header length {} exceeds limit {}".format(header_nbytes, max_header_bytes)
++            )
++        if SAFETENSORS_HEADER_BYTES + header_nbytes > self._file_nbytes:
++            raise SafetensorsBoundsError(
++                "safetensors header of {} bytes does not fit in {} byte file".format(header_nbytes, self._file_nbytes)
++            )
++        raw_header = os.pread(fd, header_nbytes, SAFETENSORS_HEADER_BYTES)
++        if len(raw_header) != header_nbytes:
++            raise SafetensorsFormatError("safetensors header is truncated")
++        tensors, metadata, header_nbytes = _parse_header(raw_header)
++        self._tensors = tensors
++        self._metadata = metadata
++        self._header_nbytes = header_nbytes
++        _validate_data_layout(tensors, self.data_nbytes)
++
++    # -- 只读属性 ---------------------------------------------------------
++
++    @property
++    def path(self) -> str:
++        return self._path
++
++    @property
++    def mode(self) -> str:
++        return self._mode
++
++    @property
++    def file_nbytes(self) -> int:
++        return self._file_nbytes
++
++    @property
++    def header_nbytes(self) -> int:
++        return self._header_nbytes
++
++    @property
++    def data_offset(self) -> int:
++        """数据段在文件中的绝对起始字节。"""
++
++        return SAFETENSORS_HEADER_BYTES + self._header_nbytes
++
++    @property
++    def data_nbytes(self) -> int:
++        return self._file_nbytes - SAFETENSORS_HEADER_BYTES - self._header_nbytes
++
++    @property
++    def header_aligned(self) -> bool:
++        """``8 + header_nbytes`` 是否为 8 的倍数（参考实现的 padding 约定）。"""
++
++        return self.data_offset % 8 == 0
++
++    @property
++    def metadata(self) -> Mapping[str, str]:
++        return dict(self._metadata)
++
++    @property
++    def names(self) -> Tuple[str, ...]:
++        return tuple(self._tensors)
++
++    def __len__(self) -> int:
++        return len(self._tensors)
++
++    def __contains__(self, name: Any) -> bool:
++        return name in self._tensors
++
++    def tensors(self) -> Mapping[str, SafetensorsTensor]:
++        """返回 name -> 目录项的浅拷贝。"""
++
++        return dict(self._tensors)
++
++    def info(self, name: str) -> SafetensorsTensor:
++        try:
++            return self._tensors[name]
++        except KeyError as exc:
++            raise SafetensorsError("safetensors file has no tensor {!r}".format(name)) from exc
++
++    def total_nbytes(self, names: Optional[Tuple[str, ...]] = None) -> int:
++        if names is None:
++            names = self.names
++        return sum(self.info(name).nbytes for name in names)
++
++    # -- 数据访问 ---------------------------------------------------------
++
++    def _require_open(self) -> None:
++        if self._closed:
++            raise SafetensorsClosedError("safetensors reader for {!r} is closed".format(self._path))
++
++    def view(self, name: str) -> memoryview:
++        """返回该 tensor 的只读 ``memoryview``；零拷贝（mmap）或单次按需读（pread）。"""
++
++        tensor = self.info(name)
++        return self.view_range(name, 0, tensor.nbytes)
++
++    def view_range(self, name: str, byte_offset: int, nbytes: int) -> memoryview:
++        """返回 tensor 内 ``[byte_offset, byte_offset + nbytes)`` 的只读视图。"""
++
++        self._require_open()
++        tensor = self.info(name)
++        _checked_non_negative_int(byte_offset, "byte_offset")
++        _checked_non_negative_int(nbytes, "nbytes")
++        if byte_offset > tensor.nbytes or nbytes > tensor.nbytes - byte_offset:
++            raise SafetensorsBoundsError(
++                "requested [{}, {}) exceeds tensor {!r} of {} bytes".format(
++                    byte_offset, byte_offset + nbytes, name, tensor.nbytes
++                )
++            )
++        start = tensor.file_offset + byte_offset
++        if self._mode == "mmap":
++            return memoryview(self._mmap)[start : start + nbytes]
++        chunk = os.pread(self._fd, nbytes, start)
++        if len(chunk) != nbytes:
++            raise SafetensorsBoundsError(
++                "short read of {} bytes for tensor {!r}".format(nbytes, name)
++            )
++        return memoryview(chunk)
++
++    def sha256(self, chunk_bytes: int = DEFAULT_HASH_CHUNK_BYTES) -> str:
++        """流式计算文件 sha256；峰值额外内存恒为 ``chunk_bytes``。"""
++
++        self._require_open()
++        if isinstance(chunk_bytes, bool) or not isinstance(chunk_bytes, int) or chunk_bytes <= 0:
++            raise SafetensorsError("chunk_bytes must be a positive integer")
++        digest = hashlib.sha256()
++        offset = 0
++        while offset < self._file_nbytes:
++            chunk = os.pread(self._fd, min(chunk_bytes, self._file_nbytes - offset), offset)
++            if not chunk:
++                raise SafetensorsBoundsError("short read while hashing {!r}".format(self._path))
++            digest.update(chunk)
++            offset += len(chunk)
++        return digest.hexdigest()
++
++    def close(self) -> None:
++        if self._closed:
++            return
++        self._closed = True
++        if self._mmap is not None:
++            self._mmap.close()
++            self._mmap = None
++        if self._fd >= 0:
++            os.close(self._fd)
++            self._fd = -1
++
++    def __enter__(self) -> "SafetensorsReader":
++        self._require_open()
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback) -> None:
++        self.close()
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "path": self._path,
++            "mode": self._mode,
++            "file_nbytes": self._file_nbytes,
++            "header_nbytes": self._header_nbytes,
++            "data_nbytes": self.data_nbytes,
++            "header_aligned": self.header_aligned,
++            "tensor_count": len(self._tensors),
++            "metadata": dict(self._metadata),
++        }
++
++
++def read_tensor_catalog(path: str, mode: str = "pread") -> Mapping[str, SafetensorsTensor]:
++    """便捷函数：只解析目录后关闭句柄，不保留任何数据视图。"""
++
++    with SafetensorsReader(path, mode=mode) as reader:
++        return reader.tensors()
+diff --git a/python/tests/ut/pypto_x/qwen35_weight_fixture.py b/python/tests/ut/pypto_x/qwen35_weight_fixture.py
+new file mode 100644
+index 000000000..20dd9d087
+--- /dev/null
++++ b/python/tests/ut/pypto_x/qwen35_weight_fixture.py
+@@ -0,0 +1,173 @@
++"""权重摄取测试用的合成 safetensors fixture 与真实资源定位。
++
++本模块只被测 safetensors/layout 测试使用，不被 pytest 收集（文件名不以
++``test_`` 开头）。合成 checkpoint 的官方张量名由 **graph metadata 的
++``layers[].parameter_routes``** 独立推导，而不是复用
++:mod:`pypto.portable.qwen35_weight_map` 的展开逻辑，避免用被测模块证明它自己。
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import os
++import struct
++from pathlib import Path
++from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
++
++from pypto.portable.safetensors_reader import SAFETENSORS_DTYPES
++
++#: 固定 revision 的真实权重资产目录（只读；不进 Git）。
++REAL_ASSET_REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
++REAL_ASSET_RELPATH = "worktrees/_meta/pypto-x/assets/qwen35-0.8b/" + REAL_ASSET_REVISION
++REAL_SAFETENSORS_NAME = "model.safetensors-00001-of-00001.safetensors"
++REAL_SAFETENSORS_SHA256 = "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
++REAL_SAFETENSORS_BYTES = 1746942600
++
++_ENV_ASSET_DIR = "PYPTO_X_QWEN35_ASSET_DIR"
++
++
++def real_asset_dir() -> Optional[Path]:
++    """返回真实权重目录；不存在时返回 ``None``（调用方据此 skip）。"""
++
++    override = os.environ.get(_ENV_ASSET_DIR)
++    if override:
++        candidate = Path(override)
++        return candidate if (candidate / REAL_SAFETENSORS_NAME).is_file() else None
++    current = Path(__file__).resolve()
++    for parent in current.parents:
++        candidate = parent / REAL_ASSET_RELPATH
++        if (candidate / REAL_SAFETENSORS_NAME).is_file():
++            return candidate
++    return None
++
++
++def payload_for(name: str, nbytes: int) -> bytes:
++    """确定性伪随机 payload；只用于合成小文件。"""
++
++    seed = hashlib.sha256(name.encode("utf-8")).digest()
++    return (seed * (nbytes // len(seed) + 1))[:nbytes]
++
++
++def write_safetensors(
++    path: Path,
++    tensors: Sequence[Tuple[str, str, Sequence[int]]],
++    *,
++    metadata: Optional[Mapping[str, str]] = None,
++) -> Dict[str, Any]:
++    """写入一个合法的合成 safetensors 文件，返回 name -> header 条目。
++
++    header 与真实 safetensors 一样用空格 padding 到 8 字节对齐。
++    """
++
++    header: Dict[str, Any] = {}
++    if metadata:
++        header["__metadata__"] = dict(metadata)
++    body = bytearray()
++    offset = 0
++    for name, dtype, shape in tensors:
++        if dtype not in SAFETENSORS_DTYPES:
++            raise AssertionError("unsupported fixture dtype {!r}".format(dtype))
++        itemsize = SAFETENSORS_DTYPES[dtype][0]
++        elements = 1
++        for dimension in shape:
++            elements *= int(dimension)
++        nbytes = elements * itemsize
++        header[name] = {
++            "dtype": dtype,
++            "shape": [int(dimension) for dimension in shape],
++            "data_offsets": [offset, offset + nbytes],
++        }
++        body.extend(payload_for(name, nbytes))
++        offset += nbytes
++    raw_header = json.dumps(header, sort_keys=True).encode("utf-8")
++    raw_header += b" " * ((-(8 + len(raw_header))) % 8)
++    with open(str(path), "wb") as stream:
++        stream.write(struct.pack("<Q", len(raw_header)))
++        stream.write(raw_header)
++        stream.write(bytes(body))
++    return header
++
++
++def write_raw_safetensors(path: Path, raw_header: bytes, body: bytes = b"") -> None:
++    """写入任意 header 字节，供负例测试构造非法文件。"""
++
++    with open(str(path), "wb") as stream:
++        stream.write(struct.pack("<Q", len(raw_header)))
++        stream.write(raw_header)
++        stream.write(body)
++
++
++def write_raw_header_json(path: Path, header: Any, body: bytes = b"") -> None:
++    write_raw_safetensors(path, json.dumps(header).encode("utf-8"), body)
++
++
++def official_names_for_metadata(
++    program_metadata: Mapping[str, Any],
++) -> List[Tuple[str, str, Tuple[int, ...]]]:
++    """按 graph metadata 独立推导 (official_name, manifest_pattern, shape)。
++
++    只用 ``layers[].parameter_routes`` / ``kind`` 与 metadata 的 compact
++    manifest 形状，不调用 weight-map 模块。
++    """
++
++    manifest = program_metadata["parameter_manifest"]
++    shape_by_pattern = {entry["name"]: tuple(entry["shape"]) for entry in manifest}
++    results: List[Tuple[str, str, Tuple[int, ...]]] = [
++        (
++            "model.language_model.embed_tokens.weight",
++            "embedding_lm_head_shared_weight",
++            shape_by_pattern["embedding_lm_head_shared_weight"],
++        ),
++        ("model.language_model.norm.weight", "final_norm.weight", shape_by_pattern["final_norm.weight"]),
++    ]
++    for layer in program_metadata["layers"]:
++        for route in layer["parameter_routes"]:
++            prefix, suffix = route.split(".", 1)
++            index = int(prefix.split("_")[1])
++            if suffix.startswith(("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm")):
++                category = "full_attention"
++                official = "model.language_model.layers.{}.self_attn.{}".format(index, suffix)
++            elif layer["kind"] == "gdr" and suffix.split(".")[0] in (
++                "in_proj_qkv",
++                "in_proj_z",
++                "in_proj_b",
++                "in_proj_a",
++                "conv1d",
++                "A_log",
++                "dt_bias",
++                "norm",
++                "out_proj",
++            ):
++                category = "linear_attention"
++                official = "model.language_model.layers.{}.linear_attn.{}".format(index, suffix)
++            else:
++                category = "shared"
++                official = "model.language_model.layers.{}.{}".format(index, suffix)
++            if category == "full_attention":
++                pattern = "layers.full_attention.*." + suffix
++            elif category == "linear_attention":
++                pattern = "layers.linear_attention.*." + suffix
++            else:
++                pattern = "layers.*." + suffix
++            if pattern not in shape_by_pattern:
++                raise AssertionError("fixture pattern {!r} is not in the manifest".format(pattern))
++            results.append((official, pattern, shape_by_pattern[pattern]))
++    return results
++
++
++def synthetic_checkpoint_tensors(
++    program_metadata: Mapping[str, Any],
++    *,
++    f32_patterns: Iterable[str] = (),
++    extra_tensors: Sequence[Tuple[str, str, Sequence[int]]] = (),
++) -> List[Tuple[str, str, Sequence[int]]]:
++    """构造完整合成 checkpoint 的 tensor 列表（含可选的 F32 不一致项与排除组）。"""
++
++    f32 = set(f32_patterns)
++    tensors: List[Tuple[str, str, Sequence[int]]] = []
++    for official, pattern, shape in official_names_for_metadata(program_metadata):
++        dtype = "F32" if pattern in f32 else "BF16"
++        tensors.append((official, dtype, shape))
++    tensors.extend(extra_tensors)
++    return tensors
+diff --git a/python/tests/ut/pypto_x/qwen35_weight_ingestion_driver.py b/python/tests/ut/pypto_x/qwen35_weight_ingestion_driver.py
+new file mode 100644
+index 000000000..16821b039
+--- /dev/null
++++ b/python/tests/ut/pypto_x/qwen35_weight_ingestion_driver.py
+@@ -0,0 +1,334 @@
++"""Qwen3.5-0.8B 权重摄取证据 driver（M1L-style，可审计）。
++
++用法（必须经 heavy runner）：
++
++    scripts/resource/run_local_heavy.sh --task qwen35-bf16-weight-ingestion \
++      --agent qwen35-bf16-weight-ingestion -- \
++      env PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=python python3 \
++      python/tests/ut/pypto_x/qwen35_weight_ingestion_driver.py \
++      --asset-dir <revision dir> --output <validation.json>
++
++driver 只读 safetensors header 与 36 个 F32 小张量，从不物化 1.7 GB 权重；
++峰值 RSS 用 ``resource.getrusage`` 与 ``/proc/self/status`` 双重记录，并由外部
++``/usr/bin/time -v`` 复核。
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import resource
++import time
++from pathlib import Path
++from typing import Dict, Optional
++
++from pypto.portable.qwen35 import QWEN35_08B_SHAPE_METADATA, build_qwen35_text_decoder_graph
++from pypto.portable.qwen35_weight_layout import audit_precision_boundary, build_weight_layout
++from pypto.portable.qwen35_weight_map import (
++    assert_manifest_reproducible,
++    build_weight_mapping,
++    tie_word_embeddings_from_config,
++)
++from pypto.portable.runtime_binding import build_binding_schema, build_packed_layout
++from pypto.portable.safetensors_reader import SafetensorsReader
++
++PARENT_BASELINE = {
++    "packed_region_count": 368,
++    "packed_total_nbytes_past_4096": 1574877952,
++    "graph_digest_past_4096": "c1a5663b644e6b6e642599689cc26c6f6b9c50f9b820743c272415b0ff0df7d5",
++    "checkpoint_text_bytes": 1504791232,
++    "manifest_parameter_bytes": 1504786048,
++    "conversion_reclaim_bytes": 5184,
++}
++
++
++def _status_kib(field: str) -> Optional[int]:
++    try:
++        with open("/proc/self/status", "r", encoding="utf-8") as stream:
++            for line in stream:
++                if line.startswith(field + ":"):
++                    return int(line.split()[1])
++    except OSError:
++        return None
++    return None
++
++
++def _maxrss_kib() -> int:
++    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--asset-dir", required=True)
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--past-length", type=int, default=4096)
++    parser.add_argument("--batch", type=int, default=1)
++    parser.add_argument("--steps", type=int, default=1)
++    parser.add_argument("--alignment", type=int, default=64)
++    parser.add_argument("--hash-chunk-mib", type=int, default=8)
++    args = parser.parse_args()
++
++    asset_dir = Path(args.asset_dir)
++    safetensors_name = "model.safetensors-00001-of-00001.safetensors"
++    checkpoint_path = asset_dir / safetensors_name
++    config_path = asset_dir / "config.json"
++    manifest_path = asset_dir / "_manifest.json"
++    if not checkpoint_path.is_file():
++        raise SystemExit("checkpoint not found: {}".format(checkpoint_path))
++
++    rss_before_kib = _maxrss_kib()
++    started = time.time()
++    tie_word_embeddings = tie_word_embeddings_from_config(str(config_path))
++    program = build_qwen35_text_decoder_graph(
++        args.batch, args.steps, past_length=args.past_length, shape_profile="model"
++    )
++    schema = build_binding_schema(program)
++    regenerated = assert_manifest_reproducible(program.metadata)
++    packed = build_packed_layout(schema, args.alignment)
++    rss_after_graph_kib = _maxrss_kib()
++
++    with SafetensorsReader(str(checkpoint_path), mode="pread") as reader:
++        header = reader.to_dict()
++        rss_after_open_kib = _maxrss_kib()
++        tensor_ranges = sorted(
++            (tensor.data_offset, tensor.data_offset + tensor.nbytes) for tensor in reader.tensors().values()
++        )
++        strict_contiguous = (
++            tensor_ranges[0][0] == 0
++            and tensor_ranges[-1][1] == reader.data_nbytes
++            and all(tensor_ranges[index][0] == tensor_ranges[index - 1][1] for index in range(1, len(tensor_ranges)))
++        )
++        mapping = build_weight_mapping(
++            schema, program.metadata, reader, tie_word_embeddings=tie_word_embeddings
++        )
++        layout = build_weight_layout(schema, mapping, reader, alignment=args.alignment)
++        conversions = audit_precision_boundary(reader, layout)
++        rss_after_mapping_kib = _maxrss_kib()
++        file_sha256 = reader.sha256(chunk_bytes=args.hash_chunk_mib * 1024 * 1024)
++        rss_after_hash_kib = _maxrss_kib()
++
++    recorded_sha256 = None
++    if manifest_path.is_file():
++        with open(str(manifest_path), "r", encoding="utf-8") as stream:
++            recorded_sha256 = json.load(stream)["files"][safetensors_name]["sha256"]
++
++    converted = [item for item in conversions if item.status == "converted_rne"]
++    identity = [item for item in conversions if item.status == "identity"]
++    pattern_by_storage = {item.storage_id: item.manifest_pattern for item in mapping.mappings}
++    pattern_groups: Dict[str, Dict[str, float]] = {}
++    for item in converted:
++        group = pattern_groups.setdefault(
++            pattern_by_storage[item.storage_id],
++            {
++                "manifest_pattern": pattern_by_storage[item.storage_id],
++                "tensor_count": 0,
++                "elements": 0,
++                "exact_elements": 0,
++                "source_bytes": 0,
++                "contract_bytes": 0,
++                "max_absolute_error": 0.0,
++                "max_relative_error": 0.0,
++            },
++        )
++        group["tensor_count"] += 1
++        group["elements"] += item.elements
++        group["exact_elements"] += item.exact_elements
++        group["source_bytes"] += item.source_nbytes
++        group["contract_bytes"] += item.contract_nbytes
++        group["max_absolute_error"] = max(group["max_absolute_error"], item.max_abs_error)
++        group["max_relative_error"] = max(group["max_relative_error"], item.max_relative_error)
++    totals = dict(mapping.totals)
++    excluded = {group.group: group for group in mapping.excluded}
++    vm_hwm_kib = _status_kib("VmHWM")
++    vm_rss_kib = _status_kib("VmRSS")
++
++    checks: Dict[str, bool] = {
++        "named_revision_matches": QWEN35_08B_SHAPE_METADATA["revision"] in str(asset_dir),
++        "safetensors_sha256_matches_checkpoint_manifest": recorded_sha256 == file_sha256,
++        "mapped_320_of_320": mapping.mapped_count == 320 and mapping.parameter_count == 320,
++        "no_unmapped_parameters": mapping.unmapped == (),
++        "no_unexpected_checkpoint_tensors": mapping.unexpected_checkpoint_tensors == (),
++        "vision_tower_excluded_153": excluded["vision_tower"].tensor_count == 153,
++        "mtp_excluded_15": excluded["mtp"].tensor_count == 15,
++        "text_bytes_match_parent_baseline": totals["checkpoint_text_bytes"]
++        == PARENT_BASELINE["checkpoint_text_bytes"],
++        "manifest_bytes_match_parent_baseline": totals["manifest_parameter_bytes"]
++        == PARENT_BASELINE["manifest_parameter_bytes"],
++        "conversion_reclaim_matches_parent_baseline": totals["conversion_reclaim_bytes"]
++        == PARENT_BASELINE["conversion_reclaim_bytes"],
++        "dtype_split_is_284_bf16_36_f32": totals["text_tensor_count_by_checkpoint_dtype"]
++        == {"BF16": 284, "F32": 36},
++        "byte_accounting_conserved": totals["checkpoint_text_bytes"]
++        == totals["manifest_parameter_bytes"] + totals["conversion_reclaim_bytes"],
++        "layout_region_count_368": len(layout.regions) == PARENT_BASELINE["packed_region_count"],
++        "layout_matches_frozen_packed_layout": layout.total_nbytes == packed.total_nbytes,
++        "layout_total_matches_parent_baseline": layout.total_nbytes
++        == PARENT_BASELINE["packed_total_nbytes_past_4096"],
++        "graph_digest_matches_parent_baseline": schema.graph_digest
++        == PARENT_BASELINE["graph_digest_past_4096"],
++        "manifest_is_reproducible_from_metadata": len(regenerated) == 22,
++        "all_36_conversions_done_rne": len(converted) == 36,
++        "conversion_bytes_are_5184": sum(item.contract_nbytes for item in converted) == 5184,
++        "conversion_relative_error_within_bf16_ulp": all(
++            item.max_relative_error is not None and item.max_relative_error <= 2 ** -8 for item in converted
++        ),
++        "a_log_conversion_is_exact": all(
++            item["exact_elements"] == item["elements"] and item["max_relative_error"] == 0.0
++            for item in pattern_groups.values()
++            if item["manifest_pattern"] == "layers.linear_attention.*.A_log"
++        ),
++        "identity_regions_were_not_read": all(item.source_sha256 is None for item in identity),
++        "safetensors_offsets_strictly_contiguous": strict_contiguous,
++    }
++    file_nbytes = checkpoint_path.stat().st_size
++    peak_rss_bytes = (vm_hwm_kib or rss_after_hash_kib) * 1024
++    hash_chunk_bytes = args.hash_chunk_mib * 1024 * 1024
++    largest_source_read = max(item.source_nbytes for item in converted)
++    reader_phase_delta_kib = max(rss_after_open_kib, rss_after_mapping_kib, rss_after_hash_kib) - rss_after_graph_kib
++    wall_seconds = time.time() - started
++    cpu_seconds = sum(resource.getrusage(resource.RUSAGE_SELF)[:2])
++    checks["peak_rss_below_half_checkpoint_file"] = peak_rss_bytes * 2 < file_nbytes
++    checks["peak_rss_below_2gib"] = peak_rss_bytes < 2 * 1024 ** 3
++    checks["single_threaded_cpu_budget"] = cpu_seconds <= wall_seconds * 1.5
++    checks["reader_phase_rss_delta_is_chunk_bounded"] = (
++        reader_phase_delta_kib * 1024 <= 2 * hash_chunk_bytes + 64 * 1024 * 1024
++    )
++    checks["largest_single_source_read_is_small"] = largest_source_read <= 1024 * 1024
++    checks["no_full_file_materialization"] = bool(
++        checks["peak_rss_below_half_checkpoint_file"] and checks["largest_single_source_read_is_small"]
++    )
++    status = "PASS" if all(checks.values()) else "FAIL"
++
++    result = {
++        "status": status,
++        "task": "qwen35-bf16-weight-ingestion",
++        "revision": QWEN35_08B_SHAPE_METADATA["revision"],
++        "execution_context": {
++            "heavy_runner_used": False,
++            "authorization": (
++                "父 agent（840ec461）于 2026-09-10 明确授权：本 driver 是 metadata + "
++                "I/O 型单线程驱动，低于资源策略 heavy 门槛（≥6/12 CPU 或 ≥4 GiB）；"
++                "若任一阶段 RSS 超过 2 GiB 或出现多核并行则必须回到 run_local_heavy.sh + local 锁"
++            ),
++            "measured_wall_seconds": round(wall_seconds, 3),
++            "measured_cpu_seconds": round(cpu_seconds, 3),
++            "cpu_over_wall_ratio": round(cpu_seconds / wall_seconds, 3) if wall_seconds else None,
++            "peak_rss_bytes": peak_rss_bytes,
++        },
++        "checkpoint_path": str(checkpoint_path),
++        "checkpoint_file_nbytes": checkpoint_path.stat().st_size,
++        "checkpoint_sha256": file_sha256,
++        "checkpoint_sha256_recorded_in_asset_manifest": recorded_sha256,
++        "graph": {
++            "graph_kind": program.metadata["graph_kind"],
++            "shape_profile": program.metadata["shape_profile"],
++            "graph_digest": schema.graph_digest,
++            "runtime_inputs": len(schema.runtime_inputs),
++            "parameters": len(schema.parameters),
++            "states": len(schema.states),
++            "outputs": len(schema.regular_outputs),
++            "state_outputs": len(schema.state_outputs),
++            "parameter_element_count": program.metadata["parameter_element_count"],
++            "parameter_byte_count": program.metadata["parameter_byte_count"],
++            "parameter_manifest_storage_classes": len(program.metadata["parameter_manifest"]),
++        },
++        "safetensors": {
++            "header_nbytes": header["header_nbytes"],
++            "data_nbytes": header["data_nbytes"],
++            "tensor_count": header["tensor_count"],
++            "header_aligned": header["header_aligned"],
++            "mode": header["mode"],
++        },
++        "mapping": {
++            "parameter_count": mapping.parameter_count,
++            "mapped_count": mapping.mapped_count,
++            "unmapped": list(mapping.unmapped),
++            "unexpected_checkpoint_tensors": list(mapping.unexpected_checkpoint_tensors),
++            "tied": mapping.tied.to_dict(),
++            "totals": totals,
++            "excluded": [
++                {
++                    "group": excluded[name].group,
++                    "prefix": excluded[name].prefix,
++                    "tensor_count": excluded[name].tensor_count,
++                    "nbytes": excluded[name].nbytes,
++                    "dtype_counts": dict(excluded[name].dtype_counts),
++                    "names": list(excluded[name].names),
++                }
++                for name in ("vision_tower", "mtp")
++            ],
++            "dtype_discrepancies": [item.to_dict() for item in mapping.dtype_discrepancies],
++        },
++        "layout": {
++            "region_count": len(layout.regions),
++            "parameter_region_count": len(layout.parameter_regions),
++            "state_region_count": len(layout.state_regions),
++            "alignment": layout.alignment,
++            "total_nbytes": layout.total_nbytes,
++            "parameter_nbytes": sum(region.nbytes for region in layout.parameter_regions),
++            "state_nbytes": sum(region.nbytes for region in layout.state_regions),
++            "padding_nbytes": layout.padding_nbytes,
++            "source_text_bytes": layout.source_text_bytes,
++            "dtype_conversion_region_count": len(layout.dtype_conversion_storage_ids),
++            "dtype_conversion_storage_ids": list(layout.dtype_conversion_storage_ids),
++            "layout_digest": layout.layout_digest(),
++        },
++        "precision_boundary": {
++            "converted_region_count": len(converted),
++            "identity_region_count": len(identity),
++            "source_bytes_read": sum(item.source_nbytes for item in converted),
++            "contract_bytes_written": sum(item.contract_nbytes for item in converted),
++            "max_absolute_error": max(item.max_abs_error for item in converted),
++            "max_relative_error": max(item.max_relative_error for item in converted),
++            "exact_round_trip_elements": sum(item.exact_elements for item in converted),
++            "total_elements": sum(item.elements for item in converted),
++            "groups": totals["dtype_discrepancy_groups"],
++            "pattern_precision_groups": [pattern_groups[key] for key in sorted(pattern_groups)],
++            "regions": [item.to_dict() for item in converted],
++        },
++        "memory": {
++            "ru_maxrss_kib_before": rss_before_kib,
++            "ru_maxrss_kib_after_graph": rss_after_graph_kib,
++            "ru_maxrss_kib_after_reader_open": rss_after_open_kib,
++            "ru_maxrss_kib_after_mapping": rss_after_mapping_kib,
++            "ru_maxrss_kib_after_hash": rss_after_hash_kib,
++            "vm_hwm_kib": vm_hwm_kib,
++            "vm_rss_kib_final": vm_rss_kib,
++            "peak_rss_bytes": peak_rss_bytes,
++            "checkpoint_file_nbytes": file_nbytes,
++            "peak_rss_over_file_ratio": peak_rss_bytes / float(file_nbytes),
++            "hash_chunk_bytes": hash_chunk_bytes,
++            "largest_single_source_read_bytes": largest_source_read,
++            "reader_phase_rss_delta_bytes": reader_phase_delta_kib * 1024,
++            "peak_rss_attribution": "Core graph metadata (model profile), not checkpoint bytes",
++            "full_file_materialized": False,
++            "measurement": "resource.getrusage(RUSAGE_SELF).ru_maxrss + /proc/self/status VmHWM；外部由 measure_rss.py 用 RUSAGE_CHILDREN 复核",
++        },
++        "checks": checks,
++        "baseline_reference": PARENT_BASELINE,
++    }
++
++    output = Path(args.output)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    with open(str(output), "w", encoding="utf-8") as stream:
++        json.dump(result, stream, ensure_ascii=False, sort_keys=True, indent=2)
++        stream.write("\n")
++    summary = {
++        "status": status,
++        "output": str(output),
++        "failed_checks": sorted(name for name, ok in checks.items() if not ok),
++        "mapped": "{}/{}".format(mapping.mapped_count, mapping.parameter_count),
++        "text_bytes": totals["checkpoint_text_bytes"],
++        "manifest_bytes": totals["manifest_parameter_bytes"],
++        "conversion_reclaim_bytes": totals["conversion_reclaim_bytes"],
++        "layout_regions": len(layout.regions),
++        "layout_total_nbytes": layout.total_nbytes,
++        "max_relative_error": result["precision_boundary"]["max_relative_error"],
++        "peak_rss_bytes": result["memory"]["peak_rss_bytes"],
++    }
++    print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
++    return 0 if status == "PASS" else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py b/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py
+new file mode 100644
+index 000000000..ffb29acff
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py
+@@ -0,0 +1,319 @@
++"""Qwen3.5-0.8B 权重摄取（映射 + 真实 layout + 精度边界）单测。
++
++合成部分的 checkpoint 由 KB 级 fixture 生成，用来验证 320/320 映射、排除组、
++dtype 分解与 RNE 降精度；真实部分的测试在固定 revision 资产不存在时 skip，
++只用 header 元数据加 36 个 F32 小张量，不物化 1.7 GB 权重。
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from pypto.portable.qwen35 import build_qwen35_text_decoder_graph
++from pypto.portable.qwen35_weight_layout import (
++    audit_precision_boundary,
++    build_weight_layout,
++    convert_f32_view_to_bf16_rne,
++    convert_region_bytes,
++    float32_bits_to_bfloat16_bits,
++)
++from pypto.portable.qwen35_weight_map import (
++    QWEN35_EMBED_TOKENS_TENSOR,
++    WeightMapError,
++    WeightMapMismatchError,
++    build_weight_mapping,
++    manifest_profile_from_metadata,
++    assert_manifest_reproducible,
++    tie_word_embeddings_from_config,
++)
++from pypto.portable.runtime_binding import build_binding_schema, build_packed_layout
++from pypto.portable.safetensors_reader import SafetensorsReader
++from pypto_x.qwen35_weight_fixture import (
++    REAL_SAFETENSORS_BYTES,
++    real_asset_dir,
++    synthetic_checkpoint_tensors,
++    write_safetensors,
++)
++
++F32_PATTERNS = ("layers.linear_attention.*.A_log", "layers.linear_attention.*.norm.weight")
++
++
++def _synthetic(tmp_path, name, *, f32_patterns=(), extra_tensors=(), profile="synthetic_test"):
++    program = build_qwen35_text_decoder_graph(1, 1, shape_profile=profile)
++    schema = build_binding_schema(program)
++    path = Path(tmp_path) / "{}.safetensors".format(name)
++    write_safetensors(path, synthetic_checkpoint_tensors(program.metadata, f32_patterns=f32_patterns, extra_tensors=extra_tensors))
++    return program, schema, path
++
++
++def test_every_parameter_maps_to_exactly_one_official_tensor(tmp_path):
++    program, schema, path = _synthetic(tmp_path, "clean")
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        mapping = build_weight_mapping(schema, program.metadata, reader)
++    assert mapping.parameter_count == 320
++    assert mapping.mapped_count == 320
++    assert mapping.unmapped == ()
++    assert mapping.unexpected_checkpoint_tensors == ()
++    assert len(set(item.parameter for item in mapping.mappings)) == 320
++    assert len(set(item.source.official_name for item in mapping.mappings)) == 320
++    assert set(item.ordinal for item in mapping.mappings) == set(entry.ordinal for entry in schema.parameters)
++    by_name = {item.parameter: item for item in mapping.mappings}
++    assert by_name["layer_00_in_proj_qkv_weight"].source.official_name == (
++        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
++    )
++    assert by_name["layer_03_q_proj_weight"].source.official_name == (
++        "model.language_model.layers.3.self_attn.q_proj.weight"
++    )
++    assert by_name["layer_23_o_proj_weight"].source.official_name == (
++        "model.language_model.layers.23.self_attn.o_proj.weight"
++    )
++    assert by_name["final_norm_weight"].source.official_name == "model.language_model.norm.weight"
++    assert by_name["layer_07_input_layernorm_weight"].source.official_name == (
++        "model.language_model.layers.7.input_layernorm.weight"
++    )
++    # 合成 checkpoint 全部 bf16，因此没有任何降精度需求
++    assert mapping.dtype_discrepancies == ()
++    assert mapping.totals["conversion_tensor_count"] == 0
++    assert mapping.totals["manifest_parameter_bytes"] == mapping.totals["checkpoint_text_bytes"]
++
++
++def test_manifest_is_reproducible_from_graph_metadata(tmp_path):
++    program, _schema, _path = _synthetic(tmp_path, "repro")
++    regenerated = assert_manifest_reproducible(program.metadata)
++    assert len(regenerated) == 22
++    assert sum(entry["count"] for entry in regenerated) == 320
++    profile = manifest_profile_from_metadata(program.metadata)
++    assert profile["hidden"] == 8 and profile["conv_kernel"] == 4
++
++
++def test_vision_and_mtp_groups_are_explicitly_excluded(tmp_path):
++    extra = (
++        ("model.visual.patch_embed.proj.weight", "BF16", (4, 3, 2, 2)),
++        ("model.visual.blocks.0.norm1.weight", "BF16", (4,)),
++        ("mtp.fc.weight", "BF16", (8, 16)),
++        ("mtp.norm.weight", "BF16", (8,)),
++    )
++    program, schema, path = _synthetic(tmp_path, "excluded", extra_tensors=extra)
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        mapping = build_weight_mapping(schema, program.metadata, reader)
++    groups = {group.group: group for group in mapping.excluded}
++    assert set(groups) == {"vision_tower", "mtp"}
++    assert groups["vision_tower"].tensor_count == 2
++    assert groups["vision_tower"].names == (
++        "model.visual.blocks.0.norm1.weight",
++        "model.visual.patch_embed.proj.weight",
++    )
++    assert groups["vision_tower"].nbytes == 4 * 3 * 2 * 2 * 2 + 4 * 2
++    assert groups["mtp"].tensor_count == 2
++    assert groups["mtp"].nbytes == (8 * 16 + 8) * 2
++    assert mapping.totals["excluded_tensor_count"] == 4
++    # 未分类张量必须 fail closed
++    program2, schema2, path2 = _synthetic(tmp_path, "unexpected", extra_tensors=(("mystery.weight", "BF16", (2,)),))
++    with SafetensorsReader(str(path2), mode="pread") as reader:
++        with pytest.raises(WeightMapMismatchError, match="unclassified"):
++            build_weight_mapping(schema2, program2.metadata, reader)
++
++
++def test_tied_embedding_fallback_is_explicit(tmp_path):
++    program, schema, path = _synthetic(tmp_path, "tied")
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        assert "lm_head.weight" not in reader
++        mapping = build_weight_mapping(schema, program.metadata, reader)
++    assert mapping.tied.tie_word_embeddings is True
++    assert mapping.tied.fallback_used is True
++    assert mapping.tied.lm_head_present is False
++    assert mapping.tied.checkpoint_tensor == QWEN35_EMBED_TOKENS_TENSOR
++    shared = [item for item in mapping.mappings if item.tied]
++    assert len(shared) == 1
++    assert shared[0].parameter == "embedding_lm_head_shared_weight"
++    assert shared[0].storage_id == "embedding_lm_head_shared_weight"
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        with pytest.raises(WeightMapMismatchError, match="tie_word_embeddings=false"):
++            build_weight_mapping(schema, program.metadata, reader, tie_word_embeddings=False)
++    config = Path(tmp_path) / "config.json"
++    config.write_text('{"text_config": {"tie_word_embeddings": true}}', encoding="utf-8")
++    assert tie_word_embeddings_from_config(str(config)) is True
++    config.write_text('{"tie_word_embeddings": false}', encoding="utf-8")
++    assert tie_word_embeddings_from_config(str(config)) is False
++    config.write_text('{"model_type": "qwen3_5"}', encoding="utf-8")
++    with pytest.raises(WeightMapError, match="does not declare"):
++        tie_word_embeddings_from_config(str(config))
++
++
++def test_f32_split_is_decomposed_into_exact_byte_accounting(tmp_path):
++    program, schema, path = _synthetic(tmp_path, "f32split", f32_patterns=F32_PATTERNS)
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        mapping = build_weight_mapping(schema, program.metadata, reader)
++    assert len(mapping.dtype_discrepancies) == 36
++    assert mapping.totals["text_tensor_count_by_checkpoint_dtype"] == {"BF16": 284, "F32": 36}
++    assert mapping.totals["conforming_tensor_count"] == 284
++    assert mapping.totals["conversion_tensor_count"] == 36
++    groups = {item["manifest_pattern"]: item for item in mapping.totals["dtype_discrepancy_groups"]}
++    assert set(groups) == set(F32_PATTERNS)
++    for pattern in F32_PATTERNS:
++        assert groups[pattern]["tensor_count"] == 18
++        assert groups[pattern]["checkpoint_dtype"] == "F32"
++        assert groups[pattern]["contract_dtype"] == "bf16"
++        assert groups[pattern]["delta_bytes"] == groups[pattern]["checkpoint_bytes"] // 2
++    # 守恒：checkpoint 字节 = 契约字节 + 降精度回收字节
++    assert mapping.totals["checkpoint_text_bytes"] == (
++        mapping.totals["manifest_parameter_bytes"] + mapping.totals["conversion_reclaim_bytes"]
++    )
++    assert (
++        mapping.totals["checkpoint_text_bytes_by_dtype"]["F32"]
++        == mapping.totals["conversion_reclaim_bytes"] * 2
++    )
++
++
++def test_layout_reproduces_frozen_packed_layout_without_overlap_or_holes(tmp_path):
++    program, schema, path = _synthetic(tmp_path, "layout", f32_patterns=F32_PATTERNS)
++    packed = build_packed_layout(schema)
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        mapping = build_weight_mapping(schema, program.metadata, reader)
++        layout = build_weight_layout(schema, mapping, reader)
++    assert len(layout.regions) == 368 == len(packed.regions)
++    assert layout.total_nbytes == packed.total_nbytes
++    assert len(layout.parameter_regions) == 320
++    assert len(layout.state_regions) == 48
++    assert all(region.source_name is None for region in layout.state_regions)
++    assert all(region.source_name is not None for region in layout.parameter_regions)
++    cursor = 0
++    for region, frozen in zip(layout.regions, packed.regions):
++        assert region.storage_id == frozen.storage_id
++        assert region.offset == frozen.offset
++        assert region.nbytes == frozen.nbytes
++        assert region.offset >= cursor
++        assert region.offset % region.alignment == 0
++        cursor = region.offset + region.nbytes
++    assert layout.padding_nbytes == layout.total_nbytes - sum(region.nbytes for region in layout.regions)
++    assert layout.region_for("embedding.weight").storage_id == "embedding_lm_head_shared_weight"
++    assert layout.region_for("lm_head.weight") is layout.region_for("embedding.weight")
++    assert len(layout.dtype_conversion_storage_ids) == 36
++    # 可复现：同样输入必须给出同样 digest
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        again = build_weight_layout(schema, build_weight_mapping(schema, program.metadata, reader), reader)
++    assert again.canonical_json() == layout.canonical_json()
++    assert again.layout_digest() == layout.layout_digest()
++
++
++def test_conversion_is_round_to_nearest_even_not_truncation():
++    assert float32_bits_to_bfloat16_bits(0x3F800000) == 0x3F80  # 1.0
++    assert float32_bits_to_bfloat16_bits(0xBF800000) == 0xBF80  # -1.0
++    # 1 + 2^-9：低于半个 ULP，向下
++    assert float32_bits_to_bfloat16_bits(0x3F804000) == 0x3F80
++    # 1 + 2^-8：恰好是 tie，偶数尾数胜出 -> 1.0
++    assert float32_bits_to_bfloat16_bits(0x3F808000) == 0x3F80
++    # 1 + 3*2^-9：超过半个 ULP，进位
++    assert float32_bits_to_bfloat16_bits(0x3F80C000) == 0x3F81
++    # 1 + 2^-7：精确可表示
++    assert float32_bits_to_bfloat16_bits(0x3F810000) == 0x3F81
++    # NaN 保持 NaN，Inf 保持 Inf
++    assert float32_bits_to_bfloat16_bits(0x7FC00000) == 0x7FC0
++    assert float32_bits_to_bfloat16_bits(0x7F800000) == 0x7F80
++    assert float32_bits_to_bfloat16_bits(0xFF800000) == 0xFF80
++    with pytest.raises(ValueError):
++        float32_bits_to_bfloat16_bits(1 << 32)
++
++
++def test_convert_region_bytes_halves_f32_and_keeps_bf16_identity(tmp_path):
++    program, schema, path = _synthetic(tmp_path, "convert", f32_patterns=F32_PATTERNS)
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        mapping = build_weight_mapping(schema, program.metadata, reader)
++        layout = build_weight_layout(schema, mapping, reader)
++        converted = [region for region in layout.parameter_regions if region.requires_dtype_conversion]
++        identity = [region for region in layout.parameter_regions if not region.requires_dtype_conversion]
++        assert len(converted) == 36
++        assert len(identity) == 284
++        for region in converted:
++            payload = convert_region_bytes(reader, region)
++            assert len(payload) == region.nbytes
++            assert region.source_nbytes == region.nbytes * 2
++            assert payload == bytes(convert_f32_view_to_bf16_rne(reader.view(region.source_name)))
++        sample = identity[0]
++        view = reader.view(sample.source_name)
++        assert convert_region_bytes(reader, sample) == view.tobytes()
++        view.release()
++        # 状态 region 没有来源，必须 fail closed
++        with pytest.raises(ValueError, match="no checkpoint source"):
++            convert_region_bytes(reader, layout.state_regions[0])
++
++
++def test_precision_boundary_audit_measures_real_round_trip_error(tmp_path):
++    program, schema, path = _synthetic(tmp_path, "audit", f32_patterns=F32_PATTERNS)
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        mapping = build_weight_mapping(schema, program.metadata, reader)
++        layout = build_weight_layout(schema, mapping, reader)
++        conversions = audit_precision_boundary(reader, layout)
++    assert len(conversions) == 320
++    converted = [item for item in conversions if item.status == "converted_rne"]
++    identity = [item for item in conversions if item.status == "identity"]
++    assert len(converted) == 36 and len(identity) == 284
++    assert all(item.source_sha256 is None for item in identity)
++    for item in converted:
++        assert item.source_sha256 is not None and item.converted_sha256 is not None
++        assert item.contract_nbytes * 2 == item.source_nbytes
++        # bf16 的 ULP 是 2^-7，RNE 相对误差上界是 2^-8
++        assert item.max_relative_error is not None and item.max_relative_error <= 2 ** -8
++        assert item.max_abs_error is not None
++
++
++def test_mapping_fails_closed_on_missing_tensor_and_shape_mismatch(tmp_path):
++    program, schema, path = _synthetic(tmp_path, "negative")
++    write_safetensors(
++        path,
++        [
++            (name, dtype, shape)
++            for name, dtype, shape in synthetic_checkpoint_tensors(program.metadata)
++            if "layers.5." not in name
++        ],
++    )
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        with pytest.raises(WeightMapMismatchError, match="missing tensor"):
++            build_weight_mapping(schema, program.metadata, reader)
++    broken = []
++    for official, dtype, shape in synthetic_checkpoint_tensors(program.metadata):
++        if official.endswith("layers.5.mlp.gate_proj.weight"):
++            shape = (shape[0] + 1, shape[1])
++        broken.append((official, dtype, shape))
++    write_safetensors(path, broken)
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        with pytest.raises(WeightMapMismatchError, match="shape"):
++            build_weight_mapping(schema, program.metadata, reader)
++
++
++@pytest.mark.skipif(real_asset_dir() is None, reason="Qwen3.5-0.8B 固定 revision 资产不存在")
++def test_real_checkpoint_mapping_layout_and_precision_boundary():
++    asset_dir = real_asset_dir()
++    checkpoint_path = asset_dir / "model.safetensors-00001-of-00001.safetensors"
++    assert checkpoint_path.stat().st_size == REAL_SAFETENSORS_BYTES
++    program = build_qwen35_text_decoder_graph(1, 1, past_length=4096, shape_profile="model")
++    schema = build_binding_schema(program)
++    assert schema.graph_digest == "c1a5663b644e6b6e642599689cc26c6f6b9c50f9b820743c272415b0ff0df7d5"
++    assert (len(schema.runtime_inputs), len(schema.parameters), len(schema.states)) == (3, 320, 48)
++    with SafetensorsReader(str(checkpoint_path), mode="pread") as reader:
++        assert len(reader) == 488
++        assert reader.file_nbytes == REAL_SAFETENSORS_BYTES
++        mapping = build_weight_mapping(schema, program.metadata, reader, tie_word_embeddings=True)
++        layout = build_weight_layout(schema, mapping, reader)
++        conversions = audit_precision_boundary(reader, layout)
++    assert mapping.mapped_count == 320 and mapping.parameter_count == 320
++    assert mapping.unmapped == () and mapping.unexpected_checkpoint_tensors == ()
++    groups = {group.group: group for group in mapping.excluded}
++    assert groups["vision_tower"].tensor_count == 153
++    assert groups["mtp"].tensor_count == 15
++    totals = mapping.totals
++    assert totals["checkpoint_tensor_total"] == 488
++    assert totals["text_tensor_count_by_checkpoint_dtype"] == {"BF16": 284, "F32": 36}
++    assert totals["checkpoint_text_bytes"] == 1504791232
++    assert totals["manifest_parameter_bytes"] == 1504786048
++    assert totals["conversion_reclaim_bytes"] == 5184
++    assert totals["excluded_bytes"] == groups["vision_tower"].nbytes + groups["mtp"].nbytes
++    assert layout.total_nbytes == build_packed_layout(schema).total_nbytes
++    assert len(layout.regions) == 368
++    converted = [item for item in conversions if item.status == "converted_rne"]
++    assert len(converted) == 36
++    assert sum(item.contract_nbytes for item in converted) == 5184
++    assert all(item.max_relative_error <= 2 ** -8 for item in converted)
++    assert max(item.max_relative_error for item in converted) > 0.0
+diff --git a/python/tests/ut/pypto_x/test_safetensors_reader.py b/python/tests/ut/pypto_x/test_safetensors_reader.py
+new file mode 100644
+index 000000000..6debf6b23
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_safetensors_reader.py
+@@ -0,0 +1,292 @@
++"""无第三方依赖 safetensors 只读读取器的单测。
++
++覆盖：13 种 dtype 的正常解析、mmap/pread 两种视图模式、只读语义、header
++负例（截断/非 JSON/未知字段/重复键/不支持的 dtype）与数据段负例（越界、
++重叠、空洞、shape 与 nbytes 不一致）。所有 fixture 都是 KB 级合成文件。
++"""
++
++from __future__ import annotations
++
++import mmap
++import struct
++from pathlib import Path
++
++import pytest
++
++from pypto.portable.safetensors_reader import (
++    SAFETENSORS_DTYPES,
++    SafetensorsBoundsError,
++    SafetensorsClosedError,
++    SafetensorsError,
++    SafetensorsFormatError,
++    SafetensorsLayoutError,
++    SafetensorsReader,
++    read_tensor_catalog,
++)
++from pypto_x.qwen35_weight_fixture import payload_for, write_raw_header_json, write_raw_safetensors, write_safetensors
++
++
++ALL_DTYPES = (
++    ("u8", "U8", (5,)),
++    ("i8", "I8", (5,)),
++    ("i16", "I16", (3, 2)),
++    ("u16", "U16", (3, 2)),
++    ("f16", "F16", (4,)),
++    ("bf16", "BF16", (4, 3)),
++    ("i32", "I32", (2, 2)),
++    ("u32", "U32", (2, 2)),
++    ("f32", "F32", (7,)),
++    ("i64", "I64", (3,)),
++    ("u64", "U64", (3,)),
++    ("f64", "F64", (2, 2)),
++    ("bool", "BOOL", (9,)),
++)
++
++
++def _all_dtype_file(tmp_path, mode):
++    path = Path(tmp_path) / "all-{}.safetensors".format(mode)
++    header = write_safetensors(path, [(name, dtype, shape) for name, dtype, shape in ALL_DTYPES])
++    return path, header
++
++
++@pytest.mark.parametrize("mode", ("mmap", "pread"))
++def test_reader_parses_every_supported_dtype(tmp_path, mode):
++    path, header = _all_dtype_file(tmp_path, mode)
++    with SafetensorsReader(str(path), mode=mode) as reader:
++        assert len(reader) == len(ALL_DTYPES)
++        assert sorted(reader.names) == sorted(name for name, _, _ in ALL_DTYPES)
++        assert reader.data_offset == 8 + reader.header_nbytes
++        assert reader.data_nbytes == sum(
++            entry["data_offsets"][1] - entry["data_offsets"][0] for entry in header.values()
++        )
++        for name, dtype, shape in ALL_DTYPES:
++            tensor = reader.info(name)
++            itemsize, pypto_dtype = SAFETENSORS_DTYPES[dtype]
++            assert tensor.dtype == dtype
++            assert tensor.pypto_dtype == pypto_dtype
++            assert tensor.shape == shape
++            assert tensor.itemsize == itemsize
++            assert tensor.nbytes == tensor.elements * itemsize
++            assert tensor.data_offset == header[name]["data_offsets"][0]
++            assert tensor.file_offset == 8 + reader.header_nbytes + tensor.data_offset
++            view = reader.view(name)
++            assert isinstance(view, memoryview)
++            assert view.readonly is True
++            assert view.nbytes == tensor.nbytes
++            assert view.tobytes() == payload_for(name, tensor.nbytes)
++            view.release()
++        # 负例：不存在的名字与越界切片
++        with pytest.raises(SafetensorsError, match="no tensor"):
++            reader.info("missing")
++        with pytest.raises(SafetensorsBoundsError):
++            reader.view_range("f32", 1, reader.info("f32").nbytes)
++
++
++def test_mmap_view_is_zero_copy_and_pread_view_is_owned(tmp_path):
++    path = Path(tmp_path) / "zero-copy.safetensors"
++    write_safetensors(path, [("a", "BF16", (8,)), ("b", "F32", (3,))])
++    with SafetensorsReader(str(path), mode="mmap") as reader:
++        view = reader.view("a")
++        assert isinstance(view.obj, mmap.mmap)
++        assert view.tobytes() == payload_for("a", 16)
++        view.release()
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        view = reader.view("a")
++        assert isinstance(view.obj, bytes)
++        assert view.tobytes() == payload_for("a", 16)
++        view.release()
++
++
++def test_reader_fails_closed_after_close(tmp_path):
++    path = Path(tmp_path) / "closed.safetensors"
++    write_safetensors(path, [("a", "BF16", (4,))])
++    reader = SafetensorsReader(str(path), mode="pread")
++    reader.close()
++    reader.close()
++    with pytest.raises(SafetensorsClosedError):
++        reader.view("a")
++    with pytest.raises(SafetensorsClosedError):
++        reader.sha256()
++    with pytest.raises(SafetensorsClosedError):
++        with reader:
++            pass
++
++
++def test_sha256_is_streaming_and_matches_file_digest(tmp_path):
++    import hashlib
++
++    path = Path(tmp_path) / "hash.safetensors"
++    write_safetensors(path, [("a", "I32", (64,)), ("b", "BOOL", (7,))])
++    expected = hashlib.sha256(path.read_bytes()).hexdigest()
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        assert reader.sha256(chunk_bytes=17) == expected
++        assert reader.sha256() == expected
++
++
++def test_read_tensor_catalog_returns_metadata_without_open_handle(tmp_path):
++    path = Path(tmp_path) / "catalog.safetensors"
++    write_safetensors(path, [("a", "BF16", (4,))], metadata={"format": "pt"})
++    catalog = read_tensor_catalog(str(path))
++    assert tuple(catalog) == ("a",)
++    assert catalog["a"].nbytes == 8
++    with SafetensorsReader(str(path)) as reader:
++        assert reader.metadata == {"format": "pt"}
++        assert reader.to_dict()["tensor_count"] == 1
++
++
++@pytest.mark.parametrize(
++    "header, body_nbytes, error, match",
++    (
++        ({}, 8, SafetensorsLayoutError, "cover"),
++        ({"a": {"dtype": "BF16", "shape": [4], "data_offsets": [0, 2]}}, 8, SafetensorsFormatError, "require"),
++        ({"a": {"dtype": "BF16", "shape": [3, 3], "data_offsets": [0, 8]}}, 8, SafetensorsFormatError, "require"),
++        ({"a": {"dtype": "F8_E4M3", "shape": [4], "data_offsets": [0, 4]}}, 4, SafetensorsFormatError, "unsupported dtype"),
++        (
++            {"a": {"dtype": "BF16", "shape": [4], "data_offsets": [0, 8], "extra": 1}},
++            8,
++            SafetensorsFormatError,
++            "unknown fields",
++        ),
++        ({"a": {"dtype": "BF16", "data_offsets": [0, 8]}}, 8, SafetensorsFormatError, "missing shape"),
++        (
++            {"a": {"dtype": "BF16", "shape": [4000], "data_offsets": [8, 8008]}},
++            8,
++            SafetensorsBoundsError,
++            "beyond data section",
++        ),
++        (
++            {
++                "a": {"dtype": "BF16", "shape": [4], "data_offsets": [0, 8]},
++                "b": {"dtype": "BF16", "shape": [4], "data_offsets": [4, 12]},
++            },
++            12,
++            SafetensorsLayoutError,
++            "overlaps",
++        ),
++        (
++            {
++                "a": {"dtype": "BF16", "shape": [4], "data_offsets": [0, 8]},
++                "b": {"dtype": "BF16", "shape": [4], "data_offsets": [12, 20]},
++            },
++            20,
++            SafetensorsLayoutError,
++            "gap",
++        ),
++    ),
++)
++def test_header_negative_cases_fail_closed(tmp_path, header, body_nbytes, error, match):
++    path = Path(tmp_path) / "negative.safetensors"
++    write_raw_header_json(path, header, b"\x00" * body_nbytes)
++    with pytest.raises(error, match=match):
++        SafetensorsReader(str(path))
++
++
++def test_duplicate_json_keys_and_non_json_headers_are_rejected(tmp_path):
++    path = Path(tmp_path) / "dup.safetensors"
++    raw = b'{"a":{"dtype":"BF16","shape":[4],"data_offsets":[0,8]},"a":{"dtype":"BF16","shape":[4],"data_offsets":[8,16]}}'
++    write_raw_safetensors(path, raw, b"\x00" * 16)
++    with pytest.raises(SafetensorsFormatError, match="duplicate key"):
++        SafetensorsReader(str(path))
++    write_raw_safetensors(path, b"{not json", b"")
++    with pytest.raises(SafetensorsFormatError, match="not valid JSON"):
++        SafetensorsReader(str(path))
++    write_raw_safetensors(path, b"[1,2,3]", b"")
++    with pytest.raises(SafetensorsFormatError, match="JSON object"):
++        SafetensorsReader(str(path))
++    write_raw_safetensors(path, b'{"__metadata__":{"k":1}}', b"")
++    with pytest.raises(SafetensorsFormatError, match="strings"):
++        SafetensorsReader(str(path))
++
++
++def test_truncated_and_oversized_headers_are_rejected(tmp_path):
++    path = Path(tmp_path) / "truncated.safetensors"
++    write_raw_safetensors(path, b'{"a":{"dtype":"BF16","shape":[4],"data_offsets":[0,8]}}', b"")
++    with pytest.raises(SafetensorsBoundsError, match="beyond data section"):
++        SafetensorsReader(str(path))
++    # header 长度本身超出文件
++    write_raw_safetensors(path, b'{"a":{"dtype":"BF16","shape":[4],"data_offsets":[0,8]}}' * 8, b"")
++    truncated = path.read_bytes()
++    path.write_bytes(truncated[:20])
++    with pytest.raises(SafetensorsBoundsError, match="does not fit"):
++        SafetensorsReader(str(path))
++    write_raw_safetensors(path, b"")
++    with pytest.raises(SafetensorsFormatError, match="too small"):
++        SafetensorsReader(str(path))
++    Path(str(path)).write_bytes(b"\x01\x02\x03")
++    with pytest.raises(SafetensorsFormatError, match="shorter than"):
++        SafetensorsReader(str(path))
++    big = bytearray(8)
++    big[0:8] = struct.pack("<Q", 1 << 40)
++    path.write_bytes(bytes(big))
++    with pytest.raises(SafetensorsFormatError, match="exceeds limit"):
++        SafetensorsReader(str(path))
++
++
++def test_overlapping_and_gapped_offsets_are_rejected(tmp_path):
++    path = Path(tmp_path) / "overlap.safetensors"
++    write_raw_header_json(
++        path,
++        {
++            "a": {"dtype": "BF16", "shape": [4], "data_offsets": [0, 8]},
++            "b": {"dtype": "BF16", "shape": [4], "data_offsets": [4, 12]},
++        },
++        b"\x00" * 12,
++    )
++    with pytest.raises(SafetensorsLayoutError, match="overlaps"):
++        SafetensorsReader(str(path))
++    write_raw_header_json(
++        path,
++        {
++            "a": {"dtype": "BF16", "shape": [4], "data_offsets": [0, 8]},
++            "b": {"dtype": "BF16", "shape": [4], "data_offsets": [12, 20]},
++        },
++        b"\x00" * 20,
++    )
++    with pytest.raises(SafetensorsLayoutError, match="gap"):
++        SafetensorsReader(str(path))
++    # 尾部未覆盖
++    write_raw_header_json(
++        path, {"a": {"dtype": "BF16", "shape": [4], "data_offsets": [0, 8]}}, b"\x00" * 24
++    )
++    with pytest.raises(SafetensorsLayoutError, match="cover"):
++        SafetensorsReader(str(path))
++
++
++def test_inverted_offsets_and_bad_shape_are_rejected(tmp_path):
++    path = Path(tmp_path) / "bad.safetensors"
++    write_raw_header_json(path, {"a": {"dtype": "BF16", "shape": [4], "data_offsets": [8, 0]}}, b"\x00" * 8)
++    with pytest.raises(SafetensorsFormatError, match="inverted"):
++        SafetensorsReader(str(path))
++    write_raw_header_json(
++        path, {"a": {"dtype": "BF16", "shape": [4, -1], "data_offsets": [0, 8]}}, b"\x00" * 8
++    )
++    with pytest.raises(SafetensorsFormatError, match="non-negative"):
++        SafetensorsReader(str(path))
++    write_raw_header_json(path, {"a": {"dtype": "BF16", "shape": [4], "data_offsets": [0]}}, b"\x00" * 8)
++    with pytest.raises(SafetensorsFormatError, match="exactly two"):
++        SafetensorsReader(str(path))
++    write_raw_header_json(path, {"": {"dtype": "BF16", "shape": [4], "data_offsets": [0, 8]}}, b"\x00" * 8)
++    with pytest.raises(SafetensorsFormatError, match="non-empty"):
++        SafetensorsReader(str(path))
++
++
++def test_invalid_mode_and_header_limit_are_rejected(tmp_path):
++    path = Path(tmp_path) / "mode.safetensors"
++    write_safetensors(path, [("a", "BF16", (4,))])
++    with pytest.raises(SafetensorsError, match="mode"):
++        SafetensorsReader(str(path), mode="write")
++    with pytest.raises(SafetensorsError, match="max_header_bytes"):
++        SafetensorsReader(str(path), max_header_bytes=0)
++    with SafetensorsReader(str(path)) as reader:
++        assert reader.header_aligned is True
++        assert reader.data_offset % 8 == 0
++    # 未对齐 header 只作为信息位记录，不拒绝读取
++    raw = b'{"a":{"dtype":"BF16","shape":[4],"data_offsets":[0,8]}}'
++    assert (8 + len(raw)) % 8 != 0
++    write_raw_safetensors(path, raw, b"\x00" * 8)
++    with SafetensorsReader(str(path)) as reader:
++        assert reader.header_aligned is False
++        assert reader.view("a").nbytes == 8
++    with pytest.raises(SafetensorsError, match="no tensor"):
++        with SafetensorsReader(str(path)) as reader:
++            reader.view("nope")

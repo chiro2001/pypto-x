@@ -1,0 +1,1751 @@
+From 05ec3cecfacdd5f8562de8261e86e0e862f7d3d9 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Thu, 10 Sep 2026 17:04:30 +0800
+Subject: [PATCH 94/96] feat(pypto-x): release dead SSA buffers and add packed
+ AVX-512 cast/transpose/embedding kernels
+
+The T=5 Qwen3.5-0.8B AVX-512 run was stopped at op #4 for two independent
+reasons, and both are fixed here.
+
+P1 (liveness): the vector, AVX2 and AVX-512 launch loops kept every SSA value
+alive until the launch returned (6.53 GB of dead intermediates at T=5).  The
+new `pypto.backends.cpu.ssa_liveness` module computes last-use indexes from the
+immutable operation list and releases a value straight after its last consumer.
+Parameters and function returns are pinned, so no observable value, canary or
+artifact contract changes.
+
+P2 (packed parameter-scale kernels): the host reference materialized whole
+tensors as Python lists (~28 B/element), which is 13.6 GiB for the embedding
+table alone.  AVX-512 now runs `cast` (f32<->bf16, RNE, bit-exact with the
+reference), rank-2 `transpose` and axis-0 `embedding` as packed native kernels
+over caller buffers, with ctypes-allocated destinations that never build a
+Python element list.  The kernel choice is a single predicate shared by the
+compiler metadata and the runtime, so a declared mode cannot disagree with the
+executed one; everything not covered stays `host_reference`.
+
+The artifact payload version moves to 2, the lowering version to 3 and the
+native ABI marker to `pypto-x.cpu.avx512:3`, so payload-1 artifacts (which
+advertised all three operations as host_reference) fail closed.
+---
+ python/pypto/backends/cpu/ssa_liveness.py                   |  97 ++++++
+ python/pypto/backends/cpu/vector/runtime.py                 |  10 +
+ python/pypto/backends/cpu/x86/avx2.py                       |  35 +-
+ python/pypto/backends/cpu/x86/avx512.py                     | 300 +++++++++++++---
+ python/pypto/compiler/targets/cpu_avx512.py                 | 239 ++++++++++++-
+ python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py |  72 +++-
+ python/tests/ut/pypto_x/test_cpu_packed_liveness.py         | 599 ++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_qwen35_avx512_parity.py        |   7 +-
+ 8 files changed, 1291 insertions(+), 68 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/ssa_liveness.py b/python/pypto/backends/cpu/ssa_liveness.py
+new file mode 100644
+index 000000000..8a615a529
+--- /dev/null
++++ b/python/pypto/backends/cpu/ssa_liveness.py
+@@ -0,0 +1,97 @@
++"""SSA last-use analysis and buffer release for CPU runtime launch loops.
++
++The CPU vector, AVX2 and AVX-512 runtimes keep every SSA value alive in one
++``environment`` mapping until the launch returns.  For a real Qwen3.5-0.8B
++graph that pins ~6.5 GB of dead intermediate buffers and dominates the peak
++RSS.  This module computes, from the immutable operation list only, the last
++operation that consumes each SSA name, and releases a value's buffer exactly
++after that operation.
++
++The analysis is deliberately conservative:
++
++* function parameters (including scalars) are never released;
++* function returns are never released;
++* a value is only released after the operation that consumed it last;
++* values that are never consumed and are not returned are released right
++  after they are produced.
++
++Nothing here changes operation semantics: the release point is always strictly
++after the consuming operation has returned.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
++
++
++class SsaLivenessError(RuntimeError):
++    """The launch function does not expose a usable SSA operation list."""
++
++
++def _operations(function: Any) -> Sequence[Any]:
++    body = getattr(function, "body", None)
++    operations = getattr(body, "operations", None)
++    if operations is None:
++        raise SsaLivenessError("launch function body has no operation list")
++    return operations
++
++
++def last_use_map(function: Any) -> Dict[str, int]:
++    """Map every consumed SSA name to the index of its last consuming op."""
++
++    last_use: Dict[str, int] = {}
++    for index, operation in enumerate(_operations(function)):
++        for ref in operation.inputs:
++            last_use[ref.name] = index
++    return last_use
++
++
++def pinned_names(function: Any) -> frozenset:
++    """Names that must survive the complete launch (parameters and returns)."""
++
++    pinned = set()
++    for ref in tuple(function.parameters) + tuple(function.returns):
++        pinned.add(ref.name)
++    return frozenset(pinned)
++
++
++def plan_release(function: Any) -> Tuple[Dict[str, int], frozenset]:
++    """Return ``(last_use, pinned)`` for one validated launch function."""
++
++    return last_use_map(function), pinned_names(function)
++
++
++def release_dead_values(
++    environment: Dict[str, Any],
++    last_use: Mapping[str, int],
++    pinned: Iterable[str],
++    index: int,
++    used_names: Sequence[str],
++    produced_names: Sequence[str],
++) -> Tuple[str, ...]:
++    """Release values that became dead at operation ``index``.
++
++    ``used_names`` are the inputs of the operation that just executed;
++    ``produced_names`` are its outputs.  Returns the released names in a
++    deterministic order so callers can report/verify the release set.
++    """
++
++    released = []
++    for name in used_names:
++        if name in environment and name not in pinned and last_use.get(name) == index:
++            del environment[name]
++            released.append(name)
++    for name in produced_names:
++        if name in environment and name not in pinned and name not in last_use:
++            del environment[name]
++            released.append(name)
++    return tuple(released)
++
++
++def live_bytes(environment: Mapping[str, Any], sizer: Any) -> int:
++    """Sum the byte size of every live value (diagnostics and tests only)."""
++
++    total = 0
++    for value in environment.values():
++        total += int(sizer(value))
++    return total
+diff --git a/python/pypto/backends/cpu/vector/runtime.py b/python/pypto/backends/cpu/vector/runtime.py
+index d134fcb59..38af40585 100644
+--- a/python/pypto/backends/cpu/vector/runtime.py
++++ b/python/pypto/backends/cpu/vector/runtime.py
+@@ -42,6 +42,7 @@ from pypto.target import TargetSpec
+ from pypto.target._utils import sha256_text
+ 
+ from ..tensor import FlatBuffer, HostTensor, _cast_value
++from ..ssa_liveness import plan_release, release_dead_values
+ 
+ 
+ class CpuVectorRuntimeError(RuntimeError):
+@@ -160,6 +161,7 @@ class CpuVectorRuntime:
+             else:
+                 raise CpuVectorExecutionError("unsupported parameter kind {!r}".format(parameter.type.kind))
+ 
++        last_use, pinned = plan_release(function)
+         for index, operation in enumerate(function.body.operations):
+             _execute_operation(
+                 operation,
+@@ -167,6 +169,14 @@ class CpuVectorRuntime:
+                 environment,
+                 "function {} operation {}".format(function.name, index),
+             )
++            release_dead_values(
++                environment,
++                last_use,
++                pinned,
++                index,
++                [ref.name for ref in operation.inputs],
++                [ref.name for ref in operation.outputs],
++            )
+ 
+         results: List[Any] = []
+         output_index = 0
+diff --git a/python/pypto/backends/cpu/x86/avx2.py b/python/pypto/backends/cpu/x86/avx2.py
+index b50b98b66..74356cb1c 100644
+--- a/python/pypto/backends/cpu/x86/avx2.py
++++ b/python/pypto/backends/cpu/x86/avx2.py
+@@ -47,6 +47,7 @@ from pypto.target._utils import mapping_copy, sha256_text
+ 
+ from ..tensor import FlatBuffer, HostTensor, _cast_value
+ from ..byte_view import CpuByteViewError, try_typed_byte_view
++from ..ssa_liveness import plan_release, release_dead_values
+ 
+ 
+ class CpuAvx2RuntimeError(RuntimeError):
+@@ -289,6 +290,27 @@ def _buffer_from_values(dtype: str, values: Sequence[Any], context: str) -> _Nat
+     return _NativeBuffer(dtype, len(values), ctypes.cast(array, _pointer(dtype)), array, False)
+ 
+ 
++def _buffer_alloc(dtype: str, count: int, context: str) -> _NativeBuffer:
++    """Allocate a zero-filled native buffer without a Python element list.
++
++    ``_buffer_from_values(dtype, [0] * count, ...)`` builds a ``count``-element
++    Python list first, which costs ~8 bytes per element and is unusable for the
++    parameter-scale tensors of a real model.  ctypes zero-fills the array
++    itself, so this path never materializes per-element Python objects.
++    """
++
++    dtype = canonical_dtype(dtype)
++    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
++        raise CpuAvx2ExecutionError("{} allocation count must be a non-negative integer".format(context))
++    ctype = _ctype(dtype)
++    array = (ctype * count)()
++    if count == 0:
++        pointer = ctypes.cast(0, _pointer(dtype))
++    else:
++        pointer = ctypes.cast(array, _pointer(dtype))
++    return _NativeBuffer(dtype, count, pointer, array, False)
++
++
+ def _buffer_from_raw(dtype: str, values: Sequence[Any], context: str) -> _NativeBuffer:
+     dtype = canonical_dtype(dtype)
+     if dtype == "bf16":
+@@ -918,8 +940,19 @@ class Avx2Runtime:
+                 raise CpuAvx2ExecutionError("unsupported parameter kind {!r}".format(parameter.type.kind))
+         if len(loaded.target_ir.plans) != len(function.body.operations):
+             raise CpuAvx2ArtifactError("AVX2 plan count does not match operation count")
+-        for operation, plan in zip(function.body.operations, loaded.target_ir.plans):
++        last_use, pinned = plan_release(function)
++        for index, (operation, plan) in enumerate(
++            zip(function.body.operations, loaded.target_ir.plans)
++        ):
+             self._execute_operation(operation, plan, environment, loaded.module)
++            release_dead_values(
++                environment,
++                last_use,
++                pinned,
++                index,
++                [ref.name for ref in operation.inputs],
++                [ref.name for ref in operation.outputs],
++            )
+         results: List[Any] = []
+         output_index = 0
+         for result_ref in function.returns:
+diff --git a/python/pypto/backends/cpu/x86/avx512.py b/python/pypto/backends/cpu/x86/avx512.py
+index 6bd71a990..208bdb9be 100644
+--- a/python/pypto/backends/cpu/x86/avx512.py
++++ b/python/pypto/backends/cpu/x86/avx512.py
+@@ -20,7 +20,17 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+ from pypto.abi import Availability, LaunchRequest, TensorDesc
+ from pypto.compiler.artifact import ABI_VERSION, Artifact
+ from pypto.compiler.targets.cpu_avx2 import DEFAULT_ARTIFACT_FORMAT as DEFAULT_AVX2_ARTIFACT_FORMAT
+-from pypto.compiler.targets.cpu_avx512 import DEFAULT_ARTIFACT_FORMAT, _execution_metadata
++from pypto.compiler.targets.cpu_avx512 import (
++    ARTIFACT_PAYLOAD_VERSION,
++    DEFAULT_ARTIFACT_FORMAT,
++    NATIVE_ABI_MARKER,
++    PACKED_CAST_MODE,
++    PACKED_EMBEDDING_MODE,
++    PACKED_KERNEL_VERSION,
++    PACKED_TRANSPOSE_MODE,
++    _execution_metadata,
++    packed_kernel_contract,
++)
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation
+ from pypto.lowering.cpu import (
+     canonical_dtype,
+@@ -49,6 +59,7 @@ from pypto.target import TargetSpec
+ from pypto.target._utils import mapping_copy, sha256_text
+ 
+ from ..tensor import FlatBuffer, HostTensor, _cast_value
++from ..ssa_liveness import plan_release, release_dead_values
+ from . import avx2 as _avx2
+ 
+ 
+@@ -110,6 +121,7 @@ _buffer_from_raw = _avx2._buffer_from_raw
+ _buffer_from_descriptor = _avx2._buffer_from_descriptor
+ _buffer_values = _avx2._buffer_values
+ _buffer_raw = _avx2._buffer_raw
++_buffer_alloc = _avx2._buffer_alloc
+ _write_descriptor = _avx2._write_descriptor
+ _symbol = _avx2._symbol
+ _unravel = _avx2._unravel
+@@ -245,6 +257,64 @@ def _call_matmul(
+     function(left.pointer, right.pointer, destination.pointer, m, k, n)
+ 
+ 
++def _call_packed_cast(
++    module: Any,
++    kernel: str,
++    source_dtype: str,
++    target_dtype: str,
++    source: _NativeBuffer,
++    destination: _NativeBuffer,
++    count: int,
++) -> None:
++    """Run ``ptx_avx512_<kernel>`` for a whole-tensor float cast/copy."""
++
++    function = _safe_symbol(
++        module,
++        "ptx_avx512_{}".format(kernel),
++        [_pointer(source_dtype), _pointer(target_dtype), ctypes.c_size_t],
++    )
++    function(source.pointer, destination.pointer, count)
++
++
++def _call_packed_transpose(
++    module: Any,
++    kernel: str,
++    source: _NativeBuffer,
++    destination: _NativeBuffer,
++    rows: int,
++    columns: int,
++) -> None:
++    function = _safe_symbol(
++        module,
++        "ptx_avx512_{}".format(kernel),
++        [_pointer(source.dtype), _pointer(destination.dtype), ctypes.c_size_t, ctypes.c_size_t],
++    )
++    function(source.pointer, destination.pointer, rows, columns)
++
++
++def _call_packed_embedding(
++    module: Any,
++    kernel: str,
++    table: _NativeBuffer,
++    indices: _NativeBuffer,
++    destination: _NativeBuffer,
++    index_count: int,
++    row_elements: int,
++) -> None:
++    function = _safe_symbol(
++        module,
++        "ptx_avx512_{}".format(kernel),
++        [
++            _pointer(table.dtype),
++            ctypes.POINTER(ctypes.c_int64),
++            _pointer(destination.dtype),
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++        ],
++    )
++    function(table.pointer, indices.pointer, destination.pointer, index_count, row_elements)
++
++
+ def _reference_operation(
+     operation: Operation,
+     plan: Any,
+@@ -347,7 +417,7 @@ def _validate_primary_semantics(artifact: Artifact, metadata: Mapping[str, Any])
+     execution-boundary field.
+     """
+ 
+-    if metadata.get("artifact_payload_version") != 1:
++    if metadata.get("artifact_payload_version") != ARTIFACT_PAYLOAD_VERSION:
+         raise CpuAvx512ArtifactError("unsupported AVX-512 artifact payload version")
+     if metadata.get("lowering_version") != AVX512_LOWERING_VERSION:
+         raise CpuAvx512ArtifactError("unsupported AVX-512 lowering version")
+@@ -549,7 +619,7 @@ def _decode_artifact(
+         raise CpuAvx512ArtifactError("native artifact content digest mismatch")
+     if metadata.get("entrypoint") != artifact.entrypoint:
+         raise CpuAvx512ArtifactError("AVX-512 artifact entrypoint mismatch")
+-    if metadata.get("artifact_payload_version") != 1:
++    if metadata.get("artifact_payload_version") != ARTIFACT_PAYLOAD_VERSION:
+         raise CpuAvx512ArtifactError("unsupported AVX-512 artifact payload version")
+     if metadata.get("lowering_version") != AVX512_LOWERING_VERSION:
+         raise CpuAvx512ArtifactError("unsupported AVX-512 lowering version")
+@@ -693,7 +763,7 @@ def _decode_artifact(
+         raise CpuAvx512ArtifactError("AVX-512 native safety marker is missing or malformed") from exc
+     if native_variant != target_ir.native_variant or metadata.get("native_source_digest") != native_source_digest:
+         raise CpuAvx512ArtifactError("AVX-512 native variant/source marker does not match metadata")
+-    if native_feature_mask != expected_mask or native_abi != "pypto-x.cpu.avx512:2":
++    if native_feature_mask != expected_mask or native_abi != NATIVE_ABI_MARKER:
+         raise CpuAvx512ArtifactError("AVX-512 native safety marker does not match ABI metadata")
+     return LoadedAvx512Artifact(artifact, target_ir, mismatch, module)
+ 
+@@ -959,8 +1029,19 @@ class Avx512Runtime:
+                 raise CpuAvx512ExecutionError("unsupported parameter kind {!r}".format(parameter.type.kind))
+         if len(loaded.target_ir.plans) != len(function.body.operations):
+             raise CpuAvx512ArtifactError("AVX-512 plan count does not match operation count")
+-        for operation, plan in zip(function.body.operations, loaded.target_ir.plans):
++        last_use, pinned = plan_release(function)
++        for index, (operation, plan) in enumerate(
++            zip(function.body.operations, loaded.target_ir.plans)
++        ):
+             self._execute_operation(operation, plan, environment, loaded.module)
++            release_dead_values(
++                environment,
++                last_use,
++                pinned,
++                index,
++                [ref.name for ref in operation.inputs],
++                [ref.name for ref in operation.outputs],
++            )
+         results: List[Any] = []
+         output_index = 0
+         for result_ref in function.returns:
+@@ -980,13 +1061,21 @@ class Avx512Runtime:
+                 results.append(values[0] if values else None)
+         return tuple(results)
+ 
+-    def _execute_operation(
++    def plan_execution(
+         self,
+         operation: Operation,
+         plan: Any,
+-        environment: Dict[str, _RuntimeValue],
+-        module: Any,
+-    ) -> None:
++        environment: Mapping[str, _RuntimeValue],
++    ) -> Mapping[str, Any]:
++        """Describe exactly how one operation will execute.
++
++        The mode string is the same contract the compiler records in artifact
++        metadata, and ``python_list_elements`` is the exact number of elements
++        the host reference would materialize as Python objects.  Callers use
++        this to classify operations (and to enforce a list-materialization
++        guard) *before* the operation runs, without guessing from the name.
++        """
++
+         name = canonical_operation_name(operation.name)
+         if plan.operation != name:
+             raise CpuAvx512ArtifactError("AVX-512 operation does not match vector plan")
+@@ -995,39 +1084,99 @@ class Avx512Runtime:
+             if ref.name not in environment:
+                 raise CpuAvx512ExecutionError("AVX-512 input {!r} is unavailable".format(ref.name))
+             inputs.append(environment[ref.name])
+-        if name == "split":
+-            environment.update(
+-                _reference_operation(
+-                    operation, plan, inputs, "AVX-512 {} split".format(operation.name)
+-                )
+-            )
+-            return
++        packed = packed_kernel_contract(operation, plan)
++        if packed is not None:
++            return {
++                "operation": name,
++                "mode": packed["mode"],
++                "kernel": packed["kernel"],
++                "packed": packed,
++                "inputs": tuple(inputs),
++                "python_list_elements": 0,
++                "output_ref": operation.outputs[0],
++            }
+         output_ref = operation.outputs[0]
+         dtype = canonical_dtype(output_ref.type.dtype)
+         native_float = dtype in ("float32", "bf16")
++        if name == "split":
++            mode = "host_reference"
++        elif name == "constant":
++            mode = "host_materialize"
++        elif name in (
++            "identity", "add", "sub", "mul", "div", "neg",
++            "reduce_sum", "reduce_max", "reduce_mean",
++        ):
++            mode = "native_avx512_zmm" if native_float else "host_reference"
++        elif name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++            mode = "native_scalar_math_lane" if native_float else "host_reference"
++        elif name == "matmul":
++            if not native_float:
++                mode = "host_reference"
++            elif plan.matmul is not None and plan.matmul.batch_shape:
++                mode = "host_batch_loop_rank2_native"
++            else:
++                mode = "native_avx512_zmm"
++        else:
++            mode = "host_reference"
++        list_elements = 0
++        if mode in ("host_reference", "host_materialize"):
++            list_elements = sum(int(value.buffer.count) for value in inputs)
++            for ref in operation.outputs:
++                if _is_tensor(ref.type):
++                    list_elements += element_count(static_shape(ref.type, ref.name))
++                else:
++                    list_elements += 1
++        return {
++            "operation": name,
++            "mode": mode,
++            "kernel": None,
++            "packed": None,
++            "inputs": tuple(inputs),
++            "python_list_elements": list_elements,
++            "output_ref": output_ref,
++        }
++
++    def _execute_operation(
++        self,
++        operation: Operation,
++        plan: Any,
++        environment: Dict[str, _RuntimeValue],
++        module: Any,
++    ) -> None:
++        decision = self.plan_execution(operation, plan, environment)
++        name = decision["operation"]
++        mode = decision["mode"]
++        inputs = list(decision["inputs"])
+         try:
+-            if name == "constant":
++            if mode == "host_reference":
++                context = (
++                    "AVX-512 {} split".format(operation.name)
++                    if name == "split"
++                    else "AVX-512 {}".format(name)
++                )
++                environment.update(_reference_operation(operation, plan, inputs, context))
++                return
++            if mode in (PACKED_CAST_MODE, PACKED_TRANSPOSE_MODE, PACKED_EMBEDDING_MODE):
++                environment.update(self._execute_packed(decision, operation, plan, module))
++                return
++            output_ref = operation.outputs[0]
++            dtype = canonical_dtype(output_ref.type.dtype)
++            if mode == "host_materialize":
+                 raw = operation.attributes.get("value", operation.attributes.get("values"))
+                 values = [raw] if _is_scalar(output_ref.type) else list(flatten_values(raw))
+                 environment[output_ref.name] = _RuntimeValue(
+                     output_ref.type, _buffer_from_values(dtype, values, output_ref.name)
+                 )
+             elif name == "identity":
+-                if native_float:
+-                    source = inputs[0].buffer
+-                    destination = _buffer_from_values(dtype, [0] * source.count, output_ref.name)
+-                    _call_copy(module, dtype, source, destination)
+-                    environment[output_ref.name] = _RuntimeValue(output_ref.type, destination)
+-                else:
+-                    environment.update(_reference_operation(operation, plan, inputs, "AVX-512 identity"))
++                source = inputs[0].buffer
++                destination = _buffer_alloc(dtype, source.count, output_ref.name)
++                _call_copy(module, dtype, source, destination)
++                environment[output_ref.name] = _RuntimeValue(output_ref.type, destination)
+             elif name in ("add", "sub", "mul", "div"):
+                 left, right = inputs
+-                if not native_float:
+-                    environment.update(_reference_operation(operation, plan, inputs, "AVX-512 {}".format(name)))
+-                    return
+                 if name == "div" and any(value == 0 for value in _buffer_values(right.buffer)):
+                     raise CpuAvx512ExecutionError("division by zero")
+-                destination = _buffer_from_values(dtype, [0] * plan.element_count, output_ref.name)
++                destination = _buffer_alloc(dtype, plan.element_count, output_ref.name)
+                 _call_binary(
+                     module,
+                     name,
+@@ -1040,39 +1189,27 @@ class Avx512Runtime:
+                 )
+                 environment[output_ref.name] = _RuntimeValue(output_ref.type, destination)
+             elif name == "neg":
+-                if native_float:
+-                    source = inputs[0].buffer
+-                    destination = _buffer_from_values(dtype, [0] * plan.element_count, output_ref.name)
+-                    _call_unary(module, "neg", dtype, source, destination)
+-                    environment[output_ref.name] = _RuntimeValue(output_ref.type, destination)
+-                else:
+-                    environment.update(_reference_operation(operation, plan, inputs, "AVX-512 neg"))
++                source = inputs[0].buffer
++                destination = _buffer_alloc(dtype, plan.element_count, output_ref.name)
++                _call_unary(module, "neg", dtype, source, destination)
++                environment[output_ref.name] = _RuntimeValue(output_ref.type, destination)
+             elif name in ("reduce_sum", "reduce_max", "reduce_mean"):
+-                if not native_float:
+-                    environment.update(_reference_operation(operation, plan, inputs, "AVX-512 {}".format(name)))
+-                    return
+                 result = self._execute_reduction(name, inputs[0], output_ref.type, plan, module, output_ref.name)
+                 environment[output_ref.name] = _RuntimeValue(output_ref.type, result)
+             elif name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
+-                if not native_float:
+-                    environment.update(_reference_operation(operation, plan, inputs, "AVX-512 {}".format(name)))
+-                    return
+                 source = inputs[0].buffer
+-                destination = _buffer_from_values(dtype, [0] * plan.element_count, output_ref.name)
++                destination = _buffer_alloc(dtype, plan.element_count, output_ref.name)
+                 _call_math(module, name, dtype, source, destination)
+                 environment[output_ref.name] = _RuntimeValue(output_ref.type, destination)
+             elif name == "matmul":
+                 matmul = plan.matmul
+-                if not native_float:
+-                    environment.update(_reference_operation(operation, plan, inputs, "AVX-512 matmul"))
+-                    return
+                 if matmul.batch_shape:
+                     values = self._execute_batched_matmul(
+                         inputs[0], inputs[1], dtype, matmul, module, output_ref.name
+                     )
+                     destination = _buffer_from_values(dtype, values, output_ref.name)
+                 else:
+-                    destination = _buffer_from_values(dtype, [0] * matmul.output_elements, output_ref.name)
++                    destination = _buffer_alloc(dtype, matmul.output_elements, output_ref.name)
+                     _call_matmul(
+                         module,
+                         dtype,
+@@ -1085,14 +1222,81 @@ class Avx512Runtime:
+                     )
+                 environment[output_ref.name] = _RuntimeValue(output_ref.type, destination)
+             else:
+-                environment.update(
+-                    _reference_operation(operation, plan, inputs, "AVX-512 {}".format(name))
++                raise CpuAvx512ExecutionError(
++                    "AVX-512 operation {!r} has no executor for mode {!r}".format(name, mode)
+                 )
+         except CpuAvx512RuntimeError:
+             raise
+         except Exception as exc:
+             raise CpuAvx512ExecutionError("AVX-512 operation {} failed: {}".format(name, exc)) from exc
+ 
++    def _execute_packed(
++        self,
++        decision: Mapping[str, Any],
++        operation: Operation,
++        plan: Any,
++        module: Any,
++    ) -> Mapping[str, _RuntimeValue]:
++        """Run one packed parameter-scale kernel on caller-owned buffers."""
++
++        packed = decision["packed"]
++        mode = packed["mode"]
++        kernel = packed["kernel"]
++        inputs = list(decision["inputs"])
++        output_ref = operation.outputs[0]
++        target_dtype = canonical_dtype(output_ref.type.dtype)
++        source = inputs[0].buffer
++        count = int(plan.element_count)
++        if mode == PACKED_CAST_MODE:
++            # A cast is elementwise: the plan domain is both the source and the
++            # destination element count.
++            if source.count != count:
++                raise CpuAvx512ArtifactError(
++                    "AVX-512 packed cast input element count {} does not match plan {}".format(
++                        source.count, count
++                    )
++                )
++            destination = _buffer_alloc(target_dtype, count, output_ref.name)
++            _call_packed_cast(
++                module,
++                kernel,
++                packed["source_dtype"],
++                target_dtype,
++                source,
++                destination,
++                count,
++            )
++        elif mode == PACKED_TRANSPOSE_MODE:
++            rows = int(packed["rows"])
++            columns = int(packed["columns"])
++            if rows <= 0 or columns <= 0 or source.count != rows * columns or count != rows * columns:
++                raise CpuAvx512ArtifactError("AVX-512 packed transpose descriptor is invalid")
++            destination = _buffer_alloc(target_dtype, count, output_ref.name)
++            _call_packed_transpose(module, kernel, source, destination, rows, columns)
++        elif mode == PACKED_EMBEDDING_MODE:
++            if len(inputs) != 2:
++                raise CpuAvx512ArtifactError("AVX-512 packed embedding requires table and indices")
++            index_buffer = inputs[1].buffer
++            table_rows = int(packed["table_rows"])
++            row_elements = int(packed["row_elements"])
++            if source.count != table_rows * row_elements or index_buffer.count * row_elements != count:
++                raise CpuAvx512ArtifactError("AVX-512 packed embedding descriptor is invalid")
++            for position in range(index_buffer.count):
++                selected = int(index_buffer.pointer[position])
++                if selected < 0 or selected >= table_rows:
++                    raise CpuAvx512ExecutionError(
++                        "AVX-512 embedding index {} is outside axis 0 length {}".format(
++                            selected, table_rows
++                        )
++                    )
++            destination = _buffer_alloc(target_dtype, count, output_ref.name)
++            _call_packed_embedding(
++                module, kernel, source, index_buffer, destination, index_buffer.count, row_elements
++            )
++        else:
++            raise CpuAvx512ArtifactError("unsupported AVX-512 packed mode {!r}".format(mode))
++        return {output_ref.name: _RuntimeValue(output_ref.type, destination)}
++
+     def _execute_batched_matmul(
+         self,
+         left: _RuntimeValue,
+diff --git a/python/pypto/compiler/targets/cpu_avx512.py b/python/pypto/compiler/targets/cpu_avx512.py
+index 7c18e06fe..cc73edb62 100644
+--- a/python/pypto/compiler/targets/cpu_avx512.py
++++ b/python/pypto/compiler/targets/cpu_avx512.py
+@@ -15,6 +15,7 @@ from typing import Any, Mapping, Optional
+ from pypto.compiler.api import CompileOptions
+ from pypto.compiler.artifact import ABI_VERSION, Artifact
+ from pypto.core_ir import CoreProgram
++from pypto.lowering.cpu import canonical_dtype, canonical_operation_name
+ from pypto.lowering.cpu.x86.avx512 import (
+     AVX512_BACKEND,
+     AVX512_LOWERING_VERSION,
+@@ -25,8 +26,13 @@ from pypto.target import TargetSpec
+ from pypto.target._utils import mapping_copy, sha256_bytes, sha256_text
+ 
+ 
+-ARTIFACT_PAYLOAD_VERSION = 1
++# Payload 2 adds the packed parameter-scale native kernels (cast / rank-2
++# transpose / embedding).  Payload 1 artifacts described every one of those
++# operations as host_reference and are rejected by the runtime.
++ARTIFACT_PAYLOAD_VERSION = 2
+ DEFAULT_ARTIFACT_FORMAT = "pypto-x.cpu.avx512"
++#: Native shared-object ABI marker.  ``:3`` adds the packed kernels.
++NATIVE_ABI_MARKER = "pypto-x.cpu.avx512:3"
+ 
+ 
+ _NATIVE_SOURCE = r'''
+@@ -57,7 +63,7 @@ _NATIVE_SOURCE = r'''
+ __attribute__((visibility("default"))) const char *ptx_avx512_variant = PTX_VARIANT;
+ __attribute__((visibility("default"))) const char *ptx_avx512_source_digest = PTX_SOURCE_DIGEST;
+ __attribute__((visibility("default"))) const unsigned int ptx_avx512_feature_mask = PTX_FEATURE_MASK;
+-__attribute__((visibility("default"))) const char *ptx_avx512_abi = "pypto-x.cpu.avx512:2";
++__attribute__((visibility("default"))) const char *ptx_avx512_abi = "pypto-x.cpu.avx512:3";
+ 
+ static inline __m512 ptx_binary_f32(int op, __m512 a, __m512 b) {
+     if (op == 0) return _mm512_add_ps(a, b);
+@@ -436,6 +442,93 @@ void ptx_avx512_matmul_bf16(const uint16_t *left, const uint16_t *right, uint16_
+     }
+ }
+ 
++/* ------------------------------------------------------------------ *
++ * Packed parameter-scale kernels (artifact payload version 2).
++ *
++ * These kernels exist so that parameter-sized tensors (embedding tables,
++ * promoted weights) never pass through a per-element Python list.  They
++ * operate on caller-owned packed buffers and are bit-exact with the
++ * vector-common host reference:
++ *   - f32 -> bf16 uses the same round-to-nearest-even bit rounding as
++ *     pypto.backends.cpu.tensor._round_bf16 / _bf16_bits (non-finite
++ *     values truncate, exactly like the reference),
++ *   - bf16 -> f32 is an exact left shift,
++ *   - transpose is a pure element permutation of one rank-2 matrix,
++ *   - embedding copies whole source rows selected by int64 indices; index
++ *     bounds are validated by the runtime before this call.
++ * ------------------------------------------------------------------ */
++
++__attribute__((visibility("default")))
++void ptx_avx512_cast_f32_bf16(const float *input, uint16_t *output, size_t n) {
++    size_t i = 0;
++    const __m512i bias = _mm512_set1_epi32(0x7fff);
++    const __m512i low_bit = _mm512_set1_epi32(1);
++    const __m512i exponent_mask = _mm512_set1_epi32(0x7f800000);
++    const __m512i exponent_full = _mm512_set1_epi32(0x7f800000);
++    for (; i + 16 <= n; i += 16) {
++        __m512i bits = _mm512_castps_si512(_mm512_loadu_ps(input + i));
++        __mmask16 special = _mm512_cmpeq_epi32_mask(
++            _mm512_and_si512(bits, exponent_mask), exponent_full);
++        __m512i rounding = _mm512_add_epi32(
++            bias, _mm512_and_si512(_mm512_srli_epi32(bits, 16), low_bit));
++        __m512i rounded = _mm512_srli_epi32(_mm512_add_epi32(bits, rounding), 16);
++        __m512i truncated = _mm512_srli_epi32(bits, 16);
++        __m512i selected = _mm512_mask_blend_epi32(special, rounded, truncated);
++        _mm256_storeu_si256((__m256i *)(output + i), _mm512_cvtepi32_epi16(selected));
++    }
++    for (; i < n; ++i) output[i] = ptx_f32_to_bf16(input[i]);
++}
++
++__attribute__((visibility("default")))
++void ptx_avx512_cast_bf16_f32(const uint16_t *input, float *output, size_t n) {
++    size_t i = 0;
++    for (; i + 16 <= n; i += 16) {
++        __m256i packed = _mm256_loadu_si256((const __m256i *)(input + i));
++        __m512i widened = _mm512_cvtepu16_epi32(packed);
++        _mm512_storeu_ps(output + i, _mm512_castsi512_ps(_mm512_slli_epi32(widened, 16)));
++    }
++    for (; i < n; ++i) output[i] = ptx_bf16_to_f32(input[i]);
++}
++
++#define PTX_TRANSPOSE_BLOCK 32
++
++#define PTX_DEFINE_TRANSPOSE(NAME, TYPE)                                        \
++__attribute__((visibility("default")))                                          \
++void NAME(const TYPE *restrict input, TYPE *restrict output,                    \
++          size_t rows, size_t cols) {                                           \
++    size_t row, column, row_block, column_block;                                 \
++    for (row_block = 0; row_block < rows; row_block += PTX_TRANSPOSE_BLOCK) {    \
++        size_t row_end = row_block + PTX_TRANSPOSE_BLOCK;                        \
++        if (row_end > rows) row_end = rows;                                      \
++        for (column_block = 0; column_block < cols; column_block += PTX_TRANSPOSE_BLOCK) { \
++            size_t column_end = column_block + PTX_TRANSPOSE_BLOCK;              \
++            if (column_end > cols) column_end = cols;                            \
++            for (row = row_block; row < row_end; ++row)                          \
++                for (column = column_block; column < column_end; ++column)       \
++                    output[column * rows + row] = input[row * cols + column];    \
++        }                                                                        \
++    }                                                                            \
++}
++
++PTX_DEFINE_TRANSPOSE(ptx_avx512_transpose_f32, float)
++PTX_DEFINE_TRANSPOSE(ptx_avx512_transpose_bf16, uint16_t)
++
++#define PTX_DEFINE_EMBEDDING(NAME, TYPE)                                        \
++__attribute__((visibility("default")))                                          \
++void NAME(const TYPE *restrict table, const int64_t *restrict indices,          \
++          TYPE *restrict output, size_t index_count, size_t row_elements) {      \
++    size_t index, element;                                                       \
++    for (index = 0; index < index_count; ++index) {                              \
++        const TYPE *row = table + (size_t)indices[index] * row_elements;         \
++        TYPE *destination = output + index * row_elements;                       \
++        for (element = 0; element < row_elements; ++element)                     \
++            destination[element] = row[element];                                 \
++    }                                                                            \
++}
++
++PTX_DEFINE_EMBEDDING(ptx_avx512_embedding_f32, float)
++PTX_DEFINE_EMBEDDING(ptx_avx512_embedding_bf16, uint16_t)
++
+ #if PTX_USE_VNNI
+ __attribute__((visibility("default")))
+ void ptx_avx512_vnni_dot_i8(const uint8_t *left, const int8_t *right,
+@@ -551,6 +644,110 @@ def _concat_metadata(target_ir: Avx512Program) -> list:
+     ]
+ 
+ 
++def _core_operations(target_ir: Avx512Program) -> tuple:
++    """Return the entrypoint operations in plan order."""
++
++    for function in target_ir.program.functions:
++        if function.name == target_ir.entrypoint:
++            return tuple(function.body.operations)
++    raise ValueError("AVX-512 entrypoint {!r} is missing from the program".format(target_ir.entrypoint))
++
++
++#: Packed native kernel plane.  The runtime selects kernels with the exact
++#: same predicate that produces this metadata, so an artifact cannot claim a
++#: packed kernel the runtime would not use (or vice versa).
++PACKED_KERNEL_VERSION = 1
++PACKED_CAST_MODE = "native_avx512_packed_cast"
++PACKED_TRANSPOSE_MODE = "native_avx512_packed_transpose"
++PACKED_EMBEDDING_MODE = "native_avx512_packed_embedding"
++_PACKED_DTYPES = frozenset(("float32", "bf16"))
++_PACKED_TENSOR_KINDS = frozenset(("tensor", "view", "tile"))
++
++
++def _packed_suffix(dtype: str) -> str:
++    return "f32" if canonical_dtype(dtype) == "float32" else "bf16"
++
++
++def packed_kernel_contract(operation: Any, plan: Any) -> Optional[dict]:
++    """Describe the packed native kernel for one operation, or ``None``.
++
++    ``None`` means the operation stays on the vector-common host reference.
++    The runtime and the artifact metadata both call this predicate, so a
++    declared kernel and the executed kernel can never disagree.
++    """
++
++    if operation is None or plan is None:
++        return None
++    name = canonical_operation_name(operation.name)
++    if name != plan.operation:
++        return None
++    if name == "cast":
++        if plan.plan_kind != "elementwise":
++            return None
++        if len(operation.inputs) != 1 or len(operation.outputs) != 1:
++            return None
++        source_type = operation.inputs[0].type
++        target_type = operation.outputs[0].type
++        if source_type.kind not in _PACKED_TENSOR_KINDS or target_type.kind not in _PACKED_TENSOR_KINDS:
++            return None
++        source_dtype = canonical_dtype(source_type.dtype)
++        target_dtype = canonical_dtype(target_type.dtype)
++        if source_dtype not in _PACKED_DTYPES or target_dtype not in _PACKED_DTYPES:
++            return None
++        if source_dtype == target_dtype:
++            kernel = "copy_{}".format(_packed_suffix(source_dtype))
++        else:
++            kernel = "cast_{}_{}".format(_packed_suffix(source_dtype), _packed_suffix(target_dtype))
++        return {
++            "mode": PACKED_CAST_MODE,
++            "kernel": kernel,
++            "source_dtype": source_dtype,
++            "target_dtype": target_dtype,
++        }
++    if name == "transpose":
++        layout = plan.layout_plan
++        if layout is None or layout.operation != "transpose" or layout.kind != "transpose":
++            return None
++        if len(layout.input_shape) != 2 or tuple(layout.permutation) != (1, 0):
++            return None
++        if any(layout.slice_starts) or any(step != 1 for step in layout.slice_steps):
++            return None
++        source_dtype = canonical_dtype(operation.inputs[0].type.dtype)
++        target_dtype = canonical_dtype(operation.outputs[0].type.dtype)
++        if source_dtype != target_dtype or source_dtype not in _PACKED_DTYPES:
++            return None
++        return {
++            "mode": PACKED_TRANSPOSE_MODE,
++            "kernel": "transpose_{}".format(_packed_suffix(source_dtype)),
++            "source_dtype": source_dtype,
++            "target_dtype": target_dtype,
++            "rows": int(layout.input_shape[0]),
++            "columns": int(layout.input_shape[1]),
++        }
++    if name == "embedding":
++        indexing = plan.indexing_plan
++        if indexing is None or indexing.operation != "embedding" or indexing.axis != 0:
++            return None
++        if len(indexing.source_shape) != 2:
++            return None
++        source_dtype = canonical_dtype(operation.inputs[0].type.dtype)
++        target_dtype = canonical_dtype(operation.outputs[0].type.dtype)
++        index_dtype = canonical_dtype(operation.inputs[1].type.dtype)
++        if source_dtype != target_dtype or source_dtype not in _PACKED_DTYPES:
++            return None
++        if index_dtype != "int64":
++            return None
++        return {
++            "mode": PACKED_EMBEDDING_MODE,
++            "kernel": "embedding_{}".format(_packed_suffix(source_dtype)),
++            "source_dtype": source_dtype,
++            "target_dtype": target_dtype,
++            "table_rows": int(indexing.source_shape[0]),
++            "row_elements": int(indexing.source_shape[1]),
++        }
++    return None
++
++
+ def _execution_metadata(target_ir: Avx512Program) -> dict:
+     """Describe the immutable AVX-512 native/reference boundary."""
+ 
+@@ -559,10 +756,33 @@ def _execution_metadata(target_ir: Avx512Program) -> dict:
+     math_fallback = []
+     position_operations = []
+     host_operations = []
++    packed_operations = []
++    packed_names = []
++    core_operations = _core_operations(target_ir)
+     for plan in target_ir.plans:
+         name = plan.operation
+         dtype = plan.dtype
+-        if name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++        operation = (
++            core_operations[plan.operation_index]
++            if 0 <= plan.operation_index < len(core_operations)
++            else None
++        )
++        packed = packed_kernel_contract(operation, plan)
++        if packed is not None:
++            mode = packed["mode"]
++            if name not in packed_names:
++                packed_names.append(name)
++            packed_operations.append(
++                {
++                    "operation_index": plan.operation_index,
++                    "operation": name,
++                    "mode": mode,
++                    "kernel": packed["kernel"],
++                    "source_dtype": packed["source_dtype"],
++                    "target_dtype": packed["target_dtype"],
++                }
++            )
++        elif name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
+             mode = "native_scalar_math_lane"
+             if name not in math_fallback:
+                 math_fallback.append(name)
+@@ -589,6 +809,9 @@ def _execution_metadata(target_ir: Avx512Program) -> dict:
+         "native_vector_mode": "zmm+opmask",
+         "avx2_fallback_policy": "explicit_fallback_artifact_only",
+         "scalar_math_lane_fallback": math_fallback,
++        "packed_kernel_version": PACKED_KERNEL_VERSION,
++        "packed_kernel_operations": packed_names,
++        "packed_operations": packed_operations,
+         "host_preexpanded_operations": [
+             name for name in ("broadcast", "where")
+             if any(plan.operation == name for plan in target_ir.plans)
+@@ -609,7 +832,9 @@ def _execution_metadata(target_ir: Avx512Program) -> dict:
+             plan.operation for plan in target_ir.plans
+             if plan.layout_plan is not None and plan.layout_plan.kind == "logical_layout_copy"
+         ],
+-        "native_layout_reorder_operations": [],
++        "native_layout_reorder_operations": sorted(
++            {entry["operation"] for entry in packed_operations if entry["mode"] == PACKED_TRANSPOSE_MODE}
++        ),
+         "batched_matmul_fallback": "host_batch_loop_rank2_native",
+         "batched_matmul_operations": [
+             {
+@@ -956,5 +1181,11 @@ __all__ = [
+     "CPUAVX512Compiler",
+     "CPUAvx512Compiler",
+     "DEFAULT_ARTIFACT_FORMAT",
++    "NATIVE_ABI_MARKER",
++    "PACKED_CAST_MODE",
++    "PACKED_EMBEDDING_MODE",
++    "PACKED_KERNEL_VERSION",
++    "PACKED_TRANSPOSE_MODE",
+     "compile_cpu_avx512",
++    "packed_kernel_contract",
+ ]
+diff --git a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+index 608d26d64..73cb382f3 100644
+--- a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
++++ b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+@@ -262,15 +262,31 @@ class OpRecorder:
+         self.abort_op_bytes = (abort_op_mib * 1024 * 1024) if abort_op_mib else None
+         self.current_mib: Optional[int] = None
+ 
+-    def before_op(self, index: int, name: str, input_bytes: int = 0, output_bytes: int = 0) -> None:
+-        mode = "host_reference" if name in HOST_REFERENCE_OPERATIONS else "native"
+-        if self.abort_op_bytes is not None and mode == "host_reference":
++    def before_op(self, index: int, name: str, input_bytes: int = 0, output_bytes: int = 0,
++                  mode: Optional[str] = None,
++                  python_list_elements: Optional[int] = None) -> None:
++        """在执行前分类本算子并施加 list 物化看门狗。
++
++        ``mode`` 由 runtime 的 ``plan_execution`` 如实给出（含 packed native
++        路径）；runtime 无法描述时（scalar/cuda）才退回按算子名静态分类，并
++        继续使用字节级保守投影。两种情况下 ``host_reference`` 都会按
++        ``max(实际 list 元素数, 输入+输出字节数) * 28 B`` 估算，绝不放宽。
++        """
++
++        if mode is None:
++            mode = "host_reference" if name in HOST_REFERENCE_OPERATIONS else "native"
+             projected = (input_bytes + output_bytes) * LIST_OVERHEAD
++            list_elements = input_bytes + output_bytes
++        else:
++            list_elements = int(python_list_elements or 0)
++            projected = max(list_elements, input_bytes + output_bytes) * LIST_OVERHEAD
++        boundary = _boundary_of(mode)
++        if self.abort_op_bytes is not None and boundary == "host_reference":
+             if projected >= self.abort_op_bytes:
+                 self.stopped_reason = (
+                     "projection guard: op #{} ({}, host_reference) 的输入 {} B + 输出 {} B "
+-                    "在当前 list 物化路径下约需 {} MiB，超过 --abort-op-mib {}".format(
+-                        index, name, input_bytes, output_bytes,
++                    "(list 元素 {}）在当前 list 物化路径下约需 {} MiB，超过 --abort-op-mib {}".format(
++                        index, name, input_bytes, output_bytes, list_elements,
+                         projected // (1024 * 1024), self.abort_op_bytes // (1024 * 1024),
+                     )
+                 )
+@@ -288,17 +304,20 @@ class OpRecorder:
+             raise BudgetExceeded(self.stopped_reason)
+ 
+     def record_op(
+-        self, index: int, name: str, dtype: str, elapsed: float, output_bytes: int, input_bytes: int
++        self, index: int, name: str, dtype: str, elapsed: float, output_bytes: int, input_bytes: int,
++        mode: Optional[str] = None,
+     ) -> None:
+-        mode = "host_reference" if name in HOST_REFERENCE_OPERATIONS else (
+-            "native" if name in NATIVE_OPERATIONS else "unclassified"
+-        )
++        if mode is None:
++            mode = "host_reference" if name in HOST_REFERENCE_OPERATIONS else (
++                "native" if name in NATIVE_OPERATIONS else "unclassified"
++            )
+         self.records.append(
+             {
+                 "index": index,
+                 "operation": name,
+                 "dtype": dtype,
+                 "mode": mode,
++                "boundary": _boundary_of(mode),
+                 "seconds": round(elapsed, 6),
+                 "output_bytes": output_bytes,
+                 "input_bytes": input_bytes,
+@@ -310,6 +329,16 @@ class OpRecorder:
+         )
+ 
+ 
++def _boundary_of(mode: str) -> str:
++    """把如实 mode 归一到 native/host_reference/unclassified 三类。"""
++
++    if mode.startswith("native"):
++        return "native"
++    if mode in ("host_reference", "host_materialize"):
++        return "host_reference"
++    return "unclassified"
++
++
+ class InstrumentedAvx512Runtime(Avx512Runtime):
+     """AVX-512 runtime + 逐算子计时/看门狗；不改变任何算子语义。"""
+ 
+@@ -317,6 +346,7 @@ class InstrumentedAvx512Runtime(Avx512Runtime):
+         super().__init__(*args, **kwargs)
+         self._recorder = recorder
+         self._op_index = 0
++        self.planned_modes: List[str] = []
+ 
+     def _execute_operation(self, operation: Any, plan: Any, environment: Any, module: Any) -> None:
+         recorder = self._recorder
+@@ -327,12 +357,20 @@ class InstrumentedAvx512Runtime(Avx512Runtime):
+         name = str(getattr(plan, "operation", operation.name))
+         out_bytes = sum(_ref_bytes(ref) for ref in operation.outputs)
+         in_bytes = sum(_ref_bytes(ref) for ref in operation.inputs)
+-        recorder.before_op(index, name, in_bytes, out_bytes)
++        # 如实模式来自 runtime 自己的调度决策，而不是算子名静态表。
++        decision = self.plan_execution(operation, plan, environment)
++        self.planned_modes.append(decision["mode"])
++        recorder.before_op(
++            index, name, in_bytes, out_bytes,
++            mode=decision["mode"],
++            python_list_elements=decision["python_list_elements"],
++        )
+         started = time.perf_counter()
+         super()._execute_operation(operation, plan, environment, module)
+         recorder.record_op(
+             index, name, str(getattr(plan, "dtype", "")),
+             time.perf_counter() - started, out_bytes, in_bytes,
++            mode=decision["mode"],
+         )
+ 
+ 
+@@ -1047,18 +1085,24 @@ def summarise_ops(recorder: OpRecorder) -> Mapping[str, Any]:
+     for record in recorder.records:
+         entry = per_class.setdefault(
+             record["operation"],
+-            {"count": 0, "seconds": 0.0, "mode": record.get("mode", "native"), "max_seconds": 0.0},
++            {"count": 0, "seconds": 0.0, "modes": set(), "max_seconds": 0.0},
+         )
+         entry["count"] += 1
+         entry["seconds"] += float(record.get("seconds", 0.0))
++        entry["modes"].add(str(record.get("mode", "native")))
+         entry["max_seconds"] = max(entry["max_seconds"], float(record.get("seconds", 0.0)))
++
++    def _mode_label(modes: Any) -> str:
++        ordered = sorted(modes)
++        return ordered[0] if len(ordered) == 1 else "mixed:" + "+".join(ordered)
++
+     return {
+         "executed_operations": len(recorder.records),
+         "total_seconds": round(sum(float(r.get("seconds", 0.0)) for r in recorder.records), 3),
+         "by_operation": {
+             name: {
+                 "count": entry["count"],
+-                "mode": entry["mode"],
++                "mode": _mode_label(entry["modes"]),
+                 "seconds": round(entry["seconds"], 3),
+                 "max_seconds": round(entry["max_seconds"], 4),
+             }
+@@ -1066,11 +1110,11 @@ def summarise_ops(recorder: OpRecorder) -> Mapping[str, Any]:
+         },
+         "host_reference_seconds": round(
+             sum(float(r.get("seconds", 0.0)) for r in recorder.records
+-                if r.get("mode") == "host_reference"), 3
++                if _boundary_of(str(r.get("mode", ""))) == "host_reference"), 3
+         ),
+         "native_seconds": round(
+             sum(float(r.get("seconds", 0.0)) for r in recorder.records
+-                if r.get("mode") == "native"), 3
++                if _boundary_of(str(r.get("mode", ""))) == "native"), 3
+         ),
+     }
+ 
+diff --git a/python/tests/ut/pypto_x/test_cpu_packed_liveness.py b/python/tests/ut/pypto_x/test_cpu_packed_liveness.py
+new file mode 100644
+index 000000000..232da1126
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cpu_packed_liveness.py
+@@ -0,0 +1,599 @@
++"""Packed parameter-scale kernels and SSA liveness release for the CPU runtimes.
++
++Scope of this file:
++
++* the AVX-512 packed kernels (cast / rank-2 transpose / embedding) must be
++  bit-exact against the vector-common host reference they replace;
++* the packed decision must be reported truthfully, and everything that is not
++  covered must stay on the host reference;
++* the launch loops must release dead SSA buffers after their last use without
++  changing any observable result;
++* payload-1 artifacts (which advertised those operations as host_reference)
++  must fail closed.
++"""
++
++from __future__ import annotations
++
++import math
++import struct
++from pathlib import Path
++
++import pytest
++
++from pypto.abi import LaunchRequest
++from pypto.backends.cpu import CpuScalarRuntime, HostTensor
++from pypto.backends.cpu.x86 import Avx512Runtime, CpuAvx512ArtifactError, CpuAvx512ExecutionError
++from pypto.backends.cpu.x86 import avx2 as avx2_runtime
++from pypto.backends.cpu.ssa_liveness import (
++    last_use_map,
++    pinned_names,
++    plan_release,
++    release_dead_values,
++)
++from pypto.compiler import CompileOptions
++from pypto.compiler.targets.cpu import CpuScalarCompiler
++from pypto.compiler.targets.cpu_avx512 import (
++    PACKED_CAST_MODE,
++    PACKED_EMBEDDING_MODE,
++    PACKED_TRANSPOSE_MODE,
++    Avx512Compiler,
++    packed_kernel_contract,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu.x86.avx512 import lower_avx512
++from pypto.target import TargetSpec
++
++
++AVX512_TARGET = TargetSpec(
++    "cpu", "x86_64-linux-gnu", features=("avx512f",), attributes={"lane_count": 16}
++)
++SCALAR_TARGET = TargetSpec("cpu", "x86_64-linux-gnu")
++
++
++def _runtime():
++    runtime = Avx512Runtime()
++    if not runtime.is_available():
++        pytest.skip("host lacks AVX-512/ZMM capability: {}".format(runtime.availability().to_dict()))
++    return runtime
++
++
++def _program(name, parameters, returns, operations):
++    return CoreProgram(functions=(CoreFunction(name, parameters, returns, Region(tuple(operations))),))
++
++
++def _compile_avx512(program, tmp_path, name="native"):
++    compiler = Avx512Compiler()
++    target_ir = compiler.lower(program, AVX512_TARGET)
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format="pypto-x.cpu.avx512", extra={"build_dir": str(tmp_path / name)}
++        ),
++    )
++    return target_ir, artifact
++
++
++def _compile_scalar(program):
++    compiler = CpuScalarCompiler()
++    return compiler.compile(compiler.lower(program, SCALAR_TARGET))
++
++
++def _launch(artifact, inputs, outputs, runtime=None, scalars=None):
++    (runtime or _runtime()).launch(
++        LaunchRequest(
++            artifact,
++            inputs=[value.descriptor(readonly=True) for value in inputs],
++            outputs=[value.descriptor() for value in outputs],
++            scalars=dict(scalars or {}),
++        )
++    )
++
++
++def _scalar_reference(program, inputs, templates, scalars=None):
++    artifact = _compile_scalar(program)
++    outputs = [HostTensor.zeros(item.dtype, item.shape) for item in templates]
++    _launch(artifact, inputs, outputs, runtime=CpuScalarRuntime(), scalars=scalars)
++    return outputs
++
++
++def _float32_bits(value):
++    return struct.unpack("<I", struct.pack("<f", float(value)))[0]
++
++
++def _bf16_bits(value):
++    bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++    if (bits & 0x7F800000) == 0x7F800000:
++        return (bits >> 16) & 0xFFFF
++    return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) & 0xFFFF
++
++
++def _bit_signature(values, dtype):
++    if dtype == "bf16":
++        return tuple(_bf16_bits(value) for value in values)
++    if dtype == "float32":
++        return tuple(_float32_bits(value) for value in values)
++    raise AssertionError("unsupported signature dtype {!r}".format(dtype))
++
++
++def _cast_program(source_dtype, target_dtype, shape):
++    source = ValueRef("source", CoreType.tensor(source_dtype, shape))
++    output = ValueRef("output", CoreType.tensor(target_dtype, shape))
++    return _program(
++        "cast",
++        (source,),
++        (output,),
++        (Operation("cast", (source,), (output,), {"dtype": target_dtype}),),
++    )
++
++
++def _transpose_program(dtype, shape, permutation=(1, 0)):
++    output_shape = tuple(shape[index] for index in permutation)
++    source = ValueRef("source", CoreType.tensor(dtype, shape))
++    output = ValueRef("output", CoreType.tensor(dtype, output_shape))
++    return _program(
++        "transpose",
++        (source,),
++        (output,),
++        (Operation("transpose", (source,), (output,), {"permutation": list(permutation)}),),
++    )
++
++
++def _embedding_program(dtype, table_shape, index_shape):
++    output_shape = index_shape + table_shape[1:]
++    table = ValueRef("table", CoreType.tensor(dtype, table_shape))
++    indices = ValueRef("indices", CoreType.tensor("int64", index_shape))
++    output = ValueRef("output", CoreType.tensor(dtype, output_shape))
++    return _program(
++        "embedding",
++        (table, indices),
++        (output,),
++        (Operation("embedding", (table, indices), (output,), {"axis": 0}),),
++    )
++
++
++class _RecordingRuntime(Avx512Runtime):
++    """Records the live SSA set before each op plus the planned mode."""
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.live_before = []
++        self.modes = []
++        self.list_elements = []
++
++    def _execute_operation(self, operation, plan, environment, module):
++        decision = self.plan_execution(operation, plan, environment)
++        self.live_before.append(frozenset(environment))
++        self.modes.append(decision["mode"])
++        self.list_elements.append(decision["python_list_elements"])
++        super()._execute_operation(operation, plan, environment, module)
++
++
++# --------------------------------------------------------------------------
++# packed cast
++# --------------------------------------------------------------------------
++
++
++SPECIAL_FLOAT32 = (
++    0.0,
++    -0.0,
++    1.0,
++    -1.0,
++    0.1,
++    -0.1,
++    1.0e-45,
++    -1.0e-45,
++    1.1754943508222875e-38,
++    3.4028234663852886e38,
++    -3.4028234663852886e38,
++    float("inf"),
++    float("-inf"),
++    float("nan"),
++    65504.0,
++    1.0 / 3.0,
++)
++
++
++@pytest.mark.parametrize("size", (1, 15, 16, 17, 33, 257))
++@pytest.mark.parametrize(
++    "source_dtype,target_dtype",
++    (("float32", "bf16"), ("bf16", "float32")),
++)
++def test_packed_cast_is_bit_exact_with_the_scalar_reference(
++    source_dtype, target_dtype, size, tmp_path
++):
++    shape = (size,)
++    values = [SPECIAL_FLOAT32[index % len(SPECIAL_FLOAT32)] for index in range(size)]
++    if source_dtype == "bf16":
++        # bf16 HostTensors store Python floats; the tensor rounds them exactly
++        # like the native buffer writer does.
++        values = [HostTensor("bf16", shape, values).data[index] for index in range(size)]
++    program = _cast_program(source_dtype, target_dtype, shape)
++    _, artifact = _compile_avx512(program, tmp_path, name="{}-{}".format(source_dtype, size))
++    assert artifact.metadata["packed_kernel_operations"] == ("cast",)
++    assert artifact.metadata["packed_operations"][0]["mode"] == PACKED_CAST_MODE
++    runtime = _runtime()
++    source = HostTensor(source_dtype, shape, values)
++    actual = HostTensor.zeros(target_dtype, shape)
++    expected = _scalar_reference(program, [source], [actual])
++    _launch(artifact, [source], [actual], runtime=runtime)
++    assert _bit_signature(actual.data, target_dtype) == _bit_signature(
++        expected[0].data, target_dtype
++    )
++
++
++def test_packed_cast_dispatches_every_float_pair(tmp_path):
++    cases = {
++        ("float32", "bf16"): "cast_f32_bf16",
++        ("bf16", "float32"): "cast_bf16_f32",
++        ("float32", "float32"): "copy_f32",
++        ("bf16", "bf16"): "copy_bf16",
++    }
++    for (source_dtype, target_dtype), kernel in cases.items():
++        program = _cast_program(source_dtype, target_dtype, (10,))
++        target_ir = lower_avx512(program, AVX512_TARGET)
++        contract = packed_kernel_contract(program.functions[0].body.operations[0], target_ir.plans[0])
++        assert contract is not None, (source_dtype, target_dtype)
++        assert contract["kernel"] == kernel
++        assert contract["mode"] == PACKED_CAST_MODE
++
++
++def test_integer_cast_keeps_the_host_reference_boundary(tmp_path):
++    program = _cast_program("int32", "float32", (8,))
++    target_ir, artifact = _compile_avx512(program, tmp_path, name="int-cast")
++    assert artifact.metadata["packed_kernel_operations"] == ()
++    assert artifact.metadata["host_reference_operations"] == ("cast",)
++    contract = packed_kernel_contract(program.functions[0].body.operations[0], target_ir.plans[0])
++    assert contract is None
++
++
++# --------------------------------------------------------------------------
++# packed transpose
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "shape",
++    ((5, 7), (7, 5), (1, 9), (9, 1), (16, 16), (17, 19), (40, 37), (64, 64), (65, 33)),
++)
++@pytest.mark.parametrize("dtype", ("float32", "bf16"))
++def test_packed_rank2_transpose_matches_scalar_reference(dtype, shape, tmp_path):
++    program = _transpose_program(dtype, shape)
++    _, artifact = _compile_avx512(program, tmp_path, name="transpose-{}-{}".format(dtype, shape[0]))
++    assert artifact.metadata["packed_kernel_operations"] == ("transpose",)
++    assert artifact.metadata["packed_operations"][0]["mode"] == PACKED_TRANSPOSE_MODE
++    count = shape[0] * shape[1]
++    values = [((index % 23) - 11) * 0.25 for index in range(count)]
++    source = HostTensor(dtype, shape, values)
++    output_shape = (shape[1], shape[0])
++    actual = HostTensor.zeros(dtype, output_shape)
++    expected = _scalar_reference(program, [source], [actual])
++    _launch(artifact, [source], [actual], runtime=_runtime())
++    assert actual.data == expected[0].data
++
++
++def test_rank3_transpose_stays_on_the_host_reference(tmp_path):
++    program = _transpose_program("float32", (2, 3, 4), permutation=(0, 2, 1))
++    target_ir, artifact = _compile_avx512(program, tmp_path, name="rank3")
++    assert artifact.metadata["packed_kernel_operations"] == ()
++    assert artifact.metadata["host_reference_operations"] == ("transpose",)
++    contract = packed_kernel_contract(program.functions[0].body.operations[0], target_ir.plans[0])
++    assert contract is None
++    values = [float(index) for index in range(24)]
++    source = HostTensor("float32", (2, 3, 4), values)
++    actual = HostTensor.zeros("float32", (2, 4, 3))
++    expected = _scalar_reference(program, [source], [actual])
++    _launch(artifact, [source], [actual], runtime=_runtime())
++    assert actual.data == expected[0].data
++
++
++# --------------------------------------------------------------------------
++# packed embedding
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("dtype", ("bf16", "float32"))
++def test_packed_embedding_gathers_rows(dtype, tmp_path):
++    table_shape = (7, 5)
++    program = _embedding_program(dtype, table_shape, (4,))
++    _, artifact = _compile_avx512(program, tmp_path, name="embedding-{}".format(dtype))
++    assert artifact.metadata["packed_kernel_operations"] == ("embedding",)
++    assert artifact.metadata["packed_operations"][0]["mode"] == PACKED_EMBEDDING_MODE
++    table = HostTensor(dtype, table_shape, [0.5 + index for index in range(35)])
++    indices = HostTensor("int64", (4,), [3, 0, 6, 3])
++    actual = HostTensor.zeros(dtype, (4, 5))
++    expected = _scalar_reference(program, [table, indices], [actual])
++    _launch(artifact, [table, indices], [actual], runtime=_runtime())
++    assert actual.data == expected[0].data
++
++
++def test_packed_embedding_reads_only_the_selected_rows(tmp_path):
++    """A huge table must never be expanded into Python objects."""
++
++    table_shape = (1 << 16, 1 << 6)
++    program = _embedding_program("bf16", table_shape, (3,))
++    _, artifact = _compile_avx512(program, tmp_path, name="embedding-large")
++    assert artifact.metadata["packed_operations"][0]["mode"] == PACKED_EMBEDDING_MODE
++    table = HostTensor("bf16", table_shape, [0.0] * (table_shape[0] * table_shape[1]))
++    table.data[5 * table_shape[1]] = 1.5
++    table.data[9 * table_shape[1] + 3] = -2.25
++    indices = HostTensor("int64", (3,), [9, 5, 9])
++    actual = HostTensor.zeros("bf16", (3, table_shape[1]))
++    recorder = _RecordingRuntime()
++    _launch(artifact, [table, indices], [actual], runtime=recorder)
++    assert recorder.modes == [PACKED_EMBEDDING_MODE]
++    assert recorder.list_elements == [0]
++    assert actual.data[0] == actual.data[2 * table_shape[1]]
++    assert float(actual.data[3]) == pytest.approx(-2.25)
++    assert float(actual.data[table_shape[1]]) == pytest.approx(1.5)
++
++
++@pytest.mark.parametrize("index", (-1, 7, 1 << 20))
++def test_packed_embedding_rejects_out_of_range_indices(index, tmp_path):
++    program = _embedding_program("bf16", (7, 5), (2,))
++    _, artifact = _compile_avx512(program, tmp_path, name="embedding-bad-{}".format(index))
++    table = HostTensor("bf16", (7, 5), [0.5] * 35)
++    indices = HostTensor("int64", (2,), [0, index])
++    output = HostTensor.zeros("bf16", (2, 5))
++    with pytest.raises(CpuAvx512ExecutionError, match="outside axis 0 length 7"):
++        _launch(artifact, [table, indices], [output], runtime=_runtime())
++
++
++def test_non_int64_embedding_indices_stay_on_the_host_reference(tmp_path):
++    table = ValueRef("table", CoreType.tensor("bf16", (7, 5)))
++    indices = ValueRef("indices", CoreType.tensor("int32", (2,)))
++    output = ValueRef("output", CoreType.tensor("bf16", (2, 5)))
++    program = _program(
++        "embedding",
++        (table, indices),
++        (output,),
++        (Operation("embedding", (table, indices), (output,), {"axis": 0}),),
++    )
++    target_ir, artifact = _compile_avx512(program, tmp_path, name="embedding-int32")
++    assert artifact.metadata["packed_kernel_operations"] == ()
++    assert artifact.metadata["host_reference_operations"] == ("embedding",)
++    contract = packed_kernel_contract(program.functions[0].body.operations[0], target_ir.plans[0])
++    assert contract is None
++
++
++# --------------------------------------------------------------------------
++# liveness
++# --------------------------------------------------------------------------
++
++
++def _chain_program():
++    """a,b,c,d -> t0 -> (t1, t2) -> out, plus one value that dies immediately."""
++
++    value_type = CoreType.tensor("float32", (4,))
++    a = ValueRef("a", value_type)
++    b = ValueRef("b", value_type)
++    c = ValueRef("c", value_type)
++    d = ValueRef("d", value_type)
++    t0 = ValueRef("t0", value_type)
++    t1 = ValueRef("t1", value_type)
++    t2 = ValueRef("t2", value_type)
++    dead = ValueRef("dead", value_type)
++    out = ValueRef("out", value_type)
++    operations = (
++        Operation("add", (a, b), (t0,)),
++        Operation("mul", (t0, c), (t1,)),
++        Operation("add", (t0, d), (t2,)),
++        Operation("neg", (c,), (dead,)),
++        Operation("add", (t1, t2), (out,)),
++    )
++    return _program("chain", (a, b, c, d), (out,), operations)
++
++
++def test_liveness_releases_values_after_their_last_use():
++    program = _chain_program()
++    function = program.functions[0]
++    last_use, pinned = plan_release(function)
++    assert last_use == {"a": 0, "b": 0, "c": 3, "t0": 2, "d": 2, "t1": 4, "t2": 4}
++    assert pinned == frozenset(("a", "b", "c", "d", "out"))
++
++    environment = {"a": 1, "b": 2, "c": 3, "d": 4}
++    released = []
++    for index, operation in enumerate(function.body.operations):
++        for ref in operation.outputs:
++            environment[ref.name] = "value:{}".format(ref.name)
++        released.append(
++            release_dead_values(
++                environment,
++                last_use,
++                pinned,
++                index,
++                [ref.name for ref in operation.inputs],
++                [ref.name for ref in operation.outputs],
++            )
++        )
++    # t0 dies at its last consumer (op 2); ``dead`` is never consumed; t1/t2 die
++    # at the final add; every parameter stays alive for the whole launch.
++    assert released == [(), (), ("t0",), ("dead",), ("t1", "t2")]
++    assert set(environment) == {"a", "b", "c", "d", "out"}
++
++
++def test_liveness_keeps_parameters_and_returns_alive():
++    program = _chain_program()
++    function = program.functions[0]
++    last_use, pinned = plan_release(function)
++    environment = {"a": 1, "b": 2, "c": 3, "d": 4, "t0": 5, "dead": 6}
++    assert release_dead_values(environment, last_use, pinned, 0, ["a", "b"], ["t0"]) == ()
++    assert "a" in environment and "b" in environment
++    # ``dead`` was never consumed and is not returned: it is released at once.
++    assert release_dead_values(environment, last_use, pinned, 3, ["c"], ["dead"]) == ("dead",)
++    assert "dead" not in environment
++
++
++def test_liveness_launch_matches_the_scalar_reference(tmp_path):
++    program = _chain_program()
++    _, artifact = _compile_avx512(program, tmp_path, name="chain")
++    inputs = [
++        HostTensor("float32", (4,), [float(index + 1) for index in range(4)]),
++        HostTensor("float32", (4,), [0.5] * 4),
++        HostTensor("float32", (4,), [2.0] * 4),
++        HostTensor("float32", (4,), [1.25] * 4),
++    ]
++    actual = HostTensor.zeros("float32", (4,))
++    recorder = _RecordingRuntime()
++    expected = _scalar_reference(program, inputs, [actual])
++    _launch(artifact, inputs, [actual], runtime=recorder)
++    assert actual.data == expected[0].data
++    live = recorder.live_before
++    assert live[0] == frozenset(("a", "b", "c", "d"))
++    assert live[1] == frozenset(("a", "b", "c", "d", "t0"))
++    assert "t0" in live[2]
++    assert "t0" not in live[4]
++    assert "t1" in live[4] and "t2" in live[4]
++    assert "dead" not in live[4]
++
++
++def test_liveness_analysis_is_deterministic_and_read_only():
++    program = _chain_program()
++    function = program.functions[0]
++    assert last_use_map(function) == last_use_map(function)
++    assert pinned_names(function) == frozenset(("a", "b", "c", "d", "out"))
++    environment = {"x": 1}
++    assert release_dead_values(environment, {"x": 0}, frozenset(), 0, ["x"], []) == ("x",)
++    assert environment == {}
++
++
++def test_liveness_of_a_wrong_plan_does_not_release_the_return(tmp_path):
++    """A returned parameter must survive even when it is never consumed."""
++
++    value_type = CoreType.tensor("float32", (4,))
++    a = ValueRef("a", value_type)
++    out = ValueRef("out", value_type)
++    program = _program(
++        "passthrough",
++        (a,),
++        (out,),
++        (Operation("identity", (a,), (out,)),),
++    )
++    _, artifact = _compile_avx512(program, tmp_path, name="passthrough")
++    source = HostTensor("float32", (4,), [1.5, -2.5, 3.5, -4.5])
++    actual = HostTensor.zeros("float32", (4,))
++    _launch(artifact, [source], [actual], runtime=_runtime())
++    assert actual.data == source.data
++
++
++# --------------------------------------------------------------------------
++# packed bookkeeping / fail-closed
++# --------------------------------------------------------------------------
++
++
++def test_buffer_alloc_has_no_python_element_list():
++    buffer = avx2_runtime._buffer_alloc("float32", 4096, "test")
++    assert buffer.count == 4096
++    assert buffer.dtype == "float32"
++    assert buffer.pointer[0] == 0.0 and buffer.pointer[4095] == 0.0
++    empty = avx2_runtime._buffer_alloc("bf16", 0, "test")
++    assert empty.count == 0
++    with pytest.raises(Exception, match="non-negative integer"):
++        avx2_runtime._buffer_alloc("float32", -1, "test")
++
++
++def test_payload_one_metadata_fails_closed(tmp_path):
++    program = _cast_program("bf16", "float32", (10,))
++    _, artifact = _compile_avx512(program, tmp_path, name="payload")
++    runtime = _runtime()
++    original = dict(artifact.metadata)
++
++    def _tampered(**updates):
++        metadata = dict(original)
++        for key, value in updates.items():
++            if value is None:
++                metadata.pop(key, None)
++            else:
++                metadata[key] = value
++        return metadata
++
++    object.__setattr__(artifact, "metadata", _tampered(artifact_payload_version=1))
++    with pytest.raises(CpuAvx512ArtifactError, match="payload version"):
++        runtime.load(artifact)
++
++    object.__setattr__(artifact, "metadata", _tampered(lowering_version=1))
++    with pytest.raises(CpuAvx512ArtifactError, match="lowering version"):
++        runtime.load(artifact)
++
++    object.__setattr__(artifact, "metadata", _tampered(packed_kernel_version=None))
++    with pytest.raises(CpuAvx512ArtifactError, match="packed_kernel_version"):
++        runtime.load(artifact)
++
++    object.__setattr__(artifact, "metadata", _tampered(packed_operations=[]))
++    with pytest.raises(CpuAvx512ArtifactError, match="packed_operations"):
++        runtime.load(artifact)
++
++    object.__setattr__(artifact, "metadata", _tampered(host_reference_operations=["cast"]))
++    with pytest.raises(CpuAvx512ArtifactError, match="host_reference_operations"):
++        runtime.load(artifact)
++
++    object.__setattr__(artifact, "metadata", original)
++
++
++def test_packed_metadata_records_the_exact_kernel_plane(tmp_path):
++    program = _cast_program("bf16", "float32", (10,))
++    _, artifact = _compile_avx512(program, tmp_path, name="plane")
++    metadata = artifact.metadata
++    assert metadata["packed_kernel_version"] == 1
++    assert metadata["packed_kernel_operations"] == ("cast",)
++    entry = dict(metadata["packed_operations"][0])
++    assert entry == {
++        "operation_index": 0,
++        "operation": "cast",
++        "mode": PACKED_CAST_MODE,
++        "kernel": "cast_bf16_f32",
++        "source_dtype": "bf16",
++        "target_dtype": "float32",
++    }
++    assert metadata["host_reference_operations"] == ()
++
++
++def test_plan_execution_reports_list_materialization(tmp_path):
++    program = _transpose_program("float32", (2, 3, 4), permutation=(0, 2, 1))
++    _, artifact = _compile_avx512(program, tmp_path, name="plan-mode")
++    recorder = _RecordingRuntime()
++    source = HostTensor("float32", (2, 3, 4), [float(index) for index in range(24)])
++    output = HostTensor.zeros("float32", (2, 4, 3))
++    _launch(artifact, [source], [output], runtime=recorder)
++    assert recorder.modes == ["host_reference"]
++    assert recorder.list_elements == [24 + 24]
++
++
++def test_packed_transpose_rejects_a_mismatched_descriptor(tmp_path):
++    program = _transpose_program("float32", (4, 4))
++    target_ir, artifact = _compile_avx512(program, tmp_path, name="bad-descriptor")
++    runtime = _runtime()
++    loaded = runtime.load(artifact)
++    operation = program.functions[0].body.operations[0]
++    buffer = avx2_runtime._buffer_from_values("float32", [1.0] * 16, "source")
++    value = avx2_runtime._RuntimeValue(CoreType.tensor("float32", (4, 4)), buffer)
++    with pytest.raises(CpuAvx512ArtifactError, match="descriptor is invalid"):
++        runtime._execute_packed(
++            {
++                "packed": {
++                    "mode": PACKED_TRANSPOSE_MODE,
++                    "kernel": "transpose_f32",
++                    "rows": 3,
++                    "columns": 5,
++                },
++                "inputs": (value,),
++            },
++            operation,
++            target_ir.plans[0],
++            loaded.module,
++        )
++
++
++def test_liveness_helper_rejects_a_function_without_operations():
++    class _Broken:
++        body = object()
++
++    with pytest.raises(Exception, match="no operation list"):
++        last_use_map(_Broken())
++
++
++def test_bf16_signature_helper_matches_the_reference_rounding():
++    # Guard the test oracle itself against a silent change of rounding mode.
++    assert _bf16_bits(1.0) == 0x3F80
++    assert _bf16_bits(float("nan")) == 0x7FC0
++    assert _bf16_bits(float("inf")) == 0x7F80
++    assert math.isinf(struct.unpack("<f", struct.pack("<I", _bf16_bits(3.4028234663852886e38) << 16))[0])
+diff --git a/python/tests/ut/pypto_x/test_qwen35_avx512_parity.py b/python/tests/ut/pypto_x/test_qwen35_avx512_parity.py
+index 6cc5ed8ae..beff52325 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_avx512_parity.py
++++ b/python/tests/ut/pypto_x/test_qwen35_avx512_parity.py
+@@ -311,7 +311,12 @@ def test_avx512_compare_iota_cast_and_bad_index_boundaries(tmp_path):
+     _launch(avx_cast, [cast_values], [actual_cast], runtime=runtime)
+     _launch(scalar_cast, [cast_values], [expected_cast], runtime=CpuScalarRuntime())
+     assert actual_cast.flat() == expected_cast.flat()
+-    assert avx_cast.metadata["host_reference_operations"] == ("cast",)
++    # Payload 2: a whole-tensor bf16->f32 cast is a packed native kernel, so it
++    # must no longer be advertised as a host-reference list materialization.
++    assert avx_cast.metadata["host_reference_operations"] == ()
++    assert avx_cast.metadata["packed_kernel_operations"] == ("cast",)
++    assert avx_cast.metadata["packed_operations"][0]["mode"] == "native_avx512_packed_cast"
++    assert avx_cast.metadata["packed_operations"][0]["kernel"] == "cast_bf16_f32"
+ 
+     iota_type = CoreType.tensor("int64", (2, 17))
+     iota_output = ValueRef("output", iota_type)

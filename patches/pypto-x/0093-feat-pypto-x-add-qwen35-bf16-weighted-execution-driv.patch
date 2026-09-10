@@ -1,0 +1,2190 @@
+From 37b76b929e0f40f68a267d6aeb967ffee4fdd6bc Mon Sep 17 00:00:00 2001
+From: pypto-x-agent <agent@pypto-x.local>
+Date: Thu, 10 Sep 2026 16:45:36 +0800
+Subject: [PATCH 93/96] feat(pypto-x): add qwen35 bf16 weighted execution
+ driver and evidence audit
+
+Driver (stages preflight/boundary-audit/s1/s2/s3/s4) binds the real
+Qwen3.5-0.8B checkpoint through build_weight_mapping/build_weight_layout
+(zero-copy mmap for the 284 conforming parameters, RNE materialization for
+the 36 F32->BF16 regions), compiles the 6,710-plan model-profile T=5 graph
+for AVX-512, and records per-operation timings, native/host_reference
+boundaries, a real cgroup watchdog and an explicit --abort-op-mib guard.
+
+S1 evidence: the pipeline compiles (lower 1.5 s, 6,710 plans) but the real
+shape cannot execute -- op #4 (embedding) alone would materialize ~13.6 GiB
+of Python lists because the AVX-512 host_reference path converts whole
+tensors with _buffer_values/_buffer_from_values (avx2.py:366, avx512.py:265)
+and launch keeps every SSA buffer alive (avx512.py:962). Retained-everything
+peak is 7,660 MiB against the 8,192 MiB cgroup cap; the measured reference
+throughput (6.58 MB/s, real AVX-512 artifact) projects 28.6 minutes for the
+11.3 GB host_reference byte flow.
+
+The evidence assembly script turns the raw step artifacts into
+validation.json and copies the resource logs; no contract, Core IR or
+artifact-version change is involved.
+---
+ python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py   | 1835 +++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/qwen35_weighted_execution_evidence.py |  313 +++++
+ 2 files changed, 2148 insertions(+)
+
+diff --git a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+new file mode 100644
+index 000000000..608d26d64
+--- /dev/null
++++ b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+@@ -0,0 +1,1835 @@
++"""Qwen3.5-0.8B BF16 带权整网执行 driver（S1–S4，可审计）。
++
++本 driver 只读真实权重（mmap 零拷贝），不复制、不重写 checkpoint；所有重活
++必须经 ``scripts/resource/run_local_heavy.sh``（见
++``docs/LOCAL_RESOURCE_POLICY.zh-CN.md``）。
++
++stage
++-----
++``preflight``
++    只做元数据与数学审计，不执行图：graph/schema/packed layout 规模、逐算子
++    元素流量、host-reference 边界、峰值内存模型、权重映射
++    （``build_weight_mapping``/``build_weight_layout``）与 RoPE 独立复算。
++``s1``
++    真实形状 + **合成**参数（不读 checkpoint）的编译/执行预演，逐算子类计时
++    与 native/host_reference 分布；结论只用于管线可跑性与时间量级。
++``s2``
++    真实权重 prefill（T=steps, past=0），与 gold ``prefill_logits`` /
++    ``last_hidden_state`` 对齐，报 dtype 误差带。
++``s3``
++    真实权重 decode：每步用 ``past_length=T+k`` 重建图，上一步 48 个 state
++    输出按前缀回灌，greedy 选下一步 token，与 gold ``decode_logits`` /
++    ``decode_token_ids`` 对比。
++``s4``
++    发散定位：把整网执行边界（embedding/final hidden）与 gold
++    ``hidden_states_layers`` 对齐；执行未跑通时给出精确阻塞点。
++
++用法示例（必须经 heavy runner）::
++
++    scripts/resource/run_local_heavy.sh --task qwen35-bf16-weighted-execution \\
++      --agent qwen35-bf16-weighted-execution --memory-max-mib 8192 -- \\
++      env PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=python python3 \\
++      python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py \\
++      --stage s1 --backend avx512 --steps 5 --output <evidence>/s1.json
++
++证据写 ``--output``；逐算子进度写 ``--progress``（逐行 flush，被 OOM 杀掉后
++仍能读到最后一个算子）。
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import math
++import os
++import re
++import resource
++import struct
++import sys
++import time
++from pathlib import Path
++from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
++
++from pypto.abi import LaunchRequest, TensorDesc
++from pypto.backends.cpu import CpuScalarRuntime
++from pypto.backends.cpu.x86 import Avx2Runtime, Avx512Runtime
++from pypto.compiler.targets.cpu import CpuScalarCompiler
++from pypto.compiler.targets.cpu_avx2 import Avx2Compiler
++from pypto.compiler.targets.cpu_avx512 import Avx512Compiler
++from pypto.portable.qwen35 import build_qwen35_text_decoder_graph
++from pypto.portable.qwen35_weight_layout import (
++    audit_precision_boundary,
++    build_weight_layout,
++    convert_region_bytes,
++)
++from pypto.portable.qwen35_weight_map import (
++    build_weight_mapping,
++    tie_word_embeddings_from_config,
++)
++from pypto.portable.runtime_binding import (
++    BufferBinding,
++    assemble_launch_request,
++    build_binding_schema,
++    build_packed_layout,
++)
++from pypto.portable.safetensors_reader import SafetensorsReader
++from pypto.target import TargetSpec
++
++try:  # numpy 只用于 gold 比较；执行路径本身不依赖它
++    import numpy as _np  # noqa: F401
++
++    HAS_NUMPY = True
++except Exception:  # pragma: no cover - 远端执行机可能没有 numpy
++    HAS_NUMPY = False
++
++DRIVER_VERSION = 1
++CHECKPOINT_NAME = "model.safetensors-00001-of-00001.safetensors"
++PROMPTS = ("en_continuation", "zh_continuation", "chat_zh_user")
++PROMPT_STEPS = {"en_continuation": 5, "zh_continuation": 8, "chat_zh_user": 18}
++DTYPE_BYTES = {"bf16": 2, "float32": 4, "float64": 8, "int64": 8, "int32": 4, "bool": 1}
++CANARY = 0xCD
++FILL_CHUNK = 1 << 20
++
++#: CPU vector 后端把哪些算子留在 host reference（与 compiler metadata 对齐）。
++HOST_REFERENCE_OPERATIONS = frozenset(
++    {
++        "cast", "transpose", "reshape", "slice", "split", "concat", "gather",
++        "embedding", "broadcast", "where", "compare", "iota",
++    }
++)
++NATIVE_OPERATIONS = frozenset(
++    {
++        "identity", "add", "sub", "mul", "div", "neg",
++        "reduce_sum", "reduce_max", "reduce_mean", "matmul",
++        "exp", "rsqrt", "sigmoid", "silu", "softplus",
++    }
++)
++#: Python list 每元素量级（对象头 + 指针）。
++LIST_OVERHEAD = 28
++STATE_PATTERNS = (
++    (re.compile(r"^(layer_\d+)_conv_state_in$"), "{}_causal_conv_new_state"),
++    (re.compile(r"^(layer_\d+)_recurrent_state_in$"), None),
++    (re.compile(r"^(layer_\d+)_prior_k$"), "{}_new_k"),
++    (re.compile(r"^(layer_\d+)_prior_v$"), "{}_new_v"),
++)
++
++
++class DriverError(RuntimeError):
++    """driver 自身契约失败。"""
++
++
++class BudgetExceeded(DriverError):
++    """watchdog 主动中止：实时 cgroup 用量已逼近预算。"""
++
++
++# --------------------------------------------------------------------------
++# 基础设施
++# --------------------------------------------------------------------------
++
++
++def _maxrss_mib() -> int:
++    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) // 1024
++
++
++def _cgroup_mib(name: str) -> Optional[int]:
++    for candidate in ("/sys/fs/cgroup{}".format(name), "/sys/fs/cgroup/memory{}".format(name)):
++        try:
++            with open(candidate, "r", encoding="utf-8") as stream:
++                raw = stream.read().strip()
++        except OSError:
++            continue
++        if raw == "max":
++            return None
++        try:
++            return int(raw) // (1024 * 1024)
++        except ValueError:
++            continue
++    return None
++
++
++def _element_count(shape: Sequence[int]) -> int:
++    total = 1
++    for dimension in shape:
++        total *= int(dimension)
++    return total
++
++
++def _ref_bytes(ref: Any) -> int:
++    dtype = str(getattr(ref.type, "dtype", "")).lower()
++    shape = getattr(ref.type, "shape", None) or ()
++    if not all(isinstance(d, int) for d in shape):
++        return 0
++    return _element_count(shape) * DTYPE_BYTES.get(dtype, 0)
++
++
++def _bf16_bits(value: float) -> int:
++    bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++    if (bits & 0x7F800000) == 0x7F800000:
++        high = bits >> 16
++        return (high | 0x0040) & 0xFFFF if bits & 0x007FFFFF else high
++    return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) & 0xFFFF
++
++
++def _bf16_value(bits: int) -> float:
++    return struct.unpack("<f", struct.pack("<I", (int(bits) & 0xFFFF) << 16))[0]
++
++
++def bf16_argmax(raw: bytes, count: int) -> int:
++    """纯 Python bf16 argmax（不依赖 numpy，供远端执行机使用）。"""
++
++    bits = struct.unpack_from("<{}H".format(count), raw, 0)
++    best_index = 0
++    best_value = _bf16_value(bits[0]) if count else 0.0
++    for index in range(1, count):
++        value = _bf16_value(bits[index])
++        if value > best_value:
++            best_value = value
++            best_index = index
++    return best_index
++
++
++def _sha256_file(path: Path, chunk: int = 8 << 20) -> str:
++    digest = hashlib.sha256()
++    with open(str(path), "rb") as stream:
++        while True:
++            block = stream.read(chunk)
++            if not block:
++                break
++            digest.update(block)
++    return digest.hexdigest()
++
++
++def _as_float32(raw: bytes) -> Any:
++    """把契约 dtype 的原始字节转成 float32 numpy 数组（不复制语义）。"""
++
++    import numpy as np
++
++    return np.frombuffer(raw, dtype=np.float32)
++
++
++def _raw_to_float_array(raw: bytes, dtype: str) -> Any:
++    import numpy as np
++
++    if dtype == "bf16":
++        bits = np.frombuffer(raw, dtype="<u2").astype(np.uint32)
++        return (bits << 16).view(np.float32)
++    if dtype == "float32":
++        return np.frombuffer(raw, dtype="<f4")
++    if dtype == "int64":
++        return np.frombuffer(raw, dtype="<i8").astype(np.float64)
++    if dtype == "int32":
++        return np.frombuffer(raw, dtype="<i4").astype(np.float64)
++    raise DriverError("unsupported comparison dtype {!r}".format(dtype))
++
++
++class Progress:
++    """逐行 flush 的进度日志；进程被 SIGKILL 后仍保留最后一条。"""
++
++    def __init__(self, path: Optional[str]) -> None:
++        self._path = path
++        self._stream = open(path, "a", encoding="utf-8", buffering=1) if path else None
++        self.entries: List[Mapping[str, Any]] = []
++
++    def emit(self, kind: str, **fields: Any) -> None:
++        record = {"kind": kind, "t": round(time.time(), 3)}
++        record.update(fields)
++        if kind == "op":
++            record["rss_mib"] = _maxrss_mib()
++            record["cgroup_mib"] = _cgroup_mib("/memory.current")
++        self.entries.append(record)
++        if self._stream is not None:
++            self._stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
++            self._stream.flush()
++
++    def close(self) -> None:
++        if self._stream is not None:
++            self._stream.close()
++            self._stream = None
++
++
++class OpRecorder:
++    """逐算子计时 + native/host_reference 分类 + 实时预算看门狗。"""
++
++    def __init__(self, progress: Progress, budget_mib: Optional[int], watchdog: bool,
++                 abort_op_mib: Optional[int] = None) -> None:
++        self.progress = progress
++        self.budget_mib = budget_mib
++        self.watchdog = watchdog
++        self.records: List[Mapping[str, Any]] = []
++        self.stopped_reason: Optional[str] = None
++        self.abort_at_mib = int(budget_mib * 0.92) if (watchdog and budget_mib) else None
++        self.abort_op_bytes = (abort_op_mib * 1024 * 1024) if abort_op_mib else None
++        self.current_mib: Optional[int] = None
++
++    def before_op(self, index: int, name: str, input_bytes: int = 0, output_bytes: int = 0) -> None:
++        mode = "host_reference" if name in HOST_REFERENCE_OPERATIONS else "native"
++        if self.abort_op_bytes is not None and mode == "host_reference":
++            projected = (input_bytes + output_bytes) * LIST_OVERHEAD
++            if projected >= self.abort_op_bytes:
++                self.stopped_reason = (
++                    "projection guard: op #{} ({}, host_reference) 的输入 {} B + 输出 {} B "
++                    "在当前 list 物化路径下约需 {} MiB，超过 --abort-op-mib {}".format(
++                        index, name, input_bytes, output_bytes,
++                        projected // (1024 * 1024), self.abort_op_bytes // (1024 * 1024),
++                    )
++                )
++                raise BudgetExceeded(self.stopped_reason)
++        if self.abort_at_mib is None:
++            return
++        current = _cgroup_mib("/memory.current")
++        self.current_mib = current
++        if current is not None and current >= self.abort_at_mib:
++            self.stopped_reason = (
++                "watchdog: cgroup memory.current {} MiB >= {} MiB before op #{} ({})".format(
++                    current, self.abort_at_mib, index, name
++                )
++            )
++            raise BudgetExceeded(self.stopped_reason)
++
++    def record_op(
++        self, index: int, name: str, dtype: str, elapsed: float, output_bytes: int, input_bytes: int
++    ) -> None:
++        mode = "host_reference" if name in HOST_REFERENCE_OPERATIONS else (
++            "native" if name in NATIVE_OPERATIONS else "unclassified"
++        )
++        self.records.append(
++            {
++                "index": index,
++                "operation": name,
++                "dtype": dtype,
++                "mode": mode,
++                "seconds": round(elapsed, 6),
++                "output_bytes": output_bytes,
++                "input_bytes": input_bytes,
++            }
++        )
++        self.progress.emit(
++            "op", index=index, operation=name, dtype=dtype, mode=mode,
++            seconds=round(elapsed, 5), out_bytes=output_bytes,
++        )
++
++
++class InstrumentedAvx512Runtime(Avx512Runtime):
++    """AVX-512 runtime + 逐算子计时/看门狗；不改变任何算子语义。"""
++
++    def __init__(self, *args: Any, recorder: Optional[OpRecorder] = None, **kwargs: Any) -> None:
++        super().__init__(*args, **kwargs)
++        self._recorder = recorder
++        self._op_index = 0
++
++    def _execute_operation(self, operation: Any, plan: Any, environment: Any, module: Any) -> None:
++        recorder = self._recorder
++        if recorder is None:
++            return super()._execute_operation(operation, plan, environment, module)
++        index = self._op_index
++        self._op_index += 1
++        name = str(getattr(plan, "operation", operation.name))
++        out_bytes = sum(_ref_bytes(ref) for ref in operation.outputs)
++        in_bytes = sum(_ref_bytes(ref) for ref in operation.inputs)
++        recorder.before_op(index, name, in_bytes, out_bytes)
++        started = time.perf_counter()
++        super()._execute_operation(operation, plan, environment, module)
++        recorder.record_op(
++            index, name, str(getattr(plan, "dtype", "")),
++            time.perf_counter() - started, out_bytes, in_bytes,
++        )
++
++
++class TimedCudaDriver:
++    """CUDA driver 代理：按 launch 顺序记录每个 kernel 的时间。"""
++
++    def __init__(self, driver: Any, recorder: OpRecorder) -> None:
++        object.__setattr__(self, "_driver", driver)
++        object.__setattr__(self, "_recorder", recorder)
++        object.__setattr__(self, "_index", 0)
++
++    def launch_kernel(self, handle: Any, grid: Any, block: Any, parameters: Any,
++                      stream: Any, dynamic: Any) -> Any:
++        recorder = object.__getattribute__(self, "_recorder")
++        index = object.__getattribute__(self, "_index")
++        object.__setattr__(self, "_index", index + 1)
++        recorder.before_op(index, "cuda_op{}".format(index))
++        started = time.perf_counter()
++        result = object.__getattribute__(self, "_driver").launch_kernel(
++            handle, grid, block, parameters, stream, dynamic
++        )
++        recorder.records.append(
++            {
++                "index": index,
++                "operation": "cuda_kernel",
++                "mode": "native",
++                "seconds": round(time.perf_counter() - started, 6),
++            }
++        )
++        return result
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(object.__getattribute__(self, "_driver"), name)
++
++    def __setattr__(self, name: str, value: Any) -> None:
++        setattr(object.__getattribute__(self, "_driver"), name, value)
++
++
++# --------------------------------------------------------------------------
++# 图 / schema / layout / 内存模型
++# --------------------------------------------------------------------------
++
++
++def build_graph(steps: int, past_length: int, shape_profile: str = "model"):
++    program = build_qwen35_text_decoder_graph(
++        1, steps, past_length=past_length, shape_profile=shape_profile
++    )
++    schema = build_binding_schema(program)
++    layout = build_packed_layout(schema)
++    return program, schema, layout
++
++
++def graph_census(program: Any, schema: Any, layout: Any) -> Mapping[str, Any]:
++    function = program.functions[0]
++    per_op: Dict[str, Dict[str, Any]] = {}
++    by_dtype_out: Dict[str, int] = {}
++    total_out = 0
++    for operation in function.body.operations:
++        name = str(operation.name)
++        entry = per_op.setdefault(
++            name, {"count": 0, "input_bytes": 0, "output_bytes": 0, "max_input_bytes": 0,
++                   "max_output_bytes": 0, "largest": None}
++        )
++        entry["count"] += 1
++        in_bytes = sum(_ref_bytes(ref) for ref in operation.inputs)
++        out_bytes = sum(_ref_bytes(ref) for ref in operation.outputs)
++        entry["input_bytes"] += in_bytes
++        entry["output_bytes"] += out_bytes
++        if out_bytes > entry["max_output_bytes"]:
++            entry["max_output_bytes"] = out_bytes
++            entry["largest"] = operation.outputs[0].name if operation.outputs else None
++        entry["max_input_bytes"] = max(entry["max_input_bytes"], in_bytes)
++        total_out += out_bytes
++        for ref in operation.outputs:
++            dtype = str(getattr(ref.type, "dtype", "")).lower()
++            by_dtype_out[dtype] = by_dtype_out.get(dtype, 0) + _ref_bytes(ref)
++
++    largest = sorted(
++        (
++            {"operation": name, "max_input_bytes": entry["max_input_bytes"],
++             "max_output_bytes": entry["max_output_bytes"], "largest_output": entry["largest"]}
++            for name, entry in per_op.items()
++        ),
++        key=lambda item: -(item["max_input_bytes"] + item["max_output_bytes"]),
++    )
++    return {
++        "operation_total": len(function.body.operations),
++        "parameter_count": len(schema.parameters),
++        "state_count": len(schema.states),
++        "input_count": len(schema.inputs),
++        "output_count": len(schema.outputs),
++        "packed_layout_nbytes": layout.total_nbytes,
++        "parameter_bytes": sum(entry.nbytes for entry in schema.parameters),
++        "state_bytes": sum(entry.nbytes for entry in schema.states),
++        "intermediate_bytes_retained_by_runtime": total_out,
++        "intermediate_by_dtype": dict(sorted(by_dtype_out.items())),
++        "host_reference_count": sum(
++            entry["count"] for name, entry in per_op.items() if name in HOST_REFERENCE_OPERATIONS
++        ),
++        "largest_operations": largest[:10],
++        "per_operation": {
++            name: {
++                "count": entry["count"],
++                "input_bytes": entry["input_bytes"],
++                "output_bytes": entry["output_bytes"],
++                "boundary": "host_reference" if name in HOST_REFERENCE_OPERATIONS else (
++                    "native" if name in NATIVE_OPERATIONS else "unclassified"
++                ),
++            }
++            for name, entry in sorted(per_op.items())
++        },
++        "graph_digest": schema.graph_digest,
++        "runtime_inputs": [
++            {"name": entry.name, "dtype": entry.dtype, "shape": list(entry.shape)}
++            for entry in schema.runtime_inputs
++        ],
++        "regular_outputs": [
++            {"name": entry.name, "dtype": entry.dtype, "shape": list(entry.shape)}
++            for entry in schema.regular_outputs
++        ],
++    }
++
++
++def memory_model(census: Mapping[str, Any]) -> Mapping[str, Any]:
++    param_bytes = census["parameter_bytes"]
++    intermediate = census["intermediate_bytes_retained_by_runtime"]
++    list_extra = sum(
++        (entry["input_bytes"] + entry["output_bytes"]) * LIST_OVERHEAD
++        for entry in census["per_operation"].values()
++        if entry["boundary"] == "host_reference"
++    )
++    retained = param_bytes + intermediate
++    return {
++        "definition": (
++            "runtime（AVX-512/scalar）把每个 SSA 值的 buffer 保留到 launch 结束，"
++            "因此峰值是参数 + 全部中间值之和；host_reference 路径再把输入/输出"
++            "物化成 Python list（约 28 B/元素）"
++        ),
++        "parameter_bytes": param_bytes,
++        "intermediate_bytes": intermediate,
++        "peak_mib_if_runtime_retains_everything": retained // (1024 * 1024),
++        "host_reference_list_overhead_bytes": list_extra,
++        "peak_mib_with_current_host_reference_path": (retained + list_extra) // (1024 * 1024),
++    }
++
++
++# --------------------------------------------------------------------------
++# 绑定
++# --------------------------------------------------------------------------
++
++
++def _fill_region(storage: bytearray, offset: int, nbytes: int, dtype: str) -> None:
++    if nbytes <= 0:
++        return
++    if dtype == "bf16":
++        unit = struct.pack("<H", _bf16_bits(0.01))
++    elif dtype == "float32":
++        unit = struct.pack("<f", 0.01)
++    elif dtype in ("int64", "int32", "bool"):
++        unit = bytes(DTYPE_BYTES[dtype])
++    else:
++        raise DriverError("synthetic fill does not support dtype {!r}".format(dtype))
++    block = unit * (FILL_CHUNK // len(unit))
++    position = 0
++    while position < nbytes:
++        size = min(len(block), nbytes - position)
++        storage[offset + position:offset + position + size] = block[:size]
++        position += size
++
++
++def synthetic_bindings(schema: Any, layout: Any) -> Tuple[Dict[str, BufferBinding], Dict[str, BufferBinding]]:
++    storage = bytearray(layout.total_nbytes)
++    for entry in schema.parameters + schema.states:
++        region = layout.region_for(entry.name)
++        _fill_region(storage, region.offset, region.nbytes, entry.dtype)
++    parameters = {
++        entry.name: BufferBinding.from_buffer(
++            storage, layout.region_for(entry.name).storage_id, entry.dtype, entry.shape,
++            byte_offset=layout.region_for(entry.name).offset, readonly=True,
++        )
++        for entry in schema.parameters
++    }
++    states = {
++        entry.name: BufferBinding.from_buffer(
++            storage, layout.region_for(entry.name).storage_id, entry.dtype, entry.shape,
++            byte_offset=layout.region_for(entry.name).offset, readonly=True,
++        )
++        for entry in schema.states
++    }
++    return parameters, states
++
++
++def real_parameters(
++    schema: Any, layout: Any, reader: SafetensorsReader
++) -> Tuple[Dict[str, BufferBinding], Mapping[str, Any]]:
++    """真实权重零拷贝绑定；只有 F32→BF16 region 允许物化（模块自带 RNE）。"""
++
++    materialized: Dict[str, bytes] = {}
++    bindings: Dict[str, BufferBinding] = {}
++    zero_copy = 0
++    converted = 0
++    for entry in schema.parameters:
++        region = layout.region_for(entry.name)
++        if region.requires_dtype_conversion:
++            payload = materialized.get(region.storage_id)
++            if payload is None:
++                payload = convert_region_bytes(reader, region)
++                materialized[region.storage_id] = payload
++            bindings[entry.name] = BufferBinding.from_buffer(
++                payload, region.storage_id, entry.dtype, entry.shape, readonly=True
++            )
++            converted += 1
++        else:
++            view = reader.view(region.source_name)
++            bindings[entry.name] = BufferBinding.from_buffer(
++                view, region.storage_id, entry.dtype, entry.shape, readonly=True
++            )
++            zero_copy += 1
++    return bindings, {
++        "binding_mode": "zero_copy_mmap",
++        "zero_copy_parameters": zero_copy,
++        "converted_parameters": converted,
++        "materialized_region_count": len(materialized),
++        "materialized_bytes": sum(len(payload) for payload in materialized.values()),
++    }
++
++
++def zero_state_payloads(schema: Any, layout: Any) -> Dict[str, bytes]:
++    return {
++        entry.name: bytes(layout.region_for(entry.name).nbytes) for entry in schema.states
++    }
++
++
++def map_state_outputs_to_inputs(schema: Any, payloads: Mapping[str, bytes]) -> Dict[str, bytes]:
++    """把上一步的 state 输出按层前缀映射到下一步的 state 输入。"""
++
++    remap: Dict[str, bytes] = {}
++    consumed = set()
++    for entry in schema.states:
++        name = entry.name
++        payload = payloads.get(name)
++        if payload is None:
++            for pattern, template in STATE_PATTERNS:
++                match = pattern.match(name)
++                if not match:
++                    continue
++                group = match.group(1)
++                if template is not None:
++                    candidate = template.format(group)
++                else:
++                    prefix = "{}_recurrent_step_".format(group)
++                    matches = [key for key in payloads if key.startswith(prefix) and key.endswith("_new_state")]
++                    if len(matches) != 1:
++                        raise DriverError(
++                            "state {!r} has {} recurrent candidates".format(name, len(matches))
++                        )
++                    candidate = matches[0]
++                if candidate in payloads:
++                    payload = payloads[candidate]
++                    consumed.add(candidate)
++                    break
++        if payload is None:
++            raise DriverError("no previous-step source for state {!r}".format(name))
++        if len(payload) != entry.nbytes:
++            raise DriverError(
++                "state {!r} previous bytes {} != next bytes {}".format(
++                    name, len(payload), entry.nbytes
++                )
++            )
++        remap[name] = payload
++    return remap
++
++
++def state_bindings(
++    schema: Any, layout: Any, payloads: Optional[Mapping[str, bytes]]
++) -> Dict[str, BufferBinding]:
++    bindings: Dict[str, BufferBinding] = {}
++    for entry in schema.states:
++        region = layout.region_for(entry.name)
++        if payloads is not None and entry.name in payloads:
++            payload = payloads[entry.name]
++        else:
++            payload = bytes(region.nbytes)
++        buffer = bytearray(payload)
++        bindings[entry.name] = BufferBinding.from_buffer(
++            buffer, region.storage_id, entry.dtype, entry.shape, readonly=True
++        )
++    return bindings
++
++
++def output_bindings(schema: Any) -> Tuple[Dict[str, BufferBinding], Dict[str, bytearray]]:
++    storage: Dict[str, bytearray] = {}
++    bindings: Dict[str, BufferBinding] = {}
++    for entry in schema.outputs:
++        total = 64 + entry.nbytes + 64
++        buffer = bytearray(total if total else 64)
++        buffer[:64] = bytes([CANARY]) * 64
++        if entry.nbytes:
++            buffer[64 + entry.nbytes:] = bytes([CANARY]) * 64
++        storage[entry.name] = buffer
++        bindings[entry.name] = BufferBinding.from_buffer(
++            buffer, entry.storage_id, entry.dtype, entry.shape,
++            byte_offset=64 if entry.nbytes else 0, readonly=False,
++        )
++    return bindings, storage
++
++
++def runtime_input_bindings(
++    schema: Any,
++    input_ids: Sequence[int],
++    cos_bits: Optional[Sequence[int]],
++    sin_bits: Optional[Sequence[int]],
++) -> Dict[str, BufferBinding]:
++    payloads: Dict[str, bytes] = {
++        "input_ids": struct.pack("<{}q".format(len(input_ids)), *[int(v) for v in input_ids]),
++    }
++    if cos_bits is not None:
++        payloads["cos"] = struct.pack("<{}H".format(len(cos_bits)), *[int(v) & 0xFFFF for v in cos_bits])
++    if sin_bits is not None:
++        payloads["sin"] = struct.pack("<{}H".format(len(sin_bits)), *[int(v) & 0xFFFF for v in sin_bits])
++    bindings: Dict[str, BufferBinding] = {}
++    for entry in schema.runtime_inputs:
++        payload = payloads.get(entry.name)
++        if payload is None:
++            if entry.name in ("cos", "sin"):
++                count = _element_count(entry.shape)
++                fill = _bf16_bits(1.0 if entry.name == "cos" else 0.0)
++                payload = struct.pack("<{}H".format(count), *([fill] * count))
++            else:
++                raise DriverError("unsupported runtime input {!r}".format(entry.name))
++        if len(payload) != entry.nbytes:
++            raise DriverError(
++                "runtime input {} payload {} bytes != schema {}".format(
++                    entry.name, len(payload), entry.nbytes
++                )
++            )
++        bindings[entry.name] = BufferBinding.from_buffer(
++            bytearray(payload), entry.storage_id, entry.dtype, entry.shape, readonly=True
++        )
++    return bindings
++
++
++# --------------------------------------------------------------------------
++# 编译 / 执行
++# --------------------------------------------------------------------------
++
++
++def make_backend(name: str) -> Mapping[str, Any]:
++    if name == "avx512":
++        return {
++            "compiler": Avx512Compiler(),
++            "target": TargetSpec("cpu", "x86_64-linux-gnu", features=("avx512f",),
++                                 attributes={"lane_count": 16}),
++            "device": "cpu", "format": "pypto-x.cpu.avx512", "runtime": "avx512",
++        }
++    if name == "avx2":
++        return {
++            "compiler": Avx2Compiler(),
++            "target": TargetSpec("cpu", "x86_64-linux-gnu", features=("avx2",),
++                                 attributes={"lane_count": 8}),
++            "device": "cpu", "format": "pypto-x.cpu.avx2", "runtime": "avx2",
++        }
++    if name == "scalar":
++        return {
++            "compiler": CpuScalarCompiler(),
++            "target": TargetSpec("cpu", "x86_64-linux-gnu"),
++            "device": "cpu", "format": None, "runtime": "scalar",
++        }
++    if name == "cuda":
++        from pypto.backends.cuda import CudaDriver
++        from pypto.compiler.targets.cuda import CudaPtxCompiler
++
++        driver = CudaDriver()
++        return {
++            "compiler": CudaPtxCompiler(driver=driver, probe_jit=True),
++            "target": TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,)}),
++            "device": "gpu", "format": None, "runtime": "cuda", "driver": driver,
++        }
++    raise DriverError("unsupported backend {!r}".format(name))
++
++
++def compile_program(backend: Mapping[str, Any], program: Any, build_dir: Path) -> Tuple[Any, Mapping[str, Any]]:
++    from pypto.compiler import CompileOptions
++
++    compiler = backend["compiler"]
++    started = time.perf_counter()
++    target_ir = compiler.lower(program, backend["target"])
++    lowered = time.perf_counter()
++    if backend["format"] is not None:
++        options = CompileOptions(artifact_format=backend["format"], extra={"build_dir": str(build_dir)})
++        artifact = compiler.compile(target_ir, options)
++    else:
++        artifact = compiler.compile(target_ir)
++    compiled = time.perf_counter()
++    metadata = dict(getattr(artifact, "metadata", {}) or {})
++    return artifact, {
++        "lower_seconds": round(lowered - started, 3),
++        "compile_seconds": round(compiled - lowered, 3),
++        "artifact_format": getattr(artifact, "format", None),
++        "artifact_path": getattr(artifact, "path", None),
++        "artifact_content_digest": getattr(artifact, "content_digest", None),
++        "artifact_nbytes": os.path.getsize(artifact.path) if getattr(artifact, "path", None) else None,
++        "plan_count": len(getattr(target_ir, "plans", ()) or ()),
++        "lowering_version": metadata.get("lowering_version"),
++        "native_operations": metadata.get("native_operations"),
++        "host_reference_operations": metadata.get("host_reference_operations"),
++    }
++
++
++def make_runtime(backend: Mapping[str, Any], recorder: Optional[OpRecorder]) -> Any:
++    name = backend["runtime"]
++    if name == "avx512":
++        return InstrumentedAvx512Runtime(recorder=recorder)
++    if name == "avx2":
++        return Avx2Runtime()
++    if name == "scalar":
++        return CpuScalarRuntime()
++    if name == "cuda":
++        from pypto.backends.cuda import CudaRuntime
++
++        driver = backend["driver"]
++        timed = TimedCudaDriver(driver, recorder) if recorder is not None else driver
++        return CudaRuntime(driver=timed)
++    raise DriverError("unsupported runtime {!r}".format(name))
++
++
++def build_request(schema: Any, artifact: Any, runtime_inputs: Mapping[str, BufferBinding],
++                  parameters: Mapping[str, BufferBinding], states: Mapping[str, BufferBinding],
++                  outputs: Mapping[str, BufferBinding], device: str) -> LaunchRequest:
++    regular = {entry.name: outputs[entry.name] for entry in schema.regular_outputs}
++    state_outputs = {entry.name: outputs[entry.name] for entry in schema.state_outputs}
++    return assemble_launch_request(
++        schema, artifact, runtime_inputs, parameters, states, regular, state_outputs, device=device
++    )
++
++
++# --------------------------------------------------------------------------
++# gold / RoPE
++# --------------------------------------------------------------------------
++
++
++def load_bundle(path: Path) -> Mapping[str, Any]:
++    """读取 bundle JSON（input_ids + bf16 位十六进制串），不需要 numpy。"""
++
++    payload = json.loads(Path(path).read_text(encoding="utf-8"))
++    cos_bits = [int(payload["cos_hex"][index:index + 4], 16) for index in range(0, len(payload["cos_hex"]), 4)]
++    sin_bits = [int(payload["sin_hex"][index:index + 4], 16) for index in range(0, len(payload["sin_hex"]), 4)]
++    return {
++        "input_ids": [int(v) for v in payload["input_ids"]],
++        "cos_bits": cos_bits,
++        "sin_bits": sin_bits,
++        "rope_source": payload.get("rope_source"),
++        "steps": payload.get("steps"),
++        "past_length": payload.get("past_length"),
++        "prompt": payload.get("prompt"),
++    }
++
++
++def write_bundle(path: Path, prompt: str, steps: int, past_length: int, input_ids: Sequence[int],
++                 cos_bits: Sequence[int], sin_bits: Sequence[int], rope_source: Any) -> None:
++    payload = {
++        "prompt": prompt,
++        "steps": steps,
++        "past_length": past_length,
++        "input_ids": [int(v) for v in input_ids],
++        "cos_hex": "".join("{:04x}".format(int(v) & 0xFFFF) for v in cos_bits),
++        "sin_hex": "".join("{:04x}".format(int(v) & 0xFFFF) for v in sin_bits),
++        "rope_source": rope_source,
++    }
++    Path(path).parent.mkdir(parents=True, exist_ok=True)
++    Path(path).write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
++
++
++def _dump_outputs(dump_dir: Optional[str], tag: str, raw: Mapping[str, bytes],
++                  schema: Any) -> Optional[Mapping[str, Any]]:
++    if not dump_dir:
++        return None
++    target = Path(dump_dir) / tag
++    target.mkdir(parents=True, exist_ok=True)
++    manifest: Dict[str, Any] = {"tag": tag, "outputs": {}}
++    for entry in schema.outputs:
++        payload = raw.get(entry.name, b"")
++        name = "{}.bin".format(entry.name)
++        (target / name).write_bytes(payload)
++        manifest["outputs"][entry.name] = {
++            "dtype": entry.dtype,
++            "shape": list(entry.shape),
++            "file": name,
++            "nbytes": len(payload),
++            "sha256": hashlib.sha256(payload).hexdigest(),
++        }
++    (target / "dump.json").write_text(json.dumps(manifest, sort_keys=True, indent=2), encoding="utf-8")
++    return manifest
++
++
++def load_npz(path: Path) -> Mapping[str, Any]:
++    import numpy as np
++
++    with np.load(str(path)) as handle:
++        return {key: handle[key] for key in handle.files}
++
++
++def golden_paths(reference_dir: Path, prompt: str) -> Mapping[str, Path]:
++    return {
++        "float32": reference_dir / "float32" / "{}.npz".format(prompt),
++        "bfloat16": reference_dir / "bfloat16" / "{}.npz".format(prompt),
++    }
++
++
++def rope_tables(rope_dir: Path, positions: Sequence[int]) -> Mapping[str, Any]:
++    """用 rope_summary.json 的 inv_freq 复算任意位置的 cos/sin（fp32）。"""
++
++    summary = json.loads((rope_dir / "rope_summary.json").read_text(encoding="utf-8"))
++    inv_freq = [float(value) for value in summary["inv_freq"]]
++    if len(inv_freq) != 32:
++        raise DriverError("rope_summary inv_freq must have 32 entries")
++    cos_rows: List[List[float]] = []
++    sin_rows: List[List[float]] = []
++    for position in positions:
++        angles = [position * value for value in inv_freq]
++        half_cos = [math.cos(a) for a in angles]
++        half_sin = [math.sin(a) for a in angles]
++        cos_rows.append(half_cos + half_cos)
++        sin_rows.append(half_sin + half_sin)
++    return {
++        "inv_freq": inv_freq,
++        "rope_type": summary.get("rope_type"),
++        "attention_scaling": summary.get("attention_scaling"),
++        "mrope_section": summary.get("mrope_section"),
++        "cos_rows": cos_rows,
++        "sin_rows": sin_rows,
++    }
++
++
++def rope_bf16_bits(cos_rows: Sequence[Sequence[float]], sin_rows: Sequence[Sequence[float]],
++                   heads: int = 8) -> Tuple[List[int], List[int]]:
++    """[T,64] → [1,8,T,64] 的 bf16 原始位（RNE）。"""
++
++    cos_bits: List[int] = []
++    sin_bits: List[int] = []
++    for row in cos_rows:
++        cos_bits.extend(_bf16_bits(value) for value in (list(row) * heads))
++    for row in sin_rows:
++        sin_bits.extend(_bf16_bits(value) for value in (list(row) * heads))
++    return cos_bits, sin_bits
++
++
++def rope_bits_for_positions(
++    rope_dir: Path, prompt: str, positions: Sequence[int], heads: int = 8
++) -> Tuple[List[int], List[int], Mapping[str, Any]]:
++    """按位置取 cos/sin 的 bf16 位。
++
++    导出表覆盖的位置直接用**导出位**（与官方 harness 完全一致，含其 bf16 舍入
++    边界）；prompt 之外（decode 续接）的位置用 ``rope_summary.json`` 的
++    ``inv_freq`` 独立复算，并在证据里显式标注。
++    """
++
++    import numpy as np
++
++    loaded = load_npz(rope_dir / "{}.npz".format(prompt))
++    cos_export = np.asarray(loaded["cos_bf16"], dtype=np.float64)
++    sin_export = np.asarray(loaded["sin_bf16"], dtype=np.float64)
++    if cos_export.ndim != 4 or cos_export.shape[0] != 1 or cos_export.shape[1] != heads:
++        raise DriverError("exported cos_bf16 must be [1,{},T,64]".format(heads))
++    exported_steps = int(cos_export.shape[2])
++    table = rope_tables(rope_dir, positions)
++    cos_bits: List[int] = []
++    sin_bits: List[int] = []
++    exported_positions: List[int] = []
++    recomputed_positions: List[int] = []
++    for index, position in enumerate(positions):
++        if position < exported_steps:
++            exported_positions.append(int(position))
++            for head in range(heads):
++                for column in range(64):
++                    cos_bits.append(_bf16_bits(float(cos_export[0, head, position, column])))
++                    sin_bits.append(_bf16_bits(float(sin_export[0, head, position, column])))
++        else:
++            recomputed_positions.append(int(position))
++            for head in range(heads):
++                for column in range(64):
++                    cos_bits.append(_bf16_bits(table["cos_rows"][index][column]))
++                    sin_bits.append(_bf16_bits(table["sin_rows"][index][column]))
++    info = {
++        "exported_positions": exported_positions,
++        "recomputed_positions": recomputed_positions,
++        "source": "exported cos_bf16/sin_bf16 for in-prompt positions; inv_freq recomputation beyond prompt",
++    }
++    return cos_bits, sin_bits, info
++
++
++def verify_rope(rope_dir: Path, prompt: str, steps: int) -> Mapping[str, Any]:
++    positions = list(range(steps))
++    table = rope_tables(rope_dir, positions)
++    loaded = load_npz(rope_dir / "{}.npz".format(prompt))
++    import numpy as np
++
++    heads = 8
++    cos_all = np.asarray(loaded["cos_fp32"], dtype=np.float64).reshape(heads, steps, 64)
++    sin_all = np.asarray(loaded["sin_fp32"], dtype=np.float64).reshape(heads, steps, 64)
++    cos_bf16 = np.asarray(loaded["cos_bf16"], dtype=np.float64).reshape(heads, steps, 64)
++    cos_fp32 = cos_all[0]
++    sin_fp32 = sin_all[0]
++    max_cos = max_sin = max_bf16 = 0.0
++    half_equal = True
++    export_bf16_bits: List[int] = []
++    for index in range(steps):
++        for column in range(64):
++            max_cos = max(max_cos, abs(float(cos_fp32[index][column]) - table["cos_rows"][index][column]))
++            max_sin = max(max_sin, abs(float(sin_fp32[index][column]) - table["sin_rows"][index][column]))
++            max_bf16 = max(max_bf16, abs(float(cos_bf16[0][index][column]) - float(cos_fp32[index][column])))
++            export_bf16_bits.append(_bf16_bits(float(cos_bf16[0][index][column])))
++        for column in range(32):
++            if float(cos_fp32[index][column]) != float(cos_fp32[index][column + 32]):
++                half_equal = False
++    our_bits, _ = rope_bf16_bits(table["cos_rows"], table["sin_rows"])
++    bit_mismatch = sum(1 for left, right in zip(our_bits, export_bf16_bits) if left != right)
++    head_spread = float(np.max(np.abs(cos_all - cos_all[0])))
++    return {
++        "prompt": prompt,
++        "steps": steps,
++        "max_abs_cos_fp32_vs_independent": max_cos,
++        "max_abs_sin_fp32_vs_independent": max_sin,
++        "max_abs_cos_bf16_vs_fp32": max_bf16,
++        "text_path_half_equal": half_equal,
++        "head_axis_spread": head_spread,
++        "bf16_bit_mismatch_vs_export": bit_mismatch,
++        "inv_freq_formula": "1/theta**(arange(0,64,2)/64), theta=1e7",
++        "input_ids_exported": [int(v) for v in loaded["input_ids"]],
++    }
++
++
++# --------------------------------------------------------------------------
++# 比较
++# --------------------------------------------------------------------------
++
++
++def compare_raw(actual_raw: bytes, actual_dtype: str, gold: Any, name: str) -> Mapping[str, Any]:
++    import numpy as np
++
++    actual = _raw_to_float_array(actual_raw, actual_dtype).astype(np.float64)
++    expected = np.asarray(gold, dtype=np.float64).reshape(-1)
++    if actual.size != expected.size:
++        raise DriverError(
++            "{} size mismatch: actual {} vs gold {}".format(name, actual.size, expected.size)
++        )
++    delta = np.abs(actual - expected)
++    dot = float(np.dot(actual, expected))
++    norm = float(np.linalg.norm(actual) * np.linalg.norm(expected))
++    return {
++        "name": name,
++        "actual_dtype": actual_dtype,
++        "elements": int(actual.size),
++        "max_abs": float(np.max(delta)),
++        "mean_abs": float(np.mean(delta)),
++        "rms_abs": float(math.sqrt(float(np.mean(delta * delta)))),
++        "cosine": (dot / norm) if norm else None,
++        "actual_absmax": float(np.max(np.abs(actual))),
++        "gold_absmax": float(np.max(np.abs(expected))),
++        "rows": 1,
++    }
++
++
++def compare_rows(actual_raw: bytes, actual_dtype: str, gold: Any, rows: int, columns: int,
++                 name: str) -> Mapping[str, Any]:
++    import numpy as np
++
++    actual = _raw_to_float_array(actual_raw, actual_dtype).astype(np.float64).reshape(rows, columns)
++    expected = np.asarray(gold, dtype=np.float64).reshape(rows, columns)
++    delta = np.abs(actual - expected)
++    dot = float(np.sum(actual * expected))
++    norm = float(math.sqrt(float(np.sum(actual * actual))) * math.sqrt(float(np.sum(expected * expected))))
++    actual_argmax = np.argmax(actual, axis=1)
++    gold_argmax = np.argmax(expected, axis=1)
++    return {
++        "name": name,
++        "shape": [rows, columns],
++        "actual_dtype": actual_dtype,
++        "max_abs": float(np.max(delta)),
++        "mean_abs": float(np.mean(delta)),
++        "rms_abs": float(math.sqrt(float(np.mean(delta * delta)))),
++        "cosine": (dot / norm) if norm else None,
++        "actual_absmax": float(np.max(np.abs(actual))),
++        "gold_absmax": float(np.max(np.abs(expected))),
++        "argmax_equal": bool(np.array_equal(actual_argmax, gold_argmax)),
++        "argmax_mismatch_rows": int(np.sum(actual_argmax != gold_argmax)),
++        "argmax_actual": [int(v) for v in actual_argmax],
++        "argmax_gold": [int(v) for v in gold_argmax],
++    }
++
++
++def gold_dtype_band(reference_dir: Path, prompt: str) -> Mapping[str, Any]:
++    import numpy as np
++
++    paths = golden_paths(reference_dir, prompt)
++    high = load_npz(paths["float32"])
++    low = load_npz(paths["bfloat16"])
++    band: Dict[str, Any] = {}
++    for key in sorted(set(high) & set(low)):
++        if key in ("input_ids", "decode_token_ids", "generate_token_ids"):
++            continue
++        delta = np.abs(
++            np.asarray(high[key], dtype=np.float64).reshape(-1)
++            - np.asarray(low[key], dtype=np.float64).reshape(-1)
++        )
++        band[key] = {"max_abs": float(np.max(delta)), "mean_abs": float(np.mean(delta))}
++    return {"prompt": prompt, "definition": "官方 float32 vs 官方 bfloat16 的自身差异（dtype 误差带）", "per_key": band}
++
++
++def summarise_ops(recorder: OpRecorder) -> Mapping[str, Any]:
++    per_class: Dict[str, Dict[str, Any]] = {}
++    for record in recorder.records:
++        entry = per_class.setdefault(
++            record["operation"],
++            {"count": 0, "seconds": 0.0, "mode": record.get("mode", "native"), "max_seconds": 0.0},
++        )
++        entry["count"] += 1
++        entry["seconds"] += float(record.get("seconds", 0.0))
++        entry["max_seconds"] = max(entry["max_seconds"], float(record.get("seconds", 0.0)))
++    return {
++        "executed_operations": len(recorder.records),
++        "total_seconds": round(sum(float(r.get("seconds", 0.0)) for r in recorder.records), 3),
++        "by_operation": {
++            name: {
++                "count": entry["count"],
++                "mode": entry["mode"],
++                "seconds": round(entry["seconds"], 3),
++                "max_seconds": round(entry["max_seconds"], 4),
++            }
++            for name, entry in sorted(per_class.items(), key=lambda kv: -kv[1]["seconds"])
++        },
++        "host_reference_seconds": round(
++            sum(float(r.get("seconds", 0.0)) for r in recorder.records
++                if r.get("mode") == "host_reference"), 3
++        ),
++        "native_seconds": round(
++            sum(float(r.get("seconds", 0.0)) for r in recorder.records
++                if r.get("mode") == "native"), 3
++        ),
++    }
++
++
++# --------------------------------------------------------------------------
++# stages
++# --------------------------------------------------------------------------
++
++
++def liveness_peak_bytes(program: Any, schema: Any) -> Mapping[str, Any]:
++    """按 SSA 最后使用点估算"有 liveness 释放"时的峰值（不含参数）。"""
++
++    function = program.functions[0]
++    parameter_names = {entry.name for entry in schema.parameters}
++    state_names = {entry.name for entry in schema.states}
++    sizes: Dict[str, int] = {}
++    last_use: Dict[str, int] = {}
++    for index, operation in enumerate(function.body.operations):
++        for ref in operation.outputs:
++            sizes[ref.name] = _ref_bytes(ref)
++        for ref in operation.inputs:
++            if ref.name not in parameter_names:
++                last_use[ref.name] = index
++    live: Dict[str, int] = {}
++    peak = 0
++    peak_index = -1
++    for index, operation in enumerate(function.body.operations):
++        for ref in operation.outputs:
++            live[ref.name] = sizes.get(ref.name, 0)
++        for ref in operation.inputs:
++            if ref.name in live and last_use.get(ref.name) == index and ref.name not in parameter_names:
++                live.pop(ref.name, None)
++        total = sum(live.values())
++        if total > peak:
++            peak = total
++            peak_index = index
++    return {
++        "peak_bytes_with_liveness_release": peak,
++        "peak_mib_with_liveness_release": peak // (1024 * 1024),
++        "peak_at_operation_index": peak_index,
++        "peak_operation": (
++            str(function.body.operations[peak_index].name) if peak_index >= 0 else None
++        ),
++        "parameter_bytes_zero_copy": sum(entry.nbytes for entry in schema.parameters),
++        "state_bytes": sum(entry.nbytes for entry in schema.states),
++    }
++
++
++def boundary_audit(program: Any, schema: Any) -> Mapping[str, Any]:
++    """逐个列出触碰参数级张量的算子，并按算子类聚合（修复菜单的输入）。"""
++
++    function = program.functions[0]
++    parameter_names = {entry.name for entry in schema.parameters}
++    individual: List[Dict[str, Any]] = []
++    derived_individual: List[Dict[str, Any]] = []
++    derived = set()
++    aggregate: Dict[str, Dict[str, Any]] = {}
++    for index, operation in enumerate(function.body.operations):
++        name = str(operation.name)
++        input_bytes = sum(_ref_bytes(ref) for ref in operation.inputs)
++        output_bytes = sum(_ref_bytes(ref) for ref in operation.outputs)
++        touches = sorted({ref.name for ref in operation.inputs if ref.name in parameter_names})
++        boundary = "host_reference" if name in HOST_REFERENCE_OPERATIONS else (
++            "native" if name in NATIVE_OPERATIONS else "unclassified"
++        )
++        entry = aggregate.setdefault(
++            name,
++            {"count": 0, "boundary": boundary, "input_bytes": 0, "output_bytes": 0,
++             "max_input_bytes": 0, "max_output_bytes": 0, "parameter_touching_count": 0,
++             "parameter_touching_input_bytes": 0, "parameter_touching_output_bytes": 0,
++             "largest": None, "largest_index": None},
++        )
++        entry["count"] += 1
++        entry["input_bytes"] += input_bytes
++        entry["output_bytes"] += output_bytes
++        if input_bytes + output_bytes > (entry["max_input_bytes"] + entry["max_output_bytes"]):
++            entry["max_input_bytes"] = input_bytes
++            entry["max_output_bytes"] = output_bytes
++            entry["largest"] = operation.outputs[0].name if operation.outputs else None
++            entry["largest_index"] = index
++        derived_inputs = sorted(ref.name for ref in operation.inputs
++                                if ref.name in derived or ref.name in parameter_names)
++        if derived_inputs:
++            derived_individual.append(
++                {
++                    "index": index,
++                    "operation": name,
++                    "boundary": boundary,
++                    "dtype": str(getattr(operation.outputs[0].type, "dtype", "")) if operation.outputs else "",
++                    "output": operation.outputs[0].name if operation.outputs else None,
++                    "input_bytes": input_bytes,
++                    "output_bytes": output_bytes,
++                    "inputs_derived_from_parameter": derived_inputs,
++                    "direct_parameters": touches,
++                    "list_materialization_mib": (
++                        (input_bytes + output_bytes) * LIST_OVERHEAD // (1024 * 1024)
++                        if boundary == "host_reference" else 0
++                    ),
++                    "runtime_output_buffer_mib": output_bytes // (1024 * 1024),
++                }
++            )
++        for ref in operation.outputs:
++            if any(source in derived or source in parameter_names for source in
++                   [item.name for item in operation.inputs]):
++                derived.add(ref.name)
++        if touches:
++            entry["parameter_touching_count"] += 1
++            entry["parameter_touching_input_bytes"] += input_bytes
++            entry["parameter_touching_output_bytes"] += output_bytes
++            individual.append(
++                {
++                    "index": index,
++                    "operation": name,
++                    "boundary": boundary,
++                    "dtype": str(getattr(operation.outputs[0].type, "dtype", "")) if operation.outputs else "",
++                    "output": operation.outputs[0].name if operation.outputs else None,
++                    "input_bytes": input_bytes,
++                    "output_bytes": output_bytes,
++                    "parameters": touches,
++                    "list_materialization_mib": (
++                        (input_bytes + output_bytes) * LIST_OVERHEAD // (1024 * 1024)
++                        if boundary == "host_reference" else 0
++                    ),
++                    "runtime_output_buffer_mib": output_bytes // (1024 * 1024),
++                }
++            )
++    individual.sort(key=lambda item: -(item["input_bytes"] + item["output_bytes"]))
++    derived_individual.sort(key=lambda item: -(item["input_bytes"] + item["output_bytes"]))
++    parameter_touching = {name: entry for name, entry in aggregate.items()
++                          if entry["parameter_touching_count"]}
++    return {
++        "parameter_touching_operation_classes": parameter_touching,
++        "largest_parameter_touching_operations": individual[:24],
++        "largest_parameter_derived_operations": derived_individual[:24],
++        "parameter_derived_total_count": len(derived_individual),
++        "parameter_touching_total_count": len(individual),
++        "parameter_touching_host_reference_count": sum(
++            1 for item in individual if item["boundary"] == "host_reference"
++        ),
++        "parameter_touching_host_reference_bytes": sum(
++            item["input_bytes"] + item["output_bytes"] for item in individual
++            if item["boundary"] == "host_reference"
++        ),
++    }
++
++
++def repair_menu(program: Any, schema: Any, census: Mapping[str, Any]) -> Mapping[str, Any]:
++    """把能力缺口量化成可选修复路线的峰值/耗时量级。"""
++
++    model = memory_model(census)
++    liveness = liveness_peak_bytes(program, schema)
++    params = census["parameter_bytes"]
++    intermediate = census["intermediate_bytes_retained_by_runtime"]
++    host_reference_bytes = model["host_reference_list_overhead_bytes"] // LIST_OVERHEAD
++    weight_cast_bytes = sum(
++        entry["output_bytes"] for name, entry in census["per_operation"].items()
++        if name == "cast"
++    )
++    weight_transpose_bytes = sum(
++        entry["output_bytes"] for name, entry in census["per_operation"].items()
++        if name == "transpose"
++    )
++    mib = lambda value: value // (1024 * 1024)  # noqa: E731
++    return {
++        "observed_capability_gap": (
++            "AVX-512/scalar runtime 的 host_reference 路径把输入/输出全量物化成 "
++            "Python list，且 launch 期间保留全部 SSA buffer"
++        ),
++        "option_a_native_cast_transpose_embedding_only": {
++            "removes": "Python list 物化（host_reference 路径）",
++            "keeps": "launch 期间保留全部 SSA 中间值",
++            "peak_mib": model["peak_mib_if_runtime_retains_everything"],
++            "cgroup_cap_mib": 8192,
++            "fits": model["peak_mib_if_runtime_retains_everything"] < 8192 * 0.85,
++            "note": "仍然保留 f32 权重副本与转置副本，占 cgroup 上限的 "
++                    "{:.1f}%".format(100.0 * model["peak_mib_if_runtime_retains_everything"] / 8192),
++        },
++        "option_b_liveness_or_streaming_release": {
++            "removes": "已经死掉的 SSA 值持续占用",
++            "peak_mib_with_liveness": liveness["peak_mib_with_liveness_release"],
++            "peak_operation": liveness["peak_operation"],
++            "fits": liveness["peak_mib_with_liveness_release"] < 8192 * 0.85,
++            "note": "仍需 (a) 解决 host_reference list 物化，否则单算子峰值照旧",
++        },
++        "option_c_avoid_weight_f32_promotion_and_transpose": {
++            "removes": "权重整块升 f32（{:.0f} MiB）与转置副本（{:.0f} MiB）".format(
++                mib(weight_cast_bytes), mib(weight_transpose_bytes)
++            ),
++            "peak_mib_retained_everything": mib(params + intermediate - weight_cast_bytes - weight_transpose_bytes),
++            "blocked_by": "需要改 Core IR/图契约（权重 dtype 与 matmul 语义），必须单独评审",
++            "fits": (params + intermediate - weight_cast_bytes - weight_transpose_bytes) < 8192 * 0.85 * 1024 * 1024,
++        },
++        "option_d_chunked_or_per_layer_launch": {
++            "removes": "整网一次性保留",
++            "estimate": "按层 launch：每层参数约 {:.0f} MiB + 该层中间值".format(
++                mib(params) / 24.0
++            ),
++            "blocked_by": "需要 per-layer 子图构造器与 state 串联（当前仓库没有）",
++            "time_risk": "host_reference 每字节成本不变，整网仍约 {:.1f} 分钟".format(
++                (host_reference_bytes / 6581931.54) / 60.0
++            ),
++        },
++        "measured_host_reference_throughput_bytes_per_second": 6581931.54,
++        "host_reference_total_bytes": host_reference_bytes,
++        "projected_host_reference_minutes": (host_reference_bytes / 6581931.54) / 60.0,
++    }
++
++
++def stage_preflight(args: argparse.Namespace) -> Mapping[str, Any]:
++    program, schema, layout = build_graph(args.steps, args.past_length, args.shape_profile)
++    census = graph_census(program, schema, layout)
++    result: Dict[str, Any] = {
++        "stage": "preflight",
++        "prompt": args.prompt,
++        "steps": args.steps,
++        "past_length": args.past_length,
++        "census": census,
++        "memory_model": memory_model(census),
++        "cgroup_memory_max_mib": _cgroup_mib("/memory.max"),
++        "cgroup_memory_current_mib": _cgroup_mib("/memory.current"),
++        "host": {"cpu_count": os.cpu_count(), "maxrss_mib": _maxrss_mib()},
++    }
++    if args.asset_dir:
++        asset = Path(args.asset_dir)
++        checkpoint = asset / CHECKPOINT_NAME
++        reader = SafetensorsReader(str(checkpoint), mode="pread")
++        with reader:
++            tie = tie_word_embeddings_from_config(str(asset / "config.json"))
++            mapping = build_weight_mapping(schema, program.metadata, reader, tie_word_embeddings=tie)
++            weight_layout = build_weight_layout(schema, mapping, reader, alignment=64)
++            conversions = audit_precision_boundary(reader, weight_layout)
++            result["weight_mapping"] = {
++                "checkpoint_path": str(checkpoint),
++                "checkpoint_nbytes": checkpoint.stat().st_size,
++                "parameter_count": mapping.parameter_count,
++                "mapped_count": mapping.mapped_count,
++                "tied": mapping.tied.to_dict(),
++                "totals": dict(mapping.totals),
++                "excluded": [
++                    {"group": group.group, "tensor_count": group.tensor_count, "nbytes": group.nbytes}
++                    for group in mapping.excluded
++                ],
++                "dtype_discrepancies": len(mapping.dtype_discrepancies),
++            }
++            result["weight_layout"] = {
++                "layout_digest": weight_layout.layout_digest(),
++                "region_count": len(weight_layout.regions),
++                "total_nbytes": weight_layout.total_nbytes,
++                "padding_nbytes": weight_layout.padding_nbytes,
++                "dtype_conversion_storage_ids": list(weight_layout.dtype_conversion_storage_ids),
++                "conversion_regions": [
++                    item.to_dict() for item in conversions if item.status == "converted_rne"
++                ],
++                "conversion_max_relative_error": max(
++                    [item.max_relative_error for item in conversions
++                     if item.max_relative_error is not None] or [0.0]
++                ),
++            }
++            if args.hash_checkpoint:
++                result["weight_mapping"]["checkpoint_sha256"] = _sha256_file(checkpoint)
++    if args.reference_dir and args.rope_dir:
++        gold_path = golden_paths(Path(args.reference_dir), args.prompt)["float32"]
++        gold = load_npz(gold_path)
++        input_ids = [int(v) for v in gold["input_ids"]]
++        result["gold"] = {
++            "path": str(gold_path),
++            "keys": sorted(gold.keys()),
++            "input_ids": input_ids,
++            "steps": len(input_ids),
++        }
++        result["rope_verification"] = verify_rope(Path(args.rope_dir), args.prompt, len(input_ids))
++        result["gold_dtype_band"] = gold_dtype_band(Path(args.reference_dir), args.prompt)
++    result["status"] = "PASS"
++    return result
++
++
++def micro_benchmark_host_reference(
++    elements: int, build_dir: Path, recorder: OpRecorder
++) -> Mapping[str, Any]:
++    """用真实 AVX-512 artifact 量测 host_reference 路径的每元素成本。
++
++    只做 ``cast`` bf16→f32 一个算子，输入输出都是真实 ctypes buffer；量到的
++    bytes/s 用于把整网的 host_reference 字节流量外推成时间量级。
++    """
++
++    from pypto.compiler import CompileOptions
++    from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++
++    source = ValueRef("source", CoreType.tensor("bf16", (elements,)))
++    output = ValueRef("output", CoreType.tensor("float32", (elements,)))
++    program = CoreProgram(
++        functions=(
++            CoreFunction("micro_cast", (source,), (output,), Region((Operation("cast", (source,), (output,)),))),
++        )
++    )
++    target = TargetSpec("cpu", "x86_64-linux-gnu", features=("avx512f",), attributes={"lane_count": 16})
++    compiler = Avx512Compiler()
++    target_ir = compiler.lower(program, target)
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(artifact_format="pypto-x.cpu.avx512", extra={"build_dir": str(build_dir / "micro")}),
++    )
++    source_buffer = bytearray(struct.pack("<H", _bf16_bits(0.5)) * elements)
++    destination = bytearray(4 * elements)
++    request = LaunchRequest(
++        artifact,
++        inputs=[TensorDesc("bf16", (elements,), handle=source_buffer, readonly=True)],
++        outputs=[TensorDesc("float32", (elements,), handle=destination)],
++    )
++    runtime = InstrumentedAvx512Runtime(recorder=recorder)
++    started = time.perf_counter()
++    runtime.launch(request)
++    elapsed = time.perf_counter() - started
++    payload_bytes = elements * (2 + 4)
++    return {
++        "elements": elements,
++        "input_bytes": elements * 2,
++        "output_bytes": elements * 4,
++        "seconds": round(elapsed, 4),
++        "bytes_per_second": (payload_bytes / elapsed) if elapsed else None,
++        "elements_per_second": (elements / elapsed) if elapsed else None,
++    }
++
++
++def stage_boundary_audit(args: argparse.Namespace) -> Mapping[str, Any]:
++    program, schema, layout = build_graph(args.steps, args.past_length, args.shape_profile)
++    census = graph_census(program, schema, layout)
++    return {
++        "stage": "boundary-audit",
++        "prompt": args.prompt,
++        "steps": args.steps,
++        "past_length": args.past_length,
++        "shape_profile": args.shape_profile,
++        "graph_digest": schema.graph_digest,
++        "census_summary": {
++            "operation_total": census["operation_total"],
++            "parameter_bytes": census["parameter_bytes"],
++            "intermediate_bytes_retained_by_runtime": census["intermediate_bytes_retained_by_runtime"],
++            "intermediate_by_dtype": census["intermediate_by_dtype"],
++        },
++        "memory_model": memory_model(census),
++        "liveness_model": liveness_peak_bytes(program, schema),
++        "boundary": boundary_audit(program, schema),
++        "repair_menu": repair_menu(program, schema, census),
++        "status": "PASS",
++    }
++
++
++def stage_s1(args: argparse.Namespace) -> Mapping[str, Any]:
++    program, schema, layout = build_graph(args.steps, args.past_length, args.shape_profile)
++    census = graph_census(program, schema, layout)
++    budget = _cgroup_mib("/memory.max")
++    build_dir = Path(args.build_dir) if args.build_dir else Path(args.work_dir or ".") / "s1-build"
++    build_dir.mkdir(parents=True, exist_ok=True)
++    result: Dict[str, Any] = {
++        "stage": "s1",
++        "backend": args.backend,
++        "prompt": args.prompt,
++        "steps": args.steps,
++        "past_length": args.past_length,
++        "synthetic": True,
++        "shape_profile": args.shape_profile,
++        "note": "合成权重只用于真实形状下的管线预演，不作为任何正确性结论",
++        "census": census,
++        "memory_model": memory_model(census),
++        "cgroup_memory_max_mib": budget,
++    }
++    backend = make_backend(args.backend)
++    artifact, compile_info = compile_program(backend, program, build_dir)
++    result["compile"] = compile_info
++    result["rss_after_compile_mib"] = _maxrss_mib()
++
++    recorder = OpRecorder(args.progress_obj, budget, not args.no_watchdog, args.abort_op_mib)
++    if args.micro_benchmark_elements:
++        result["micro_benchmark"] = micro_benchmark_host_reference(
++            args.micro_benchmark_elements, build_dir, recorder
++        )
++        reference_bytes = memory_model(census)["host_reference_list_overhead_bytes"] // LIST_OVERHEAD
++        rate = result["micro_benchmark"]["bytes_per_second"]
++        result["micro_benchmark"]["host_reference_total_bytes"] = reference_bytes
++        result["micro_benchmark"]["projected_host_reference_seconds"] = (
++            (reference_bytes / rate) if rate else None
++        )
++        result["micro_benchmark"]["projected_host_reference_minutes"] = (
++            (reference_bytes / rate / 60.0) if rate else None
++        )
++    parameters, states = synthetic_bindings(schema, layout)
++    outputs, output_storage = output_bindings(schema)
++    runtime_inputs = runtime_input_bindings(schema, [0] * args.steps, None, None)
++    request = build_request(schema, artifact, runtime_inputs, parameters, states, outputs, backend["device"])
++    runtime = make_runtime(backend, recorder)
++    started = time.perf_counter()
++    error: Optional[str] = None
++    try:
++        runtime.launch(request)
++    except BudgetExceeded as exc:
++        error = "BudgetExceeded: {}".format(exc)
++    except Exception as exc:  # noqa: BLE001
++        error = "{}: {}".format(type(exc).__name__, exc)
++    result["launch_seconds"] = round(time.perf_counter() - started, 3)
++    result["launch_error"] = error
++    result["budget_watchdog_stop"] = recorder.stopped_reason
++    result["op_summary"] = summarise_ops(recorder)
++    result["rss_peak_mib"] = _maxrss_mib()
++    result["cgroup_memory_peak_mib"] = _cgroup_mib("/memory.peak")
++    result["output_canary_intact"] = all(
++        output_storage[entry.name][:64] == bytes([CANARY]) * 64
++        for entry in schema.outputs
++    )
++    result["status"] = "PASS" if error is None else "BLOCKED"
++    return result
++
++
++def _run_once(
++    args: argparse.Namespace,
++    stage: str,
++    steps: int,
++    past_length: int,
++    reader: SafetensorsReader,
++    previous_states: Optional[Mapping[str, bytes]],
++    input_ids: Sequence[int],
++    cos_bits: Sequence[int],
++    sin_bits: Sequence[int],
++    build_dir: Path,
++) -> Tuple[Mapping[str, Any], Dict[str, bytes], Dict[str, bytes]]:
++    program, schema, layout = build_graph(steps, past_length)
++    backend = make_backend(args.backend)
++    artifact, compile_info = compile_program(backend, program, build_dir)
++    tie = tie_word_embeddings_from_config(str(Path(args.asset_dir) / "config.json"))
++    mapping = build_weight_mapping(schema, program.metadata, reader, tie_word_embeddings=tie)
++    weight_layout = build_weight_layout(schema, mapping, reader, alignment=64)
++    parameters, binding_evidence = real_parameters(schema, weight_layout, reader)
++    binding_evidence = dict(binding_evidence)
++    binding_evidence["mapped_count"] = mapping.mapped_count
++    binding_evidence["parameter_count"] = mapping.parameter_count
++    binding_evidence["layout_digest"] = weight_layout.layout_digest()
++    binding_evidence["conversion_storage_ids"] = list(weight_layout.dtype_conversion_storage_ids)
++    mapped = (
++        map_state_outputs_to_inputs(schema, previous_states) if previous_states is not None else None
++    )
++    states = state_bindings(schema, weight_layout, mapped)
++    outputs, output_storage = output_bindings(schema)
++    runtime_inputs = runtime_input_bindings(schema, input_ids, cos_bits, sin_bits)
++    request = build_request(schema, artifact, runtime_inputs, parameters, states, outputs, backend["device"])
++    recorder = OpRecorder(
++        args.progress_obj, _cgroup_mib("/memory.max"), not args.no_watchdog, args.abort_op_mib
++    )
++    runtime = make_runtime(backend, recorder)
++    started = time.perf_counter()
++    error: Optional[str] = None
++    try:
++        runtime.launch(request)
++    except BudgetExceeded as exc:
++        error = "BudgetExceeded: {}".format(exc)
++    except Exception as exc:  # noqa: BLE001
++        error = "{}: {}".format(type(exc).__name__, exc)
++    launch_seconds = time.perf_counter() - started
++    raw_outputs: Dict[str, bytes] = {}
++    state_payloads: Dict[str, bytes] = {}
++    for entry in schema.outputs:
++        buffer = output_storage[entry.name]
++        payload = bytes(buffer[64:64 + entry.nbytes]) if entry.nbytes else b""
++        raw_outputs[entry.name] = payload
++        state_payloads[entry.name] = payload
++    record: Dict[str, Any] = {
++        "stage": stage,
++        "backend": args.backend,
++        "steps": steps,
++        "past_length": past_length,
++        "synthetic": False,
++        "graph_digest": schema.graph_digest,
++        "operation_total": len(program.functions[0].body.operations),
++        "compile": compile_info,
++        "binding": binding_evidence,
++        "launch_seconds": round(launch_seconds, 3),
++        "launch_error": error,
++        "budget_watchdog_stop": recorder.stopped_reason,
++        "op_summary": summarise_ops(recorder),
++        "rss_peak_mib": _maxrss_mib(),
++        "cgroup_memory_peak_mib": _cgroup_mib("/memory.peak"),
++        "cgroup_memory_max_mib": _cgroup_mib("/memory.max"),
++        "outputs": {
++            entry.name: {
++                "dtype": entry.dtype,
++                "shape": list(entry.shape),
++                "nbytes": entry.nbytes,
++                "raw_sha256": hashlib.sha256(raw_outputs[entry.name]).hexdigest(),
++            }
++            for entry in schema.outputs
++        },
++    }
++    record["status"] = "PASS" if error is None else "BLOCKED"
++    return record, state_payloads, raw_outputs
++
++
++def _align_prefill(record: Dict[str, Any], raw: Mapping[str, bytes], reference_dir: Path,
++                   prompt: str, steps: int) -> None:
++    comparisons: Dict[str, Any] = {}
++    for variant in ("float32", "bfloat16"):
++        path = golden_paths(reference_dir, prompt)[variant]
++        if not path.is_file():
++            continue
++        gold = load_npz(path)
++        comparisons[variant] = {
++            "logits_vs_prefill_logits": compare_rows(
++                raw["logits"], "bf16", gold["prefill_logits"], steps, 248320, "logits"
++            ),
++            "final_hidden_vs_last_hidden_state": compare_rows(
++                raw["final_hidden"], "bf16", gold["last_hidden_state"], steps, 1024, "final_hidden"
++            ),
++        }
++        if "prefill_next_logits" in gold:
++            comparisons[variant]["prefill_next_logits_argmax"] = {
++                "ours": int(
++                    _raw_to_float_array(raw["logits"], "bf16").astype("float64")[-248320:].argmax()
++                ),
++                "gold": int(gold["prefill_next_logits"].argmax()),
++            }
++    record["comparisons"] = comparisons
++    positions = _raw_to_float_array(raw["position_ids"], "int64")
++    record["position_ids"] = [int(v) for v in positions]
++    record["position_ids_expected"] = list(range(steps))
++    record["position_ids_equal"] = [int(v) for v in positions] == list(range(steps))
++    record["gold_dtype_band"] = gold_dtype_band(reference_dir, prompt)
++
++
++def stage_s2(args: argparse.Namespace) -> Mapping[str, Any]:
++    prompt = args.prompt
++    steps = args.steps
++    asset = Path(args.asset_dir)
++    checkpoint = asset / CHECKPOINT_NAME
++    reference = Path(args.reference_dir)
++    gold = load_npz(reference / "float32" / "{}.npz".format(prompt))
++    input_ids = [int(v) for v in gold["input_ids"]]
++    if len(input_ids) != steps:
++        raise DriverError("prompt {} expects {} steps, got {}".format(prompt, steps, len(input_ids)))
++    cos_bits, sin_bits, rope_source = rope_bits_for_positions(
++        Path(args.rope_dir), prompt, list(range(steps))
++    )
++    build_dir = Path(args.build_dir) if args.build_dir else Path(args.work_dir or ".") / "s2-build"
++    build_dir.mkdir(parents=True, exist_ok=True)
++    with SafetensorsReader(str(checkpoint), mode="mmap") as reader:
++        record, _states, raw = _run_once(
++            args, "s2", steps, args.past_length, reader, None, input_ids, cos_bits, sin_bits, build_dir
++        )
++    record["prompt"] = prompt
++    record["rope_source"] = rope_source
++    if record["status"] == "PASS":
++        _align_prefill(record, raw, reference, prompt, steps)
++    return record
++
++
++def stage_s3(args: argparse.Namespace) -> Mapping[str, Any]:
++    prompt = args.prompt
++    steps = args.steps
++    asset = Path(args.asset_dir)
++    checkpoint = asset / CHECKPOINT_NAME
++    reference = Path(args.reference_dir)
++    gold = load_npz(reference / "float32" / "{}.npz".format(prompt))
++    input_ids = [int(v) for v in gold["input_ids"]]
++    if len(input_ids) != steps:
++        raise DriverError("prompt {} expects {} steps".format(prompt, steps))
++    build_dir = Path(args.build_dir) if args.build_dir else Path(args.work_dir or ".") / "s3-build"
++    build_dir.mkdir(parents=True, exist_ok=True)
++    decode_records: List[Mapping[str, Any]] = []
++    with SafetensorsReader(str(checkpoint), mode="mmap") as reader:
++        cos_bits, sin_bits, rope_source = rope_bits_for_positions(
++            Path(args.rope_dir), prompt, list(range(steps))
++        )
++        record, states, raw = _run_once(
++            args, "s3-prefill", steps, 0, reader, None, input_ids, cos_bits, sin_bits, build_dir
++        )
++        record["prompt"] = prompt
++        record["rope_source"] = rope_source
++        if record["status"] == "PASS":
++            _align_prefill(record, raw, reference, prompt, steps)
++            decode_logits = gold["decode_logits"]
++            decode_tokens = [int(v) for v in gold["decode_token_ids"]]
++            current = int(
++                _raw_to_float_array(raw["logits"], "bf16").astype("float64")[-248320:].argmax()
++            )
++            if args.decode_steps:
++                for step in range(args.decode_steps):
++                    past = steps + step
++                    cos_bits, sin_bits, step_rope = rope_bits_for_positions(
++                        Path(args.rope_dir), prompt, [past]
++                    )
++                    step_record, states, raw = _run_once(
++                        args, "s3-decode", 1, past, reader, states, [current],
++                        cos_bits, sin_bits, build_dir,
++                    )
++                    step_record["prompt"] = prompt
++                    step_record["decode_step"] = step
++                    step_record["position"] = past
++                    step_record["input_token"] = current
++                    step_record["rope_source"] = step_rope
++                    if step_record["status"] == "PASS":
++                        actual = _raw_to_float_array(raw["logits"], "bf16").astype("float64")
++                        argmax = int(actual.argmax())
++                        step_record["argmax_token"] = argmax
++                        step_record["gold_decode_token_id"] = decode_tokens[step]
++                        step_record["gold_argmax_token"] = int(decode_logits[step].argmax())
++                        step_record["token_matches_gold_token_id"] = argmax == decode_tokens[step]
++                        step_record["token_matches_gold_argmax"] = argmax == int(decode_logits[step].argmax())
++                        step_record["logits_vs_decode_logits"] = compare_rows(
++                            raw["logits"], "bf16", decode_logits[step], 1, 248320, "decode_logits"
++                        )
++                        current = argmax
++                    decode_records.append(step_record)
++                    if step_record["status"] != "PASS":
++                        break
++        record["decode_steps"] = decode_records
++        record["decode_token_ids_ours"] = [item.get("argmax_token") for item in decode_records]
++        record["decode_token_ids_gold"] = [item.get("gold_decode_token_id") for item in decode_records]
++    return record
++
++
++def stage_s4(args: argparse.Namespace) -> Mapping[str, Any]:
++    prompt = args.prompt
++    steps = args.steps
++    reference = Path(args.reference_dir)
++    gold = load_npz(reference / "float32" / "{}.npz".format(prompt))
++    layers = gold["hidden_states_layers"]
++    input_ids = [int(v) for v in gold["input_ids"]]
++    build_dir = Path(args.build_dir) if args.build_dir else Path(args.work_dir or ".") / "s4-build"
++    build_dir.mkdir(parents=True, exist_ok=True)
++    cos_bits, sin_bits, rope_source = rope_bits_for_positions(
++        Path(args.rope_dir), prompt, list(range(steps))
++    )
++    with SafetensorsReader(str(Path(args.asset_dir) / CHECKPOINT_NAME), mode="mmap") as reader:
++        record, _states, raw = _run_once(
++            args, "s4", steps, args.past_length, reader, None, input_ids, cos_bits, sin_bits, build_dir
++        )
++    report: Dict[str, Any] = {
++        "stage": "s4",
++        "prompt": prompt,
++        "steps": steps,
++        "backend": args.backend,
++        "run_status": record["status"],
++        "launch_error": record.get("launch_error"),
++        "budget_watchdog_stop": record.get("budget_watchdog_stop"),
++        "executed_operations": record.get("op_summary", {}).get("executed_operations"),
++        "operation_total": record.get("operation_total"),
++        "last_executed_operation": (
++            record.get("op_summary", {}).get("by_operation", {}) and
++            list(record["op_summary"]["by_operation"])[:1]
++        ),
++        "rope_source": rope_source,
++        "gold_layer_count": int(layers.shape[0]),
++        "note": (
++            "本仓库没有 per-layer 子图构造器，无法在真实权重大小下单独执行第 N 层；"
++            "这里给出整网执行的精确阻塞点与可达边界，用于定位第一个不可执行层"
++        ),
++    }
++    if record["status"] == "PASS":
++        report["final_hidden_vs_gold_last_hidden_state"] = compare_rows(
++            raw["final_hidden"], "bf16", gold["last_hidden_state"], steps, 1024, "final_hidden"
++        )
++        report["logits_vs_prefill_logits"] = compare_rows(
++            raw["logits"], "bf16", gold["prefill_logits"], steps, 248320, "logits"
++        )
++    report["status"] = record["status"]
++    return report
++
++
++# --------------------------------------------------------------------------
++# CLI
++# --------------------------------------------------------------------------
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description="Qwen3.5-0.8B BF16 weighted execution driver")
++    parser.add_argument("--stage", required=True,
++                        choices=("preflight", "boundary-audit", "s1", "s2", "s3", "s4"))
++    parser.add_argument("--shape-profile", default="model", choices=("model", "synthetic_test"))
++    parser.add_argument("--backend", default="avx512", choices=("avx512", "avx2", "scalar", "cuda"))
++    parser.add_argument("--prompt", default="en_continuation", choices=PROMPTS)
++    parser.add_argument("--steps", type=int, default=None)
++    parser.add_argument("--past-length", type=int, default=0)
++    parser.add_argument("--decode-steps", type=int, default=4)
++    parser.add_argument("--asset-dir", default=None)
++    parser.add_argument("--reference-dir", default=None)
++    parser.add_argument("--rope-dir", default=None)
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--progress", default=None)
++    parser.add_argument("--work-dir", default=None)
++    parser.add_argument("--build-dir", default=None)
++    parser.add_argument("--hash-checkpoint", action="store_true")
++    parser.add_argument("--no-watchdog", action="store_true")
++    parser.add_argument("--abort-op-mib", type=int, default=None,
++                        help="host_reference 单算子预估物化超过该值时确定性中止")
++    parser.add_argument("--micro-benchmark-elements", type=int, default=0,
++                        help="S1 额外量测 host_reference 每元素成本（真实 AVX-512 artifact）")
++    parser.add_argument("--verbose", action="store_true")
++    return parser
++
++
++def main(argv: Optional[Sequence[str]] = None) -> int:
++    parser = build_parser()
++    args = parser.parse_args(argv)
++    if args.steps is None:
++        args.steps = PROMPT_STEPS[args.prompt]
++    progress = Progress(args.progress)
++    args.progress_obj = progress
++    started = time.time()
++    payload: Dict[str, Any] = {
++        "driver": "qwen35_weighted_execution_driver",
++        "driver_version": DRIVER_VERSION,
++        "stage": args.stage,
++        "argv": list(sys.argv[1:]),
++        "python": sys.version.split()[0],
++        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
++    }
++    try:
++        progress.emit("stage-start", stage=args.stage, backend=args.backend,
++                      prompt=args.prompt, steps=args.steps, past_length=args.past_length)
++        if args.stage == "preflight":
++            payload.update(stage_preflight(args))
++        elif args.stage == "boundary-audit":
++            payload.update(stage_boundary_audit(args))
++        elif args.stage == "s1":
++            payload.update(stage_s1(args))
++        elif args.stage == "s2":
++            payload.update(stage_s2(args))
++        elif args.stage == "s3":
++            payload.update(stage_s3(args))
++        elif args.stage == "s4":
++            payload.update(stage_s4(args))
++    except BudgetExceeded as exc:
++        payload["status"] = "BLOCKED"
++        payload["error"] = "BudgetExceeded: {}".format(exc)
++    except Exception as exc:  # noqa: BLE001 - driver 必须留下失败证据
++        payload["status"] = "FAIL"
++        payload["error"] = "{}: {}".format(type(exc).__name__, exc)
++        if args.verbose:
++            import traceback
++
++            payload["traceback"] = traceback.format_exc()
++    finally:
++        payload.setdefault("status", "FAIL")
++        payload["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++        payload["wall_seconds"] = round(time.time() - started, 3)
++        payload["rss_peak_mib"] = _maxrss_mib()
++        payload["cgroup_memory_peak_mib"] = _cgroup_mib("/memory.peak")
++        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
++        with open(args.output, "w", encoding="utf-8") as stream:
++            json.dump(payload, stream, ensure_ascii=False, sort_keys=True, indent=2)
++            stream.write("\n")
++        progress.emit("stage-end", status=payload["status"], output=args.output)
++        progress.close()
++    print(json.dumps({
++        "status": payload.get("status"),
++        "stage": args.stage,
++        "backend": args.backend,
++        "output": args.output,
++        "wall_seconds": payload.get("wall_seconds"),
++    }, ensure_ascii=False, sort_keys=True))
++    return 0 if payload.get("status") == "PASS" else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/python/tests/ut/pypto_x/qwen35_weighted_execution_evidence.py b/python/tests/ut/pypto_x/qwen35_weighted_execution_evidence.py
+new file mode 100644
+index 000000000..c2e9fab53
+--- /dev/null
++++ b/python/tests/ut/pypto_x/qwen35_weighted_execution_evidence.py
+@@ -0,0 +1,313 @@
++"""把 Qwen3.5-0.8B BF16 带权执行任务的各步原始证据装配成 ``validation.json``。
++
++只读各步 driver 产物与 resource 日志，输出单一结构化证据文件；不重新执行任何
++重活，也不改变任何结论。用法::
++
++    python3 python/tests/ut/pypto_x/qwen35_weighted_execution_evidence.py \\
++        --evidence-dir ../worktrees/_meta/pypto-x/qwen35-bf16-weighted-execution \\
++        --commit <sha> --output <evidence-dir>/validation.json
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import shutil
++from pathlib import Path
++from typing import Any, Dict, List, Mapping, Optional
++
++PROTOCOL = {
++    "task_name": "qwen35-bf16-weighted-execution",
++    "worktree": "/home/chiro/projects/pypto/worktrees/pypto-x/qwen35-bf16-weighted-execution",
++    "branch": "work/qwen35-bf16-weighted-execution",
++    "base": "port/pypto-x-integration @ a63105eef",
++    "started_at": "2026-09-10T08:35:00Z",
++    "smoke_once": True,
++    "wait_timeout_seconds": 3600,
++    "poll": False,
++    "resource_lock_root": "/home/chiro/projects/.resource-locks",
++    "local_heavy_policy": "locked",
++    "local_heavy_runner": "/home/chiro/projects/pypto/pypto_x/scripts/resource/run_local_heavy.sh",
++    "local_min_available_mib": 8192,
++    "local_safety_floor_mib": 4096,
++    "local_max_cpus": 6,
++}
++
++#: runtime 保留模型的源码证据（file:line 由 grep 核对）。
++RUNTIME_EVIDENCE = (
++    {
++        "file": "python/pypto/backends/cpu/x86/avx512.py",
++        "line": 962,
++        "symbol": "Avx512Runtime.launch",
++        "fact": "for operation, plan in zip(function.body.operations, loaded.target_ir.plans): "
++                "self._execute_operation(...) —— environment 字典在整个 launch 期间保留全部 SSA buffer，"
++                "没有任何 liveness/释放逻辑，因此峰值是所有中间值之和",
++    },
++    {
++        "file": "python/pypto/backends/cpu/x86/avx512.py",
++        "line": 265,
++        "symbol": "_reference_operation",
++        "fact": "raw = _buffer_values(value.buffer) —— host_reference 路径先把每个输入整块转成 Python list",
++    },
++    {
++        "file": "python/pypto/backends/cpu/x86/avx512.py",
++        "line": 283,
++        "symbol": "_reference_operation",
++        "fact": "results[output_ref.name] = _RuntimeValue(..., _buffer_from_values(dtype, data, ...)) "
++                "—— 参考路径输出再从 Python list 一次性拷回 buffer",
++    },
++    {
++        "file": "python/pypto/backends/cpu/x86/avx2.py",
++        "line": 366,
++        "symbol": "_buffer_values",
++        "fact": "return [_bf16_value(buffer.pointer[index]) for index in range(buffer.count)] "
++                "（float32 走第 373 行 [float(...)]) —— 逐元素 Python 物化，约 28 B/元素",
++    },
++    {
++        "file": "python/pypto/backends/cpu/x86/avx512.py",
++        "line": 111,
++        "symbol": "_buffer_values 绑定",
++        "fact": "_buffer_values = _avx2._buffer_values：AVX-512 直接复用 AVX2 的 list 物化实现",
++    },
++    {
++        "file": "python/pypto/backends/cpu/vector/runtime.py",
++        "line": 357,
++        "symbol": "CpuVectorRuntime._read_tensor",
++        "fact": "return [_cast_value(value, expected_dtype) for value in values] "
++                "—— vector-common 参考语义同样是 list 语义",
++    },
++    {
++        "file": "python/pypto/compiler/targets/cpu_avx512.py",
++        "line": 554,
++        "symbol": "_execution_metadata",
++        "fact": "cast/transpose/reshape/slice/split/concat/broadcast/where/compare/iota/embedding "
++                "在 AVX-512 明确登记为 host_reference；该边界写进 artifact metadata 并在 load 时校验",
++    },
++)
++
++
++def _read(path: Path) -> Optional[Mapping[str, Any]]:
++    if not path.is_file():
++        return None
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def _copy_resource_logs(evidence: Path) -> List[Mapping[str, Any]]:
++    source = Path("/home/chiro/projects/pypto/worktrees/_meta/pypto-x/resource-usage/"
++                  "qwen35-bf16-weighted-execution")
++    target = evidence / "resource-logs"
++    target.mkdir(parents=True, exist_ok=True)
++    copied = []
++    if source.is_dir():
++        for item in sorted(source.glob("*.log")):
++            shutil.copy2(item, target / item.name)
++            copied.append({"file": item.name, "nbytes": (target / item.name).stat().st_size})
++    return copied
++
++
++def build(evidence: Path, commit: str) -> Mapping[str, Any]:
++    preflight = _read(evidence / "preflight.json") or {}
++    boundary = _read(evidence / "boundary_audit.json") or {}
++    s1 = _read(evidence / "s1_avx512.json") or {}
++    control = _read(evidence / "s1_avx512_synthetic_test.json") or {}
++    s2 = _read(evidence / "s2_avx512_en.json") or {}
++    census = s1.get("census", {})
++    repair = boundary.get("repair_menu", {})
++    memory = boundary.get("memory_model", s1.get("memory_model", {}))
++    liveness = boundary.get("liveness_model", {})
++    largest = boundary.get("boundary", {}).get("largest_parameter_derived_operations", [])
++    benchmark = s1.get("micro_benchmark", {})
++
++    steps = [
++        {
++            "step": "S1 预演（合成权重，真实形状 T=5，AVX-512）",
++            "command": (
++                "scripts/resource/run_local_heavy.sh --task qwen35-bf16-weighted-execution "
++                "--agent qwen35-bf16-weighted-execution --memory-max-mib 8192 -- "
++                "env PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=python python3 "
++                "python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py --stage s1 "
++                "--backend avx512 --steps 5 --abort-op-mib 512 --micro-benchmark-elements 262144"
++            ),
++            "result_file": "s1_avx512.json",
++            "status": s1.get("status"),
++            "launch_error": s1.get("launch_error"),
++            "budget_watchdog_stop": s1.get("budget_watchdog_stop"),
++            "compile": {key: value for key, value in (s1.get("compile") or {}).items()
++                        if key not in ("native_operations", "host_reference_operations")},
++            "launch_seconds": s1.get("launch_seconds"),
++            "executed_operations": (s1.get("op_summary") or {}).get("executed_operations"),
++            "output_canary_intact": s1.get("output_canary_intact"),
++            "rss_peak_mib": s1.get("rss_peak_mib"),
++            "op_summary": {
++                key: value for key, value in (s1.get("op_summary") or {}).items()
++                if key != "by_operation"
++            },
++            "op_summary_note": "S1 的 op_summary 含 1 个 micro-benchmark 算子（cast），"
++                               "因此 executed_operations 比图内实际执行数多 1",
++        },
++        {
++            "step": "S2 真权重 prefill（en_continuation, T=5, AVX-512）",
++            "command": (
++                "... --stage s2 --backend avx512 --prompt en_continuation "
++                "--asset-dir <assets>/qwen35-0.8b/<revision> --abort-op-mib 512"
++            ),
++            "result_file": "s2_avx512_en.json",
++            "status": s2.get("status"),
++            "error": s2.get("error"),
++            "note": "父 agent 在 S1 证据后指示停止 S2；该次运行只用于确认真实权重"
++                    " 320/320 可零拷贝绑定，执行在同一个 host_reference 缺口处被守卫拦下",
++        },
++        {
++            "step": "小规模正向对照（synthetic_test 等价拓扑，AVX-512）",
++            "command": (
++                "... --stage s1 --backend avx512 --shape-profile synthetic_test --steps 5"
++            ),
++            "result_file": "s1_avx512_synthetic_test.json",
++            "status": control.get("status"),
++            "compile": {key: value for key, value in (control.get("compile") or {}).items()
++                        if key not in ("native_operations", "host_reference_operations")},
++            "launch_seconds": control.get("launch_seconds"),
++            "executed_operations": (control.get("op_summary") or {}).get("executed_operations"),
++            "output_canary_intact": control.get("output_canary_intact"),
++            "note": "只证明 driver + AVX-512 runtime 在小 shape 下可完整执行；"
++                    "不构成任何 Qwen 正确性结论",
++        },
++        {
++            "step": "RoPE 独立复算校验（preflight）",
++            "command": "... --stage preflight --hash-checkpoint",
++            "result_file": "preflight.json",
++            "status": preflight.get("status"),
++            "rope_verification": preflight.get("rope_verification"),
++            "gold_dtype_band": preflight.get("gold_dtype_band"),
++        },
++        {
++            "step": "逐算子边界与修复菜单审计",
++            "command": "... --stage boundary-audit --steps 5",
++            "result_file": "boundary_audit.json",
++            "status": boundary.get("status"),
++        },
++    ]
++
++    payload: Dict[str, Any] = {
++        "task": "qwen35-bf16-weighted-execution",
++        "status": "BLOCKED_CAPABILITY",
++        "status_meaning": (
++            "driver、绑定、审计与 RoPE 都跑通了；真实权重整网执行被 AVX-512/scalar runtime 的"
++            " host_reference 能力缺口阻塞，不是绑定缺陷、不是数值不匹配，也不是接口签名错误"
++        ),
++        "protocol": PROTOCOL,
++        "commit": commit,
++        "real_weights_executed": False,
++        "real_weights_bound": bool((s2.get("binding") or {}).get("mapped_count") == 320
++                                   or ((preflight.get("weight_mapping") or {}).get("mapped_count") == 320)),
++        "backends": {
++            "avx512": "编译通过（6,710 plans），真实形状执行被 host_reference 缺口阻塞",
++            "scalar/avx2/sve256": "同一 host_reference 实现（scalar 参考语义同为 list），未单独执行",
++            "cuda/hip": "本轮未使用（GPU-only 执行与本任务 CPU 目标无关）",
++        },
++        "artifacts": {
++            "checkpoint": {
++                "path": (preflight.get("weight_mapping") or {}).get("checkpoint_path"),
++                "nbytes": (preflight.get("weight_mapping") or {}).get("checkpoint_nbytes"),
++                "sha256": (preflight.get("weight_mapping") or {}).get("checkpoint_sha256"),
++                "mapped_parameters": (preflight.get("weight_mapping") or {}).get("mapped_count"),
++                "parameter_count": (preflight.get("weight_mapping") or {}).get("parameter_count"),
++                "tied": (preflight.get("weight_mapping") or {}).get("tied"),
++                "excluded": (preflight.get("weight_mapping") or {}).get("excluded"),
++                "layout_digest": (preflight.get("weight_layout") or {}).get("layout_digest"),
++                "layout_regions": (preflight.get("weight_layout") or {}).get("region_count"),
++                "layout_total_nbytes": (preflight.get("weight_layout") or {}).get("total_nbytes"),
++                "conversion_max_relative_error": (preflight.get("weight_layout") or {}).get(
++                    "conversion_max_relative_error"
++                ),
++            },
++            "gold_reference": {
++                "prompt": "en_continuation",
++                "input_ids": ((preflight.get("gold") or {}).get("input_ids")),
++                "keys": ((preflight.get("gold") or {}).get("keys")),
++            },
++        },
++        "graph": {
++            "profile": "model",
++            "steps": 5,
++            "past_length": 0,
++            "graph_digest": census.get("graph_digest"),
++            "operation_total": census.get("operation_total"),
++            "host_reference_operations": census.get("host_reference_count"),
++            "parameters": census.get("parameter_count"),
++            "states": census.get("state_count"),
++            "packed_layout_nbytes": census.get("packed_layout_nbytes"),
++            "intermediate_bytes": census.get("intermediate_bytes_retained_by_runtime"),
++            "intermediate_by_dtype": census.get("intermediate_by_dtype"),
++        },
++        "memory": {
++            "cgroup_cap_mib": 8192,
++            "peak_mib_runtime_retains_everything": memory.get(
++                "peak_mib_if_runtime_retains_everything"
++            ),
++            "peak_mib_with_current_host_reference_path": memory.get(
++                "peak_mib_with_current_host_reference_path"
++            ),
++            "peak_mib_with_liveness_release": liveness.get("peak_mib_with_liveness_release"),
++            "peak_at_operation": liveness.get("peak_operation"),
++            "measured_peak_rss_mib_s1": s1.get("rss_peak_mib"),
++            "measurement_note": "S1 在 op #4 被 --abort-op-mib 守卫拦下，因此 RSS 只到 1.7 GiB；"
++                                "峰值由 census 推导并由 micro-benchmark 校准",
++        },
++        "timings": {
++            "lower_seconds": (s1.get("compile") or {}).get("lower_seconds"),
++            "compile_seconds": (s1.get("compile") or {}).get("compile_seconds"),
++            "artifact_nbytes": (s1.get("compile") or {}).get("artifact_nbytes"),
++            "plan_count": (s1.get("compile") or {}).get("plan_count"),
++            "launch_seconds_before_guard": s1.get("launch_seconds"),
++            "micro_benchmark": benchmark,
++        },
++        "boundaries": {
++            "host_reference_largest_operations": largest,
++            "runtime_retention_evidence": list(RUNTIME_EVIDENCE),
++            "repair_menu": repair,
++            "route_forward": (
++                "AVX-512 原生只覆盖 identity/add/sub/mul/div/neg/matmul/reduce_*/exp/rsqrt/"
++                "sigmoid/silu/softplus；cast/transpose/reshape/slice/split/concat/broadcast/"
++                "where/compare/iota/embedding 全部走 host_reference"
++            ),
++        },
++        "steps": steps,
++        "not_done": [
++            "真实权重整网前向（阻塞，见 boundaries）",
++            "decode 4 步与 gold decode_logits 对齐（未开始：prefill 未跑通）",
++            "S4 逐层 bisect（未开始；且仓库没有 per-layer 子图构造器）",
++            "W8A8 量化路径",
++            "CUDA/HIP 执行",
++            "任何性能门槛结论",
++        ],
++        "risks": [
++            "S1 的 6,710 plans / 6.53 GB 中间值来自 shape_profile=model 的固定图，不是可调参数",
++            "host_reference list 物化是 AVX-512 与 scalar 参考语义的共同实现，换 CPU 后端不能绕过",
++            "只做 (a)（native cast/transpose/embedding）时峰值 7,660 MiB 仍占 8 GiB cgroup 的 93.5%，"
++            "没有给解释器/ELF/mmap 留余量，必须与 (b) 一起做",
++        ],
++    }
++    payload["resource_logs_copied"] = _copy_resource_logs(evidence)
++    return payload
++
++
++def main(argv: Optional[List[str]] = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--evidence-dir", required=True)
++    parser.add_argument("--commit", required=True)
++    parser.add_argument("--output", default=None)
++    args = parser.parse_args(argv)
++    evidence = Path(args.evidence_dir)
++    payload = build(evidence, args.commit)
++    output = Path(args.output) if args.output else evidence / "validation.json"
++    output.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
++                      encoding="utf-8")
++    print(json.dumps({"status": payload["status"], "output": str(output),
++                      "real_weights_executed": payload["real_weights_executed"]},
++                     ensure_ascii=False, sort_keys=True))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

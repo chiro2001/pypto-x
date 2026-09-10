@@ -78,6 +78,13 @@ references/               外部公开资料离线副本
 ../worktrees/             linked worktree 与全部证据目录（_meta），**不在本仓**
 ```
 
+## 许可证
+
+- 本仓自有内容（docs/configs/scripts/patches）使用 **Apache License 2.0**，全文见 [`LICENSE`](LICENSE)；
+- `upstream/*` 是固定 commit 的 submodule 引用，各随其上游许可证（含 CANN OSL 2.0），本仓不含上游源码；
+- **实现补丁**发布在 [`patches/`](patches/README.md)：补丁文本以 Apache-2.0 提供，但应用后的衍生作品仍受上游
+  CANN OSL 2.0 约束（含处理器适用范围条款）。详见 [`NOTICE`](NOTICE)。
+
 ## 公开镜像与发布
 
 ```text
@@ -85,6 +92,7 @@ references/               外部公开资料离线副本
 公开主仓  chiro2001/pypto-x          由脚本从私有仓生成：历史中剔除 references/*.pdf|*.html|*.txt，
                                     并在 references/README.md 标注"公开镜像不再分发"
 生成脚本  scripts/remote/publish_public_mirror.sh [--repo <owner/name>] [--dry-run]
+补丁导出  scripts/remote/export_patches.sh [<base-sha>] [<branch>]   → patches/pypto-x/*.patch + SERIES
 ```
 
 发布纪律：**推送到公开仓属于对外发布动作，需用户明确指示**；脚本默认只做 dry-run 之外的 force-push 到公开仓，绝不改私有仓历史。

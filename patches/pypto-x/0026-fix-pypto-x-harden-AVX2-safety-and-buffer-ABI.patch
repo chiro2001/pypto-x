@@ -1,0 +1,1300 @@
+From 976bd87f2e7259f657faeef8c14b2e9c9a567872 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Mon, 7 Sep 2026 04:21:00 +0800
+Subject: [PATCH 26/96] fix(pypto-x): harden AVX2 safety and buffer ABI
+
+---
+ python/pypto/backends/cpu/__init__.py              |   2 +
+ python/pypto/backends/cpu/x86/__init__.py          |   2 +
+ python/pypto/backends/cpu/x86/avx2.py              | 248 ++++++++++++++++++++----
+ python/pypto/compiler/targets/cpu_avx2.py          | 162 ++++++++++++----
+ python/pypto/lowering/cpu/x86/avx2/capabilities.py |   3 +-
+ python/pypto/lowering/cpu/x86/avx2/lowering.py     |  22 ++-
+ python/tests/ut/pypto_x/test_cpu_avx2.py           | 416 +++++++++++++++++++++++++++++++++++++++--
+ 7 files changed, 768 insertions(+), 87 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/__init__.py b/python/pypto/backends/cpu/__init__.py
+index a1b880b19..12399ed05 100644
+--- a/python/pypto/backends/cpu/__init__.py
++++ b/python/pypto/backends/cpu/__init__.py
+@@ -14,6 +14,7 @@ from .tensor import FlatBuffer, HostTensor
+ from .x86 import (
+     Avx2Runtime,
+     CpuAvx2ArtifactError,
++    CpuAvx2Backend,
+     CpuAvx2ExecutionError,
+     CpuAvx2FeatureMismatchError,
+     CpuAvx2RuntimeError,
+@@ -29,6 +30,7 @@ __all__ = [
+     "CpuScalarRuntime",
+     "Avx2Runtime",
+     "CpuAvx2ArtifactError",
++    "CpuAvx2Backend",
+     "CpuAvx2ExecutionError",
+     "CpuAvx2FeatureMismatchError",
+     "CpuAvx2RuntimeError",
+diff --git a/python/pypto/backends/cpu/x86/__init__.py b/python/pypto/backends/cpu/x86/__init__.py
+index 8db7dff2e..23888bb60 100644
+--- a/python/pypto/backends/cpu/x86/__init__.py
++++ b/python/pypto/backends/cpu/x86/__init__.py
+@@ -5,6 +5,7 @@ from .avx2 import (
+     CPUAVX2Runtime,
+     CPUAvx2Runtime,
+     CpuAvx2ArtifactError,
++    CpuAvx2Backend,
+     CpuAvx2ExecutionError,
+     CpuAvx2FeatureMismatchError,
+     CpuAvx2RuntimeError,
+@@ -18,6 +19,7 @@ __all__ = [
+     "CPUAVX2Runtime",
+     "CPUAvx2Runtime",
+     "CpuAvx2ArtifactError",
++    "CpuAvx2Backend",
+     "CpuAvx2ExecutionError",
+     "CpuAvx2FeatureMismatchError",
+     "CpuAvx2RuntimeError",
+diff --git a/python/pypto/backends/cpu/x86/avx2.py b/python/pypto/backends/cpu/x86/avx2.py
+index 3de3e6419..683b13f0a 100644
+--- a/python/pypto/backends/cpu/x86/avx2.py
++++ b/python/pypto/backends/cpu/x86/avx2.py
+@@ -12,11 +12,13 @@ import ctypes
+ from dataclasses import dataclass
+ import hashlib
+ import math
++from pathlib import Path
+ import struct
+ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+ 
+ from pypto.abi import Availability, LaunchRequest, TensorDesc
+-from pypto.compiler.artifact import Artifact
++from pypto.compiler.artifact import ABI_VERSION, Artifact
++from pypto.compiler.targets.cpu_avx2 import DEFAULT_ARTIFACT_FORMAT
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation
+ from pypto.lowering.cpu import (
+     canonical_dtype,
+@@ -65,6 +67,19 @@ class CpuAvx2ExecutionError(CpuAvx2RuntimeError):
+     """A launch request or native operation is invalid."""
+ 
+ 
++class CpuAvx2FeatureMismatchError(CpuVectorFeatureMismatchError):
++    """The artifact requires features absent from the selected host contract."""
++
++    def __init__(self, mismatch: Any):
++        super().__init__(mismatch)
++        self.status = Availability.no(
++            AVX2_BACKEND,
++            "required AVX2 artifact features are unavailable",
++            "missing_cpu_features",
++            mismatch.to_dict(),
++        )
++
++
+ @dataclass(frozen=True)
+ class _NativeBuffer:
+     dtype: str
+@@ -133,6 +148,83 @@ def _address_value(value: Any) -> Optional[int]:
+     return None
+ 
+ 
++def _array_interface_buffer(
++    storage: Any,
++    descriptor: TensorDesc,
++    expected_dtype: str,
++    context: str,
++) -> Optional[_NativeBuffer]:
++    """Validate and expose a C-contiguous ``__array_interface__`` buffer."""
++
++    interface = getattr(storage, "__array_interface__", None)
++    if not isinstance(interface, Mapping):
++        return None
++    shape = interface.get("shape")
++    if shape is None:
++        raise CpuAvx2ExecutionError("{} array interface must provide shape".format(context))
++    try:
++        actual_shape = tuple(int(dimension) for dimension in shape)
++    except (TypeError, ValueError) as exc:
++        raise CpuAvx2ExecutionError("{} array interface shape is invalid".format(context)) from exc
++    if actual_shape != descriptor.shape:
++        raise CpuAvx2ExecutionError(
++            "{} array interface shape {} does not match descriptor {}".format(
++                context, actual_shape, descriptor.shape
++            )
++        )
++    typestr = interface.get("typestr")
++    if not isinstance(typestr, str) or len(typestr) < 2:
++        raise CpuAvx2ExecutionError("{} array interface typestr is missing".format(context))
++    try:
++        itemsize = int(typestr[2:])
++    except ValueError as exc:
++        raise CpuAvx2ExecutionError("{} array interface itemsize is invalid".format(context)) from exc
++    kind = typestr[1]
++    if expected_dtype == "float32":
++        dtype_match = kind == "f" and itemsize == 4
++    else:
++        # NumPy has no universally available BF16 dtype.  Accept uint16 or
++        # a two-byte void representation, but never silently reinterpret f32.
++        dtype_match = kind in ("u", "V") and itemsize == 2
++    if not dtype_match:
++        raise CpuAvx2ExecutionError(
++            "{} array interface dtype {} does not match {}".format(context, typestr, expected_dtype)
++        )
++    expected_strides = _contiguous_byte_strides(actual_shape, itemsize)
++    strides = interface.get("strides")
++    if strides is not None:
++        try:
++            actual_strides = tuple(int(stride) for stride in strides)
++        except (TypeError, ValueError) as exc:
++            raise CpuAvx2ExecutionError("{} array interface strides are invalid".format(context)) from exc
++        if actual_strides != expected_strides:
++            raise CpuAvx2ExecutionError("{} array interface must be C-contiguous".format(context))
++    data = interface.get("data")
++    if not isinstance(data, (tuple, list)) or not data:
++        raise CpuAvx2ExecutionError("{} array interface data is missing".format(context))
++    try:
++        address = int(data[0] or 0)
++    except (TypeError, ValueError) as exc:
++        raise CpuAvx2ExecutionError("{} array interface address is invalid".format(context)) from exc
++    actual_readonly = bool(data[1]) if len(data) > 1 else False
++    if actual_readonly and not descriptor.readonly:
++        raise CpuAvx2ExecutionError("{} array interface is read-only but descriptor is writable".format(context))
++    count = descriptor.element_count
++    if count and address == 0:
++        raise CpuAvx2ExecutionError("{} array interface has a null address".format(context))
++    pointer = ctypes.cast(address, _pointer(expected_dtype))
++    return _NativeBuffer(expected_dtype, count, pointer, storage, True)
++
++
++def _contiguous_byte_strides(shape: Sequence[int], itemsize: int) -> Tuple[int, ...]:
++    strides = [itemsize] * len(shape)
++    running = itemsize
++    for index in range(len(shape) - 1, -1, -1):
++        strides[index] = running
++        running *= shape[index]
++    return tuple(strides)
++
++
+ def _flat_storage(storage: Any, context: str) -> List[Any]:
+     if isinstance(storage, HostTensor):
+         return list(storage.data)
+@@ -191,14 +283,22 @@ def _buffer_from_descriptor(descriptor: TensorDesc, value_type: CoreType, contex
+         pointer = ctypes.cast(address, _pointer(expected_dtype))
+         return _NativeBuffer(expected_dtype, descriptor.element_count, pointer, None, True)
+     storage = descriptor.storage
+-    array_interface = getattr(storage, "__array_interface__", None)
+-    if isinstance(array_interface, Mapping):
+-        data = array_interface.get("data")
+-        if isinstance(data, (tuple, list)) and data and data[0]:
+-            pointer = ctypes.cast(int(data[0]), _pointer(expected_dtype))
+-            return _NativeBuffer(expected_dtype, descriptor.element_count, pointer, storage, True)
++    array_buffer = _array_interface_buffer(storage, descriptor, expected_dtype, context)
++    if array_buffer is not None:
++        return array_buffer
+     if isinstance(storage, ctypes.Array):
+-        pointer = ctypes.cast(ctypes.addressof(storage), _pointer(expected_dtype))
++        required_bytes = descriptor.nbytes
++        available_bytes = ctypes.sizeof(storage)
++        if required_bytes is not None and available_bytes < required_bytes:
++            raise CpuAvx2ExecutionError(
++                "{} ctypes.Array has {} bytes but descriptor requires {}".format(
++                    context, available_bytes, required_bytes
++                )
++            )
++        if descriptor.element_count == 0:
++            pointer = ctypes.cast(0, _pointer(expected_dtype))
++        else:
++            pointer = ctypes.cast(ctypes.addressof(storage), _pointer(expected_dtype))
+         return _NativeBuffer(expected_dtype, descriptor.element_count, pointer, storage, True)
+     values = _flat_storage(storage, context)
+     expected_count = element_count(expected_shape)
+@@ -238,6 +338,15 @@ def _write_descriptor(descriptor: TensorDesc, buffer: _NativeBuffer, value_type:
+             )
+         return
+     storage = descriptor.storage
++    array_destination = _array_interface_buffer(storage, descriptor, expected_dtype, context)
++    if array_destination is not None:
++        if array_destination.count:
++            ctypes.memmove(
++                ctypes.addressof(array_destination.pointer.contents),
++                ctypes.addressof(buffer.pointer.contents),
++                array_destination.count * ctypes.sizeof(_ctype(expected_dtype)),
++            )
++        return
+     if isinstance(storage, ctypes.Array):
+         destination = _buffer_from_descriptor(descriptor, value_type, context)
+         if destination.count:
+@@ -399,11 +508,24 @@ def _decode_artifact(artifact: Artifact, available: CpuFeatureSet, capability: A
+         raise CpuAvx2ArtifactError("artifact validation failed: {}".format(exc)) from exc
+     if artifact.path is None:
+         raise CpuAvx2ArtifactError("AVX2 artifact must reference a native shared object path")
++    if artifact.format != DEFAULT_ARTIFACT_FORMAT:
++        raise CpuAvx2ArtifactError(
++            "unsupported AVX2 artifact format {!r}".format(artifact.format)
++        )
++    if artifact.abi_version != ABI_VERSION:
++        raise CpuAvx2ArtifactError("unsupported AVX2 artifact ABI {!r}".format(artifact.abi_version))
++    if artifact.target.kind != "cpu" or not artifact.target.triple.startswith(("x86_64", "amd64")):
++        raise CpuAvx2ArtifactError("AVX2 artifact target must be x86_64 CPU")
+     metadata = mapping_copy(artifact.metadata)
+     if metadata.get("backend") != AVX2_BACKEND:
+         raise CpuAvx2ArtifactError("artifact backend metadata is not cpu.avx2")
+     if metadata.get("native_isa") != "avx2" or metadata.get("native_format") != "elf-shared-object":
+         raise CpuAvx2ArtifactError("artifact native format is not an AVX2 shared object")
++    compile_command = metadata.get("compile_command")
++    if not isinstance(compile_command, (list, tuple)) or not compile_command:
++        raise CpuAvx2ArtifactError("AVX2 compile_command metadata is missing")
++    if not str(compile_command[0]).lower().startswith("clang") or "-mavx2" not in compile_command:
++        raise CpuAvx2ArtifactError("AVX2 artifact was not compiled by the required Clang AVX2 command")
+     with open(artifact.path, "rb") as native_file:
+         actual_digest = hashlib.sha256(native_file.read()).hexdigest()
+     if actual_digest != artifact.content_digest or metadata.get("native_digest") != actual_digest:
+@@ -425,6 +547,13 @@ def _decode_artifact(artifact: Artifact, available: CpuFeatureSet, capability: A
+         required_data.get("features", ()),
+         source=required_data.get("source", metadata.get("required_feature_source", "artifact")),
+     )
++    required_names = set(required.features)
++    if not {"avx", "avx2", "osxsave", "ymm"}.issubset(required_names):
++        raise CpuAvx2ArtifactError("AVX2 artifact required_features omit AVX/YMM safety fields")
++    if metadata.get("use_fma") and "fma" not in required_names:
++        raise CpuAvx2ArtifactError("FMA artifact required_features omit fma")
++    if not metadata.get("use_fma") and "fma" in required_names:
++        raise CpuAvx2ArtifactError("non-FMA artifact must not require fma")
+     try:
+         program = CoreProgram.from_dict(program_data)
+         target_ir = lower_avx2(
+@@ -455,12 +584,37 @@ def _decode_artifact(artifact: Artifact, available: CpuFeatureSet, capability: A
+     mismatch = CpuFeatureContract(required, available)
+     try:
+         mismatch.validate()
+-    except CpuVectorFeatureMismatchError:
+-        raise
++    except CpuVectorFeatureMismatchError as exc:
++        raise CpuAvx2FeatureMismatchError(exc.mismatch) from exc
++    use_fma = bool(metadata.get("use_fma"))
++    expected_variant = "avx2-fma" if use_fma else "avx2"
++    expected_mask = 1 | 2 | 4 | 8 | (16 if use_fma else 0)
++    if metadata.get("native_variant") != expected_variant:
++        raise CpuAvx2ArtifactError("AVX2 native variant metadata is inconsistent")
++    if metadata.get("native_feature_mask") != expected_mask:
++        raise CpuAvx2ArtifactError("AVX2 native feature mask metadata is inconsistent")
++    command_has_fma = "-mfma" in compile_command
++    if command_has_fma != use_fma:
++        raise CpuAvx2ArtifactError("AVX2 compile command and FMA metadata disagree")
++    if compile_command[-1] != Path(artifact.path).name:
++        raise CpuAvx2ArtifactError("AVX2 compile command is not bound to artifact path")
++    if "clang" not in str(metadata.get("compiler_version", "")).lower():
++        raise CpuAvx2ArtifactError("AVX2 compiler metadata is not Clang")
+     try:
+         module = ctypes.CDLL(artifact.path)
+     except OSError as exc:
+         raise CpuAvx2ArtifactError("could not load AVX2 shared object: {}".format(exc)) from exc
++    try:
++        native_variant = ctypes.c_char_p.in_dll(module, "ptx_avx2_variant").value.decode("ascii")
++        native_source_digest = ctypes.c_char_p.in_dll(module, "ptx_avx2_source_digest").value.decode("ascii")
++        native_feature_mask = ctypes.c_uint.in_dll(module, "ptx_avx2_feature_mask").value
++        native_abi = ctypes.c_char_p.in_dll(module, "ptx_avx2_abi").value.decode("ascii")
++    except (AttributeError, TypeError, UnicodeDecodeError, ValueError) as exc:
++        raise CpuAvx2ArtifactError("AVX2 native safety marker is missing or malformed") from exc
++    if native_variant != expected_variant or metadata.get("native_source_digest") != native_source_digest:
++        raise CpuAvx2ArtifactError("AVX2 native variant/source marker does not match metadata")
++    if native_feature_mask != expected_mask or native_abi != "pypto-x.cpu.avx2:1":
++        raise CpuAvx2ArtifactError("AVX2 native safety marker does not match ABI metadata")
+     return LoadedAvx2Artifact(artifact, target_ir, mismatch, module)
+ 
+ 
+@@ -477,33 +631,18 @@ class Avx2Runtime:
+     ) -> None:
+         if capability is not None and available_features is not None:
+             raise ValueError("capability and available_features are aliases; pass only one")
++        injected = capability is not None or available_features is not None
++        self._probe_directory = probe_directory
+         if capability is None and available_features is None:
+             try:
+                 capability = _capabilities.probe_avx2_capabilities(directory=probe_directory)
+             except Exception as exc:
+-                capability = Avx2Capability(
+-                    False,
+-                    (),
+-                    "cpuid+osxsave+xgetbv",
+-                    "probe_failed",
+-                    str(exc),
+-                    "clang",
+-                    "unknown",
+-                    0,
+-                    0,
+-                    0,
+-                    0,
+-                    0,
+-                    False,
+-                    False,
+-                    False,
+-                    False,
+-                    False,
+-                    False,
+-                )
++                capability = self._probe_failure(str(exc))
+         elif capability is None:
+             capability = Avx2Capability.injected_capability(available_features, source="injected")
+         self.capability = capability
++        self._injected = injected
++        self._real_capability = None if injected else capability
+         self.available_features = CpuFeatureSet(capability.features, source=capability.source)
+         if capability.available:
+             self._status = Availability.yes(self.name)
+@@ -515,6 +654,51 @@ class Avx2Runtime:
+                 capability.to_dict(),
+             )
+ 
++    @staticmethod
++    def _probe_failure(reason: str) -> Avx2Capability:
++        return Avx2Capability(
++            False,
++            (),
++            "cpuid+osxsave+xgetbv",
++            "probe_failed",
++            reason,
++            "clang",
++            "unknown",
++            0,
++            0,
++            0,
++            0,
++            0,
++            False,
++            False,
++            False,
++            False,
++            False,
++            False,
++        )
++
++    def _probe_real_capability(self) -> Avx2Capability:
++        if self._real_capability is None:
++            try:
++                self._real_capability = _capabilities.probe_avx2_capabilities(
++                    directory=self._probe_directory
++                )
++            except Exception as exc:
++                self._real_capability = self._probe_failure(str(exc))
++        return self._real_capability
++
++    def _require_real_capability(self) -> Avx2Capability:
++        capability = self._probe_real_capability()
++        if not capability.available:
++            status = Availability.no(
++                self.name,
++                capability.reason or "real CPUID/XGETBV capability is unavailable",
++                "real_capability_unavailable",
++                capability.to_dict(),
++            )
++            raise CpuAvx2UnavailableError(status)
++        return capability
++
+     def availability(self) -> Availability:
+         return self._status
+ 
+@@ -540,11 +724,12 @@ class Avx2Runtime:
+             raise CpuAvx2ExecutionError("AVX2 launch requires LaunchRequest")
+         if not self.is_available():
+             raise CpuAvx2UnavailableError(self._status)
++        real_capability = self._require_real_capability()
+         try:
+             request.validate()
+         except Exception as exc:
+             raise CpuAvx2ExecutionError("invalid LaunchRequest: {}".format(exc)) from exc
+-        loaded = self.load(request.artifact)
++        loaded = self.load(request.artifact, available_features=real_capability.features)
+         target = loaded.target_ir.target
+         if target.kind != "cpu" or not target.triple.startswith(("x86_64", "amd64")):
+             raise CpuAvx2ExecutionError("AVX2 artifact target must be x86_64 CPU")
+@@ -733,7 +918,6 @@ class Avx2Runtime:
+ CpuAvx2Backend = Avx2Runtime
+ CPUAVX2Runtime = Avx2Runtime
+ CPUAvx2Runtime = Avx2Runtime
+-CpuAvx2FeatureMismatchError = CpuVectorFeatureMismatchError
+ 
+ 
+ def launch_avx2(request: LaunchRequest, available_features: Any = None) -> Tuple[Any, ...]:
+diff --git a/python/pypto/compiler/targets/cpu_avx2.py b/python/pypto/compiler/targets/cpu_avx2.py
+index 9ced9307e..79cccb97d 100644
+--- a/python/pypto/compiler/targets/cpu_avx2.py
++++ b/python/pypto/compiler/targets/cpu_avx2.py
+@@ -8,6 +8,7 @@ import os
+ from pathlib import Path
+ import shutil
+ import subprocess
++import tempfile
+ from typing import Any, Mapping, Optional
+ 
+ from pypto.compiler.api import CompileOptions
+@@ -35,6 +36,20 @@ _NATIVE_SOURCE = r'''
+ #ifndef PTX_USE_FMA
+ #define PTX_USE_FMA 0
+ #endif
++#ifndef PTX_VARIANT
++#define PTX_VARIANT "avx2"
++#endif
++#ifndef PTX_SOURCE_DIGEST
++#define PTX_SOURCE_DIGEST "unknown"
++#endif
++#ifndef PTX_FEATURE_MASK
++#define PTX_FEATURE_MASK 0U
++#endif
++
++__attribute__((visibility("default"))) const char *ptx_avx2_variant = PTX_VARIANT;
++__attribute__((visibility("default"))) const char *ptx_avx2_source_digest = PTX_SOURCE_DIGEST;
++__attribute__((visibility("default"))) const unsigned int ptx_avx2_feature_mask = PTX_FEATURE_MASK;
++__attribute__((visibility("default"))) const char *ptx_avx2_abi = "pypto-x.cpu.avx2:1";
+ 
+ static inline __m256 ptx_binary_f32(int op, __m256 a, __m256 b) {
+     if (op == 0) return _mm256_add_ps(a, b);
+@@ -170,7 +185,7 @@ void ptx_avx2_reduce_sum_f32(const float *input, float *output, size_t n) {
+ 
+ __attribute__((visibility("default")))
+ void ptx_avx2_reduce_max_f32(const float *input, float *output, size_t n) {
+-    size_t i = 0;
++    size_t i = 0, vector_end;
+     float lanes[8];
+     __m256 accumulator;
+     if (n == 0) return;
+@@ -180,12 +195,14 @@ void ptx_avx2_reduce_max_f32(const float *input, float *output, size_t n) {
+         return;
+     }
+     accumulator = _mm256_loadu_ps(input);
+-    i = 8;
+-    for (; i + 8 <= n; i += 8) accumulator = _mm256_max_ps(accumulator, _mm256_loadu_ps(input + i));
++    vector_end = n - (n % 8);
++    for (i = 8; i < vector_end; i += 8) {
++        accumulator = _mm256_max_ps(accumulator, _mm256_loadu_ps(input + i));
++    }
+     _mm256_storeu_ps(lanes, accumulator);
+     *output = lanes[0];
+-    for (i = 1; i < 8 && i < n; ++i) if (lanes[i] > *output) *output = lanes[i];
+-    for (; i < n; ++i) if (input[i] > *output) *output = input[i];
++    for (i = 1; i < 8; ++i) if (lanes[i] > *output) *output = lanes[i];
++    for (i = vector_end; i < n; ++i) if (input[i] > *output) *output = input[i];
+ }
+ 
+ __attribute__((visibility("default")))
+@@ -306,25 +323,77 @@ def _build_directory(options: Optional[CompileOptions]) -> Path:
+     extra = {} if options is None else mapping_copy(options.extra)
+     selected = extra.get("build_dir") or os.environ.get("PYPTO_X_AVX2_BUILD_DIR")
+     if selected is None:
+-        selected = os.path.join(os.environ.get("TMPDIR", "/tmp"), "pypto-x-avx2")
++        selected = tempfile.mkdtemp(prefix="pypto-x-avx2-", dir=os.environ.get("TMPDIR") or None)
+     path = Path(os.fspath(selected)).resolve()
+     path.mkdir(parents=True, exist_ok=True)
+     (path / "tmp").mkdir(parents=True, exist_ok=True)
+     return path
+ 
+ 
++def _artifact_directory(options: Optional[CompileOptions], build_dir: Path) -> Path:
++    extra = {} if options is None else mapping_copy(options.extra)
++    selected = extra.get("artifact_dir") or os.environ.get("PYPTO_X_AVX2_ARTIFACT_DIR")
++    if selected is None:
++        selected = build_dir / "artifacts"
++    path = Path(os.fspath(selected)).resolve()
++    path.mkdir(parents=True, exist_ok=True)
++    return path
++
++
++def _native_source(target_ir: Avx2Program) -> tuple:
++    feature_mask = 1 | 2 | 4 | 8 | (16 if target_ir.use_fma else 0)
++    contract = "pypto-x.cpu.avx2.native.v1\n{}\nuse_fma={}\n".format(
++        _NATIVE_SOURCE, int(target_ir.use_fma)
++    )
++    source_digest = hashlib.sha256(contract.encode("utf-8")).hexdigest()
++    prefix = (
++        "#define PTX_USE_FMA {}\n"
++        "#define PTX_VARIANT \"{}\"\n"
++        "#define PTX_SOURCE_DIGEST \"{}\"\n"
++        "#define PTX_FEATURE_MASK {}U\n"
++    ).format(1 if target_ir.use_fma else 0, "avx2-fma" if target_ir.use_fma else "avx2", source_digest, feature_mask)
++    return prefix + _NATIVE_SOURCE, source_digest, feature_mask
++
++
++def _compiler_info(compiler_path: str) -> tuple:
++    version_result = subprocess.run(
++        [compiler_path, "--version"],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        universal_newlines=True,
++        check=False,
++    )
++    compiler_version = (version_result.stdout.splitlines() or [compiler_path])[0].strip()
++    if "clang" not in compiler_version.lower():
++        raise Avx2CompileError("AVX2 requires a real Clang compiler, got {!r}".format(compiler_version))
++    triple_result = subprocess.run(
++        [compiler_path, "-print-target-triple"],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        universal_newlines=True,
++        check=False,
++    )
++    return compiler_version, triple_result.stdout.strip() or "unknown"
++
++
+ def _compile_native(target_ir: Avx2Program, options: Optional[CompileOptions]) -> tuple:
+     extra = {} if options is None else mapping_copy(options.extra)
+-    compiler = str(extra.get("clang") or os.environ.get("CC") or "clang")
++    compiler = str(extra.get("clang") or "clang")
++    compiler_name = Path(compiler).name.lower()
++    if not compiler_name.startswith("clang"):
++        raise Avx2CompileError("AVX2 requires Clang; refusing compiler {!r}".format(compiler))
+     compiler_path = shutil.which(compiler) or compiler
+     if not shutil.which(compiler_path) and not Path(compiler_path).is_file():
+         raise Avx2CompileError("Clang compiler {!r} was not found".format(compiler))
++    compiler_version, target_triple = _compiler_info(compiler_path)
+     build_dir = _build_directory(options)
+-    source = ("#define PTX_USE_FMA {}\n".format(1 if target_ir.use_fma else 0)) + _NATIVE_SOURCE
+-    source_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
++    artifact_dir = _artifact_directory(options, build_dir)
++    source, source_digest, feature_mask = _native_source(target_ir)
+     stem = "pypto_x_avx2_{}".format(source_digest[:20])
+-    source_path = build_dir / (stem + ".c")
+-    output_path = build_dir / (stem + ".so")
++    temporary_dir = build_dir / "tmp"
++    temporary_dir.mkdir(parents=True, exist_ok=True)
++    source_path = temporary_dir / (stem + ".c")
++    temporary_output = temporary_dir / (stem + ".so")
+     source_path.write_text(source, encoding="utf-8")
+     command = [
+         compiler_path,
+@@ -336,7 +405,7 @@ def _compile_native(target_ir: Avx2Program, options: Optional[CompileOptions]) -
+     ]
+     if target_ir.use_fma:
+         command.append("-mfma")
+-    command.extend([str(source_path), "-o", str(output_path)])
++    command.extend([str(source_path), "-o", str(temporary_output)])
+     environment = dict(os.environ)
+     environment["TMPDIR"] = str(build_dir / "tmp")
+     result = subprocess.run(
+@@ -348,32 +417,49 @@ def _compile_native(target_ir: Avx2Program, options: Optional[CompileOptions]) -
+         universal_newlines=True,
+         check=False,
+     )
+-    if result.returncode != 0 or not output_path.is_file():
++    if result.returncode != 0 or not temporary_output.is_file():
+         raise Avx2CompileError(
+             "Clang AVX2 compilation failed ({}): {}".format(
+                 result.returncode, (result.stderr or result.stdout).strip()
+             )
+         )
+-    version_result = subprocess.run(
+-        [compiler_path, "--version"],
+-        stdout=subprocess.PIPE,
+-        stderr=subprocess.STDOUT,
+-        universal_newlines=True,
+-        check=False,
+-    )
+-    triple_result = subprocess.run(
+-        [compiler_path, "-print-target-triple"],
+-        stdout=subprocess.PIPE,
+-        stderr=subprocess.STDOUT,
+-        universal_newlines=True,
+-        check=False,
+-    )
+-    compiler_version = (version_result.stdout.splitlines() or [compiler_path])[0].strip()
+-    target_triple = triple_result.stdout.strip() or "unknown"
++    native_bytes = temporary_output.read_bytes()
++    native_digest = sha256_bytes(native_bytes)
++    output_path = artifact_dir / ("pypto_x_avx2_{}.so".format(native_digest))
++    if output_path.exists():
++        if output_path.read_bytes() != native_bytes:
++            raise Avx2CompileError("content-addressed AVX2 artifact path contains different bytes")
++    else:
++        descriptor, publication_name = tempfile.mkstemp(
++            prefix=output_path.name + ".tmp.", dir=str(artifact_dir)
++        )
++        os.close(descriptor)
++        publication_path = Path(publication_name)
++        try:
++            publication_path.write_bytes(native_bytes)
++            if output_path.exists():
++                if output_path.read_bytes() != native_bytes:
++                    raise Avx2CompileError(
++                        "content-addressed AVX2 artifact publication raced with different bytes"
++                    )
++            else:
++                os.replace(str(publication_path), str(output_path))
++        finally:
++            if publication_path.exists():
++                publication_path.unlink()
+     normalized_command = [Path(compiler_path).name]
+     normalized_command.extend(command[1:-3])
+     normalized_command.extend([source_path.name, "-o", output_path.name])
+-    return output_path, source_digest, compiler_path, compiler_version, target_triple, tuple(normalized_command)
++    return (
++        output_path,
++        source_digest,
++        native_digest,
++        compiler_path,
++        compiler_version,
++        target_triple,
++        tuple(normalized_command),
++        feature_mask,
++    )
+ 
+ 
+ class Avx2Compiler:
+@@ -390,16 +476,22 @@ class Avx2Compiler:
+         if options is not None and not isinstance(options, CompileOptions):
+             raise TypeError("options must be CompileOptions")
+         target_ir.validate()
+-        output_path, source_digest, compiler_path, compiler_version, target_triple, command = _compile_native(
+-            target_ir, options
+-        )
++        (
++            output_path,
++            source_digest,
++            native_digest,
++            compiler_path,
++            compiler_version,
++            target_triple,
++            command,
++            feature_mask,
++        ) = _compile_native(target_ir, options)
+         program_json = target_ir.program.canonical_json()
+         program_data = json.loads(program_json)
+         program_digest = hashlib.sha256(program_json.encode("utf-8")).hexdigest()
+         plan_data = _plain_mapping(target_ir.vector_program.to_dict())
+         plan_digest = target_ir.plan_digest
+         target_data = _plain_mapping(target_ir.target.to_dict())
+-        native_digest = sha256_bytes(output_path.read_bytes())
+         metadata = {
+             "backend": AVX2_BACKEND,
+             "artifact_payload_version": ARTIFACT_PAYLOAD_VERSION,
+@@ -417,6 +509,8 @@ class Avx2Compiler:
+             "native_format": "elf-shared-object",
+             "native_digest": native_digest,
+             "native_source_digest": source_digest,
++            "native_feature_mask": feature_mask,
++            "native_variant": "avx2-fma" if target_ir.use_fma else "avx2",
+             "compiler": Path(compiler_path).name,
+             "compiler_version": compiler_version,
+             "compiler_target_triple": target_triple,
+diff --git a/python/pypto/lowering/cpu/x86/avx2/capabilities.py b/python/pypto/lowering/cpu/x86/avx2/capabilities.py
+index b6c6c9ab7..e5012f5c9 100644
+--- a/python/pypto/lowering/cpu/x86/avx2/capabilities.py
++++ b/python/pypto/lowering/cpu/x86/avx2/capabilities.py
+@@ -16,6 +16,7 @@ import os
+ from pathlib import Path
+ import shutil
+ import subprocess
++import tempfile
+ from typing import Any, Mapping, Optional, Tuple
+ 
+ 
+@@ -219,7 +220,7 @@ def _probe_directory(directory: Optional[Any]) -> Path:
+     if selected is None:
+         selected = os.environ.get("TMPDIR")
+     if selected is None:
+-        selected = os.path.join(os.path.abspath(os.path.expanduser("~")), ".cache", "pypto-x", "avx2-probe")
++        selected = tempfile.mkdtemp(prefix="pypto-x-avx2-probe-", dir=os.environ.get("TMPDIR") or None)
+     path = Path(os.fspath(selected)).resolve()
+     path.mkdir(parents=True, exist_ok=True)
+     return path
+diff --git a/python/pypto/lowering/cpu/x86/avx2/lowering.py b/python/pypto/lowering/cpu/x86/avx2/lowering.py
+index e2ff3c362..78734ec3a 100644
+--- a/python/pypto/lowering/cpu/x86/avx2/lowering.py
++++ b/python/pypto/lowering/cpu/x86/avx2/lowering.py
+@@ -91,10 +91,13 @@ class Avx2Program:
+         if self.vector_program.lane_count != AVX2_LANE_COUNT:
+             raise Avx2ValidationError("AVX2 requires {} float32 lanes".format(AVX2_LANE_COUNT))
+         required = set(self.vector_program.required_features.features)
+-        if "avx2" not in required:
+-            raise Avx2ValidationError("AVX2 vector plan must require avx2")
++        for feature in ("avx", "avx2", "osxsave", "ymm"):
++            if feature not in required:
++                raise Avx2ValidationError("AVX2 vector plan must require {}".format(feature))
+         if self.use_fma and "fma" not in required:
+             raise Avx2ValidationError("FMA artifact must declare the fma feature")
++        if not self.use_fma and "fma" in required:
++            raise Avx2ValidationError("non-FMA artifact must not require fma")
+         for plan in self.vector_program.plans:
+             if canonical_dtype(plan.dtype) not in ("float32", "bf16"):
+                 raise Avx2UnsupportedError(
+@@ -174,13 +177,20 @@ def lower_avx2(
+         required = required_features
+     else:
+         features = list(explicit)
+-        if "avx2" not in features:
+-            features.append("avx2")
++        for feature in ("avx", "avx2", "osxsave", "ymm"):
++            if feature not in features:
++                features.append(feature)
+         if fma and "fma" not in features:
+             features.append("fma")
+         required = CpuFeatureSet(tuple(features), source="compiler")
+-    if "avx2" not in set(required.features) and "avx2" not in set(target.features):
+-        raise Avx2ValidationError("AVX2 lowering could not establish the avx2 feature")
++    required_names = set(required.features)
++    target_names = set(target.features)
++    required_safety_features = ("avx", "avx2", "osxsave", "ymm")
++    if any(
++        feature not in required_names and feature not in target_names
++        for feature in required_safety_features
++    ):
++        raise Avx2ValidationError("AVX2 lowering could not establish the complete AVX2/YMM feature contract")
+     if fma and "fma" not in set(required.features) and "fma" not in set(target.features):
+         raise Avx2ValidationError("FMA lowering could not establish the fma feature")
+     vector_program = lower_cpu_vector(
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx2.py b/python/tests/ut/pypto_x/test_cpu_avx2.py
+index fe867a36e..ff9c1a7fd 100644
+--- a/python/tests/ut/pypto_x/test_cpu_avx2.py
++++ b/python/tests/ut/pypto_x/test_cpu_avx2.py
+@@ -9,8 +9,10 @@ smoke and an objdump report outside the source worktree.
+ from __future__ import annotations
+ 
+ import ctypes
++import os
+ from pathlib import Path
+ import shutil
++import struct
+ import subprocess
+ import sys
+ import types
+@@ -29,13 +31,21 @@ def _imports():
+     try:
+         from pypto.abi import LaunchRequest, TensorDesc
+         from pypto.backends.cpu import CpuScalarRuntime, HostTensor
+-        from pypto.backends.cpu.x86 import Avx2Runtime, CpuAvx2ArtifactError, CpuAvx2ExecutionError
++        from pypto.backends.cpu.x86 import (
++            Avx2Runtime,
++            CpuAvx2ArtifactError,
++            CpuAvx2ExecutionError,
++            CpuAvx2FeatureMismatchError,
++            CpuAvx2UnavailableError,
++        )
+         from pypto.compiler import CompileOptions
+         from pypto.compiler.targets.cpu import CpuScalarCompiler
+-        from pypto.compiler.targets.cpu_avx2 import Avx2Compiler
++        from pypto.compiler.targets.cpu_avx2 import Avx2CompileError, Avx2Compiler
+         from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
+         from pypto.lowering.cpu.x86.avx2 import Avx2Capability, Avx2UnsupportedError, lower_avx2
++        from pypto.lowering.cpu.x86.avx2 import capabilities as capabilities_module
+         from pypto.target import TargetSpec
++        from pypto_x.harness import compare_outputs
+         return locals()
+     finally:
+         for name in list(sys.modules):
+@@ -52,9 +62,12 @@ HostTensor = _C["HostTensor"]
+ Avx2Runtime = _C["Avx2Runtime"]
+ CpuAvx2ArtifactError = _C["CpuAvx2ArtifactError"]
+ CpuAvx2ExecutionError = _C["CpuAvx2ExecutionError"]
++CpuAvx2FeatureMismatchError = _C["CpuAvx2FeatureMismatchError"]
++CpuAvx2UnavailableError = _C["CpuAvx2UnavailableError"]
+ CompileOptions = _C["CompileOptions"]
+ CpuScalarCompiler = _C["CpuScalarCompiler"]
+ Avx2Compiler = _C["Avx2Compiler"]
++Avx2CompileError = _C["Avx2CompileError"]
+ CoreFunction = _C["CoreFunction"]
+ CoreProgram = _C["CoreProgram"]
+ CoreType = _C["CoreType"]
+@@ -65,6 +78,8 @@ Avx2Capability = _C["Avx2Capability"]
+ Avx2UnsupportedError = _C["Avx2UnsupportedError"]
+ lower_avx2 = _C["lower_avx2"]
+ TargetSpec = _C["TargetSpec"]
++compare_outputs = _C["compare_outputs"]
++capabilities_module = _C["capabilities_module"]
+ 
+ 
+ def _program(name, parameters, returns, operations):
+@@ -86,9 +101,23 @@ def _add_program(dtype="float32", shape=(11,)):
+     return _program("add", (left, right), (output,), (Operation("add", (left, right), (output,)),))
+ 
+ 
++def _bf16_bits(value):
++    bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++    if (bits & 0x7F800000) == 0x7F800000:
++        return (bits >> 16) & 0xFFFF
++    return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) & 0xFFFF
++
++
++def _bf16_value(bits):
++    return struct.unpack("<f", struct.pack("<I", (int(bits) & 0xFFFF) << 16))[0]
++
++
+ def _compile(program, target, tmp_path):
+     compiler = Avx2Compiler()
+-    options = CompileOptions(extra={"build_dir": str(tmp_path / "native")})
++    options = CompileOptions(
++        artifact_format="pypto-x.cpu.avx2",
++        extra={"build_dir": str(tmp_path / "native")},
++    )
+     target_ir = compiler.lower(program, target)
+     return compiler, target_ir, compiler.compile(target_ir, options)
+ 
+@@ -122,6 +151,55 @@ def test_cpuid_xgetbv_probe_has_structured_host_result():
+         assert isinstance(runtime.capability.xcr0, int)
+ 
+ 
++def test_avx2_required_features_are_explicit(tmp_path):
++    _, target_ir, _ = _compile(_add_program(), _target("avx2"), tmp_path / "base")
++    assert target_ir.required_features.features == ("avx", "avx2", "osxsave", "ymm")
++    _, fma_ir, _ = _compile(_add_program(), _target("avx2", "fma"), tmp_path / "fma")
++    assert fma_ir.required_features.features == ("avx", "avx2", "fma", "osxsave", "ymm")
++
++
++def test_missing_base_capability_has_structured_status_and_never_loads_native(
++    tmp_path, monkeypatch
++):
++    _, _, artifact = _compile(_add_program(), _target("avx2"), tmp_path)
++    runtime = Avx2Runtime(available_features=("avx", "avx2", "osxsave"))
++
++    def fail_cdll(*args, **kwargs):
++        raise AssertionError("ctypes.CDLL must not be called for missing capability")
++
++    monkeypatch.setattr(ctypes, "CDLL", fail_cdll)
++    with pytest.raises(CpuAvx2UnavailableError) as error:
++        runtime.load(artifact)
++    assert error.value.status.reason_code == "missing_cpu_features"
++    assert error.value.status.details["available"] is False
++    assert not error.value.status.details["ymm_state"]
++
++
++def test_injected_capability_cannot_bypass_real_probe_before_native_launch(tmp_path, monkeypatch):
++    _, _, artifact = _compile(_add_program(), _target("avx2"), tmp_path)
++    injected = Avx2Capability.injected_capability(("avx", "avx2", "osxsave", "ymm"))
++    runtime = Avx2Runtime(capability=injected)
++    unavailable = Avx2Capability.injected_capability((), source="cpuid+osxsave+xgetbv")
++    monkeypatch.setattr(capabilities_module, "probe_avx2_capabilities", lambda **kwargs: unavailable)
++
++    def fail_cdll(*args, **kwargs):
++        raise AssertionError("ctypes.CDLL must not be called after real probe failure")
++
++    monkeypatch.setattr(ctypes, "CDLL", fail_cdll)
++    input_tensor = HostTensor("float32", (11,), [1.0] * 11)
++    output_tensor = HostTensor.zeros("float32", (11,))
++    with pytest.raises(CpuAvx2UnavailableError) as error:
++        runtime.launch(
++            LaunchRequest(
++                artifact,
++                inputs=[input_tensor.descriptor(readonly=True), input_tensor.descriptor(readonly=True)],
++                outputs=[output_tensor.descriptor()],
++            )
++        )
++    assert error.value.status.reason_code == "real_capability_unavailable"
++    assert error.value.status.details["source"] == "cpuid+osxsave+xgetbv"
++
++
+ @pytest.mark.parametrize("length", (0, 1, 7, 8, 9, 19))
+ def test_elementwise_lengths_differential_against_scalar(length, tmp_path):
+     program = _add_program(shape=(length,))
+@@ -150,19 +228,52 @@ def test_elementwise_lengths_differential_against_scalar(length, tmp_path):
+     assert compiler.lower(program, target).lane_count == 8
+ 
+ 
++@pytest.mark.parametrize("operation", ("add", "sub", "mul", "div", "neg"))
++def test_all_fp32_elementwise_operations_have_structured_scalar_differential(operation, tmp_path):
++    value_type = CoreType.tensor("float32", (19,))
++    left = ValueRef("left", value_type)
++    right = ValueRef("right", value_type)
++    output = ValueRef("output", value_type)
++    inputs = (left,) if operation == "neg" else (left, right)
++    program = _program(operation, inputs, (output,), (Operation(operation, inputs, (output,)),))
++    _, _, artifact = _compile(program, _target("avx2", "fma"), tmp_path / "avx2")
++    left_tensor = HostTensor("float32", (19,), [0.25 + index * 0.125 for index in range(19)])
++    right_tensor = HostTensor("float32", (19,), [1.0 + index * 0.03125 for index in range(19)])
++    avx_output = HostTensor.zeros("float32", (19,))
++    _run(artifact, [left_tensor] if operation == "neg" else [left_tensor, right_tensor], avx_output)
++    scalar_compiler = CpuScalarCompiler()
++    scalar_artifact = scalar_compiler.compile(
++        scalar_compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu"))
++    )
++    scalar_output = HostTensor.zeros("float32", (19,))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            scalar_artifact,
++            inputs=[left_tensor.descriptor(readonly=True)]
++            if operation == "neg"
++            else [left_tensor.descriptor(readonly=True), right_tensor.descriptor(readonly=True)],
++            outputs=[scalar_output.descriptor()],
++        )
++    )
++    report = compare_outputs(scalar_output, avx_output)
++    assert report.passed, report.to_dict()
++
++
+ def test_non_aligned_float32_addresses_use_safe_load_store(tmp_path):
+     program = _add_program(shape=(9,))
+     _, _, artifact = _compile(program, _target("avx2"), tmp_path)
+     runtime = _runtime()
+-    raw_left = (ctypes.c_ubyte * (9 * 4 + 1))()
+-    raw_right = (ctypes.c_ubyte * (9 * 4 + 1))()
+-    raw_output = (ctypes.c_ubyte * (9 * 4 + 1))()
++    raw_left = (ctypes.c_ubyte * (9 * 4 + 2))()
++    raw_right = (ctypes.c_ubyte * (9 * 4 + 2))()
++    raw_output = (ctypes.c_ubyte * (9 * 4 + 2))()
+     left_address = ctypes.addressof(raw_left) + 1
+     right_address = ctypes.addressof(raw_right) + 1
+     output_address = ctypes.addressof(raw_output) + 1
+     left_pointer = ctypes.cast(left_address, ctypes.POINTER(ctypes.c_float))
+     right_pointer = ctypes.cast(right_address, ctypes.POINTER(ctypes.c_float))
+     output_pointer = ctypes.cast(output_address, ctypes.POINTER(ctypes.c_float))
++    raw_output[0] = 0xA5
++    raw_output[-1] = 0x5A
+     for index in range(9):
+         left_pointer[index] = float(index)
+         right_pointer[index] = 2.0
+@@ -177,6 +288,100 @@ def test_non_aligned_float32_addresses_use_safe_load_store(tmp_path):
+     )
+     runtime.launch(request)
+     assert [output_pointer[index] for index in range(9)] == [float(index + 2) for index in range(9)]
++    assert raw_output[0] == 0xA5
++    assert raw_output[-1] == 0x5A
++
++
++def test_array_interface_validates_2d_dtype_shape_strides_and_readonly(tmp_path):
++    np = pytest.importorskip("numpy")
++    program = _add_program(shape=(2, 9))
++    _, _, artifact = _compile(program, _target("avx2"), tmp_path / "contiguous")
++    left = np.arange(18, dtype=np.float32).reshape(2, 9)
++    right = np.full((2, 9), 2.0, dtype=np.float32)
++    output = np.zeros((2, 9), dtype=np.float32)
++    Avx2Runtime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[
++                TensorDesc("float32", (2, 9), handle=left, readonly=True),
++                TensorDesc("float32", (2, 9), handle=right, readonly=True),
++            ],
++            outputs=[TensorDesc("float32", (2, 9), handle=output)],
++        )
++    )
++    np.testing.assert_array_equal(output, left + right)
++
++    non_contiguous = left[:, ::2]
++    bad_program = _add_program(shape=(2, 5))
++    _, _, bad_artifact = _compile(bad_program, _target("avx2"), tmp_path / "non-contiguous")
++    with pytest.raises(CpuAvx2ExecutionError, match="C-contiguous"):
++        Avx2Runtime().launch(
++            LaunchRequest(
++                bad_artifact,
++                inputs=[
++                    TensorDesc("float32", (2, 5), handle=non_contiguous, readonly=True),
++                    TensorDesc("float32", (2, 5), handle=np.ones((2, 5), dtype=np.float32), readonly=True),
++                ],
++                outputs=[TensorDesc("float32", (2, 5), handle=np.zeros((2, 5), dtype=np.float32))],
++            )
++        )
++
++    with pytest.raises(CpuAvx2ExecutionError, match="dtype"):
++        Avx2Runtime().launch(
++            LaunchRequest(
++                artifact,
++                inputs=[
++                    TensorDesc("float32", (2, 9), handle=np.ones((2, 9), dtype=np.int32), readonly=True),
++                    TensorDesc("float32", (2, 9), handle=right, readonly=True),
++                ],
++                outputs=[TensorDesc("float32", (2, 9), handle=output)],
++            )
++        )
++
++    readonly_output = np.zeros((2, 9), dtype=np.float32)
++    readonly_output.flags.writeable = False
++    with pytest.raises(CpuAvx2ExecutionError, match="read-only"):
++        Avx2Runtime().launch(
++            LaunchRequest(
++                artifact,
++                inputs=[
++                    TensorDesc("float32", (2, 9), handle=left, readonly=True),
++                    TensorDesc("float32", (2, 9), handle=right, readonly=True),
++                ],
++                outputs=[TensorDesc("float32", (2, 9), handle=readonly_output)],
++            )
++        )
++
++
++def test_zero_element_array_and_ctypes_byte_bounds_are_safe(tmp_path):
++    np = pytest.importorskip("numpy")
++    zero_program = _add_program(shape=(0, 9))
++    _, _, zero_artifact = _compile(zero_program, _target("avx2"), tmp_path / "zero")
++    left = np.empty((0, 9), dtype=np.float32)
++    right = np.empty((0, 9), dtype=np.float32)
++    output = np.empty((0, 9), dtype=np.float32)
++    Avx2Runtime().launch(
++        LaunchRequest(
++            zero_artifact,
++            inputs=[
++                TensorDesc("float32", (0, 9), handle=left, readonly=True),
++                TensorDesc("float32", (0, 9), handle=right, readonly=True),
++            ],
++            outputs=[TensorDesc("float32", (0, 9), handle=output)],
++        )
++    )
++    small = (ctypes.c_float * 1)()
++    with pytest.raises(CpuAvx2ExecutionError, match="bytes"):
++        Avx2Runtime().launch(
++            LaunchRequest(
++                _compile(_add_program(shape=(2,)), _target("avx2"), tmp_path / "small")[2],
++                inputs=[
++                    TensorDesc("float32", (2,), handle=small, readonly=True),
++                    TensorDesc("float32", (2,), handle=(ctypes.c_float * 2)(), readonly=True),
++                ],
++                outputs=[TensorDesc("float32", (2,), handle=(ctypes.c_float * 2)())],
++            )
++        )
+ 
+ 
+ def test_bf16_round_to_nearest_even_and_fp32_accumulation(tmp_path):
+@@ -196,6 +401,31 @@ def test_bf16_round_to_nearest_even_and_fp32_accumulation(tmp_path):
+     assert result.flat() == expected.flat()
+ 
+ 
++def test_bf16_native_rne_ties_round_to_even_in_both_directions(tmp_path):
++    value_type = CoreType.tensor("bf16", (2,))
++    left = ValueRef("left", value_type)
++    right = ValueRef("right", value_type)
++    output = ValueRef("output", value_type)
++    program = _program("mul_ties", (left, right), (output,), (Operation("mul", (left, right), (output,)),))
++    _, _, artifact = _compile(program, _target("avx2"), tmp_path)
++    left_bits = (ctypes.c_uint16 * 2)(0x3F01, 0x3F02)
++    right_bits = (ctypes.c_uint16 * 2)(0x3F40, 0x3F20)
++    output_bits = (ctypes.c_uint16 * 2)()
++    Avx2Runtime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[
++                TensorDesc("bf16", (2,), handle=left_bits, readonly=True),
++                TensorDesc("bf16", (2,), handle=right_bits, readonly=True),
++            ],
++            outputs=[TensorDesc("bf16", (2,), handle=output_bits)],
++        )
++    )
++    golden = [_bf16_bits(_bf16_value(left_bits[i]) * _bf16_value(right_bits[i])) for i in range(2)]
++    assert list(output_bits) == golden
++    assert golden == [0x3EC2, 0x3EA2]
++
++
+ def test_bf16_reduction_and_matmul_match_scalar(tmp_path):
+     input_type = CoreType.tensor("bf16", (2, 3, 5))
+     reduced_type = CoreType.tensor("bf16", (2, 5))
+@@ -224,6 +454,13 @@ def test_bf16_reduction_and_matmul_match_scalar(tmp_path):
+         )
+     )
+     assert avx_reduce.flat() == scalar_reduce.flat()
++    rounded_values = [_bf16_value(_bf16_bits(value)) for value in values]
++    expected_reduce = []
++    for row in range(2):
++        for column in range(5):
++            total = sum(rounded_values[row * 15 + axis * 5 + column] for axis in range(3))
++            expected_reduce.append(_bf16_value(_bf16_bits(total)))
++    assert avx_reduce.flat() == tuple(expected_reduce)
+ 
+     left_type = CoreType.tensor("bf16", (2, 3))
+     right_type = CoreType.tensor("bf16", (3, 9))
+@@ -261,6 +498,17 @@ def test_bf16_reduction_and_matmul_match_scalar(tmp_path):
+         )
+     )
+     assert avx_matmul.flat() == scalar_matmul.flat()
++    rounded_left = [_bf16_value(_bf16_bits(value)) for value in left_values]
++    rounded_right = [_bf16_value(_bf16_bits(value)) for value in right_values]
++    expected_matmul = []
++    for row in range(2):
++        for column in range(9):
++            total = sum(
++                rounded_left[row * 3 + inner] * rounded_right[inner * 9 + column]
++                for inner in range(3)
++            )
++            expected_matmul.append(_bf16_value(_bf16_bits(total)))
++    assert avx_matmul.flat() == tuple(expected_matmul)
+ 
+ 
+ def test_identity_constant_and_scalar_broadcast_use_native_elementwise(tmp_path):
+@@ -337,6 +585,37 @@ def test_reduction_groups_and_tail_differential(operation, tmp_path):
+     assert avx_output.flat() == scalar_output.flat()
+ 
+ 
++def test_reduction_multi_axis_odd_group_has_scalar_differential(tmp_path):
++    input_type = CoreType.tensor("float32", (3, 5, 7))
++    output_type = CoreType.tensor("float32", (5,))
++    source = ValueRef("source", input_type)
++    output = ValueRef("output", output_type)
++    program = _program(
++        "reduce_multi_axis",
++        (source,),
++        (output,),
++        (Operation("reduce_sum", (source,), (output,), attributes={"axes": (0, 2)}),),
++    )
++    _, _, artifact = _compile(program, _target("avx2"), tmp_path / "avx2")
++    values = [float(index) * 0.125 - 2.0 for index in range(3 * 5 * 7)]
++    avx_output = HostTensor.zeros("float32", (5,))
++    _run(artifact, [HostTensor("float32", (3, 5, 7), values)], avx_output)
++    scalar_compiler = CpuScalarCompiler()
++    scalar_artifact = scalar_compiler.compile(
++        scalar_compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu"))
++    )
++    scalar_output = HostTensor.zeros("float32", (5,))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            scalar_artifact,
++            inputs=[HostTensor("float32", (3, 5, 7), values).descriptor(readonly=True)],
++            outputs=[scalar_output.descriptor()],
++        )
++    )
++    report = compare_outputs(scalar_output, avx_output)
++    assert report.passed, report.to_dict()
++
++
+ def test_rectangular_matmul_uses_native_path(tmp_path):
+     left_type = CoreType.tensor("float32", (2, 3))
+     right_type = CoreType.tensor("float32", (3, 9))
+@@ -361,6 +640,42 @@ def test_rectangular_matmul_uses_native_path(tmp_path):
+     ]
+ 
+ 
++def test_rectangular_float_matmul_has_tolerant_scalar_differential(tmp_path):
++    left_type = CoreType.tensor("float32", (3, 5))
++    right_type = CoreType.tensor("float32", (5, 7))
++    output_type = CoreType.tensor("float32", (3, 7))
++    left = ValueRef("left", left_type)
++    right = ValueRef("right", right_type)
++    output = ValueRef("output", output_type)
++    program = _program("matmul_float", (left, right), (output,), (Operation("matmul", (left, right), (output,)),))
++    _, _, artifact = _compile(program, _target("avx2", "fma"), tmp_path / "avx2")
++    left_values = [0.1 + index * 0.017 for index in range(15)]
++    right_values = [0.2 - index * 0.013 for index in range(35)]
++    avx_output = HostTensor.zeros("float32", (3, 7))
++    _run(
++        artifact,
++        [HostTensor("float32", (3, 5), left_values), HostTensor("float32", (5, 7), right_values)],
++        avx_output,
++    )
++    scalar_compiler = CpuScalarCompiler()
++    scalar_artifact = scalar_compiler.compile(
++        scalar_compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu"))
++    )
++    scalar_output = HostTensor.zeros("float32", (3, 7))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            scalar_artifact,
++            inputs=[
++                HostTensor("float32", (3, 5), left_values).descriptor(readonly=True),
++                HostTensor("float32", (5, 7), right_values).descriptor(readonly=True),
++            ],
++            outputs=[scalar_output.descriptor()],
++        )
++    )
++    report = compare_outputs(scalar_output, avx_output, atol=2e-5, rtol=2e-5)
++    assert report.passed, report.to_dict()
++
++
+ def test_missing_feature_is_structured_and_does_not_load_artifact(tmp_path):
+     _, _, artifact = _compile(_add_program(), _target("avx2"), tmp_path)
+     runtime = Avx2Runtime(available_features=("avx", "osxsave", "ymm"))
+@@ -371,13 +686,20 @@ def test_missing_feature_is_structured_and_does_not_load_artifact(tmp_path):
+         runtime.load(artifact)
+ 
+ 
+-def test_feature_contract_rejects_fma_when_fake_host_lacks_it(tmp_path):
++def test_feature_contract_rejects_fma_when_fake_host_lacks_it(tmp_path, monkeypatch):
+     _, _, artifact = _compile(_add_program(), _target("avx2", "fma"), tmp_path)
+     runtime = Avx2Runtime(capability=Avx2Capability.injected_capability(("avx", "avx2", "osxsave", "ymm")))
+     assert runtime.is_available()
+-    with pytest.raises(Exception) as error:
++
++    def fail_cdll(*args, **kwargs):
++        raise AssertionError("ctypes.CDLL must not be called for missing fma")
++
++    monkeypatch.setattr(ctypes, "CDLL", fail_cdll)
++    with pytest.raises(CpuAvx2FeatureMismatchError) as error:
+         runtime.load(artifact)
+     assert "fma" in str(error.value)
++    assert error.value.status.reason_code == "missing_cpu_features"
++    assert error.value.status.to_dict()["details"]["missing"] == ["fma"]
+ 
+ 
+ def test_readonly_output_and_wrong_target_are_rejected(tmp_path):
+@@ -420,20 +742,86 @@ def test_cache_key_isolated_by_fma_and_target(tmp_path):
+     assert no_fma.content_digest != with_fma.content_digest
+     _, _, same_target_other_dir = _compile(program, _target("avx2"), tmp_path / "other-dir")
+     assert no_fma.cache_key == same_target_other_dir.cache_key
++    _, _, shared_no_fma = _compile(program, _target("avx2"), tmp_path / "shared")
++    before = Path(shared_no_fma.path).read_bytes()
++    _, _, shared_fma = _compile(program, _target("avx2", "fma"), tmp_path / "shared")
++    assert shared_no_fma.path != shared_fma.path
++    assert Path(shared_no_fma.path).read_bytes() == before
++
++
++def test_compiler_accepts_only_clang_and_runtime_rejects_wrong_format(tmp_path):
++    compiler = Avx2Compiler()
++    target_ir = compiler.lower(_add_program(), _target("avx2"))
++    with pytest.raises(Avx2CompileError, match="Clang"):
++        compiler.compile(
++            target_ir,
++            CompileOptions(
++                artifact_format="pypto-x.cpu.avx2",
++                extra={"build_dir": str(tmp_path / "gcc"), "clang": "gcc"},
++            ),
++        )
++    wrong_format = compiler.compile(
++        target_ir,
++        CompileOptions(artifact_format="python", extra={"build_dir": str(tmp_path / "wrong-format")}),
++    )
++    with pytest.raises(CpuAvx2ArtifactError, match="format"):
++        Avx2Runtime().load(wrong_format)
++
++
++def test_native_variant_marker_binds_metadata_to_binary(tmp_path):
++    _, _, artifact = _compile(_add_program(), _target("avx2"), tmp_path)
++    metadata = dict(artifact.metadata)
++    metadata["native_variant"] = "avx2-fma"
++    object.__setattr__(artifact, "metadata", metadata)
++    with pytest.raises(CpuAvx2ArtifactError, match="variant"):
++        Avx2Runtime().load(artifact)
+ 
+ 
+ def test_objdump_has_ymm_and_no_zmm(tmp_path):
+-    _, _, artifact = _compile(_add_program(shape=(19,)), _target("avx2", "fma"), tmp_path)
++    _, _, fma_artifact = _compile(_add_program(shape=(19,)), _target("avx2", "fma"), tmp_path / "fma")
++    _, _, no_fma_artifact = _compile(_add_program(shape=(19,)), _target("avx2"), tmp_path / "no-fma")
+     objdump = shutil.which("objdump")
+     if objdump is None:
+         pytest.skip("GNU objdump is unavailable")
+-    result = subprocess.run([objdump, "-d", artifact.path], stdout=subprocess.PIPE, text=True, check=True)
+-    text = result.stdout.lower()
+-    assert "ymm" in text
+-    assert "zmm" not in text
+-    assert "avx512" not in text
++    def disassemble(path):
++        result = subprocess.run(
++            [objdump, "-d", path], stdout=subprocess.PIPE, universal_newlines=True, check=True
++        )
++        return result.stdout.lower()
++
++    fma_text = disassemble(fma_artifact.path)
++    no_fma_text = disassemble(no_fma_artifact.path)
++    for text in (fma_text, no_fma_text):
++        assert "ymm" in text
++        assert "zmm" not in text
++        assert "evex" not in text
++        assert "avx512" not in text
++    assert "vfmadd" in fma_text
++    assert "vfmadd" not in no_fma_text
+ 
+ 
+ def test_unsupported_dtype_is_rejected_before_codegen(tmp_path):
+     with pytest.raises(Avx2UnsupportedError):
+         _compile(_add_program(dtype="float16"), _target("avx2"), tmp_path)
++
++
++def test_portable_only_direct_import_does_not_enter_native_initializer():
++    environment = dict(os.environ)
++    environment["PYPTO_X_PORTABLE_ONLY"] = "1"
++    python_root = Path(__file__).parents[3]
++    existing = environment.get("PYTHONPATH")
++    environment["PYTHONPATH"] = str(python_root) + (os.pathsep + existing if existing else "")
++    result = subprocess.run(
++        [
++            sys.executable,
++            "-c",
++            "import pypto; import pypto.backends.cpu.x86; import pypto.compiler.targets.cpu_avx2; print('portable-ok')",
++        ],
++        cwd=str(python_root.parent),
++        env=environment,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        universal_newlines=True,
++        check=True,
++    )
++    assert "portable-ok" in result.stdout

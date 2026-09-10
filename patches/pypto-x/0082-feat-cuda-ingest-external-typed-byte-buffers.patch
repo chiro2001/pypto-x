@@ -1,0 +1,714 @@
+From fe6f3270b973b08be98cacfec04a6a4e9482e2b0 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Thu, 10 Sep 2026 10:20:26 +0800
+Subject: [PATCH 82/96] feat(cuda): ingest external typed byte buffers
+
+---
+ python/pypto/backends/cuda/driver.py                          |  54 +++++++
+ python/pypto/backends/cuda/runtime.py                         |  86 +++++++++-
+ python/tests/ut/pypto_x/qwen35_cuda_byte_buffer_validation.py | 233 +++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_cuda_byte_buffer_ingestion.py    | 253 ++++++++++++++++++++++++++++++
+ 4 files changed, 624 insertions(+), 2 deletions(-)
+
+diff --git a/python/pypto/backends/cuda/driver.py b/python/pypto/backends/cuda/driver.py
+index 4a8efedbe..aa9ddca0f 100644
+--- a/python/pypto/backends/cuda/driver.py
++++ b/python/pypto/backends/cuda/driver.py
+@@ -396,6 +396,34 @@ class CudaDriver:
+             self._cuMemcpyHtoD(ctypes.c_uint64(_as_int(pointer)), ctypes.cast(source, ctypes.c_void_p), len(raw)),
+         )
+ 
++    def memcpy_htod_address(self, pointer: Any, source_address: Any, size: int) -> None:
++        """Synchronously copy an existing host buffer into device memory.
++
++        ``source_address`` is borrowed only for the duration of this call.  A
++        caller that obtained it from a Python buffer exporter must retain the
++        exporter (and its active buffer view) until this method returns.  The
++        method intentionally does not create a ``bytes`` object or a ctypes
++        staging allocation, which keeps external checkpoint buffers raw and
++        auditable at the CUDA ABI boundary.
++        """
++
++        size = int(size)
++        if size < 0:
++            raise ValueError("CUDA host-to-device byte count must be non-negative")
++        if size == 0:
++            return
++        address = _as_int(source_address)
++        if address == 0:
++            raise ValueError("CUDA host-to-device source address must not be null")
++        self._check(
++            "cuMemcpyHtoD",
++            self._cuMemcpyHtoD(
++                ctypes.c_uint64(_as_int(pointer)),
++                ctypes.c_void_p(address),
++                size,
++            ),
++        )
++
+     def memcpy_dtoh(self, pointer: Any, size: int) -> bytes:
+         size = int(size)
+         destination = ctypes.create_string_buffer(max(1, size))
+@@ -405,6 +433,32 @@ class CudaDriver:
+         )
+         return destination.raw[:size]
+ 
++    def memcpy_dtoh_address(self, destination_address: Any, pointer: Any, size: int) -> None:
++        """Synchronously copy device bytes into a caller-owned host buffer.
++
++        The destination must remain writable and alive until this call
++        returns.  Validation of writability and lifetime belongs to the typed
++        buffer owner; this method only binds the Driver API address-based
++        operation and never materializes a Python byte string.
++        """
++
++        size = int(size)
++        if size < 0:
++            raise ValueError("CUDA device-to-host byte count must be non-negative")
++        if size == 0:
++            return
++        address = _as_int(destination_address)
++        if address == 0:
++            raise ValueError("CUDA device-to-host destination address must not be null")
++        self._check(
++            "cuMemcpyDtoH",
++            self._cuMemcpyDtoH(
++                ctypes.c_void_p(address),
++                ctypes.c_uint64(_as_int(pointer)),
++                size,
++            ),
++        )
++
+     def launch_kernel(
+         self,
+         function: Any,
+diff --git a/python/pypto/backends/cuda/runtime.py b/python/pypto/backends/cuda/runtime.py
+index 10abeabf2..ed7be8aac 100644
+--- a/python/pypto/backends/cuda/runtime.py
++++ b/python/pypto/backends/cuda/runtime.py
+@@ -8,6 +8,7 @@ from dataclasses import dataclass
+ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+ 
+ from pypto.abi import Availability, GpuLaunchRequest, LaunchRequest, TensorDesc
++from pypto.backends.cpu.byte_view import CpuByteViewError, TypedByteView, try_typed_byte_view
+ from pypto.backends.cpu.tensor import FlatBuffer, HostTensor
+ from pypto.compiler.artifact import Artifact
+ from pypto.compiler.targets.cuda import (
+@@ -56,6 +57,40 @@ class _Allocation:
+     shape: Tuple[int, ...] = ()
+ 
+ 
++def _typed_host_view(
++    descriptor: TensorDesc,
++    value_type: CoreType,
++    context: str,
++    *,
++    writable: bool = False,
++) -> Optional[TypedByteView]:
++    """Return the shared strict byte-view contract for CUDA host staging.
++
++    This deliberately delegates dtype/shape/contiguity/readonly/lifetime
++    validation to the CPU ingestion seam.  CUDA only consumes the resulting
++    borrowed address while the returned object remains alive.
++    """
++
++    expected_dtype = canonical_dtype(value_type.dtype)
++    expected_shape = static_shape(value_type, context)
++    try:
++        typed = try_typed_byte_view(
++            _storage(descriptor),
++            expected_dtype,
++            expected_shape,
++            readonly=descriptor.readonly,
++            context=context,
++        )
++    except CpuByteViewError as exc:
++        raise CudaExecutionError(str(exc)) from exc
++    if typed is not None:
++        try:
++            typed.validate(writable=writable)
++        except CpuByteViewError as exc:
++            raise CudaExecutionError(str(exc)) from exc
++    return typed
++
++
+ def _bf16_bits(value: Any) -> int:
+     raw = struct.unpack("<I", struct.pack("<f", float(value)))[0]
+     upper = raw >> 16
+@@ -230,6 +265,14 @@ def _validate_request(request: GpuLaunchRequest, target_ir: CudaProgram, functio
+     for descriptor, ref in zip(request.outputs, tensor_returns):
+         if canonical_dtype(descriptor.dtype) != canonical_dtype(ref.type.dtype) or descriptor.shape != static_shape(ref.type, ref.name):
+             raise CudaExecutionError("CUDA output descriptor does not match {!r}".format(ref.name))
++    # Validate all buffer exporters before creating a context, loading a
++    # module, or allocating any device memory.  The shared typed-view parser
++    # returns ``None`` for legacy sequences and explicit device pointers, so
++    # those compatibility paths remain untouched.
++    for descriptor, ref in zip(request.inputs, tensor_parameters):
++        _typed_host_view(descriptor, ref.type, "CUDA input")
++    for descriptor, ref in zip(request.outputs, tensor_returns):
++        _typed_host_view(descriptor, ref.type, "CUDA output", writable=True)
+ 
+ 
+ def _contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
+@@ -398,8 +441,21 @@ class CudaRuntime:
+                     descriptor = gpu_request.outputs[tensor_return_index]
+                     if _pointer(_storage(descriptor)) is None:
+                         size = element_count(static_shape(ref.type, ref.name)) * _itemsize(ref.type.dtype)
+-                        raw = self.driver.memcpy_dtoh(allocation.pointer, size) if size else b""
+-                        _write_host(_storage(descriptor), _unpack(ref.type.dtype, raw), element_count(static_shape(ref.type, ref.name)))
++                        typed = allocation.host_storage
++                        if isinstance(typed, TypedByteView):
++                            try:
++                                typed.validate(writable=True)
++                            except CpuByteViewError as exc:
++                                raise CudaExecutionError(str(exc)) from exc
++                            if size:
++                                self.driver.memcpy_dtoh_address(typed.address, allocation.pointer, size)
++                        else:
++                            raw = self.driver.memcpy_dtoh(allocation.pointer, size) if size else b""
++                            _write_host(
++                                _storage(descriptor),
++                                _unpack(ref.type.dtype, raw),
++                                element_count(static_shape(ref.type, ref.name)),
++                            )
+                     results.append(_storage(descriptor))
+                     tensor_return_index += 1
+                 elif _is_scalar(ref.type):
+@@ -430,6 +486,25 @@ class CudaRuntime:
+         if pointer is not None:
+             return pointer
+         shape = static_shape(value_type, value_type.kind)
++        typed = _typed_host_view(descriptor, value_type, "CUDA input")
++        if typed is not None:
++            size = typed.nbytes
++            pointer = self.driver.mem_alloc(size)
++            allocation = _Allocation(
++                pointer,
++                size,
++                True,
++                typed,
++                canonical_dtype(value_type.dtype),
++                shape,
++            )
++            # Keep the active Py_buffer export alive through the synchronous
++            # Driver call and the complete launch.  No Python bytes/list is
++            # created for this external-buffer path.
++            allocations.append(allocation)
++            if size:
++                self.driver.memcpy_htod_address(pointer, typed.address, size)
++            return pointer
+         values = _host_values(_storage(descriptor))
+         expected = element_count(shape)
+         if len(values) != expected:
+@@ -445,6 +520,13 @@ class CudaRuntime:
+         pointer = _pointer(_storage(descriptor))
+         if pointer is not None:
+             return _Allocation(pointer, element_count(static_shape(value_type, value_type.kind)) * _itemsize(value_type.dtype), False)
++        typed = _typed_host_view(descriptor, value_type, "CUDA output", writable=True)
++        if typed is not None:
++            return self._allocate_for_type(
++                value_type,
++                allocations,
++                typed,
++            )
+         return self._allocate_for_type(value_type, allocations, _storage(descriptor))
+ 
+     def _allocate_for_type(self, value_type: CoreType, allocations: list, host_storage: Any = None) -> _Allocation:
+diff --git a/python/tests/ut/pypto_x/qwen35_cuda_byte_buffer_validation.py b/python/tests/ut/pypto_x/qwen35_cuda_byte_buffer_validation.py
+new file mode 100644
+index 000000000..1c254cf2b
+--- /dev/null
++++ b/python/tests/ut/pypto_x/qwen35_cuda_byte_buffer_validation.py
+@@ -0,0 +1,233 @@
++"""Weight-free CUDA M1K byte-buffer validation on the RTX 5080.
++
++This driver intentionally uses the explicit ``synthetic_test`` Qwen profile:
++it retains the 24-layer 18-GDR/6-attention topology while keeping the packed
++storage near 43 KiB.  It never downloads, maps, or loads checkpoint weights.
++"""
++
++from __future__ import annotations
++
++import math
++import json
++import struct
++import subprocess
++from typing import Dict, Sequence
++
++from pypto.backends.cuda import CudaDriver, CudaRuntime
++from pypto.compiler.targets.cuda import CudaPtxCompiler
++from pypto.portable.qwen35 import build_qwen35_text_decoder_graph
++from pypto.portable.runtime_binding import (
++    BufferBinding,
++    assemble_launch_request,
++    bind_packed_region,
++    build_binding_schema,
++    build_packed_layout,
++)
++from pypto.target import TargetSpec
++
++
++TARGET = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,)})
++CANARY = 0xCD
++
++
++def _count(shape: Sequence[int]) -> int:
++    result = 1
++    for dimension in shape:
++        result *= int(dimension)
++    return result
++
++
++def _bf16_bits(value: float) -> int:
++    bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++    return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) & 0xFFFF
++
++
++def _fill(dtype: str, shape: Sequence[int], value: float = 0.01) -> bytes:
++    count = _count(shape)
++    if dtype == "bf16":
++        return struct.pack("<{}H".format(count), *([_bf16_bits(value)] * count))
++    if dtype == "float32":
++        return struct.pack("<{}f".format(count), *([float(value)] * count))
++    if dtype == "int64":
++        return struct.pack("<{}q".format(count), *([int(value)] * count))
++    if dtype == "int32":
++        return struct.pack("<{}i".format(count), *([int(value)] * count))
++    raise ValueError("unsupported synthetic dtype {!r}".format(dtype))
++
++
++def _set_region(storage: bytearray, offset: int, payload: bytes) -> None:
++    storage[offset:offset + len(payload)] = payload
++
++
++def _make_external_bindings(schema, layout):
++    packed = bytearray(layout.total_nbytes + 128)
++    packed_before = None
++    for entry in schema.parameters:
++        region = layout.region_for(entry.name)
++        _set_region(packed, region.offset, _fill(entry.dtype, entry.shape))
++    for entry in schema.states:
++        region = layout.region_for(entry.name)
++        _set_region(packed, region.offset, bytes(entry.nbytes))
++    packed_before = bytes(packed)
++
++    runtime = {}
++    for entry in schema.runtime_inputs:
++        if entry.name == "input_ids":
++            payload = _fill(entry.dtype, entry.shape, 0)
++        elif entry.name == "cos":
++            payload = _fill(entry.dtype, entry.shape, 1.0)
++        else:
++            payload = _fill(entry.dtype, entry.shape, 0.0)
++        runtime[entry.name] = BufferBinding.from_buffer(
++            bytearray(payload), entry.storage_id, entry.dtype, entry.shape, readonly=True
++        )
++    parameters = {
++        entry.name: bind_packed_region(layout, entry.name, packed)
++        for entry in schema.parameters
++    }
++    states = {
++        entry.name: bind_packed_region(layout, entry.name, packed)
++        for entry in schema.states
++    }
++
++    output_storage: Dict[str, bytearray] = {}
++    outputs = {}
++    for entry in schema.outputs:
++        storage = bytearray([CANARY] * (64 + entry.nbytes + 64))
++        output_storage[entry.name] = storage
++        outputs[entry.name] = BufferBinding.from_buffer(
++            storage,
++            entry.storage_id,
++            entry.dtype,
++            entry.shape,
++            byte_offset=64,
++            alignment=64,
++            readonly=False,
++        )
++    return packed, packed_before, runtime, parameters, states, outputs, output_storage
++
++
++def _region_bytes(binding: BufferBinding) -> bytes:
++    binding.validate()
++    return bytes(binding.view)
++
++
++def _decode_values(binding: BufferBinding):
++    raw = _region_bytes(binding)
++    count = _count(binding.shape)
++    if binding.dtype == "bf16":
++        bits = struct.unpack("<{}H".format(count), raw) if count else ()
++        return tuple(struct.unpack("<f", struct.pack("<I", bit << 16))[0] for bit in bits)
++    if binding.dtype == "float32":
++        return struct.unpack("<{}f".format(count), raw) if count else ()
++    if binding.dtype == "int64":
++        return struct.unpack("<{}q".format(count), raw) if count else ()
++    if binding.dtype == "int32":
++        return struct.unpack("<{}i".format(count), raw) if count else ()
++    raise ValueError("unsupported output dtype {!r}".format(binding.dtype))
++
++
++def _assert_output_guards(schema, bindings, storage):
++    for entry in schema.outputs:
++        raw = storage[entry.name]
++        view = bindings[entry.name].view
++        assert raw[:64] == bytes([CANARY] * 64), entry.name
++        assert raw[64 + view.nbytes:] == bytes([CANARY] * 64), entry.name
++
++
++def _compute_processes():
++    command = (
++        "nvidia-smi",
++        "--query-compute-apps=pid,process_name,used_memory",
++        "--format=csv,noheader",
++    )
++    output = subprocess.check_output(command, stderr=subprocess.STDOUT)
++    return tuple(line.strip() for line in output.decode("utf-8", "replace").splitlines() if line.strip())
++
++
++def main() -> None:
++    compute_before = _compute_processes()
++    driver = CudaDriver()
++    compiler = None
++    runtime = None
++    result = None
++    try:
++        device = driver.device_info().to_dict()
++        program = build_qwen35_text_decoder_graph(1, 1, shape_profile="synthetic_test")
++        schema = build_binding_schema(program)
++        layout = build_packed_layout(schema)
++        assert len(schema.inputs) == 371
++        assert len(schema.outputs) == 51
++        assert layout.total_nbytes == 43200
++
++        # Compile/validate exactly this topology; no model data is supplied to
++        # the builder or compiler.
++        compiler = CudaPtxCompiler(driver=driver, probe_jit=True)
++        target_ir = compiler.lower(program, TARGET)
++        artifact = compiler.compile(target_ir)
++        assert artifact.metadata["program_digest"] == schema.graph_digest
++
++        packed, packed_before, runtime_inputs, parameters, states, outputs, output_storage = _make_external_bindings(schema, layout)
++        request = assemble_launch_request(
++            schema,
++            artifact,
++            runtime_inputs,
++            parameters,
++            states,
++            {entry.name: outputs[entry.name] for entry in schema.regular_outputs},
++            {entry.name: outputs[entry.name] for entry in schema.state_outputs},
++            device="gpu",
++        )
++        runtime = CudaRuntime(driver=driver)
++        input_before = {name: _region_bytes(binding) for name, binding in runtime_inputs.items()}
++        state_before = {name: _region_bytes(binding) for name, binding in states.items()}
++        launch_summaries = []
++        for launch_index in range(2):
++            runtime.launch(request)
++            _assert_output_guards(schema, outputs, output_storage)
++            assert bytes(packed) == packed_before
++            assert {name: _region_bytes(binding) for name, binding in runtime_inputs.items()} == input_before
++            assert {name: _region_bytes(binding) for name, binding in states.items()} == state_before
++            logits = _decode_values(outputs["logits"])
++            position = _decode_values(outputs["position_ids"])
++            assert logits and all(math.isfinite(value) for value in logits)
++            assert any(value != 0.0 for value in logits)
++            assert position == (0,)
++            state_values = []
++            for entry in schema.state_outputs:
++                values = _decode_values(outputs[entry.name])
++                assert all(math.isfinite(value) for value in values), entry.name
++                state_values.extend(values)
++            assert len(schema.state_outputs) == 48
++            assert len(state_values) > 0
++            launch_summaries.append({
++                "launch": launch_index + 1,
++                "logits_finite": True,
++                "logits_nonzero": True,
++                "position": list(position),
++                "state_outputs": len(schema.state_outputs),
++            })
++        result = {
++            "cuda_m1k": "PASS",
++            "device": device,
++            "inputs": len(schema.inputs),
++            "outputs": len(schema.outputs),
++            "packed_nbytes": layout.total_nbytes,
++            "launches": launch_summaries,
++            "host_inputs_immutable": True,
++            "output_canaries": True,
++        }
++    finally:
++        if runtime is not None:
++            runtime.close()
++        if driver is not None:
++            driver.close()
++    compute_after = _compute_processes()
++    assert not compute_after, compute_after
++    result["compute_processes_before"] = list(compute_before)
++    result["compute_processes_after"] = list(compute_after)
++    print(json.dumps(result, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/tests/ut/pypto_x/test_cuda_byte_buffer_ingestion.py b/python/tests/ut/pypto_x/test_cuda_byte_buffer_ingestion.py
+new file mode 100644
+index 000000000..029113a80
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cuda_byte_buffer_ingestion.py
+@@ -0,0 +1,253 @@
++"""CUDA external typed-byte staging tests.
++
++The fake driver below models the address-based Driver API calls.  It refuses
++the legacy bytes/list helpers so a raw external buffer can only pass when the
++runtime keeps the shared :class:`TypedByteView` alive through both copies.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import mmap
++import struct
++from pathlib import Path
++
++import pytest
++
++from pypto.abi import GpuLaunchRequest, TensorDesc
++from pypto.backends.cuda import CudaDeviceInfo, CudaRuntime
++from pypto.backends.cuda import runtime as cuda_runtime
++from pypto.compiler.targets.cuda import CudaPtxCompiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.target import TargetSpec
++
++
++TARGET = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,)})
++
++
++class _Context:
++    def close(self):
++        return None
++
++
++class _Module:
++    info_log = ""
++    error_log = ""
++
++    def __init__(self, driver):
++        self.driver = driver
++
++    def get_function(self, name):
++        return name
++
++    def close(self):
++        self.driver.calls.append(("module_close",))
++
++
++class _AddressOnlyDriver:
++    """Tiny fake which records exact address/byte-count copies."""
++
++    def __init__(self):
++        self.calls = []
++        self.memory = {}
++        self.next_pointer = 0x1000
++        self.output_payload = b""
++
++    def device_info(self, index=0):
++        return CudaDeviceInfo(index, "fake-address-gpu", 12, 0, 16 * 1024**3)
++
++    def context_create(self, index=0):
++        self.calls.append(("context_create", index))
++        return _Context()
++
++    def module_load_data(self, ptx):
++        self.calls.append(("module_load_data", len(ptx)))
++        return _Module(self)
++
++    def mem_alloc(self, size):
++        self.next_pointer += 1
++        self.memory[self.next_pointer] = bytearray(max(1, int(size)))
++        self.calls.append(("mem_alloc", int(size)))
++        return self.next_pointer
++
++    def mem_free(self, pointer):
++        self.calls.append(("mem_free", pointer))
++        self.memory.pop(pointer, None)
++
++    def memcpy_htod(self, pointer, payload):  # pragma: no cover - must not run
++        raise AssertionError("raw input staging called legacy memcpy_htod(bytes)")
++
++    def memcpy_dtoh(self, pointer, size):  # pragma: no cover - must not run
++        raise AssertionError("raw output staging called legacy memcpy_dtoh(bytes)")
++
++    def memcpy_htod_address(self, pointer, source_address, size):
++        size = int(size)
++        self.calls.append(("memcpy_htod_address", int(source_address), size))
++        self.memory[pointer][:size] = ctypes.string_at(int(source_address), size)
++
++    def memcpy_dtoh_address(self, destination_address, pointer, size):
++        size = int(size)
++        self.calls.append(("memcpy_dtoh_address", int(destination_address), size))
++        payload = bytes(self.memory[pointer][:size])
++        ctypes.memmove(int(destination_address), payload, size)
++
++    def launch_kernel(self, function, grid, block, parameters, stream=None, shared_memory=0):
++        self.calls.append(("launch_kernel", function, len(parameters)))
++        output_pointer = int(parameters[-1])
++        size = len(self.memory[output_pointer])
++        if self.output_payload:
++            payload = (self.output_payload * ((size + len(self.output_payload) - 1) // len(self.output_payload)))[:size]
++        else:
++            payload = b"\0" * size
++        self.memory[output_pointer][:size] = payload
++
++    def context_synchronize(self):
++        self.calls.append(("context_synchronize",))
++
++
++def _identity(dtype, shape):
++    tensor = CoreType.tensor(dtype, shape)
++    x = ValueRef("x", tensor)
++    z = ValueRef("z", tensor)
++    return CoreProgram(
++        functions=(CoreFunction("main", (x,), (z,), Region((Operation("identity", (x,), (z,)),))),)
++    )
++
++
++def _artifact(program):
++    compiler = CudaPtxCompiler()
++    target_ir = compiler.lower(program, TARGET)
++    return target_ir, compiler.compile(target_ir)
++
++
++@pytest.mark.parametrize(
++    "dtype,shape,input_payload,output_payload",
++    (
++        ("bf16", (3,), struct.pack("<3H", 0x3F80, 0xC000, 0x7FC1), struct.pack("<3H", 0x0001, 0x8000, 0x7FC1)),
++        ("float32", (2,), struct.pack("<2f", 1.25, -2.5), struct.pack("<2f", 3.5, -4.5)),
++        ("int32", (2,), struct.pack("<2i", -7, 19), struct.pack("<2i", 11, -23)),
++        ("int64", (2,), struct.pack("<2q", -7, 19), struct.pack("<2q", 11, -23)),
++    ),
++)
++def test_cuda_raw_typed_views_use_address_staging_and_preserve_bits(
++    monkeypatch, dtype, shape, input_payload, output_payload
++):
++    for name in ("_host_values", "_pack", "_unpack", "_write_host"):
++        monkeypatch.setattr(cuda_runtime, name, lambda *args, _name=name, **kwargs: (_ for _ in ()).throw(AssertionError(_name)))
++    program = _identity(dtype, shape)
++    target_ir, artifact = _artifact(program)
++    driver = _AddressOnlyDriver()
++    driver.output_payload = output_payload
++    runtime = CudaRuntime(driver=driver)
++    source = bytearray(input_payload)
++    destination = bytearray(b"\xA5" * len(output_payload))
++    source_before = bytes(source)
++    request = GpuLaunchRequest(
++        artifact,
++        geometries=tuple(plan.geometry for plan in target_ir.gpu_program.plans),
++        inputs=(TensorDesc(dtype, shape, device="gpu", handle=memoryview(source), readonly=True),),
++        outputs=(TensorDesc(dtype, shape, device="gpu", handle=memoryview(destination)),),
++    )
++    try:
++        result = runtime.launch(request)
++    finally:
++        runtime.close()
++    assert result[0] is not None
++    assert bytes(source) == source_before
++    assert bytes(destination) == output_payload
++    input_calls = [call for call in driver.calls if call[0] == "memcpy_htod_address"]
++    output_calls = [call for call in driver.calls if call[0] == "memcpy_dtoh_address"]
++    assert [(call[2]) for call in input_calls] == [len(input_payload)]
++    assert [(call[2]) for call in output_calls] == [len(output_payload)]
++    assert all(call[1] != 0 for call in input_calls + output_calls)
++    assert not any(call[0] in ("memcpy_htod", "memcpy_dtoh") for call in driver.calls)
++    assert driver.memory == {}
++
++
++def test_cuda_raw_view_rejects_readonly_output_and_bad_contracts(monkeypatch):
++    program = _identity("bf16", (2,))
++    target_ir, artifact = _artifact(program)
++    driver = _AddressOnlyDriver()
++    runtime = CudaRuntime(driver=driver)
++    source = bytes(struct.pack("<2H", 1, 2))
++    readonly_output = bytes(4)
++    request = GpuLaunchRequest(
++        artifact,
++        geometries=tuple(plan.geometry for plan in target_ir.gpu_program.plans),
++        inputs=(TensorDesc("bf16", (2,), device="gpu", handle=memoryview(source), readonly=True),),
++        outputs=(TensorDesc("bf16", (2,), device="gpu", handle=memoryview(readonly_output)),),
++    )
++    with pytest.raises(Exception, match="read-only|output"):
++        runtime.launch(request)
++    assert not any(call[0] in ("mem_alloc", "memcpy_htod_address") for call in driver.calls)
++
++    # Buffer validation happens before a driver allocation and does not infer
++    # elements from a short/strided byte exporter.
++    short = bytearray(2)
++    bad_request = GpuLaunchRequest(
++        artifact,
++        geometries=tuple(plan.geometry for plan in target_ir.gpu_program.plans),
++        inputs=(TensorDesc("bf16", (2,), device="gpu", handle=memoryview(short), readonly=True),),
++        outputs=(TensorDesc("bf16", (2,), device="gpu", handle=bytearray(4)),),
++    )
++    with pytest.raises(Exception, match="shorter|bytes"):
++        runtime.launch(bad_request)
++    assert driver.memory == {}
++
++    released = memoryview(bytearray(4))
++    released.release()
++    released_request = GpuLaunchRequest(
++        artifact,
++        geometries=tuple(plan.geometry for plan in target_ir.gpu_program.plans),
++        inputs=(TensorDesc("bf16", (2,), device="gpu", handle=released, readonly=True),),
++        outputs=(TensorDesc("bf16", (2,), device="gpu", handle=bytearray(4)),),
++    )
++    with pytest.raises(Exception, match="released"):
++        runtime.launch(released_request)
++    assert driver.memory == {}
++
++    non_contiguous = memoryview(bytearray(8))[::2]
++    non_contiguous_request = GpuLaunchRequest(
++        artifact,
++        geometries=tuple(plan.geometry for plan in target_ir.gpu_program.plans),
++        inputs=(TensorDesc("bf16", (2,), device="gpu", handle=non_contiguous, readonly=True),),
++        outputs=(TensorDesc("bf16", (2,), device="gpu", handle=bytearray(4)),),
++    )
++    with pytest.raises(Exception, match="contiguous"):
++        runtime.launch(non_contiguous_request)
++    non_contiguous.release()
++    assert driver.memory == {}
++
++
++def test_cuda_raw_mmap_view_keeps_canary_and_zero_work(monkeypatch, tmp_path):
++    path = Path(tmp_path) / "raw.bin"
++    path.write_bytes(b"\x01\x02\x03\x04\xC7\xC7\xC7\xC7")
++    with path.open("r+b") as stream:
++        mapped = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_WRITE)
++        try:
++            program = _identity("bf16", (0,))
++            target_ir, artifact = _artifact(program)
++            driver = _AddressOnlyDriver()
++            driver.output_payload = b""
++            runtime = CudaRuntime(driver=driver)
++            destination = memoryview(mapped)[4:]
++            input_view = memoryview(mapped)[:0]
++            output_view = destination[:0]
++            request = GpuLaunchRequest(
++                artifact,
++                geometries=tuple(plan.geometry for plan in target_ir.gpu_program.plans),
++                inputs=(TensorDesc("bf16", (0,), device="gpu", handle=input_view, readonly=True),),
++                outputs=(TensorDesc("bf16", (0,), device="gpu", handle=output_view),),
++            )
++            try:
++                runtime.launch(request)
++            finally:
++                runtime.close()
++            assert mapped[4:] == b"\xC7\xC7\xC7\xC7"
++            assert not any(call[0] in ("memcpy_htod_address", "memcpy_dtoh_address") for call in driver.calls)
++            assert driver.memory == {}
++            input_view.release()
++            output_view.release()
++            destination.release()
++        finally:
++            mapped.close()

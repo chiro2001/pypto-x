@@ -1,0 +1,1084 @@
+From f44e1a79ce3892ab66cce8ea3398b446043982b1 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Wed, 9 Sep 2026 03:23:18 +0800
+Subject: [PATCH 62/96] feat(pypto-x): close qwen attention kv cache
+
+---
+ python/pypto/backends/cpu/aarch64/sve256.py                |  58 +++++-
+ python/pypto/backends/cpu/runtime.py                       |  40 +++-
+ python/pypto/backends/cpu/vector/runtime.py                |  21 +-
+ python/pypto/compiler/targets/cpu_sve256.py                |  18 ++
+ python/pypto/lowering/cpu/__init__.py                      |  17 +-
+ python/pypto/lowering/cpu/vector/plan.py                   |  44 ++--
+ python/pypto/lowering/cpu/x86/avx2/lowering.py             |   4 +
+ python/pypto/lowering/cpu/x86/avx512/lowering.py           |   4 +
+ python/pypto/portable/__init__.py                          |   6 +
+ python/pypto/portable/qwen35.py                            | 270 ++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_qwen35_sve256_attention_kv.py | 369 +++++++++++++++++++++++++++++++++
+ 11 files changed, 818 insertions(+), 33 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/aarch64/sve256.py b/python/pypto/backends/cpu/aarch64/sve256.py
+index 73a9cc779..e2483cfb3 100644
+--- a/python/pypto/backends/cpu/aarch64/sve256.py
++++ b/python/pypto/backends/cpu/aarch64/sve256.py
+@@ -527,6 +527,22 @@ def _decode_artifact(artifact: Artifact, available: CpuFeatureSet) -> LoadedSve2
+         raise CpuSve256ArtifactError("SVE256 logical-layout-copy metadata mismatch")
+     if metadata.get("native_layout_reorder_operations") != expected_reorder:
+         raise CpuSve256ArtifactError("SVE256 native layout reorder metadata mismatch")
++    if metadata.get("batched_matmul_fallback") != "host_batch_loop_rank2_runner":
++        raise CpuSve256ArtifactError("SVE256 batched matmul fallback metadata is missing")
++    expected_batched_matmul = [
++        {
++            "operation": plan.operation,
++            "batch_shape": list(plan.matmul.batch_shape),
++            "m": plan.matmul.m,
++            "k": plan.matmul.k,
++            "n": plan.matmul.n,
++            "mode": "host_batch_loop_rank2_runner",
++        }
++        for plan in target_ir.plans
++        if plan.matmul is not None and plan.matmul.batch_shape
++    ]
++    if metadata.get("batched_matmul_operations") != expected_batched_matmul:
++        raise CpuSve256ArtifactError("SVE256 batched matmul metadata mismatch")
+     expected_indexing = [
+         {
+             "operation": plan.operation,
+@@ -1406,10 +1422,44 @@ class Sve256Runtime:
+             )
+         elif name == "matmul":
+             matmul = plan.matmul
+-            values = self._run_runner(
+-                artifact, "matmul", dtype, [inputs[0][1], inputs[1][1]],
+-                matmul.output_elements, matmul.m, matmul.k, matmul.n,
+-            )
++            if matmul.batch_shape:
++                # The native wire contract remains rank-2.  Keep batched
++                # semantics explicit and auditable by invoking that runner
++                # once per equal batch-prefix slice on the host.  This is a
++                # correctness fallback, never a claim of a fused/native
++                # batched SVE kernel.
++                batch_count = 1
++                for dimension in matmul.batch_shape:
++                    batch_count *= dimension
++                left_matrix_elements = matmul.m * matmul.k
++                right_matrix_elements = matmul.k * matmul.n
++                output_matrix_elements = matmul.m * matmul.n
++                if len(inputs[0][1]) != batch_count * left_matrix_elements or len(inputs[1][1]) != batch_count * right_matrix_elements:
++                    raise CpuSve256ExecutionError("SVE256 batched matmul input length mismatch")
++                values = []
++                for batch_index in range(batch_count):
++                    left_base = batch_index * left_matrix_elements
++                    right_base = batch_index * right_matrix_elements
++                    values.extend(
++                        self._run_runner(
++                            artifact,
++                            "matmul",
++                            dtype,
++                            [
++                                inputs[0][1][left_base:left_base + left_matrix_elements],
++                                inputs[1][1][right_base:right_base + right_matrix_elements],
++                            ],
++                            output_matrix_elements,
++                            matmul.m,
++                            matmul.k,
++                            matmul.n,
++                        )
++                    )
++            else:
++                values = self._run_runner(
++                    artifact, "matmul", dtype, [inputs[0][1], inputs[1][1]],
++                    matmul.output_elements, matmul.m, matmul.k, matmul.n,
++                )
+         elif name in ("reshape", "view", "transpose", "contiguous", "slice"):
+             layout = plan.layout_plan
+             if layout is None or layout.operation != name:
+diff --git a/python/pypto/backends/cpu/runtime.py b/python/pypto/backends/cpu/runtime.py
+index 6ef538fa1..656a0db1f 100644
+--- a/python/pypto/backends/cpu/runtime.py
++++ b/python/pypto/backends/cpu/runtime.py
+@@ -844,20 +844,40 @@ def _matmul_value(
+     left_shape = static_shape(left_type, "matmul left")
+     right_shape = static_shape(right_type, "matmul right")
+     output_shape = static_shape(output_type, "matmul output")
+-    m, k = left_shape
+-    right_k, n = right_shape
+-    if right_k != k or output_shape != (m, n):
++    if len(left_shape) < 2 or len(left_shape) > 4:
++        raise CpuScalarExecutionError("matmul supports rank 2 through rank 4")
++    if len(left_shape) != len(right_shape) or len(left_shape) != len(output_shape):
++        raise CpuScalarExecutionError("batched matmul ranks are inconsistent")
++    if left_shape[:-2] != right_shape[:-2]:
++        raise CpuScalarExecutionError("batched matmul batch prefixes are inconsistent")
++    batch_shape = left_shape[:-2]
++    m, k = left_shape[-2:]
++    right_k, n = right_shape[-2:]
++    expected_output_shape = batch_shape + (m, n)
++    if right_k != k or output_shape != expected_output_shape:
+         raise CpuScalarExecutionError("matmul runtime shapes are inconsistent")
+-    if len(left) != m * k or len(right) != right_k * n:
++    batch_count = element_count(batch_shape)
++    left_matrix_elements = m * k
++    right_matrix_elements = right_k * n
++    output_matrix_elements = m * n
++    if len(left) != batch_count * left_matrix_elements or len(right) != batch_count * right_matrix_elements:
+         raise CpuScalarExecutionError("matmul input storage length mismatch")
+     dtype = canonical_dtype(output_type.dtype)
++    fp32_accumulation = dtype in ("float32", "bf16")
+     output = []
+-    for row in range(m):
+-        for column in range(n):
+-            aggregate = 0
+-            for inner in range(k):
+-                aggregate += left[row * k + inner] * right[inner * n + column]
+-            output.append(_cast_value(aggregate, dtype))
++    for batch_index in range(batch_count):
++        left_base = batch_index * left_matrix_elements
++        right_base = batch_index * right_matrix_elements
++        for row in range(m):
++            for column in range(n):
++                aggregate = 0
++                for inner in range(k):
++                    value = aggregate + (
++                        left[left_base + row * k + inner]
++                        * right[right_base + inner * n + column]
++                    )
++                    aggregate = _cast_value(value, "float32") if fp32_accumulation else value
++                output.append(_cast_value(aggregate, dtype))
+     return output
+ 
+ 
+diff --git a/python/pypto/backends/cpu/vector/runtime.py b/python/pypto/backends/cpu/vector/runtime.py
+index 6c843d9fc..2c801adb6 100644
+--- a/python/pypto/backends/cpu/vector/runtime.py
++++ b/python/pypto/backends/cpu/vector/runtime.py
+@@ -953,18 +953,31 @@ def _execute_matmul(
+     right_values, right_scalar = _value_sequence(right.data, right.type, context + ".right")
+     if left_scalar or right_scalar:
+         raise CpuVectorExecutionError("{} matmul inputs must be tensors".format(context))
+-    if len(left_values) != matmul.m * matmul.k or len(right_values) != matmul.k * matmul.n:
++    batch_count = 1
++    for dimension in matmul.batch_shape:
++        batch_count *= dimension
++    left_matrix_elements = matmul.m * matmul.k
++    right_matrix_elements = matmul.k * matmul.n
++    output_matrix_elements = matmul.m * matmul.n
++    if len(left_values) != batch_count * left_matrix_elements or len(right_values) != batch_count * right_matrix_elements:
+         raise CpuVectorExecutionError("{} matmul input length mismatch".format(context))
+     result = [None] * matmul.output_elements
+     fp32_accumulation = canonical_dtype(output_type.dtype) in ("float32", "bf16")
+     for output_index in _iteration_indices(matmul.output_iteration):
+-        row = output_index // matmul.n if matmul.n else 0
+-        column = output_index % matmul.n if matmul.n else 0
++        matrix_index = output_index % output_matrix_elements if output_matrix_elements else 0
++        batch_index = output_index // output_matrix_elements if output_matrix_elements else 0
++        row = matrix_index // matmul.n if matmul.n else 0
++        column = matrix_index % matmul.n if matmul.n else 0
++        left_base = batch_index * left_matrix_elements
++        right_base = batch_index * right_matrix_elements
+         aggregate = 0
+         for inner in _iteration_indices(matmul.reduction_iteration):
+             if inner >= matmul.k:
+                 raise CpuVectorExecutionError("{} matmul reduction chunk exceeds k".format(context))
+-            value = aggregate + left_values[row * matmul.k + inner] * right_values[inner * matmul.n + column]
++            value = aggregate + (
++                left_values[left_base + row * matmul.k + inner]
++                * right_values[right_base + inner * matmul.n + column]
++            )
+             aggregate = _float32(value) if fp32_accumulation else value
+         result[output_index] = _cast_value(aggregate, canonical_dtype(output_type.dtype))
+     return result
+diff --git a/python/pypto/compiler/targets/cpu_sve256.py b/python/pypto/compiler/targets/cpu_sve256.py
+index 67d50d71d..20aaa0ce4 100644
+--- a/python/pypto/compiler/targets/cpu_sve256.py
++++ b/python/pypto/compiler/targets/cpu_sve256.py
+@@ -2126,6 +2126,24 @@ class Sve256Compiler:
+                 for plan in target_ir.plans
+                 if plan.layout_plan is not None and plan.layout_plan.kind in ("transpose", "slice")
+             ],
++            # The native wire protocol is intentionally rank-2.  Batched
++            # matmul plans are therefore executed by the SVE Python runtime
++            # as an auditable host loop over rank-2 runner calls.  Keep this
++            # marker in the immutable artifact metadata so it cannot be
++            # mistaken for a fused/native batched kernel.
++            "batched_matmul_fallback": "host_batch_loop_rank2_runner",
++            "batched_matmul_operations": [
++                {
++                    "operation": plan.operation,
++                    "batch_shape": list(plan.matmul.batch_shape),
++                    "m": plan.matmul.m,
++                    "k": plan.matmul.k,
++                    "n": plan.matmul.n,
++                    "mode": "host_batch_loop_rank2_runner",
++                }
++                for plan in target_ir.plans
++                if plan.matmul is not None and plan.matmul.batch_shape
++            ],
+         }
+         if options is not None:
+             option_metadata = _plain_mapping(options.metadata)
+diff --git a/python/pypto/lowering/cpu/__init__.py b/python/pypto/lowering/cpu/__init__.py
+index 536fbb601..311025a72 100644
+--- a/python/pypto/lowering/cpu/__init__.py
++++ b/python/pypto/lowering/cpu/__init__.py
+@@ -1154,8 +1154,10 @@ def _validate_operation(operation: Operation, context: str) -> None:
+             raise CpuScalarUnsupportedError("{} matmul only supports tensor values".format(context))
+         for ref in inputs:
+             _validate_dtype(ref.type, context + ".input")
+-            if len(ref.type.shape) != 2:
+-                raise CpuScalarValidationError("{} matmul inputs must be rank 2".format(context))
++            if len(ref.type.shape) < 2 or len(ref.type.shape) > 4:
++                raise CpuScalarValidationError(
++                    "{} matmul inputs must have rank 2, 3, or 4".format(context)
++                )
+         _validate_dtype(output_type, context + ".output")
+         if any(canonical_dtype(ref.type.dtype) == "bool" for ref in inputs) or canonical_dtype(output_type.dtype) == "bool":
+             raise CpuScalarUnsupportedError(
+@@ -1166,7 +1168,16 @@ def _validate_operation(operation: Operation, context: str) -> None:
+         left_shape = static_shape(inputs[0].type, context + ".left")
+         right_shape = static_shape(inputs[1].type, context + ".right")
+         output_shape = static_shape(output_type, context + ".output")
+-        if left_shape[1] != right_shape[0] or output_shape != (left_shape[0], right_shape[1]):
++        if len(left_shape) != len(right_shape) or len(left_shape) != len(output_shape):
++            raise CpuScalarValidationError(
++                "{} batched matmul requires equal input/output ranks".format(context)
++            )
++        if left_shape[:-2] != right_shape[:-2]:
++            raise CpuScalarValidationError(
++                "{} batched matmul requires identical batch prefixes".format(context)
++            )
++        expected_output_shape = left_shape[:-2] + (left_shape[-2], right_shape[-1])
++        if left_shape[-1] != right_shape[-2] or output_shape != expected_output_shape:
+             raise CpuScalarValidationError(
+                 "{} matmul shapes {} x {} cannot produce {}".format(context, left_shape, right_shape, output_shape)
+             )
+diff --git a/python/pypto/lowering/cpu/vector/plan.py b/python/pypto/lowering/cpu/vector/plan.py
+index ff15d58b6..da441d840 100644
+--- a/python/pypto/lowering/cpu/vector/plan.py
++++ b/python/pypto/lowering/cpu/vector/plan.py
+@@ -525,30 +525,43 @@ class ReductionPlan:
+ 
+ @dataclass(frozen=True)
+ class MatmulPlan:
+-    """Rectangular ``(m,k) x (k,n)`` iteration description."""
++    """Rectangular batched ``(...,m,k) x (...,k,n)`` iteration description.
++
++    Batch prefixes are deliberately represented explicitly and must be equal
++    on both inputs.  This is the first portable contract: it avoids silently
++    inheriting NumPy batch broadcasting semantics while still covering the
++    rank-3/rank-4 Qwen attention shapes.
++    """
+ 
+     m: int
+     k: int
+     n: int
+-    output_shape: Tuple[int, int]
++    output_shape: Tuple[int, ...]
+     output_elements: int
+     output_iteration: IterationPlan
+     reduction_iteration: IterationPlan
++    batch_shape: Tuple[int, ...] = ()
+ 
+     def __post_init__(self) -> None:
+         _non_negative_int(self.m, "matmul.m")
+         _non_negative_int(self.k, "matmul.k")
+         _non_negative_int(self.n, "matmul.n")
+-        if self.output_shape != (self.m, self.n):
+-            raise CpuVectorValidationError("matmul output_shape must be (m, n)")
+-        if self.output_elements != self.m * self.n:
+-            raise CpuVectorValidationError("matmul output_elements does not match m*n")
++        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in self.batch_shape):
++            raise CpuVectorValidationError("matmul batch_shape must contain non-negative integers")
++        expected_shape = self.batch_shape + (self.m, self.n)
++        if self.output_shape != expected_shape:
++            raise CpuVectorValidationError(
++                "matmul output_shape must be batch_shape + (m, n)"
++            )
++        if self.output_elements != _product(expected_shape):
++            raise CpuVectorValidationError("matmul output_elements does not match output shape")
+ 
+     def to_dict(self) -> Mapping[str, Any]:
+         return {
+             "m": self.m,
+             "k": self.k,
+             "n": self.n,
++            "batch_shape": list(self.batch_shape),
+             "output_shape": list(self.output_shape),
+             "output_elements": self.output_elements,
+             "output_iteration": self.output_iteration.to_dict(),
+@@ -1854,11 +1867,17 @@ def _make_plan_for_operation(
+     if name == "matmul":
+         left_shape = static_shape(operation.inputs[0].type, "vector matmul left")
+         right_shape = static_shape(operation.inputs[1].type, "vector matmul right")
+-        if len(left_shape) != 2 or len(right_shape) != 2 or len(output_shape) != 2:
+-            raise CpuVectorValidationError("vector matmul requires rank-2 values")
+-        m, k = left_shape
+-        right_k, n = right_shape
+-        if right_k != k or output_shape != (m, n):
++        if len(left_shape) < 2 or len(left_shape) > 4:
++            raise CpuVectorValidationError("vector matmul supports rank 2 through rank 4")
++        if len(left_shape) != len(right_shape) or len(left_shape) != len(output_shape):
++            raise CpuVectorValidationError("vector batched matmul ranks are inconsistent")
++        if left_shape[:-2] != right_shape[:-2]:
++            raise CpuVectorValidationError("vector batched matmul batch prefixes are inconsistent")
++        m, k = left_shape[-2:]
++        right_k, n = right_shape[-2:]
++        batch_shape = left_shape[:-2]
++        expected_output_shape = batch_shape + (m, n)
++        if right_k != k or output_shape != expected_output_shape:
+             raise CpuVectorValidationError("vector matmul shapes are inconsistent")
+         reduction_iteration = make_iteration_plan(
+             k, lane_count, 1, tail_policy, compact=compact_iteration
+@@ -1867,10 +1886,11 @@ def _make_plan_for_operation(
+             m=m,
+             k=k,
+             n=n,
+-            output_shape=(m, n),
++            output_shape=expected_output_shape,
+             output_elements=count,
+             output_iteration=iteration,
+             reduction_iteration=reduction_iteration,
++            batch_shape=batch_shape,
+         )
+         return VectorPlan(
+             VECTOR_PLAN_VERSION,
+diff --git a/python/pypto/lowering/cpu/x86/avx2/lowering.py b/python/pypto/lowering/cpu/x86/avx2/lowering.py
+index 4fa441cac..efcd679f4 100644
+--- a/python/pypto/lowering/cpu/x86/avx2/lowering.py
++++ b/python/pypto/lowering/cpu/x86/avx2/lowering.py
+@@ -109,6 +109,10 @@ class Avx2Program:
+                 raise Avx2UnsupportedError(
+                     "AVX2 has no emitting lowering for operation {!r}".format(plan.operation)
+                 )
++            if plan.matmul is not None and plan.matmul.batch_shape:
++                raise Avx2UnsupportedError(
++                    "AVX2 batched matmul is not lowered yet; use scalar/vector-common or SVE256 fallback"
++                )
+             if canonical_dtype(plan.dtype) not in ("float32", "bf16"):
+                 raise Avx2UnsupportedError(
+                     "AVX2 supports float32 and bf16 plans, got {!r}".format(plan.dtype)
+diff --git a/python/pypto/lowering/cpu/x86/avx512/lowering.py b/python/pypto/lowering/cpu/x86/avx512/lowering.py
+index 279d4b1d2..964239bce 100644
+--- a/python/pypto/lowering/cpu/x86/avx512/lowering.py
++++ b/python/pypto/lowering/cpu/x86/avx512/lowering.py
+@@ -223,6 +223,10 @@ class Avx512Program:
+                 raise Avx512UnsupportedError(
+                     "AVX-512 has no emitting lowering for operation {!r}".format(plan.operation)
+                 )
++            if plan.matmul is not None and plan.matmul.batch_shape:
++                raise Avx512UnsupportedError(
++                    "AVX-512 batched matmul is not lowered yet; use scalar/vector-common or SVE256 fallback"
++                )
+             if canonical_dtype(plan.dtype) not in ("float32", "bf16"):
+                 raise Avx512UnsupportedError(
+                     "AVX-512 supports float32 and bf16 plans, got {!r}".format(plan.dtype)
+diff --git a/python/pypto/portable/__init__.py b/python/pypto/portable/__init__.py
+index 8e835fb99..59e282a4f 100644
+--- a/python/pypto/portable/__init__.py
++++ b/python/pypto/portable/__init__.py
+@@ -6,7 +6,9 @@
+ 
+ from .qwen35 import (
+     QWEN35_08B_SHAPE_METADATA,
++    build_attention_kv_cache,
+     build_attention_subgraph,
++    build_batched_matmul,
+     build_causal_mask,
+     build_causal_conv1d,
+     build_causal_conv1d_state,
+@@ -14,6 +16,7 @@ from .qwen35 import (
+     build_gqa_repeat_kv,
+     build_l2_norm,
+     build_qwen35_gated_delta_conv_state,
++    build_qwen35_attention_kv_cache,
+     build_rms_norm,
+     build_rope_rotate_half,
+     build_stable_softmax,
+@@ -22,7 +25,9 @@ from .qwen35 import (
+ 
+ __all__ = [
+     "QWEN35_08B_SHAPE_METADATA",
++    "build_attention_kv_cache",
+     "build_attention_subgraph",
++    "build_batched_matmul",
+     "build_causal_mask",
+     "build_causal_conv1d",
+     "build_causal_conv1d_state",
+@@ -30,6 +35,7 @@ __all__ = [
+     "build_gqa_repeat_kv",
+     "build_l2_norm",
+     "build_qwen35_gated_delta_conv_state",
++    "build_qwen35_attention_kv_cache",
+     "build_rms_norm",
+     "build_rope_rotate_half",
+     "build_stable_softmax",
+diff --git a/python/pypto/portable/qwen35.py b/python/pypto/portable/qwen35.py
+index 06864148a..3d32aa19b 100644
+--- a/python/pypto/portable/qwen35.py
++++ b/python/pypto/portable/qwen35.py
+@@ -1080,6 +1080,273 @@ def build_decoder_subgraph(
+     )
+ 
+ 
++def _matmul_output_shape(
++    left_shape: Tuple[int, ...], right_shape: Tuple[int, ...], field: str
++) -> Tuple[int, ...]:
++    """Validate the portable equal-prefix batched matmul contract."""
++
++    if len(left_shape) < 2 or len(left_shape) > 4:
++        raise ValueError("{} left operand must have rank 2, 3, or 4".format(field))
++    if len(left_shape) != len(right_shape):
++        raise ValueError("{} operands must have equal rank".format(field))
++    if left_shape[:-2] != right_shape[:-2]:
++        raise ValueError("{} operands must have identical batch prefixes".format(field))
++    if left_shape[-1] != right_shape[-2]:
++        raise ValueError(
++            "{} reduction dimensions {} and {} do not match".format(
++                field, left_shape[-1], right_shape[-2]
++            )
++        )
++    return left_shape[:-2] + (left_shape[-2], right_shape[-1])
++
++
++def build_batched_matmul(
++    left_shape: Sequence[int],
++    right_shape: Sequence[int],
++    dtype: str = "bf16",
++    output_dtype: Optional[str] = None,
++) -> CoreProgram:
++    """Build an equal-prefix rank-2/rank-3/rank-4 portable matmul.
++
++    The public contract intentionally has no implicit transpose attributes.
++    Callers express QK^T/PV layouts with an explicit ``transpose`` operation
++    before this builder's ``matmul``.  Batch prefixes must match exactly; no
++    NumPy-style batch broadcasting is inferred by the Core layer.
++    """
++
++    left_shape = _shape(left_shape, "left_shape")
++    right_shape = _shape(right_shape, "right_shape")
++    output_shape = _matmul_output_shape(left_shape, right_shape, "batched matmul")
++    dtype = _dtype(dtype, "dtype")
++    output_dtype = _output_dtype(dtype, output_dtype)
++    if output_dtype != dtype:
++        raise ValueError(
++            "batched matmul output_dtype must match dtype; cast inputs explicitly for FP32 accumulation"
++        )
++    builder = _Builder("qwen35_batched_matmul", "batched_matmul", output_shape)
++    left = builder.parameter("left", _tensor(dtype, left_shape))
++    right = builder.parameter("right", _tensor(dtype, right_shape))
++    output = builder.op(
++        "matmul",
++        (left, right),
++        (("output", _tensor(dtype, output_shape)),),
++    )[0]
++    return builder.finish(
++        (output,),
++        {
++            "matmul_rank": len(left_shape),
++            "batch_shape": list(left_shape[:-2]),
++            "batch_prefix_broadcast": False,
++            "transpose_attributes": False,
++            "transpose_semantics": "caller_must_emit_explicit_transpose",
++            "accumulation_dtype": "float32" if dtype in ("bf16", "float32") else dtype,
++            "fallbacks": ["python_list_wire_staging"],
++        },
++    )
++
++
++def build_qwen35_attention_kv_cache(
++    query_shape: Sequence[int],
++    prior_k_shape: Sequence[int],
++    prior_v_shape: Sequence[int],
++    current_k_shape: Sequence[int],
++    current_v_shape: Sequence[int],
++    dtype: str = "bf16",
++    index_dtype: str = "int64",
++) -> CoreProgram:
++    """Build Qwen3.5 full attention with a pure functional KV transition.
++
++    Shapes follow the fixed 0.8B text contract:
++
++    * query: ``[B, 8, T, 256]``;
++    * prior/current K and V: ``[B, 2, P/T, 256]``;
++    * explicit runtime head indices: ``[8]``;
++    * explicit runtime causal mask: ``[B, 8, T, P+T]``.
++
++    ``prior_k/prior_v`` and ``current_k/current_v`` are never mutated.  The
++    function returns ``(activation, new_k, new_v)`` where the new caches are
++    SSA results of concatenation.  Query/key/value storage stays BF16 while
++    QK scaling, masking, softmax, and PV matmul use FP32 intermediates.
++    ``qk_scale`` and ``fill_value`` are scalar LaunchRequest inputs.
++    """
++
++    query_shape = _shape(query_shape, "query_shape", rank=4)
++    prior_k_shape = _shape(prior_k_shape, "prior_k_shape", rank=4)
++    prior_v_shape = _shape(prior_v_shape, "prior_v_shape", rank=4)
++    current_k_shape = _shape(current_k_shape, "current_k_shape", rank=4)
++    current_v_shape = _shape(current_v_shape, "current_v_shape", rank=4)
++    dtype = _dtype(dtype, "dtype")
++    if dtype != "bf16":
++        raise ValueError("Qwen3.5 attention/KV contract requires dtype='bf16'")
++    batch, query_heads, steps, head_dim = query_shape
++    if (query_heads, head_dim) != (QWEN35_08B_SHAPE_METADATA["num_attention_heads"], QWEN35_08B_SHAPE_METADATA["head_dim"]):
++        raise ValueError("query_shape must use fixed Qwen3.5 heads=8 and head_dim=256")
++    kv_heads = QWEN35_08B_SHAPE_METADATA["num_key_value_heads"]
++    if prior_k_shape != prior_v_shape or current_k_shape != current_v_shape:
++        raise ValueError("K and V shapes must match within prior/current cache pairs")
++    if prior_k_shape[0] != batch or current_k_shape[0] != batch:
++        raise ValueError("query and KV batch dimensions must match exactly")
++    if prior_k_shape[1] != kv_heads or current_k_shape[1] != kv_heads:
++        raise ValueError("KV shapes must use fixed Qwen3.5 kv_heads=2")
++    if prior_k_shape[3] != head_dim or current_k_shape[3] != head_dim:
++        raise ValueError("query and KV head_dim must match fixed value 256")
++    past = prior_k_shape[2]
++    current_steps = current_k_shape[2]
++    if current_steps <= 0:
++        raise ValueError("current KV sequence length must be positive")
++    if steps != current_steps:
++        raise ValueError("query and current KV sequence lengths must match")
++    total_steps = past + current_steps
++    attention_shape = (batch, query_heads, steps, total_steps)
++    index_dtype = _index_dtype(index_dtype)
++    builder = _Builder(
++        "qwen35_attention_kv_cache",
++        "attention_kv_cache",
++        query_shape,
++    )
++    query = builder.parameter("query", _tensor("bf16", query_shape))
++    prior_k = builder.parameter("prior_k", _tensor("bf16", prior_k_shape))
++    prior_v = builder.parameter("prior_v", _tensor("bf16", prior_v_shape))
++    current_k = builder.parameter("current_k", _tensor("bf16", current_k_shape))
++    current_v = builder.parameter("current_v", _tensor("bf16", current_v_shape))
++    head_indices = builder.parameter("head_indices", _tensor(index_dtype, (query_heads,)))
++    causal_mask = builder.parameter("causal_mask", _tensor("bool", attention_shape))
++    qk_scale = builder.parameter("qk_scale", _scalar("float32"))
++    fill_value = builder.parameter("fill_value", _scalar("float32"))
++
++    new_k = builder.op(
++        "concat",
++        (prior_k, current_k),
++        (("new_k", _tensor("bf16", (batch, kv_heads, total_steps, head_dim))),),
++        {"axis": 2},
++    )[0]
++    new_v = builder.op(
++        "concat",
++        (prior_v, current_v),
++        (("new_v", _tensor("bf16", (batch, kv_heads, total_steps, head_dim))),),
++        {"axis": 2},
++    )[0]
++    repeated_k = builder.op(
++        "gather",
++        (new_k, head_indices),
++        (("repeated_k", _tensor("bf16", (batch, query_heads, total_steps, head_dim))),),
++        {"axis": 1},
++    )[0]
++    repeated_v = builder.op(
++        "gather",
++        (new_v, head_indices),
++        (("repeated_v", _tensor("bf16", (batch, query_heads, total_steps, head_dim))),),
++        {"axis": 1},
++    )[0]
++    query_f32 = _as_f32(builder, query, "bf16", "attention_query")
++    key_f32 = _as_f32(builder, repeated_k, "bf16", "attention_key")
++    key_transposed = builder.op(
++        "transpose",
++        (key_f32,),
++        (("key_transposed", _tensor("float32", (batch, query_heads, head_dim, total_steps))),),
++        {"permutation": [0, 1, 3, 2]},
++    )[0]
++    logits = builder.op(
++        "matmul",
++        (query_f32, key_transposed),
++        (("qk_logits", _tensor("float32", attention_shape)),),
++    )[0]
++    scaled_logits = builder.op(
++        "mul",
++        (logits, qk_scale),
++        (("scaled_logits", _tensor("float32", attention_shape)),),
++    )[0]
++    masked_logits = builder.op(
++        "where",
++        (causal_mask, scaled_logits, fill_value),
++        (("masked_logits", _tensor("float32", attention_shape)),),
++    )[0]
++    reduced_shape = attention_shape[:-1] + (1,)
++    maximum = builder.op(
++        "reduce_max",
++        (masked_logits,),
++        (("attention_max", _tensor("float32", reduced_shape)),),
++        {"axis": -1, "keepdims": True},
++    )[0]
++    maximum_full = builder.op(
++        "broadcast",
++        (maximum,),
++        (("attention_max_full", _tensor("float32", attention_shape)),),
++        {"shape": list(attention_shape)},
++    )[0]
++    shifted = builder.op(
++        "sub",
++        (masked_logits, maximum_full),
++        (("attention_shifted", _tensor("float32", attention_shape)),),
++    )[0]
++    exponent = builder.op(
++        "exp",
++        (shifted,),
++        (("attention_exp", _tensor("float32", attention_shape)),),
++    )[0]
++    total = builder.op(
++        "reduce_sum",
++        (exponent,),
++        (("attention_sum", _tensor("float32", reduced_shape)),),
++        {"axis": -1, "keepdims": True},
++    )[0]
++    total_full = builder.op(
++        "broadcast",
++        (total,),
++        (("attention_sum_full", _tensor("float32", attention_shape)),),
++        {"shape": list(attention_shape)},
++    )[0]
++    probabilities = builder.op(
++        "div",
++        (exponent, total_full),
++        (("attention_probabilities", _tensor("float32", attention_shape)),),
++    )[0]
++    value_f32 = _as_f32(builder, repeated_v, "bf16", "attention_value")
++    context = builder.op(
++        "matmul",
++        (probabilities, value_f32),
++        (("attention_context", _tensor("float32", query_shape)),),
++    )[0]
++    output = _cast_from_f32(builder, context, "bf16", "output")
++    return builder.finish(
++        (output, new_k, new_v),
++        {
++            "attention_heads": query_heads,
++            "kv_heads": kv_heads,
++            "head_dim": head_dim,
++            "past_length": past,
++            "current_length": current_steps,
++            "total_length": total_steps,
++            "mode": "prefill" if past == 0 else "decode_or_chunk",
++            "gqa_indices_runtime": True,
++            "causal_mask_runtime": True,
++            "causal_mask_shape": list(attention_shape),
++            "qk_scale_runtime_scalar": True,
++            "fill_value_runtime_scalar": True,
++            "qk_scale_accumulation_dtype": "float32",
++            "softmax_accumulation_dtype": "float32",
++            "pv_accumulation_dtype": "float32",
++            "activation_dtype": "bf16",
++            "kv_cache_dtype": "bf16",
++            "state_semantics": "functional_pure_ssa_output",
++            "transpose_semantics": "explicit_core_transpose_for_qk_t",
++            "batch_prefix_broadcast": False,
++            "fallbacks": [
++                "primitive_composition_not_fused",
++                "scalar_math_lane_fallback:exp",
++                "host_broadcast_pre_expansion",
++                "bf16_indexing_scalar_lane_fallback",
++                "python_list_wire_staging",
++                "sve_batched_matmul_host_batch_loop_rank2_runner",
++            ],
++        },
++    )
++
++
++# Short spelling kept for callers that do not need the model prefix.
++build_attention_kv_cache = build_qwen35_attention_kv_cache
++
++
+ def build_attention_subgraph(
+     rope_shape: Sequence[int],
+     attention_shape: Sequence[int],
+@@ -1198,13 +1465,16 @@ def build_attention_subgraph(
+ 
+ __all__ = [
+     "QWEN35_08B_SHAPE_METADATA",
++    "build_attention_kv_cache",
+     "build_attention_subgraph",
++    "build_batched_matmul",
+     "build_causal_mask",
+     "build_causal_conv1d",
+     "build_causal_conv1d_state",
+     "build_decoder_subgraph",
+     "build_gqa_repeat_kv",
+     "build_qwen35_gated_delta_conv_state",
++    "build_qwen35_attention_kv_cache",
+     "build_l2_norm",
+     "build_rms_norm",
+     "build_rope_rotate_half",
+diff --git a/python/tests/ut/pypto_x/test_qwen35_sve256_attention_kv.py b/python/tests/ut/pypto_x/test_qwen35_sve256_attention_kv.py
+new file mode 100644
+index 000000000..a5de90b79
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_qwen35_sve256_attention_kv.py
+@@ -0,0 +1,369 @@
++"""M1F batched matmul and functional Qwen3.5 attention/KV tests.
++
++All values are synthetic.  The attention contract is deliberately the fixed
++0.8B text shape (8 query heads, 2 KV heads, head_dim=256); no model or
++checkpoint is loaded.
++"""
++
++from __future__ import annotations
++
++import math
++from pathlib import Path
++from typing import Iterable, List, Sequence, Tuple
++
++import pytest
++
++from pypto.abi import LaunchRequest
++from pypto.backends.cpu import CpuScalarRuntime, HostTensor
++from pypto.backends.cpu.vector import CpuVectorRuntime
++from pypto.backends.cpu.aarch64.sve256 import Sve256Runtime
++from pypto.compiler import CompileOptions
++from pypto.compiler.targets.cpu import CpuScalarCompiler
++from pypto.compiler.targets.cpu_sve256 import Sve256Compiler
++from pypto.compiler.targets.cpu_vector import CpuVectorCompiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.portable.qwen35 import (
++    build_batched_matmul,
++    build_qwen35_attention_kv_cache,
++)
++from pypto.target import TargetSpec
++
++
++SCALAR_TARGET = TargetSpec("cpu", "x86_64-linux-gnu")
++VECTOR_TARGET = TargetSpec(
++    "cpu",
++    "x86_64-linux-gnu",
++    attributes={"lane_count": 4, "specialization": {"compact_iteration": True}},
++)
++SVE_TARGET = TargetSpec(
++    "cpu",
++    "aarch64-linux-gnu",
++    features=("sve", "sve2"),
++    attributes={"vl_bytes": 32},
++)
++
++
++def _count(shape: Sequence[int]) -> int:
++    result = 1
++    for dimension in shape:
++        result *= dimension
++    return result
++
++
++def _compile_scalar(program: CoreProgram):
++    compiler = CpuScalarCompiler()
++    return compiler.compile(compiler.lower(program, SCALAR_TARGET))
++
++
++def _compile_vector(program: CoreProgram):
++    compiler = CpuVectorCompiler()
++    return compiler.compile(compiler.lower(program, VECTOR_TARGET))
++
++
++def _compile_sve(program: CoreProgram, tmp_path: Path):
++    compiler = Sve256Compiler()
++    target_ir = compiler.lower(program, SVE_TARGET)
++    return compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format="pypto-x.cpu.sve256",
++            extra={"build_dir": str(tmp_path / "build")},
++        ),
++    )
++
++
++def _launch(artifact, inputs, outputs, runtime, scalars=None):
++    return runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[item.descriptor(readonly=True) for item in inputs],
++            outputs=[item.descriptor() for item in outputs],
++            scalars=scalars or {},
++        )
++    )
++
++
++def _assert_close(actual: Sequence[float], expected: Sequence[float], tolerance: float):
++    assert len(actual) == len(expected)
++    for left, right in zip(actual, expected):
++        assert math.isclose(float(left), float(right), rel_tol=tolerance, abs_tol=tolerance), (left, right)
++
++
++def _matmul_golden(left: Sequence[float], right: Sequence[float], left_shape, right_shape):
++    batch_shape = left_shape[:-2]
++    m, k = left_shape[-2:]
++    n = right_shape[-1]
++    batch_count = _count(batch_shape)
++    result = []
++    for batch_index in range(batch_count):
++        left_base = batch_index * m * k
++        right_base = batch_index * k * n
++        for row in range(m):
++            for column in range(n):
++                result.append(
++                    sum(
++                        left[left_base + row * k + inner]
++                        * right[right_base + inner * n + column]
++                        for inner in range(k)
++                    )
++                )
++    return result
++
++
++@pytest.mark.parametrize(
++    "left_shape,right_shape",
++    [((2, 2, 3), (2, 3, 4)), ((1, 2, 2, 3), (1, 2, 3, 4))],
++)
++def test_rank3_rank4_batched_matmul_scalar_vector_sve(left_shape, right_shape, tmp_path):
++    program = build_batched_matmul(left_shape, right_shape, dtype="float32")
++    output_shape = program.functions[0].returns[0].type.shape
++    left_values = [float((index % 11) - 5) * 0.125 for index in range(_count(left_shape))]
++    right_values = [float((index % 13) - 6) * 0.1 for index in range(_count(right_shape))]
++    left = HostTensor("float32", left_shape, left_values)
++    right = HostTensor("float32", right_shape, right_values)
++    expected = _matmul_golden(left_values, right_values, left_shape, right_shape)
++
++    scalar_output = HostTensor.zeros("float32", output_shape)
++    _launch(_compile_scalar(program), [left, right], [scalar_output], CpuScalarRuntime())
++    _assert_close(scalar_output.flat(), expected, 2.0e-6)
++
++    vector_output = HostTensor.zeros("float32", output_shape)
++    _launch(_compile_vector(program), [left, right], [vector_output], CpuVectorRuntime())
++    _assert_close(vector_output.flat(), expected, 2.0e-6)
++
++    sve_output = HostTensor.zeros("float32", output_shape)
++    artifact = _compile_sve(program, tmp_path / "rank{}".format(len(left_shape)))
++    assert artifact.metadata["batched_matmul_fallback"] == "host_batch_loop_rank2_runner"
++    assert artifact.metadata["batched_matmul_operations"][0]["mode"] == "host_batch_loop_rank2_runner"
++    _launch(
++        artifact,
++        [left, right],
++        [sve_output],
++        Sve256Runtime(execution_mode="qemu"),
++    )
++    _assert_close(sve_output.flat(), expected, 2.0e-6)
++
++
++def test_batched_matmul_rejects_broadcast_and_implicit_transpose():
++    with pytest.raises(ValueError, match="identical batch prefixes"):
++        build_batched_matmul((2, 3, 4), (1, 4, 5), dtype="float32")
++    with pytest.raises(ValueError, match="equal rank"):
++        build_batched_matmul((3, 4), (2, 3, 4), dtype="float32")
++
++    left = ValueRef("left", CoreType.tensor("float32", (2, 3, 4)))
++    right = ValueRef("right", CoreType.tensor("float32", (2, 4, 5)))
++    output = ValueRef("output", CoreType.tensor("float32", (2, 3, 5)))
++    program = CoreProgram(
++        functions=(
++            CoreFunction(
++                "implicit_transpose",
++                (left, right),
++                (output,),
++                Region((Operation("matmul", (left, right), (output,), {"transpose_b": True}),)),
++            ),
++        )
++    )
++    with pytest.raises(Exception, match="transpose_b"):
++        _compile_scalar(program)
++
++
++def _attention_inputs(past: int, steps: int):
++    query_shape = (1, 8, steps, 256)
++    prior_shape = (1, 2, past, 256)
++    current_shape = (1, 2, steps, 256)
++    query = HostTensor(
++        "bf16",
++        query_shape,
++        [0.01 * ((index * 5) % 17 - 8) for index in range(_count(query_shape))],
++    )
++    prior_k = HostTensor(
++        "bf16",
++        prior_shape,
++        [0.02 * ((index * 3) % 19 - 9) for index in range(_count(prior_shape))],
++    )
++    prior_v = HostTensor(
++        "bf16",
++        prior_shape,
++        [0.03 * ((index * 7) % 23 - 11) for index in range(_count(prior_shape))],
++    )
++    current_k = HostTensor(
++        "bf16",
++        current_shape,
++        [0.015 * ((index * 11) % 17 - 8) for index in range(_count(current_shape))],
++    )
++    current_v = HostTensor(
++        "bf16",
++        current_shape,
++        [0.025 * ((index * 13) % 29 - 14) for index in range(_count(current_shape))],
++    )
++    head_indices = HostTensor("int64", (8,), [0, 0, 0, 0, 1, 1, 1, 1])
++    total = past + steps
++    mask_values = []
++    for _batch in range(1):
++        for _head in range(8):
++            for row in range(steps):
++                mask_values.extend(column <= past + row for column in range(total))
++    mask = HostTensor("bool", (1, 8, steps, total), mask_values)
++    return [query, prior_k, prior_v, current_k, current_v, head_indices, mask]
++
++
++def _attention_golden(inputs, past: int, steps: int):
++    query, prior_k, prior_v, current_k, current_v, head_indices, mask = inputs
++    q = query.flat()
++    prior_k_values = prior_k.flat()
++    prior_v_values = prior_v.flat()
++    current_k_values = current_k.flat()
++    current_v_values = current_v.flat()
++    output = []
++    scale = 1.0 / math.sqrt(256.0)
++    for head in range(8):
++        kv_head = int(head_indices.flat()[head])
++        for row in range(steps):
++            scores = []
++            for column in range(past + steps):
++                score = 0.0
++                for inner in range(256):
++                    q_index = (head * steps + row) * 256 + inner
++                    if column < past:
++                        k_index = (kv_head * past + column) * 256 + inner
++                        key_value = prior_k_values[k_index]
++                    else:
++                        k_index = (kv_head * steps + column - past) * 256 + inner
++                        key_value = current_k_values[k_index]
++                    score += float(q[q_index]) * float(key_value)
++                mask_index = ((head * steps + row) * (past + steps)) + column
++                scores.append(score * scale if mask.flat()[mask_index] else -10000.0)
++            maximum = max(scores)
++            probabilities = [math.exp(score - maximum) for score in scores]
++            total = sum(probabilities)
++            probabilities = [value / total for value in probabilities]
++            for inner in range(256):
++                value = 0.0
++                for column, probability in enumerate(probabilities):
++                    if column < past:
++                        v_index = (kv_head * past + column) * 256 + inner
++                        value_value = prior_v_values[v_index]
++                    else:
++                        v_index = (kv_head * steps + column - past) * 256 + inner
++                        value_value = current_v_values[v_index]
++                    value += probability * float(value_value)
++                output.append(value)
++    return output
++
++
++def _run_attention(program, inputs, output, new_k, new_v, runtime, artifact, past, steps):
++    _launch(
++        artifact,
++        inputs,
++        [output, new_k, new_v],
++        runtime,
++        scalars={"qk_scale": 1.0 / math.sqrt(256.0), "fill_value": -10000.0},
++    )
++    _assert_close(output.flat(), _attention_golden(inputs, past, steps), 0.04)
++
++
++def test_qwen_attention_prefill_decode_functional_kv_scalar_and_sve(tmp_path):
++    prefill_inputs = _attention_inputs(0, 2)
++    prefill = build_qwen35_attention_kv_cache(
++        (1, 8, 2, 256), (1, 2, 0, 256), (1, 2, 0, 256), (1, 2, 2, 256), (1, 2, 2, 256)
++    )
++    assert [ref.name for ref in prefill.functions[0].returns] == ["output", "new_k", "new_v"]
++    assert prefill.metadata["mode"] == "prefill"
++    assert prefill.metadata["gqa_indices_runtime"] is True
++    assert prefill.metadata["causal_mask_runtime"] is True
++    scalar_artifact = _compile_scalar(prefill)
++    scalar_output = HostTensor.zeros("bf16", (1, 8, 2, 256))
++    scalar_k = HostTensor.zeros("bf16", (1, 2, 2, 256))
++    scalar_v = HostTensor.zeros("bf16", (1, 2, 2, 256))
++    _run_attention(
++        prefill,
++        prefill_inputs,
++        scalar_output,
++        scalar_k,
++        scalar_v,
++        CpuScalarRuntime(),
++        scalar_artifact,
++        0,
++        2,
++    )
++
++    sve_artifact = _compile_sve(prefill, tmp_path / "prefill")
++    sve_output = HostTensor.zeros("bf16", (1, 8, 2, 256))
++    sve_k = HostTensor.zeros("bf16", (1, 2, 2, 256))
++    sve_v = HostTensor.zeros("bf16", (1, 2, 2, 256))
++    _run_attention(
++        prefill,
++        prefill_inputs,
++        sve_output,
++        sve_k,
++        sve_v,
++        Sve256Runtime(execution_mode="qemu"),
++        sve_artifact,
++        0,
++        2,
++    )
++    _assert_close(sve_output.flat(), scalar_output.flat(), 0.04)
++    _assert_close(sve_k.flat(), scalar_k.flat(), 0.04)
++    _assert_close(sve_v.flat(), scalar_v.flat(), 0.04)
++
++    decode_inputs = _attention_inputs(2, 1)
++    decode_inputs[1] = scalar_k
++    decode_inputs[2] = scalar_v
++    decode = build_qwen35_attention_kv_cache(
++        (1, 8, 1, 256), (1, 2, 2, 256), (1, 2, 2, 256), (1, 2, 1, 256), (1, 2, 1, 256)
++    )
++    assert decode.metadata["mode"] == "decode_or_chunk"
++    decode_artifact = _compile_scalar(decode)
++    decode_output = HostTensor.zeros("bf16", (1, 8, 1, 256))
++    decode_k = HostTensor.zeros("bf16", (1, 2, 3, 256))
++    decode_v = HostTensor.zeros("bf16", (1, 2, 3, 256))
++    _run_attention(
++        decode,
++        decode_inputs,
++        decode_output,
++        decode_k,
++        decode_v,
++        CpuScalarRuntime(),
++        decode_artifact,
++        2,
++        1,
++    )
++    decode_inputs[1] = sve_k
++    decode_inputs[2] = sve_v
++    decode_sve_artifact = _compile_sve(decode, tmp_path / "decode")
++    decode_sve_output = HostTensor.zeros("bf16", (1, 8, 1, 256))
++    decode_sve_k = HostTensor.zeros("bf16", (1, 2, 3, 256))
++    decode_sve_v = HostTensor.zeros("bf16", (1, 2, 3, 256))
++    _run_attention(
++        decode,
++        decode_inputs,
++        decode_sve_output,
++        decode_sve_k,
++        decode_sve_v,
++        Sve256Runtime(execution_mode="qemu"),
++        decode_sve_artifact,
++        2,
++        1,
++    )
++
++
++def test_batched_matmul_zero_output_and_attention_shape_rejections():
++    program = build_batched_matmul((2, 2, 0, 3), (2, 2, 3, 4), dtype="float32")
++    compiler = CpuVectorCompiler()
++    artifact = compiler.compile(compiler.lower(program, VECTOR_TARGET))
++    output = HostTensor.zeros("float32", (2, 2, 0, 4))
++    _launch(
++        artifact,
++        [HostTensor("float32", (2, 2, 0, 3)), HostTensor("float32", (2, 2, 3, 4))],
++        [output],
++        CpuVectorRuntime(),
++    )
++    assert output.flat() == ()
++    with pytest.raises(ValueError, match="fixed Qwen3.5"):
++        build_qwen35_attention_kv_cache(
++            (1, 4, 1, 256), (1, 2, 0, 256), (1, 2, 0, 256), (1, 2, 1, 256), (1, 2, 1, 256)
++        )
++    with pytest.raises(ValueError, match="K and V shapes"):
++        build_qwen35_attention_kv_cache(
++            (1, 8, 1, 256), (1, 2, 0, 256), (1, 2, 0, 128), (1, 2, 1, 256), (1, 2, 1, 256)
++        )

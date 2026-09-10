@@ -92,6 +92,8 @@ git -C /home/chiro/projects/pypto/worktrees/pypto-x/integration log --oneline -1
 - 根目录是轻量控制仓（docs/configs/scripts + submodule gitlink）；远端为私有归档 `chiro2001/pypto-x-private`，
   公开主仓是 `chiro2001/pypto-x`（由 `scripts/remote/publish_public_mirror.sh` 生成，历史中剔除第三方 PDF/HTML）。
   **推送到公开仓是发布动作，需用户明确指示**；不得把上游源码、权重或证据上传到公开仓。
+- 许可与补丁：本仓自有内容为 Apache-2.0（`LICENSE`/`NOTICE`）；`patches/pypto-x/` 是**机器生成**的补丁集，
+  改动实现后需重跑 `scripts/remote/export_patches.sh` 再提交，不要手工编辑补丁文件。
 - 不清理或重置未知修改。`upstream/PTOAS/.codex/CLAUDE.md` 的 dirty 来自上游 CRLF/`.gitattributes` 不一致，不是人工改动。
 
 ## Subagent 协议

@@ -1,0 +1,858 @@
+From a266fa2a825c39fd2f36300eacb4ababb0c5cdb6 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Tue, 8 Sep 2026 15:25:43 +0800
+Subject: [PATCH 41/96] fix(pypto-x): close GPU common artifact and correctness
+ gates
+
+---
+ python/pypto/abi/gpu.py                    |  40 ++----
+ python/pypto/abi/gpu_tokens.py             |  61 +++++++++
+ python/pypto/backends/gpu/runtime.py       | 103 +++++++++++++--
+ python/pypto/compiler/targets/gpu.py       |  32 +----
+ python/pypto/lowering/gpu/plan.py          |  41 +-----
+ python/tests/ut/pypto_x/test_gpu_common.py | 345 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 519 insertions(+), 103 deletions(-)
+
+diff --git a/python/pypto/abi/gpu.py b/python/pypto/abi/gpu.py
+index 2c717fbc3..6657ffa18 100644
+--- a/python/pypto/abi/gpu.py
++++ b/python/pypto/abi/gpu.py
+@@ -12,31 +12,17 @@ from dataclasses import dataclass
+ from enum import Enum
+ from typing import Any, Mapping, Optional, Sequence, Tuple
+ 
+-from pypto.compiler.artifact import ARTIFACT_FORMAT_VERSION, Artifact
++from pypto.compiler.artifact import Artifact
+ from pypto.target._utils import frozen_mapping, mapping_copy
+ from pypto.target.errors import ABIValidationError, VersionMismatchError
+ 
+ from .descriptors import ABI_SCHEMA_VERSION, LaunchRequest, TensorDesc
++from .gpu_tokens import find_vendor_term
+ 
+ 
+ GPU_ABI_SCHEMA_VERSION = 1
+ MAX_LOGICAL_INDEX = (1 << 64) - 1
+ MAX_DIMENSIONS = 3
+-_VENDOR_TERMS = (
+-    "cuda",
+-    "nvidia",
+-    "amd",
+-    "rocm",
+-    "nvvm",
+-    "ptx",
+-    "hip",
+-    "rocdl",
+-    "amdgpu",
+-    "warp",
+-    "wavefront",
+-    "wmma",
+-    "mfma",
+-)
+ 
+ 
+ def _positive_int(value: Any, field: str) -> int:
+@@ -68,22 +54,12 @@ def _checked_product(values: Sequence[int], field: str) -> int:
+ 
+ 
+ def _reject_vendor_terms(value: Any, context: str = "value") -> None:
+-    if isinstance(value, str):
+-        lowered = value.lower()
+-        if any(term in lowered for term in _VENDOR_TERMS):
+-            raise ABIValidationError(
+-                "{} contains a vendor-specific GPU term".format(context),
+-                field=context,
+-            )
+-        return
+-    if isinstance(value, Mapping):
+-        for key, item in value.items():
+-            _reject_vendor_terms(key, "{}.key".format(context))
+-            _reject_vendor_terms(item, "{}.{}".format(context, key))
+-        return
+-    if isinstance(value, (list, tuple, set, frozenset)):
+-        for index, item in enumerate(value):
+-            _reject_vendor_terms(item, "{}[{}]".format(context, index))
++    found = find_vendor_term(value, context)
++    if found is not None:
++        raise ABIValidationError(
++            "{} contains a vendor-specific GPU term".format(found),
++            field=found,
++        )
+ 
+ 
+ def _dim_tuple(value: Any, field: str) -> Tuple[int, int, int]:
+diff --git a/python/pypto/abi/gpu_tokens.py b/python/pypto/abi/gpu_tokens.py
+new file mode 100644
+index 000000000..4a1d59bef
+--- /dev/null
++++ b/python/pypto/abi/gpu_tokens.py
+@@ -0,0 +1,61 @@
++"""Shared vendor-token boundary checks for the GPU common contracts."""
++
++from __future__ import annotations
++
++import re
++from typing import Any, Mapping, Optional
++
++
++VENDOR_TERMS = (
++    "cuda",
++    "nvidia",
++    "amd",
++    "rocm",
++    "hip",
++    "nvvm",
++    "ptx",
++    "nvptx",
++    "amdgpu",
++    "amdgcn",
++    "rocdl",
++    "warp",
++    "wavefront",
++    "wmma",
++    "mfma",
++)
++_VENDOR_TOKEN_RE = re.compile(
++    r"(?<![A-Za-z0-9])(?:" + "|".join(re.escape(term) for term in VENDOR_TERMS) + r")(?![A-Za-z0-9])",
++    re.IGNORECASE,
++)
++
++
++def find_vendor_term(value: Any, context: str = "value") -> Optional[str]:
++    """Return the first offending path, using token/namespace boundaries.
++
++    An ordinary word such as ``relationship`` is allowed even though its
++    suffix happens to contain the letters ``hip``.  Namespaced or delimited
++    values such as ``hip-target`` and ``cuda_stream`` remain rejected.
++    """
++
++    if isinstance(value, str):
++        if _VENDOR_TOKEN_RE.search(value):
++            return context
++        return None
++    if isinstance(value, Mapping):
++        for key, item in value.items():
++            found = find_vendor_term(key, "{}.key".format(context))
++            if found is not None:
++                return found
++            found = find_vendor_term(item, "{}.{}".format(context, key))
++            if found is not None:
++                return found
++        return None
++    if isinstance(value, (list, tuple, set, frozenset)):
++        for index, item in enumerate(value):
++            found = find_vendor_term(item, "{}[{}]".format(context, index))
++            if found is not None:
++                return found
++    return None
++
++
++__all__ = ["VENDOR_TERMS", "find_vendor_term"]
+diff --git a/python/pypto/backends/gpu/runtime.py b/python/pypto/backends/gpu/runtime.py
+index 37a3c7be7..01eaf3514 100644
+--- a/python/pypto/backends/gpu/runtime.py
++++ b/python/pypto/backends/gpu/runtime.py
+@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+ 
+ from pypto.abi import Availability, LaunchRequest, TensorDesc
+ from pypto.abi.gpu import GpuLaunchRequest
++from pypto.abi.gpu_tokens import find_vendor_term
+ from pypto.compiler.artifact import Artifact
+ from pypto.compiler.targets.gpu import ABI_VERSION, DEFAULT_ARTIFACT_FORMAT
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation
+@@ -24,7 +25,6 @@ from pypto.lowering.gpu import (
+     GPU_IR_VERSION,
+     GPU_LOWERING_VERSION,
+     GPU_PLAN_VERSION,
+-    BoundsPredicate,
+     GpuKernelPlan,
+     GpuProgram,
+     GpuUnsupportedError,
+@@ -217,6 +217,44 @@ def _as_gpu_request(request: Any) -> GpuLaunchRequest:
+     )
+ 
+ 
++def _artifact_string(value: Any, field: str) -> str:
++    if not isinstance(value, str) or not value.strip():
++        raise GpuArtifactError("GPU artifact {} must be a non-empty string".format(field))
++    return value
++
++
++def _artifact_int(value: Any, field: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise GpuArtifactError("GPU artifact {} must be an integer".format(field))
++    return value
++
++
++def _artifact_mapping(value: Any, field: str) -> Mapping[str, Any]:
++    if not isinstance(value, Mapping):
++        raise GpuArtifactError("GPU artifact {} must be an object".format(field))
++    return value
++
++
++def _artifact_string_sequence(value: Any, field: str) -> Tuple[str, ...]:
++    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
++        raise GpuArtifactError("GPU artifact {} must be an array of strings".format(field))
++    result = []
++    for index, item in enumerate(value):
++        if not isinstance(item, str) or not item.strip():
++            raise GpuArtifactError("GPU artifact {}[{}] must be a non-empty string".format(field, index))
++        result.append(item)
++    return tuple(result)
++
++
++def _artifact_mapping_sequence(value: Any, field: str) -> Tuple[Mapping[str, Any], ...]:
++    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
++        raise GpuArtifactError("GPU artifact {} must be an array of objects".format(field))
++    result = []
++    for index, item in enumerate(value):
++        result.append(_artifact_mapping(item, "{}[{}]".format(field, index)))
++    return tuple(result)
++
++
+ def _decode_artifact(artifact: Artifact) -> LoadedGpuArtifact:
+     if not isinstance(artifact, Artifact):
+         raise GpuArtifactError("GPU common runtime requires Artifact")
+@@ -228,7 +266,12 @@ def _decode_artifact(artifact: Artifact) -> LoadedGpuArtifact:
+         raise GpuArtifactError("GPU common artifact requires an inline canonical payload")
+     payload = bytes(artifact.payload)
+     metadata = artifact.metadata
+-    metadata_plain = mapping_copy(metadata)
++    try:
++        metadata_plain = mapping_copy(metadata)
++    except Exception as exc:
++        raise GpuArtifactError("GPU artifact metadata must be an object") from exc
++    if not isinstance(metadata_plain, dict):
++        raise GpuArtifactError("GPU artifact metadata must be an object")
+     required_envelope = {
+         "artifact_payload_version",
+         "backend",
+@@ -261,6 +304,19 @@ def _decode_artifact(artifact: Artifact) -> LoadedGpuArtifact:
+     }
+     if not required_metadata.issubset(set(metadata_plain)):
+         raise GpuArtifactError("GPU artifact metadata has unknown or missing required fields")
++    _artifact_string(metadata_plain.get("backend"), "metadata.backend")
++    _artifact_int(metadata_plain.get("artifact_payload_version"), "metadata.artifact_payload_version")
++    _artifact_string(metadata_plain.get("gpu_ir_version"), "metadata.gpu_ir_version")
++    _artifact_int(metadata_plain.get("lowering_version"), "metadata.lowering_version")
++    _artifact_int(metadata_plain.get("plan_version"), "metadata.plan_version")
++    _artifact_string(metadata_plain.get("entrypoint"), "metadata.entrypoint")
++    for field in ("program_digest", "plan_digest", "payload_digest", "target_digest"):
++        _artifact_string(metadata_plain.get(field), "metadata." + field)
++    _artifact_string_sequence(metadata_plain.get("required_capabilities"), "metadata.required_capabilities")
++    _artifact_mapping_sequence(metadata_plain.get("geometry"), "metadata.geometry")
++    _artifact_mapping(metadata_plain.get("specialization"), "metadata.specialization")
++    _artifact_string_sequence(metadata_plain.get("dtypes"), "metadata.dtypes")
++    _artifact_string_sequence(metadata_plain.get("layouts"), "metadata.layouts")
+     if metadata.get("backend") != GPU_COMMON_BACKEND:
+         raise GpuArtifactError("artifact backend metadata is not GPU common")
+     if metadata.get("artifact_payload_version") != 1:
+@@ -277,6 +333,17 @@ def _decode_artifact(artifact: Artifact) -> LoadedGpuArtifact:
+     envelope_keys = set(decoded)
+     if not required_envelope.issubset(envelope_keys) or envelope_keys - required_envelope - {"compile_options"}:
+         raise GpuArtifactError("GPU artifact envelope has unknown or missing fields")
++    _artifact_int(decoded.get("artifact_payload_version"), "artifact_payload_version")
++    _artifact_string(decoded.get("backend"), "backend")
++    _artifact_string(decoded.get("gpu_ir_version"), "gpu_ir_version")
++    _artifact_int(decoded.get("lowering_version"), "lowering_version")
++    _artifact_int(decoded.get("plan_version"), "plan_version")
++    _artifact_string(decoded.get("entrypoint"), "entrypoint")
++    _artifact_mapping(decoded.get("target"), "target")
++    _artifact_mapping(decoded.get("program"), "program")
++    _artifact_mapping(decoded.get("gpu_program"), "gpu_program")
++    for field in ("program_digest", "plan_digest"):
++        _artifact_string(decoded.get(field), field)
+     canonical_payload = json.dumps(
+         decoded,
+         ensure_ascii=False,
+@@ -298,6 +365,8 @@ def _decode_artifact(artifact: Artifact) -> LoadedGpuArtifact:
+         raise GpuArtifactError("unsupported GPU plan version")
+     if decoded.get("target") != artifact.target.to_dict():
+         raise GpuArtifactError("GPU artifact target mismatch")
++    if "compile_options" in decoded and decoded["compile_options"] is None:
++        raise GpuArtifactError("GPU artifact compile_options must be an object")
+     payload_options = decoded.get("compile_options")
+     if payload_options is None:
+         if artifact.format != DEFAULT_ARTIFACT_FORMAT or artifact.abi_version != ABI_VERSION:
+@@ -311,6 +380,9 @@ def _decode_artifact(artifact: Artifact) -> LoadedGpuArtifact:
+             raise GpuArtifactError("GPU artifact compile_options has unknown or missing fields")
+         if not isinstance(payload_options["metadata"], dict) or not isinstance(payload_options["extra"], dict):
+             raise GpuArtifactError("GPU artifact compile_options metadata/extra must be objects")
++        vendor_field = find_vendor_term(payload_options, "compile_options")
++        if vendor_field is not None:
++            raise GpuArtifactError("GPU artifact compile_options contains a vendor-specific term")
+         if (
+             payload_options["artifact_format"] != artifact.format
+             or payload_options["abi_version"] != artifact.abi_version
+@@ -367,16 +439,16 @@ def _decode_artifact(artifact: Artifact) -> LoadedGpuArtifact:
+         raise GpuArtifactError("GPU artifact metadata plan version mismatch")
+     if metadata.get("target_digest") != sha256_text(artifact.target.to_dict()):
+         raise GpuArtifactError("GPU artifact target digest mismatch")
+-    if tuple(metadata.get("required_capabilities", ())) != target_ir.required_capabilities:
++    if tuple(metadata_plain["required_capabilities"]) != target_ir.required_capabilities:
+         raise GpuArtifactError("GPU artifact required capability metadata mismatch")
+     expected_geometry = [plan.geometry.to_dict() for plan in target_ir.plans]
+     if metadata_plain.get("geometry") != expected_geometry:
+         raise GpuArtifactError("GPU artifact geometry metadata mismatch")
+     if metadata_plain.get("specialization") != mapping_copy(target_ir.specialization):
+         raise GpuArtifactError("GPU artifact specialization metadata mismatch")
+-    if list(metadata.get("dtypes", ())) != sorted(set(plan.dtype for plan in target_ir.plans)):
++    if list(metadata_plain["dtypes"]) != sorted(set(plan.dtype for plan in target_ir.plans)):
+         raise GpuArtifactError("GPU artifact dtype metadata mismatch")
+-    if list(metadata.get("layouts", ())) != sorted(set(plan.layout for plan in target_ir.plans)):
++    if list(metadata_plain["layouts"]) != sorted(set(plan.layout for plan in target_ir.plans)):
+         raise GpuArtifactError("GPU artifact layout metadata mismatch")
+     return LoadedGpuArtifact(artifact, target_ir)
+ 
+@@ -410,6 +482,10 @@ def _validate_request_target(
+         if descriptor.strides != _contiguous_strides(descriptor.shape):
+             raise GpuExecutionError("GPU common requires contiguous tensor descriptors")
+     if request.argument_bindings and function is not None and plans is not None:
++        if tuple(binding.index for binding in request.argument_bindings) != tuple(
++            range(len(request.argument_bindings))
++        ):
++            raise GpuExecutionError("GPU argument bindings are not in parameter order")
+         expected = []
+         for ref in function.parameters:
+             expected.append((ref.name, "scalar" if _is_scalar(ref.type) else "tensor", ref))
+@@ -487,20 +563,27 @@ def _write_tensor(descriptor: TensorDesc, value_type: CoreType, values: Sequence
+         cast_values = [_gpu_cast(value, expected_dtype) for value in values]
+     except (TypeError, ValueError, OverflowError) as exc:
+         raise GpuExecutionError("{} produced an invalid value".format(context)) from exc
+-    if len(cast_values) != element_count(descriptor.shape):
++    expected_count = element_count(descriptor.shape)
++    if len(cast_values) != expected_count:
+         raise GpuExecutionError("{} output length does not match shape".format(context))
+-    if not cast_values:
+-        return
+     if destination is not None:
+-        if len(destination) != len(cast_values):
++        try:
++            destination_length = len(destination)
++        except (TypeError, AttributeError) as exc:
++            raise GpuExecutionError("{} output storage is not mutable".format(context)) from exc
++        if destination_length != expected_count:
+             raise GpuExecutionError("{} output storage length does not match shape".format(context))
++        if not cast_values:
++            return
+         destination[:] = cast_values
+         return
+     if storage is None or not hasattr(storage, "__setitem__"):
+         raise GpuExecutionError("{} output storage is not mutable".format(context))
+     try:
+-        if len(storage) != len(cast_values):
++        if len(storage) != expected_count:
+             raise GpuExecutionError("{} output storage length does not match shape".format(context))
++        if not cast_values:
++            return
+         for index, value in enumerate(cast_values):
+             storage[index] = value
+     except (TypeError, IndexError, AttributeError) as exc:
+diff --git a/python/pypto/compiler/targets/gpu.py b/python/pypto/compiler/targets/gpu.py
+index 438879bb4..ceb47d731 100644
+--- a/python/pypto/compiler/targets/gpu.py
++++ b/python/pypto/compiler/targets/gpu.py
+@@ -9,6 +9,7 @@ from typing import Any, Mapping, Optional
+ from pypto.compiler.api import CompileOptions
+ from pypto.compiler.artifact import ABI_VERSION, Artifact
+ from pypto.core_ir import CoreProgram
++from pypto.abi.gpu_tokens import find_vendor_term
+ from pypto.lowering.gpu import (
+     GPU_COMMON_BACKEND,
+     GPU_IR_VERSION,
+@@ -23,21 +24,6 @@ from pypto.target._utils import mapping_copy, sha256_text
+ 
+ ARTIFACT_PAYLOAD_VERSION = 1
+ DEFAULT_ARTIFACT_FORMAT = "pypto-x.gpu.common"
+-_VENDOR_TERMS = (
+-    "cuda",
+-    "nvidia",
+-    "amd",
+-    "rocm",
+-    "nvvm",
+-    "ptx",
+-    "hip",
+-    "rocdl",
+-    "amdgpu",
+-    "warp",
+-    "wavefront",
+-    "wmma",
+-    "mfma",
+-)
+ 
+ 
+ def _plain(value: Any) -> Any:
+@@ -51,17 +37,9 @@ def _plain(value: Any) -> Any:
+ 
+ 
+ def _reject_vendor_terms(value: Any, context: str = "value") -> None:
+-    if isinstance(value, str):
+-        if any(term in value.lower() for term in _VENDOR_TERMS):
+-            raise ValueError("{} contains a vendor-specific GPU term".format(context))
+-        return
+-    if isinstance(value, Mapping):
+-        for key, item in value.items():
+-            _reject_vendor_terms(key, "{}.key".format(context))
+-            _reject_vendor_terms(item, "{}.{}".format(context, key))
+-    elif isinstance(value, (list, tuple, set, frozenset)):
+-        for index, item in enumerate(value):
+-            _reject_vendor_terms(item, "{}[{}]".format(context, index))
++    found = find_vendor_term(value, context)
++    if found is not None:
++        raise ValueError("{} contains a vendor-specific GPU term".format(found))
+ 
+ 
+ class GpuCommonCompiler:
+@@ -142,7 +120,7 @@ class GpuCommonCompiler:
+         }
+         if options is not None:
+             option_metadata = _plain(options.metadata)
+-            reserved = set(metadata).intersection(option_metadata)
++            reserved = (set(metadata) | {"compile_options"}).intersection(option_metadata)
+             if reserved:
+                 raise ValueError(
+                     "compile option metadata uses reserved GPU common keys: {}".format(
+diff --git a/python/pypto/lowering/gpu/plan.py b/python/pypto/lowering/gpu/plan.py
+index 7b1b0b96f..f6423ffe8 100644
+--- a/python/pypto/lowering/gpu/plan.py
++++ b/python/pypto/lowering/gpu/plan.py
+@@ -9,7 +9,6 @@ handle.  A CUDA- or HIP-specific lowering can consume the same immutable
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+-import math
+ import re
+ from typing import Any, Mapping, Optional, Sequence, Tuple
+ 
+@@ -21,13 +20,13 @@ from pypto.abi.gpu import (
+     MemoryScope,
+     WorkgroupDim,
+ )
+-from pypto.core_ir import CoreProgram, CoreType, Operation
++from pypto.abi.gpu_tokens import find_vendor_term
++from pypto.core_ir import CoreProgram, Operation
+ from pypto.lowering.cpu import (
+     CpuScalarError,
+     CpuScalarUnsupportedError,
+     canonical_dtype,
+     canonical_operation_name,
+-    element_count,
+     reduced_shape,
+     static_shape,
+     SUPPORTED_DTYPES,
+@@ -48,21 +47,6 @@ GPU_SUPPORTED_OPERATIONS = frozenset(
+ )
+ MAX_LOGICAL_INDEX = (1 << 64) - 1
+ _SSA_NAME_RE = re.compile(r"^(?:%[A-Za-z0-9_.$-]+|[A-Za-z_][A-Za-z0-9_.$-]*)$")
+-_VENDOR_TERMS = (
+-    "cuda",
+-    "nvidia",
+-    "amd",
+-    "rocm",
+-    "hip",
+-    "nvvm",
+-    "ptx",
+-    "amdgpu",
+-    "rocdl",
+-    "warp",
+-    "wavefront",
+-    "wmma",
+-    "mfma",
+-)
+ 
+ 
+ class GpuError(ValueError):
+@@ -146,22 +130,9 @@ def _names(value: Any, field: str) -> Tuple[str, ...]:
+ 
+ 
+ def _reject_vendor_terms(value: Any, context: str = "value") -> None:
+-    """Keep vendor entities out of common serialized structures."""
+-
+-    if isinstance(value, str):
+-        lowered = value.lower()
+-        for term in _VENDOR_TERMS:
+-            if term in lowered:
+-                raise GpuValidationError("{} contains a vendor-specific GPU term".format(context))
+-        return
+-    if isinstance(value, Mapping):
+-        for key, item in value.items():
+-            _reject_vendor_terms(key, "{}.key".format(context))
+-            _reject_vendor_terms(item, "{}.{}".format(context, key))
+-        return
+-    if isinstance(value, (list, tuple, set, frozenset)):
+-        for index, item in enumerate(value):
+-            _reject_vendor_terms(item, "{}[{}]".format(context, index))
++    found = find_vendor_term(value, context)
++    if found is not None:
++        raise GpuValidationError("{} contains a vendor-specific GPU term".format(found))
+ 
+ 
+ def _layout(program: CoreProgram, operation: Operation, refs: Sequence[Any], context: str) -> str:
+@@ -897,6 +868,8 @@ class GpuProgram:
+         functions = {function.name: function for function in program.functions}
+         if entrypoint not in functions:
+             raise GpuValidationError("GPU entrypoint {!r} is not in CoreProgram".format(entrypoint))
++        if not functions[entrypoint].body.operations:
++            raise GpuValidationError("GPU entrypoint must contain at least one operation")
+         values = tuple(plans)
+         if any(not isinstance(plan, GpuKernelPlan) for plan in values):
+             raise GpuValidationError("GPU plans must be GpuKernelPlan values")
+diff --git a/python/tests/ut/pypto_x/test_gpu_common.py b/python/tests/ut/pypto_x/test_gpu_common.py
+index a28fa1575..e84416bb3 100644
+--- a/python/tests/ut/pypto_x/test_gpu_common.py
++++ b/python/tests/ut/pypto_x/test_gpu_common.py
+@@ -59,6 +59,34 @@ def _compile(program, target=TARGET):
+     return compiler, target_ir, compiler.compile(target_ir)
+ 
+ 
++def _rebuild_artifact(
++    artifact,
++    envelope=None,
++    metadata=None,
++    format_name=None,
++    abi_version=None,
++    drop_fields=(),
++):
++    payload_data = json.loads(artifact.payload.decode("utf-8"))
++    if envelope:
++        payload_data.update(envelope)
++    for field in drop_fields:
++        payload_data.pop(field, None)
++    payload = json.dumps(payload_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    artifact_metadata = dict(artifact.metadata)
++    if metadata:
++        artifact_metadata.update(metadata)
++    artifact_metadata["payload_digest"] = hashlib.sha256(payload).hexdigest()
++    return Artifact(
++        format=format_name or artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=abi_version or artifact.abi_version,
++        payload=payload,
++        metadata=artifact_metadata,
++    )
++
++
+ def _descriptor(tensor, readonly=False):
+     return TensorDesc(
+         tensor.dtype,
+@@ -715,3 +743,320 @@ def test_constant_and_identity_copy_subset_preserves_non_float_dtype():
+         LaunchRequest(artifact, outputs=[_descriptor(destination)])
+     )
+     assert destination.flat() == (1, -2, 3)
++
++
++def test_compiler_options_metadata_reserved_and_load_roundtrip():
++    compiler, target_ir, artifact = _compile(_add_program((3,)))
++    assert GpuCommonSimulator().load(artifact).target_ir.to_dict() == target_ir.to_dict()
++    options = CompileOptions(metadata={"tag": "roundtrip"}, extra={"level": 1})
++    option_artifact = compiler.compile(target_ir, options)
++    assert GpuCommonSimulator().load(option_artifact).target_ir.to_dict() == target_ir.to_dict()
++    with pytest.raises(ValueError, match="reserved"):
++        compiler.compile(target_ir, CompileOptions(metadata={"compile_options": "user"}))
++
++
++@pytest.mark.parametrize(
++    "metadata_change",
++    (
++        {"required_capabilities": None},
++        {"dtypes": None},
++        {"layouts": None},
++        {"geometry": None},
++        {"specialization": None},
++    ),
++)
++def test_malformed_known_metadata_fields_are_gpu_artifact_errors(metadata_change):
++    _, _, artifact = _compile(_add_program((3,)))
++    tampered = _rebuild_artifact(artifact, metadata=metadata_change)
++    with pytest.raises(GpuArtifactError):
++        GpuCommonSimulator().load(tampered)
++
++
++def test_malformed_compile_options_fields_are_gpu_artifact_errors():
++    compiler, target_ir, artifact = _compile(_add_program((3,)))
++    option_artifact = compiler.compile(target_ir, CompileOptions(metadata={"tag": "ok"}))
++    malformed = json.loads(option_artifact.payload.decode("utf-8"))
++    malformed["compile_options"]["metadata"] = None
++    tampered = _rebuild_artifact(option_artifact, envelope={"compile_options": malformed["compile_options"]})
++    with pytest.raises(GpuArtifactError):
++        GpuCommonSimulator().load(tampered)
++
++
++def test_artifact_missing_envelope_and_known_metadata_tamper_are_rejected():
++    _, _, artifact = _compile(_add_program((3,)))
++    decoded = json.loads(artifact.payload.decode("utf-8"))
++    with pytest.raises(GpuArtifactError, match="missing|unknown"):
++        GpuCommonSimulator().load(_rebuild_artifact(artifact, drop_fields=("target",)))
++    payload_unknown = dict(decoded)
++    payload_unknown["gpu_program"] = dict(payload_unknown["gpu_program"])
++    payload_unknown["gpu_program"]["unknown"] = True
++    with pytest.raises(GpuArtifactError, match="plan|unknown"):
++        GpuCommonSimulator().load(_rebuild_artifact(artifact, envelope=payload_unknown))
++    for metadata_change in (
++        {"required_capabilities": ["tampered"]},
++        {"geometry": [{"tampered": True}]},
++        {"dtypes": ["bf16"]},
++        {"layouts": ["strided"]},
++        {"specialization": {"tampered": True}},
++        {"target_digest": "0" * 64},
++        {"plan_digest": "0" * 64},
++    ):
++        with pytest.raises(GpuArtifactError):
++            GpuCommonSimulator().load(_rebuild_artifact(artifact, metadata=metadata_change))
++    payload_plan = dict(decoded)
++    payload_plan["gpu_program"] = dict(payload_plan["gpu_program"])
++    payload_plan["gpu_program"]["plans"] = list(payload_plan["gpu_program"]["plans"])
++    payload_plan["gpu_program"]["plans"][0] = dict(payload_plan["gpu_program"]["plans"][0])
++    payload_plan["gpu_program"]["plans"][0]["dtype"] = "bf16"
++    with pytest.raises(GpuArtifactError, match="plan|digest"):
++        GpuCommonSimulator().load(_rebuild_artifact(artifact, envelope=payload_plan))
++    payload_target = dict(decoded)
++    payload_target["target"] = dict(payload_target["target"])
++    payload_target["target"]["triple"] = "gpu-other"
++    with pytest.raises(GpuArtifactError, match="target"):
++        GpuCommonSimulator().load(_rebuild_artifact(artifact, envelope=payload_target))
++
++
++def test_core_metadata_tokens_are_boundary_checked_not_substrings():
++    program = _add_program((3,))
++    relationship_program = _program(
++        "relationship",
++        program.functions[0].parameters,
++        program.functions[0].returns,
++        program.functions[0].body.operations,
++        metadata={"relationship": "ownership"},
++    )
++    assert lower_gpu_common(relationship_program, TARGET).plans
++    for value in ("cuda_stream", "hip-target"):
++        bad_program = _program(
++            "bad_vendor",
++            program.functions[0].parameters,
++            program.functions[0].returns,
++            program.functions[0].body.operations,
++            metadata={"backend": value},
++        )
++        with pytest.raises(GpuValidationError, match="vendor"):
++            lower_gpu_common(bad_program, TARGET)
++    assert KernelArgumentBinding("x", 0, "tensor", attributes={"relationship": "ownership"})
++    with pytest.raises(Exception, match="vendor"):
++        KernelArgumentBinding("x", 0, "tensor", attributes={"cuda_stream": 1})
++    compiler = GpuCommonCompiler()
++    target_ir = compiler.lower(program, TARGET)
++    relationship_artifact = compiler.compile(target_ir, CompileOptions(metadata={"relationship": "ownership"}))
++    assert GpuCommonSimulator().load(relationship_artifact).target_ir.to_dict() == target_ir.to_dict()
++    with pytest.raises(ValueError, match="vendor"):
++        compiler.compile(target_ir, CompileOptions(metadata={"hip-target": "x"}))
++
++
++def test_empty_entrypoint_is_rejected_during_lowering():
++    empty = _program("empty", (), (), ())
++    with pytest.raises(GpuValidationError, match="at least one|operation"):
++        lower_gpu_common(empty, TARGET)
++
++
++def test_zero_domain_storage_contract_checks_length_and_writability():
++    compiler, target_ir, artifact = _compile(_add_program((0,)))
++    source = HostTensor("float32", (0,))
++    with pytest.raises(GpuExecutionError, match="length"):
++        GpuCommonSimulator().launch(
++            GpuLaunchRequest(
++                artifact,
++                target_ir.plans[0].geometry,
++                inputs=[_descriptor(source, True), _descriptor(source, True)],
++                outputs=[TensorDesc("float32", (0,), device="gpu", handle=[99])],
++            )
++        )
++    with pytest.raises(GpuExecutionError, match="mutable"):
++        GpuCommonSimulator().launch(
++            GpuLaunchRequest(
++                artifact,
++                target_ir.plans[0].geometry,
++                inputs=[_descriptor(source, True), _descriptor(source, True)],
++                outputs=[TensorDesc("float32", (0,), device="gpu", handle=())],
++            )
++        )
++
++
++def test_sequential_binary32_reduction_golden_is_not_python_double():
++    value_type = CoreType.tensor("float32", (3,))
++    output_type = CoreType.tensor("float32", ())
++    x = ValueRef("x", value_type)
++    y = ValueRef("y", output_type)
++    program = _program(
++        "sequential_sum",
++        (x,),
++        (y,),
++        (Operation("reduce_sum", (x,), (y,), attributes={"axes": (0,)}),),
++    )
++    compiler, target_ir, artifact = _compile(program)
++    result = HostTensor.zeros("float32", ())
++    GpuCommonSimulator().launch(
++        GpuLaunchRequest(
++            artifact,
++            target_ir.plans[0].geometry,
++            inputs=[TensorDesc("float32", (3,), device="gpu", handle=[1e8, 1.0, -1e8], readonly=True)],
++            outputs=[_descriptor(result)],
++        )
++    )
++    assert result.flat() == (0.0,)
++
++
++def test_sequential_binary32_matmul_golden_is_not_python_double():
++    left_type = CoreType.tensor("float32", (1, 3))
++    right_type = CoreType.tensor("float32", (3, 1))
++    output_type = CoreType.tensor("float32", (1, 1))
++    left = ValueRef("left", left_type)
++    right = ValueRef("right", right_type)
++    output = ValueRef("output", output_type)
++    program = _program(
++        "sequential_matmul",
++        (left, right),
++        (output,),
++        (Operation("matmul", (left, right), (output,)),),
++    )
++    compiler, target_ir, artifact = _compile(program)
++    result = HostTensor.zeros("float32", (1, 1))
++    GpuCommonSimulator().launch(
++        GpuLaunchRequest(
++            artifact,
++            target_ir.plans[0].geometry,
++            inputs=[
++                TensorDesc("float32", (1, 3), device="gpu", handle=[1e8, 1.0, -1e8], readonly=True),
++                TensorDesc("float32", (3, 1), device="gpu", handle=[1.0, 1.0, 1.0], readonly=True),
++            ],
++            outputs=[_descriptor(result)],
++        )
++    )
++    assert result.tolist() == [[0.0]]
++
++
++def test_binding_runtime_rejects_name_order_readonly_address_and_kind():
++    scalar_type = CoreType.scalar("float32")
++    tensor_type = CoreType.tensor("float32", (2,))
++    scalar = ValueRef("scale", scalar_type)
++    tensor = ValueRef("x", tensor_type)
++    output = ValueRef("y", tensor_type)
++    program = _program(
++        "binding_runtime",
++        (scalar, tensor),
++        (output,),
++        (Operation("mul", (tensor, scalar), (output,)),),
++    )
++    compiler, target_ir, artifact = _compile(program)
++    source = HostTensor("float32", (2,), [1, 2])
++    destination = HostTensor.zeros("float32", (2,))
++    descriptors = {
++        "inputs": [_descriptor(source, True)],
++        "outputs": [_descriptor(destination)],
++        "scalars": {"scale": 2.0},
++    }
++
++    def run(bindings):
++        return GpuCommonSimulator().launch(
++            GpuLaunchRequest(
++                artifact,
++                target_ir.plans[0].geometry,
++                argument_bindings=bindings,
++                **descriptors,
++            )
++        )
++
++    valid = (
++        KernelArgumentBinding("scale", 0, "scalar", None, readonly=False),
++        KernelArgumentBinding("x", 1, "tensor", AddressSpace.GLOBAL, readonly=True),
++        KernelArgumentBinding("y", 2, "tensor", AddressSpace.GLOBAL, readonly=False),
++    )
++    run(valid)
++    for bad in (
++        (
++            KernelArgumentBinding("wrong", 0, "scalar", None),
++            valid[1],
++            valid[2],
++        ),
++        (
++            valid[1],
++            valid[0],
++            valid[2],
++        ),
++        (
++            KernelArgumentBinding("scale", 0, "scalar", None),
++            KernelArgumentBinding("x", 1, "tensor", AddressSpace.GLOBAL, readonly=False),
++            valid[2],
++        ),
++        (
++            valid[0],
++            KernelArgumentBinding("x", 1, "tensor", AddressSpace.CONSTANT, readonly=True),
++            valid[2],
++        ),
++    ):
++        with pytest.raises(GpuExecutionError, match="binding|readonly|address|name|kind"):
++            run(bad)
++    tampered = KernelArgumentBinding("x", 1, "tensor", AddressSpace.GLOBAL, readonly=True)
++    object.__setattr__(tampered, "kind", "scalar")
++    with pytest.raises(GpuExecutionError, match="kind"):
++        run((valid[0], tampered, valid[2]))
++
++
++def test_scalar_binding_is_by_value_and_readonly_flag_is_not_storage_access():
++    scalar_type = CoreType.scalar("float32")
++    tensor_type = CoreType.tensor("float32", (1,))
++    scale = ValueRef("scale", scalar_type)
++    x = ValueRef("x", tensor_type)
++    y = ValueRef("y", tensor_type)
++    program = _program("scalar_by_value", (scale, x), (y,), (Operation("mul", (x, scale), (y,)),))
++    compiler, target_ir, artifact = _compile(program)
++    output = HostTensor.zeros("float32", (1,))
++    GpuCommonSimulator().launch(
++        GpuLaunchRequest(
++            artifact,
++            target_ir.plans[0].geometry,
++            inputs=[_descriptor(HostTensor("float32", (1,), [3]), True)],
++            outputs=[_descriptor(output)],
++            scalars={"scale": 2},
++            argument_bindings=(
++                KernelArgumentBinding("scale", 0, "scalar", None, readonly=False),
++                KernelArgumentBinding("x", 1, "tensor", AddressSpace.GLOBAL, readonly=True),
++                KernelArgumentBinding("y", 2, "tensor", AddressSpace.GLOBAL, readonly=False),
++            ),
++        )
++    )
++    assert output.flat() == (6.0,)
++
++
++def test_cache_key_same_semantics_and_real_tile_subgroup_specialization_options_variants():
++    program = _add_program((7,))
++    compiler = GpuCommonCompiler()
++    base_target = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,)})
++    base = compiler.compile(compiler.lower(program, base_target))
++    same = compiler.compile(compiler.lower(program, TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,)})))
++    assert same.cache_key == base.cache_key
++    variants = (
++        compiler.compile(
++            compiler.lower(
++                program,
++                TargetSpec(
++                    "gpu",
++                    "gpu-neutral",
++                    attributes={"workgroup": (4,), "tile": {"output": (64,), "reduction": (8,)}},
++                ),
++            )
++        ),
++        compiler.compile(
++            compiler.lower(
++                program,
++                TargetSpec(
++                    "gpu",
++                    "gpu-neutral",
++                    attributes={"workgroup": (4,), "subgroup_size": 32, "supported_subgroup_sizes": (32,)},
++                ),
++            )
++        ),
++        compiler.compile(
++            compiler.lower(
++                program,
++                TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,), "specialization": {"N": 7}}),
++            )
++        ),
++        compiler.compile(compiler.lower(program, base_target), CompileOptions(metadata={"option": 1})),
++    )
++    assert all(variant.cache_key != base.cache_key for variant in variants)

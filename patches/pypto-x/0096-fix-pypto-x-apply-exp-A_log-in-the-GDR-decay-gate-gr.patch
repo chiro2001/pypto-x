@@ -1,0 +1,449 @@
+From 9aae4649e58cd993f756fe85d897d866dd990e15 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Thu, 10 Sep 2026 18:25:49 +0800
+Subject: [PATCH 96/96] fix(pypto-x): apply exp(A_log) in the GDR decay gate
+ (graph contract v3)
+
+The decoder graph computed the GDR decay gate as
+``gate_log = -A_log * softplus(a + dt_bias)`` while the official model uses
+``g = -exp(A_log) * softplus(a + dt_bias)``
+(transformers/models/qwen3_5/modeling_qwen3_5.py: ``self.A_log =
+nn.Parameter(torch.log(A))``).  Without ``exp`` the decay ``exp(g)`` exceeds
+one for every head with a negative ``A_log`` (this checkpoint: A_log in
+[-6.59, 0.26]), so the FP32 recurrent state grew exponentially (|state|max
+0.60 -> 2.8e4 -> 2.36e16 over five prefill steps) and the whole-network logits
+could not match the reference.
+
+Effect on the real checkpoint (T=5 prefill, AVX-512): logits cosine 0.7771 ->
+0.9999136, max_abs 17.99 -> 0.2338 (the reference's own fp32<->bf16 band is
+0.2352), per-row argmax 1/5 -> 5/5.  Layer-0 GDR |state|max at step 4 becomes
+1.43.  Decode steps 0..2 (positions 5..7) reproduce the gold argmax with
+cosine >= 0.9998 once the driver compares our step k against
+``decode_logits[k+1]`` (gold row 0 is the prefill boundary and is bit-identical
+to ``prefill_next_logits``).
+
+Chained effects recorded here and in the evidence brief:
+
+* graph contract version 2 -> 3; decoder graph digest (past=4096) changes from
+  c1a5663b... to 66dd4077...; decoder operation total 4,532 -> 4,550 (T=5:
+  6,710 -> 6,728);
+* the frozen digest in test_qwen35_weight_ingestion.py and the weight-ingestion
+  driver PARENT_BASELINE are updated with an erratum comment, and
+  test_qwen35_full_decoder_connectivity.py now expects contract version 3;
+* previously frozen M1J artifacts (model-metadata.json in
+  verify-qwen35-bf16-runtime-binding, integration-w6-qwen35-bf16-runtime-binding-final-r2,
+  qwen35-bf16-weight-ingestion, parent-real-profile-probe) still carry the v2
+  digest and need an erratum annotation; parameter bytes, packed layout regions
+  and sizes are unchanged (371 params / 1,504,786,048 B / 368 regions);
+* content-addressed native artifacts fail closed automatically because the
+  native/program/plan digests all change;
+* no lowering/artifact/ABI bump is required: only the portable graph changed.
+
+M1G/M1D conclusions are unaffected: their drivers and composite builders take
+``gate`` as a program input and validate ``S_decay = exp(g) * S``, which was
+correct.  The gap was the construction of ``g`` from ``A_log`` in the full
+decoder graph.
+
+Also adds test_qwen35_gdr_decay_gate.py as a structural + semantic regression
+guard for the fixed gate, and makes the driver's generate_logits cross-check
+mask the EOS -inf position.
+---
+ python/pypto/portable/qwen35.py                                 |  16 +++-
+ python/tests/ut/pypto_x/qwen35_weight_ingestion_driver.py       |   4 +-
+ python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py     | 100 +++++++++++++++++++++--
+ .../tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py   |   4 +-
+ python/tests/ut/pypto_x/test_qwen35_gdr_decay_gate.py           | 119 ++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py         |   3 +-
+ 6 files changed, 233 insertions(+), 13 deletions(-)
+
+diff --git a/python/pypto/portable/qwen35.py b/python/pypto/portable/qwen35.py
+index 612f90bdb..5a8a96347 100644
+--- a/python/pypto/portable/qwen35.py
++++ b/python/pypto/portable/qwen35.py
+@@ -36,7 +36,7 @@ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region
+ 
+ _SUPPORTED_DTYPES = frozenset(("bf16", "float32"))
+ _SUPPORTED_INDEX_DTYPES = frozenset(("int32", "int64"))
+-_QWEN35_DECODER_GRAPH_CONTRACT_VERSION = 2
++_QWEN35_DECODER_GRAPH_CONTRACT_VERSION = 3
+ _QWEN35_DECODER_GRAPH_PROFILE_VERSION = 1
+ _UINT64_MAX = (1 << 64) - 1
+ _DTYPE_BYTES = {"bf16": 2, "float32": 4, "int64": 8, "bool": 1}
+@@ -2479,9 +2479,21 @@ def _append_gdr_graph(
+         (a_plus_dt,),
+         ((prefix + "_positive_dt", _tensor("float32", (batch, steps, value_heads))),),
+     )[0]
++    # The checkpoint stores ``A_log = log(A)`` and the official decay gate is
++    # ``g = -exp(A_log) * softplus(a + dt_bias)``
++    # (transformers/models/qwen3_5/modeling_qwen3_5.py: ``self.A_log =
++    # nn.Parameter(torch.log(A))`` and ``g = -self.A_log.float().exp() *
++    # F.softplus(a.float() + self.dt_bias)``).  ``exp`` is mandatory: without
++    # it ``exp(g)`` exceeds one for every head with a negative ``A_log`` and
++    # the recurrent state grows without bound.
++    a_log_exp = builder.op(
++        "exp",
++        (a_log_f32,),
++        ((prefix + "_a_log_exp", _tensor("float32", (batch, steps, value_heads))),),
++    )[0]
+     neg_a_log = builder.op(
+         "neg",
+-        (a_log_f32,),
++        (a_log_exp,),
+         ((prefix + "_negative_a_log", _tensor("float32", (batch, steps, value_heads))),),
+     )[0]
+     gate_log = builder.op(
+diff --git a/python/tests/ut/pypto_x/qwen35_weight_ingestion_driver.py b/python/tests/ut/pypto_x/qwen35_weight_ingestion_driver.py
+index 16821b039..f853d5870 100644
+--- a/python/tests/ut/pypto_x/qwen35_weight_ingestion_driver.py
++++ b/python/tests/ut/pypto_x/qwen35_weight_ingestion_driver.py
+@@ -35,7 +35,9 @@ from pypto.portable.safetensors_reader import SafetensorsReader
+ PARENT_BASELINE = {
+     "packed_region_count": 368,
+     "packed_total_nbytes_past_4096": 1574877952,
+-    "graph_digest_past_4096": "c1a5663b644e6b6e642599689cc26c6f6b9c50f9b820743c272415b0ff0df7d5",
++    # 勘误：v2 图（decay 门缺 exp(A_log)）的 digest 已作废；
++    # 这里记录图契约 v3 的新基线，M1J 冻结证据需按此重新对齐。
++    "graph_digest_past_4096": "66dd40770dbb41251f0f7ec9b15b75b604daddc95633aabc24d9e48ffff33c6d",
+     "checkpoint_text_bytes": 1504791232,
+     "manifest_parameter_bytes": 1504786048,
+     "conversion_reclaim_bytes": 5184,
+diff --git a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+index 93dce7a60..439963fc2 100644
+--- a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
++++ b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+@@ -431,12 +431,24 @@ def rewrite_decay_gate_to_exp_a_log(program: Any) -> Tuple[Any, int]:
+ 
+     function = program.functions[0]
+     suffix = "_negative_a_log"
++    exp_names = {
++        ref.name
++        for operation in function.body.operations
++        if operation.name == "exp"
++        for ref in operation.outputs
++    }
+     rewritten = []
+     count = 0
+     for operation in function.body.operations:
+         names = [ref.name for ref in operation.outputs]
+         if operation.name == "neg" and len(names) == 1 and names[0].endswith(suffix):
+             source = operation.inputs[0]
++            if source.name in exp_names:
++                raise DriverError(
++                    "graph already applies exp(A_log) at {}; the debug rewrite is obsolete".format(
++                        names[0]
++                    )
++                )
+             exp_ref = ValueRef(names[0][: -len(suffix)] + "_a_log_exp", source.type)
+             rewritten.append(Operation("exp", (source,), (exp_ref,), {}))
+             rewritten.append(
+@@ -1131,11 +1143,24 @@ def compare_raw(actual_raw: bytes, actual_dtype: str, gold: Any, name: str) -> M
+ 
+ 
+ def compare_rows(actual_raw: bytes, actual_dtype: str, gold: Any, rows: int, columns: int,
+-                 name: str) -> Mapping[str, Any]:
++                 name: str, mask_non_finite: bool = False) -> Mapping[str, Any]:
++    """逐行统计；``mask_non_finite`` 用于剔除 gold 里被 mask 成 -inf 的位置。
++
++    ``generate_logits`` 每行把 EOS(248044) 位置置成 ``-inf``（logits processor），
++    与 ``decode_logits`` 只在这一点上不同；做交叉校验时必须先剔除该位置，否则
++    max_abs/cosine 会恒为 inf。
++    """
++
+     import numpy as np
+ 
+     actual = _raw_to_float_array(actual_raw, actual_dtype).astype(np.float64).reshape(rows, columns)
+     expected = np.asarray(gold, dtype=np.float64).reshape(rows, columns)
++    masked_positions = 0
++    if mask_non_finite:
++        finite = np.isfinite(actual) & np.isfinite(expected)
++        masked_positions = int(finite.size - finite.sum())
++        actual = np.where(finite, actual, 0.0)
++        expected = np.where(finite, expected, 0.0)
+     delta = np.abs(actual - expected)
+     dot = float(np.sum(actual * expected))
+     norm = float(math.sqrt(float(np.sum(actual * actual))) * math.sqrt(float(np.sum(expected * expected))))
+@@ -1155,6 +1180,7 @@ def compare_rows(actual_raw: bytes, actual_dtype: str, gold: Any, rows: int, col
+         "argmax_mismatch_rows": int(np.sum(actual_argmax != gold_argmax)),
+         "argmax_actual": [int(v) for v in actual_argmax],
+         "argmax_gold": [int(v) for v in gold_argmax],
++        "masked_positions": masked_positions,
+     }
+ 
+ 
+@@ -1749,6 +1775,8 @@ def _run_once(
+ 
+ def _align_prefill(record: Dict[str, Any], raw: Mapping[str, bytes], reference_dir: Path,
+                    prompt: str, steps: int) -> None:
++    import numpy as np
++
+     comparisons: Dict[str, Any] = {}
+     for variant in ("float32", "bfloat16"):
+         path = golden_paths(reference_dir, prompt)[variant]
+@@ -1771,12 +1799,29 @@ def _align_prefill(record: Dict[str, Any], raw: Mapping[str, bytes], reference_d
+             comparison["final_hidden_note"] = "gold {} 缺少 last_hidden_state 键".format(variant)
+         comparisons[variant] = comparison
+         if "prefill_next_logits" in gold:
++            # 对齐口径：我们的 prefill 末行 logits == gold 的 prefill 边界 logits，
++            # 也就是 gold ``decode_logits[0]``（已核对两者在 gold 内逐位相等）。
++            boundary = None
++            if "decode_logits" in gold:
++                row_bytes = 248320 * 2  # bf16
++                last_row = raw["logits"][(steps - 1) * row_bytes: steps * row_bytes]
++                boundary = compare_rows(
++                    last_row, "bf16", gold["decode_logits"][0], 1, 248320, "decode_logits[0]"
++                )
+             comparisons[variant]["prefill_next_logits_argmax"] = {
+                 "ours": int(
+                     _raw_to_float_array(raw["logits"], "bf16").astype("float64")[-248320:].argmax()
+                 ),
+                 "gold": int(gold["prefill_next_logits"].argmax()),
+             }
++            if boundary is not None:
++                comparisons[variant]["prefill_boundary_vs_decode_logits0"] = boundary
++                comparisons[variant]["prefill_boundary_matches_prefill_next_logits"] = bool(
++                    np.allclose(
++                        np.asarray(gold["prefill_next_logits"], dtype=np.float64),
++                        np.asarray(gold["decode_logits"][0], dtype=np.float64),
++                    )
++                )
+         debug_names = list(record.get("debug_hidden_state_outputs") or ())
+         if debug_names and "hidden_states_layers" in gold:
+             layers = gold["hidden_states_layers"]
+@@ -1859,11 +1904,19 @@ def stage_s3(args: argparse.Namespace) -> Mapping[str, Any]:
+         record["rope_source"] = rope_source
+         if record["status"] == "PASS":
+             _align_prefill(record, raw, reference, prompt, steps)
++            # gold 对齐口径（已核对）：``decode_logits[k]`` 是**消费第 k 个生成 token
++            # 之前**的 logits，``decode_logits[0] == prefill_next_logits`` 逐位相等。
++            # 因此我们的 prefill 末行 == decode_logits[0]，
++            # 我们的第 step 步 decode（位置 steps+step）== decode_logits[step + 1]。
+             decode_logits = gold["decode_logits"]
+             decode_tokens = [int(v) for v in gold["decode_token_ids"]]
++            generate_logits = gold["generate_logits"] if "generate_logits" in gold else None
+             current = int(
+                 _raw_to_float_array(raw["logits"], "bf16").astype("float64")[-248320:].argmax()
+             )
++            record["prefill_next_token"] = current
++            record["gold_decode_token_ids"] = decode_tokens
++            record["prefill_next_token_matches_gold"] = bool(decode_tokens) and current == decode_tokens[0]
+             if args.decode_steps:
+                 for step in range(args.decode_steps):
+                     past = steps + step
+@@ -1878,18 +1931,48 @@ def stage_s3(args: argparse.Namespace) -> Mapping[str, Any]:
+                     step_record["decode_step"] = step
+                     step_record["position"] = past
+                     step_record["input_token"] = current
++                    step_record["gold_input_token"] = decode_tokens[step] if step < len(decode_tokens) else None
++                    step_record["input_matches_gold"] = (
++                        step < len(decode_tokens) and current == decode_tokens[step]
++                    )
+                     step_record["rope_source"] = step_rope
++                    gold_row = step + 1
++                    step_record["gold_logits_row"] = (
++                        gold_row if gold_row < int(decode_logits.shape[0]) else None
++                    )
+                     if step_record["status"] == "PASS":
+                         actual = _raw_to_float_array(raw["logits"], "bf16").astype("float64")
+                         argmax = int(actual.argmax())
+                         step_record["argmax_token"] = argmax
+-                        step_record["gold_decode_token_id"] = decode_tokens[step]
+-                        step_record["gold_argmax_token"] = int(decode_logits[step].argmax())
+-                        step_record["token_matches_gold_token_id"] = argmax == decode_tokens[step]
+-                        step_record["token_matches_gold_argmax"] = argmax == int(decode_logits[step].argmax())
+-                        step_record["logits_vs_decode_logits"] = compare_rows(
+-                            raw["logits"], "bf16", decode_logits[step], 1, 248320, "decode_logits"
+-                        )
++                        if step_record["gold_logits_row"] is not None:
++                            row = step_record["gold_logits_row"]
++                            step_record["gold_decode_token_id"] = decode_tokens[row]
++                            step_record["gold_argmax_token"] = int(decode_logits[row].argmax())
++                            step_record["token_matches_gold_token_id"] = argmax == decode_tokens[row]
++                            step_record["token_matches_gold_argmax"] = argmax == int(
++                                decode_logits[row].argmax()
++                            )
++                            step_record["logits_vs_decode_logits"] = compare_rows(
++                                raw["logits"], "bf16", decode_logits[row], 1, 248320,
++                                "decode_logits[{}]".format(row),
++                            )
++                            if generate_logits is not None:
++                                # generate_logits 与 decode_logits 同索引、仅在
++                                # EOS(248044) 位置被 mask 成 -inf，比较时剔除该位置。
++                                step_record["logits_vs_generate_logits"] = compare_rows(
++                                    raw["logits"], "bf16", generate_logits[row], 1, 248320,
++                                    "generate_logits[{}]".format(row), mask_non_finite=True,
++                                )
++                        else:
++                            step_record["gold_decode_token_id"] = None
++                            step_record["gold_argmax_token"] = None
++                            step_record["token_matches_gold_token_id"] = None
++                            step_record["token_matches_gold_argmax"] = None
++                            step_record["logits_vs_decode_logits"] = None
++                            step_record["note"] = (
++                                "gold 只导出 {} 行 decode logits；本步已超出参考范围，"
++                                "不作为对错判据".format(int(decode_logits.shape[0]))
++                            )
+                         current = argmax
+                     decode_records.append(step_record)
+                     if step_record["status"] != "PASS":
+@@ -1897,6 +1980,7 @@ def stage_s3(args: argparse.Namespace) -> Mapping[str, Any]:
+         record["decode_steps"] = decode_records
+         record["decode_token_ids_ours"] = [item.get("argmax_token") for item in decode_records]
+         record["decode_token_ids_gold"] = [item.get("gold_decode_token_id") for item in decode_records]
++        record["decode_input_matches_gold"] = [item.get("input_matches_gold") for item in decode_records]
+     return record
+ 
+ 
+diff --git a/python/tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py b/python/tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py
+index 8ff4f003a..b501f2f1c 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py
++++ b/python/tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py
+@@ -73,7 +73,9 @@ def _bf16_value(bits):
+ def test_full_manifest_parameter_and_route_contract():
+     manifest = qwen35_text_decoder_manifest(1, 1, past_length=4096)
+     assert manifest["graph_kind"] == "text_decoder_full_no_weight"
+-    assert manifest["graph_contract_version"] == 2
++    # Version 3 fixes the GDR decay gate to the official -exp(A_log) form
++    # (version 2 used -A_log directly and made the recurrent state diverge).
++    assert manifest["graph_contract_version"] == 3
+     assert manifest["weights_embedded"] is False
+     assert manifest["weight_execution"] is False
+     assert manifest["parameter_byte_count"] < (1 << 64)
+diff --git a/python/tests/ut/pypto_x/test_qwen35_gdr_decay_gate.py b/python/tests/ut/pypto_x/test_qwen35_gdr_decay_gate.py
+new file mode 100644
+index 000000000..332f58dfc
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_qwen35_gdr_decay_gate.py
+@@ -0,0 +1,119 @@
++"""GDR decay 门的回归守卫。
++
++背景：图契约 v2 把 decay 门写成 ``-A_log * softplus(a + dt_bias)``，缺了官方
++``-exp(A_log) * softplus(...)`` 里的 ``exp``（官方
++``transformers/models/qwen3_5/modeling_qwen3_5.py``：``self.A_log =
++nn.Parameter(torch.log(A))``，``g = -self.A_log.float().exp() *
++F.softplus(a.float() + self.dt_bias)``）。后果是 ``exp(g)`` 对多数 head 大于 1，
++GDR 递推状态指数爆炸，整网 prefill 的 logits 与 gold 完全对不上。
++
++本文件把「decay 门必须经过 exp(A_log)」锁成结构契约，并验证 gate 的数值语义。
++"""
++
++from __future__ import annotations
++
++import math
++
++import pytest
++
++from pypto.portable.qwen35 import (
++    build_qwen35_text_decoder_graph,
++    qwen35_text_decoder_manifest,
++)
++
++
++def _gdr_prefixes(program) -> list:
++    return sorted(
++        {
++            operation.outputs[0].name[: -len("_a_log_full")]
++            for operation in program.functions[0].body.operations
++            if operation.name == "broadcast"
++            and operation.outputs
++            and operation.outputs[0].name.endswith("_a_log_full")
++        }
++    )
++
++
++def test_every_gdr_layer_decay_gate_uses_exp_a_log():
++    program = build_qwen35_text_decoder_graph(1, 1, past_length=0, shape_profile="model")
++    operations = list(program.functions[0].body.operations)
++    by_output = {}
++    for operation in operations:
++        for ref in operation.outputs:
++            by_output[ref.name] = operation
++
++    prefixes = _gdr_prefixes(program)
++    assert len(prefixes) == 18, prefixes
++
++    for prefix in prefixes:
++        exp_op = by_output[prefix + "_a_log_exp"]
++        assert exp_op.name == "exp", prefix
++        assert [ref.name for ref in exp_op.inputs] == [prefix + "_a_log_full"], prefix
++
++        neg_op = by_output[prefix + "_negative_a_log"]
++        assert neg_op.name == "neg", prefix
++        assert [ref.name for ref in neg_op.inputs] == [prefix + "_a_log_exp"], prefix
++
++        gate_op = by_output[prefix + "_gate_log_decay"]
++        assert gate_op.name == "mul", prefix
++        assert [ref.name for ref in gate_op.inputs] == [
++            prefix + "_negative_a_log",
++            prefix + "_positive_dt",
++        ], prefix
++
++        dt_op = by_output[prefix + "_positive_dt"]
++        assert dt_op.name == "softplus", prefix
++
++
++def test_decay_gate_never_consumes_raw_a_log():
++    """``-A_log`` 直连是 v2 的缺陷形态，必须彻底消失。"""
++
++    program = build_qwen35_text_decoder_graph(1, 2, past_length=0, shape_profile="model")
++    for operation in program.functions[0].body.operations:
++        if operation.name != "neg":
++            continue
++        names = [ref.name for ref in operation.outputs]
++        if not names[0].endswith("_negative_a_log"):
++            continue
++        source = operation.inputs[0].name
++        assert source.endswith("_a_log_exp"), names[0]
++        assert not source.endswith("_a_log_full"), names[0]
++
++
++def test_graph_contract_version_marks_the_decay_fix():
++    manifest = qwen35_text_decoder_manifest(1, 1, past_length=0)
++    assert manifest["graph_contract_version"] == 3
++
++
++def test_exp_a_log_semantics_match_the_official_formula():
++    """把 gate 的数值语义与官方公式对齐（纯 Python 复算，不依赖任何后端）。"""
++
++    # 一个负 A_log（本模型 [-6.59, 0.26] 区间内）必须让 decay <= 1。
++    a_log = -2.5
++    a = 0.75
++    dt_bias = -1.25
++    softplus = math.log1p(math.exp(-abs(a + dt_bias))) + max(a + dt_bias, 0.0)
++    official = math.exp(-math.exp(a_log) * softplus)
++    buggy = math.exp(-a_log * softplus)
++    assert official <= 1.0
++    assert buggy > 1.0
++    # 状态在官方公式下不会爆炸：连续 8 步纯衰减
++    state = 1.0
++    for _ in range(8):
++        state *= official
++    assert abs(state) <= 1.0
++    state = 1.0
++    for _ in range(8):
++        state *= buggy
++    assert abs(state) > 8.0
++
++
++@pytest.mark.parametrize("steps", (1, 3))
++def test_gate_shape_follows_the_time_axis(steps):
++    program = build_qwen35_text_decoder_graph(1, steps, past_length=0, shape_profile="model")
++    by_output = {}
++    for operation in program.functions[0].body.operations:
++        for ref in operation.outputs:
++            by_output[ref.name] = operation
++    exp_op = by_output["layer_00_a_log_exp"]
++    assert tuple(exp_op.outputs[0].type.shape) == (1, steps, 16)
+diff --git a/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py b/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py
+index ffb29acff..47109b61e 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py
++++ b/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py
+@@ -290,7 +290,8 @@ def test_real_checkpoint_mapping_layout_and_precision_boundary():
+     assert checkpoint_path.stat().st_size == REAL_SAFETENSORS_BYTES
+     program = build_qwen35_text_decoder_graph(1, 1, past_length=4096, shape_profile="model")
+     schema = build_binding_schema(program)
+-    assert schema.graph_digest == "c1a5663b644e6b6e642599689cc26c6f6b9c50f9b820743c272415b0ff0df7d5"
++    # 图契约 v3：GDR decay 门补上 exp(A_log)（v2 的 digest 已作废，M1J 冻结证据需加勘误）
++    assert schema.graph_digest == "66dd40770dbb41251f0f7ec9b15b75b604daddc95633aabc24d9e48ffff33c6d"
+     assert (len(schema.runtime_inputs), len(schema.parameters), len(schema.states)) == (3, 320, 48)
+     with SafetensorsReader(str(checkpoint_path), mode="pread") as reader:
+         assert len(reader) == 488

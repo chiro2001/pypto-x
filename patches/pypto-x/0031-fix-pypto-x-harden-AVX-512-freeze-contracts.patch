@@ -1,0 +1,1014 @@
+From 3cfc5dc3b2e3791005091bda6fd96b30d15c2d0f Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Tue, 8 Sep 2026 11:41:03 +0800
+Subject: [PATCH 31/96] fix(pypto-x): harden AVX-512 freeze contracts
+
+---
+ python/pypto/backends/cpu/__init__.py            |   4 +
+ python/pypto/backends/cpu/x86/__init__.py        |   4 +
+ python/pypto/backends/cpu/x86/avx512.py          | 240 ++++++++++++++++++++----
+ python/pypto/compiler/targets/cpu_avx512.py      |  24 +--
+ python/pypto/lowering/cpu/x86/avx512/lowering.py |  13 ++
+ python/tests/ut/pypto_x/test_cpu_avx512.py       | 434 +++++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 669 insertions(+), 50 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/__init__.py b/python/pypto/backends/cpu/__init__.py
+index cfa1d1b9f..6d85ce3a8 100644
+--- a/python/pypto/backends/cpu/__init__.py
++++ b/python/pypto/backends/cpu/__init__.py
+@@ -26,6 +26,8 @@ from .x86 import (
+     CpuAvx512FeatureMismatchError,
+     CpuAvx512RuntimeError,
+     CpuAvx512UnavailableError,
++    VNNI_INT32_MAX,
++    VNNI_MAX_SAFE_LENGTH,
+ )
+ 
+ __all__ = [
+@@ -49,6 +51,8 @@ __all__ = [
+     "CpuAvx512FeatureMismatchError",
+     "CpuAvx512RuntimeError",
+     "CpuAvx512UnavailableError",
++    "VNNI_INT32_MAX",
++    "VNNI_MAX_SAFE_LENGTH",
+     "FlatBuffer",
+     "HostTensor",
+     "LoadedCpuScalarArtifact",
+diff --git a/python/pypto/backends/cpu/x86/__init__.py b/python/pypto/backends/cpu/x86/__init__.py
+index 9adc48429..5e3621d73 100644
+--- a/python/pypto/backends/cpu/x86/__init__.py
++++ b/python/pypto/backends/cpu/x86/__init__.py
+@@ -24,6 +24,8 @@ from .avx512 import (
+     CpuAvx512RuntimeError,
+     CpuAvx512UnavailableError,
+     LoadedAvx512Artifact,
++    VNNI_INT32_MAX,
++    VNNI_MAX_SAFE_LENGTH,
+     launch_avx512,
+ )
+ 
+@@ -49,5 +51,7 @@ __all__ = [
+     "CpuAvx512RuntimeError",
+     "CpuAvx512UnavailableError",
+     "LoadedAvx512Artifact",
++    "VNNI_INT32_MAX",
++    "VNNI_MAX_SAFE_LENGTH",
+     "launch_avx512",
+ ]
+diff --git a/python/pypto/backends/cpu/x86/avx512.py b/python/pypto/backends/cpu/x86/avx512.py
+index c3d2a50e4..d3d8e6612 100644
+--- a/python/pypto/backends/cpu/x86/avx512.py
++++ b/python/pypto/backends/cpu/x86/avx512.py
+@@ -12,11 +12,14 @@ from dataclasses import dataclass
+ import hashlib
+ import os
+ from pathlib import Path
++from numbers import Integral
+ import struct
++import stat
+ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+ 
+ from pypto.abi import Availability, LaunchRequest, TensorDesc
+ from pypto.compiler.artifact import ABI_VERSION, Artifact
++from pypto.compiler.targets.cpu_avx2 import DEFAULT_ARTIFACT_FORMAT as DEFAULT_AVX2_ARTIFACT_FORMAT
+ from pypto.compiler.targets.cpu_avx512 import DEFAULT_ARTIFACT_FORMAT
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation
+ from pypto.lowering.cpu import (
+@@ -114,6 +117,32 @@ _find_function = _avx2._find_function
+ _is_tensor = _avx2._is_tensor
+ _is_scalar = _avx2._is_scalar
+ 
++VNNI_INT32_MAX = (1 << 31) - 1
++VNNI_MAX_SAFE_LENGTH = VNNI_INT32_MAX // (255 * 128)
++
++
++def _strict_vnni_values(values: Sequence[int], name: str, lower: int, upper: int) -> Tuple[int, ...]:
++    if isinstance(values, (str, bytes, bytearray, Mapping)):
++        raise CpuAvx512ExecutionError("VNNI {} must be an integer sequence".format(name))
++    try:
++        result = tuple(values)
++    except TypeError as exc:
++        raise CpuAvx512ExecutionError("VNNI {} must be an integer sequence".format(name)) from exc
++    if len(result) > VNNI_MAX_SAFE_LENGTH:
++        raise CpuAvx512ExecutionError(
++            "VNNI input length {} exceeds int32-safe maximum {}".format(
++                len(result), VNNI_MAX_SAFE_LENGTH
++            )
++        )
++    for index, value in enumerate(result):
++        if isinstance(value, bool) or not isinstance(value, Integral):
++            raise CpuAvx512ExecutionError("VNNI {}[{}] must be an integer".format(name, index))
++        if int(value) < lower or int(value) > upper:
++            raise CpuAvx512ExecutionError(
++                "VNNI {}[{}] is outside [{}, {}]".format(name, index, lower, upper)
++            )
++    return tuple(int(value) for value in result)
++
+ 
+ def _call_copy(module: Any, dtype: str, source: _NativeBuffer, destination: _NativeBuffer) -> None:
+     function = _symbol(
+@@ -202,7 +231,7 @@ def _read_native_bytes(path: str) -> bytes:
+         raise CpuAvx512ArtifactError("AVX-512 native artifact path is unsafe: {}".format(exc)) from exc
+     try:
+         metadata = os.fstat(descriptor)
+-        if not os.path.isfile(path) or metadata.st_nlink != 1:
++        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+             raise CpuAvx512ArtifactError("AVX-512 native artifact must be a single-link regular file")
+         chunks = []
+         while True:
+@@ -222,6 +251,85 @@ def _metadata_bool(metadata: Mapping[str, Any], key: str) -> bool:
+     return value
+ 
+ 
++def _program_digest_from_metadata(metadata: Mapping[str, Any], context: str) -> str:
++    program_data = metadata.get("program")
++    digest = metadata.get("program_digest")
++    if not isinstance(program_data, Mapping) or not isinstance(digest, str):
++        raise CpuAvx512ArtifactError("{} is missing CoreProgram digest metadata".format(context))
++    try:
++        program = CoreProgram.from_dict(program_data)
++    except Exception as exc:
++        raise CpuAvx512ArtifactError("{} CoreProgram metadata is invalid".format(context)) from exc
++    actual = hashlib.sha256(program.canonical_json().encode("utf-8")).hexdigest()
++    if actual != digest:
++        raise CpuAvx512ArtifactError("{} CoreProgram digest is inconsistent".format(context))
++    return digest
++
++
++def _validate_fallback_artifact(primary: Artifact, fallback: Artifact) -> None:
++    """Validate fallback identity without mapping its native shared object."""
++
++    if not isinstance(fallback, Artifact):
++        raise CpuAvx512ArtifactError("fallback must be an Artifact")
++    try:
++        primary.validate()
++        fallback.validate()
++    except Exception as exc:
++        raise CpuAvx512ArtifactError("fallback artifact validation failed: {}".format(exc)) from exc
++    if fallback.format not in (DEFAULT_ARTIFACT_FORMAT, DEFAULT_AVX2_ARTIFACT_FORMAT):
++        raise CpuAvx512ArtifactError("unsupported fallback artifact format {!r}".format(fallback.format))
++    if fallback.entrypoint != primary.entrypoint:
++        raise CpuAvx512ArtifactError("fallback entrypoint does not match primary artifact")
++    if fallback.abi_version != primary.abi_version or fallback.abi_version != ABI_VERSION:
++        raise CpuAvx512ArtifactError("fallback ABI does not match primary artifact")
++    if fallback.target.kind != "cpu" or primary.target.kind != "cpu":
++        raise CpuAvx512ArtifactError("fallback and primary must target CPU")
++    if fallback.target.triple != primary.target.triple:
++        raise CpuAvx512ArtifactError("fallback CPU triple does not match primary artifact")
++    primary_metadata = mapping_copy(primary.metadata)
++    fallback_metadata = mapping_copy(fallback.metadata)
++    if fallback_metadata.get("entrypoint") != fallback.entrypoint:
++        raise CpuAvx512ArtifactError("fallback metadata entrypoint is inconsistent")
++    primary_digest = _program_digest_from_metadata(primary_metadata, "primary artifact")
++    fallback_digest = _program_digest_from_metadata(fallback_metadata, "fallback artifact")
++    if fallback_digest != primary_digest:
++        raise CpuAvx512ArtifactError("fallback CoreProgram digest does not match primary artifact")
++    if fallback.format == DEFAULT_ARTIFACT_FORMAT:
++        if fallback_metadata.get("backend") != AVX512_BACKEND:
++            raise CpuAvx512ArtifactError("fallback AVX-512 backend metadata is invalid")
++    elif fallback_metadata.get("backend") != "cpu.avx2":
++        raise CpuAvx512ArtifactError("fallback AVX2 backend metadata is invalid")
++
++
++def _fallback_request(request: LaunchRequest, artifact: Artifact) -> LaunchRequest:
++    return LaunchRequest(
++        artifact,
++        entrypoint=request.entrypoint,
++        inputs=request.inputs,
++        outputs=request.outputs,
++        scalars=request.scalars,
++        workspace=request.workspace,
++        stream_handle=request.stream_handle,
++        schema_version=request.schema_version,
++    )
++
++
++def _fallback_sequence(value: Any) -> Tuple[Artifact, ...]:
++    if value is None:
++        return ()
++    if isinstance(value, Artifact):
++        return (value,)
++    if isinstance(value, (str, bytes, bytearray, Mapping)):
++        raise CpuAvx512ArtifactError("fallback sequence must contain Artifact values")
++    try:
++        result = tuple(value)
++    except TypeError as exc:
++        raise CpuAvx512ArtifactError("fallback must be an Artifact or sequence") from exc
++    if any(not isinstance(item, Artifact) for item in result):
++        raise CpuAvx512ArtifactError("fallback sequence must contain Artifact values")
++    return result
++
++
+ def _decode_artifact(
+     artifact: Artifact,
+     available: CpuFeatureSet,
+@@ -282,6 +390,10 @@ def _decode_artifact(
+         "use_vnni": _metadata_bool(metadata, "use_vnni"),
+         "use_bf16": _metadata_bool(metadata, "use_bf16"),
+     }
++    if flags["use_dq"] or flags["use_bw"] or flags["use_vl"]:
++        raise CpuAvx512ArtifactError(
++            "AVX-512 DQ/BW/VL artifact has no emitting lowering"
++        )
+     try:
+         program = CoreProgram.from_dict(program_data)
+         target_ir = lower_avx512(
+@@ -311,6 +423,17 @@ def _decode_artifact(
+         raise CpuAvx512ArtifactError("AVX-512 required feature metadata mismatch")
+     if metadata.get("required_feature_source") != required.source:
+         raise CpuAvx512ArtifactError("AVX-512 required feature source mismatch")
++    expected_required = {"avx", "avx512f", "osxsave", "ymm", "opmask", "zmm"}
++    if flags["use_fma"]:
++        expected_required.add("fma")
++    if flags["use_vnni"]:
++        expected_required.add("avx512vnni")
++    if flags["use_bf16"]:
++        expected_required.add("avx512bf16")
++    if set(required.features) != expected_required:
++        raise CpuAvx512ArtifactError(
++            "AVX-512 required_features do not match enabled native variant"
++        )
+     mismatch = CpuFeatureContract(required, available)
+     try:
+         mismatch.validate()
+@@ -324,7 +447,7 @@ def _decode_artifact(
+     expected_mask |= 64 if flags["use_bf16"] else 0
+     if metadata.get("native_feature_mask") != expected_mask:
+         raise CpuAvx512ArtifactError("AVX-512 native feature mask is inconsistent")
+-    expected_flags = []
++    expected_flags = ["-mavx512f"]
+     if flags["use_fma"]:
+         expected_flags.append("-mfma")
+     else:
+@@ -338,9 +461,27 @@ def _decode_artifact(
+     ):
+         if enabled:
+             expected_flags.append(flag)
++    native_flags = metadata.get("native_flags")
++    if not isinstance(native_flags, (list, tuple)) or tuple(native_flags) != tuple(expected_flags):
++        raise CpuAvx512ArtifactError("AVX-512 native_flags metadata disagrees with variant")
+     for flag in expected_flags:
+         if flag not in compile_command:
+             raise CpuAvx512ArtifactError("AVX-512 compile command is missing {}".format(flag))
++    if flags["use_fma"] and "-ffp-contract=off" in compile_command:
++        raise CpuAvx512ArtifactError("FMA compile command contains disabled contraction flag")
++    if not flags["use_fma"] and "-mfma" in compile_command:
++        raise CpuAvx512ArtifactError("disabled FMA flag is present")
++    for flag, enabled in (
++        ("-mavx512dq", flags["use_dq"]),
++        ("-mavx512bw", flags["use_bw"]),
++        ("-mavx512vl", flags["use_vl"]),
++        ("-mavx512vnni", flags["use_vnni"]),
++        ("-mavx512bf16", flags["use_bf16"]),
++    ):
++        if not enabled and flag in compile_command:
++            raise CpuAvx512ArtifactError("disabled AVX-512 flag {} is present".format(flag))
++    if any(str(flag).startswith("-mno-avx512") for flag in compile_command):
++        raise CpuAvx512ArtifactError("AVX-512 compile command contains forbidden disabled ISA flags")
+     if compile_command[-1] != Path(artifact.path).name:
+         raise CpuAvx512ArtifactError("AVX-512 compile command is not bound to artifact path")
+     if "clang" not in str(metadata.get("compiler_version", "")).lower():
+@@ -390,6 +531,7 @@ class Avx512Runtime:
+         self.capability = capability
+         self._injected = injected
+         self._real_capability = None if injected else capability
++        self._selected_artifact = None
+         self.available_features = CpuFeatureSet(capability.features, source=capability.source)
+         if capability.available:
+             self._status = Availability.yes(self.name)
+@@ -460,6 +602,12 @@ class Avx512Runtime:
+     def is_available(self) -> bool:
+         return self._status.available
+ 
++    @property
++    def selected_artifact(self) -> Optional[Artifact]:
++        """Artifact selected by the last launch, including fallback dispatch."""
++
++        return self._selected_artifact
++
+     def load(self, artifact: Artifact, available_features: Any = None) -> LoadedAvx512Artifact:
+         if not self.is_available():
+             raise CpuAvx512UnavailableError(self._status)
+@@ -468,17 +616,20 @@ class Avx512Runtime:
+         )
+         return _decode_artifact(artifact, available, self.capability)
+ 
+-    def select_artifact(self, artifact: Artifact, fallback_artifact: Optional[Artifact] = None) -> Artifact:
++    def select_artifact(self, artifact: Artifact, fallback_artifact: Any = None) -> Artifact:
+         """Choose a safe AVX-512/base/AVX2 artifact before loading any ELF."""
+ 
+         if artifact.format != DEFAULT_ARTIFACT_FORMAT:
+             return artifact
++        candidates = _fallback_sequence(fallback_artifact)
++        for candidate in candidates:
++            _validate_fallback_artifact(artifact, candidate)
+         required = tuple(mapping_copy(artifact.metadata).get("required_features", ()))
+         available = set(self.available_features.features)
+         if self.is_available() and set(required).issubset(available):
+             return artifact
+-        if fallback_artifact is not None:
+-            return fallback_artifact
++        if candidates:
++            return candidates[0]
+         raise CpuAvx512UnavailableError(self._status)
+ 
+     def workspace_size(self, request: Any) -> int:
+@@ -490,19 +641,26 @@ class Avx512Runtime:
+     def launch(
+         self,
+         request: LaunchRequest,
+-        fallback_artifact: Optional[Artifact] = None,
+-        fallback: Optional[Artifact] = None,
++        fallback_artifact: Any = None,
++        fallback: Any = None,
+     ) -> Tuple[Any, ...]:
+         if fallback_artifact is not None and fallback is not None:
+             raise ValueError("fallback_artifact and fallback are aliases; pass only one")
+-        fallback_artifact = fallback_artifact if fallback_artifact is not None else fallback
++        fallback_artifacts = _fallback_sequence(
++            fallback_artifact if fallback_artifact is not None else fallback
++        )
+         if not isinstance(request, LaunchRequest):
+             raise CpuAvx512ExecutionError("AVX-512 launch requires LaunchRequest")
+         if request.artifact.format != DEFAULT_ARTIFACT_FORMAT:
+             try:
++                self._selected_artifact = request.artifact
+                 return _avx2.Avx2Runtime().launch(request)
+             except Exception as exc:
+                 raise CpuAvx512ExecutionError("unsupported fallback artifact format") from exc
++        # Validate every candidate before choosing one.  This is metadata-only;
++        # no fallback shared object is opened by this loop.
++        for candidate in fallback_artifacts:
++            _validate_fallback_artifact(request.artifact, candidate)
+         # A supplied capability is useful for load-time tests, but launch still
+         # performs a real probe before mapping an ELF.  This also lets a fake
+         # low-capability host exercise the AVX2 fallback without loading the
+@@ -512,7 +670,7 @@ class Avx512Runtime:
+         metadata = mapping_copy(request.artifact.metadata)
+         required = set(metadata.get("required_features", ()))
+         if not real_capability.available or not required.issubset(set(available.features)):
+-            if fallback_artifact is None:
++            if not fallback_artifacts:
+                 if not real_capability.available:
+                     raise CpuAvx512UnavailableError(
+                         Availability.no(
+@@ -530,34 +688,40 @@ class Avx512Runtime:
+                         tuple(missing),
+                     )
+                 )
+-            if fallback_artifact.format == DEFAULT_ARTIFACT_FORMAT:
+-                fallback_request = LaunchRequest(
+-                    fallback_artifact,
+-                    entrypoint=request.entrypoint,
+-                    inputs=request.inputs,
+-                    outputs=request.outputs,
+-                    scalars=request.scalars,
+-                    workspace=request.workspace,
+-                    stream_handle=request.stream_handle,
+-                    schema_version=request.schema_version,
++            for index, candidate in enumerate(fallback_artifacts):
++                if candidate.format == DEFAULT_ARTIFACT_FORMAT:
++                    self._selected_artifact = candidate
++                    try:
++                        return self.launch(
++                            _fallback_request(request, candidate),
++                            fallback_artifact=fallback_artifacts[index + 1 :],
++                        )
++                    except (CpuAvx512UnavailableError, CpuAvx512FeatureMismatchError):
++                        continue
++                self._selected_artifact = candidate
++                return _avx2.Avx2Runtime().launch(_fallback_request(request, candidate))
++            if not real_capability.available:
++                raise CpuAvx512UnavailableError(
++                    Availability.no(
++                        self.name,
++                        real_capability.reason or "real AVX-512 capability is unavailable",
++                        "real_capability_unavailable",
++                        real_capability.to_dict(),
++                    )
+                 )
+-                return self.launch(fallback_request)
+-            return _avx2.Avx2Runtime().launch(
+-                LaunchRequest(
+-                    fallback_artifact,
+-                    entrypoint=request.entrypoint,
+-                    inputs=request.inputs,
+-                    outputs=request.outputs,
+-                    scalars=request.scalars,
+-                    workspace=request.workspace,
+-                    stream_handle=request.stream_handle,
+-                    schema_version=request.schema_version,
++            missing = sorted(required.difference(set(available.features)))
++            raise CpuAvx512FeatureMismatchError(
++                FeatureMismatch(
++                    CpuFeatureSet(required, source="artifact"),
++                    available,
++                    tuple(missing),
+                 )
+             )
+         try:
+             request.validate()
+         except Exception as exc:
+             raise CpuAvx512ExecutionError("invalid LaunchRequest: {}".format(exc)) from exc
++        self._selected_artifact = request.artifact
+         loaded = _decode_artifact(request.artifact, available, real_capability)
+         target = loaded.target_ir.target
+         if target.kind != "cpu" or not target.triple.startswith(("x86_64", "amd64")):
+@@ -752,12 +916,14 @@ class Avx512Runtime:
+ 
+         if not isinstance(artifact, Artifact) or not mapping_copy(artifact.metadata).get("use_vnni", False):
+             raise CpuAvx512ExecutionError("VNNI primitive requires a VNNI AVX-512 artifact")
++        left_values = _strict_vnni_values(left, "u8", 0, 255)
++        right_values = _strict_vnni_values(right, "s8", -128, 127)
++        if len(left_values) != len(right_values):
++            raise CpuAvx512ExecutionError("VNNI operands must have equal length")
+         capability = self._require_real_capability()
+         loaded = self.load(artifact, available_features=capability.features)
+-        if len(left) != len(right):
+-            raise CpuAvx512ExecutionError("VNNI operands must have equal length")
+-        left_array = (ctypes.c_uint8 * len(left))(*[int(value) & 0xFF for value in left])
+-        right_array = (ctypes.c_int8 * len(right))(*[int(value) for value in right])
++        left_array = (ctypes.c_uint8 * len(left_values))(*left_values)
++        right_array = (ctypes.c_int8 * len(right_values))(*right_values)
+         result = ctypes.c_int32(0)
+         function = _symbol(
+             loaded.module,
+@@ -769,7 +935,7 @@ class Avx512Runtime:
+                 ctypes.c_size_t,
+             ],
+         )
+-        function(left_array, right_array, ctypes.byref(result), len(left))
++        function(left_array, right_array, ctypes.byref(result), len(left_values))
+         return int(result.value)
+ 
+     execute_vnni_dot_i8 = run_vnni_dot_i8
+@@ -783,12 +949,14 @@ CPUAvx512Runtime = Avx512Runtime
+ def launch_avx512(
+     request: LaunchRequest,
+     available_features: Any = None,
+-    fallback_artifact: Optional[Artifact] = None,
++    fallback_artifact: Any = None,
+ ) -> Tuple[Any, ...]:
+     return Avx512Runtime(available_features).launch(request, fallback_artifact=fallback_artifact)
+ 
+ 
+ __all__ = [
++    "VNNI_INT32_MAX",
++    "VNNI_MAX_SAFE_LENGTH",
+     "Avx512Runtime",
+     "CPUAVX512Runtime",
+     "CPUAvx512Runtime",
+diff --git a/python/pypto/compiler/targets/cpu_avx512.py b/python/pypto/compiler/targets/cpu_avx512.py
+index 305c95562..a1772069d 100644
+--- a/python/pypto/compiler/targets/cpu_avx512.py
++++ b/python/pypto/compiler/targets/cpu_avx512.py
+@@ -228,13 +228,11 @@ void ptx_avx512_reduce_max_f32(const float *input, float *output, size_t n) {
+     if (n < 16) { *output = input[0]; for (i = 1; i < n; ++i) if (input[i] > *output) *output = input[i]; return; }
+     __m512 accumulator = _mm512_loadu_ps(input);
+     for (i = 16; i + 16 <= n; i += 16) accumulator = _mm512_max_ps(accumulator, _mm512_loadu_ps(input + i));
+-    if (i < n) {
+-        __mmask16 mask = (__mmask16)((1U << (n - i)) - 1U);
+-        accumulator = _mm512_max_ps(accumulator, _mm512_maskz_loadu_ps(mask, input + i));
+-    }
+     _mm512_storeu_ps(values, accumulator);
+     *output = values[0];
+     for (lane = 1; lane < 16; ++lane) if (values[lane] > *output) *output = values[lane];
++    /* A zero-filled mask is not a valid max identity for an all-negative tail. */
++    for (; i < n; ++i) if (input[i] > *output) *output = input[i];
+ }
+ 
+ __attribute__((visibility("default")))
+@@ -261,7 +259,7 @@ void ptx_avx512_reduce_sum_bf16(const uint16_t *input, uint16_t *output, size_t
+ __attribute__((visibility("default")))
+ void ptx_avx512_reduce_max_bf16(const uint16_t *input, uint16_t *output, size_t n) {
+     size_t i = 0, lane;
+-    float values[16], lanes[16];
++    float values[16], lanes[16], maximum;
+     if (n == 0) return;
+     if (n < 16) {
+         *output = input[0];
+@@ -274,16 +272,14 @@ void ptx_avx512_reduce_max_bf16(const uint16_t *input, uint16_t *output, size_t
+         ptx_load_bf16(input, values, i, 16);
+         accumulator = _mm512_max_ps(accumulator, _mm512_loadu_ps(values));
+     }
+-    if (i < n) {
+-        size_t count = n - i;
+-        __mmask16 mask = (__mmask16)((1U << count) - 1U);
+-        ptx_load_bf16(input, values, i, count);
+-        accumulator = _mm512_max_ps(accumulator, _mm512_maskz_loadu_ps(mask, values));
+-    }
+     _mm512_storeu_ps(lanes, accumulator);
+-    *output = ptx_f32_to_bf16(lanes[0]);
+-    for (lane = 1; lane < 16; ++lane)
+-        if (lanes[lane] > ptx_bf16_to_f32(*output)) *output = ptx_f32_to_bf16(lanes[lane]);
++    maximum = lanes[0];
++    for (lane = 1; lane < 16; ++lane) if (lanes[lane] > maximum) maximum = lanes[lane];
++    for (; i < n; ++i) {
++        float value = ptx_bf16_to_f32(input[i]);
++        if (value > maximum) maximum = value;
++    }
++    *output = ptx_f32_to_bf16(maximum);
+ }
+ 
+ __attribute__((visibility("default")))
+diff --git a/python/pypto/lowering/cpu/x86/avx512/lowering.py b/python/pypto/lowering/cpu/x86/avx512/lowering.py
+index eeef08f73..6ccbcceaa 100644
+--- a/python/pypto/lowering/cpu/x86/avx512/lowering.py
++++ b/python/pypto/lowering/cpu/x86/avx512/lowering.py
+@@ -193,6 +193,10 @@ class Avx512Program:
+         ):
+             if not isinstance(value, bool):
+                 raise Avx512ValidationError("{} must be bool".format(name))
++        if self.use_dq or self.use_bw or self.use_vl:
++            raise Avx512UnsupportedError(
++                "AVX-512 DQ/BW/VL variants have no emitting lowering yet"
++            )
+         required = set(self.vector_program.required_features.features)
+         missing = sorted(_BASE_FEATURES.difference(required))
+         if missing:
+@@ -350,6 +354,15 @@ def lower_avx512(
+             raise Avx512ValidationError("required feature {} conflicts with disabled variant".format(feature))
+         if options[key] and feature in target.features:
+             continue
++    unsupported_variants = tuple(
++        key for key in ("dq", "bw", "vl") if options[key]
++    )
++    if unsupported_variants:
++        raise Avx512UnsupportedError(
++            "AVX-512 {} variants have no emitting lowering yet".format(
++                "/".join(name.upper() for name in unsupported_variants)
++            )
++        )
+     selected_tail = tail_policy
+     if selected_tail is None:
+         selected_tail = target.attributes.get("tail_policy", AVX512_TAIL_POLICY.value)
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx512.py b/python/tests/ut/pypto_x/test_cpu_avx512.py
+index 49a4a8ebf..66ef78df0 100644
+--- a/python/tests/ut/pypto_x/test_cpu_avx512.py
++++ b/python/tests/ut/pypto_x/test_cpu_avx512.py
+@@ -37,6 +37,7 @@ def _imports():
+             CpuAvx512ExecutionError,
+             CpuAvx512FeatureMismatchError,
+             CpuAvx512UnavailableError,
++            VNNI_MAX_SAFE_LENGTH,
+         )
+         from pypto.compiler import Artifact, CompileOptions
+         from pypto.compiler.targets.cpu import CpuScalarCompiler
+@@ -71,6 +72,7 @@ CpuAvx512ArtifactError = _C["CpuAvx512ArtifactError"]
+ CpuAvx512ExecutionError = _C["CpuAvx512ExecutionError"]
+ CpuAvx512FeatureMismatchError = _C["CpuAvx512FeatureMismatchError"]
+ CpuAvx512UnavailableError = _C["CpuAvx512UnavailableError"]
++VNNI_MAX_SAFE_LENGTH = _C["VNNI_MAX_SAFE_LENGTH"]
+ Artifact = _C["Artifact"]
+ CompileOptions = _C["CompileOptions"]
+ CpuScalarCompiler = _C["CpuScalarCompiler"]
+@@ -116,6 +118,34 @@ def _elementwise(dtype="float32", shape=(19,), operation="add"):
+     )
+ 
+ 
++def _reduction(dtype, input_shape, output_shape, operation, attributes):
++    input_type = CoreType.tensor(dtype, input_shape)
++    output_type = CoreType.tensor(dtype, output_shape)
++    source = ValueRef("source", input_type)
++    output = ValueRef("output", output_type)
++    return _program(
++        operation,
++        (source,),
++        (output,),
++        (Operation(operation, (source,), (output,), attributes=attributes),),
++    )
++
++
++def _matmul(dtype, left_shape, right_shape):
++    left_type = CoreType.tensor(dtype, left_shape)
++    right_type = CoreType.tensor(dtype, right_shape)
++    output_type = CoreType.tensor(dtype, (left_shape[0], right_shape[1]))
++    left = ValueRef("left", left_type)
++    right = ValueRef("right", right_type)
++    output = ValueRef("output", output_type)
++    return _program(
++        "matmul",
++        (left, right),
++        (output,),
++        (Operation("matmul", (left, right), (output,)),),
++    )
++
++
+ def _compile(program, target, tmp_path, options=None):
+     compiler = Avx512Compiler()
+     target_ir = compiler.lower(program, target)
+@@ -151,6 +181,14 @@ def _bf16_bits(value):
+     return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) & 0xFFFF
+ 
+ 
++def _bf16_value(bits):
++    return struct.unpack("<f", struct.pack("<I", (int(bits) & 0xFFFF) << 16))[0]
++
++
++def _float32(value):
++    return struct.unpack("<f", struct.pack("<f", float(value)))[0]
++
++
+ def _disassemble(path):
+     objdump = shutil.which("objdump")
+     if objdump is None:
+@@ -469,3 +507,399 @@ def test_portable_only_imports_avx512_modules():
+         check=True,
+     )
+     assert "portable-ok" in result.stdout
++
++
++@pytest.mark.parametrize("operation", ("add", "sub", "mul", "div", "neg"))
++@pytest.mark.parametrize("length", (0, 1, 15, 16, 17, 35))
++def test_base_all_elementwise_operations_structured_differential(operation, length, tmp_path):
++    program = _elementwise(shape=(length,), operation=operation)
++    _, _, artifact = _compile(program, _target("avx512f"), tmp_path / operation / str(length))
++    left = HostTensor("float32", (length,), [0.25 + index * 0.125 for index in range(length)])
++    right = HostTensor("float32", (length,), [1.0 + index * 0.03125 for index in range(length)])
++    actual = HostTensor.zeros("float32", (length,))
++    _run(artifact, [left] if operation == "neg" else [left, right], actual)
++    scalar_compiler = CpuScalarCompiler()
++    scalar_artifact = scalar_compiler.compile(
++        scalar_compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu"))
++    )
++    expected = HostTensor.zeros("float32", (length,))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            scalar_artifact,
++            inputs=[left.descriptor(readonly=True)]
++            if operation == "neg"
++            else [left.descriptor(readonly=True), right.descriptor(readonly=True)],
++            outputs=[expected.descriptor()],
++        )
++    )
++    report = compare_outputs(expected, actual)
++    assert report.passed, report.to_dict()
++
++
++@pytest.mark.parametrize("dtype", ("float32", "bf16"))
++@pytest.mark.parametrize("length", (17, 35))
++def test_reduce_max_negative_masked_tail_matches_scalar(dtype, length, tmp_path):
++    program = _reduction(dtype, (2, length), (2,), "reduce_max", {"axis": 1})
++    _, _, artifact = _compile(program, _target("avx512f"), tmp_path / dtype / str(length))
++    values = [-float(index + 1) for index in range(2 * length)]
++    actual = HostTensor.zeros(dtype, (2,))
++    _run(artifact, [HostTensor(dtype, (2, length), values)], actual)
++    scalar_compiler = CpuScalarCompiler()
++    scalar_artifact = scalar_compiler.compile(
++        scalar_compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu"))
++    )
++    expected = HostTensor.zeros(dtype, (2,))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            scalar_artifact,
++            inputs=[HostTensor(dtype, (2, length), values).descriptor(readonly=True)],
++            outputs=[expected.descriptor()],
++        )
++    )
++    assert actual.flat() == expected.flat()
++    assert actual.flat() == (-1.0, -length - 1.0)
++
++
++def test_reduce_sum_multiaxis_odd_group_differential(tmp_path):
++    program = _reduction("float32", (3, 5, 7), (5,), "reduce_sum", {"axes": (0, 2)})
++    _, _, artifact = _compile(program, _target("avx512f"), tmp_path)
++    values = [float(index) * 0.125 - 2.0 for index in range(3 * 5 * 7)]
++    actual = HostTensor.zeros("float32", (5,))
++    _run(artifact, [HostTensor("float32", (3, 5, 7), values)], actual)
++    scalar_compiler = CpuScalarCompiler()
++    scalar_artifact = scalar_compiler.compile(
++        scalar_compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu"))
++    )
++    expected = HostTensor.zeros("float32", (5,))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            scalar_artifact,
++            inputs=[HostTensor("float32", (3, 5, 7), values).descriptor(readonly=True)],
++            outputs=[expected.descriptor()],
++        )
++    )
++    report = compare_outputs(expected, actual)
++    assert report.passed, report.to_dict()
++
++
++def test_rectangular_fp32_matmul_odd_masked_tail_tolerant_differential(tmp_path):
++    program = _matmul("float32", (3, 5), (5, 17))
++    _, _, artifact = _compile(program, _target("avx512f", "fma"), tmp_path)
++    left_values = [0.1 + index * 0.017 for index in range(15)]
++    right_values = [0.2 - index * 0.013 for index in range(85)]
++    actual = HostTensor.zeros("float32", (3, 17))
++    _run(
++        artifact,
++        [HostTensor("float32", (3, 5), left_values), HostTensor("float32", (5, 17), right_values)],
++        actual,
++    )
++    scalar_compiler = CpuScalarCompiler()
++    scalar_artifact = scalar_compiler.compile(
++        scalar_compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu"))
++    )
++    expected = HostTensor.zeros("float32", (3, 17))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            scalar_artifact,
++            inputs=[
++                HostTensor("float32", (3, 5), left_values).descriptor(readonly=True),
++                HostTensor("float32", (5, 17), right_values).descriptor(readonly=True),
++            ],
++            outputs=[expected.descriptor()],
++        )
++    )
++    report = compare_outputs(expected, actual, atol=2e-5, rtol=2e-5)
++    assert report.passed, report.to_dict()
++
++
++def test_base_bf16_software_elementwise_reduce_and_matmul_rne(tmp_path):
++    elementwise = _elementwise("bf16", (17,), "mul")
++    _, _, elementwise_artifact = _compile(elementwise, _target("avx512f"), tmp_path / "elementwise")
++    left_values = [1.00390625 + index * 0.01 for index in range(17)]
++    right_values = [1.99609375 - index * 0.01 for index in range(17)]
++    actual = HostTensor.zeros("bf16", (17,))
++    _run(
++        elementwise_artifact,
++        [HostTensor("bf16", (17,), left_values), HostTensor("bf16", (17,), right_values)],
++        actual,
++    )
++    scalar_compiler = CpuScalarCompiler()
++    scalar_artifact = scalar_compiler.compile(
++        scalar_compiler.lower(elementwise, TargetSpec("cpu", "x86_64-linux-gnu"))
++    )
++    expected = HostTensor.zeros("bf16", (17,))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            scalar_artifact,
++            inputs=[
++                HostTensor("bf16", (17,), left_values).descriptor(readonly=True),
++                HostTensor("bf16", (17,), right_values).descriptor(readonly=True),
++            ],
++            outputs=[expected.descriptor()],
++        )
++    )
++    assert actual.flat() == expected.flat()
++
++    reduction = _reduction("bf16", (2, 3, 17), (2, 17), "reduce_sum", {"axis": 1})
++    _, _, reduction_artifact = _compile(reduction, _target("avx512f"), tmp_path / "reduction")
++    reduction_values = [float(index + 1) / 7.0 for index in range(2 * 3 * 17)]
++    reduction_actual = HostTensor.zeros("bf16", (2, 17))
++    _run(
++        reduction_artifact,
++        [HostTensor("bf16", (2, 3, 17), reduction_values)],
++        reduction_actual,
++    )
++    reduction_scalar = scalar_compiler.compile(
++        scalar_compiler.lower(reduction, TargetSpec("cpu", "x86_64-linux-gnu"))
++    )
++    reduction_expected = HostTensor.zeros("bf16", (2, 17))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            reduction_scalar,
++            inputs=[HostTensor("bf16", (2, 3, 17), reduction_values).descriptor(readonly=True)],
++            outputs=[reduction_expected.descriptor()],
++        )
++    )
++    assert reduction_actual.flat() == reduction_expected.flat()
++
++    matmul = _matmul("bf16", (2, 3), (3, 17))
++    _, _, matmul_artifact = _compile(matmul, _target("avx512f"), tmp_path / "matmul")
++    matmul_left = [1.00390625, 2.0, 3.0, 4.0, 5.0, 6.0]
++    matmul_right = [float(index + 1) / 7.0 for index in range(51)]
++    matmul_actual = HostTensor.zeros("bf16", (2, 17))
++    _run(
++        matmul_artifact,
++        [HostTensor("bf16", (2, 3), matmul_left), HostTensor("bf16", (3, 17), matmul_right)],
++        matmul_actual,
++    )
++    matmul_scalar = scalar_compiler.compile(
++        scalar_compiler.lower(matmul, TargetSpec("cpu", "x86_64-linux-gnu"))
++    )
++    matmul_expected = HostTensor.zeros("bf16", (2, 17))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            matmul_scalar,
++            inputs=[
++                HostTensor("bf16", (2, 3), matmul_left).descriptor(readonly=True),
++                HostTensor("bf16", (3, 17), matmul_right).descriptor(readonly=True),
++            ],
++            outputs=[matmul_expected.descriptor()],
++        )
++    )
++    assert matmul_actual.flat() == matmul_expected.flat()
++    rounded_left = [_bf16_value(_bf16_bits(value)) for value in matmul_left]
++    rounded_right = [_bf16_value(_bf16_bits(value)) for value in matmul_right]
++    total = _float32(0.0)
++    for inner in range(3):
++        total = _float32(
++            total + _float32(rounded_left[inner] * rounded_right[inner * 17 + 4])
++        )
++    assert matmul_actual.flat()[4] == _bf16_value(_bf16_bits(total))
++
++
++def test_native_bf16_matmul_uses_vdpbf16_and_safe_odd_tail(tmp_path):
++    program = _matmul("bf16", (2, 3), (3, 17))
++    _, target_ir, artifact = _compile(
++        program,
++        _target("avx512f", "avx512bf16"),
++        tmp_path,
++    )
++    if not _runtime().capability.avx512bf16:
++        pytest.skip("host lacks AVX-512 BF16")
++    left_values = [1.00390625, 2.0, 3.0, 4.0, 5.0, 6.0]
++    right_values = [float(index + 1) / 7.0 for index in range(51)]
++    actual = HostTensor.zeros("bf16", (2, 17))
++    _run(
++        artifact,
++        [HostTensor("bf16", (2, 3), left_values), HostTensor("bf16", (3, 17), right_values)],
++        actual,
++    )
++    scalar_compiler = CpuScalarCompiler()
++    scalar_artifact = scalar_compiler.compile(
++        scalar_compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu"))
++    )
++    expected = HostTensor.zeros("bf16", (2, 17))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            scalar_artifact,
++            inputs=[
++                HostTensor("bf16", (2, 3), left_values).descriptor(readonly=True),
++                HostTensor("bf16", (3, 17), right_values).descriptor(readonly=True),
++            ],
++            outputs=[expected.descriptor()],
++        )
++    )
++    assert actual.flat() == expected.flat()
++    assert "vdpbf16ps" in _disassemble(artifact.path)
++    assert target_ir.use_bf16
++
++
++def test_base_numpy_2d_output_readonly_and_wrong_target(tmp_path):
++    np = pytest.importorskip("numpy")
++    program = _elementwise(shape=(2, 17))
++    _, _, artifact = _compile(program, _target("avx512f"), tmp_path)
++    left = np.arange(34, dtype=np.float32).reshape(2, 17)
++    right = np.full((2, 17), 2.0, dtype=np.float32)
++    output = np.zeros((2, 17), dtype=np.float32)
++    Avx512Runtime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[
++                TensorDesc("float32", (2, 17), handle=left, readonly=True),
++                TensorDesc("float32", (2, 17), handle=right, readonly=True),
++            ],
++            outputs=[TensorDesc("float32", (2, 17), handle=output)],
++        )
++    )
++    np.testing.assert_array_equal(output, left + right)
++    output.flags.writeable = False
++    with pytest.raises(CpuAvx512ExecutionError, match="read-only"):
++        Avx512Runtime().launch(
++            LaunchRequest(
++                artifact,
++                inputs=[
++                    TensorDesc("float32", (2, 17), handle=left, readonly=True),
++                    TensorDesc("float32", (2, 17), handle=right, readonly=True),
++                ],
++                outputs=[TensorDesc("float32", (2, 17), handle=output)],
++            )
++        )
++    with pytest.raises(Exception):
++        lower_avx512(program, TargetSpec("cuda", "x86_64-linux-gnu"))
++
++
++def test_dq_bw_vl_are_explicitly_unsupported_until_emitting_lowering():
++    for feature in ("avx512dq", "avx512bw", "avx512vl"):
++        with pytest.raises(Avx512UnsupportedError, match="no emitting lowering"):
++            lower_avx512(_elementwise(), _target("avx512f", feature))
++
++
++def test_native_flags_and_marker_tampering_are_rejected(tmp_path):
++    _, _, artifact = _compile(_elementwise(), _target("avx512f"), tmp_path)
++    runtime = _runtime()
++    metadata = dict(artifact.metadata)
++    metadata["native_flags"] = list(metadata["native_flags"]) + ["-mavx512bf16"]
++    object.__setattr__(artifact, "metadata", metadata)
++    with pytest.raises(CpuAvx512ArtifactError, match="native_flags"):
++        runtime.load(artifact)
++
++    _, _, artifact = _compile(_elementwise(), _target("avx512f"), tmp_path / "command")
++    metadata = dict(artifact.metadata)
++    metadata["compile_command"] = list(metadata["compile_command"])[:-3] + [
++        "-mavx512bf16",
++        metadata["compile_command"][-3],
++        metadata["compile_command"][-2],
++        metadata["compile_command"][-1],
++    ]
++    object.__setattr__(artifact, "metadata", metadata)
++    with pytest.raises(CpuAvx512ArtifactError, match="disabled AVX-512 flag"):
++        runtime.load(artifact)
++
++
++def test_wrong_fallback_program_is_rejected_before_any_dlopen(tmp_path, monkeypatch):
++    program = _elementwise(shape=(17,))
++    wrong_type = CoreType.tensor("float32", (17,))
++    wrong_left = ValueRef("left", wrong_type)
++    wrong_right = ValueRef("right", wrong_type)
++    wrong_output = ValueRef("output", wrong_type)
++    wrong_program = _program(
++        "add",
++        (wrong_left, wrong_right),
++        (wrong_output,),
++        (Operation("mul", (wrong_left, wrong_right), (wrong_output,)),),
++    )
++    _, _, primary = _compile(program, _target("avx512f", "avx512bf16"), tmp_path / "primary")
++    avx2_compiler = Avx2Compiler()
++    avx2_target = TargetSpec("cpu", "x86_64-linux-gnu", features=("avx2",), attributes={"lane_count": 8})
++    wrong = avx2_compiler.compile(
++        avx2_compiler.lower(wrong_program, avx2_target),
++        CompileOptions(
++            artifact_format="pypto-x.cpu.avx2",
++            extra={"build_dir": str(tmp_path / "wrong")},
++        ),
++    )
++    missing = Avx512Capability.injected_capability(())
++    runtime = Avx512Runtime(capability=missing)
++    monkeypatch.setattr(capabilities_module, "probe_avx512_capabilities", lambda **kwargs: missing)
++    monkeypatch.setattr(ctypes, "CDLL", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dlopen")))
++    left = HostTensor("float32", (17,), [float(index) for index in range(17)])
++    output = HostTensor.zeros("float32", (17,))
++    with pytest.raises(CpuAvx512ArtifactError, match="CoreProgram digest"):
++        runtime.launch(
++            LaunchRequest(
++                primary,
++                inputs=[left.descriptor(readonly=True), left.descriptor(readonly=True)],
++                outputs=[output.descriptor()],
++            ),
++            fallback_artifact=wrong,
++        )
++
++
++def test_layered_advanced_to_base_to_avx2_fallback_selection(tmp_path, monkeypatch):
++    program = _matmul("bf16", (2, 3), (3, 17))
++    _, _, advanced = _compile(program, _target("avx512f", "avx512bf16"), tmp_path / "advanced")
++    _, _, base = _compile(program, _target("avx512f"), tmp_path / "base")
++    avx2_compiler = Avx2Compiler()
++    avx2_target = TargetSpec("cpu", "x86_64-linux-gnu", features=("avx2",), attributes={"lane_count": 8})
++    avx2 = avx2_compiler.compile(
++        avx2_compiler.lower(program, avx2_target),
++        CompileOptions(
++            artifact_format="pypto-x.cpu.avx2",
++            extra={"build_dir": str(tmp_path / "avx2")},
++        ),
++    )
++    left_values = [1.00390625, 2.0, 3.0, 4.0, 5.0, 6.0]
++    right_values = [float(index + 1) / 7.0 for index in range(51)]
++    missing_advanced = Avx512Capability.injected_capability(
++        ("avx", "avx512f", "osxsave", "ymm", "opmask", "zmm")
++    )
++    monkeypatch.setattr(capabilities_module, "probe_avx512_capabilities", lambda **kwargs: missing_advanced)
++    runtime = Avx512Runtime(capability=missing_advanced)
++    output = HostTensor.zeros("bf16", (2, 17))
++    runtime.launch(
++        LaunchRequest(
++            advanced,
++            inputs=[
++                HostTensor("bf16", (2, 3), left_values).descriptor(readonly=True),
++                HostTensor("bf16", (3, 17), right_values).descriptor(readonly=True),
++            ],
++            outputs=[output.descriptor()],
++        ),
++        fallback_artifact=(base, avx2),
++    )
++    assert runtime.selected_artifact.path == base.path
++
++    missing_base = Avx512Capability.injected_capability(())
++    monkeypatch.setattr(capabilities_module, "probe_avx512_capabilities", lambda **kwargs: missing_base)
++    runtime = Avx512Runtime(capability=missing_base)
++    output = HostTensor.zeros("bf16", (2, 17))
++    runtime.launch(
++        LaunchRequest(
++            advanced,
++            inputs=[
++                HostTensor("bf16", (2, 3), left_values).descriptor(readonly=True),
++                HostTensor("bf16", (3, 17), right_values).descriptor(readonly=True),
++            ],
++            outputs=[output.descriptor()],
++        ),
++        fallback_artifact=(base, avx2),
++    )
++    assert runtime.selected_artifact.path == avx2.path
++
++
++def test_vnni_inputs_are_strict_and_int32_safe(tmp_path):
++    _, _, artifact = _compile(_elementwise(), _target("avx512f", "avx512vnni"), tmp_path)
++    runtime = _runtime()
++    for left, right in (
++        ([True], [1]),
++        ([-1], [1]),
++        ([256], [1]),
++        ([1], [-129]),
++        ([1], [128]),
++        ([0] * (VNNI_MAX_SAFE_LENGTH + 1), [0] * (VNNI_MAX_SAFE_LENGTH + 1)),
++    ):
++        with pytest.raises(CpuAvx512ExecutionError):
++            runtime.run_vnni_dot_i8(artifact, left, right)
++    left = [255] * VNNI_MAX_SAFE_LENGTH
++    right = [127] * VNNI_MAX_SAFE_LENGTH
++    assert runtime.run_vnni_dot_i8(artifact, left, right) == 255 * 127 * VNNI_MAX_SAFE_LENGTH

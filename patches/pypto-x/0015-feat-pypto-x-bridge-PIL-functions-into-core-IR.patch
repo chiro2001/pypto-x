@@ -1,0 +1,1379 @@
+From 6bc5cf0698da1f1e941d819ac88f756af8e9aace Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Mon, 7 Sep 2026 02:08:53 +0800
+Subject: [PATCH 15/96] feat(pypto-x): bridge PIL functions into core IR
+
+---
+ python/pypto/frontend/core_export.py               |   55 ++-
+ python/pypto/frontend/pil_core_bridge.py           | 1000 ++++++++++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_tensor_core_bridge.py |  267 +++++++++++
+ 3 files changed, 1320 insertions(+), 2 deletions(-)
+
+diff --git a/python/pypto/frontend/core_export.py b/python/pypto/frontend/core_export.py
+index 322a00045..5d2bc0a23 100644
+--- a/python/pypto/frontend/core_export.py
++++ b/python/pypto/frontend/core_export.py
+@@ -164,6 +164,7 @@ def export_tensor_frontend(
+     *,
+     name: Optional[str] = None,
+     metadata: Optional[Mapping[str, Any]] = None,
++    parser: Optional[Any] = None,
+ ) -> CoreProgram:
+     """把一次 Tensor frontend 解析结果导出为 ``CoreProgram``。
+ 
+@@ -175,10 +176,26 @@ def export_tensor_frontend(
+     * 一个带 ``functions`` 的 CoreProgram mapping。
+ 
+     callable（包括 ``@pypto.frontend.jit`` 函数）会被拒绝，因为导出阶段
+-    禁止按 target 再执行用户 kernel。要连接 native parser，请调用
+-    ``export_with_native_bridge`` 并显式提供 bridge。
++    禁止按 target 再执行用户 kernel。若确实需要在 Tensor parser 边界执行
++    一次 parser，可通过 ``parser=`` 显式传入；要连接 native parser，也可
++    调用 ``export_with_native_bridge`` 并显式提供 bridge。
+     """
+ 
++    # ``pypto.pil.pir.Function`` is intentionally recognized through a lazy,
++    # duck-typed bridge.  Importing the bridge at module import time would
++    # make this otherwise pure-Python adapter depend on the native pypto
++    # package.  An explicit parser is allowed for a callable source, but it is
++    # invoked exactly once here and the resulting PIL is then reused by all
++    # target backends.
++    from_pil = _export_pil_if_available(export_input, name=name, metadata=metadata)
++    if from_pil is not None:
++        return from_pil
++    if parser is not None:
++        if not callable(parser):
++            raise CoreExportError("parser 必须是 callable")
++        parsed = parser(export_input)
++        return export_tensor_frontend(parsed, name=name, metadata=metadata)
++
+     if isinstance(export_input, CoreProgram):
+         program = export_input
+         if name is not None or metadata is not None:
+@@ -245,6 +262,39 @@ def export_with_native_bridge(parsed: Any, bridge: Optional[NativeTensorParserBr
+     return export_tensor_frontend(exporter(parsed))
+ 
+ 
++def export_with_tensor_parser(parsed_input: Any, parser: Any) -> CoreProgram:
++    """显式执行一次 Tensor parser，然后导出同一份 PIL/Core 输入。
++
++    该入口是 target-neutral 的：parser 的结果只在这里产生一次，后续
++    backend 应缓存并共享返回的 ``CoreProgram``，不能按 target 重新调用
++    ``parsed_callable`` 或 parser。
++    """
++
++    if not callable(parser):
++        raise CoreExportError("Tensor parser 必须是 callable")
++    return export_tensor_frontend(parser(parsed_input))
++
++
++def _export_pil_if_available(
++    export_input: Any,
++    *,
++    name: Optional[str],
++    metadata: Optional[Mapping[str, Any]],
++) -> Optional[CoreProgram]:
++    """Lazily route a parsed PIL Function without importing native PIL types."""
++
++    # Avoid importing pypto.pil.pir here: the actual package initializer can
++    # require CANN shared libraries.  The bridge's structural check handles
++    # the native class and pure-Python fakes alike.
++    try:
++        from .pil_core_bridge import export_pil_function, is_pil_function
++    except (ImportError, ModuleNotFoundError):
++        return None
++    if not is_pil_function(export_input):
++        return None
++    return export_pil_function(export_input, name=name, metadata=metadata)
++
++
+ def native_parser_available() -> bool:
+     """当前 W1 不主动导入 CANN，因此 native parser 默认不可用。"""
+ 
+@@ -263,6 +313,7 @@ __all__ = [
+     "TensorExportInput",
+     "export_core_program",
+     "export_tensor_frontend",
++    "export_with_tensor_parser",
+     "export_with_native_bridge",
+     "from_tensor_frontend",
+     "native_parser_available",
+diff --git a/python/pypto/frontend/pil_core_bridge.py b/python/pypto/frontend/pil_core_bridge.py
+new file mode 100644
+index 000000000..baa4b6198
+--- /dev/null
++++ b/python/pypto/frontend/pil_core_bridge.py
+@@ -0,0 +1,1000 @@
++"""Duck-typed bridge from the Tensor frontend's PIL to Core IR.
++
++The Tensor frontend and :mod:`pypto.pil.pir` are intentionally not imported at
++module import time.  The latter imports the native ``pypto`` implementation in
++some installations, which makes a Core IR unit test unnecessarily depend on a
++CANN runtime.  This module therefore identifies the small, stable shape of a
++PIL ``Function``/``Block``/``Call``/``Value`` and adapts that shape directly.
++
++The bridge consumes an already parsed PIL object.  It never calls a user
++kernel and it never calls a parser based on a target.  A parser, if one is
++needed, is owned by :func:`pypto.frontend.core_export.export_with_tensor_parser`
++and is invoked exactly once before this module is entered.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++import math
++import re
++from collections.abc import Mapping
++from enum import Enum
++from typing import Any, Optional
++
++from pypto.core_ir import (
++    Block as CoreBlock,
++    CoreFunction,
++    CoreIRError,
++    CoreProgram,
++    CoreType,
++    Effect,
++    Operation,
++    Region,
++    ValueRef,
++)
++
++
++_MISSING = object()
++_CORE_NAME_RE = re.compile(r"^(?:%[A-Za-z0-9_.$-]+|[A-Za-z_][A-Za-z0-9_.$-]*)$")
++_PORTABLE_OP_NAMES = {
++    "operator.add": "add",
++    "operator.sub": "sub",
++    "operator.mul": "mul",
++    "operator.truediv": "div",
++    "operator.matmul": "matmul",
++    "operator.neg": "neg",
++    "operator.pos": "identity",
++    "!bop.add": "add",
++    "!bop.sub": "sub",
++    "!bop.mult": "mul",
++    "!bop.div": "div",
++    "!bop.matmult": "matmul",
++    "!uop.usub": "neg",
++    "!uop.uadd": "identity",
++    "pil.const": "constant",
++    "pil.identity": "identity",
++    "pil.copy": "copy",
++    "tensor.add": "add",
++    "tensor.sub": "sub",
++    "tensor.mul": "mul",
++    "tensor.div": "div",
++    "tensor.matmul": "matmul",
++    "tensor.neg": "neg",
++    "tensor.reduce_sum": "reduce_sum",
++    "tensor.reduce_max": "reduce_max",
++    "pil.reduce_sum": "reduce_sum",
++    "pil.reduce_max": "reduce_max",
++    "pypto.reduce_sum": "reduce_sum",
++    "pypto.reduce_max": "reduce_max",
++    "tensor.identity": "identity",
++    "tensor.copy": "copy",
++}
++
++
++class PilCoreBridgeError(CoreIRError):
++    """PIL 结构不能安全地映射为 Core IR。"""
++
++
++class UnsupportedPILNodeError(PilCoreBridgeError):
++    """输入中有未支持的 node；错误信息始终包含结构路径。"""
++
++    def __init__(self, path: str, node: Any, detail: str = "") -> None:
++        node_type = _qualified_type_name(node)
++        suffix = f": {detail}" if detail else ""
++        super().__init__(f"不支持的 PIL node at {path}: {node_type}{suffix}")
++        self.path = path
++        self.node_type = node_type
++
++
++@dataclass(frozen=True)
++class PilBridgeDiagnostic:
++    """A structured, JSON-compatible diagnostic emitted during export."""
++
++    path: str
++    kind: str
++    message: str
++    value_id: Optional[int] = None
++
++    def to_dict(self) -> dict[str, Any]:
++        result: dict[str, Any] = {
++            "kind": self.kind,
++            "message": self.message,
++            "path": self.path,
++        }
++        if self.value_id is not None:
++            result["value_id"] = self.value_id
++        return result
++
++
++class PilCoreBridge:
++    """Reusable target-neutral bridge object.
++
++    A caller may construct one at the Tensor-parser boundary and pass the
++    resulting ``CoreProgram`` to several backends.  ``export`` only consumes
++    an already parsed PIL object; it never invokes a callable kernel.
++    """
++
++    def export(
++        self,
++        parsed: Any,
++        *,
++        name: Optional[str] = None,
++        metadata: Optional[Mapping[str, Any]] = None,
++    ) -> CoreProgram:
++        return export_pil_function(parsed, name=name, metadata=metadata)
++
++
++def _qualified_type_name(value: Any) -> str:
++    cls = value if isinstance(value, type) else type(value)
++    module = getattr(cls, "__module__", "")
++    name = getattr(cls, "__qualname__", getattr(cls, "__name__", "unknown"))
++    return f"{module}.{name}" if module else str(name)
++
++
++def _stable_text(value: Any) -> Optional[str]:
++    """Return a name without ever consulting an object's repr/address."""
++
++    if isinstance(value, str):
++        return value
++    if isinstance(value, Enum):
++        candidate = value.value
++        if isinstance(candidate, str):
++            return candidate
++        candidate = value.name
++        return candidate if isinstance(candidate, str) else None
++    module = getattr(value, "__module__", _MISSING)
++    if module == "_operator":
++        # CPython exposes the public ``operator`` functions from the private
++        # implementation module.  The public module name is the stable
++        # semantic spelling expected in Core IR.
++        module = "operator"
++    for attr in ("qualified_name", "qualname", "__qualname__", "name", "__name__"):
++        candidate = getattr(value, attr, _MISSING)
++        if isinstance(candidate, str) and candidate:
++            if isinstance(module, str) and module and attr in {"qualname", "__qualname__", "name", "__name__"}:
++                return f"{module}.{candidate}"
++            return candidate
++    return None
++
++
++def _stable_symbol(value: Any, path: str, diagnostics: list[PilBridgeDiagnostic]) -> str:
++    """Normalize a callee/jump/effect name to a deterministic IR symbol."""
++
++    text = _stable_text(value)
++    if text is None:
++        # A class-qualified name is deterministic even for callable objects;
++        # using repr(value) here would leak a process address into the IR.
++        text = _qualified_type_name(value)
++        diagnostics.append(
++            PilBridgeDiagnostic(
++                path,
++                "unstable_name_fallback",
++                "对象没有稳定 name，使用类型限定名作为语义名",
++            )
++        )
++    text = text.strip()
++    if not text:
++        text = "unknown"
++        diagnostics.append(PilBridgeDiagnostic(path, "unknown_name", "名称为空，使用 unknown"))
++    # Operation names only reject whitespace.  Replacing it keeps the
++    # original stable spelling as much as possible while satisfying Core IR.
++    text = re.sub(r"\s+", "_", text)
++    return text
++
++
++def _portable_op_name(name: str) -> str:
++    """Map only audited Tensor/PIL aliases to the Core portable vocabulary."""
++
++    return _PORTABLE_OP_NAMES.get(name, name)
++
++
++def _is_int_id(value: Any) -> bool:
++    candidate = getattr(value, "id", _MISSING)
++    return isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0
++
++
++def _is_pil_value(value: Any) -> bool:
++    if isinstance(value, ValueRef):
++        return False
++    if not _is_int_id(value):
++        return False
++    class_name = type(value).__name__.lower()
++    if class_name in {"value", "pilvalue", "fakevalue"}:
++        return True
++    # ``Block`` also has an id, so structural fields disambiguate it.  A
++    # simple fake Value is often a namespace with only ``id`` and ``type``.
++    if any(hasattr(value, attr) for attr in ("calls", "result", "jump", "span")):
++        return False
++    return hasattr(value, "type") or hasattr(value, "value_type") or hasattr(value, "dtype") or not hasattr(
++        value, "args"
++    )
++
++
++def _is_pil_block(value: Any) -> bool:
++    return value is not None and hasattr(value, "calls") and hasattr(value, "result") and (
++        hasattr(value, "args") or hasattr(value, "id")
++    )
++
++
++def _is_pil_call(value: Any) -> bool:
++    return value is not None and hasattr(value, "callee") and hasattr(value, "args") and hasattr(value, "result")
++
++
++def is_pil_function(value: Any) -> bool:
++    """Duck-type check for ``pypto.pil.pir.Function`` without importing it."""
++
++    if value is None or not hasattr(value, "name") or not hasattr(value, "body"):
++        return False
++    if not _is_pil_block(getattr(value, "body", None)):
++        return False
++    # The body shape is the discriminator.  Keeping this fully structural is
++    # important for a fake PIL in a no-native test environment and for a
++    # native wheel whose class is not importable from this process.
++    return True
++
++
++def _get(value: Any, *names: str, default: Any = _MISSING) -> Any:
++    for name in names:
++        if isinstance(value, Mapping) and name in value:
++            return value[name]
++        candidate = getattr(value, name, _MISSING)
++        if candidate is not _MISSING:
++            return candidate
++    return default
++
++
++def _is_wrapper(value: Any, wrapper_name: str) -> bool:
++    if value is None:
++        return False
++    if type(value).__name__.lower() == wrapper_name.lower():
++        return True
++    return hasattr(value, "value") and type(value).__name__.lower().endswith(wrapper_name.lower())
++
++
++def _wrapper_value(value: Any) -> Any:
++    return _get(value, "value", default=_MISSING)
++
++
++def _format_path(path: str, index: int) -> str:
++    return f"{path}[{index}]"
++
++
++class _PilExporter:
++    """Stateful, single-pass exporter for one already parsed PIL Function."""
++
++    def __init__(self, function: Any) -> None:
++        self.function = function
++        self.diagnostics: list[PilBridgeDiagnostic] = []
++        self._diagnostic_keys: set[tuple[str, str, Optional[int]]] = set()
++        self._value_refs: dict[int, ValueRef] = {}
++        self._value_types: dict[int, CoreType] = {}
++        self._defined_value_ids: set[int] = set()
++        self._external_value_refs: dict[int, ValueRef] = {}
++        self._parameter_by_source_name: dict[str, ValueRef] = {}
++        self._parameter_descriptors: list[Any] = []
++
++    def diagnostic(
++        self,
++        path: str,
++        kind: str,
++        message: str,
++        value_id: Optional[int] = None,
++    ) -> None:
++        key = (path, kind, value_id)
++        if key not in self._diagnostic_keys:
++            self._diagnostic_keys.add(key)
++            self.diagnostics.append(PilBridgeDiagnostic(path, kind, message, value_id))
++
++    def unknown_type(self, path: str, value_id: Optional[int] = None) -> CoreType:
++        self.diagnostic(path, "unknown_type", "无法从 PIL 结构可靠推导 dtype/shape，显式使用 unknown", value_id)
++        return CoreType("unknown", "unknown", ())
++
++    def type_from_any(self, value: Any, path: str, *, report: bool = True) -> CoreType:
++        if isinstance(value, CoreType):
++            return value
++        if isinstance(value, Mapping):
++            if {"kind", "dtype", "shape"}.issubset(value):
++                try:
++                    return CoreType.from_dict(value)
++                except CoreIRError:
++                    pass
++            nested = _get(value, "core_type", "value_type", "type", default=_MISSING)
++            if nested is not _MISSING and nested is not value:
++                return self.type_from_any(nested, path, report=report)
++            kind = value.get("kind", _MISSING)
++            dtype = value.get("dtype", _MISSING)
++            shape = value.get("shape", _MISSING)
++            if kind is not _MISSING and dtype is not _MISSING and shape is not _MISSING:
++                try:
++                    return CoreType(str(kind), _dtype_text(dtype), tuple(shape))
++                except (CoreIRError, TypeError, ValueError):
++                    pass
++        for attr in ("core_type", "value_type", "type"):
++            nested = getattr(value, attr, _MISSING)
++            if nested is not _MISSING and nested is not value:
++                candidate = self.type_from_any(nested, path, report=False)
++                if candidate.kind != "unknown":
++                    return candidate
++        kind = _get(value, "kind", default=_MISSING)
++        dtype = _get(value, "dtype", default=_MISSING)
++        shape = _get(value, "shape", default=_MISSING)
++        if kind is not _MISSING and dtype is not _MISSING and shape is not _MISSING:
++            try:
++                return CoreType(str(kind), _dtype_text(dtype), tuple(shape))
++            except (CoreIRError, TypeError, ValueError):
++                pass
++        if report:
++            return self.unknown_type(path)
++        return CoreType("unknown", "unknown", ())
++
++    def _value_id(self, value: Any, path: str) -> int:
++        if isinstance(value, ValueRef):
++            raise TypeError("ValueRef 没有 PIL value id")
++        value_id = _get(value, "id", "value_id", default=_MISSING)
++        if not isinstance(value_id, int) or isinstance(value_id, bool) or value_id < 0:
++            raise UnsupportedPILNodeError(path, value, "Value.id 必须是非负整数")
++        return value_id
++
++    def ref_for_value(
++        self,
++        value: Any,
++        path: str,
++        *,
++        type_hint: Any = _MISSING,
++        report_unknown: bool = True,
++    ) -> ValueRef:
++        if isinstance(value, ValueRef):
++            return value
++        if not _is_pil_value(value):
++            raise UnsupportedPILNodeError(path, value, "期望 PIL Value")
++        value_id = self._value_id(value, path)
++        explicit = type_hint if type_hint is not _MISSING else value
++        value_type = self.type_from_any(explicit, path + ".type", report=report_unknown)
++        previous = self._value_refs.get(value_id)
++        if previous is not None:
++            # The first explicit type wins.  Replacing a previously emitted
++            # ValueRef would make already-built Operations fail Core IR verify.
++            if previous.type.kind == "unknown" and value_type.kind != "unknown":
++                self.diagnostic(path, "type_conflict", "同一 Value id 已按 unknown 导出，忽略后续不一致类型", value_id)
++            return previous
++        ref = ValueRef(f"%v{value_id}", value_type)
++        self._value_refs[value_id] = ref
++        self._value_types[value_id] = value_type
++        return ref
++
++    def parameter_descriptors(self) -> list[Any]:
++        raw = _get(self.function, "parameters", default=_MISSING)
++        if raw is _MISSING:
++            raw = _get(self.function, "params", default=_MISSING)
++        descriptors: list[Any] = []
++        if isinstance(raw, Mapping):
++            descriptors.extend(raw.items())
++        elif raw is not _MISSING and raw is not None and not isinstance(raw, (str, bytes)):
++            try:
++                descriptors.extend(raw)
++            except TypeError:
++                pass
++        if not descriptors:
++            signature = _get(self.function, "signature", default=_MISSING)
++            signature_params = _get(signature, "parameters", default=_MISSING)
++            if isinstance(signature_params, Mapping):
++                descriptors.extend(signature_params.items())
++        if not descriptors:
++            annotations = _get(self.function, "annotations", default={})
++            params = _get(self.function, "params", default=())
++            if isinstance(params, (list, tuple)):
++                descriptors.extend((name, _get(annotations, name, default=_MISSING)) for name in params)
++        normalized: list[Any] = []
++        for item in descriptors:
++            if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], str):
++                normalized.append(item)
++            else:
++                normalized.append(item)
++        self._parameter_descriptors = normalized
++        return normalized
++
++    def _parameter_name_type(self, descriptor: Any, index: int) -> tuple[str, CoreType, Any]:
++        raw_name: Any = _MISSING
++        annotation: Any = _MISSING
++        if isinstance(descriptor, tuple) and len(descriptor) == 2 and isinstance(descriptor[0], str):
++            raw_name, annotation = descriptor
++        elif isinstance(descriptor, str):
++            raw_name = descriptor
++        else:
++            raw_name = _get(descriptor, "name", "id", default=_MISSING)
++            annotation = _get(descriptor, "annotation", "type", "value_type", default=_MISSING)
++        if raw_name is _MISSING or not isinstance(raw_name, str) or not raw_name:
++            raw_name = f"arg{index}"
++            self.diagnostic(f"function.parameters[{index}]", "unstable_parameter_name", "参数没有稳定名称，使用 argN")
++        name = raw_name if _CORE_NAME_RE.fullmatch(raw_name) else f"arg{index}"
++        if name != raw_name:
++            self.diagnostic(
++                f"function.parameters[{index}]",
++                "invalid_parameter_name",
++                "参数名不是稳定 SSA 名称，使用 argN",
++            )
++        if annotation is _MISSING:
++            annotations = _get(self.function, "annotations", default={})
++            if isinstance(annotations, Mapping):
++                annotation = annotations.get(raw_name, _MISSING)
++        if annotation is _MISSING:
++            signature = _get(self.function, "signature", default=_MISSING)
++            sig_params = _get(signature, "parameters", default=_MISSING)
++            if isinstance(sig_params, Mapping):
++                parameter = sig_params.get(raw_name, _MISSING)
++                annotation = _get(parameter, "annotation", default=_MISSING)
++        value_type = self.type_from_any(annotation, f"function.parameters[{index}].type")
++        return name, value_type, descriptor
++
++    def build_parameters(self) -> tuple[ValueRef, ...]:
++        parameters: list[ValueRef] = []
++        seen: set[str] = set()
++        for index, descriptor in enumerate(self.parameter_descriptors()):
++            name, value_type, raw_descriptor = self._parameter_name_type(descriptor, index)
++            if name in seen:
++                replacement = f"arg{index}"
++                self.diagnostic(
++                    f"function.parameters[{index}]",
++                    "duplicate_parameter_name",
++                    f"重复参数名 {name}，使用 {replacement}",
++                )
++                name = replacement
++            seen.add(name)
++            ref = ValueRef(name, value_type)
++            parameters.append(ref)
++            self._parameter_by_source_name[name] = ref
++            source_name = _get(raw_descriptor, "name", default=_MISSING)
++            if isinstance(raw_descriptor, tuple) and len(raw_descriptor) == 2 and isinstance(raw_descriptor[0], str):
++                source_name = raw_descriptor[0]
++            if isinstance(source_name, str):
++                self._parameter_by_source_name[source_name] = ref
++            value_id = _get(raw_descriptor, "id", "value_id", default=_MISSING)
++            if isinstance(value_id, int) and not isinstance(value_id, bool) and value_id >= 0:
++                self._value_refs[value_id] = ref
++                self._value_types[value_id] = value_type
++                self._defined_value_ids.add(value_id)
++        return tuple(parameters)
++
++    def _encode_literal(self, value: Any, path: str) -> Any:
++        if value is None or isinstance(value, (str, bool, int)):
++            return value
++        if isinstance(value, float):
++            if not math.isfinite(value):
++                raise UnsupportedPILNodeError(path, value, "浮点常量不能是 NaN 或无穷大")
++            return value
++        if isinstance(value, Enum):
++            return _stable_symbol(value, path, self.diagnostics)
++        if isinstance(value, (list, tuple)):
++            return [self._encode_operand(item, _format_path(path, index), None)[0] for index, item in enumerate(value)]
++        if isinstance(value, Mapping):
++            encoded: dict[str, Any] = {}
++            for key, item in value.items():
++                if not isinstance(key, str):
++                    raise UnsupportedPILNodeError(path, key, "属性键必须是字符串")
++                encoded[key] = self._encode_operand(item, f"{path}.{key}", None)[0]
++            return encoded
++        # Callee/function objects can appear as literal values in nested
++        # helper calls.  Keep only a stable semantic name.
++        stable = _stable_text(value)
++        if callable(value) or stable is not None:
++            return {"symbol": _stable_symbol(value, path, self.diagnostics)}
++        raise UnsupportedPILNodeError(path, value, "无法稳定编码为 Core IR attribute")
++
++    def _collect_operand_refs(self, operand: Any, path: str) -> tuple[ValueRef, ...]:
++        """Collect nested Value operands for Core IR dependency edges.
++
++        PIL tuple/list/dict construction calls can carry Values below one
++        literal container.  ``Operation.inputs`` is flat, so this traversal
++        preserves those dependencies while ``attributes["args"]`` retains
++        the original nested argument order.
++        """
++
++        if isinstance(operand, ValueRef):
++            return (operand,)
++        if _is_pil_value(operand):
++            ref = self.ref_for_value(operand, path)
++            value_id = self._value_id(operand, path)
++            if value_id not in self._defined_value_ids:
++                self._external_value_refs[value_id] = ref
++                self.diagnostic(
++                    path,
++                    "external_value",
++                    "Value 在当前 PIL scope 没有定义，显式建模为 external 输入",
++                    value_id,
++                )
++            return (ref,)
++        if _is_pil_block(operand):
++            # The nested Region carries its own block arguments and operations;
++            # it is not an SSA input of the enclosing operation.
++            return ()
++        if _is_wrapper(operand, "Starred") or _is_wrapper(operand, "DoubleStarred"):
++            wrapped = _wrapper_value(operand)
++            return () if wrapped is _MISSING else self._collect_operand_refs(wrapped, path + ".value")
++        if isinstance(operand, (list, tuple)):
++            refs: list[ValueRef] = []
++            for index, item in enumerate(operand):
++                refs.extend(self._collect_operand_refs(item, _format_path(path, index)))
++            return tuple(refs)
++        if isinstance(operand, Mapping):
++            refs = []
++            for key, item in operand.items():
++                refs.extend(self._collect_operand_refs(item, f"{path}.{key}"))
++            return tuple(refs)
++        return ()
++
++    def _encode_operand(
++        self,
++        operand: Any,
++        path: str,
++        regions: Optional[list[Region]],
++        env: Optional[dict[str, ValueRef]] = None,
++    ) -> tuple[Any, Optional[ValueRef]]:
++        if isinstance(operand, ValueRef):
++            return {"value": operand.name}, operand
++        if _is_pil_value(operand):
++            ref = self.ref_for_value(operand, path)
++            value_id = self._value_id(operand, path)
++            if value_id not in self._defined_value_ids:
++                self._external_value_refs[value_id] = ref
++                self.diagnostic(
++                    path,
++                    "external_value",
++                    "Value 在当前 PIL scope 没有定义，显式建模为 external 输入",
++                    value_id,
++                )
++            return {"value": ref.name}, ref
++        if _is_pil_block(operand):
++            if regions is None:
++                raise UnsupportedPILNodeError(path, operand, "嵌套 Block 只能出现在 Call 参数中")
++            region, _ = self.convert_nested_block(operand, path, env or {})
++            region_index = len(regions)
++            regions.append(region)
++            block_id = _get(operand, "id", default=_MISSING)
++            encoded: dict[str, Any] = {"region": region_index}
++            if isinstance(block_id, int) and not isinstance(block_id, bool):
++                encoded["block_id"] = block_id
++            return encoded, None
++        if _is_wrapper(operand, "Starred") or _is_wrapper(operand, "DoubleStarred"):
++            wrapped = _wrapper_value(operand)
++            if wrapped is _MISSING:
++                raise UnsupportedPILNodeError(path, operand, "wrapper 缺少 value")
++            encoded, ref = self._encode_operand(wrapped, path + ".value", regions, env)
++            operand_name = type(operand).__name__.lower()
++            is_starred = operand_name.endswith("starred") and not operand_name.endswith("doublestarred")
++            key = "starred" if is_starred else "double_starred"
++            return {key: encoded}, ref
++        return self._encode_literal(operand, path), None
++
++    def _callee_name(self, callee: Any, path: str) -> tuple[str, Any, Optional[ValueRef]]:
++        if _is_pil_value(callee):
++            ref = self.ref_for_value(callee, path + ".callee")
++            return "call", {"value": ref.name}, ref
++        if isinstance(callee, ValueRef):
++            return "call", {"value": callee.name}, callee
++        name = _stable_symbol(callee, path + ".callee", self.diagnostics)
++        return name, name, None
++
++    def _effect_for(
++        self,
++        call: Any,
++        callee_name: str,
++        path: str,
++        *,
++        source_name: Optional[str] = None,
++    ) -> Effect:
++        explicit = _get(call, "effect", default=_MISSING)
++        if explicit is _MISSING:
++            attributes = _get(call, "attributes", "attrs", default=_MISSING)
++            if isinstance(attributes, Mapping):
++                explicit = attributes.get("effect", _MISSING)
++        if explicit is not _MISSING:
++            try:
++                if isinstance(explicit, Effect):
++                    return explicit
++                candidate = explicit
++                if not isinstance(candidate, str):
++                    candidate = getattr(explicit, "value", getattr(explicit, "name", explicit))
++                return Effect(candidate)
++            except (TypeError, ValueError):
++                self.diagnostic(path + ".effect", "unknown_effect", "未知 effect，保守使用 read_write")
++                return Effect.READ_WRITE
++
++        if callee_name == "pil.load":
++            return Effect.READ
++        if callee_name == "pil.store":
++            return Effect.WRITE
++        if callee_name in {"pil.return", "pil.raise", "pil.assert"}:
++            return Effect.BARRIER
++        if (
++            (source_name or callee_name).startswith("operator.")
++            or callee_name.startswith("!bop.")
++            or callee_name.startswith("!uop.")
++            or callee_name.startswith("!cop.")
++            or callee_name in {
++                "add",
++                "sub",
++                "mul",
++                "div",
++                "neg",
++                "matmul",
++                "reduce_sum",
++                "reduce_max",
++                "constant",
++                "identity",
++                "copy",
++                "pil.const",
++                "pil.fstring",
++                "builtins.tuple",
++                "builtins.list",
++                "builtins.set",
++                "builtins.dict",
++            }
++        ):
++            return Effect.PURE
++        self.diagnostic(path + ".effect", "unknown_effect", "无法从 callee 推导 effect，保守使用 read_write")
++        return Effect.READ_WRITE
++
++    def _span_attributes(self, call: Any) -> dict[str, Any]:
++        span = _get(call, "span", default=_MISSING)
++        if span is _MISSING or span is None:
++            return {}
++        result: dict[str, Any] = {}
++        if isinstance(span, Mapping):
++            source = span
++            names = ("filename", "begin_line", "begin_col", "end_line", "end_col", "line", "column")
++            for name in names:
++                item = source.get(name, _MISSING)
++                if isinstance(item, (str, int, bool)):
++                    result[name] = item
++            return result
++        names = ("filename", "begin_line", "begin_col", "end_line", "end_col", "line", "column")
++        for name in names:
++            item = getattr(span, name, _MISSING)
++            if isinstance(item, (str, int, bool)):
++                result[name] = item
++        return result
++
++    def convert_call(self, call: Any, path: str, env: dict[str, ValueRef]) -> Operation:
++        if not _is_pil_call(call):
++            raise UnsupportedPILNodeError(path, call, "期望 Call")
++        callee = _get(call, "callee", default=_MISSING)
++        if callee is _MISSING:
++            raise UnsupportedPILNodeError(path, call, "Call 缺少 callee")
++        source_op_name, encoded_callee, callee_ref = self._callee_name(callee, path)
++        op_name = _portable_op_name(source_op_name)
++        args = _get(call, "args", default=())
++        if args is None:
++            args = ()
++        try:
++            args = tuple(args)
++        except TypeError as exc:
++            raise UnsupportedPILNodeError(path + ".args", args, "Call.args 必须可迭代") from exc
++        regions: list[Region] = []
++        inputs: list[ValueRef] = []
++        input_names: set[str] = set()
++        if callee_ref is not None:
++            if callee_ref.name not in input_names:
++                inputs.append(callee_ref)
++                input_names.add(callee_ref.name)
++            if _is_pil_value(callee) and self._value_id(callee, path + ".callee") not in self._defined_value_ids:
++                value_id = self._value_id(callee, path + ".callee")
++                self._external_value_refs[value_id] = callee_ref
++                self.diagnostic(
++                    path + ".callee",
++                    "external_value",
++                    "动态 callee Value 没有定义，显式建模为 external 输入",
++                    value_id,
++                )
++        encoded_args: list[Any] = []
++        for index, arg in enumerate(args):
++            encoded, ref = self._encode_operand(arg, f"{path}.args[{index}]", regions, env)
++            encoded_args.append(encoded)
++            for nested_ref in self._collect_operand_refs(arg, f"{path}.args[{index}]" if ref is None else path):
++                if nested_ref.name not in input_names:
++                    inputs.append(nested_ref)
++                    input_names.add(nested_ref.name)
++
++        encoded_kwargs: list[Any] = []
++        kwargs = _get(call, "kwargs", default=())
++        if kwargs is None:
++            kwargs = ()
++        items = kwargs.items() if isinstance(kwargs, Mapping) else kwargs
++        try:
++            items = tuple(items)
++        except TypeError as exc:
++            raise UnsupportedPILNodeError(path + ".kwargs", kwargs, "Call.kwargs 必须是 mapping 或序列") from exc
++        for index, item in enumerate(items):
++            key: Any = _MISSING
++            value: Any = _MISSING
++            if isinstance(item, tuple) and len(item) == 2:
++                key, value = item
++            elif _is_wrapper(item, "Keyword"):
++                key = _get(item, "arg", "name", default=None)
++                value = _get(item, "value", default=_MISSING)
++            if value is _MISSING:
++                raise UnsupportedPILNodeError(f"{path}.kwargs[{index}]", item, "keyword 必须是 (name, value)")
++            if key is not None and not isinstance(key, str):
++                raise UnsupportedPILNodeError(
++                    f"{path}.kwargs[{index}]",
++                    key,
++                    "keyword name 必须是字符串或 None",
++                )
++            encoded, ref = self._encode_operand(value, f"{path}.kwargs[{index}].value", regions, env)
++            encoded_kwargs.append({"name": key, "value": encoded})
++            for nested_ref in self._collect_operand_refs(value, f"{path}.kwargs[{index}].value"):
++                if nested_ref.name not in input_names:
++                    inputs.append(nested_ref)
++                    input_names.add(nested_ref.name)
++
++        result_value = _get(call, "result", default=None)
++        outputs: tuple[ValueRef, ...] = ()
++        if result_value is not None:
++            result_type_hint = _get(call, "result_type", "output_type", "type", default=_MISSING)
++            result_ref = self.ref_for_value(result_value, path + ".result", type_hint=result_type_hint)
++            result_id = self._value_id(result_value, path + ".result")
++            self._defined_value_ids.add(result_id)
++            self._external_value_refs.pop(result_id, None)
++            outputs = (result_ref,)
++
++        attrs: dict[str, Any] = {
++            "callee": encoded_callee,
++            "args": encoded_args,
++            "kwargs": encoded_kwargs,
++        }
++        if op_name != source_op_name:
++            attrs["semantic_op"] = op_name
++        span_attrs = self._span_attributes(call)
++        if span_attrs:
++            attrs["span"] = span_attrs
++        if callee_ref is not None:
++            attrs["dynamic_callee"] = True
++        if op_name == "pil.load" and args and isinstance(args[0], str):
++            source_ref = env.get(args[0]) or self._parameter_by_source_name.get(args[0])
++            if source_ref is not None:
++                if source_ref.name not in input_names:
++                    inputs.append(source_ref)
++                    input_names.add(source_ref.name)
++                attrs["variable"] = args[0]
++                attrs["source"] = {"value": source_ref.name}
++                if outputs and outputs[0].type.kind == "unknown" and source_ref.type.kind != "unknown":
++                    # Rebuild the result once, before the Operation is made,
++                    # so the output type follows the parameter type.
++                    result_id = self._value_id(result_value, path + ".result")
++                    typed = ValueRef(outputs[0].name, source_ref.type)
++                    self._value_refs[result_id] = typed
++                    self._value_types[result_id] = source_ref.type
++                    outputs = (typed,)
++            else:
++                self.diagnostic(path + ".args[0]", "unresolved_variable", "pil.load 的变量没有已知绑定")
++        if op_name == "pil.store" and args and isinstance(args[0], str):
++            attrs["variable"] = args[0]
++            if len(args) > 1:
++                stored = args[1]
++                if isinstance(stored, ValueRef):
++                    stored_ref = stored
++                elif _is_pil_value(stored):
++                    stored_ref = self.ref_for_value(stored, path + ".args[1]", report_unknown=False)
++                else:
++                    stored_ref = None
++                if stored_ref is not None:
++                    env[args[0]] = stored_ref
++
++        return Operation(
++            op_name,
++            inputs=tuple(inputs),
++            outputs=outputs,
++            attributes=attrs,
++            effect=self._effect_for(call, op_name, path, source_name=source_op_name),
++            regions=tuple(regions),
++        )
++
++    def _jump_name(self, jump: Any, path: str) -> Optional[str]:
++        if jump is None:
++            return None
++        if isinstance(jump, (str, int)):
++            return str(jump)
++        return _stable_symbol(jump, path, self.diagnostics)
++
++    def _terminator_name(self, jump_name: Optional[str], *, top_level: bool = False) -> str:
++        if top_level or jump_name is None:
++            return "return"
++        normalized = jump_name.upper()
++        if normalized == "RETURN":
++            return "return"
++        if normalized == "END_BRANCH":
++            return "yield"
++        if normalized == "CONTINUE":
++            return "continue"
++        if normalized == "BREAK":
++            return "break"
++        self.diagnostic("control.jump", "unknown_jump", "未知控制流 terminator，使用 control.jump")
++        return "control.jump"
++
++    def convert_nested_block(
++        self,
++        block: Any,
++        path: str,
++        outer_env: dict[str, ValueRef],
++    ) -> tuple[Region, Optional[ValueRef]]:
++        if not _is_pil_block(block):
++            raise UnsupportedPILNodeError(path, block, "期望 Block")
++        env = dict(outer_env)
++        arguments: list[ValueRef] = []
++        raw_args = _get(block, "args", "arguments", default=())
++        if raw_args is None:
++            raw_args = ()
++        for index, arg in enumerate(tuple(raw_args)):
++            ref = self.ref_for_value(arg, f"{path}.args[{index}]")
++            arguments.append(ref)
++            env[f"$arg{index}"] = ref
++            self._defined_value_ids.add(self._value_id(arg, f"{path}.args[{index}]"))
++
++        operations: list[Operation] = []
++        calls = _get(block, "calls", "operations", default=())
++        if calls is None:
++            calls = ()
++        try:
++            calls = tuple(calls)
++        except TypeError as exc:
++            raise UnsupportedPILNodeError(path + ".calls", calls, "Block.calls 必须可迭代") from exc
++        for index, call in enumerate(calls):
++            operations.append(self.convert_call(call, f"{path}.calls[{index}]", env))
++
++        result = _get(block, "result", default=None)
++        result_ref: Optional[ValueRef] = None
++        jump_name = self._jump_name(_get(block, "jump", default=None), path + ".jump")
++        if result is not None:
++            encoded, result_ref = self._encode_operand(result, path + ".result", None, env)
++            if result_ref is None:
++                self.diagnostic(path + ".result", "non_value_result", "Block.result 不是 Value，无法作为 SSA return")
++            else:
++                operations.append(
++                    Operation(
++                        self._terminator_name(jump_name),
++                        inputs=(result_ref,),
++                        attributes={"jump": jump_name or "return", "result": encoded},
++                        effect=Effect.BARRIER,
++                    )
++                )
++        elif jump_name is not None:
++            operations.append(
++                Operation(
++                    self._terminator_name(jump_name),
++                    attributes={"jump": jump_name},
++                    effect=Effect.BARRIER,
++                )
++            )
++
++        label = _get(block, "id", default=None)
++        block_value = CoreBlock(
++            arguments=tuple(arguments),
++            operations=tuple(operations),
++            label=f"block_{label}" if isinstance(label, int) else None,
++        )
++        return Region(blocks=(block_value,)), result_ref
++
++    def convert_function_body(self, body: Any, parameters: tuple[ValueRef, ...]) -> tuple[Region, tuple[ValueRef, ...]]:
++        if not _is_pil_block(body):
++            raise UnsupportedPILNodeError("function.body", body, "期望 PIL Block")
++        env = dict(self._parameter_by_source_name)
++        # A top-level Block can expose argument Values in a fake/native PIL.
++        for index, arg in enumerate(tuple(_get(body, "args", "arguments", default=()) or ())):
++            env[f"$arg{index}"] = self.ref_for_value(arg, f"function.body.args[{index}]")
++            self._defined_value_ids.add(self._value_id(arg, f"function.body.args[{index}]"))
++        calls = tuple(_get(body, "calls", "operations", default=()) or ())
++        operations = [self.convert_call(call, f"function.body.calls[{index}]", env) for index, call in enumerate(calls)]
++        result = _get(body, "result", default=None)
++        return_refs: tuple[ValueRef, ...] = ()
++        if result is not None:
++            _, result_ref = self._encode_operand(result, "function.body.result", None, env)
++            if result_ref is None:
++                self.diagnostic(
++                    "function.body.result",
++                    "non_value_result",
++                    "函数 result 不是 Value，不能声明 CoreFunction return",
++                )
++            else:
++                return_refs = (result_ref,)
++                jump_name = self._jump_name(_get(body, "jump", default=None), "function.body.jump") or "return"
++                operations.append(
++                    Operation(
++                        self._terminator_name(jump_name, top_level=True),
++                        inputs=(result_ref,),
++                        attributes={"jump": jump_name},
++                        effect=Effect.BARRIER,
++                    )
++                )
++        else:
++            jump_name = self._jump_name(_get(body, "jump", default=None), "function.body.jump")
++            if jump_name is not None:
++                operations.append(Operation("return", attributes={"jump": jump_name}, effect=Effect.BARRIER))
++        external_operations = [
++            Operation(
++                "external",
++                outputs=(self._external_value_refs[value_id],),
++                attributes={"value_id": value_id},
++                effect=Effect.READ,
++            )
++            for value_id in sorted(self._external_value_refs)
++            if value_id not in self._defined_value_ids
++        ]
++        operations = external_operations + operations
++        return Region(operations=tuple(operations)), return_refs
++
++    def export(self, *, name: Optional[str] = None, metadata: Optional[Mapping[str, Any]] = None) -> CoreProgram:
++        if not is_pil_function(self.function):
++            raise PilCoreBridgeError("输入不是可识别的 pypto.pil.pir.Function 结构")
++        function_name = name or _stable_text(_get(self.function, "name", default=None))
++        if not function_name:
++            function_name = "pil_function"
++            self.diagnostic("function.name", "unknown_function_name", "Function 没有稳定名称，使用 pil_function")
++        function_name = re.sub(r"\s+", "_", function_name)
++        parameters = self.build_parameters()
++        body, returns = self.convert_function_body(_get(self.function, "body"), parameters)
++        core_function = CoreFunction(function_name, parameters=parameters, returns=returns, body=body)
++        program_metadata: dict[str, Any] = {
++            "frontend": "tensor",
++            "source": "pypto.pil.pir",
++            "native_bridge": False,
++            "diagnostics": [item.to_dict() for item in self.diagnostics],
++        }
++        if metadata:
++            program_metadata.update(dict(metadata))
++        program = CoreProgram(functions=(core_function,), metadata=program_metadata)
++        program.verify()
++        return program
++
++
++def export_pil_function(
++    function: Any,
++    *,
++    name: Optional[str] = None,
++    metadata: Optional[Mapping[str, Any]] = None,
++) -> CoreProgram:
++    """Export one already-parsed PIL ``Function`` in a single pass."""
++
++    return _PilExporter(function).export(name=name, metadata=metadata)
++
++
++def export_pil_to_core(
++    function: Any,
++    *,
++    name: Optional[str] = None,
++    metadata: Optional[Mapping[str, Any]] = None,
++) -> CoreProgram:
++    """Readable alias used by frontend integrations."""
++
++    return export_pil_function(function, name=name, metadata=metadata)
++
++
++def pil_function_to_core_program(
++    function: Any,
++    *,
++    name: Optional[str] = None,
++    metadata: Optional[Mapping[str, Any]] = None,
++) -> CoreProgram:
++    return export_pil_function(function, name=name, metadata=metadata)
++
++
++def _dtype_text(dtype: Any) -> str:
++    if isinstance(dtype, str):
++        return dtype
++    value = getattr(dtype, "value", _MISSING)
++    if isinstance(value, str):
++        return value
++    name = getattr(dtype, "name", _MISSING)
++    if isinstance(name, str):
++        return name
++    return str(type(dtype).__name__)
++
++
++__all__ = [
++    "PilBridgeDiagnostic",
++    "PilCoreBridge",
++    "PilCoreBridgeError",
++    "UnsupportedPILNodeError",
++    "export_pil_function",
++    "export_pil_to_core",
++    "is_pil_function",
++    "pil_function_to_core_program",
++]
+diff --git a/python/tests/ut/pypto_x/test_tensor_core_bridge.py b/python/tests/ut/pypto_x/test_tensor_core_bridge.py
+new file mode 100644
+index 000000000..59bf5ed7a
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_tensor_core_bridge.py
+@@ -0,0 +1,267 @@
++"""W2 Tensor/PIL -> Core IR bridge tests.
++
++These tests deliberately use a tiny fake of ``pypto.pil.pir``.  The bridge is
++duck-typed and must remain useful when the native PyPTO shared libraries are
++not installed, while still preserving the real PIL Function/Block/Call/Value
++shape and the one-pass parser boundary.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++import importlib.util
++from pathlib import Path
++import operator
++import sys
++import types
++from typing import Optional
++
++import pytest
++
++
++def _load_modules():
++    repository_root = Path(__file__).resolve().parents[4]
++    package_root = repository_root / "python" / "pypto"
++    module_names = (
++        "pypto",
++        "pypto.core_ir",
++        "pypto.core_ir.model",
++        "pypto.frontend",
++        "pypto.frontend.core_export",
++        "pypto.frontend.pil_core_bridge",
++    )
++    saved = {name: sys.modules.get(name) for name in module_names}
++    isolated_pypto = types.ModuleType("pypto")
++    isolated_pypto.__path__ = [str(package_root)]
++    for name in module_names:
++        sys.modules.pop(name, None)
++    sys.modules["pypto"] = isolated_pypto
++    try:
++        core_spec = importlib.util.spec_from_file_location(
++            "pypto.core_ir",
++            package_root / "core_ir" / "__init__.py",
++            submodule_search_locations=[str(package_root / "core_ir")],
++        )
++        assert core_spec.loader is not None
++        core_ir = importlib.util.module_from_spec(core_spec)
++        sys.modules["pypto.core_ir"] = core_ir
++        core_spec.loader.exec_module(core_ir)
++
++        frontend = types.ModuleType("pypto.frontend")
++        frontend.__path__ = [str(package_root / "frontend")]
++        sys.modules["pypto.frontend"] = frontend
++
++        export_spec = importlib.util.spec_from_file_location(
++            "pypto.frontend.core_export", package_root / "frontend" / "core_export.py"
++        )
++        assert export_spec.loader is not None
++        core_export = importlib.util.module_from_spec(export_spec)
++        sys.modules["pypto.frontend.core_export"] = core_export
++        export_spec.loader.exec_module(core_export)
++
++        bridge_spec = importlib.util.spec_from_file_location(
++            "pypto.frontend.pil_core_bridge", package_root / "frontend" / "pil_core_bridge.py"
++        )
++        assert bridge_spec.loader is not None
++        bridge = importlib.util.module_from_spec(bridge_spec)
++        sys.modules["pypto.frontend.pil_core_bridge"] = bridge
++        bridge_spec.loader.exec_module(bridge)
++        return core_ir, core_export, bridge
++    finally:
++        for name, module in saved.items():
++            if module is None:
++                sys.modules.pop(name, None)
++            else:
++                sys.modules[name] = module
++
++
++CORE_IR, CORE_EXPORT, BRIDGE = _load_modules()
++CoreType = CORE_IR.CoreType
++Effect = CORE_IR.Effect
++
++
++@dataclass(frozen=True)
++class FakeValue:
++    id: int
++    type: Optional[object] = None
++
++
++@dataclass
++class FakeCall:
++    result: Optional[FakeValue]
++    callee: object
++    args: tuple[object, ...] = ()
++    kwargs: object = ()
++    span: Optional[object] = None
++
++
++@dataclass
++class FakeBlock:
++    id: int
++    args: tuple[object, ...]
++    calls: list[object]
++    result: Optional[object] = None
++    jump: Optional[object] = None
++
++
++@dataclass
++class FakeFunction:
++    name: str
++    body: FakeBlock
++    params: tuple[str, ...] = ()
++    signature: Optional[object] = None
++
++
++def _function_with_add() -> FakeFunction:
++    x = FakeValue(1)
++    y = FakeValue(2)
++    loaded_x = FakeValue(10)
++    loaded_y = FakeValue(11)
++    result = FakeValue(12)
++    body = FakeBlock(
++        id=0,
++        args=(),
++        calls=[
++            FakeCall(loaded_x, "pil.load", ("x",)),
++            FakeCall(loaded_y, "pil.load", ("y",)),
++            FakeCall(result, operator.add, (loaded_x, loaded_y)),
++            FakeCall(None, "pil.store", ("$retval", result)),
++        ],
++        result=result,
++        jump="RETURN",
++    )
++    # The ids on parameters are optional in real pir.Function (which exposes
++    # names); keeping x/y alive here documents that the fake has real PIL
++    # values available if a future bridge version consumes them.
++    del x, y
++    return FakeFunction("add", body, params=("x", "y"))
++
++
++def test_fake_pil_function_maps_params_values_calls_and_return_deterministically():
++    function = _function_with_add()
++    program = BRIDGE.export_pil_function(function)
++    assert program.verify() is True
++    core_function = program.functions[0]
++    assert [parameter.name for parameter in core_function.parameters] == ["x", "y"]
++    assert core_function.returns[0].name == "%v12"
++    assert [operation.name for operation in core_function.body.operations] == [
++        "pil.load",
++        "pil.load",
++        "add",
++        "pil.store",
++        "return",
++    ]
++    assert core_function.body.operations[2].attributes["semantic_op"] == "add"
++    first = program.canonical_json()
++    assert first == program.canonical_json()
++    assert "0x" not in first
++
++
++def test_nested_blocks_and_value_id_are_preserved_as_regions():
++    condition = FakeValue(1)
++    then_result = FakeValue(2)
++    else_result = FakeValue(3)
++    branch_result = FakeValue(4)
++    then_block = FakeBlock(
++        id=7,
++        args=(),
++        calls=[FakeCall(then_result, "pil.const", (1,))],
++        result=then_result,
++        jump="END_BRANCH",
++    )
++    else_block = FakeBlock(
++        id=8,
++        args=(),
++        calls=[FakeCall(else_result, "pil.const", (2,))],
++        result=else_result,
++        jump="END_BRANCH",
++    )
++    body = FakeBlock(
++        id=0,
++        args=(),
++        calls=[FakeCall(branch_result, "pil.if_else", (condition, then_block, else_block))],
++        result=branch_result,
++        jump="RETURN",
++    )
++    program = BRIDGE.export_pil_function(FakeFunction("branch", body, params=()))
++    assert program.verify() is True
++    branch = next(operation for operation in program.functions[0].body.operations if operation.name == "pil.if_else")
++    assert branch.name == "pil.if_else"
++    assert len(branch.regions) == 2
++    assert [block.label for block in branch.regions[0].blocks] == ["block_7"]
++    assert [block.label for block in branch.regions[1].blocks] == ["block_8"]
++    assert branch.regions[0].blocks[0].operations[-1].name == "yield"
++
++
++def test_unknown_types_and_effects_are_explicit_and_conservative():
++    result = FakeValue(2)
++    body = FakeBlock(
++        id=0,
++        args=(),
++        calls=[FakeCall(result, "vendor.custom_op", (FakeValue(1),))],
++        result=result,
++        jump="RETURN",
++    )
++    program = BRIDGE.export_pil_function(FakeFunction("unknown", body, params=()))
++    diagnostics = program.metadata["diagnostics"]
++    assert any(item["kind"] == "unknown_type" for item in diagnostics)
++    assert any(item["kind"] == "unknown_effect" for item in diagnostics)
++    custom = next(operation for operation in program.functions[0].body.operations if operation.name == "vendor.custom_op")
++    assert custom.effect is Effect.READ_WRITE
++    assert custom.outputs[0].type.kind == "unknown"
++    assert custom.outputs[0].type.dtype == "unknown"
++
++
++def test_unsupported_node_contains_structural_path():
++    body = FakeBlock(id=0, args=(), calls=[object()], result=None, jump="RETURN")
++    with pytest.raises(BRIDGE.UnsupportedPILNodeError, match=r"function\.body\.calls\[0\]"):
++        BRIDGE.export_pil_function(FakeFunction("bad", body, params=()))
++
++
++def test_core_export_routes_pil_and_parser_is_called_once():
++    function = _function_with_add()
++    parsed = {"count": 0}
++
++    def parser(source):
++        assert source == "kernel"
++        parsed["count"] += 1
++        return function
++
++    saved_bridge = sys.modules.get("pypto.frontend.pil_core_bridge")
++    sys.modules["pypto.frontend.pil_core_bridge"] = BRIDGE
++    try:
++        program = CORE_EXPORT.export_tensor_frontend("kernel", parser=parser)
++        direct = CORE_EXPORT.export_tensor_frontend(function)
++    finally:
++        if saved_bridge is None:
++            sys.modules.pop("pypto.frontend.pil_core_bridge", None)
++        else:
++            sys.modules["pypto.frontend.pil_core_bridge"] = saved_bridge
++    assert parsed["count"] == 1
++    assert program.functions[0].name == "add"
++    assert direct == program
++
++
++def test_effect_override_accepts_known_value_and_unknown_is_not_silent():
++    result = FakeValue(1)
++    call = FakeCall(result, "vendor.op", (), ())
++    call.effect = "write"
++    body = FakeBlock(id=0, args=(), calls=[call], result=result, jump="RETURN")
++    program = BRIDGE.export_pil_function(FakeFunction("effect", body))
++    assert program.functions[0].body.operations[0].effect is Effect.WRITE
++
++    call.effect = "future_effect"
++    program = BRIDGE.export_pil_function(FakeFunction("effect_unknown", body))
++    assert program.functions[0].body.operations[0].effect is Effect.READ_WRITE
++    assert any(item["kind"] == "unknown_effect" for item in program.metadata["diagnostics"])
++
++
++def test_operation_inputs_deduplicate_repeated_value_without_losing_argument_order():
++    x = FakeValue(1)
++    result = FakeValue(2)
++    body = FakeBlock(id=0, args=(), calls=[FakeCall(result, operator.add, (x, x))], result=result, jump="RETURN")
++    program = BRIDGE.export_pil_function(FakeFunction("same", body))
++    assert program.verify() is True
++    operation = next(operation for operation in program.functions[0].body.operations if operation.name == "add")
++    assert [ref.name for ref in operation.inputs] == ["%v1"]
++    assert list(operation.attributes["args"]) == [{"value": "%v1"}, {"value": "%v1"}]

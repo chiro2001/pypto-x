@@ -1,0 +1,1540 @@
+From 431cf4d310ed4fda6e412a9bf402c4423f234591 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Mon, 7 Sep 2026 02:01:30 +0800
+Subject: [PATCH 12/96] feat(pypto-x): add executable CPU scalar reference
+
+---
+ python/pypto/backends/cpu/__init__.py      |  26 +++
+ python/pypto/backends/cpu/runtime.py       | 528 +++++++++++++++++++++++++++++++++++++++++++++++++
+ python/pypto/backends/cpu/tensor.py        | 180 +++++++++++++++++
+ python/pypto/compiler/targets/cpu.py       | 140 +++++++++++++
+ python/pypto/lowering/cpu/__init__.py      | 463 +++++++++++++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_cpu_scalar.py | 153 ++++++++++++++
+ 6 files changed, 1490 insertions(+)
+
+diff --git a/python/pypto/backends/cpu/__init__.py b/python/pypto/backends/cpu/__init__.py
+new file mode 100644
+index 000000000..220a6f2ea
+--- /dev/null
++++ b/python/pypto/backends/cpu/__init__.py
+@@ -0,0 +1,26 @@
++"""CPU scalar reference backend for PyPTO-X."""
++
++from .runtime import (
++    CPUScalarRuntime,
++    CpuScalarBackend,
++    CpuRuntime,
++    CpuScalarArtifactError,
++    CpuScalarExecutionError,
++    CpuScalarRuntime,
++    LoadedCpuScalarArtifact,
++    launch,
++)
++from .tensor import FlatBuffer, HostTensor
++
++__all__ = [
++    "CPUScalarRuntime",
++    "CpuScalarBackend",
++    "CpuRuntime",
++    "CpuScalarArtifactError",
++    "CpuScalarExecutionError",
++    "CpuScalarRuntime",
++    "FlatBuffer",
++    "HostTensor",
++    "LoadedCpuScalarArtifact",
++    "launch",
++]
+diff --git a/python/pypto/backends/cpu/runtime.py b/python/pypto/backends/cpu/runtime.py
+new file mode 100644
+index 000000000..937636e16
+--- /dev/null
++++ b/python/pypto/backends/cpu/runtime.py
+@@ -0,0 +1,528 @@
++"""Executable standard-library CPU scalar reference runtime."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++from dataclasses import dataclass
++from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
++
++from pypto.abi import Availability, LaunchRequest, TensorDesc
++from pypto.compiler.artifact import Artifact
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, ValueRef
++from pypto.lowering.cpu import (
++    CPU_SCALAR_BACKEND,
++    CpuScalarProgram,
++    canonical_dtype,
++    canonical_operation_name,
++    element_count,
++    flatten_values,
++    lower_cpu_scalar,
++    reduced_shape,
++    static_shape,
++)
++from pypto.target import TargetSpec
++
++from .tensor import FlatBuffer, HostTensor, _cast_value
++
++
++class CpuScalarRuntimeError(RuntimeError):
++    """Base class for explicit CPU scalar runtime failures."""
++
++
++class CpuScalarArtifactError(CpuScalarRuntimeError):
++    """An artifact payload, digest, or version is invalid."""
++
++
++class CpuScalarExecutionError(CpuScalarRuntimeError):
++    """A valid scalar program cannot execute the supplied invocation."""
++
++
++@dataclass(frozen=True)
++class LoadedCpuScalarArtifact:
++    artifact: Artifact
++    target_ir: CpuScalarProgram
++
++
++@dataclass(frozen=True)
++class _RuntimeValue:
++    type: CoreType
++    data: Any
++
++
++class CpuScalarRuntime:
++    """Reference runtime implementing the common ``RuntimeBackend`` ABI."""
++
++    name = CPU_SCALAR_BACKEND
++
++    def availability(self) -> Availability:
++        return Availability.yes(self.name)
++
++    def is_available(self) -> bool:
++        return True
++
++    def load(self, artifact: Artifact) -> LoadedCpuScalarArtifact:
++        return _decode_artifact(artifact)
++
++    def workspace_size(self, request: Any) -> int:
++        if not isinstance(request, LaunchRequest):
++            raise CpuScalarExecutionError("workspace_size requires LaunchRequest")
++        self.load(request.artifact)
++        return 0
++
++    def launch(self, request: LaunchRequest) -> Tuple[Any, ...]:
++        if not isinstance(request, LaunchRequest):
++            raise CpuScalarExecutionError("CPU scalar launch requires LaunchRequest")
++        try:
++            request.validate()
++        except Exception as exc:
++            raise CpuScalarExecutionError("invalid LaunchRequest: {}".format(exc)) from exc
++        loaded = self.load(request.artifact)
++        if request.entrypoint != loaded.target_ir.entrypoint:
++            raise CpuScalarExecutionError(
++                "launch entrypoint {!r} does not match loaded CPU scalar entrypoint {!r}".format(
++                    request.entrypoint, loaded.target_ir.entrypoint
++                )
++            )
++        function = _find_function(loaded.target_ir.program, request.entrypoint)
++        _validate_request_target(request, loaded.target_ir.target)
++        tensor_parameters = [ref for ref in function.parameters if _is_tensor(ref.type)]
++        tensor_returns = [ref for ref in function.returns if _is_tensor(ref.type)]
++        if len(request.inputs) != len(tensor_parameters):
++            raise CpuScalarExecutionError(
++                "function {!r} expects {} tensor inputs, got {}".format(
++                    function.name, len(tensor_parameters), len(request.inputs)
++                )
++            )
++        if len(request.outputs) != len(tensor_returns):
++            raise CpuScalarExecutionError(
++                "function {!r} expects {} tensor outputs, got {}".format(
++                    function.name, len(tensor_returns), len(request.outputs)
++                )
++            )
++
++        environment: Dict[str, _RuntimeValue] = {}
++        input_index = 0
++        for parameter in function.parameters:
++            if _is_tensor(parameter.type):
++                environment[parameter.name] = _RuntimeValue(
++                    parameter.type,
++                    _read_tensor(request.inputs[input_index], parameter.type, parameter.name),
++                )
++                input_index += 1
++            elif _is_scalar(parameter.type):
++                if parameter.name not in request.scalars:
++                    raise CpuScalarExecutionError(
++                        "missing scalar input {!r} in LaunchRequest.scalars".format(parameter.name)
++                    )
++                environment[parameter.name] = _RuntimeValue(
++                    parameter.type,
++                    _cast_value(request.scalars[parameter.name], canonical_dtype(parameter.type.dtype)),
++                )
++            else:  # Lowering already rejects this; retain a defensive error at the ABI edge.
++                raise CpuScalarExecutionError("unsupported parameter kind {!r}".format(parameter.type.kind))
++
++        for index, operation in enumerate(function.body.operations):
++            _execute_operation(operation, environment, "function {} operation {}".format(function.name, index))
++
++        results: List[Any] = []
++        output_index = 0
++        for result_ref in function.returns:
++            try:
++                result = environment[result_ref.name]
++            except KeyError as exc:
++                raise CpuScalarExecutionError("return value {!r} was not produced".format(result_ref.name)) from exc
++            if result.type != result_ref.type:
++                raise CpuScalarExecutionError("return value {!r} has the wrong type".format(result_ref.name))
++            if _is_tensor(result_ref.type):
++                descriptor = request.outputs[output_index]
++                _write_tensor(descriptor, result_ref.type, result.data, result_ref.name)
++                results.append(descriptor.storage)
++                output_index += 1
++            else:
++                results.append(result.data)
++        return tuple(results)
++
++
++CpuRuntime = CpuScalarRuntime
++CpuScalarBackend = CpuScalarRuntime
++CPUScalarRuntime = CpuScalarRuntime
++
++
++def launch(request: LaunchRequest) -> Tuple[Any, ...]:
++    """Run one request with a fresh always-available scalar runtime."""
++
++    return CpuScalarRuntime().launch(request)
++
++
++def _decode_artifact(artifact: Artifact) -> LoadedCpuScalarArtifact:
++    if not isinstance(artifact, Artifact):
++        raise CpuScalarArtifactError("CPU scalar runtime requires Artifact")
++    try:
++        artifact.validate()
++    except Exception as exc:
++        raise CpuScalarArtifactError("artifact validation failed: {}".format(exc)) from exc
++    if artifact.payload is None:
++        raise CpuScalarArtifactError("CPU scalar artifact requires an inline payload")
++    payload = bytes(artifact.payload)
++    metadata = artifact.metadata
++    if metadata.get("backend") != CPU_SCALAR_BACKEND:
++        raise CpuScalarArtifactError("artifact backend metadata is not CPU scalar")
++    actual_digest = hashlib.sha256(payload).hexdigest()
++    if actual_digest != artifact.content_digest:
++        raise CpuScalarArtifactError("artifact content digest does not match immutable Artifact payload")
++    if metadata.get("payload_digest") != actual_digest:
++        raise CpuScalarArtifactError("artifact metadata payload digest mismatch")
++    try:
++        decoded = json.loads(payload.decode("utf-8"))
++    except (UnicodeDecodeError, ValueError) as exc:
++        raise CpuScalarArtifactError("CPU scalar artifact payload is not UTF-8 JSON") from exc
++    if not isinstance(decoded, dict):
++        raise CpuScalarArtifactError("CPU scalar artifact payload must be a JSON object")
++    canonical_payload = json.dumps(
++        decoded,
++        ensure_ascii=False,
++        allow_nan=False,
++        sort_keys=True,
++        separators=(",", ":"),
++    ).encode("utf-8")
++    if canonical_payload != payload:
++        raise CpuScalarArtifactError("CPU scalar artifact payload is not canonical JSON")
++    if decoded.get("artifact_payload_version") != 1:
++        raise CpuScalarArtifactError("unsupported CPU scalar artifact payload version")
++    if decoded.get("backend") != CPU_SCALAR_BACKEND:
++        raise CpuScalarArtifactError("CPU scalar artifact payload backend mismatch")
++    if decoded.get("target") != artifact.target.to_dict():
++        raise CpuScalarArtifactError("CPU scalar artifact target mismatch")
++    if decoded.get("entrypoint") != artifact.entrypoint:
++        raise CpuScalarArtifactError("CPU scalar artifact entrypoint mismatch")
++    program_data = decoded.get("program")
++    if not isinstance(program_data, dict):
++        raise CpuScalarArtifactError("CPU scalar artifact does not contain a CoreProgram")
++    try:
++        program = CoreProgram.from_dict(program_data)
++        program_json = program.canonical_json()
++        target_ir = lower_cpu_scalar(program, artifact.target, decoded["entrypoint"])
++    except Exception as exc:
++        raise CpuScalarArtifactError("CPU scalar artifact CoreProgram is invalid: {}".format(exc)) from exc
++    program_digest = hashlib.sha256(program_json.encode("utf-8")).hexdigest()
++    if decoded.get("program_digest") != program_digest or metadata.get("program_digest") != program_digest:
++        raise CpuScalarArtifactError("CPU scalar artifact program digest mismatch")
++    if metadata.get("entrypoint") != artifact.entrypoint:
++        raise CpuScalarArtifactError("CPU scalar artifact metadata entrypoint mismatch")
++    if metadata.get("artifact_payload_version") != 1 or metadata.get("lowering_version") != 1:
++        raise CpuScalarArtifactError("unsupported CPU scalar artifact metadata version")
++    target_digest = hashlib.sha256(
++        json.dumps(artifact.target.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    ).hexdigest()
++    if metadata.get("target_digest") != target_digest:
++        raise CpuScalarArtifactError("CPU scalar artifact target digest mismatch")
++    return LoadedCpuScalarArtifact(artifact, target_ir)
++
++
++def _find_function(program: CoreProgram, entrypoint: str) -> CoreFunction:
++    for function in program.functions:
++        if function.name == entrypoint:
++            return function
++    raise CpuScalarExecutionError("entrypoint {!r} is not present in CoreProgram".format(entrypoint))
++
++
++def _validate_request_target(request: LaunchRequest, target: TargetSpec) -> None:
++    if target.kind != "cpu":
++        raise CpuScalarExecutionError("CPU scalar artifact target kind must be cpu")
++    for index, descriptor in enumerate(request.inputs + request.outputs):
++        if descriptor.device != "cpu":
++            raise CpuScalarExecutionError(
++                "CPU scalar tensor descriptor {} has device {!r}, expected 'cpu'".format(index, descriptor.device)
++            )
++        if descriptor.strides != _contiguous_strides(descriptor.shape):
++            raise CpuScalarExecutionError("CPU scalar requires contiguous tensor descriptors")
++
++
++def _is_tensor(value_type: CoreType) -> bool:
++    return value_type.kind in ("tensor", "view", "tile")
++
++
++def _is_scalar(value_type: CoreType) -> bool:
++    return value_type.kind == "scalar"
++
++
++def _read_tensor(descriptor: TensorDesc, value_type: CoreType, context: str) -> List[Any]:
++    expected_dtype = canonical_dtype(value_type.dtype)
++    expected_shape = static_shape(value_type, context)
++    if descriptor.dtype != expected_dtype or descriptor.shape != expected_shape:
++        raise CpuScalarExecutionError(
++            "{} descriptor dtype/shape ({}, {}) does not match expected ({}, {})".format(
++                context, descriptor.dtype, descriptor.shape, expected_dtype, expected_shape
++            )
++        )
++    values = _storage_values(descriptor.storage, context)
++    expected_count = element_count(expected_shape)
++    if len(values) != expected_count:
++        raise CpuScalarExecutionError(
++            "{} storage has {} values but shape {} requires {}".format(context, len(values), expected_shape, expected_count)
++        )
++    try:
++        return [_cast_value(value, expected_dtype) for value in values]
++    except (TypeError, ValueError, OverflowError) as exc:
++        raise CpuScalarExecutionError("{} contains an invalid {} value: {}".format(context, expected_dtype, exc)) from exc
++
++
++def _write_tensor(descriptor: TensorDesc, value_type: CoreType, values: Sequence[Any], context: str) -> None:
++    expected_dtype = canonical_dtype(value_type.dtype)
++    expected_shape = static_shape(value_type, context)
++    if descriptor.dtype != expected_dtype or descriptor.shape != expected_shape:
++        raise CpuScalarExecutionError(
++            "{} output descriptor dtype/shape ({}, {}) does not match expected ({}, {})".format(
++                context, descriptor.dtype, descriptor.shape, expected_dtype, expected_shape
++            )
++        )
++    storage = descriptor.storage
++    if isinstance(storage, HostTensor):
++        if storage.dtype != expected_dtype or storage.shape != expected_shape:
++            raise CpuScalarExecutionError("{} HostTensor metadata does not match output descriptor".format(context))
++        destination = storage.data
++    elif isinstance(storage, FlatBuffer):
++        destination = storage.data
++    elif isinstance(storage, list):
++        destination = storage
++    elif hasattr(storage, "data") and isinstance(storage.data, list):
++        destination = storage.data
++    else:
++        destination = None
++    try:
++        cast_values = [_cast_value(value, expected_dtype) for value in values]
++    except (TypeError, ValueError, OverflowError) as exc:
++        raise CpuScalarExecutionError("{} produced an invalid {} value: {}".format(context, expected_dtype, exc)) from exc
++    if len(cast_values) != element_count(expected_shape):
++        raise CpuScalarExecutionError("{} result length does not match output shape".format(context))
++    if destination is not None:
++        if len(destination) != len(cast_values):
++            raise CpuScalarExecutionError("{} output storage length does not match output shape".format(context))
++        destination[:] = cast_values
++        return
++    if storage is None or not hasattr(storage, "__setitem__"):
++        raise CpuScalarExecutionError("{} output storage is not mutable".format(context))
++    try:
++        if len(storage) != len(cast_values):
++            raise CpuScalarExecutionError("{} output storage length does not match output shape".format(context))
++        for index, value in enumerate(cast_values):
++            storage[index] = value
++    except (TypeError, IndexError, AttributeError) as exc:
++        raise CpuScalarExecutionError("{} output storage is not mutable".format(context)) from exc
++
++
++def _storage_values(storage: Any, context: str) -> List[Any]:
++    if isinstance(storage, HostTensor):
++        return list(storage.data)
++    if isinstance(storage, FlatBuffer):
++        return list(storage.data)
++    if isinstance(storage, (str, bytes, bytearray, Mapping)) or storage is None:
++        raise CpuScalarExecutionError("{} storage must be a flat numeric sequence".format(context))
++    if isinstance(storage, (list, tuple)):
++        return list(flatten_values(storage))
++    if hasattr(storage, "data") and isinstance(storage.data, (list, tuple)):
++        return list(storage.data)
++    try:
++        return [storage[index] for index in range(len(storage))]
++    except (TypeError, IndexError, KeyError, AttributeError) as exc:
++        raise CpuScalarExecutionError("{} storage must support flat sequence access".format(context)) from exc
++
++
++def _execute_operation(operation: Operation, environment: Dict[str, _RuntimeValue], context: str) -> None:
++    name = canonical_operation_name(operation.name)
++    inputs = []
++    for ref in operation.inputs:
++        if ref.name not in environment:
++            raise CpuScalarExecutionError("{} input {!r} is unavailable".format(context, ref.name))
++        value = environment[ref.name]
++        if value.type != ref.type:
++            raise CpuScalarExecutionError("{} input {!r} has a type mismatch".format(context, ref.name))
++        inputs.append(value)
++    if len(operation.outputs) != 1:
++        raise CpuScalarExecutionError("{} must have one output".format(context))
++    output_ref = operation.outputs[0]
++    try:
++        if name == "constant":
++            raw = operation.attributes.get("value", operation.attributes.get("values"))
++            if _is_scalar(output_ref.type):
++                if isinstance(raw, (list, tuple)):
++                    raw = raw[0] if len(raw) == 1 else raw
++                result = _cast_value(raw, canonical_dtype(output_ref.type.dtype))
++            else:
++                result = [_cast_value(value, canonical_dtype(output_ref.type.dtype)) for value in flatten_values(raw)]
++        elif name == "identity":
++            result = _copy_value(inputs[0].data)
++        elif name in ("add", "sub", "mul", "div"):
++            result = _binary_value(name, inputs[0].data, inputs[1].data, output_ref.type)
++        elif name == "neg":
++            result = _unary_value(inputs[0].data, lambda value: -value, output_ref.type)
++        elif name in ("reduce_sum", "reduce_max"):
++            result = _reduce_value(name, inputs[0].data, inputs[0].type, output_ref.type, operation.attributes)
++        elif name == "matmul":
++            result = _matmul_value(
++                inputs[0].data,
++                inputs[0].type,
++                inputs[1].data,
++                inputs[1].type,
++                output_ref.type,
++            )
++        else:  # canonical_operation_name currently makes this unreachable.
++            raise CpuScalarExecutionError("{} operation {!r} is unsupported".format(context, operation.name))
++    except CpuScalarExecutionError:
++        raise
++    except (TypeError, ValueError, ZeroDivisionError, OverflowError) as exc:
++        raise CpuScalarExecutionError("{} failed: {}".format(context, exc)) from exc
++    environment[output_ref.name] = _RuntimeValue(output_ref.type, result)
++
++
++def _copy_value(value: Any) -> Any:
++    return list(value) if isinstance(value, list) else value
++
++
++def _binary_value(name: str, left: Any, right: Any, output_type: CoreType) -> Any:
++    output_dtype = canonical_dtype(output_type.dtype)
++    operation: Callable[[Any, Any], Any]
++    if name == "add":
++        operation = lambda a, b: a + b
++    elif name == "sub":
++        operation = lambda a, b: a - b
++    elif name == "mul":
++        operation = lambda a, b: a * b
++    else:
++        def operation(a, b):
++            if b == 0:
++                raise CpuScalarExecutionError("division by zero")
++            return a / b
++
++    if isinstance(left, list) and isinstance(right, list):
++        if len(left) != len(right):
++            raise CpuScalarExecutionError("elementwise operands have different lengths")
++        return [_cast_value(operation(a, b), output_dtype) for a, b in zip(left, right)]
++    if isinstance(left, list):
++        return [_cast_value(operation(value, right), output_dtype) for value in left]
++    if isinstance(right, list):
++        return [_cast_value(operation(left, value), output_dtype) for value in right]
++    return _cast_value(operation(left, right), output_dtype)
++
++
++def _unary_value(value: Any, operation: Callable[[Any], Any], output_type: CoreType) -> Any:
++    dtype = canonical_dtype(output_type.dtype)
++    if isinstance(value, list):
++        return [_cast_value(operation(item), dtype) for item in value]
++    return _cast_value(operation(value), dtype)
++
++
++def _reduce_value(
++    name: str,
++    values: Sequence[Any],
++    input_type: CoreType,
++    output_type: CoreType,
++    attributes: Mapping[str, Any],
++) -> List[Any]:
++    input_shape = static_shape(input_type, "reduction input")
++    output_shape = static_shape(output_type, "reduction output")
++    rank = len(input_shape)
++    raw_axes = attributes.get("axes", attributes.get("axis"))
++    if raw_axes is None:
++        axes = tuple(range(rank))
++    elif isinstance(raw_axes, int) and not isinstance(raw_axes, bool):
++        axes = (raw_axes + rank if raw_axes < 0 else raw_axes,)
++    else:
++        axes = tuple(raw_axes)
++        axes = tuple(axis + rank if axis < 0 else axis for axis in axes)
++    keepdims = attributes.get("keepdims", False)
++    input_count = element_count(input_shape)
++    output_count = element_count(output_shape)
++    if len(values) != input_count:
++        raise CpuScalarExecutionError("reduction input storage length mismatch")
++    result = []
++    for output_index in range(output_count):
++        output_coords = _unravel(output_index, output_shape)
++        candidates = []
++        for input_index, value in enumerate(values):
++            input_coords = _unravel(input_index, input_shape)
++            if keepdims:
++                projected = tuple(0 if axis in axes else input_coords[axis] for axis in range(rank))
++            else:
++                projected = tuple(input_coords[axis] for axis in range(rank) if axis not in axes)
++            if projected == output_coords:
++                candidates.append(value)
++        if name == "reduce_sum":
++            aggregate = 0
++            for value in candidates:
++                aggregate += value
++        else:
++            if not candidates:
++                raise CpuScalarExecutionError("reduce_max has an empty reduction group")
++            aggregate = candidates[0]
++            for value in candidates[1:]:
++                if value > aggregate:
++                    aggregate = value
++        result.append(_cast_value(aggregate, canonical_dtype(output_type.dtype)))
++    return result
++
++
++def _matmul_value(
++    left: Sequence[Any],
++    left_type: CoreType,
++    right: Sequence[Any],
++    right_type: CoreType,
++    output_type: CoreType,
++) -> List[Any]:
++    left_shape = static_shape(left_type, "matmul left")
++    right_shape = static_shape(right_type, "matmul right")
++    output_shape = static_shape(output_type, "matmul output")
++    m, k = left_shape
++    right_k, n = right_shape
++    if right_k != k or output_shape != (m, n):
++        raise CpuScalarExecutionError("matmul runtime shapes are inconsistent")
++    if len(left) != m * k or len(right) != right_k * n:
++        raise CpuScalarExecutionError("matmul input storage length mismatch")
++    dtype = canonical_dtype(output_type.dtype)
++    output = []
++    for row in range(m):
++        for column in range(n):
++            aggregate = 0
++            for inner in range(k):
++                aggregate += left[row * k + inner] * right[inner * n + column]
++            output.append(_cast_value(aggregate, dtype))
++    return output
++
++
++def _contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
++    strides = [1] * len(shape)
++    running = 1
++    for index in range(len(shape) - 1, -1, -1):
++        strides[index] = running
++        running *= shape[index]
++    return tuple(strides)
++
++
++def _unravel(index: int, shape: Sequence[int]) -> Tuple[int, ...]:
++    if not shape:
++        return ()
++    coordinates = [0] * len(shape)
++    remainder = index
++    for axis in range(len(shape) - 1, -1, -1):
++        dimension = shape[axis]
++        if dimension == 0:
++            return tuple(coordinates)
++        coordinates[axis] = remainder % dimension
++        remainder //= dimension
++    return tuple(coordinates)
++
++
++__all__ = [
++    "CPUScalarRuntime",
++    "CpuScalarBackend",
++    "CpuRuntime",
++    "CpuScalarArtifactError",
++    "CpuScalarExecutionError",
++    "CpuScalarRuntime",
++    "FlatBuffer",
++    "HostTensor",
++    "LoadedCpuScalarArtifact",
++    "launch",
++]
+diff --git a/python/pypto/backends/cpu/tensor.py b/python/pypto/backends/cpu/tensor.py
+new file mode 100644
+index 000000000..230241c58
+--- /dev/null
++++ b/python/pypto/backends/cpu/tensor.py
+@@ -0,0 +1,180 @@
++"""Small host-side buffers used by the CPU scalar runtime tests and examples."""
++
++from __future__ import annotations
++
++import math
++import struct
++from typing import Any, Iterable, Optional, Sequence, Tuple
++
++from pypto.abi import TensorDesc
++from pypto.lowering.cpu import canonical_dtype, element_count, flatten_values
++
++
++class HostTensor:
++    """A mutable flat host tensor with a vendor-neutral ``TensorDesc`` handle.
++
++    The class deliberately stores ordinary Python values.  It is a convenience
++    for the reference runtime, not a replacement for a production device
++    allocation.  ``descriptor()`` puts this object in ``TensorDesc.handle``;
++    it never adds vendor fields to the ABI descriptor.
++    """
++
++    def __init__(
++        self,
++        dtype: str,
++        shape: Sequence[int],
++        values: Optional[Any] = None,
++        *,
++        fill: Any = 0,
++    ) -> None:
++        self.dtype = canonical_dtype(dtype)
++        self.shape = _shape(shape)
++        expected = element_count(self.shape)
++        if values is None:
++            raw_values = [fill] * expected
++        else:
++            raw_values = list(flatten_values(values))
++        if len(raw_values) != expected:
++            raise ValueError("HostTensor values length {} does not match shape {} ({} values)".format(
++                len(raw_values), self.shape, expected
++            ))
++        self.data = [_cast_value(value, self.dtype) for value in raw_values]
++
++    @classmethod
++    def zeros(cls, dtype: str, shape: Sequence[int]) -> "HostTensor":
++        return cls(dtype, shape)
++
++    @classmethod
++    def from_flat(cls, dtype: str, shape: Sequence[int], values: Iterable[Any]) -> "HostTensor":
++        return cls(dtype, shape, list(values))
++
++    def descriptor(self, *, readonly: bool = False) -> TensorDesc:
++        return TensorDesc(self.dtype, self.shape, device="cpu", handle=self, readonly=readonly)
++
++    def tolist(self) -> Any:
++        return _reshape(self.data, self.shape)
++
++    def flat(self) -> Tuple[Any, ...]:
++        return tuple(self.data)
++
++    def copy(self) -> "HostTensor":
++        return HostTensor(self.dtype, self.shape, self.data)
++
++    def __len__(self) -> int:
++        return len(self.data)
++
++    def __getitem__(self, index: int) -> Any:
++        return self.data[index]
++
++    def __setitem__(self, index: int, value: Any) -> None:
++        self.data[index] = _cast_value(value, self.dtype)
++
++    def __repr__(self) -> str:
++        return "HostTensor(dtype={!r}, shape={!r}, values={!r})".format(self.dtype, self.shape, self.tolist())
++
++
++class FlatBuffer:
++    """A dtype-neutral mutable flat buffer for callers using raw descriptors."""
++
++    def __init__(self, values: Iterable[Any]) -> None:
++        self.data = list(values)
++
++    @classmethod
++    def zeros(cls, size: int, fill: Any = 0) -> "FlatBuffer":
++        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
++            raise ValueError("FlatBuffer size must be a non-negative integer")
++        return cls([fill] * size)
++
++    def __len__(self) -> int:
++        return len(self.data)
++
++    def __getitem__(self, index: int) -> Any:
++        return self.data[index]
++
++    def __setitem__(self, index: int, value: Any) -> None:
++        self.data[index] = value
++
++    def __iter__(self):
++        return iter(self.data)
++
++
++def _shape(shape: Sequence[int]) -> Tuple[int, ...]:
++    if isinstance(shape, (str, bytes)):
++        raise ValueError("shape must be a sequence of non-negative integers")
++    try:
++        values = tuple(shape)
++    except TypeError as exc:
++        raise ValueError("shape must be a sequence of non-negative integers") from exc
++    for index, value in enumerate(values):
++        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
++            raise ValueError("shape[{}] must be a non-negative integer".format(index))
++    return values
++
++
++def _reshape(values: Sequence[Any], shape: Tuple[int, ...]) -> Any:
++    if not shape:
++        return values[0] if values else None
++    if any(dimension == 0 for dimension in shape):
++        return _empty_nested(shape)
++    cursor = 0
++
++    def build(axis: int):
++        nonlocal cursor
++        if axis == len(shape) - 1:
++            result = list(values[cursor:cursor + shape[axis]])
++            cursor += shape[axis]
++            return result
++        return [build(axis + 1) for _ in range(shape[axis])]
++
++    return build(0)
++
++
++def _empty_nested(shape: Tuple[int, ...]) -> Any:
++    if not shape:
++        return None
++    if shape[0] == 0:
++        return []
++    return [_empty_nested(shape[1:]) for _ in range(shape[0])]
++
++
++def _cast_value(value: Any, dtype: str) -> Any:
++    dtype = canonical_dtype(dtype)
++    if dtype == "bool":
++        return bool(value)
++    if dtype.startswith("int") or dtype.startswith("uint"):
++        if isinstance(value, bool):
++            value = int(value)
++        if isinstance(value, float) and not math.isfinite(value):
++            raise ValueError("integer tensor value must be finite")
++        result = int(value)
++        bits = int(dtype[3:] if dtype.startswith("int") else dtype[4:])
++        lower = -(1 << (bits - 1)) if dtype.startswith("int") else 0
++        upper = (1 << (bits - 1)) - 1 if dtype.startswith("int") else (1 << bits) - 1
++        if result < lower or result > upper:
++            raise ValueError("{} value {} is out of range".format(dtype, result))
++        return result
++    result = float(value)
++    if dtype == "bf16":
++        return _round_bf16(result)
++    if dtype == "float16":
++        try:
++            return struct.unpack("<e", struct.pack("<e", result))[0]
++        except OverflowError as exc:
++            raise ValueError("float16 value {} is out of range".format(result)) from exc
++    return result
++
++
++def _round_bf16(value: float) -> float:
++    """Round a Python float to the nearest representable BF16 value."""
++
++    if not math.isfinite(value):
++        return value
++    bits = struct.unpack("<I", struct.pack("<f", value))[0]
++    lower = bits & 0xFFFF
++    upper = bits >> 16
++    if lower > 0x8000 or (lower == 0x8000 and (upper & 1)):
++        upper += 1
++    return struct.unpack("<f", struct.pack("<I", upper << 16))[0]
++
++
++__all__ = ["FlatBuffer", "HostTensor"]
+diff --git a/python/pypto/compiler/targets/cpu.py b/python/pypto/compiler/targets/cpu.py
+new file mode 100644
+index 000000000..f083dd802
+--- /dev/null
++++ b/python/pypto/compiler/targets/cpu.py
+@@ -0,0 +1,140 @@
++"""Deterministic compiler for the PyPTO-X CPU scalar reference target."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from typing import Any, Mapping, Optional
++
++from pypto.compiler.api import CompileOptions
++from pypto.compiler.artifact import ABI_VERSION, Artifact
++from pypto.core_ir import CoreProgram
++from pypto.lowering.cpu import (
++    CPU_SCALAR_BACKEND,
++    LOWERING_VERSION,
++    CpuScalarProgram,
++    lower_cpu_scalar,
++)
++from pypto.target import TargetSpec
++
++
++ARTIFACT_PAYLOAD_VERSION = 1
++DEFAULT_ARTIFACT_FORMAT = "pypto-x.cpu.scalar"
++
++
++class CpuScalarCompiler:
++    """Lower and package a validated CoreProgram for the scalar runtime."""
++
++    name = CPU_SCALAR_BACKEND
++
++    def lower(self, program: CoreProgram, target: TargetSpec) -> CpuScalarProgram:
++        return lower_cpu_scalar(program, target)
++
++    def compile(self, target_ir: CpuScalarProgram, options: Optional[CompileOptions] = None) -> Artifact:
++        if not isinstance(target_ir, CpuScalarProgram):
++            raise TypeError("CPU scalar compile() requires CpuScalarProgram from lower()")
++        if options is not None and not isinstance(options, CompileOptions):
++            raise TypeError("options must be CompileOptions")
++
++        program_json = target_ir.program.canonical_json()
++        program_payload = json.loads(program_json)
++        program_digest = hashlib.sha256(program_json.encode("utf-8")).hexdigest()
++        target_data = dict(target_ir.target.to_dict())
++        envelope = {
++            "artifact_payload_version": ARTIFACT_PAYLOAD_VERSION,
++            "backend": CPU_SCALAR_BACKEND,
++            "lowering_version": LOWERING_VERSION,
++            "entrypoint": target_ir.entrypoint,
++            "target": target_data,
++            "program": program_payload,
++            "program_digest": program_digest,
++        }
++        payload_text = json.dumps(
++            envelope,
++            ensure_ascii=False,
++            allow_nan=False,
++            sort_keys=True,
++            separators=(",", ":"),
++        )
++        payload = payload_text.encode("utf-8")
++        payload_digest = hashlib.sha256(payload).hexdigest()
++        metadata = {
++            "backend": CPU_SCALAR_BACKEND,
++            "artifact_payload_version": ARTIFACT_PAYLOAD_VERSION,
++            "lowering_version": LOWERING_VERSION,
++            "entrypoint": target_ir.entrypoint,
++            "program_digest": program_digest,
++            "payload_digest": payload_digest,
++            "target_digest": hashlib.sha256(
++                json.dumps(target_data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
++            ).hexdigest(),
++        }
++        if options is not None:
++            option_metadata = _plain_mapping(options.metadata)
++            reserved = set(metadata).intersection(option_metadata)
++            if reserved:
++                raise ValueError("compile option metadata uses reserved CPU scalar keys: {}".format(
++                    ", ".join(sorted(reserved))
++                ))
++            metadata.update(option_metadata)
++            metadata["compile_options"] = {
++                "artifact_format": options.artifact_format,
++                "abi_version": options.abi_version,
++                "extra": _plain_mapping(options.extra),
++            }
++            artifact_format = options.artifact_format
++            abi_version = options.abi_version
++        else:
++            artifact_format = DEFAULT_ARTIFACT_FORMAT
++            abi_version = ABI_VERSION
++        return Artifact(
++            format=artifact_format,
++            entrypoint=target_ir.entrypoint,
++            target=target_ir.target,
++            abi_version=abi_version,
++            payload=payload,
++            metadata=metadata,
++        )
++
++
++def _plain_mapping(value: Mapping[str, Any]) -> dict:
++    """Copy frozen ABI mappings before placing them in artifact metadata."""
++
++    if not isinstance(value, Mapping):
++        raise TypeError("metadata must be a mapping")
++    return {key: _plain_value(item) for key, item in value.items()}
++
++
++def _plain_value(value: Any) -> Any:
++    if isinstance(value, Mapping):
++        return {key: _plain_value(item) for key, item in value.items()}
++    if isinstance(value, tuple):
++        return [_plain_value(item) for item in value]
++    if isinstance(value, list):
++        return [_plain_value(item) for item in value]
++    return value
++
++
++CPUCompiler = CpuScalarCompiler
++CPUScalarCompiler = CpuScalarCompiler
++
++
++def compile_cpu_scalar(
++    program: CoreProgram,
++    target: TargetSpec,
++    options: Optional[CompileOptions] = None,
++) -> Artifact:
++    """Convenience wrapper using the public compiler contract."""
++
++    compiler = CpuScalarCompiler()
++    return compiler.compile(compiler.lower(program, target), options)
++
++
++__all__ = [
++    "ARTIFACT_PAYLOAD_VERSION",
++    "CPUCompiler",
++    "CPUScalarCompiler",
++    "DEFAULT_ARTIFACT_FORMAT",
++    "CpuScalarCompiler",
++    "compile_cpu_scalar",
++]
+diff --git a/python/pypto/lowering/cpu/__init__.py b/python/pypto/lowering/cpu/__init__.py
+new file mode 100644
+index 000000000..f6b32da45
+--- /dev/null
++++ b/python/pypto/lowering/cpu/__init__.py
+@@ -0,0 +1,463 @@
++"""CPU scalar reference lowering for the PyPTO-X Core IR.
++
++The scalar target is intentionally small and boring.  It is the executable
++correctness reference for later vector and accelerator lowerings, so it does
++not silently reinterpret an operation, broadcast a shape, or delegate to a
++third-party numerical library.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
++
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region
++from pypto.target import TargetSpec
++
++
++CPU_SCALAR_BACKEND = "cpu.scalar"
++LOWERING_VERSION = 1
++
++
++class CpuScalarError(ValueError):
++    """Base error for an invalid CPU scalar program or target."""
++
++
++class CpuScalarValidationError(CpuScalarError):
++    """The program is structurally valid Core IR but not scalar-lowerable."""
++
++
++class CpuScalarUnsupportedError(CpuScalarError):
++    """The scalar reference deliberately does not implement this feature."""
++
++
++SUPPORTED_DTYPES = frozenset(
++    {
++        "bool",
++        "int8",
++        "uint8",
++        "int16",
++        "uint16",
++        "int32",
++        "uint32",
++        "int64",
++        "uint64",
++        "float16",
++        "half",
++        "bf16",
++        "bfloat16",
++        "float32",
++        "float64",
++    }
++)
++
++
++# Aliases are explicit.  The executor never turns an arbitrary name into an
++# operation by stripping a prefix, which keeps unknown operations visible.
++OP_ALIASES = {
++    "identity": "identity",
++    "copy": "identity",
++    "tensor.identity": "identity",
++    "tensor.copy": "identity",
++    "core.identity": "identity",
++    "core.copy": "identity",
++    "constant": "constant",
++    "const": "constant",
++    "tensor.constant": "constant",
++    "core.constant": "constant",
++    "add": "add",
++    "tensor.add": "add",
++    "elementwise.add": "add",
++    "sub": "sub",
++    "subtract": "sub",
++    "tensor.sub": "sub",
++    "elementwise.sub": "sub",
++    "mul": "mul",
++    "multiply": "mul",
++    "tensor.mul": "mul",
++    "elementwise.mul": "mul",
++    "div": "div",
++    "divide": "div",
++    "tensor.div": "div",
++    "elementwise.div": "div",
++    "neg": "neg",
++    "negative": "neg",
++    "tensor.neg": "neg",
++    "elementwise.neg": "neg",
++    "reduce_sum": "reduce_sum",
++    "reduce.sum": "reduce_sum",
++    "tensor.reduce_sum": "reduce_sum",
++    "sum": "reduce_sum",
++    "reduce_max": "reduce_max",
++    "reduce.max": "reduce_max",
++    "tensor.reduce_max": "reduce_max",
++    "max": "reduce_max",
++    "matmul": "matmul",
++    "tensor.matmul": "matmul",
++    "linalg.matmul": "matmul",
++}
++SUPPORTED_OPERATIONS = frozenset(OP_ALIASES)
++
++
++def canonical_operation_name(name: str) -> str:
++    """Return one of the small scalar operation names.
++
++    Only the aliases listed in :data:`OP_ALIASES` are accepted.  This is
++    intentionally stricter than a generic ``split('.')[-1]`` conversion.
++    """
++
++    if not isinstance(name, str):
++        raise CpuScalarUnsupportedError("operation name must be a string")
++    key = name.strip().lower()
++    try:
++        return OP_ALIASES[key]
++    except KeyError as exc:
++        raise CpuScalarUnsupportedError("CPU scalar does not support operation {!r}".format(name)) from exc
++
++
++def canonical_dtype(dtype: Any) -> str:
++    """Normalize scalar-supported dtype spellings."""
++
++    if not isinstance(dtype, str):
++        raise CpuScalarValidationError("dtype must be a string")
++    value = dtype.strip().lower()
++    if value == "bfloat16":
++        value = "bf16"
++    elif value == "half":
++        value = "float16"
++    if value not in SUPPORTED_DTYPES:
++        raise CpuScalarUnsupportedError("CPU scalar does not support dtype {!r}".format(dtype))
++    return value
++
++
++def static_shape(value_type: CoreType, context: str) -> Tuple[int, ...]:
++    """Return a concrete shape; symbolic runtime specialization is W3+."""
++
++    if not isinstance(value_type, CoreType):
++        raise CpuScalarValidationError("{} must be CoreType".format(context))
++    result = []
++    for index, dimension in enumerate(value_type.shape):
++        if isinstance(dimension, bool) or not isinstance(dimension, int):
++            raise CpuScalarUnsupportedError(
++                "{} has symbolic dimension at axis {}; CPU scalar requires concrete shapes".format(context, index)
++            )
++        result.append(dimension)
++    return tuple(result)
++
++
++def _is_tensor(value_type: CoreType) -> bool:
++    return value_type.kind in ("tensor", "view", "tile")
++
++
++def _is_scalar(value_type: CoreType) -> bool:
++    return value_type.kind == "scalar"
++
++
++def _validate_dtype(value_type: CoreType, context: str) -> None:
++    if value_type.dtype is None:
++        raise CpuScalarValidationError("{} has no dtype".format(context))
++    canonical_dtype(value_type.dtype)
++
++
++def _attrs(operation: Operation) -> Mapping[str, Any]:
++    return operation.attributes
++
++
++def _one_output(operation: Operation, opname: str) -> CoreType:
++    if len(operation.outputs) != 1:
++        raise CpuScalarValidationError(
++            "{} operation must have exactly one output, got {}".format(opname, len(operation.outputs))
++        )
++    return operation.outputs[0].type
++
++
++def _same_type(left: CoreType, right: CoreType, context: str) -> None:
++    if left != right:
++        raise CpuScalarValidationError("{} requires matching CoreType values".format(context))
++
++
++def _same_dtype(left: CoreType, right: CoreType, context: str) -> None:
++    if left.kind != right.kind or canonical_dtype(left.dtype) != canonical_dtype(right.dtype):
++        raise CpuScalarValidationError("{} requires matching value kinds and dtypes".format(context))
++
++
++def _normalize_axes(attributes: Mapping[str, Any], rank: int, context: str) -> Tuple[int, ...]:
++    raw = attributes.get("axes", attributes.get("axis"))
++    if raw is None:
++        axes = tuple(range(rank))
++    elif isinstance(raw, int) and not isinstance(raw, bool):
++        axes = (raw,)
++    else:
++        if isinstance(raw, (str, bytes)):
++            raise CpuScalarValidationError("{} axes must be an integer or sequence of integers".format(context))
++        try:
++            axes = tuple(raw)
++        except TypeError as exc:
++            raise CpuScalarValidationError("{} axes must be an integer or sequence of integers".format(context)) from exc
++    normalized = []
++    for axis in axes:
++        if isinstance(axis, bool) or not isinstance(axis, int):
++            raise CpuScalarValidationError("{} axes must contain integers".format(context))
++        axis = axis + rank if axis < 0 else axis
++        if axis < 0 or axis >= rank:
++            raise CpuScalarValidationError("{} axis {} is outside rank {}".format(context, axis, rank))
++        if axis in normalized:
++            raise CpuScalarValidationError("{} contains duplicate axis {}".format(context, axis))
++        normalized.append(axis)
++    return tuple(normalized)
++
++
++def reduced_shape(input_shape: Sequence[int], attributes: Mapping[str, Any], context: str) -> Tuple[int, ...]:
++    """Compute the exact shape required by a reduction operation."""
++
++    shape = tuple(input_shape)
++    axes = _normalize_axes(attributes, len(shape), context)
++    keepdims = attributes.get("keepdims", False)
++    if not isinstance(keepdims, bool):
++        raise CpuScalarValidationError("{} keepdims must be bool".format(context))
++    if keepdims:
++        return tuple(1 if axis in axes else dimension for axis, dimension in enumerate(shape))
++    return tuple(dimension for axis, dimension in enumerate(shape) if axis not in axes)
++
++
++def _constant_values(operation: Operation, output_type: CoreType) -> Any:
++    attributes = _attrs(operation)
++    has_value = "value" in attributes
++    has_values = "values" in attributes
++    if has_value == has_values:
++        raise CpuScalarValidationError("constant requires exactly one of attributes 'value' or 'values'")
++    value = attributes["value"] if has_value else attributes["values"]
++    if _is_scalar(output_type):
++        if isinstance(value, (list, tuple)):
++            if len(value) != 1:
++                raise CpuScalarValidationError("scalar constant value must not be an array")
++            return value[0]
++        return value
++    if not _is_tensor(output_type):
++        raise CpuScalarUnsupportedError("constant output kind {!r} is unsupported".format(output_type.kind))
++    shape = static_shape(output_type, "constant output")
++    flattened = flatten_values(value)
++    expected = element_count(shape)
++    if len(flattened) != expected:
++        raise CpuScalarValidationError(
++            "constant has {} values but output shape {} requires {}".format(len(flattened), shape, expected)
++        )
++    return flattened
++
++
++def flatten_values(value: Any) -> Tuple[Any, ...]:
++    """Flatten nested standard-library sequences, rejecting strings/mappings."""
++
++    if isinstance(value, (str, bytes, bytearray, Mapping)):
++        return (value,)
++    if isinstance(value, (list, tuple)):
++        result = []
++        for item in value:
++            result.extend(flatten_values(item))
++        return tuple(result)
++    return (value,)
++
++
++def element_count(shape: Sequence[int]) -> int:
++    result = 1
++    for dimension in shape:
++        result *= dimension
++    return result
++
++
++def _validate_operation(operation: Operation, context: str) -> None:
++    name = canonical_operation_name(operation.name)
++    if operation.regions:
++        raise CpuScalarUnsupportedError("{} contains regions; structured control flow is not in W2".format(context))
++    inputs = operation.inputs
++    outputs = operation.outputs
++    if name == "constant":
++        if inputs:
++            raise CpuScalarValidationError("{} constant must not have inputs".format(context))
++        output_type = _one_output(operation, name)
++        _validate_dtype(output_type, context + ".output")
++        _constant_values(operation, output_type)
++        return
++    if name == "identity":
++        if len(inputs) != 1:
++            raise CpuScalarValidationError("{} identity requires one input".format(context))
++        output_type = _one_output(operation, name)
++        _same_type(inputs[0].type, output_type, context + ".identity")
++        _validate_dtype(output_type, context + ".output")
++        if not (_is_tensor(output_type) or _is_scalar(output_type)):
++            raise CpuScalarUnsupportedError("{} identity kind {!r} is unsupported".format(context, output_type.kind))
++        if _is_tensor(output_type):
++            static_shape(output_type, context + ".output")
++        return
++    if name in ("add", "sub", "mul", "div"):
++        if len(inputs) != 2:
++            raise CpuScalarValidationError("{} {} requires two inputs".format(context, name))
++        output_type = _one_output(operation, name)
++        for input_ref in inputs:
++            _validate_dtype(input_ref.type, context + ".input")
++            if not (_is_tensor(input_ref.type) or _is_scalar(input_ref.type)):
++                raise CpuScalarUnsupportedError("{} input kind {!r} is unsupported".format(context, input_ref.type.kind))
++        _validate_dtype(output_type, context + ".output")
++        if _is_tensor(inputs[0].type) and _is_tensor(inputs[1].type):
++            _same_type(inputs[0].type, inputs[1].type, context + ".binary")
++            _same_type(inputs[0].type, output_type, context + ".binary output")
++            static_shape(output_type, context + ".output")
++        elif _is_tensor(inputs[0].type) and _is_scalar(inputs[1].type):
++            _same_type(inputs[0].type, output_type, context + ".tensor-scalar output")
++            static_shape(output_type, context + ".output")
++        elif _is_scalar(inputs[0].type) and _is_tensor(inputs[1].type):
++            _same_type(inputs[1].type, output_type, context + ".scalar-tensor output")
++            static_shape(output_type, context + ".output")
++        elif _is_scalar(inputs[0].type) and _is_scalar(inputs[1].type):
++            if not _is_scalar(output_type):
++                raise CpuScalarValidationError("{} scalar binary output must be scalar".format(context))
++        else:
++            raise CpuScalarUnsupportedError("{} binary input kinds are unsupported".format(context))
++        return
++    if name == "neg":
++        if len(inputs) != 1:
++            raise CpuScalarValidationError("{} neg requires one input".format(context))
++        output_type = _one_output(operation, name)
++        _same_type(inputs[0].type, output_type, context + ".neg")
++        _validate_dtype(output_type, context + ".output")
++        if not (_is_tensor(output_type) or _is_scalar(output_type)):
++            raise CpuScalarUnsupportedError("{} neg kind {!r} is unsupported".format(context, output_type.kind))
++        if _is_tensor(output_type):
++            static_shape(output_type, context + ".output")
++        return
++    if name in ("reduce_sum", "reduce_max"):
++        if len(inputs) != 1:
++            raise CpuScalarValidationError("{} {} requires one input".format(context, name))
++        input_type = inputs[0].type
++        output_type = _one_output(operation, name)
++        if not _is_tensor(input_type) or not _is_tensor(output_type):
++            raise CpuScalarUnsupportedError("{} reduction only supports tensor values".format(context))
++        _validate_dtype(input_type, context + ".input")
++        _validate_dtype(output_type, context + ".output")
++        _same_dtype(input_type, output_type, context + ".reduction dtype")
++        input_shape = static_shape(input_type, context + ".input")
++        output_shape = static_shape(output_type, context + ".output")
++        expected_shape = reduced_shape(input_shape, _attrs(operation), context + ".reduction")
++        if output_shape != expected_shape:
++            raise CpuScalarValidationError(
++                "{} reduction output shape {} does not match expected {}".format(context, output_shape, expected_shape)
++            )
++        return
++    if name == "matmul":
++        if len(inputs) != 2:
++            raise CpuScalarValidationError("{} matmul requires two inputs".format(context))
++        output_type = _one_output(operation, name)
++        if not all(_is_tensor(ref.type) for ref in inputs) or not _is_tensor(output_type):
++            raise CpuScalarUnsupportedError("{} matmul only supports tensor values".format(context))
++        for ref in inputs:
++            _validate_dtype(ref.type, context + ".input")
++            if len(ref.type.shape) != 2:
++                raise CpuScalarValidationError("{} matmul inputs must be rank 2".format(context))
++        _validate_dtype(output_type, context + ".output")
++        _same_dtype(inputs[0].type, inputs[1].type, context + ".matmul dtype")
++        _same_dtype(inputs[0].type, output_type, context + ".matmul output")
++        left_shape = static_shape(inputs[0].type, context + ".left")
++        right_shape = static_shape(inputs[1].type, context + ".right")
++        output_shape = static_shape(output_type, context + ".output")
++        if left_shape[1] != right_shape[0] or output_shape != (left_shape[0], right_shape[1]):
++            raise CpuScalarValidationError(
++                "{} matmul shapes {} x {} cannot produce {}".format(context, left_shape, right_shape, output_shape)
++            )
++        for key in ("transpose_a", "transpose_b"):
++            if key in _attrs(operation) and _attrs(operation)[key] is not False:
++                raise CpuScalarUnsupportedError("{} matmul {} is unsupported".format(context, key))
++        return
++    raise CpuScalarUnsupportedError("{} operation {!r} is unsupported".format(context, operation.name))
++
++
++def validate_program(program: CoreProgram) -> CoreProgram:
++    """Verify Core IR and the complete static scalar subset."""
++
++    if not isinstance(program, CoreProgram):
++        raise CpuScalarValidationError("CPU scalar lowering requires CoreProgram")
++    program.verify()
++    if not program.functions:
++        raise CpuScalarValidationError("CPU scalar program must contain at least one function")
++    for function in program.functions:
++        if function.body.blocks:
++            raise CpuScalarUnsupportedError(
++                "function {!r} uses block regions; CPU scalar W2 accepts direct operation bodies only".format(function.name)
++            )
++        for index, operation in enumerate(function.body.operations):
++            _validate_operation(operation, "function {}.body.operations[{}]".format(function.name, index))
++        for ref in function.parameters + function.returns:
++            if not (_is_tensor(ref.type) or _is_scalar(ref.type)):
++                raise CpuScalarUnsupportedError(
++                    "function {!r} value {!r} has unsupported kind {!r}".format(function.name, ref.name, ref.type.kind)
++                )
++            _validate_dtype(ref.type, "function {} value {}".format(function.name, ref.name))
++            if _is_tensor(ref.type):
++                static_shape(ref.type, "function {} value {}".format(function.name, ref.name))
++    return program
++
++
++@dataclass(frozen=True)
++class CpuScalarProgram:
++    """Validated target IR passed from the compiler to the artifact builder."""
++
++    program: CoreProgram
++    target: TargetSpec
++    entrypoint: str
++    lowering_version: int = LOWERING_VERSION
++
++    def __post_init__(self) -> None:
++        validate_program(self.program)
++        validate_cpu_target(self.target)
++        if not isinstance(self.entrypoint, str) or not self.entrypoint.strip():
++            raise CpuScalarValidationError("CPU scalar entrypoint must be non-empty")
++        if self.entrypoint not in {function.name for function in self.program.functions}:
++            raise CpuScalarValidationError("CPU scalar entrypoint {!r} is not a program function".format(self.entrypoint))
++        if self.lowering_version != LOWERING_VERSION:
++            raise CpuScalarValidationError("unsupported CPU scalar lowering version {!r}".format(self.lowering_version))
++
++
++def validate_cpu_target(target: TargetSpec) -> TargetSpec:
++    if not isinstance(target, TargetSpec):
++        raise CpuScalarValidationError("CPU scalar lowering requires TargetSpec")
++    if target.kind != "cpu":
++        raise CpuScalarValidationError("CPU scalar target requires kind='cpu', got {!r}".format(target.kind))
++    return target
++
++
++def lower_cpu_scalar(program: CoreProgram, target: TargetSpec, entrypoint: Optional[str] = None) -> CpuScalarProgram:
++    """Validate and lower one target-independent program to scalar target IR."""
++
++    validate_cpu_target(target)
++    validate_program(program)
++    selected = entrypoint
++    if selected is None:
++        selected = target.attributes.get("entrypoint", program.functions[0].name)
++    if not isinstance(selected, str):
++        raise CpuScalarValidationError("target entrypoint must be a string")
++    return CpuScalarProgram(program, target, selected)
++
++
++lower = lower_cpu_scalar
++
++
++__all__ = [
++    "CPU_SCALAR_BACKEND",
++    "LOWERING_VERSION",
++    "OP_ALIASES",
++    "SUPPORTED_DTYPES",
++    "SUPPORTED_OPERATIONS",
++    "CpuScalarError",
++    "CpuScalarProgram",
++    "CpuScalarUnsupportedError",
++    "CpuScalarValidationError",
++    "canonical_dtype",
++    "canonical_operation_name",
++    "element_count",
++    "flatten_values",
++    "lower",
++    "lower_cpu_scalar",
++    "reduced_shape",
++    "static_shape",
++    "validate_cpu_target",
++    "validate_program",
++]
+diff --git a/python/tests/ut/pypto_x/test_cpu_scalar.py b/python/tests/ut/pypto_x/test_cpu_scalar.py
+new file mode 100644
+index 000000000..3b1a01877
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cpu_scalar.py
+@@ -0,0 +1,153 @@
++"""W2 CPU scalar reference tests.
++
++These tests use only the standard library and isolate the upstream ``pypto``
++initializer, so they run without CANN, device runtimes, or model weights.
++"""
++
++from __future__ import annotations
++
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++
++def _imports():
++    package_root = Path(__file__).parents[3] / "pypto"
++    saved = {name: module for name, module in sys.modules.items() if name == "pypto" or name.startswith("pypto.")}
++    for name in list(saved):
++        del sys.modules[name]
++    package = types.ModuleType("pypto")
++    package.__path__ = [str(package_root)]
++    sys.modules["pypto"] = package
++    try:
++        from pypto.abi import LaunchRequest
++        from pypto.backends.cpu import CpuScalarRuntime, HostTensor
++        from pypto.compiler.targets.cpu import CpuScalarCompiler
++        from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++        from pypto.lowering.cpu import CpuScalarUnsupportedError
++        from pypto.target import TargetSpec
++        return locals()
++    finally:
++        for name in list(sys.modules):
++            if name == "pypto" or name.startswith("pypto."):
++                del sys.modules[name]
++        sys.modules.update(saved)
++
++
++# Keep imports in one place to avoid invoking the native upstream initializer.
++_C = _imports()
++LaunchRequest = _C["LaunchRequest"]
++CpuScalarRuntime = _C["CpuScalarRuntime"]
++HostTensor = _C["HostTensor"]
++CpuScalarCompiler = _C["CpuScalarCompiler"]
++CoreFunction = _C["CoreFunction"]
++CoreProgram = _C["CoreProgram"]
++CoreType = _C["CoreType"]
++Operation = _C["Operation"]
++Region = _C["Region"]
++ValueRef = _C["ValueRef"]
++CpuScalarUnsupportedError = _C["CpuScalarUnsupportedError"]
++TargetSpec = _C["TargetSpec"]
++
++
++TARGET = TargetSpec("cpu", "x86_64-linux-gnu")
++
++
++def _program(name, parameters, returns, operations):
++    return CoreProgram(functions=(CoreFunction(name, parameters, returns, Region(tuple(operations))),))
++
++
++def _compile(program):
++    compiler = CpuScalarCompiler()
++    return compiler, compiler.compile(compiler.lower(program, TARGET))
++
++
++def test_add_uses_common_launch_abi_and_is_deterministic():
++    value_type = CoreType.tensor("float32", (2, 3))
++    x = ValueRef("x", value_type)
++    y = ValueRef("y", value_type)
++    z = ValueRef("z", value_type)
++    program = _program("add", (x, y), (z,), (Operation("tensor.add", (x, y), (z,)),))
++    compiler, artifact = _compile(program)
++    second = compiler.compile(compiler.lower(program, TARGET))
++    assert artifact.payload == second.payload
++    left = HostTensor("float32", (2, 3), [[1, 2, 3], [4, 5, 6]])
++    right = HostTensor("float32", (2, 3), [[10, 20, 30], [40, 50, 60]])
++    output = HostTensor.zeros("float32", (2, 3))
++    request = LaunchRequest(
++        artifact,
++        inputs=[left.descriptor(readonly=True), right.descriptor(readonly=True)],
++        outputs=[output.descriptor()],
++    )
++    result = CpuScalarRuntime().launch(request)
++    assert result == (output,)
++    assert output.tolist() == [[11.0, 22.0, 33.0], [44.0, 55.0, 66.0]]
++
++
++def test_reduce_sum_supports_non_divisible_shape():
++    input_type = CoreType.tensor("int32", (2, 3, 5))
++    output_type = CoreType.tensor("int32", (2, 5))
++    x = ValueRef("x", input_type)
++    y = ValueRef("y", output_type)
++    operation = Operation("reduce_sum", (x,), (y,), attributes={"axis": 1})
++    program = _program("reduce", (x,), (y,), (operation,))
++    _, artifact = _compile(program)
++    values = list(range(30))
++    source = HostTensor("int32", (2, 3, 5), values)
++    output = HostTensor.zeros("int32", (2, 5))
++    LaunchRequest(artifact, inputs=[source.descriptor(readonly=True)], outputs=[output.descriptor()])
++    CpuScalarRuntime().launch(
++        LaunchRequest(artifact, inputs=[source.descriptor(readonly=True)], outputs=[output.descriptor()])
++    )
++    assert output.tolist() == [[15, 18, 21, 24, 27], [60, 63, 66, 69, 72]]
++
++
++def test_rectangular_matmul():
++    left_type = CoreType.tensor("float32", (2, 3))
++    right_type = CoreType.tensor("float32", (3, 4))
++    output_type = CoreType.tensor("float32", (2, 4))
++    left = ValueRef("left", left_type)
++    right = ValueRef("right", right_type)
++    output = ValueRef("output", output_type)
++    program = _program("matmul", (left, right), (output,), (Operation("matmul", (left, right), (output,)),))
++    _, artifact = _compile(program)
++    a = HostTensor("float32", (2, 3), [[1, 2, 3], [4, 5, 6]])
++    b = HostTensor("float32", (3, 4), [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]])
++    result = HostTensor.zeros("float32", (2, 4))
++    CpuScalarRuntime().launch(
++        LaunchRequest(artifact, inputs=[a.descriptor(readonly=True), b.descriptor(readonly=True)], outputs=[result.descriptor()])
++    )
++    assert result.tolist() == [[38.0, 44.0, 50.0, 56.0], [83.0, 98.0, 113.0, 128.0]]
++
++
++def test_shape_mismatch_and_unknown_operation_fail_explicitly():
++    value_type = CoreType.tensor("float32", (2, 3))
++    wrong_type = CoreType.tensor("float32", (2, 2))
++    x = ValueRef("x", value_type)
++    y = ValueRef("y", value_type)
++    z = ValueRef("z", value_type)
++    program = _program("add", (x, y), (z,), (Operation("add", (x, y), (z,)),))
++    _, artifact = _compile(program)
++    source = HostTensor.zeros("float32", (2, 3))
++    wrong_output = HostTensor.zeros("float32", (2, 2))
++    with pytest.raises(RuntimeError, match="descriptor dtype/shape"):
++        CpuScalarRuntime().launch(
++            LaunchRequest(artifact, inputs=[source.descriptor(), source.descriptor()], outputs=[wrong_output.descriptor()])
++        )
++
++    unknown = _program("unknown", (x,), (z,), (Operation("vendor.magic", (x,), (z,)),))
++    with pytest.raises(CpuScalarUnsupportedError, match="does not support operation"):
++        CpuScalarCompiler().lower(unknown, TARGET)
++
++
++def test_artifact_payload_tampering_is_detected():
++    value_type = CoreType.tensor("float32", (1,))
++    x = ValueRef("x", value_type)
++    y = ValueRef("y", value_type)
++    program = _program("copy", (x,), (y,), (Operation("identity", (x,), (y,)),))
++    _, artifact = _compile(program)
++    object.__setattr__(artifact, "payload", artifact.payload + b" ")
++    with pytest.raises(RuntimeError, match="digest|canonical"):
++        CpuScalarRuntime().load(artifact)

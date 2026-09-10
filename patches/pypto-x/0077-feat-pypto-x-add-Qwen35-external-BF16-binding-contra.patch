@@ -1,0 +1,1361 @@
+From 55f71762ed8ab11437cf6053f36ab73df492aee1 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Wed, 9 Sep 2026 16:37:31 +0800
+Subject: [PATCH 77/96] feat(pypto-x): add Qwen35 external BF16 binding
+ contract
+
+---
+ python/pypto/portable/__init__.py                               |  46 ++
+ python/pypto/portable/qwen35.py                                 |  19 +-
+ python/pypto/portable/runtime_binding.py                        | 915 ++++++++++++++++++++++++++++
+ .../tests/ut/pypto_x/qwen35_runtime_binding_metadata_driver.py  |  68 +++
+ python/tests/ut/pypto_x/test_qwen35_runtime_binding.py          | 247 ++++++++
+ 5 files changed, 1290 insertions(+), 5 deletions(-)
+
+diff --git a/python/pypto/portable/__init__.py b/python/pypto/portable/__init__.py
+index a4c7e6cd9..5bfb59e0b 100644
+--- a/python/pypto/portable/__init__.py
++++ b/python/pypto/portable/__init__.py
+@@ -34,6 +34,30 @@ from .qwen35 import (
+     build_stable_softmax,
+     build_swiglu,
+ )
++from .runtime_binding import (
++    BINDING_SCHEMA_VERSION,
++    BindingEntry,
++    BindingMismatchError,
++    BindingSchema,
++    BufferBinding,
++    DEFAULT_PACK_ALIGNMENT,
++    ExternalBuffer,
++    PACKED_LAYOUT_VERSION,
++    PackedLayout,
++    PackedRegion,
++    RuntimeBindingError,
++    UINT64_MAX,
++    TypedBufferBinding,
++    assemble_launch_request,
++    assemble_launcher_request,
++    bind_packed_region,
++    build_binding_contract,
++    build_binding_schema,
++    build_external_buffer,
++    build_packed_file_layout,
++    build_packed_layout,
++    ordered_input_descriptors,
++)
+ 
+ __all__ = [
+     "QWEN35_08B_SHAPE_METADATA",
+@@ -64,4 +88,26 @@ __all__ = [
+     "build_rope_rotate_half",
+     "build_stable_softmax",
+     "build_swiglu",
++    "BINDING_SCHEMA_VERSION",
++    "BindingEntry",
++    "BindingMismatchError",
++    "BindingSchema",
++    "BufferBinding",
++    "DEFAULT_PACK_ALIGNMENT",
++    "ExternalBuffer",
++    "PACKED_LAYOUT_VERSION",
++    "PackedLayout",
++    "PackedRegion",
++    "RuntimeBindingError",
++    "UINT64_MAX",
++    "TypedBufferBinding",
++    "assemble_launch_request",
++    "assemble_launcher_request",
++    "bind_packed_region",
++    "build_binding_contract",
++    "build_binding_schema",
++    "build_external_buffer",
++    "build_packed_file_layout",
++    "build_packed_layout",
++    "ordered_input_descriptors",
+ ]
+diff --git a/python/pypto/portable/qwen35.py b/python/pypto/portable/qwen35.py
+index 9849a3e6c..612f90bdb 100644
+--- a/python/pypto/portable/qwen35.py
++++ b/python/pypto/portable/qwen35.py
+@@ -1810,6 +1810,11 @@ def build_qwen35_text_decoder_graph(
+     )
+ 
+     operation_counts = Counter(operation.name for operation in builder.operations)
++    parameter_input_names = [
++        ref.name
++        for ref in builder.parameters
++        if ref.name not in {"input_ids", "cos", "sin"} and ref.name not in set(state_inputs)
++    ]
+     extra = dict(manifest)
+     extra.update(
+         {
+@@ -1850,11 +1855,15 @@ def build_qwen35_text_decoder_graph(
+             "t_gt_1_gdr_warning": "not_chunk_or_fused; operation count grows linearly with steps",
+             "state_transition": "all prior state inputs remain immutable; new state is returned",
+             "tied_weight_use_sites": ["embedding", "lm_head"],
+-            "parameter_function_inputs": [
+-                ref.name
+-                for ref in builder.parameters
+-                if "weight" in ref.name or ref.name in ("final_norm_weight",)
+-            ],
++            # Keep the model-parameter contract as the exact ordered
++            # remainder of the function parameters.  A name substring such
++            # as ``weight`` is not a complete checkpoint contract: Qwen's
++            # GDR route also has the model parameters ``A_log`` and
++            # ``dt_bias``.  Runtime/state names are already explicit above,
++            # so this list remains deterministic without a fragile naming
++            # heuristic.
++            "parameter_function_inputs": parameter_input_names,
++            "parameter_input_names": parameter_input_names,
+         }
+     )
+     # State values are retained while the layer loop runs; resolve them by
+diff --git a/python/pypto/portable/runtime_binding.py b/python/pypto/portable/runtime_binding.py
+new file mode 100644
+index 000000000..b3ad814df
+--- /dev/null
++++ b/python/pypto/portable/runtime_binding.py
+@@ -0,0 +1,915 @@
++"""Target-independent external buffer binding for parameterized Core graphs.
++
++This module freezes the *metadata* seam between a parameterized CoreProgram and
++caller-owned storage.  It deliberately does not execute a backend and never
++turns a buffer into a Python value list.  A :class:`BufferBinding` owns only a
++``memoryview`` reference; the caller owns the underlying bytes/mmap and must
++keep them alive until the backend has finished using the assembled request.
++
++The Qwen3.5 decoder uses three runtime inputs, 320 model parameters and 48
++functional state inputs.  The schema is generated from the exact ordered
++``CoreFunction.parameters`` tuple.  Runtime/state metadata is checked against
++that tuple, and a stale or name-heuristic-only parameter manifest fails closed.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from dataclasses import dataclass, field
++from types import MappingProxyType
++from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
++
++from pypto.abi import LaunchRequest, TensorDesc
++from pypto.compiler.artifact import Artifact
++from pypto.core_ir import CoreProgram, ValueRef
++
++
++UINT64_MAX = (1 << 64) - 1
++BINDING_SCHEMA_VERSION = 1
++PACKED_LAYOUT_VERSION = 1
++DEFAULT_PACK_ALIGNMENT = 64
++
++_DTYPE_BYTES = {
++    "bool": 1,
++    "int8": 1,
++    "uint8": 1,
++    "int16": 2,
++    "uint16": 2,
++    "int32": 4,
++    "uint32": 4,
++    "int64": 8,
++    "uint64": 8,
++    "float16": 2,
++    "half": 2,
++    "bf16": 2,
++    "bfloat16": 2,
++    "float32": 4,
++    "float64": 8,
++    "fp8": 1,
++    "int4": 1,
++}
++
++
++class RuntimeBindingError(ValueError):
++    """Base error for malformed external-buffer or launcher contracts."""
++
++
++class BindingMismatchError(RuntimeBindingError):
++    """Raised when a binding does not match an exact schema entry."""
++
++
++def _canonical_dtype(dtype: Any) -> str:
++    if not isinstance(dtype, str):
++        name = getattr(dtype, "name", None)
++        dtype = name if isinstance(name, str) else str(dtype)
++    value = dtype.strip().lower()
++    if value == "bfloat16":
++        return "bf16"
++    if value == "half":
++        return "float16"
++    if value not in _DTYPE_BYTES:
++        raise RuntimeBindingError("unsupported binding dtype {!r}".format(dtype))
++    return value
++
++
++def _checked_shape(shape: Sequence[int], field_name: str) -> Tuple[int, ...]:
++    if isinstance(shape, (str, bytes)):
++        raise RuntimeBindingError("{} must be a sequence of non-negative integers".format(field_name))
++    try:
++        values = tuple(shape)
++    except TypeError as exc:
++        raise RuntimeBindingError("{} must be a sequence of non-negative integers".format(field_name)) from exc
++    for index, value in enumerate(values):
++        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
++            raise RuntimeBindingError("{}[{}] must be a non-negative integer".format(field_name, index))
++    return values
++
++
++def _element_count(shape: Sequence[int], field_name: str = "shape") -> int:
++    result = 1
++    for index, dimension in enumerate(shape):
++        if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension < 0:
++            raise RuntimeBindingError("{}[{}] must be a non-negative integer".format(field_name, index))
++        if dimension and result > UINT64_MAX // dimension:
++            raise RuntimeBindingError("{} element count exceeds uint64".format(field_name))
++        result *= dimension
++    return result
++
++
++def _expected_nbytes(dtype: str, shape: Sequence[int]) -> int:
++    normalized = _canonical_dtype(dtype)
++    elements = _element_count(shape)
++    itemsize = _DTYPE_BYTES[normalized]
++    if elements and elements > UINT64_MAX // itemsize:
++        raise RuntimeBindingError("tensor byte count exceeds uint64")
++    return elements * itemsize
++
++
++def _positive_alignment(value: Any, field_name: str = "alignment") -> int:
++    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
++        raise RuntimeBindingError("{} must be a positive integer".format(field_name))
++    if value & (value - 1):
++        raise RuntimeBindingError("{} must be a power of two".format(field_name))
++    return value
++
++
++def _uint64(value: Any, field_name: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > UINT64_MAX:
++        raise RuntimeBindingError("{} must be an unsigned uint64".format(field_name))
++    return value
++
++
++def _canonical_json(value: Any) -> str:
++    return json.dumps(
++        value,
++        ensure_ascii=False,
++        sort_keys=True,
++        separators=(",", ":"),
++        allow_nan=False,
++    )
++
++
++def _mapping_copy(value: Mapping[str, Any]) -> Dict[str, Any]:
++    return {str(key): item for key, item in value.items()}
++
++
++@dataclass(frozen=True, init=False, repr=False)
++class BufferBinding:
++    """A non-owning, contiguous byte slice with an exact tensor contract.
++
++    ``buffer`` may be ``bytes``, ``bytearray``, ``mmap.mmap`` or any other
++    object exporting a contiguous buffer.  ``memoryview`` slicing is used and
++    no element conversion or list allocation is performed.  ``storage_id``
++    identifies the caller-owned storage, while ``byte_offset`` identifies the
++    slice within that storage.  ``readonly`` is an execution contract: a
++    writable source may still be deliberately bound read-only, but a
++    read-only source can never be bound as a mutable output.
++    """
++
++    storage_id: str
++    byte_offset: int
++    nbytes: int
++    dtype: str
++    shape: Tuple[int, ...]
++    readonly: bool
++    alignment: int
++    lifetime: str
++    storage_nbytes: int
++    _view: memoryview = field(repr=False, compare=False)
++    _owner: Any = field(repr=False, compare=False)
++
++    def __init__(
++        self,
++        buffer: Any,
++        storage_id: str,
++        dtype: Any,
++        shape: Sequence[int],
++        *,
++        byte_offset: int = 0,
++        nbytes: Optional[int] = None,
++        readonly: Optional[bool] = None,
++        alignment: int = 1,
++        lifetime: str = "caller-owned-until-completion",
++    ) -> None:
++        if not isinstance(storage_id, str) or not storage_id.strip():
++            raise RuntimeBindingError("storage_id must be a non-empty string")
++        if not isinstance(lifetime, str) or not lifetime.strip():
++            raise RuntimeBindingError("lifetime must be a non-empty string")
++        normalized_dtype = _canonical_dtype(dtype)
++        normalized_shape = _checked_shape(shape, "shape")
++        expected = _expected_nbytes(normalized_dtype, normalized_shape)
++        offset = _uint64(byte_offset, "byte_offset")
++        requested_nbytes = expected if nbytes is None else _uint64(nbytes, "nbytes")
++        if requested_nbytes != expected:
++            raise BindingMismatchError(
++                "nbytes {} does not match dtype/shape requirement {}".format(requested_nbytes, expected)
++            )
++        normalized_alignment = _positive_alignment(alignment)
++        if offset % normalized_alignment:
++            raise RuntimeBindingError(
++                "byte_offset {} is not aligned to {}".format(offset, normalized_alignment)
++            )
++        try:
++            raw = memoryview(buffer)
++        except (TypeError, ValueError) as exc:
++            raise RuntimeBindingError("buffer must export a memoryview-compatible buffer") from exc
++        try:
++            if not raw.c_contiguous:
++                raise RuntimeBindingError("external buffer must be C-contiguous")
++            # A byte view keeps the slice byte-addressed even when the source
++            # memoryview has an element format such as ``I``.  This cast is a
++            # view operation for contiguous storage; it never copies data.
++            byte_view = raw if raw.format == "B" and raw.itemsize == 1 else raw.cast("B")
++            capacity = _uint64(byte_view.nbytes, "storage_nbytes")
++        except (TypeError, ValueError) as exc:
++            raise RuntimeBindingError("buffer cannot be viewed as contiguous bytes") from exc
++        if offset > capacity or requested_nbytes > capacity - offset:
++            raise RuntimeBindingError(
++                "buffer slice [{}, {}) exceeds storage bounds {}".format(
++                    offset, offset + requested_nbytes, capacity
++                )
++            )
++        source_readonly = bool(byte_view.readonly)
++        effective_readonly = source_readonly if readonly is None else bool(readonly)
++        if not effective_readonly and source_readonly:
++            raise RuntimeBindingError("read-only source cannot satisfy a mutable binding")
++        try:
++            sliced = byte_view[offset:offset + requested_nbytes]
++        except (TypeError, ValueError) as exc:
++            raise RuntimeBindingError("buffer slice cannot be created") from exc
++        object.__setattr__(self, "storage_id", storage_id.strip())
++        object.__setattr__(self, "byte_offset", offset)
++        object.__setattr__(self, "nbytes", requested_nbytes)
++        object.__setattr__(self, "dtype", normalized_dtype)
++        object.__setattr__(self, "shape", normalized_shape)
++        object.__setattr__(self, "readonly", effective_readonly)
++        object.__setattr__(self, "alignment", normalized_alignment)
++        object.__setattr__(self, "lifetime", lifetime.strip())
++        object.__setattr__(self, "storage_nbytes", capacity)
++        object.__setattr__(self, "_view", sliced)
++        object.__setattr__(self, "_owner", buffer)
++
++    @classmethod
++    def from_buffer(cls, buffer: Any, storage_id: str, dtype: Any, shape: Sequence[int], **kwargs):
++        """Explicit constructor spelling for callers building a binding."""
++
++        return cls(buffer, storage_id, dtype, shape, **kwargs)
++
++    @property
++    def view(self) -> memoryview:
++        """Return the non-owning byte view; no data conversion is performed."""
++
++        return self._view
++
++    @property
++    def buffer(self) -> memoryview:
++        """Alias for :attr:`view` used by launcher adapters."""
++
++        return self._view
++
++    @property
++    def owner(self) -> Any:
++        """Return the caller-owned object retained for the lifetime contract."""
++
++        return self._owner
++
++    @property
++    def expected_nbytes(self) -> int:
++        return _expected_nbytes(self.dtype, self.shape)
++
++    def validate(self) -> None:
++        """Recheck bounds and lifetime validity without reading tensor values."""
++
++        if self.nbytes != self.expected_nbytes:
++            raise BindingMismatchError("binding nbytes no longer matches dtype/shape")
++        try:
++            actual = self._view.nbytes
++        except (AttributeError, ValueError) as exc:
++            raise RuntimeBindingError("bound memoryview has been released") from exc
++        if actual != self.nbytes:
++            raise RuntimeBindingError("bound memoryview length changed")
++        if self.readonly is False and self._view.readonly:
++            raise RuntimeBindingError("mutable binding now references a read-only view")
++        if self.byte_offset % self.alignment:
++            raise RuntimeBindingError("binding byte offset lost its alignment")
++
++    def to_tensor_desc(self, device: str = "cpu") -> TensorDesc:
++        """Build a regular ABI descriptor around this byte view.
++
++        The vendor-neutral ``TensorDesc`` intentionally has no storage-id or
++        offset fields.  Those fields remain in this contract object; an
++        adapter may consume them before handing the view to a backend.  The
++        descriptor handle is the exact ``memoryview`` slice, never a list.
++        """
++
++        self.validate()
++        return TensorDesc(
++            self.dtype,
++            self.shape,
++            device=device,
++            handle=self._view,
++            readonly=self.readonly,
++        )
++
++    descriptor = to_tensor_desc
++
++    def to_dict(self) -> Mapping[str, Any]:
++        self.validate()
++        return {
++            "storage_id": self.storage_id,
++            "byte_offset": self.byte_offset,
++            "nbytes": self.nbytes,
++            "storage_nbytes": self.storage_nbytes,
++            "dtype": self.dtype,
++            "shape": list(self.shape),
++            "readonly": self.readonly,
++            "alignment": self.alignment,
++            "lifetime": self.lifetime,
++        }
++
++
++@dataclass(frozen=True)
++class BindingEntry:
++    """One exact function parameter or return contract entry."""
++
++    ordinal: int
++    name: str
++    role: str
++    dtype: str
++    shape: Tuple[int, ...]
++    nbytes: int
++    storage_id: str
++    readonly: bool
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "ordinal": self.ordinal,
++            "name": self.name,
++            "role": self.role,
++            "dtype": self.dtype,
++            "shape": list(self.shape),
++            "nbytes": self.nbytes,
++            "storage_id": self.storage_id,
++            "readonly": self.readonly,
++        }
++
++
++@dataclass(frozen=True)
++class BindingSchema:
++    """Deterministic ordered input/output schema for one Core function."""
++
++    function_name: str
++    graph_digest: str
++    inputs: Tuple[BindingEntry, ...]
++    outputs: Tuple[BindingEntry, ...]
++    aliases: Mapping[str, str]
++    schema_version: int = BINDING_SCHEMA_VERSION
++
++    def __post_init__(self) -> None:
++        object.__setattr__(self, "aliases", MappingProxyType(dict(self.aliases)))
++
++    @property
++    def runtime_inputs(self) -> Tuple[BindingEntry, ...]:
++        return tuple(entry for entry in self.inputs if entry.role == "runtime")
++
++    @property
++    def parameters(self) -> Tuple[BindingEntry, ...]:
++        return tuple(entry for entry in self.inputs if entry.role == "parameter")
++
++    @property
++    def states(self) -> Tuple[BindingEntry, ...]:
++        return tuple(entry for entry in self.inputs if entry.role == "state")
++
++    @property
++    def state_outputs(self) -> Tuple[BindingEntry, ...]:
++        return tuple(entry for entry in self.outputs if entry.role == "state_output")
++
++    @property
++    def regular_outputs(self) -> Tuple[BindingEntry, ...]:
++        return tuple(entry for entry in self.outputs if entry.role == "output")
++
++    def entry_for(self, name: str) -> BindingEntry:
++        canonical = self.aliases.get(name, name)
++        for entry in self.inputs + self.outputs:
++            if entry.name == canonical:
++                return entry
++        raise BindingMismatchError("unknown schema entry {!r}".format(name))
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "schema_version": self.schema_version,
++            "function_name": self.function_name,
++            "graph_digest": self.graph_digest,
++            "counts": {
++                "runtime_inputs": len(self.runtime_inputs),
++                "parameters": len(self.parameters),
++                "states": len(self.states),
++                "outputs": len(self.regular_outputs),
++                "state_outputs": len(self.state_outputs),
++            },
++            "inputs": [entry.to_dict() for entry in self.inputs],
++            "outputs": [entry.to_dict() for entry in self.outputs],
++            "aliases": dict(self.aliases),
++        }
++
++    def canonical_json(self) -> str:
++        return _canonical_json(self.to_dict())
++
++
++def _as_names(value: Any, field_name: str) -> Tuple[str, ...]:
++    if value is None:
++        return ()
++    if isinstance(value, (str, bytes)):
++        raise BindingMismatchError("{} must be a sequence of names".format(field_name))
++    try:
++        result = tuple(value)
++    except TypeError as exc:
++        raise BindingMismatchError("{} must be a sequence of names".format(field_name)) from exc
++    for index, name in enumerate(result):
++        if not isinstance(name, str) or not name:
++            raise BindingMismatchError("{}[{}] must be a non-empty string".format(field_name, index))
++    if len(set(result)) != len(result):
++        raise BindingMismatchError("{} contains duplicate names".format(field_name))
++    return result
++
++
++def _metadata_ref(metadata: Mapping[str, Any], name: str) -> Optional[Mapping[str, Any]]:
++    values = metadata.get("runtime_inputs")
++    if values is None:
++        return None
++    for value in values:
++        if isinstance(value, Mapping) and value.get("name") == name:
++            return value
++    return None
++
++
++def _ref_contract(ref: ValueRef) -> Tuple[str, Tuple[int, ...], int]:
++    dtype = _canonical_dtype(ref.type.dtype)
++    shape = _checked_shape(ref.type.shape, "{}.shape".format(ref.name))
++    return dtype, shape, _expected_nbytes(dtype, shape)
++
++
++def _entry_from_ref(
++    ref: ValueRef,
++    ordinal: int,
++    role: str,
++    storage_id: str,
++    readonly: bool,
++) -> BindingEntry:
++    dtype, shape, nbytes = _ref_contract(ref)
++    return BindingEntry(ordinal, ref.name, role, dtype, shape, nbytes, storage_id, readonly)
++
++
++def build_binding_schema(program: CoreProgram, entrypoint: Optional[str] = None) -> BindingSchema:
++    """Derive a fail-closed schema from exact Core function parameters.
++
++    Runtime and state groups come from explicit graph metadata.  Model
++    parameters are the exact ordered remainder, and a present
++    ``parameter_function_inputs`` metadata list must match that remainder
++    byte-for-byte in order.  This catches the historical ``"weight"`` name
++    filter, including omitted ``A_log``/``dt_bias`` parameters.
++    """
++
++    if not isinstance(program, CoreProgram):
++        raise RuntimeBindingError("program must be CoreProgram")
++    program.verify()
++    if entrypoint is None:
++        if len(program.functions) != 1:
++            raise RuntimeBindingError("entrypoint is required for a multi-function CoreProgram")
++        function = program.functions[0]
++    else:
++        function = next((item for item in program.functions if item.name == entrypoint), None)
++        if function is None:
++            raise RuntimeBindingError("entrypoint {!r} is not present in CoreProgram".format(entrypoint))
++
++    metadata = program.metadata
++    runtime_metadata = metadata.get("runtime_inputs", ())
++    if isinstance(runtime_metadata, (str, bytes)):
++        raise BindingMismatchError("runtime_inputs must be a sequence of objects")
++    try:
++        runtime_metadata = tuple(runtime_metadata)
++    except TypeError as exc:
++        raise BindingMismatchError("runtime_inputs must be a sequence of objects") from exc
++    if any(not isinstance(item, Mapping) for item in runtime_metadata):
++        raise BindingMismatchError("runtime_inputs entries must be mappings")
++    runtime_names = _as_names(
++        tuple(item.get("name") for item in runtime_metadata),
++        "runtime_inputs",
++    )
++    state_names = _as_names(metadata.get("state_input_names", ()), "state_input_names")
++    parameter_names = _as_names(metadata.get("parameter_function_inputs"), "parameter_function_inputs")
++    parameter_input_names = _as_names(metadata.get("parameter_input_names"), "parameter_input_names")
++    if parameter_input_names and parameter_names and parameter_input_names != parameter_names:
++        raise BindingMismatchError(
++            "parameter_input_names does not match parameter_function_inputs"
++        )
++    if not parameter_names:
++        parameter_names = parameter_input_names
++    exact_names = tuple(ref.name for ref in function.parameters)
++    exact_set = set(exact_names)
++    if len(exact_names) != len(exact_set):
++        raise BindingMismatchError("Core function parameters contain duplicate names")
++    for group_name, names in (("runtime_inputs", runtime_names), ("state_input_names", state_names)):
++        unknown = tuple(name for name in names if name not in exact_set)
++        if unknown:
++            raise BindingMismatchError("{} contains unknown parameters {}".format(group_name, unknown))
++    if set(runtime_names) & set(state_names):
++        raise BindingMismatchError("runtime and state input groups overlap")
++    expected_parameter_names = tuple(
++        name for name in exact_names if name not in set(runtime_names) and name not in set(state_names)
++    )
++    if parameter_names and parameter_names != expected_parameter_names:
++        raise BindingMismatchError(
++            "parameter_function_inputs does not match exact parameter remainder: expected {}, got {}".format(
++                expected_parameter_names, parameter_names
++            )
++        )
++    if not parameter_names:
++        parameter_names = expected_parameter_names
++    role_by_name = {}
++    role_by_name.update({name: "runtime" for name in runtime_names})
++    role_by_name.update({name: "state" for name in state_names})
++    role_by_name.update({name: "parameter" for name in parameter_names})
++    if set(role_by_name) != exact_set or len(role_by_name) != len(exact_names):
++        raise BindingMismatchError("function parameters are not partitioned exactly into runtime/parameter/state")
++
++    tied = metadata.get("tied_weight", {})
++    tied_name = tied.get("function_parameter") if isinstance(tied, Mapping) else None
++    tied_storage = tied.get("storage_id") if isinstance(tied, Mapping) else None
++    if tied_name is not None and (not isinstance(tied_name, str) or tied_name not in exact_set):
++        raise BindingMismatchError("tied_weight.function_parameter is not an exact parameter")
++    if tied_storage is not None and (not isinstance(tied_storage, str) or not tied_storage):
++        raise BindingMismatchError("tied_weight.storage_id must be a non-empty string")
++
++    entries = []
++    for ordinal, ref in enumerate(function.parameters):
++        role = role_by_name[ref.name]
++        if role == "runtime":
++            storage_id = "runtime:" + ref.name
++        elif role == "state":
++            storage_id = "state:" + ref.name
++        elif tied_name == ref.name and tied_storage:
++            storage_id = tied_storage
++        else:
++            storage_id = "parameter:" + ref.name
++        entries.append(_entry_from_ref(ref, ordinal, role, storage_id, True))
++
++        contract = _metadata_ref(metadata, ref.name)
++        if contract is not None:
++            contract_dtype = _canonical_dtype(contract.get("dtype"))
++            contract_shape = _checked_shape(contract.get("shape", ()), "runtime_inputs.{}.shape".format(ref.name))
++            ref_dtype, ref_shape, _ = _ref_contract(ref)
++            if (contract_dtype, contract_shape) != (ref_dtype, ref_shape):
++                raise BindingMismatchError("runtime metadata does not match exact parameter {!r}".format(ref.name))
++
++    state_output_names = _as_names(metadata.get("state_output_names", ()), "state_output_names")
++    return_names = tuple(ref.name for ref in function.returns)
++    if len(set(return_names)) != len(return_names):
++        raise BindingMismatchError("Core function returns contain duplicate names")
++    if any(name not in return_names for name in state_output_names):
++        raise BindingMismatchError("state_output_names contains a non-return value")
++    if len(set(state_output_names)) != len(state_output_names):
++        raise BindingMismatchError("state_output_names contains duplicates")
++    outputs = []
++    for ordinal, ref in enumerate(function.returns):
++        role = "state_output" if ref.name in set(state_output_names) else "output"
++        storage_id = ("state_output:" if role == "state_output" else "output:") + ref.name
++        outputs.append(_entry_from_ref(ref, ordinal, role, storage_id, False))
++
++    aliases = {}
++    if isinstance(tied, Mapping):
++        for alias in tied.get("aliases", ()):
++            if not isinstance(alias, str) or not alias:
++                raise BindingMismatchError("tied_weight.aliases must contain non-empty strings")
++            if alias in exact_set:
++                raise BindingMismatchError("tied weight alias collides with exact parameter {!r}".format(alias))
++            if alias in aliases:
++                raise BindingMismatchError("duplicate tied weight alias {!r}".format(alias))
++            aliases[alias] = tied_name
++
++    graph_kind = metadata.get("graph_kind")
++    if graph_kind == "text_decoder_full_no_weight":
++        counts = (len(runtime_names), len(parameter_names), len(state_names))
++        if counts != (3, 320, 48):
++            raise BindingMismatchError(
++                "Qwen3.5 decoder requires 3 runtime, 320 parameter and 48 state inputs; got {}".format(counts)
++            )
++
++    graph_digest = hashlib.sha256(program.canonical_json().encode("utf-8")).hexdigest()
++    return BindingSchema(
++        function.name,
++        graph_digest,
++        tuple(entries),
++        tuple(outputs),
++        aliases,
++    )
++
++
++@dataclass(frozen=True)
++class PackedRegion:
++    """One metadata-only region in a deterministic packed storage layout."""
++
++    storage_id: str
++    role: str
++    dtype: str
++    shape: Tuple[int, ...]
++    nbytes: int
++    offset: int
++    alignment: int
++    logical_names: Tuple[str, ...]
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "storage_id": self.storage_id,
++            "role": self.role,
++            "dtype": self.dtype,
++            "shape": list(self.shape),
++            "nbytes": self.nbytes,
++            "offset": self.offset,
++            "alignment": self.alignment,
++            "logical_names": list(self.logical_names),
++        }
++
++
++@dataclass(frozen=True)
++class PackedLayout:
++    """Deterministic offsets without allocating a packed data file."""
++
++    schema_digest: str
++    alignment: int
++    regions: Tuple[PackedRegion, ...]
++    total_nbytes: int
++    layout_version: int = PACKED_LAYOUT_VERSION
++
++    def region_for(self, logical_name: str) -> PackedRegion:
++        for region in self.regions:
++            if logical_name in region.logical_names:
++                return region
++        raise BindingMismatchError("packed layout has no logical name {!r}".format(logical_name))
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "layout_version": self.layout_version,
++            "schema_digest": self.schema_digest,
++            "alignment": self.alignment,
++            "total_nbytes": self.total_nbytes,
++            "regions": [region.to_dict() for region in self.regions],
++        }
++
++    def canonical_json(self) -> str:
++        return _canonical_json(self.to_dict())
++
++
++def _align_up(value: int, alignment: int) -> int:
++    remainder = value % alignment
++    if not remainder:
++        return value
++    increment = alignment - remainder
++    if value > UINT64_MAX - increment:
++        raise RuntimeBindingError("packed layout offset exceeds uint64")
++    return value + increment
++
++
++def build_packed_layout(schema: BindingSchema, alignment: int = DEFAULT_PACK_ALIGNMENT) -> PackedLayout:
++    """Compute parameter/state offsets only; never allocate backing storage."""
++
++    if not isinstance(schema, BindingSchema):
++        raise RuntimeBindingError("schema must be BindingSchema")
++    normalized_alignment = _positive_alignment(alignment)
++    offset = 0
++    regions = []
++    by_storage = {}
++    aliases_by_name = dict(schema.aliases)
++    for entry in schema.parameters + schema.states:
++        existing = by_storage.get(entry.storage_id)
++        if existing is not None:
++            if existing.role != entry.role or existing.dtype != entry.dtype or existing.shape != entry.shape:
++                raise BindingMismatchError("storage_id {!r} is reused with incompatible contracts".format(entry.storage_id))
++            names = tuple(existing.logical_names) + (entry.name,)
++            replacement = PackedRegion(
++                existing.storage_id,
++                existing.role,
++                existing.dtype,
++                existing.shape,
++                existing.nbytes,
++                existing.offset,
++                existing.alignment,
++                names,
++            )
++            regions[regions.index(existing)] = replacement
++            by_storage[entry.storage_id] = replacement
++            continue
++        offset = _align_up(offset, normalized_alignment)
++        region = PackedRegion(
++            entry.storage_id,
++            entry.role,
++            entry.dtype,
++            entry.shape,
++            entry.nbytes,
++            offset,
++            normalized_alignment,
++            (entry.name,),
++        )
++        regions.append(region)
++        by_storage[entry.storage_id] = region
++        if offset > UINT64_MAX - entry.nbytes:
++            raise RuntimeBindingError("packed layout total exceeds uint64")
++        offset += entry.nbytes
++
++    # Tied embedding/lm-head aliases are logical names of one region.  They
++    # never add a second descriptor or a second byte range.
++    if aliases_by_name:
++        updated_regions = []
++        for region in regions:
++            names = list(region.logical_names)
++            for alias, canonical in aliases_by_name.items():
++                if canonical in names and alias not in names:
++                    names.append(alias)
++            updated = PackedRegion(
++                region.storage_id,
++                region.role,
++                region.dtype,
++                region.shape,
++                region.nbytes,
++                region.offset,
++                region.alignment,
++                tuple(names),
++            )
++            updated_regions.append(updated)
++        regions = updated_regions
++    return PackedLayout(schema.graph_digest, normalized_alignment, tuple(regions), offset)
++
++
++def bind_packed_region(
++    layout: PackedLayout,
++    logical_name: str,
++    buffer: Any,
++    *,
++    readonly: Optional[bool] = None,
++    lifetime: str = "caller-owned-until-completion",
++) -> BufferBinding:
++    """Create a zero-copy binding for one metadata-only packed region."""
++
++    region = layout.region_for(logical_name)
++    if readonly is None:
++        readonly = region.role in ("parameter", "state")
++    return BufferBinding.from_buffer(
++        buffer,
++        region.storage_id,
++        region.dtype,
++        region.shape,
++        byte_offset=region.offset,
++        nbytes=region.nbytes,
++        readonly=readonly,
++        alignment=region.alignment,
++        lifetime=lifetime,
++    )
++
++
++def _normalize_bindings(
++    schema: BindingSchema,
++    values: Mapping[str, BufferBinding],
++    entries: Sequence[BindingEntry],
++    group_name: str,
++    *,
++    allow_aliases: bool = False,
++) -> Dict[str, BufferBinding]:
++    if not isinstance(values, Mapping):
++        raise RuntimeBindingError("{} bindings must be a mapping".format(group_name))
++    expected = {entry.name: entry for entry in entries}
++    normalized = {}
++    for name, binding in values.items():
++        if not isinstance(name, str):
++            raise RuntimeBindingError("{} binding names must be strings".format(group_name))
++        canonical = schema.aliases.get(name, name) if allow_aliases else name
++        if canonical is None or canonical not in expected:
++            raise BindingMismatchError("{} contains extra binding {!r}".format(group_name, name))
++        if canonical in normalized:
++            raise BindingMismatchError(
++                "{} supplies duplicate logical bindings for {!r}".format(group_name, canonical)
++            )
++        if not isinstance(binding, BufferBinding):
++            raise RuntimeBindingError("{}[{}] must be BufferBinding".format(group_name, name))
++        entry = expected[canonical]
++        binding.validate()
++        if (binding.dtype, binding.shape, binding.nbytes) != (entry.dtype, entry.shape, entry.nbytes):
++            raise BindingMismatchError("{} binding {!r} dtype/shape/nbytes mismatch".format(group_name, name))
++        if binding.storage_id != entry.storage_id:
++            raise BindingMismatchError(
++                "{} binding {!r} storage_id {!r} does not match expected {!r}".format(
++                    group_name, name, binding.storage_id, entry.storage_id
++                )
++            )
++        if entry.readonly and not binding.readonly:
++            raise BindingMismatchError("{} binding {!r} must be read-only".format(group_name, name))
++        if not entry.readonly and binding.readonly:
++            raise BindingMismatchError("{} binding {!r} must be mutable".format(group_name, name))
++        normalized[canonical] = binding
++    missing = tuple(entry.name for entry in entries if entry.name not in normalized)
++    if missing:
++        raise BindingMismatchError("{} is missing bindings {}".format(group_name, missing))
++    storage_ids = {}
++    for name, binding in normalized.items():
++        previous = storage_ids.get(binding.storage_id)
++        if previous is not None and previous != name:
++            raise BindingMismatchError(
++                "{} reuses storage_id {!r} for {!r} and {!r}".format(
++                    group_name, binding.storage_id, previous, name
++                )
++            )
++        storage_ids[binding.storage_id] = name
++    return normalized
++
++
++def ordered_input_descriptors(
++    schema: BindingSchema,
++    runtime_bindings: Mapping[str, BufferBinding],
++    parameter_bindings: Mapping[str, BufferBinding],
++    state_bindings: Mapping[str, BufferBinding],
++    *,
++    device: str = "cpu",
++) -> Tuple[TensorDesc, ...]:
++    """Validate groups and assemble descriptors in exact Core parameter order."""
++
++    runtime = _normalize_bindings(schema, runtime_bindings, schema.runtime_inputs, "runtime")
++    parameters = _normalize_bindings(
++        schema, parameter_bindings, schema.parameters, "parameter", allow_aliases=True
++    )
++    states = _normalize_bindings(schema, state_bindings, schema.states, "state")
++    result = []
++    for entry in schema.inputs:
++        binding = {"runtime": runtime, "parameter": parameters, "state": states}[entry.role][entry.name]
++        result.append(binding.to_tensor_desc(device=device))
++    return tuple(result)
++
++
++def _normalize_outputs(
++    schema: BindingSchema,
++    values: Mapping[str, BufferBinding],
++    entries: Sequence[BindingEntry],
++    group_name: str,
++) -> Dict[str, BufferBinding]:
++    return _normalize_bindings(schema, values, entries, group_name, allow_aliases=False)
++
++
++def assemble_launch_request(
++    schema: BindingSchema,
++    artifact: Artifact,
++    runtime_bindings: Mapping[str, BufferBinding],
++    parameter_bindings: Mapping[str, BufferBinding],
++    state_bindings: Mapping[str, BufferBinding],
++    outputs: Mapping[str, BufferBinding],
++    state_outputs: Mapping[str, BufferBinding],
++    *,
++    device: str = "cpu",
++) -> LaunchRequest:
++    """Assemble and validate a vendor-neutral request without executing it.
++
++    ``outputs`` and ``state_outputs`` are intentionally separate.  The latter
++    makes the functional state ABI explicit and prevents a mutable state
++    return from being confused with an immutable state input.
++    """
++
++    if not isinstance(schema, BindingSchema):
++        raise RuntimeBindingError("schema must be BindingSchema")
++    if not isinstance(artifact, Artifact):
++        raise RuntimeBindingError("artifact must be Artifact")
++    if artifact.entrypoint != schema.function_name:
++        raise BindingMismatchError("artifact entrypoint does not match binding schema function")
++    inputs = ordered_input_descriptors(
++        schema,
++        runtime_bindings,
++        parameter_bindings,
++        state_bindings,
++        device=device,
++    )
++    regular = _normalize_outputs(schema, outputs, schema.regular_outputs, "output")
++    states = _normalize_outputs(schema, state_outputs, schema.state_outputs, "state_output")
++    output_descriptors = tuple(
++        {"output": regular, "state_output": states}[entry.role][entry.name].to_tensor_desc(device=device)
++        for entry in schema.outputs
++    )
++    request = LaunchRequest(
++        artifact,
++        entrypoint=schema.function_name,
++        inputs=inputs,
++        outputs=output_descriptors,
++    )
++    request.validate(require_storage=True)
++    return request
++
++
++# Short names make the seam discoverable without imposing a second public ABI.
++ExternalBuffer = BufferBinding
++TypedBufferBinding = BufferBinding
++build_binding_contract = build_binding_schema
++build_external_buffer = BufferBinding.from_buffer
++build_packed_file_layout = build_packed_layout
++assemble_launcher_request = assemble_launch_request
++
++
++__all__ = [
++    "BINDING_SCHEMA_VERSION",
++    "BindingEntry",
++    "BindingMismatchError",
++    "BindingSchema",
++    "BufferBinding",
++    "DEFAULT_PACK_ALIGNMENT",
++    "ExternalBuffer",
++    "PACKED_LAYOUT_VERSION",
++    "PackedLayout",
++    "PackedRegion",
++    "RuntimeBindingError",
++    "UINT64_MAX",
++    "TypedBufferBinding",
++    "assemble_launch_request",
++    "assemble_launcher_request",
++    "bind_packed_region",
++    "build_binding_contract",
++    "build_binding_schema",
++    "build_external_buffer",
++    "build_packed_file_layout",
++    "build_packed_layout",
++    "ordered_input_descriptors",
++]
+diff --git a/python/tests/ut/pypto_x/qwen35_runtime_binding_metadata_driver.py b/python/tests/ut/pypto_x/qwen35_runtime_binding_metadata_driver.py
+new file mode 100644
+index 000000000..6b5b32cdd
+--- /dev/null
++++ b/python/tests/ut/pypto_x/qwen35_runtime_binding_metadata_driver.py
+@@ -0,0 +1,68 @@
++"""Auditable M1J real-profile metadata-only layout driver.
++
++The driver constructs Core metadata and computes offsets only.  It never opens
++an external checkpoint and never allocates a parameter/state backing buffer.
++Run it through ``run_local_heavy.sh`` because the real graph has model-sized
++shape metadata even though its storage remains symbolic.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import resource
++from pathlib import Path
++
++from pypto.portable.qwen35 import build_qwen35_text_decoder_graph
++from pypto.portable.runtime_binding import build_binding_schema, build_packed_layout
++
++
++def _rss_kib():
++    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--output", required=True)
++    args = parser.parse_args()
++    rss_before = _rss_kib()
++    program = build_qwen35_text_decoder_graph(1, 1, past_length=4096, shape_profile="model")
++    schema = build_binding_schema(program)
++    layout = build_packed_layout(schema)
++    rss_after = _rss_kib()
++    result = {
++        "status": "PASS",
++        "weights_loaded": False,
++        "buffers_allocated": False,
++        "graph_kind": program.metadata["graph_kind"],
++        "shape_profile": program.metadata["shape_profile"],
++        "graph_digest": schema.graph_digest,
++        "counts": {
++            "runtime_inputs": len(schema.runtime_inputs),
++            "parameters": len(schema.parameters),
++            "states": len(schema.states),
++            "outputs": len(schema.regular_outputs),
++            "state_outputs": len(schema.state_outputs),
++        },
++        "parameter_bytes_from_graph_manifest": int(program.metadata["parameter_byte_count"]),
++        "packed_region_count": len(layout.regions),
++        "packed_total_nbytes": layout.total_nbytes,
++        "packed_alignment": layout.alignment,
++        "tied_alias_storage_id": layout.region_for("embedding.weight").storage_id,
++        "tied_alias_region_count": sum(
++            1 for region in layout.regions if "embedding.weight" in region.logical_names
++        ),
++        "schema_json_bytes": len(schema.canonical_json().encode("utf-8")),
++        "layout_json_bytes": len(layout.canonical_json().encode("utf-8")),
++        "rss_maxrss_kib_before": rss_before,
++        "rss_maxrss_kib_after": rss_after,
++        "rss_delta_kib": rss_after - rss_before,
++    }
++    output = Path(args.output)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    output.write_text(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
++    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/tests/ut/pypto_x/test_qwen35_runtime_binding.py b/python/tests/ut/pypto_x/test_qwen35_runtime_binding.py
+new file mode 100644
+index 000000000..907907aae
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_qwen35_runtime_binding.py
+@@ -0,0 +1,247 @@
++"""M1J external-buffer binding contract tests.
++
++These tests use only synthetic shapes and tiny temporary storage.  The model
++profile layout is exercised separately by the metadata-only driver so this
++module never allocates a Qwen checkpoint-sized buffer.
++"""
++
++from __future__ import annotations
++
++import mmap
++from pathlib import Path
++
++import pytest
++
++from pypto.portable.qwen35 import build_qwen35_text_decoder_graph
++from pypto.portable.runtime_binding import (
++    BindingMismatchError,
++    BufferBinding,
++    RuntimeBindingError,
++    UINT64_MAX,
++    assemble_launch_request,
++    bind_packed_region,
++    build_binding_schema,
++    build_packed_layout,
++    ordered_input_descriptors,
++)
++from pypto.compiler.artifact import Artifact
++from pypto.target import TargetSpec
++
++
++def _schema():
++    return build_binding_schema(build_qwen35_text_decoder_graph(1, 1, shape_profile="synthetic_test"))
++
++
++def _small_storage(nbytes):
++    return bytearray(max(1, nbytes))
++
++
++def _make_bindings(schema):
++    layout = build_packed_layout(schema)
++    packed = bytearray(max(1, layout.total_nbytes))
++    runtime = {
++        entry.name: BufferBinding.from_buffer(
++            _small_storage(entry.nbytes),
++            entry.storage_id,
++            entry.dtype,
++            entry.shape,
++            readonly=True,
++        )
++        for entry in schema.runtime_inputs
++    }
++    parameters = {
++        entry.name: bind_packed_region(layout, entry.name, packed)
++        for entry in schema.parameters
++    }
++    states = {
++        entry.name: bind_packed_region(layout, entry.name, packed)
++        for entry in schema.states
++    }
++    outputs = {
++        entry.name: BufferBinding.from_buffer(
++            _small_storage(entry.nbytes),
++            entry.storage_id,
++            entry.dtype,
++            entry.shape,
++            readonly=False,
++        )
++        for entry in schema.regular_outputs
++    }
++    state_outputs = {
++        entry.name: BufferBinding.from_buffer(
++            _small_storage(entry.nbytes),
++            entry.storage_id,
++            entry.dtype,
++            entry.shape,
++            readonly=False,
++        )
++        for entry in schema.state_outputs
++    }
++    return layout, packed, runtime, parameters, states, outputs, state_outputs
++
++
++def test_schema_uses_exact_parameter_remainder_and_keeps_gdr_parameters():
++    schema = _schema()
++    assert len(schema.runtime_inputs) == 3
++    assert len(schema.parameters) == 320
++    assert len(schema.states) == 48
++    assert tuple(entry.ordinal for entry in schema.inputs) == tuple(range(371))
++    assert set(entry.name for entry in schema.inputs) == set(
++        entry.name for entry in schema.runtime_inputs + schema.parameters + schema.states
++    )
++    gdr_names = [entry.name for entry in schema.parameters if entry.name.endswith(("_A_log", "_dt_bias"))]
++    assert len(gdr_names) == 36
++    assert schema.entry_for("embedding.weight").name == "embedding_lm_head_shared_weight"
++    assert schema.entry_for("lm_head.weight").storage_id == "embedding_lm_head_shared_weight"
++    assert schema.canonical_json() == _schema().canonical_json()
++
++
++def test_readonly_mmap_and_bytes_are_zero_copy_contract_bindings(tmp_path):
++    path = Path(tmp_path) / "tiny.bin"
++    path.write_bytes(bytes(range(128)))
++    with path.open("r+b") as stream:
++        mapped = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ)
++        binding = BufferBinding.from_buffer(
++            mapped,
++            "parameter:test",
++            "bf16",
++            (8,),
++            byte_offset=64,
++            alignment=64,
++            readonly=True,
++        )
++        assert binding.view.obj is mapped
++        assert binding.owner is mapped
++        assert binding.view.nbytes == 16
++        descriptor = binding.to_tensor_desc()
++        assert descriptor.handle is binding.view
++        assert descriptor.readonly is True
++        with pytest.raises(RuntimeBindingError):
++            BufferBinding.from_buffer(mapped, "bad", "bf16", (8,), byte_offset=65, alignment=64)
++        with pytest.raises(RuntimeBindingError):
++            BufferBinding.from_buffer(mapped, "bad", "bf16", (33,), byte_offset=64, alignment=64)
++        with pytest.raises(RuntimeBindingError):
++            BufferBinding.from_buffer(memoryview(bytearray(32))[::2], "bad", "bf16", (8,))
++        # A read-only bytes object remains a valid contract binding, while a
++        # mutable output request fails closed before any backend sees it.
++        raw = bytes(16)
++        readonly_bytes = BufferBinding.from_buffer(raw, "parameter:bytes", "bf16", (8,), readonly=True)
++        assert readonly_bytes.view.obj is raw
++        with pytest.raises(RuntimeBindingError):
++            BufferBinding.from_buffer(raw, "output:bytes", "bf16", (8,), readonly=False)
++        binding.view.release()
++        mapped.close()
++
++
++def test_uint64_overflow_is_rejected_before_storage_access():
++    with pytest.raises(RuntimeBindingError, match="uint64"):
++        BufferBinding.from_buffer(bytearray(1), "overflow", "float32", (UINT64_MAX, 2))
++    with pytest.raises(RuntimeBindingError, match="uint64"):
++        BufferBinding.from_buffer(bytearray(1), "overflow", "uint8", (1,), byte_offset=UINT64_MAX + 1)
++    with pytest.raises(RuntimeBindingError, match="uint64"):
++        BufferBinding.from_buffer(bytearray(1), "overflow", "uint8", (1,), nbytes=UINT64_MAX + 1)
++
++
++def test_layout_alias_ordering_and_launcher_assembly_are_zero_copy():
++    schema = _schema()
++    layout, packed, runtime, parameters, states, outputs, state_outputs = _make_bindings(schema)
++    embedding_region = layout.region_for("embedding.weight")
++    lm_head_region = layout.region_for("lm_head.weight")
++    assert embedding_region is lm_head_region
++    assert embedding_region.storage_id == "embedding_lm_head_shared_weight"
++    assert embedding_region.logical_names == (
++        "embedding_lm_head_shared_weight",
++        "embedding.weight",
++        "lm_head.weight",
++    )
++    assert layout.total_nbytes >= embedding_region.nbytes
++    descriptors = ordered_input_descriptors(schema, runtime, parameters, states)
++    assert len(descriptors) == 371
++    for descriptor, entry in zip(descriptors, schema.inputs):
++        binding = {
++            "runtime": runtime,
++            "parameter": parameters,
++            "state": states,
++        }[entry.role][entry.name]
++        assert descriptor.handle is binding.view
++        assert descriptor.shape == entry.shape
++        assert descriptor.dtype == entry.dtype
++    aliased_parameters = dict(parameters)
++    shared_binding = aliased_parameters.pop("embedding_lm_head_shared_weight")
++    aliased_parameters["embedding.weight"] = shared_binding
++    aliased_descriptors = ordered_input_descriptors(
++        schema=schema,
++        runtime_bindings=runtime,
++        parameter_bindings=aliased_parameters,
++        state_bindings=states,
++    )
++    assert aliased_descriptors[3].handle is shared_binding.view
++    artifact = Artifact(
++        format="binding-only",
++        entrypoint=schema.function_name,
++        target=TargetSpec("cpu", "x86_64-linux-gnu"),
++        payload=b"metadata-only",
++    )
++    request = assemble_launch_request(
++        schema,
++        artifact,
++        runtime,
++        parameters,
++        states,
++        outputs,
++        state_outputs,
++    )
++    assert tuple(item.handle for item in request.inputs) == tuple(item.handle for item in descriptors)
++    assert len(request.outputs) == len(schema.outputs)
++    assert request.inputs[3].handle.obj is packed
++
++
++def test_binding_tamper_missing_extra_and_mutability_fail_closed():
++    schema = _schema()
++    layout, packed, runtime, parameters, states, outputs, state_outputs = _make_bindings(schema)
++    del layout, packed
++    broken_parameters = dict(parameters)
++    first = schema.parameters[0]
++    broken_parameters[first.name] = BufferBinding.from_buffer(
++        _small_storage(first.nbytes),
++        "parameter:tampered",
++        first.dtype,
++        first.shape,
++        readonly=True,
++    )
++    with pytest.raises(BindingMismatchError, match="storage_id"):
++        ordered_input_descriptors(schema, runtime, broken_parameters, states)
++    missing_runtime = dict(runtime)
++    missing_runtime.pop(schema.runtime_inputs[0].name)
++    with pytest.raises(BindingMismatchError, match="missing"):
++        ordered_input_descriptors(schema, missing_runtime, parameters, states)
++    extra_runtime = dict(runtime)
++    extra_runtime["extra"] = runtime[schema.runtime_inputs[0].name]
++    with pytest.raises(BindingMismatchError, match="extra"):
++        ordered_input_descriptors(schema, extra_runtime, parameters, states)
++    mutable_state = dict(states)
++    state = schema.states[0]
++    mutable_state[state.name] = BufferBinding.from_buffer(
++        _small_storage(state.nbytes), state.storage_id, state.dtype, state.shape, readonly=False
++    )
++    with pytest.raises(BindingMismatchError, match="read-only"):
++        ordered_input_descriptors(schema, runtime, parameters, mutable_state)
++    readonly_output = dict(state_outputs)
++    state_output = schema.state_outputs[0]
++    readonly_output[state_output.name] = BufferBinding.from_buffer(
++        _small_storage(state_output.nbytes),
++        state_output.storage_id,
++        state_output.dtype,
++        state_output.shape,
++        readonly=True,
++    )
++    artifact = Artifact(
++        format="binding-only",
++        entrypoint=schema.function_name,
++        target=TargetSpec("cpu", "x86_64-linux-gnu"),
++        payload=b"metadata-only",
++    )
++    with pytest.raises(BindingMismatchError, match="mutable"):
++        assemble_launch_request(
++            schema, artifact, runtime, parameters, states, outputs, readonly_output
++        )

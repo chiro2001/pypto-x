@@ -1,0 +1,326 @@
+From c15e16d1ec7afc62c6800e2e01725c7b70ca772f Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Thu, 10 Sep 2026 17:44:10 +0800
+Subject: [PATCH 95/96] test(pypto-x): truthful execution modes, liveness A/B
+ and per-layer debug bisect in the weighted driver
+
+- OpRecorder/InstrumentedAvx512Runtime now classify every operation from
+  Avx512Runtime.plan_execution instead of a static name table, so packed
+  native kernels are reported truthfully and the list-materialization guard
+  still fires on any real host-reference fallback.
+- S1 records per-output digests so a liveness on/off A/B can be compared
+  bit-for-bit.
+- --disable-liveness-release, --debug-hidden-states, --debug-extra-returns,
+  --debug-dump and --debug-decay-exp-a-log add debug-only observability; the
+  public 51-return binding contract is unchanged.
+---
+ python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py | 222 ++++++++++++++++++++++++++++++--
+ 1 file changed, 213 insertions(+), 9 deletions(-)
+
+diff --git a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+index 73cb382f3..93dce7a60 100644
+--- a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
++++ b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+@@ -414,10 +414,106 @@ class TimedCudaDriver:
+ # --------------------------------------------------------------------------
+ 
+ 
+-def build_graph(steps: int, past_length: int, shape_profile: str = "model"):
++def _debug_extra_return_names(args: argparse.Namespace) -> Tuple[str, ...]:
++    raw = getattr(args, "debug_extra_returns", "") or ""
++    names = tuple(item.strip() for item in str(raw).split(",") if item.strip())
++    return names
++
++
++def rewrite_decay_gate_to_exp_a_log(program: Any) -> Tuple[Any, int]:
++    """调试副本：把 GDR decay 门从 ``-A_log`` 改成官方 ``-exp(A_log)``。
++
++    只改这一处 SSA：``neg(a_log_full)`` -> ``neg(exp(a_log_full))``，并
++    保持算子顺序与返回契约不变。用于证明数值发散的根因，不作为交付实现。
++    """
++
++    from pypto.core_ir import CoreFunction, CoreProgram, Operation, Region, ValueRef
++
++    function = program.functions[0]
++    suffix = "_negative_a_log"
++    rewritten = []
++    count = 0
++    for operation in function.body.operations:
++        names = [ref.name for ref in operation.outputs]
++        if operation.name == "neg" and len(names) == 1 and names[0].endswith(suffix):
++            source = operation.inputs[0]
++            exp_ref = ValueRef(names[0][: -len(suffix)] + "_a_log_exp", source.type)
++            rewritten.append(Operation("exp", (source,), (exp_ref,), {}))
++            rewritten.append(
++                Operation("neg", (exp_ref,), operation.outputs, dict(operation.attributes))
++            )
++            count += 1
++            continue
++        rewritten.append(operation)
++    if count == 0:
++        raise DriverError("no GDR decay gate matched for the exp(A_log) debug rewrite")
++    body = Region(tuple(rewritten))
++    rebuilt = CoreProgram(
++        functions=(CoreFunction(function.name, function.parameters, function.returns, body),),
++        metadata=program.metadata,
++    )
++    return rebuilt, count
++
++
++def debug_hidden_state_names(program: Any) -> Tuple[str, ...]:
++    """返回与 gold ``hidden_states_layers`` 一一对应的中间 SSA 名字。
++
++    索引 0 = embedding 之后的 hidden（layer_hidden_inputs[0]），索引 i+1 =
++    第 i 层输出（layer_hidden_outputs[i]）。只读图元数据，不改图。
++    """
++
++    metadata = program.metadata
++    inputs = tuple(metadata.get("layer_hidden_inputs", ()))
++    outputs = tuple(metadata.get("layer_hidden_outputs", ()))
++    if not inputs or not outputs:
++        raise DriverError("graph metadata has no layer hidden-state chain")
++    return (inputs[0],) + outputs
++
++
++def extend_returns(program: Any, names: Sequence[str]) -> Any:
++    """在**副本**上把已存在的中间 SSA 值追加为图返回值（公开 48+3 返回契约不变）。
++
++    调试专用：不改任何算子、不改参数、不改绑定 schema 的输入分组；只是让
++    launcher 能把逐层 hidden state 取出来做 bisect。
++    """
++
++    from pypto.core_ir import CoreFunction, CoreProgram
++
++    function = program.functions[0]
++    available = {ref.name: ref for ref in function.parameters}
++    for operation in function.body.operations:
++        for ref in operation.outputs:
++            available[ref.name] = ref
++    missing = [name for name in names if name not in available]
++    if missing:
++        raise DriverError("debug hidden states are not in the graph: {}".format(missing))
++    existing = set(ref.name for ref in function.returns)
++    ordered: List[str] = []
++    for name in names:
++        if name in existing or name in ordered:
++            continue
++        ordered.append(name)
++    extra = tuple(available[name] for name in ordered)
++    returns = tuple(function.returns) + extra
++    extended = CoreFunction(function.name, function.parameters, returns, function.body)
++    return CoreProgram(functions=(extended,), metadata=program.metadata)
++
++
++def build_graph(steps: int, past_length: int, shape_profile: str = "model",
++                debug_hidden_states: bool = False, debug_extra_returns: Sequence[str] = (),
++                debug_decay_exp_a_log: bool = False):
+     program = build_qwen35_text_decoder_graph(
+         1, steps, past_length=past_length, shape_profile=shape_profile
+     )
++    if debug_decay_exp_a_log:
++        program, _rewritten = rewrite_decay_gate_to_exp_a_log(program)
++    extra_names: Tuple[str, ...] = ()
++    if debug_hidden_states:
++        extra_names += debug_hidden_state_names(program)
++    if debug_extra_returns:
++        extra_names += tuple(debug_extra_returns)
++    if extra_names:
++        program = extend_returns(program, extra_names)
+     schema = build_binding_schema(program)
+     layout = build_packed_layout(schema)
+     return program, schema, layout
+@@ -1524,6 +1620,18 @@ def stage_s1(args: argparse.Namespace) -> Mapping[str, Any]:
+         output_storage[entry.name][:64] == bytes([CANARY]) * 64
+         for entry in schema.outputs
+     )
++    # 逐输出摘要：S1 也留可比较的逐位证据（liveness 开/关 A/B 用）。
++    result["outputs"] = {
++        entry.name: {
++            "dtype": entry.dtype,
++            "shape": list(entry.shape),
++            "nbytes": entry.nbytes,
++            "raw_sha256": hashlib.sha256(
++                bytes(output_storage[entry.name][64:64 + entry.nbytes]) if entry.nbytes else b""
++            ).hexdigest(),
++        }
++        for entry in schema.outputs
++    }
+     result["status"] = "PASS" if error is None else "BLOCKED"
+     return result
+ 
+@@ -1540,7 +1648,13 @@ def _run_once(
+     sin_bits: Sequence[int],
+     build_dir: Path,
+ ) -> Tuple[Mapping[str, Any], Dict[str, bytes], Dict[str, bytes]]:
+-    program, schema, layout = build_graph(steps, past_length)
++    program, schema, layout = build_graph(
++        steps,
++        past_length,
++        debug_hidden_states=getattr(args, "debug_hidden_states", False),
++        debug_extra_returns=_debug_extra_return_names(args),
++        debug_decay_exp_a_log=getattr(args, "debug_decay_exp_a_log", False),
++    )
+     backend = make_backend(args.backend)
+     artifact, compile_info = compile_program(backend, program, build_dir)
+     tie = tie_word_embeddings_from_config(str(Path(args.asset_dir) / "config.json"))
+@@ -1587,6 +1701,11 @@ def _run_once(
+         "synthetic": False,
+         "graph_digest": schema.graph_digest,
+         "operation_total": len(program.functions[0].body.operations),
++        "debug_hidden_state_outputs": (
++            list(debug_hidden_state_names(program))
++            if getattr(args, "debug_hidden_states", False)
++            else []
++        ),
+         "compile": compile_info,
+         "binding": binding_evidence,
+         "launch_seconds": round(launch_seconds, 3),
+@@ -1607,6 +1726,24 @@ def _run_once(
+         },
+     }
+     record["status"] = "PASS" if error is None else "BLOCKED"
++    dump_path = getattr(args, "debug_dump", None)
++    if dump_path:
++        import numpy as np
++
++        arrays: Dict[str, Any] = {}
++        for entry in schema.outputs:
++            payload = raw_outputs[entry.name]
++            if entry.dtype == "bf16":
++                values = (np.frombuffer(payload, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
++            elif entry.dtype == "float32":
++                values = np.frombuffer(payload, dtype=np.float32)
++            elif entry.dtype == "int64":
++                values = np.frombuffer(payload, dtype=np.int64)
++            else:
++                continue
++            arrays[entry.name] = values.reshape(tuple(entry.shape)).copy()
++        np.savez_compressed(str(dump_path), **arrays)
++        record["debug_dump"] = str(dump_path)
+     return record, state_payloads, raw_outputs
+ 
+ 
+@@ -1618,14 +1755,21 @@ def _align_prefill(record: Dict[str, Any], raw: Mapping[str, bytes], reference_d
+         if not path.is_file():
+             continue
+         gold = load_npz(path)
+-        comparisons[variant] = {
++        comparison: Dict[str, Any] = {
+             "logits_vs_prefill_logits": compare_rows(
+                 raw["logits"], "bf16", gold["prefill_logits"], steps, 248320, "logits"
+             ),
+-            "final_hidden_vs_last_hidden_state": compare_rows(
+-                raw["final_hidden"], "bf16", gold["last_hidden_state"], steps, 1024, "final_hidden"
+-            ),
+         }
++        # 只有 float32 参考导出携带 last_hidden_state；bfloat16 变体没有该键，
++        # 缺键时不要伪造，直接略过并在证据里保留原因。
++        if "last_hidden_state" in gold:
++            comparison["final_hidden_vs_last_hidden_state"] = compare_rows(
++                raw["final_hidden"], "bf16", gold["last_hidden_state"], steps, 1024, "final_hidden"
++            )
++        else:
++            comparison["final_hidden_vs_last_hidden_state"] = None
++            comparison["final_hidden_note"] = "gold {} 缺少 last_hidden_state 键".format(variant)
++        comparisons[variant] = comparison
+         if "prefill_next_logits" in gold:
+             comparisons[variant]["prefill_next_logits_argmax"] = {
+                 "ours": int(
+@@ -1633,6 +1777,30 @@ def _align_prefill(record: Dict[str, Any], raw: Mapping[str, bytes], reference_d
+                 ),
+                 "gold": int(gold["prefill_next_logits"].argmax()),
+             }
++        debug_names = list(record.get("debug_hidden_state_outputs") or ())
++        if debug_names and "hidden_states_layers" in gold:
++            layers = gold["hidden_states_layers"]
++            per_layer = []
++            for index, name in enumerate(debug_names):
++                if index >= int(layers.shape[0]):
++                    break
++                entry = {
++                    "gold_index": index,
++                    "ssa_name": name,
++                    "gold_layer": int(layers.shape[0]),
++                }
++                entry.update(compare_rows(raw[name], "bf16", layers[index], steps, 1024, name))
++                per_layer.append(entry)
++            comparisons[variant]["hidden_states_layers"] = per_layer
++            first_divergence = next(
++                (
++                    item["gold_index"]
++                    for item in per_layer
++                    if item["mean_abs"] > 1.0
++                ),
++                None,
++            )
++            comparisons[variant]["first_layer_mean_abs_gt_1"] = first_divergence
+     record["comparisons"] = comparisons
+     positions = _raw_to_float_array(raw["position_ids"], "int64")
+     record["position_ids"] = [int(v) for v in positions]
+@@ -1770,9 +1938,13 @@ def stage_s4(args: argparse.Namespace) -> Mapping[str, Any]:
+         ),
+     }
+     if record["status"] == "PASS":
+-        report["final_hidden_vs_gold_last_hidden_state"] = compare_rows(
+-            raw["final_hidden"], "bf16", gold["last_hidden_state"], steps, 1024, "final_hidden"
+-        )
++        if "last_hidden_state" in gold:
++            report["final_hidden_vs_gold_last_hidden_state"] = compare_rows(
++                raw["final_hidden"], "bf16", gold["last_hidden_state"], steps, 1024, "final_hidden"
++            )
++        else:
++            report["final_hidden_vs_gold_last_hidden_state"] = None
++            report["final_hidden_note"] = "gold 缺少 last_hidden_state 键"
+         report["logits_vs_prefill_logits"] = compare_rows(
+             raw["logits"], "bf16", gold["prefill_logits"], steps, 248320, "logits"
+         )
+@@ -1808,10 +1980,39 @@ def build_parser() -> argparse.ArgumentParser:
+                         help="host_reference 单算子预估物化超过该值时确定性中止")
+     parser.add_argument("--micro-benchmark-elements", type=int, default=0,
+                         help="S1 额外量测 host_reference 每元素成本（真实 AVX-512 artifact）")
++    parser.add_argument("--disable-liveness-release", action="store_true",
++                        help="仅用于语义等价性 A/B：关闭 SSA liveness 释放（与开启时输出必须逐位一致）")
++    parser.add_argument("--debug-hidden-states", action="store_true",
++                        help="调试模式：把小 shape 副本的逐层 hidden state 追加为图返回值，公开 ABI 不变")
++    parser.add_argument("--debug-dump", default=None,
++                        help="调试模式：把所有图输出写成 npz（离线逐行/逐通道分析）")
++    parser.add_argument("--debug-extra-returns", default="",
++                        help="调试模式：额外返回的 SSA 名字（逗号分隔），公开 ABI 不变")
++    parser.add_argument("--debug-decay-exp-a-log", action="store_true",
++                        help="调试模式：GDR decay 门改用官方 -exp(A_log)（仅用于根因证明）")
+     parser.add_argument("--verbose", action="store_true")
+     return parser
+ 
+ 
++def _disable_liveness_release() -> None:
++    """关闭三个 CPU 后端的 SSA liveness 释放（只用于语义等价性 A/B 证据）。
++
++    默认不启用：这是证据工具，不是执行开关。关闭后同一张图的全部输出摘要
++    必须与开启时逐位一致，否则说明释放点选错了。
++    """
++
++    import pypto.backends.cpu.vector.runtime as vector_runtime
++    import pypto.backends.cpu.x86.avx2 as avx2_runtime
++    import pypto.backends.cpu.x86.avx512 as avx512_runtime
++
++    def _no_release(*args: Any, **kwargs: Any) -> tuple:
++        return ()
++
++    for module in (vector_runtime, avx2_runtime, avx512_runtime):
++        module.release_dead_values = _no_release
++    avx512_runtime.CpuAvx512Runtime = avx512_runtime.Avx512Runtime
++
++
+ def main(argv: Optional[Sequence[str]] = None) -> int:
+     parser = build_parser()
+     args = parser.parse_args(argv)
+@@ -1819,6 +2020,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
+         args.steps = PROMPT_STEPS[args.prompt]
+     progress = Progress(args.progress)
+     args.progress_obj = progress
++    if args.disable_liveness_release:
++        _disable_liveness_release()
++        progress.emit("liveness-release", enabled=False)
+     started = time.time()
+     payload: Dict[str, Any] = {
+         "driver": "qwen35_weighted_execution_driver",

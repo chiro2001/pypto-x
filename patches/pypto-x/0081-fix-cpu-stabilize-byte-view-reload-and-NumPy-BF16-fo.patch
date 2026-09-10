@@ -1,0 +1,148 @@
+From 0bc662c6af9bdd32f587dbe2a0e9d0aec81290da Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Thu, 10 Sep 2026 00:32:43 +0800
+Subject: [PATCH 81/96] fix(cpu): stabilize byte view reload and NumPy BF16
+ format
+
+---
+ python/pypto/backends/cpu/byte_view.py                    | 28 ++++++++++++++----
+ python/tests/ut/pypto_x/test_cpu_byte_buffer_ingestion.py | 56 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 78 insertions(+), 6 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/byte_view.py b/python/pypto/backends/cpu/byte_view.py
+index 9ce401f55..264f5d41a 100644
+--- a/python/pypto/backends/cpu/byte_view.py
++++ b/python/pypto/backends/cpu/byte_view.py
+@@ -36,7 +36,10 @@ _DTYPE_INFO = {
+     "int64": (8, "q"),
+ }
+ _NATIVE_FORMATS = {
+-    "bf16": ("H",),
++    # NumPy exposes dtype=V2 through memoryview as the pad-byte format ``2x``
++    # (typestr ``|V2``).  It is a raw two-byte container, not an endian-aware
++    # numeric format, and is accepted only with the exact BF16 itemsize.
++    "bf16": ("H", "2x"),
+     "float32": ("f",),
+     "int32": ("i",),
+     # NumPy exposes np.int64 as ``l`` on LP64 hosts, while ctypes/array use
+@@ -107,10 +110,16 @@ class _PyBuffer(ctypes.Structure):
+ 
+ try:
+     _GET_BUFFER = ctypes.pythonapi.PyObject_GetBuffer
+-    _GET_BUFFER.argtypes = [ctypes.py_object, ctypes.POINTER(_PyBuffer), ctypes.c_int]
++    # ``ctypes.pythonapi`` caches one _FuncPtr per process.  A module reload
++    # creates a new ``_PyBuffer`` Python class, so putting a module-local
++    # POINTER(_PyBuffer) into the cached function's argtypes makes an older
++    # function object reject pointers created after reload.  c_void_p is the
++    # stable ABI spelling for the second C argument and avoids that class
++    # identity trap while retaining the exact Py_buffer layout locally.
++    _GET_BUFFER.argtypes = [ctypes.py_object, ctypes.c_void_p, ctypes.c_int]
+     _GET_BUFFER.restype = ctypes.c_int
+     _RELEASE_BUFFER = ctypes.pythonapi.PyBuffer_Release
+-    _RELEASE_BUFFER.argtypes = [ctypes.POINTER(_PyBuffer)]
++    _RELEASE_BUFFER.argtypes = [ctypes.c_void_p]
+     _RELEASE_BUFFER.restype = None
+ except AttributeError:  # pragma: no cover - CPython is the supported runtime.
+     _GET_BUFFER = None
+@@ -155,17 +164,24 @@ class _BorrowedBuffer:
+         self.view = byte_view
+         self._buffer = _PyBuffer()
+         self._released = False
+-        result = _GET_BUFFER(byte_view, ctypes.byref(self._buffer), 0)
+-        if result != 0 or not self._buffer.buf and self._buffer.len:
++        buffer_pointer = ctypes.cast(ctypes.byref(self._buffer), ctypes.c_void_p)
++        result = _GET_BUFFER(byte_view, buffer_pointer, 0)
++        if result != 0:
+             self._released = True
+             raise CpuByteViewError("{} buffer address cannot be borrowed".format(context))
++        if not self._buffer.buf and self._buffer.len:
++            # GetBuffer succeeded, so this exceptional validation path must
++            # release the export before reporting the malformed address.
++            self._released = True
++            _RELEASE_BUFFER(buffer_pointer)
++            raise CpuByteViewError("{} buffer address cannot be borrowed".format(context))
+         self.address = int(self._buffer.buf or 0)
+         self.nbytes = int(self._buffer.len)
+ 
+     def close(self) -> None:
+         if not self._released:
+             self._released = True
+-            _RELEASE_BUFFER(ctypes.byref(self._buffer))
++            _RELEASE_BUFFER(ctypes.cast(ctypes.byref(self._buffer), ctypes.c_void_p))
+ 
+     def __del__(self):  # pragma: no cover - exercised by CPython lifetime tests.
+         try:
+diff --git a/python/tests/ut/pypto_x/test_cpu_byte_buffer_ingestion.py b/python/tests/ut/pypto_x/test_cpu_byte_buffer_ingestion.py
+index 9d3712701..34486b4d1 100644
+--- a/python/tests/ut/pypto_x/test_cpu_byte_buffer_ingestion.py
++++ b/python/tests/ut/pypto_x/test_cpu_byte_buffer_ingestion.py
+@@ -6,6 +6,7 @@ not model loading or a Qwen-sized allocation.
+ 
+ from __future__ import annotations
+ 
++import importlib
+ import mmap
+ import os
+ from pathlib import Path
+@@ -174,6 +175,61 @@ def test_typed_byte_view_exactness_endianness_and_lifetime():
+     assert TypedByteView(big_endian, "bf16", (2,), readonly=True).to_raw_values() == [0x803F, 0x0040]
+ 
+ 
++def test_typed_byte_view_reload_keeps_cpython_buffer_signature_stable():
++    package_root = Path(__file__).parents[3] / "pypto"
++    saved = {name: module for name, module in sys.modules.items() if name == "pypto" or name.startswith("pypto.")}
++    for name in list(saved):
++        del sys.modules[name]
++    package = types.ModuleType("pypto")
++    package.__path__ = [str(package_root)]
++    sys.modules["pypto"] = package
++    try:
++        module = importlib.import_module("pypto.backends.cpu.byte_view")
++        first = module.TypedByteView(struct.pack("<f", 1.0), "float32", (1,), readonly=True)
++        importlib.reload(module)
++        second = module.TypedByteView(struct.pack("<f", 2.0), "float32", (1,), readonly=True)
++        assert first.to_values() == [1.0]
++        assert second.to_values() == [2.0]
++        first.close()
++        second.close()
++    finally:
++        for name in list(sys.modules):
++            if name == "pypto" or name.startswith("pypto."):
++                del sys.modules[name]
++        sys.modules.update(saved)
++
++
++def test_numpy_v2_bf16_pad_format_is_exact_and_writable():
++    np = pytest.importorskip("numpy")
++    source = np.array([0x3F80, 0x4000], dtype="<u2").view("V2")
++    assert memoryview(source).format == "2x"
++    typed = TypedByteView(source, "bf16", (2,), readonly=True)
++    assert typed.to_raw_values() == [0x3F80, 0x4000]
++    typed.close()
++
++    destination = np.zeros((2,), dtype="V2")
++    writable = TypedByteView(destination, "bf16", (2,), readonly=False)
++    writable.write_values([1.0, 2.0])
++    writable.close()
++    assert tuple(np.frombuffer(destination.tobytes(), dtype="<u2")) == (0x3F80, 0x4000)
++
++
++def test_scalar_numpy_v2_bf16_ingestion_round_trips_raw_bits():
++    np = pytest.importorskip("numpy")
++    artifact = _scalar_artifact(_elementwise("bf16", operation="mul"))
++    left = np.array([0x3F80, 0x4000], dtype="<u2").view("V2")
++    right = np.array([0x4000, 0x3F80], dtype="<u2").view("V2")
++    output = np.zeros((2,), dtype="V2")
++    CpuScalarRuntime().launch(
++        _request(
++            artifact,
++            [TensorDesc("bf16", (2,), handle=left, readonly=True), TensorDesc("bf16", (2,), handle=right, readonly=True)],
++            TensorDesc("bf16", (2,), handle=output),
++        )
++    )
++    assert tuple(np.frombuffer(output.tobytes(), dtype="<u2")) == (0x4000, 0x4000)
++
++
+ def test_scalar_bytes_bytearray_mmap_and_bf16_raw_write(tmp_path):
+     artifact = _scalar_artifact(_elementwise("bf16", operation="mul"))
+     left_bits = (0x3F01, 0x3F02)

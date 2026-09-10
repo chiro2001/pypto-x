@@ -1,0 +1,2220 @@
+From 3026d18f95af063dd9ff0314a4c810c9a2bee8d2 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Mon, 7 Sep 2026 03:07:18 +0800
+Subject: [PATCH 21/96] feat(pypto-x): add ISA-neutral CPU vector common plans
+
+---
+ python/pypto/backends/cpu/vector/__init__.py      |   27 +
+ python/pypto/backends/cpu/vector/runtime.py       |  643 ++++++++++++++++++++++++
+ python/pypto/compiler/targets/cpu_vector.py       |  167 +++++++
+ python/pypto/lowering/cpu/vector/__init__.py      |    3 +
+ python/pypto/lowering/cpu/vector/plan.py          | 1091 +++++++++++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_cpu_vector_common.py |  239 +++++++++
+ 6 files changed, 2170 insertions(+)
+
+diff --git a/python/pypto/backends/cpu/vector/__init__.py b/python/pypto/backends/cpu/vector/__init__.py
+new file mode 100644
+index 000000000..d97959ffc
+--- /dev/null
++++ b/python/pypto/backends/cpu/vector/__init__.py
+@@ -0,0 +1,27 @@
++"""Pure-Python reference backend for ISA-neutral CPU vector plans."""
++
++from .runtime import (
++    CpuVectorArtifactError,
++    CpuVectorBackend,
++    CpuVectorExecutionError,
++    CpuVectorReferenceRuntime,
++    CpuVectorRuntime,
++    CpuVectorRuntimeError,
++    LoadedCpuVectorArtifact,
++    VectorRuntime,
++    launch,
++)
++from pypto.lowering.cpu.vector import CpuVectorFeatureMismatchError
++
++__all__ = [
++    "CpuVectorArtifactError",
++    "CpuVectorBackend",
++    "CpuVectorExecutionError",
++    "CpuVectorFeatureMismatchError",
++    "CpuVectorReferenceRuntime",
++    "CpuVectorRuntime",
++    "CpuVectorRuntimeError",
++    "LoadedCpuVectorArtifact",
++    "VectorRuntime",
++    "launch",
++]
+diff --git a/python/pypto/backends/cpu/vector/runtime.py b/python/pypto/backends/cpu/vector/runtime.py
+new file mode 100644
+index 000000000..8fae68c1e
+--- /dev/null
++++ b/python/pypto/backends/cpu/vector/runtime.py
+@@ -0,0 +1,643 @@
++"""Pure-Python reference executor for CPU vector plans.
++
++The executor intentionally visits every logical vector chunk and its bounded
++tail.  It is a correctness/reference path for later native vector backends;
++it does not call ``CpuScalarRuntime`` and does not claim SIMD execution.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from dataclasses import dataclass
++from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
++
++from pypto.abi import Availability, LaunchRequest, TensorDesc
++from pypto.compiler.artifact import Artifact
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation
++from pypto.lowering.cpu import (
++    canonical_dtype,
++    canonical_operation_name,
++    element_count,
++    flatten_values,
++    static_shape,
++)
++from pypto.lowering.cpu.vector import (
++    CPU_VECTOR_BACKEND,
++    VECTOR_LOWERING_VERSION,
++    VECTOR_PLAN_VERSION,
++    CpuFeatureContract,
++    CpuFeatureSet,
++    CpuVectorFeatureMismatchError,
++    CpuVectorProgram,
++    lower_cpu_vector,
++)
++from pypto.target import TargetSpec
++from pypto.target._utils import mapping_copy, sha256_text
++
++from ..tensor import FlatBuffer, HostTensor, _cast_value
++
++
++class CpuVectorRuntimeError(RuntimeError):
++    """Base class for explicit vector reference runtime failures."""
++
++
++class CpuVectorArtifactError(CpuVectorRuntimeError):
++    """An artifact payload, digest, plan, or feature contract is invalid."""
++
++
++class CpuVectorExecutionError(CpuVectorRuntimeError):
++    """A valid vector plan cannot execute a supplied invocation."""
++
++
++@dataclass(frozen=True)
++class LoadedCpuVectorArtifact:
++    artifact: Artifact
++    target_ir: CpuVectorProgram
++    feature_contract: CpuFeatureContract
++
++    @property
++    def contract(self) -> CpuFeatureContract:
++        return self.feature_contract
++
++
++@dataclass(frozen=True)
++class _RuntimeValue:
++    type: CoreType
++    data: Any
++
++
++class CpuVectorRuntime:
++    """Reference runtime that executes vector chunks with Python loops."""
++
++    name = CPU_VECTOR_BACKEND
++
++    def __init__(self, available_features: Any = None) -> None:
++        if available_features is None:
++            available_features = CpuFeatureSet((), source="injected")
++        elif not isinstance(available_features, CpuFeatureSet):
++            available_features = CpuFeatureSet(available_features, source="injected")
++        self.available_features = available_features
++
++    def availability(self) -> Availability:
++        return Availability.yes(self.name)
++
++    def is_available(self) -> bool:
++        # This is a dependency-free reference executor.  Artifact-specific
++        # CPU feature requirements are checked by load(), not faked here.
++        return True
++
++    def load(self, artifact: Artifact, available_features: Any = None) -> LoadedCpuVectorArtifact:
++        available = self.available_features if available_features is None else _feature_set(available_features)
++        return _decode_artifact(artifact, available)
++
++    def workspace_size(self, request: Any) -> int:
++        if not isinstance(request, LaunchRequest):
++            raise CpuVectorExecutionError("workspace_size requires LaunchRequest")
++        self.load(request.artifact)
++        return 0
++
++    def launch(self, request: LaunchRequest) -> Tuple[Any, ...]:
++        if not isinstance(request, LaunchRequest):
++            raise CpuVectorExecutionError("CPU vector launch requires LaunchRequest")
++        try:
++            request.validate()
++        except Exception as exc:
++            raise CpuVectorExecutionError("invalid LaunchRequest: {}".format(exc)) from exc
++        loaded = self.load(request.artifact)
++        if request.entrypoint != loaded.target_ir.entrypoint:
++            raise CpuVectorExecutionError(
++                "launch entrypoint {!r} does not match loaded CPU vector entrypoint {!r}".format(
++                    request.entrypoint, loaded.target_ir.entrypoint
++                )
++            )
++        function = _find_function(loaded.target_ir.program, request.entrypoint)
++        _validate_request_target(request, loaded.target_ir.target)
++        tensor_parameters = [ref for ref in function.parameters if _is_tensor(ref.type)]
++        tensor_returns = [ref for ref in function.returns if _is_tensor(ref.type)]
++        if len(request.inputs) != len(tensor_parameters):
++            raise CpuVectorExecutionError(
++                "function {!r} expects {} tensor inputs, got {}".format(
++                    function.name, len(tensor_parameters), len(request.inputs)
++                )
++            )
++        if len(request.outputs) != len(tensor_returns):
++            raise CpuVectorExecutionError(
++                "function {!r} expects {} tensor outputs, got {}".format(
++                    function.name, len(tensor_returns), len(request.outputs)
++                )
++            )
++        if len(loaded.target_ir.plans) != len(function.body.operations):
++            raise CpuVectorExecutionError("artifact vector plan count does not match function operation count")
++
++        environment: Dict[str, _RuntimeValue] = {}
++        input_index = 0
++        for parameter in function.parameters:
++            if _is_tensor(parameter.type):
++                environment[parameter.name] = _RuntimeValue(
++                    parameter.type,
++                    _read_tensor(request.inputs[input_index], parameter.type, parameter.name),
++                )
++                input_index += 1
++            elif _is_scalar(parameter.type):
++                if parameter.name not in request.scalars:
++                    raise CpuVectorExecutionError(
++                        "missing scalar input {!r} in LaunchRequest.scalars".format(parameter.name)
++                    )
++                try:
++                    value = _cast_value(request.scalars[parameter.name], canonical_dtype(parameter.type.dtype))
++                except (TypeError, ValueError, OverflowError) as exc:
++                    raise CpuVectorExecutionError(
++                        "scalar input {!r} is invalid: {}".format(parameter.name, exc)
++                    ) from exc
++                environment[parameter.name] = _RuntimeValue(parameter.type, value)
++            else:
++                raise CpuVectorExecutionError("unsupported parameter kind {!r}".format(parameter.type.kind))
++
++        for index, operation in enumerate(function.body.operations):
++            _execute_operation(operation, loaded.target_ir.plans[index], environment, "function {} operation {}".format(function.name, index))
++
++        results: List[Any] = []
++        output_index = 0
++        for result_ref in function.returns:
++            if result_ref.name not in environment:
++                raise CpuVectorExecutionError("return value {!r} was not produced".format(result_ref.name))
++            result = environment[result_ref.name]
++            if result.type != result_ref.type:
++                raise CpuVectorExecutionError("return value {!r} has the wrong type".format(result_ref.name))
++            if _is_tensor(result_ref.type):
++                descriptor = request.outputs[output_index]
++                _write_tensor(descriptor, result_ref.type, result.data, result_ref.name)
++                results.append(descriptor.storage)
++                output_index += 1
++            else:
++                results.append(result.data)
++        return tuple(results)
++
++
++CpuVectorReferenceRuntime = CpuVectorRuntime
++CpuVectorBackend = CpuVectorRuntime
++VectorRuntime = CpuVectorRuntime
++
++
++def _feature_set(value: Any) -> CpuFeatureSet:
++    if isinstance(value, CpuFeatureSet):
++        return value
++    return CpuFeatureSet(value, source="injected")
++
++
++def _decode_artifact(artifact: Artifact, available: CpuFeatureSet) -> LoadedCpuVectorArtifact:
++    if not isinstance(artifact, Artifact):
++        raise CpuVectorArtifactError("CPU vector runtime requires Artifact")
++    try:
++        artifact.validate()
++    except Exception as exc:
++        raise CpuVectorArtifactError("artifact validation failed: {}".format(exc)) from exc
++    if artifact.payload is None:
++        raise CpuVectorArtifactError("CPU vector artifact requires an inline payload")
++    payload = bytes(artifact.payload)
++    metadata = artifact.metadata
++    if metadata.get("backend") != CPU_VECTOR_BACKEND:
++        raise CpuVectorArtifactError("artifact backend metadata is not CPU vector common")
++    actual_digest = hashlib.sha256(payload).hexdigest()
++    if actual_digest != artifact.content_digest:
++        raise CpuVectorArtifactError("artifact content digest does not match immutable Artifact payload")
++    if metadata.get("payload_digest") != actual_digest:
++        raise CpuVectorArtifactError("CPU vector artifact metadata payload digest mismatch")
++    try:
++        decoded = json.loads(payload.decode("utf-8"))
++    except (UnicodeDecodeError, ValueError) as exc:
++        raise CpuVectorArtifactError("CPU vector artifact payload is not UTF-8 JSON") from exc
++    if not isinstance(decoded, dict):
++        raise CpuVectorArtifactError("CPU vector artifact payload must be a JSON object")
++    canonical_payload = json.dumps(
++        decoded,
++        ensure_ascii=False,
++        allow_nan=False,
++        sort_keys=True,
++        separators=(",", ":"),
++    ).encode("utf-8")
++    if canonical_payload != payload:
++        raise CpuVectorArtifactError("CPU vector artifact payload is not canonical JSON")
++    if decoded.get("artifact_payload_version") != 1:
++        raise CpuVectorArtifactError("unsupported CPU vector artifact payload version")
++    if decoded.get("backend") != CPU_VECTOR_BACKEND:
++        raise CpuVectorArtifactError("CPU vector artifact payload backend mismatch")
++    if decoded.get("target") != artifact.target.to_dict():
++        raise CpuVectorArtifactError("CPU vector artifact target mismatch")
++    program_data = decoded.get("program")
++    if not isinstance(program_data, dict):
++        raise CpuVectorArtifactError("CPU vector artifact does not contain a CoreProgram")
++    plan_data = decoded.get("vector_plan")
++    if not isinstance(plan_data, dict):
++        raise CpuVectorArtifactError("CPU vector artifact does not contain vector plan data")
++    required_data = plan_data.get("required_features", {})
++    if not isinstance(required_data, Mapping):
++        raise CpuVectorArtifactError("CPU vector artifact required_features is invalid")
++    required = CpuFeatureSet(required_data.get("features", ()), source=required_data.get("source", "artifact"))
++    try:
++        program = CoreProgram.from_dict(program_data)
++        target_ir = lower_cpu_vector(
++            program,
++            artifact.target,
++            plan_data.get("entrypoint"),
++            lane_count=plan_data.get("lane_count"),
++            tail_policy=plan_data.get("tail_policy"),
++            required_features=required,
++            specialization=plan_data.get("specialization", {}),
++        )
++    except Exception as exc:
++        raise CpuVectorArtifactError("CPU vector artifact CoreProgram/plan is invalid: {}".format(exc)) from exc
++    if target_ir.to_dict() != plan_data:
++        raise CpuVectorArtifactError("CPU vector artifact vector plan mismatch")
++    program_json = program.canonical_json()
++    program_digest = hashlib.sha256(program_json.encode("utf-8")).hexdigest()
++    if decoded.get("program_digest") != program_digest or metadata.get("program_digest") != program_digest:
++        raise CpuVectorArtifactError("CPU vector artifact program digest mismatch")
++    if decoded.get("plan_digest") != target_ir.plan_digest or metadata.get("plan_digest") != target_ir.plan_digest:
++        raise CpuVectorArtifactError("CPU vector artifact plan digest mismatch")
++    if metadata.get("entrypoint") != artifact.entrypoint or plan_data.get("entrypoint") != artifact.entrypoint:
++        raise CpuVectorArtifactError("CPU vector artifact entrypoint mismatch")
++    if metadata.get("artifact_payload_version") != 1:
++        raise CpuVectorArtifactError("unsupported CPU vector artifact metadata version")
++    if metadata.get("lowering_version") != VECTOR_LOWERING_VERSION:
++        raise CpuVectorArtifactError("unsupported CPU vector lowering version")
++    if metadata.get("plan_version") != VECTOR_PLAN_VERSION:
++        raise CpuVectorArtifactError("unsupported CPU vector plan version")
++    if metadata.get("target_digest") != sha256_text(artifact.target.to_dict()):
++        raise CpuVectorArtifactError("CPU vector artifact target digest mismatch")
++    expected_features = tuple(required.features)
++    if tuple(metadata.get("required_features", ())) != expected_features:
++        raise CpuVectorArtifactError("CPU vector artifact required feature metadata mismatch")
++    mismatch_contract = CpuFeatureContract(required, available)
++    try:
++        mismatch_contract.validate()
++    except CpuVectorFeatureMismatchError:
++        raise
++    return LoadedCpuVectorArtifact(artifact, target_ir, mismatch_contract)
++
++
++def launch(request: LaunchRequest, available_features: Any = None) -> Tuple[Any, ...]:
++    """Run one request with a fresh dependency-free vector reference runtime."""
++
++    return CpuVectorRuntime(available_features).launch(request)
++
++
++def _find_function(program: CoreProgram, entrypoint: str) -> CoreFunction:
++    for function in program.functions:
++        if function.name == entrypoint:
++            return function
++    raise CpuVectorExecutionError("entrypoint {!r} is not present in CoreProgram".format(entrypoint))
++
++
++def _validate_request_target(request: LaunchRequest, target: TargetSpec) -> None:
++    if target.kind != "cpu":
++        raise CpuVectorExecutionError("CPU vector artifact target kind must be cpu")
++    for index, descriptor in enumerate(request.inputs + request.outputs):
++        if descriptor.device != "cpu":
++            raise CpuVectorExecutionError(
++                "CPU vector tensor descriptor {} has device {!r}, expected 'cpu'".format(index, descriptor.device)
++            )
++        if descriptor.strides != _contiguous_strides(descriptor.shape):
++            raise CpuVectorExecutionError("CPU vector requires contiguous tensor descriptors")
++
++
++def _is_tensor(value_type: CoreType) -> bool:
++    return value_type.kind in ("tensor", "view", "tile")
++
++
++def _is_scalar(value_type: CoreType) -> bool:
++    return value_type.kind == "scalar"
++
++
++def _read_tensor(descriptor: TensorDesc, value_type: CoreType, context: str) -> List[Any]:
++    try:
++        expected_dtype = canonical_dtype(value_type.dtype)
++        descriptor_dtype = canonical_dtype(descriptor.dtype)
++    except (TypeError, ValueError) as exc:
++        raise CpuVectorExecutionError("{} has an unsupported dtype: {}".format(context, exc)) from exc
++    expected_shape = static_shape(value_type, context)
++    if descriptor_dtype != expected_dtype or descriptor.shape != expected_shape:
++        raise CpuVectorExecutionError(
++            "{} descriptor dtype/shape ({}, {}) does not match expected ({}, {})".format(
++                context, descriptor.dtype, descriptor.shape, expected_dtype, expected_shape
++            )
++        )
++    if isinstance(descriptor.storage, HostTensor):
++        try:
++            storage_dtype = canonical_dtype(descriptor.storage.dtype)
++        except (TypeError, ValueError) as exc:
++            raise CpuVectorExecutionError("{} HostTensor has an unsupported dtype: {}".format(context, exc)) from exc
++        if storage_dtype != expected_dtype or descriptor.storage.shape != expected_shape:
++            raise CpuVectorExecutionError("{} HostTensor metadata does not match input descriptor".format(context))
++    values = _storage_values(descriptor.storage, context)
++    expected_count = element_count(expected_shape)
++    if len(values) != expected_count:
++        raise CpuVectorExecutionError(
++            "{} storage has {} values but shape {} requires {}".format(context, len(values), expected_shape, expected_count)
++        )
++    try:
++        return [_cast_value(value, expected_dtype) for value in values]
++    except (TypeError, ValueError, OverflowError) as exc:
++        raise CpuVectorExecutionError("{} contains an invalid value: {}".format(context, exc)) from exc
++
++
++def _write_tensor(descriptor: TensorDesc, value_type: CoreType, values: Sequence[Any], context: str) -> None:
++    if descriptor.readonly:
++        raise CpuVectorExecutionError("{} output descriptor is read-only".format(context))
++    try:
++        expected_dtype = canonical_dtype(value_type.dtype)
++        descriptor_dtype = canonical_dtype(descriptor.dtype)
++    except (TypeError, ValueError) as exc:
++        raise CpuVectorExecutionError("{} has an unsupported dtype: {}".format(context, exc)) from exc
++    expected_shape = static_shape(value_type, context)
++    if descriptor_dtype != expected_dtype or descriptor.shape != expected_shape:
++        raise CpuVectorExecutionError(
++            "{} output descriptor dtype/shape ({}, {}) does not match expected ({}, {})".format(
++                context, descriptor.dtype, descriptor.shape, expected_dtype, expected_shape
++            )
++        )
++    storage = descriptor.storage
++    if isinstance(storage, HostTensor):
++        try:
++            storage_dtype = canonical_dtype(storage.dtype)
++        except (TypeError, ValueError) as exc:
++            raise CpuVectorExecutionError("{} HostTensor has an unsupported dtype: {}".format(context, exc)) from exc
++        if storage_dtype != expected_dtype or storage.shape != expected_shape:
++            raise CpuVectorExecutionError("{} HostTensor metadata does not match output descriptor".format(context))
++        destination = storage.data
++    elif isinstance(storage, FlatBuffer):
++        destination = storage.data
++    elif isinstance(storage, list):
++        destination = storage
++    elif hasattr(storage, "data") and isinstance(storage.data, list):
++        destination = storage.data
++    else:
++        destination = None
++    try:
++        cast_values = [_cast_value(value, expected_dtype) for value in values]
++    except (TypeError, ValueError, OverflowError) as exc:
++        raise CpuVectorExecutionError("{} produced an invalid value: {}".format(context, exc)) from exc
++    if len(cast_values) != element_count(expected_shape):
++        raise CpuVectorExecutionError("{} result length does not match output shape".format(context))
++    if destination is not None:
++        if len(destination) != len(cast_values):
++            raise CpuVectorExecutionError("{} output storage length does not match output shape".format(context))
++        destination[:] = cast_values
++        return
++    if storage is None or not hasattr(storage, "__setitem__"):
++        raise CpuVectorExecutionError("{} output storage is not mutable".format(context))
++    try:
++        if len(storage) != len(cast_values):
++            raise CpuVectorExecutionError("{} output storage length does not match output shape".format(context))
++        for index, value in enumerate(cast_values):
++            storage[index] = value
++    except (TypeError, IndexError, AttributeError) as exc:
++        raise CpuVectorExecutionError("{} output storage is not mutable".format(context)) from exc
++
++
++def _storage_values(storage: Any, context: str) -> List[Any]:
++    if isinstance(storage, HostTensor):
++        return list(storage.data)
++    if isinstance(storage, FlatBuffer):
++        return list(storage.data)
++    if isinstance(storage, (str, bytes, bytearray, Mapping)) or storage is None:
++        raise CpuVectorExecutionError("{} storage must be a flat numeric sequence".format(context))
++    if isinstance(storage, (list, tuple)):
++        return list(flatten_values(storage))
++    if hasattr(storage, "data") and isinstance(storage.data, (list, tuple)):
++        return list(storage.data)
++    try:
++        return [storage[index] for index in range(len(storage))]
++    except (TypeError, IndexError, KeyError, AttributeError) as exc:
++        raise CpuVectorExecutionError("{} storage must support flat sequence access".format(context)) from exc
++
++
++def _value_sequence(value: Any, value_type: CoreType, context: str) -> Tuple[List[Any], bool]:
++    if _is_tensor(value_type):
++        expected = element_count(static_shape(value_type, context))
++        if not isinstance(value, list) or len(value) != expected:
++            raise CpuVectorExecutionError("{} tensor value length mismatch".format(context))
++        return value, False
++    if _is_scalar(value_type):
++        return [value], True
++    raise CpuVectorExecutionError("{} value kind {!r} is unsupported".format(context, value_type.kind))
++
++
++def _from_sequence(values: List[Any], scalar: bool) -> Any:
++    return values[0] if scalar else values
++
++
++def _execute_operation(
++    operation: Operation,
++    plan: Any,
++    environment: Dict[str, _RuntimeValue],
++    context: str,
++) -> None:
++    name = canonical_operation_name(operation.name)
++    if plan.operation != name:
++        raise CpuVectorExecutionError("{} operation does not match vector plan".format(context))
++    inputs = []
++    for ref in operation.inputs:
++        if ref.name not in environment:
++            raise CpuVectorExecutionError("{} input {!r} is unavailable".format(context, ref.name))
++        value = environment[ref.name]
++        if value.type != ref.type:
++            raise CpuVectorExecutionError("{} input {!r} has a type mismatch".format(context, ref.name))
++        inputs.append(value)
++    output_ref = operation.outputs[0]
++    try:
++        if name == "constant":
++            raw = operation.attributes.get("value", operation.attributes.get("values"))
++            if _is_scalar(output_ref.type):
++                if isinstance(raw, (list, tuple)):
++                    raw = raw[0] if len(raw) == 1 else raw
++                result = _cast_value(raw, canonical_dtype(output_ref.type.dtype))
++            else:
++                values = list(flatten_values(raw))
++                result = _vector_map(plan, values, lambda value: _cast_value(value, plan.dtype), context)
++        elif name == "identity":
++            source, scalar = _value_sequence(inputs[0].data, inputs[0].type, context)
++            result = _from_sequence(_vector_map(plan, source, lambda value: value, context), scalar)
++        elif name in ("add", "sub", "mul", "div"):
++            result = _execute_binary(name, inputs[0], inputs[1], output_ref.type, plan, context)
++        elif name == "neg":
++            source, scalar = _value_sequence(inputs[0].data, inputs[0].type, context)
++            result = _from_sequence(
++                _vector_map(plan, source, lambda value: _unary(name, value, plan.dtype), context), scalar
++            )
++        elif name in ("reduce_sum", "reduce_max"):
++            result = _execute_reduction(name, inputs[0], output_ref.type, plan, context)
++        elif name == "matmul":
++            result = _execute_matmul(inputs[0], inputs[1], output_ref.type, plan, context)
++        else:
++            raise CpuVectorExecutionError("{} operation {!r} is unsupported".format(context, operation.name))
++    except CpuVectorExecutionError:
++        raise
++    except (TypeError, ValueError, ZeroDivisionError, OverflowError) as exc:
++        raise CpuVectorExecutionError("{} failed: {}".format(context, exc)) from exc
++    environment[output_ref.name] = _RuntimeValue(output_ref.type, result)
++
++
++def _vector_map(plan: Any, values: Sequence[Any], operation: Callable[[Any], Any], context: str) -> List[Any]:
++    if len(values) != plan.element_count:
++        raise CpuVectorExecutionError(
++            "{} value length {} does not match vector plan element count {}".format(
++                context, len(values), plan.element_count
++            )
++        )
++    result = [None] * plan.element_count
++    for chunk in plan.iteration.chunks:
++        for offset in range(chunk.length):
++            index = chunk.start + offset
++            if index >= plan.element_count:
++                raise CpuVectorExecutionError("{} vector chunk exceeds element domain".format(context))
++            result[index] = operation(values[index])
++    return result
++
++
++def _execute_binary(name: str, left: _RuntimeValue, right: _RuntimeValue, output_type: CoreType, plan: Any, context: str) -> Any:
++    left_values, left_scalar = _value_sequence(left.data, left.type, context + ".left")
++    right_values, right_scalar = _value_sequence(right.data, right.type, context + ".right")
++    output_is_scalar = _is_scalar(output_type)
++    count = plan.element_count
++    if not left_scalar and len(left_values) != count:
++        raise CpuVectorExecutionError("{} left value length mismatch".format(context))
++    if not right_scalar and len(right_values) != count:
++        raise CpuVectorExecutionError("{} right value length mismatch".format(context))
++    result = [None] * count
++    for chunk in plan.iteration.chunks:
++        for offset in range(chunk.length):
++            index = chunk.start + offset
++            a = left_values[0] if left_scalar else left_values[index]
++            b = right_values[0] if right_scalar else right_values[index]
++            result[index] = _binary(name, a, b, plan.dtype)
++    return result[0] if output_is_scalar else result
++
++
++def _binary(name: str, left: Any, right: Any, dtype: str) -> Any:
++    if name == "add":
++        value = left + right
++    elif name == "sub":
++        value = left - right
++    elif name == "mul":
++        value = left * right
++    else:
++        if right == 0:
++            raise CpuVectorExecutionError("division by zero")
++        value = left / right
++    return _cast_value(value, dtype)
++
++
++def _unary(name: str, value: Any, dtype: str) -> Any:
++    if name != "neg":
++        raise CpuVectorExecutionError("unsupported unary operation {!r}".format(name))
++    return _cast_value(-value, dtype)
++
++
++def _execute_reduction(name: str, value: _RuntimeValue, output_type: CoreType, plan: Any, context: str) -> List[Any]:
++    reduction = plan.reduction
++    input_values, scalar = _value_sequence(value.data, value.type, context + ".input")
++    if scalar:
++        raise CpuVectorExecutionError("{} reduction input must be tensor".format(context))
++    input_shape = reduction.input_shape
++    output_shape = reduction.output_shape
++    if len(input_values) != element_count(input_shape):
++        raise CpuVectorExecutionError("{} reduction input length mismatch".format(context))
++    result = [None] * reduction.output_elements
++    for output_chunk in reduction.output_iteration.chunks:
++        for output_index in range(output_chunk.start, output_chunk.start + output_chunk.length):
++            output_coords = _unravel(output_index, output_shape)
++            candidates = []
++            for input_index, input_value in enumerate(input_values):
++                input_coords = _unravel(input_index, input_shape)
++                if reduction.keepdims:
++                    projected = tuple(0 if axis in reduction.axes else input_coords[axis] for axis in range(len(input_shape)))
++                else:
++                    projected = tuple(input_coords[axis] for axis in range(len(input_shape)) if axis not in reduction.axes)
++                if projected == output_coords:
++                    candidates.append(input_value)
++            if len(candidates) != reduction.reduction_size:
++                if reduction.reduction_size == 0 and not candidates:
++                    candidates = []
++                else:
++                    raise CpuVectorExecutionError("{} reduction group length mismatch".format(context))
++            aggregate = None
++            for reduction_chunk in reduction.reduction_iteration.chunks:
++                for offset in range(reduction_chunk.length):
++                    candidate_index = reduction_chunk.start + offset
++                    if candidate_index >= len(candidates):
++                        raise CpuVectorExecutionError("{} reduction chunk exceeds group".format(context))
++                    candidate = candidates[candidate_index]
++                    if aggregate is None:
++                        aggregate = candidate
++                    elif name == "reduce_sum":
++                        aggregate += candidate
++                    elif candidate > aggregate:
++                        aggregate = candidate
++            if name == "reduce_sum" and aggregate is None:
++                aggregate = 0
++            if aggregate is None:
++                raise CpuVectorExecutionError("reduce_max has an empty reduction group")
++            result[output_index] = _cast_value(aggregate, canonical_dtype(output_type.dtype))
++    return result
++
++
++def _execute_matmul(left: _RuntimeValue, right: _RuntimeValue, output_type: CoreType, plan: Any, context: str) -> List[Any]:
++    matmul = plan.matmul
++    left_values, left_scalar = _value_sequence(left.data, left.type, context + ".left")
++    right_values, right_scalar = _value_sequence(right.data, right.type, context + ".right")
++    if left_scalar or right_scalar:
++        raise CpuVectorExecutionError("{} matmul inputs must be tensors".format(context))
++    if len(left_values) != matmul.m * matmul.k or len(right_values) != matmul.k * matmul.n:
++        raise CpuVectorExecutionError("{} matmul input length mismatch".format(context))
++    result = [None] * matmul.output_elements
++    for output_chunk in matmul.output_iteration.chunks:
++        for output_index in range(output_chunk.start, output_chunk.start + output_chunk.length):
++            row = output_index // matmul.n if matmul.n else 0
++            column = output_index % matmul.n if matmul.n else 0
++            aggregate = 0
++            for reduction_chunk in matmul.reduction_iteration.chunks:
++                for offset in range(reduction_chunk.length):
++                    inner = reduction_chunk.start + offset
++                    if inner >= matmul.k:
++                        raise CpuVectorExecutionError("{} matmul reduction chunk exceeds k".format(context))
++                    aggregate += left_values[row * matmul.k + inner] * right_values[inner * matmul.n + column]
++            result[output_index] = _cast_value(aggregate, canonical_dtype(output_type.dtype))
++    return result
++
++
++def _contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
++    strides = [1] * len(shape)
++    running = 1
++    for index in range(len(shape) - 1, -1, -1):
++        strides[index] = running
++        running *= shape[index]
++    return tuple(strides)
++
++
++def _unravel(index: int, shape: Sequence[int]) -> Tuple[int, ...]:
++    if not shape:
++        return ()
++    coordinates = [0] * len(shape)
++    remainder = index
++    for axis in range(len(shape) - 1, -1, -1):
++        dimension = shape[axis]
++        if dimension == 0:
++            return tuple(coordinates)
++        coordinates[axis] = remainder % dimension
++        remainder //= dimension
++    return tuple(coordinates)
++
++
++__all__ = [
++    "CpuVectorArtifactError",
++    "CpuVectorBackend",
++    "CpuVectorExecutionError",
++    "CpuVectorReferenceRuntime",
++    "CpuVectorRuntime",
++    "CpuVectorRuntimeError",
++    "LoadedCpuVectorArtifact",
++    "VectorRuntime",
++    "launch",
++]
+diff --git a/python/pypto/compiler/targets/cpu_vector.py b/python/pypto/compiler/targets/cpu_vector.py
+new file mode 100644
+index 000000000..a60409184
+--- /dev/null
++++ b/python/pypto/compiler/targets/cpu_vector.py
+@@ -0,0 +1,167 @@
++"""Deterministic compiler for the ISA-neutral CPU vector target."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from typing import Any, Mapping, Optional
++
++from pypto.compiler.api import CompileOptions
++from pypto.compiler.artifact import ABI_VERSION, Artifact
++from pypto.core_ir import CoreProgram
++from pypto.lowering.cpu.vector import (
++    CPU_VECTOR_BACKEND,
++    VECTOR_LOWERING_VERSION,
++    VECTOR_PLAN_VERSION,
++    CpuVectorProgram,
++    lower_cpu_vector,
++)
++from pypto.target import TargetSpec
++from pypto.target._utils import mapping_copy, sha256_text
++
++
++ARTIFACT_PAYLOAD_VERSION = 1
++DEFAULT_ARTIFACT_FORMAT = "pypto-x.cpu.vector.common"
++
++
++class CpuVectorCompiler:
++    """Lower and package target-owned vector plans.
++
++    Compilation here creates a deterministic Python/JSON artifact only.  It
++    deliberately emits no ISA instruction or intrinsic; AVX2/AVX-512
++    compilers can consume the same ``CpuVectorProgram`` later.
++    """
++
++    name = CPU_VECTOR_BACKEND
++
++    def lower(self, program: CoreProgram, target: TargetSpec) -> CpuVectorProgram:
++        return lower_cpu_vector(program, target)
++
++    def compile(self, target_ir: CpuVectorProgram, options: Optional[CompileOptions] = None) -> Artifact:
++        if not isinstance(target_ir, CpuVectorProgram):
++            raise TypeError("CPU vector compile() requires CpuVectorProgram from lower()")
++        if options is not None and not isinstance(options, CompileOptions):
++            raise TypeError("options must be CompileOptions")
++
++        program_json = target_ir.program.canonical_json()
++        program_payload = json.loads(program_json)
++        program_digest = hashlib.sha256(program_json.encode("utf-8")).hexdigest()
++        target_data = dict(target_ir.target.to_dict())
++        plan_data = target_ir.to_dict()
++        plan_digest = target_ir.plan_digest
++        envelope = {
++            "artifact_payload_version": ARTIFACT_PAYLOAD_VERSION,
++            "backend": CPU_VECTOR_BACKEND,
++            "lowering_version": VECTOR_LOWERING_VERSION,
++            "plan_version": VECTOR_PLAN_VERSION,
++            "entrypoint": target_ir.entrypoint,
++            "target": target_data,
++            "program": program_payload,
++            "program_digest": program_digest,
++            "vector_plan": plan_data,
++            "plan_digest": plan_digest,
++        }
++        if options is not None:
++            envelope["compile_options"] = {
++                "artifact_format": options.artifact_format,
++                "abi_version": options.abi_version,
++                "metadata": _plain_mapping(options.metadata),
++                "extra": _plain_mapping(options.extra),
++            }
++        payload_text = json.dumps(
++            envelope,
++            ensure_ascii=False,
++            allow_nan=False,
++            sort_keys=True,
++            separators=(",", ":"),
++        )
++        payload = payload_text.encode("utf-8")
++        payload_digest = hashlib.sha256(payload).hexdigest()
++        plan_dtypes = sorted(set(plan.dtype for plan in target_ir.plans))
++        plan_layouts = sorted(set(plan.layout for plan in target_ir.plans))
++        metadata = {
++            "backend": CPU_VECTOR_BACKEND,
++            "artifact_payload_version": ARTIFACT_PAYLOAD_VERSION,
++            "lowering_version": VECTOR_LOWERING_VERSION,
++            "plan_version": VECTOR_PLAN_VERSION,
++            "entrypoint": target_ir.entrypoint,
++            "program_digest": program_digest,
++            "plan_digest": plan_digest,
++            "payload_digest": payload_digest,
++            "target_digest": sha256_text(target_data),
++            "required_features": list(target_ir.required_features.features),
++            "dtypes": plan_dtypes,
++            "layouts": plan_layouts,
++            "lane_count": target_ir.lane_count,
++            "tail_policy": target_ir.tail_policy.value,
++            "specialization": mapping_copy(target_ir.specialization),
++        }
++        if options is not None:
++            option_metadata = _plain_mapping(options.metadata)
++            reserved = set(metadata).intersection(option_metadata)
++            if reserved:
++                raise ValueError(
++                    "compile option metadata uses reserved CPU vector keys: {}".format(
++                        ", ".join(sorted(reserved))
++                    )
++                )
++            metadata.update(option_metadata)
++            metadata["compile_options"] = {
++                "artifact_format": options.artifact_format,
++                "abi_version": options.abi_version,
++                "extra": _plain_mapping(options.extra),
++            }
++            artifact_format = options.artifact_format
++            abi_version = options.abi_version
++        else:
++            artifact_format = DEFAULT_ARTIFACT_FORMAT
++            abi_version = ABI_VERSION
++        artifact = Artifact(
++            format=artifact_format,
++            entrypoint=target_ir.entrypoint,
++            target=target_ir.target,
++            abi_version=abi_version,
++            payload=payload,
++            metadata=metadata,
++        )
++        artifact.validate()
++        return artifact
++
++
++def _plain_mapping(value: Mapping[str, Any]) -> dict:
++    if not isinstance(value, Mapping):
++        raise TypeError("metadata must be a mapping")
++    return {key: _plain_value(item) for key, item in value.items()}
++
++
++def _plain_value(value: Any) -> Any:
++    if isinstance(value, Mapping):
++        return {key: _plain_value(item) for key, item in value.items()}
++    if isinstance(value, tuple):
++        return [_plain_value(item) for item in value]
++    if isinstance(value, list):
++        return [_plain_value(item) for item in value]
++    return value
++
++
++CPUVectorCompiler = CpuVectorCompiler
++
++
++def compile_cpu_vector(
++    program: CoreProgram,
++    target: TargetSpec,
++    options: Optional[CompileOptions] = None,
++) -> Artifact:
++    """Convenience wrapper using the public compiler contract."""
++
++    compiler = CpuVectorCompiler()
++    return compiler.compile(compiler.lower(program, target), options)
++
++
++__all__ = [
++    "ARTIFACT_PAYLOAD_VERSION",
++    "CPUVectorCompiler",
++    "DEFAULT_ARTIFACT_FORMAT",
++    "CpuVectorCompiler",
++    "compile_cpu_vector",
++]
+diff --git a/python/pypto/lowering/cpu/vector/__init__.py b/python/pypto/lowering/cpu/vector/__init__.py
+new file mode 100644
+index 000000000..a486e99b6
+--- /dev/null
++++ b/python/pypto/lowering/cpu/vector/__init__.py
+@@ -0,0 +1,3 @@
++"""ISA-neutral CPU vector planning contracts."""
++
++from .plan import *
+diff --git a/python/pypto/lowering/cpu/vector/plan.py b/python/pypto/lowering/cpu/vector/plan.py
+new file mode 100644
+index 000000000..dd3cd4688
+--- /dev/null
++++ b/python/pypto/lowering/cpu/vector/plan.py
+@@ -0,0 +1,1091 @@
++"""ISA-neutral CPU vector plans for PyPTO-X.
++
++This module deliberately stops at a target-owned iteration plan.  It does not
++name an instruction, register file, compiler intrinsic, or vendor ISA.  The
++plan is consumed by the reference executor and by later AVX/SVE lowerings.
++
++The scalar CPU lowering remains the source of truth for Core IR operation,
++shape, and dtype validation.  Vector planning only adds a concrete, immutable
++iteration domain on top of that validated subset.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from enum import Enum
++from typing import Any, Mapping, Optional, Sequence, Tuple
++
++from pypto.core_ir import CoreProgram, CoreType, Operation
++from pypto.lowering.cpu import (
++    CpuScalarError,
++    CpuScalarUnsupportedError,
++    canonical_dtype,
++    canonical_operation_name,
++    element_count,
++    reduced_shape,
++    static_shape,
++    validate_cpu_target,
++    validate_program,
++)
++from pypto.target import TargetSpec
++from pypto.target._utils import canonical_json, frozen_mapping, mapping_copy, sha256_text
++
++
++VECTOR_PLAN_VERSION = 1
++VECTOR_LOWERING_VERSION = 1
++CPU_VECTOR_BACKEND = "cpu.vector.common"
++DEFAULT_LANE_COUNT = 4
++
++
++class CpuVectorError(ValueError):
++    """Base class for vector-plan validation and execution contracts."""
++
++
++class CpuVectorValidationError(CpuVectorError):
++    """The Core IR or vector-plan options are invalid."""
++
++
++class CpuVectorUnsupportedError(CpuVectorError):
++    """The scalar subset is valid but not representable by this vector plan."""
++
++
++class CpuVectorFeatureMismatchError(CpuVectorError):
++    """Required CPU features are absent from an injected capability set."""
++
++    def __init__(self, mismatch: "FeatureMismatch") -> None:
++        self.mismatch = mismatch
++        super().__init__(
++            "missing CPU features: {}".format(", ".join(mismatch.missing) or "<none>")
++        )
++
++
++def _positive_int(value: Any, field: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
++        raise CpuVectorValidationError("{} must be a positive integer".format(field))
++    return value
++
++
++def _non_negative_int(value: Any, field: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
++        raise CpuVectorValidationError("{} must be a non-negative integer".format(field))
++    return value
++
++
++def _product(values: Sequence[int]) -> int:
++    result = 1
++    for value in values:
++        result *= value
++    return result
++
++
++def _normalise_names(values: Any, field: str) -> Tuple[str, ...]:
++    if values is None:
++        return ()
++    if isinstance(values, str):
++        values = (values,)
++    try:
++        iterator = iter(values)
++    except TypeError as exc:
++        raise CpuVectorValidationError("{} must be a string or sequence of strings".format(field)) from exc
++    names = set()
++    for value in iterator:
++        if not isinstance(value, str) or not value.strip():
++            raise CpuVectorValidationError("{} must contain non-empty strings".format(field))
++        names.add(value.strip().lower())
++    return tuple(sorted(names))
++
++
++@dataclass(frozen=True, init=False)
++class CpuFeatureSet:
++    """Immutable, injected CPU capability names.
++
++    The common layer intentionally has no host probing method.  AVX2/AVX-512
++    variants can construct this value from CPUID plus OSXSAVE/XGETBV results,
++    while tests can inject a deterministic set directly.
++    """
++
++    features: Tuple[str, ...]
++    source: str
++
++    def __init__(self, features: Any = (), source: str = "injected") -> None:
++        names = _normalise_names(features, "features")
++        if not isinstance(source, str) or not source.strip():
++            raise CpuVectorValidationError("feature source must be a non-empty string")
++        object.__setattr__(self, "features", names)
++        object.__setattr__(self, "source", source.strip())
++
++    @property
++    def names(self) -> Tuple[str, ...]:
++        return self.features
++
++    def contains(self, feature: Any) -> bool:
++        return isinstance(feature, str) and feature.strip().lower() in self.features
++
++    def missing(self, required: Any) -> Tuple[str, ...]:
++        required_set = required if isinstance(required, CpuFeatureSet) else CpuFeatureSet(required)
++        return tuple(name for name in required_set.features if name not in self.features)
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {"features": list(self.features), "source": self.source}
++
++    @property
++    def fingerprint(self) -> str:
++        return sha256_text(self.to_dict())
++
++
++@dataclass(frozen=True)
++class FeatureMismatch:
++    """Stable diagnostic for a missing-feature decision."""
++
++    required: CpuFeatureSet
++    available: CpuFeatureSet
++    missing: Tuple[str, ...]
++    reason_code: str = "missing_cpu_features"
++
++    def __post_init__(self) -> None:
++        missing = tuple(sorted(set(self.missing)))
++        if missing != tuple(self.available.missing(self.required)):
++            raise CpuVectorValidationError("feature mismatch does not match required/available sets")
++        object.__setattr__(self, "missing", missing)
++
++    @property
++    def compatible(self) -> bool:
++        return not self.missing
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "reason_code": self.reason_code,
++            "required": self.required.to_dict(),
++            "available": self.available.to_dict(),
++            "missing": list(self.missing),
++        }
++
++
++@dataclass(frozen=True)
++class CpuFeatureContract:
++    """Required and injected available CPU features for one artifact."""
++
++    required: CpuFeatureSet
++    available: CpuFeatureSet
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.required, CpuFeatureSet) or not isinstance(self.available, CpuFeatureSet):
++            raise CpuVectorValidationError("feature contract requires CpuFeatureSet values")
++
++    @property
++    def missing(self) -> Tuple[str, ...]:
++        return self.available.missing(self.required)
++
++    @property
++    def compatible(self) -> bool:
++        return not self.missing
++
++    def mismatch(self) -> Optional[FeatureMismatch]:
++        missing = self.missing
++        if not missing:
++            return None
++        return FeatureMismatch(self.required, self.available, missing)
++
++    def validate(self) -> None:
++        mismatch = self.mismatch()
++        if mismatch is not None:
++            raise CpuVectorFeatureMismatchError(mismatch)
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {"required": self.required.to_dict(), "available": self.available.to_dict()}
++
++
++FeatureSet = CpuFeatureSet
++FeatureContract = CpuFeatureContract
++CpuFeatureMismatch = FeatureMismatch
++
++
++class TailPolicy(str, Enum):
++    """Abstract handling for a vector block shorter than ``lane_count``."""
++
++    SCALAR_CLEANUP = "scalar_cleanup"
++    MASKED = "masked"
++
++    # Convenient spellings for backend code without creating new values.
++    scalar = SCALAR_CLEANUP
++    masked = MASKED
++    SCALAR = SCALAR_CLEANUP
++    MASK = MASKED
++
++
++def _tail_policy(value: Any) -> TailPolicy:
++    if value is None:
++        return TailPolicy.SCALAR_CLEANUP
++    if isinstance(value, TailPolicy):
++        return value
++    if isinstance(value, str):
++        key = value.strip().lower().replace("-", "_")
++        for candidate in TailPolicy:
++            if candidate.value == key:
++                return candidate
++    raise CpuVectorValidationError("tail_policy must be 'scalar_cleanup' or 'masked'")
++
++
++@dataclass(frozen=True)
++class VectorChunk:
++    """One bounded logical vector block.
++
++    ``length`` is the number of active elements, including for a masked tail;
++    no chunk ever includes elements outside the iteration domain.
++    """
++
++    start: int
++    length: int
++    is_tail: bool
++
++    def __post_init__(self) -> None:
++        _non_negative_int(self.start, "chunk.start")
++        if isinstance(self.length, bool) or not isinstance(self.length, int) or self.length <= 0:
++            raise CpuVectorValidationError("chunk.length must be a positive integer")
++        if not isinstance(self.is_tail, bool):
++            raise CpuVectorValidationError("chunk.is_tail must be bool")
++
++    @property
++    def active_lanes(self) -> int:
++        return self.length
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {"start": self.start, "length": self.length, "is_tail": self.is_tail}
++
++
++@dataclass(frozen=True)
++class TailPlan:
++    """Abstract tail policy and bounded tail interval."""
++
++    policy: TailPolicy
++    start: int
++    elements: int
++
++    def __post_init__(self) -> None:
++        _non_negative_int(self.start, "tail.start")
++        if isinstance(self.elements, bool) or not isinstance(self.elements, int) or self.elements < 0:
++            raise CpuVectorValidationError("tail.elements must be a non-negative integer")
++
++    @property
++    def is_present(self) -> bool:
++        return self.elements > 0
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {"policy": self.policy.value, "start": self.start, "elements": self.elements}
++
++
++@dataclass(frozen=True)
++class IterationPlan:
++    """Immutable linear iteration domain split into vector blocks and a tail."""
++
++    element_count: int
++    lane_count: int
++    contiguous_axis: Optional[int]
++    tail: TailPlan
++    chunks: Tuple[VectorChunk, ...]
++
++    def __post_init__(self) -> None:
++        _non_negative_int(self.element_count, "iteration.element_count")
++        _positive_int(self.lane_count, "iteration.lane_count")
++        if self.contiguous_axis is not None:
++            _non_negative_int(self.contiguous_axis, "iteration.contiguous_axis")
++        expected = []
++        full = self.element_count // self.lane_count
++        remainder = self.element_count % self.lane_count
++        for index in range(full):
++            expected.append(VectorChunk(index * self.lane_count, self.lane_count, False))
++        if remainder:
++            expected.append(VectorChunk(full * self.lane_count, remainder, True))
++        if tuple(expected) != tuple(self.chunks):
++            raise CpuVectorValidationError("iteration chunks do not cover the declared domain")
++        expected_tail_start = full * self.lane_count
++        if self.tail.start != expected_tail_start or self.tail.elements != remainder:
++            raise CpuVectorValidationError("iteration tail does not match the declared domain")
++
++    @property
++    def vector_blocks(self) -> Tuple[VectorChunk, ...]:
++        return tuple(chunk for chunk in self.chunks if not chunk.is_tail)
++
++    @property
++    def full_chunks(self) -> int:
++        return len(self.vector_blocks)
++
++    @property
++    def tail_elements(self) -> int:
++        return self.tail.elements
++
++    @property
++    def vector_width(self) -> int:
++        """Number of elements in a logical vector block, not a register width."""
++
++        return self.lane_count
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "element_count": self.element_count,
++            "lane_count": self.lane_count,
++            "contiguous_axis": self.contiguous_axis,
++            "full_chunks": self.full_chunks,
++            "tail": self.tail.to_dict(),
++            "chunks": [chunk.to_dict() for chunk in self.chunks],
++        }
++
++    def canonical_json(self) -> str:
++        return canonical_json(self.to_dict())
++
++    dumps = canonical_json
++    to_json = canonical_json
++
++
++VectorIterationPlan = IterationPlan
++
++
++def make_iteration_plan(
++    element_count: int,
++    lane_count: int,
++    contiguous_axis: Optional[int] = None,
++    tail_policy: Any = TailPolicy.SCALAR_CLEANUP,
++) -> IterationPlan:
++    """Create a bounded chunk plan for ``[0, element_count)``."""
++
++    count = _non_negative_int(element_count, "element_count")
++    lanes = _positive_int(lane_count, "lane_count")
++    policy = _tail_policy(tail_policy)
++    full, remainder = divmod(count, lanes)
++    chunks = [VectorChunk(index * lanes, lanes, False) for index in range(full)]
++    if remainder:
++        chunks.append(VectorChunk(full * lanes, remainder, True))
++    return IterationPlan(
++        element_count=count,
++        lane_count=lanes,
++        contiguous_axis=contiguous_axis,
++        tail=TailPlan(policy, full * lanes, remainder),
++        chunks=tuple(chunks),
++    )
++
++
++@dataclass(frozen=True)
++class ReductionPlan:
++    """Reduction iteration description independent of an instruction set."""
++
++    input_shape: Tuple[int, ...]
++    output_shape: Tuple[int, ...]
++    axes: Tuple[int, ...]
++    keepdims: bool
++    reduction_size: int
++    output_elements: int
++    output_iteration: IterationPlan
++    reduction_iteration: IterationPlan
++
++    def __post_init__(self) -> None:
++        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in self.input_shape):
++            raise CpuVectorValidationError("reduction input_shape must contain non-negative integers")
++        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in self.output_shape):
++            raise CpuVectorValidationError("reduction output_shape must contain non-negative integers")
++        rank = len(self.input_shape)
++        if tuple(sorted(self.axes)) != self.axes or len(set(self.axes)) != len(self.axes):
++            raise CpuVectorValidationError("reduction axes must be sorted and unique")
++        if any(axis < 0 or axis >= rank for axis in self.axes):
++            raise CpuVectorValidationError("reduction axis is outside input rank")
++        if not isinstance(self.keepdims, bool):
++            raise CpuVectorValidationError("reduction keepdims must be bool")
++        if self.reduction_size != _product(tuple(self.input_shape[axis] for axis in self.axes)):
++            raise CpuVectorValidationError("reduction_size does not match input_shape and axes")
++        if self.output_elements != _product(self.output_shape):
++            raise CpuVectorValidationError("output_elements does not match output_shape")
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "input_shape": list(self.input_shape),
++            "output_shape": list(self.output_shape),
++            "axes": list(self.axes),
++            "keepdims": self.keepdims,
++            "reduction_size": self.reduction_size,
++            "output_elements": self.output_elements,
++            "output_iteration": self.output_iteration.to_dict(),
++            "reduction_iteration": self.reduction_iteration.to_dict(),
++        }
++
++
++@dataclass(frozen=True)
++class MatmulPlan:
++    """Rectangular ``(m,k) x (k,n)`` iteration description."""
++
++    m: int
++    k: int
++    n: int
++    output_shape: Tuple[int, int]
++    output_elements: int
++    output_iteration: IterationPlan
++    reduction_iteration: IterationPlan
++
++    def __post_init__(self) -> None:
++        _non_negative_int(self.m, "matmul.m")
++        _non_negative_int(self.k, "matmul.k")
++        _non_negative_int(self.n, "matmul.n")
++        if self.output_shape != (self.m, self.n):
++            raise CpuVectorValidationError("matmul output_shape must be (m, n)")
++        if self.output_elements != self.m * self.n:
++            raise CpuVectorValidationError("matmul output_elements does not match m*n")
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "m": self.m,
++            "k": self.k,
++            "n": self.n,
++            "output_shape": list(self.output_shape),
++            "output_elements": self.output_elements,
++            "output_iteration": self.output_iteration.to_dict(),
++            "reduction_iteration": self.reduction_iteration.to_dict(),
++        }
++
++
++def _is_tensor(value_type: CoreType) -> bool:
++    return value_type.kind in ("tensor", "view", "tile")
++
++
++def _is_scalar(value_type: CoreType) -> bool:
++    return value_type.kind == "scalar"
++
++
++def _contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
++    strides = [1] * len(shape)
++    running = 1
++    for index in range(len(shape) - 1, -1, -1):
++        strides[index] = running
++        running *= shape[index]
++    return tuple(strides)
++
++
++def _normalise_axes(attributes: Mapping[str, Any], rank: int, context: str) -> Tuple[int, ...]:
++    raw = attributes.get("axes", attributes.get("axis"))
++    if raw is None:
++        axes = tuple(range(rank))
++    elif isinstance(raw, int) and not isinstance(raw, bool):
++        axes = (raw,)
++    else:
++        if isinstance(raw, (str, bytes)):
++            raise CpuVectorValidationError("{} axes must be an integer or sequence".format(context))
++        try:
++            axes = tuple(raw)
++        except TypeError as exc:
++            raise CpuVectorValidationError("{} axes must be an integer or sequence".format(context)) from exc
++    result = []
++    for axis in axes:
++        if isinstance(axis, bool) or not isinstance(axis, int):
++            raise CpuVectorValidationError("{} axes must contain integers".format(context))
++        axis = axis + rank if axis < 0 else axis
++        if axis < 0 or axis >= rank:
++            raise CpuVectorValidationError("{} axis is outside rank".format(context))
++        if axis in result:
++            raise CpuVectorValidationError("{} axes contain a duplicate".format(context))
++        result.append(axis)
++    return tuple(sorted(result))
++
++
++def _layout_value(value: Any, context: str) -> Tuple[str, Optional[Tuple[int, ...]], Optional[int]]:
++    """Normalize a layout descriptor into kind, strides, and contiguous axis."""
++
++    if value is None:
++        return "row_major_contiguous", None, None
++    if isinstance(value, str):
++        key = value.strip().lower().replace("-", "_")
++        if key in ("contiguous", "row_major", "row_major_contiguous", "c"):
++            return "row_major_contiguous", None, None
++        raise CpuVectorUnsupportedError("{} layout {!r} is non-contiguous or unknown".format(context, value))
++    if not isinstance(value, Mapping):
++        raise CpuVectorValidationError("{} layout must be a string or mapping".format(context))
++    kind = value.get("kind", value.get("layout", "row_major_contiguous"))
++    if not isinstance(kind, str):
++        raise CpuVectorValidationError("{} layout kind must be a string".format(context))
++    kind = kind.strip().lower().replace("-", "_")
++    if kind not in ("contiguous", "row_major", "row_major_contiguous", "c"):
++        raise CpuVectorUnsupportedError("{} layout {!r} is non-contiguous or unknown".format(context, kind))
++    strides = value.get("strides")
++    if strides is not None:
++        if isinstance(strides, (str, bytes)):
++            raise CpuVectorValidationError("{} layout strides must be integer sequence".format(context))
++        try:
++            strides = tuple(strides)
++        except TypeError as exc:
++            raise CpuVectorValidationError("{} layout strides must be integer sequence".format(context)) from exc
++        for item in strides:
++            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
++                raise CpuVectorValidationError("{} layout strides must be non-negative integers".format(context))
++    contiguous_axis = value.get("contiguous_axis")
++    if contiguous_axis is not None and (isinstance(contiguous_axis, bool) or not isinstance(contiguous_axis, int)):
++        raise CpuVectorValidationError("{} contiguous_axis must be an integer".format(context))
++    return kind if kind != "c" else "row_major_contiguous", strides, contiguous_axis
++
++
++def _check_layout(
++    program: CoreProgram,
++    operation: Operation,
++    refs: Sequence[Any],
++    context: str,
++) -> Tuple[str, Optional[int]]:
++    """Reject views/strides that the first vector planner cannot prove safe."""
++
++    operation_layout = operation.attributes.get("layout")
++    operation_strides = operation.attributes.get("strides")
++    operation_axis = operation.attributes.get("contiguous_axis")
++    if operation_strides is not None:
++        if isinstance(operation_layout, Mapping):
++            operation_layout = dict(operation_layout)
++            operation_layout["strides"] = operation_strides
++        else:
++            operation_layout = {"kind": operation_layout or "row_major_contiguous", "strides": operation_strides}
++    if operation_axis is not None:
++        if isinstance(operation_layout, Mapping):
++            operation_layout = dict(operation_layout)
++            operation_layout["contiguous_axis"] = operation_axis
++        else:
++            operation_layout = {
++                "kind": operation_layout or "row_major_contiguous",
++                "contiguous_axis": operation_axis,
++            }
++    if operation.attributes.get("contiguous") is False or operation.attributes.get("is_contiguous") is False:
++        raise CpuVectorUnsupportedError("{} declares a non-contiguous layout".format(context))
++    layouts = program.metadata.get("layouts", {})
++    if layouts is not None and not isinstance(layouts, Mapping):
++        raise CpuVectorValidationError("program metadata 'layouts' must be a mapping")
++    selected_kind = "row_major_contiguous"
++    selected_axis = None
++    for ref in refs:
++        if not _is_tensor(ref.type):
++            continue
++        if ref.type.kind == "view":
++            raise CpuVectorUnsupportedError("{} value {!r} is a view; non-contiguous views are unsupported".format(context, ref.name))
++        raw = operation_layout
++        if isinstance(layouts, Mapping) and ref.name in layouts:
++            raw = layouts[ref.name]
++        if isinstance(raw, Mapping) and (
++            raw.get("contiguous") is False or raw.get("is_contiguous") is False
++        ):
++            raise CpuVectorUnsupportedError("{} value {!r} declares a non-contiguous layout".format(context, ref.name))
++        kind, strides, axis = _layout_value(raw, "{} value {!r}".format(context, ref.name))
++        shape = static_shape(ref.type, "{} value {!r}".format(context, ref.name))
++        expected = _contiguous_strides(shape)
++        if strides is not None and tuple(strides) != expected:
++            raise CpuVectorUnsupportedError("{} value {!r} has non-contiguous strides".format(context, ref.name))
++        expected_axis = len(shape) - 1 if shape else None
++        if axis is not None:
++            normalized_axis = axis + len(shape) if axis < 0 else axis
++            if normalized_axis != expected_axis:
++                raise CpuVectorUnsupportedError("{} value {!r} contiguous axis is not the innermost axis".format(context, ref.name))
++            axis = normalized_axis
++        else:
++            axis = expected_axis
++        if selected_axis is None:
++            selected_axis = axis
++        elif selected_axis != axis and selected_axis is not None and axis is not None:
++            raise CpuVectorUnsupportedError("{} operands do not share a contiguous axis".format(context))
++        selected_kind = kind
++    return selected_kind, selected_axis
++
++
++def _target_lane_count(target: TargetSpec, requested: Optional[int]) -> int:
++    if requested is not None:
++        return _positive_int(requested, "lane_count")
++    attributes = target.attributes
++    for key in ("lane_count", "vector_lanes", "vector_lane_count", "vector_block_elements", "vector_width"):
++        if key in attributes:
++            return _positive_int(attributes[key], "target.attributes[{}]".format(key))
++    return DEFAULT_LANE_COUNT
++
++
++def _target_required_features(target: TargetSpec, required: Any) -> CpuFeatureSet:
++    if required is not None:
++        return required if isinstance(required, CpuFeatureSet) else CpuFeatureSet(required, source="compiler")
++    attributes = target.attributes
++    if "required_features" in attributes:
++        return CpuFeatureSet(attributes["required_features"], source="target")
++    return CpuFeatureSet(target.features, source="target")
++
++
++def _target_specialization(target: TargetSpec, specialization: Optional[Mapping[str, Any]]) -> Mapping[str, Any]:
++    value = specialization if specialization is not None else target.attributes.get("specialization", {})
++    if not isinstance(value, Mapping):
++        raise CpuVectorValidationError("specialization must be a mapping")
++    return frozen_mapping(value)
++
++
++@dataclass(frozen=True, init=False)
++class VectorPlan:
++    """Target-owned plan for one Core IR operation."""
++
++    plan_version: int
++    operation: str
++    plan_kind: str
++    operation_index: int
++    input_names: Tuple[str, ...]
++    output_name: str
++    dtype: str
++    shape: Tuple[int, ...]
++    layout: str
++    contiguous_axis: Optional[int]
++    element_count: int
++    lane_count: int
++    iteration: IterationPlan
++    required_features: CpuFeatureSet
++    specialization: Mapping[str, Any]
++    reduction: Optional[ReductionPlan]
++    matmul: Optional[MatmulPlan]
++
++    def __init__(
++        self,
++        plan_version: int,
++        operation: str,
++        plan_kind: str,
++        operation_index: int,
++        input_names: Sequence[str],
++        output_name: str,
++        dtype: str,
++        shape: Sequence[int],
++        layout: str,
++        contiguous_axis: Optional[int],
++        element_count: int,
++        lane_count: int,
++        iteration: IterationPlan,
++        required_features: CpuFeatureSet,
++        specialization: Optional[Mapping[str, Any]] = None,
++        reduction: Optional[ReductionPlan] = None,
++        matmul: Optional[MatmulPlan] = None,
++    ) -> None:
++        if plan_version != VECTOR_PLAN_VERSION:
++            raise CpuVectorValidationError("unsupported vector plan version {!r}".format(plan_version))
++        if not isinstance(operation, str) or not operation.strip():
++            raise CpuVectorValidationError("plan operation must be a non-empty string")
++        if plan_kind not in ("elementwise", "reduction", "matmul"):
++            raise CpuVectorValidationError("unknown vector plan kind {!r}".format(plan_kind))
++        if isinstance(operation_index, bool) or not isinstance(operation_index, int) or operation_index < 0:
++            raise CpuVectorValidationError("operation_index must be a non-negative integer")
++        if not isinstance(output_name, str) or not output_name:
++            raise CpuVectorValidationError("output_name must be non-empty")
++        normalized_dtype = canonical_dtype(dtype)
++        normalized_shape = tuple(shape)
++        count = _non_negative_int(element_count, "plan.element_count")
++        lanes = _positive_int(lane_count, "plan.lane_count")
++        if count != _product(normalized_shape):
++            raise CpuVectorValidationError("plan.element_count does not match shape")
++        if iteration.element_count != count or iteration.lane_count != lanes:
++            raise CpuVectorValidationError("plan iteration does not match element_count/lane_count")
++        if not isinstance(required_features, CpuFeatureSet):
++            raise CpuVectorValidationError("required_features must be CpuFeatureSet")
++        object.__setattr__(self, "plan_version", plan_version)
++        object.__setattr__(self, "operation", operation.strip())
++        object.__setattr__(self, "plan_kind", plan_kind)
++        object.__setattr__(self, "operation_index", operation_index)
++        object.__setattr__(self, "input_names", tuple(input_names))
++        object.__setattr__(self, "output_name", output_name)
++        object.__setattr__(self, "dtype", normalized_dtype)
++        object.__setattr__(self, "shape", normalized_shape)
++        object.__setattr__(self, "layout", layout)
++        object.__setattr__(self, "contiguous_axis", contiguous_axis)
++        object.__setattr__(self, "element_count", count)
++        object.__setattr__(self, "lane_count", lanes)
++        object.__setattr__(self, "iteration", iteration)
++        object.__setattr__(self, "required_features", required_features)
++        object.__setattr__(self, "specialization", frozen_mapping(specialization))
++        object.__setattr__(self, "reduction", reduction)
++        object.__setattr__(self, "matmul", matmul)
++        if plan_kind == "reduction" and reduction is None:
++            raise CpuVectorValidationError("reduction plan kind requires reduction details")
++        if plan_kind == "matmul" and matmul is None:
++            raise CpuVectorValidationError("matmul plan kind requires matmul details")
++        if plan_kind == "elementwise" and (reduction is not None or matmul is not None):
++            raise CpuVectorValidationError("elementwise plan cannot carry reduction/matmul details")
++
++    @property
++    def vector_blocks(self) -> Tuple[VectorChunk, ...]:
++        return self.iteration.vector_blocks
++
++    @property
++    def chunks(self) -> Tuple[VectorChunk, ...]:
++        """All bounded blocks, including the optional tail."""
++
++        return self.iteration.chunks
++
++    @property
++    def full_chunks(self) -> int:
++        return self.iteration.full_chunks
++
++    @property
++    def tail(self) -> TailPlan:
++        return self.iteration.tail
++
++    @property
++    def tail_elements(self) -> int:
++        return self.iteration.tail_elements
++
++    @property
++    def iteration_domain(self) -> IterationPlan:
++        return self.iteration
++
++    @property
++    def vector_block_elements(self) -> int:
++        return self.lane_count
++
++    @property
++    def tail_policy(self) -> TailPolicy:
++        return self.tail.policy
++
++    @property
++    def kind(self) -> str:
++        return self.plan_kind
++
++    @property
++    def output_shape(self) -> Tuple[int, ...]:
++        return self.shape
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "plan_version": self.plan_version,
++            "operation": self.operation,
++            "plan_kind": self.plan_kind,
++            "operation_index": self.operation_index,
++            "input_names": list(self.input_names),
++            "output_name": self.output_name,
++            "dtype": self.dtype,
++            "shape": list(self.shape),
++            "layout": self.layout,
++            "contiguous_axis": self.contiguous_axis,
++            "element_count": self.element_count,
++            "lane_count": self.lane_count,
++            "iteration": self.iteration.to_dict(),
++            "tail_policy": self.tail.policy.value,
++            "required_features": self.required_features.to_dict(),
++            "specialization": mapping_copy(self.specialization),
++            "reduction": None if self.reduction is None else self.reduction.to_dict(),
++            "matmul": None if self.matmul is None else self.matmul.to_dict(),
++        }
++
++    def canonical_json(self) -> str:
++        return canonical_json(self.to_dict())
++
++    dumps = canonical_json
++    to_json = canonical_json
++
++    @property
++    def fingerprint(self) -> str:
++        return sha256_text(self.to_dict())
++
++
++CpuVectorPlan = VectorPlan
++
++
++def _make_plan_for_operation(
++    program: CoreProgram,
++    operation: Operation,
++    operation_index: int,
++    lane_count: int,
++    tail_policy: TailPolicy,
++    required_features: CpuFeatureSet,
++    specialization: Mapping[str, Any],
++) -> VectorPlan:
++    name = canonical_operation_name(operation.name)
++    if len(operation.outputs) != 1:
++        raise CpuVectorValidationError("operation {} must have exactly one output".format(operation_index))
++    output = operation.outputs[0]
++    output_type = output.type
++    output_shape = static_shape(output_type, "vector operation output") if _is_tensor(output_type) else ()
++    # Reduction outputs may have a different rank (and therefore a different
++    # innermost-axis number) from their input.  The reduction iteration axis
++    # is defined by the input domain; elementwise/matmul outputs must share
++    # the input contiguous axis.
++    refs = tuple(operation.inputs) if name in ("reduce_sum", "reduce_max") else tuple(operation.inputs) + (output,)
++    layout, contiguous_axis = _check_layout(
++        program,
++        operation,
++        refs,
++        "function operation {}".format(operation_index),
++    )
++    count = element_count(output_shape)
++    output_axis = len(output_shape) - 1 if output_shape else None
++    if name in ("reduce_sum", "reduce_max"):
++        contiguous_axis = output_axis
++    iteration = make_iteration_plan(count, lane_count, contiguous_axis, tail_policy)
++    dtype = canonical_dtype(output_type.dtype)
++    if name in ("reduce_sum", "reduce_max"):
++        input_type = operation.inputs[0].type
++        input_shape = static_shape(input_type, "vector reduction input")
++        axes = _normalise_axes(operation.attributes, len(input_shape), "vector reduction")
++        expected_output_shape = reduced_shape(input_shape, operation.attributes, "vector reduction")
++        if output_shape != expected_output_shape:
++            raise CpuVectorValidationError(
++                "vector reduction output shape {} does not match {}".format(output_shape, expected_output_shape)
++            )
++        reduction_size = _product(tuple(input_shape[axis] for axis in axes))
++        reduction_axis = len(input_shape) - 1 if input_shape else None
++        reduction_iteration = make_iteration_plan(reduction_size, lane_count, reduction_axis, tail_policy)
++        reduction = ReductionPlan(
++            input_shape=input_shape,
++            output_shape=output_shape,
++            axes=axes,
++            keepdims=bool(operation.attributes.get("keepdims", False)),
++            reduction_size=reduction_size,
++            output_elements=count,
++            output_iteration=iteration,
++            reduction_iteration=reduction_iteration,
++        )
++        return VectorPlan(
++            VECTOR_PLAN_VERSION,
++            name,
++            "reduction",
++            operation_index,
++            tuple(ref.name for ref in operation.inputs),
++            output.name,
++            dtype,
++            output_shape,
++            layout,
++            contiguous_axis,
++            count,
++            lane_count,
++            iteration,
++            required_features,
++            specialization,
++            reduction=reduction,
++        )
++    if name == "matmul":
++        left_shape = static_shape(operation.inputs[0].type, "vector matmul left")
++        right_shape = static_shape(operation.inputs[1].type, "vector matmul right")
++        if len(left_shape) != 2 or len(right_shape) != 2 or len(output_shape) != 2:
++            raise CpuVectorValidationError("vector matmul requires rank-2 values")
++        m, k = left_shape
++        right_k, n = right_shape
++        if right_k != k or output_shape != (m, n):
++            raise CpuVectorValidationError("vector matmul shapes are inconsistent")
++        reduction_iteration = make_iteration_plan(k, lane_count, 1, tail_policy)
++        matmul = MatmulPlan(
++            m=m,
++            k=k,
++            n=n,
++            output_shape=(m, n),
++            output_elements=count,
++            output_iteration=iteration,
++            reduction_iteration=reduction_iteration,
++        )
++        return VectorPlan(
++            VECTOR_PLAN_VERSION,
++            name,
++            "matmul",
++            operation_index,
++            tuple(ref.name for ref in operation.inputs),
++            output.name,
++            dtype,
++            output_shape,
++            layout,
++            contiguous_axis,
++            count,
++            lane_count,
++            iteration,
++            required_features,
++            specialization,
++            matmul=matmul,
++        )
++    return VectorPlan(
++        VECTOR_PLAN_VERSION,
++        name,
++        "elementwise",
++        operation_index,
++        tuple(ref.name for ref in operation.inputs),
++        output.name,
++        dtype,
++        output_shape,
++        layout,
++        contiguous_axis,
++        count,
++        lane_count,
++        iteration,
++        required_features,
++        specialization,
++    )
++
++
++@dataclass(frozen=True, init=False)
++class CpuVectorProgram:
++    """Validated target IR containing a plan for every direct-body operation."""
++
++    program: CoreProgram
++    target: TargetSpec
++    entrypoint: str
++    plans: Tuple[VectorPlan, ...]
++    required_features: CpuFeatureSet
++    lane_count: int
++    tail_policy: TailPolicy
++    specialization: Mapping[str, Any]
++    plan_version: int
++
++    def __init__(
++        self,
++        program: CoreProgram,
++        target: TargetSpec,
++        entrypoint: str,
++        plans: Sequence[VectorPlan],
++        required_features: CpuFeatureSet,
++        lane_count: int,
++        tail_policy: Any,
++        specialization: Optional[Mapping[str, Any]] = None,
++        plan_version: int = VECTOR_PLAN_VERSION,
++    ) -> None:
++        if not isinstance(program, CoreProgram):
++            raise CpuVectorValidationError("vector program requires CoreProgram")
++        if not isinstance(target, TargetSpec):
++            raise CpuVectorValidationError("vector program requires TargetSpec")
++        if not isinstance(entrypoint, str) or not entrypoint.strip():
++            raise CpuVectorValidationError("vector entrypoint must be non-empty")
++        plan_values = tuple(plans)
++        if any(not isinstance(plan, VectorPlan) for plan in plan_values):
++            raise CpuVectorValidationError("vector program plans must be VectorPlan values")
++        if not isinstance(required_features, CpuFeatureSet):
++            raise CpuVectorValidationError("vector program required_features must be CpuFeatureSet")
++        lanes = _positive_int(lane_count, "lane_count")
++        policy = _tail_policy(tail_policy)
++        if plan_version != VECTOR_PLAN_VERSION:
++            raise CpuVectorValidationError("unsupported vector plan version {!r}".format(plan_version))
++        if any(plan.lane_count != lanes for plan in plan_values):
++            raise CpuVectorValidationError("all vector plans must use the program lane_count")
++        if any(plan.required_features != required_features for plan in plan_values):
++            raise CpuVectorValidationError("all vector plans must use program required_features")
++        object.__setattr__(self, "program", program)
++        object.__setattr__(self, "target", target)
++        object.__setattr__(self, "entrypoint", entrypoint.strip())
++        object.__setattr__(self, "plans", plan_values)
++        object.__setattr__(self, "required_features", required_features)
++        object.__setattr__(self, "lane_count", lanes)
++        object.__setattr__(self, "tail_policy", policy)
++        object.__setattr__(self, "specialization", frozen_mapping(specialization))
++        object.__setattr__(self, "plan_version", plan_version)
++
++    @property
++    def plan_digest(self) -> str:
++        return sha256_text([plan.to_dict() for plan in self.plans])
++
++    @property
++    def vector_plans(self) -> Tuple[VectorPlan, ...]:
++        return self.plans
++
++    @property
++    def features(self) -> CpuFeatureSet:
++        return self.required_features
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "plan_version": self.plan_version,
++            "entrypoint": self.entrypoint,
++            "lane_count": self.lane_count,
++            "tail_policy": self.tail_policy.value,
++            "required_features": self.required_features.to_dict(),
++            "specialization": mapping_copy(self.specialization),
++            "plans": [plan.to_dict() for plan in self.plans],
++            "plan_digest": self.plan_digest,
++        }
++
++    def canonical_json(self) -> str:
++        return canonical_json(self.to_dict())
++
++    dumps = canonical_json
++    to_json = canonical_json
++
++
++def validate_cpu_vector_target(target: TargetSpec) -> TargetSpec:
++    try:
++        validate_cpu_target(target)
++    except CpuScalarError as exc:
++        raise CpuVectorValidationError(str(exc)) from exc
++    return target
++
++
++def lower_cpu_vector(
++    program: CoreProgram,
++    target: TargetSpec,
++    entrypoint: Optional[str] = None,
++    *,
++    lane_count: Optional[int] = None,
++    tail_policy: Any = None,
++    required_features: Any = None,
++    specialization: Optional[Mapping[str, Any]] = None,
++) -> CpuVectorProgram:
++    """Validate and construct ISA-neutral vector plans for one program."""
++
++    validate_cpu_vector_target(target)
++    try:
++        validate_program(program)
++    except CpuScalarUnsupportedError as exc:
++        raise CpuVectorUnsupportedError("scalar validation rejected vector plan: {}".format(exc)) from exc
++    except CpuScalarError as exc:
++        raise CpuVectorValidationError("scalar validation failed: {}".format(exc)) from exc
++    if any(function.body.blocks for function in program.functions):
++        raise CpuVectorUnsupportedError("vector common supports direct operation bodies only")
++    functions = {function.name: function for function in program.functions}
++    selected = entrypoint
++    if selected is None:
++        selected = target.attributes.get("entrypoint", program.functions[0].name)
++    if not isinstance(selected, str) or selected not in functions:
++        raise CpuVectorValidationError("vector entrypoint {!r} is not a program function".format(selected))
++    lanes = _target_lane_count(target, lane_count)
++    policy = _tail_policy(tail_policy if tail_policy is not None else target.attributes.get("tail_policy"))
++    required = _target_required_features(target, required_features)
++    normalized_specialization = _target_specialization(target, specialization)
++    function = functions[selected]
++    plans = tuple(
++        _make_plan_for_operation(
++            program,
++            operation,
++            index,
++            lanes,
++            policy,
++            required,
++            normalized_specialization,
++        )
++        for index, operation in enumerate(function.body.operations)
++    )
++    return CpuVectorProgram(
++        program,
++        target,
++        selected,
++        plans,
++        required,
++        lanes,
++        policy,
++        normalized_specialization,
++    )
++
++
++build_vector_plan = lower_cpu_vector
++make_vector_plan = lower_cpu_vector
++lower = lower_cpu_vector
++
++
++__all__ = [
++    "CPU_VECTOR_BACKEND",
++    "DEFAULT_LANE_COUNT",
++    "VECTOR_LOWERING_VERSION",
++    "VECTOR_PLAN_VERSION",
++    "CpuFeatureContract",
++    "CpuFeatureMismatch",
++    "CpuFeatureSet",
++    "CpuVectorError",
++    "CpuVectorFeatureMismatchError",
++    "CpuVectorPlan",
++    "CpuVectorProgram",
++    "CpuVectorUnsupportedError",
++    "CpuVectorValidationError",
++    "FeatureContract",
++    "FeatureMismatch",
++    "FeatureSet",
++    "IterationPlan",
++    "MatmulPlan",
++    "ReductionPlan",
++    "TailPlan",
++    "TailPolicy",
++    "VectorChunk",
++    "VectorIterationPlan",
++    "VectorPlan",
++    "build_vector_plan",
++    "lower",
++    "lower_cpu_vector",
++    "make_iteration_plan",
++    "make_vector_plan",
++    "validate_cpu_vector_target",
++]
+diff --git a/python/tests/ut/pypto_x/test_cpu_vector_common.py b/python/tests/ut/pypto_x/test_cpu_vector_common.py
+new file mode 100644
+index 000000000..2ee006a65
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cpu_vector_common.py
+@@ -0,0 +1,239 @@
++"""W3 CPU vector-common plan and reference-executor tests.
++
++Run with ``PYPTO_X_PORTABLE_ONLY=1`` so imports exercise the real portable
++bootstrap path instead of a fake ``sys.modules`` package.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++import pypto
++from pypto.abi import LaunchRequest
++from pypto.backends.cpu import CpuScalarRuntime, HostTensor
++from pypto.backends.cpu.vector import (
++    CpuVectorArtifactError,
++    CpuVectorExecutionError,
++    CpuVectorRuntime,
++)
++from pypto.compiler.targets.cpu_vector import CpuVectorCompiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu.vector import (
++    CpuFeatureSet,
++    CpuVectorFeatureMismatchError,
++    CpuVectorUnsupportedError,
++    CpuVectorValidationError,
++    TailPolicy,
++    make_iteration_plan,
++)
++from pypto.target import TargetSpec
++
++
++TARGET = TargetSpec("cpu", "x86_64-linux-gnu", attributes={"lane_count": 4})
++
++
++def _program(name, parameters, returns, operations, metadata=None):
++    return CoreProgram(
++        functions=(CoreFunction(name, parameters, returns, Region(tuple(operations))),),
++        metadata=metadata,
++    )
++
++
++def _add_program(shape=(11,)):
++    value_type = CoreType.tensor("float32", shape)
++    x = ValueRef("x", value_type)
++    y = ValueRef("y", value_type)
++    z = ValueRef("z", value_type)
++    return _program("add", (x, y), (z,), (Operation("add", (x, y), (z,)),))
++
++
++def _run(compiler, artifact, inputs, output, runtime=None):
++    runtime = runtime or CpuVectorRuntime()
++    return runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[tensor.descriptor(readonly=True) for tensor in inputs],
++            outputs=[output.descriptor()],
++        )
++    )
++
++
++def test_portable_only_normal_import_path_is_active():
++    assert pypto.__portable_only__ is True
++
++
++@pytest.mark.parametrize("length", (0, 1, 3, 4, 5, 11))
++@pytest.mark.parametrize("tail_policy", (TailPolicy.SCALAR_CLEANUP, TailPolicy.MASKED))
++def test_iteration_plan_covers_each_boundary_without_out_of_bounds(length, tail_policy):
++    plan = make_iteration_plan(length, 4, 0, tail_policy)
++    assert plan.element_count == length
++    assert sum(chunk.length for chunk in plan.chunks) == length
++    assert all(chunk.start >= 0 and chunk.start + chunk.length <= length for chunk in plan.chunks)
++    assert plan.tail.policy is tail_policy
++    assert plan.tail_elements == (length % 4)
++    assert plan.to_dict() == make_iteration_plan(length, 4, 0, tail_policy).to_dict()
++
++
++def test_iteration_plan_is_immutable_and_stable():
++    plan = make_iteration_plan(11, 4, 0, TailPolicy.MASKED)
++    with pytest.raises((AttributeError, TypeError)):
++        plan.lane_count = 8
++    assert plan.to_dict()["chunks"][-1] == {"start": 8, "length": 3, "is_tail": True}
++
++
++def test_elementwise_vector_executor_differentials_scalar_on_tail():
++    program = _add_program()
++    vector_compiler = CpuVectorCompiler()
++    vector_artifact = vector_compiler.compile(vector_compiler.lower(program, TARGET))
++    scalar_compiler = __import__("pypto.compiler.targets.cpu", fromlist=["CpuScalarCompiler"]).CpuScalarCompiler()
++    scalar_artifact = scalar_compiler.compile(scalar_compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu")))
++    left = HostTensor("float32", (11,), list(range(11)))
++    right = HostTensor("float32", (11,), [1] * 11)
++    vector_output = HostTensor.zeros("float32", (11,))
++    scalar_output = HostTensor.zeros("float32", (11,))
++    _run(vector_compiler, vector_artifact, [left, right], vector_output)
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            scalar_artifact,
++            inputs=[left.descriptor(readonly=True), right.descriptor(readonly=True)],
++            outputs=[scalar_output.descriptor()],
++        )
++    )
++    assert vector_output.flat() == scalar_output.flat()
++    plan = vector_compiler.lower(program, TARGET).plans[0]
++    assert plan.chunks[-1].start == 8
++    assert plan.tail.elements == 3
++
++
++def test_reduce_plan_and_executor_differential():
++    input_type = CoreType.tensor("float32", (2, 3, 5))
++    output_type = CoreType.tensor("float32", (2, 5))
++    x = ValueRef("x", input_type)
++    y = ValueRef("y", output_type)
++    program = _program(
++        "reduce",
++        (x,),
++        (y,),
++        (Operation("reduce_sum", (x,), (y,), attributes={"axis": 1}),),
++    )
++    vector_compiler = CpuVectorCompiler()
++    artifact = vector_compiler.compile(vector_compiler.lower(program, TARGET))
++    source = HostTensor("float32", (2, 3, 5), list(range(30)))
++    result = HostTensor.zeros("float32", (2, 5))
++    _run(vector_compiler, artifact, [source], result)
++    assert result.tolist() == [[15.0, 18.0, 21.0, 24.0, 27.0], [60.0, 63.0, 66.0, 69.0, 72.0]]
++    plan = vector_compiler.lower(program, TARGET).plans[0]
++    assert plan.plan_kind == "reduction"
++    assert plan.reduction.reduction_size == 3
++    assert plan.reduction.reduction_iteration.tail.elements == 3
++
++
++def test_rectangular_matmul_plan_and_executor():
++    left_type = CoreType.tensor("float32", (2, 3))
++    right_type = CoreType.tensor("float32", (3, 4))
++    output_type = CoreType.tensor("float32", (2, 4))
++    left = ValueRef("left", left_type)
++    right = ValueRef("right", right_type)
++    output = ValueRef("output", output_type)
++    program = _program("matmul", (left, right), (output,), (Operation("matmul", (left, right), (output,)),))
++    compiler = CpuVectorCompiler()
++    artifact = compiler.compile(compiler.lower(program, TARGET))
++    destination = HostTensor.zeros("float32", (2, 4))
++    _run(
++        compiler,
++        artifact,
++        [
++            HostTensor("float32", (2, 3), [[1, 2, 3], [4, 5, 6]]),
++            HostTensor("float32", (3, 4), [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]),
++        ],
++        destination,
++    )
++    assert destination.tolist() == [[38.0, 44.0, 50.0, 56.0], [83.0, 98.0, 113.0, 128.0]]
++    plan = compiler.lower(program, TARGET).plans[0]
++    assert (plan.matmul.m, plan.matmul.k, plan.matmul.n) == (2, 3, 4)
++    assert plan.matmul.reduction_iteration.tail.elements == 3
++
++
++def test_zero_length_vector_executes_without_touching_tail():
++    program = _add_program((0,))
++    compiler = CpuVectorCompiler()
++    artifact = compiler.compile(compiler.lower(program, TARGET))
++    output = HostTensor.zeros("float32", (0,))
++    _run(compiler, artifact, [HostTensor("float32", (0,)), HostTensor("float32", (0,))], output)
++    assert output.flat() == ()
++
++
++def test_feature_contract_is_injected_and_missing_features_are_structured():
++    target = TargetSpec("cpu", "x86_64-linux-gnu", features=("test-vector",), attributes={"lane_count": 4})
++    compiler = CpuVectorCompiler()
++    artifact = compiler.compile(compiler.lower(_add_program(), target))
++    with pytest.raises(CpuVectorFeatureMismatchError) as error:
++        CpuVectorRuntime().load(artifact)
++    assert error.value.mismatch.missing == ("test-vector",)
++    loaded = CpuVectorRuntime(CpuFeatureSet(("test-vector",), source="unit-test")).load(artifact)
++    assert loaded.feature_contract.compatible
++
++
++def test_artifact_is_deterministic_and_metadata_carries_plan_identity():
++    program = _add_program()
++    compiler = CpuVectorCompiler()
++    first = compiler.compile(compiler.lower(program, TARGET))
++    second = compiler.compile(compiler.lower(program, TARGET))
++    assert first.payload == second.payload
++    assert first.cache_key == second.cache_key
++    assert first.metadata["plan_version"] == 1
++    assert first.metadata["required_features"] == ()
++    assert first.metadata["dtypes"] == ("float32",)
++    assert first.metadata["layouts"] == ("row_major_contiguous",)
++    assert first.metadata["lane_count"] == 4
++    assert first.metadata["specialization"] == {}
++
++
++def test_artifact_plan_tampering_is_rejected():
++    compiler = CpuVectorCompiler()
++    artifact = compiler.compile(compiler.lower(_add_program(), TARGET))
++    payload = artifact.payload.decode("utf-8").replace('"lane_count":4', '"lane_count":8', 1)
++    object.__setattr__(artifact, "payload", payload.encode("utf-8"))
++    with pytest.raises(CpuVectorArtifactError, match="digest|canonical|plan"):
++        CpuVectorRuntime().load(artifact)
++
++
++def test_non_contiguous_layout_is_rejected_explicitly():
++    value_type = CoreType.tensor("float32", (2, 3))
++    x = ValueRef("x", value_type)
++    y = ValueRef("y", value_type)
++    z = ValueRef("z", value_type)
++    program = _program(
++        "non_contiguous",
++        (x, y),
++        (z,),
++        (Operation("add", (x, y), (z,), attributes={"strides": (1, 2)}),),
++    )
++    with pytest.raises(CpuVectorUnsupportedError, match="non-contiguous"):
++        CpuVectorCompiler().lower(program, TARGET)
++
++
++def test_symbolic_shape_is_rejected_explicitly():
++    value_type = CoreType.tensor("float32", ("N",))
++    x = ValueRef("x", value_type)
++    y = ValueRef("y", value_type)
++    z = ValueRef("z", value_type)
++    program = _program("symbolic", (x, y), (z,), (Operation("add", (x, y), (z,)),))
++    with pytest.raises((CpuVectorValidationError, CpuVectorUnsupportedError), match="symbolic|scalar validation"):
++        CpuVectorCompiler().lower(program, TARGET)
++
++
++def test_wrong_target_and_readonly_output_are_rejected():
++    with pytest.raises(CpuVectorValidationError, match="kind='cpu'"):
++        CpuVectorCompiler().lower(_add_program(), TargetSpec("cuda", "sm_90"))
++    compiler = CpuVectorCompiler()
++    artifact = compiler.compile(compiler.lower(_add_program((4,)), TARGET))
++    output = HostTensor.zeros("float32", (4,))
++    with pytest.raises(CpuVectorExecutionError, match="readonly|read-only"):
++        CpuVectorRuntime().launch(
++            LaunchRequest(
++                artifact,
++                inputs=[HostTensor.zeros("float32", (4,)).descriptor(readonly=True)] * 2,
++                outputs=[output.descriptor(readonly=True)],
++            )
++        )

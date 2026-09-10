@@ -1,0 +1,336 @@
+From 763b5df286480a54a0a38cd029316782e3ff872b Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Wed, 9 Sep 2026 02:34:51 +0800
+Subject: [PATCH 60/96] fix(pypto-x): version SVE compact iteration contract
+
+---
+ python/pypto/backends/cpu/vector/runtime.py       |  18 ++--
+ python/pypto/lowering/cpu/aarch64/sve/lowering.py |  13 ++-
+ python/tests/ut/pypto_x/test_cpu_sve256.py        |  25 ++++++
+ python/tests/ut/pypto_x/test_cpu_vector_common.py | 189 ++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 230 insertions(+), 15 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/vector/runtime.py b/python/pypto/backends/cpu/vector/runtime.py
+index 5f24b344a..6c843d9fc 100644
+--- a/python/pypto/backends/cpu/vector/runtime.py
++++ b/python/pypto/backends/cpu/vector/runtime.py
+@@ -591,16 +591,10 @@ def _vector_map(plan: Any, values: Sequence[Any], operation: Callable[[Any], Any
+             )
+         )
+     result = [None] * plan.element_count
+-    if plan.iteration.compact:
+-        for index in range(plan.element_count):
+-            result[index] = operation(values[index])
+-        return result
+-    for chunk in plan.iteration.chunks:
+-        for offset in range(chunk.length):
+-            index = chunk.start + offset
+-            if index >= plan.element_count:
+-                raise CpuVectorExecutionError("{} vector chunk exceeds element domain".format(context))
+-            result[index] = operation(values[index])
++    for index in _iteration_indices(plan.iteration):
++        if index >= plan.element_count:
++            raise CpuVectorExecutionError("{} vector iteration exceeds element domain".format(context))
++        result[index] = operation(values[index])
+     return result
+ 
+ 
+@@ -962,6 +956,7 @@ def _execute_matmul(
+     if len(left_values) != matmul.m * matmul.k or len(right_values) != matmul.k * matmul.n:
+         raise CpuVectorExecutionError("{} matmul input length mismatch".format(context))
+     result = [None] * matmul.output_elements
++    fp32_accumulation = canonical_dtype(output_type.dtype) in ("float32", "bf16")
+     for output_index in _iteration_indices(matmul.output_iteration):
+         row = output_index // matmul.n if matmul.n else 0
+         column = output_index % matmul.n if matmul.n else 0
+@@ -969,7 +964,8 @@ def _execute_matmul(
+         for inner in _iteration_indices(matmul.reduction_iteration):
+             if inner >= matmul.k:
+                 raise CpuVectorExecutionError("{} matmul reduction chunk exceeds k".format(context))
+-            aggregate += left_values[row * matmul.k + inner] * right_values[inner * matmul.n + column]
++            value = aggregate + left_values[row * matmul.k + inner] * right_values[inner * matmul.n + column]
++            aggregate = _float32(value) if fp32_accumulation else value
+         result[output_index] = _cast_value(aggregate, canonical_dtype(output_type.dtype))
+     return result
+ 
+diff --git a/python/pypto/lowering/cpu/aarch64/sve/lowering.py b/python/pypto/lowering/cpu/aarch64/sve/lowering.py
+index 97cbf8f30..e1f35377f 100644
+--- a/python/pypto/lowering/cpu/aarch64/sve/lowering.py
++++ b/python/pypto/lowering/cpu/aarch64/sve/lowering.py
+@@ -19,7 +19,11 @@ from .capabilities import Sve256Capability, probe_sve256_capabilities
+ 
+ 
+ SVE256_BACKEND = "cpu.aarch64.sve256"
+-SVE256_LOWERING_VERSION = 3
++# Version 4 makes the compact iteration-domain representation part of the
++# SVE256 plan contract.  Every SVE plan uses it so artifact size and cache
++# identity do not depend on a shape threshold; v3 plans with materialized
++# chunks must be rejected rather than silently reinterpreted.
++SVE256_LOWERING_VERSION = 4
+ SVE256_LANE_COUNT = 8
+ SVE256_TAIL_POLICY = TailPolicy.MASKED
+ SVE256_REQUIRED_FEATURES = frozenset(("sve", "vl256"))
+@@ -310,9 +314,10 @@ def lower_sve256(
+     if selected_tail not in (SVE256_TAIL_POLICY, SVE256_TAIL_POLICY.value, "mask", "predicate"):
+         raise Sve256ValidationError("SVE256 requires tail_policy='masked'")
+     required = _required_features(required_features if required_features is not None else target.features)
+-    # Large Qwen static shapes must not materialize one VectorChunk object per
+-    # logical element.  Compact iteration is a plan-only representation; the
+-    # runtime still visits the same logical domain and preserves tail policy.
++    # Compact iteration is part of the SVE plan contract for every shape, not
++    # a size-threshold heuristic.  This keeps plan/artifact size deterministic
++    # and independent of numel; the runtime still visits the same logical
++    # domain and preserves the masked-tail policy.
+     sve_specialization = dict(specialization or target.attributes.get("specialization", {}))
+     sve_specialization["compact_iteration"] = True
+     vector_program = lower_cpu_vector(
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256.py b/python/tests/ut/pypto_x/test_cpu_sve256.py
+index d8db41616..e8ca66d35 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256.py
+@@ -35,6 +35,7 @@ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region
+ from pypto.lowering.cpu.aarch64.sve import (
+     SVE256_LANE_COUNT,
+     Sve256Capability,
++    Sve256Program,
+     Sve256UnsupportedError,
+     Sve256ValidationError,
+     lower_sve256,
+@@ -240,6 +241,30 @@ def test_lowering_uses_eight_lanes_masked_tail_and_omits_sve2():
+         lower_sve256(_elementwise(), _target("sve", "neon"))
+ 
+ 
++def test_sve_v3_plan_and_artifact_are_explicitly_incompatible_after_compact_bump(tmp_path):
++    program = _elementwise(shape=(9,))
++    compiler, target_ir, artifact = _compile(program, tmp_path)
++    assert target_ir.lowering_version == 4
++    assert artifact.metadata["lowering_version"] == 4
++    assert target_ir.plans[0].iteration.compact is True
++    with pytest.raises(Sve256ValidationError, match="unsupported SVE256 lowering version"):
++        Sve256Program(target_ir.vector_program, lowering_version=3)
++
++    old_metadata = dict(artifact.metadata)
++    old_metadata["lowering_version"] = 3
++    old_artifact = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        path=artifact.path,
++        metadata=old_metadata,
++    )
++    assert old_artifact.cache_key != artifact.cache_key
++    with pytest.raises(CpuSve256ArtifactError, match="unsupported SVE256 lowering version"):
++        Sve256Runtime(execution_mode="qemu").load(old_artifact)
++
++
+ def test_sve_target_is_fixed_little_endian_linux_protocol():
+     for triple in (
+         "aarch64-linux-gnu",
+diff --git a/python/tests/ut/pypto_x/test_cpu_vector_common.py b/python/tests/ut/pypto_x/test_cpu_vector_common.py
+index 318ce5190..b709961f9 100644
+--- a/python/tests/ut/pypto_x/test_cpu_vector_common.py
++++ b/python/tests/ut/pypto_x/test_cpu_vector_common.py
+@@ -64,6 +64,23 @@ def _run(artifact, inputs, output, runtime=None):
+     )
+ 
+ 
++def _compile_with_iteration_mode(program, compact, tail_policy="masked"):
++    attributes = {
++        "lane_count": 4,
++        "specialization": {"compact_iteration": bool(compact)},
++    }
++    if tail_policy is not None:
++        attributes["tail_policy"] = tail_policy
++    target = TargetSpec(
++        "cpu",
++        "x86_64-linux-gnu",
++        attributes=attributes,
++    )
++    compiler = CpuVectorCompiler()
++    target_ir = compiler.lower(program, target)
++    return compiler.compile(target_ir), target_ir
++
++
+ def test_portable_only_normal_import_path_is_active():
+     assert pypto.__portable_only__ is True
+ 
+@@ -176,6 +193,178 @@ def test_elementwise_vector_executor_differentials_scalar_on_tail():
+     assert plan.tail.elements == 3
+ 
+ 
++def test_compact_and_materialized_iteration_domains_are_equivalent():
++    binary_program = _add_program((9,))
++    compact_artifact, compact_ir = _compile_with_iteration_mode(binary_program, True)
++    materialized_artifact, materialized_ir = _compile_with_iteration_mode(binary_program, False)
++    assert compact_ir.plans[0].iteration.compact is True
++    assert compact_ir.plans[0].chunks == ()
++    assert compact_ir.plans[0].tail.policy is TailPolicy.MASKED
++    assert compact_ir.plans[0].tail.elements == 1
++    assert materialized_ir.plans[0].iteration.compact is False
++    assert materialized_ir.plans[0].tail.elements == 1
++    left = HostTensor("float32", (9,), [index * 0.25 for index in range(9)])
++    right = HostTensor("float32", (9,), [1.0 - index * 0.03125 for index in range(9)])
++    compact_output = HostTensor.zeros("float32", (9,))
++    materialized_output = HostTensor.zeros("float32", (9,))
++    _run(compact_artifact, [left, right], compact_output)
++    _run(materialized_artifact, [left, right], materialized_output)
++    assert compact_output.flat() == materialized_output.flat()
++
++    source_type = CoreType.tensor("float32", (2, 3))
++    reduced_type = CoreType.tensor("float32", (2,))
++    source = ValueRef("source", source_type)
++    reduced = ValueRef("reduced", reduced_type)
++    reduction_program = _program(
++        "compact_reduce",
++        (source,),
++        (reduced,),
++        (Operation("reduce_sum", (source,), (reduced,), attributes={"axis": 1}),),
++    )
++    compact_reduction, compact_reduction_ir = _compile_with_iteration_mode(reduction_program, True)
++    materialized_reduction, materialized_reduction_ir = _compile_with_iteration_mode(reduction_program, False)
++    assert compact_reduction_ir.plans[0].reduction.output_iteration.compact is True
++    assert compact_reduction_ir.plans[0].reduction.reduction_iteration.compact is True
++    assert materialized_reduction_ir.plans[0].reduction.output_iteration.compact is False
++    assert materialized_reduction_ir.plans[0].reduction.reduction_iteration.compact is False
++    compact_reduced = HostTensor.zeros("float32", (2,))
++    materialized_reduced = HostTensor.zeros("float32", (2,))
++    reduce_input = HostTensor("float32", (2, 3), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
++    _run(compact_reduction, [reduce_input], compact_reduced)
++    _run(materialized_reduction, [reduce_input], materialized_reduced)
++    assert compact_reduced.flat() == materialized_reduced.flat()
++
++    left_type = CoreType.tensor("float32", (1, 3))
++    right_type = CoreType.tensor("float32", (3, 1))
++    output_type = CoreType.tensor("float32", (1, 1))
++    left_ref = ValueRef("left", left_type)
++    right_ref = ValueRef("right", right_type)
++    output_ref = ValueRef("output", output_type)
++    matmul_program = _program(
++        "compact_matmul",
++        (left_ref, right_ref),
++        (output_ref,),
++        (Operation("matmul", (left_ref, right_ref), (output_ref,)),),
++    )
++    compact_matmul, compact_matmul_ir = _compile_with_iteration_mode(matmul_program, True)
++    materialized_matmul, materialized_matmul_ir = _compile_with_iteration_mode(matmul_program, False)
++    assert compact_matmul_ir.plans[0].matmul.output_iteration.compact is True
++    assert compact_matmul_ir.plans[0].matmul.reduction_iteration.compact is True
++    assert materialized_matmul_ir.plans[0].matmul.output_iteration.compact is False
++    assert materialized_matmul_ir.plans[0].matmul.reduction_iteration.compact is False
++    compact_product = HostTensor.zeros("float32", (1, 1))
++    materialized_product = HostTensor.zeros("float32", (1, 1))
++    _run(
++        compact_matmul,
++        [
++            HostTensor("float32", (1, 3), [1.0, 2.0 ** -24, -1.0]),
++            HostTensor("float32", (3, 1), [1.0, 1.0, 1.0]),
++        ],
++        compact_product,
++    )
++    _run(
++        materialized_matmul,
++        [
++            HostTensor("float32", (1, 3), [1.0, 2.0 ** -24, -1.0]),
++            HostTensor("float32", (3, 1), [1.0, 1.0, 1.0]),
++        ],
++        materialized_product,
++    )
++    assert compact_product.flat() == materialized_product.flat() == (0.0,)
++
++
++def test_compact_runtime_empty_reductions_and_zero_dimension_matmul():
++    source_type = CoreType.tensor("float32", (2, 0))
++    output_type = CoreType.tensor("float32", (2,))
++    source = ValueRef("source", source_type)
++    output = ValueRef("output", output_type)
++    for name in ("reduce_sum", "reduce_mean", "reduce_max"):
++        program = _program(
++            "empty_{}".format(name),
++            (source,),
++            (output,),
++            (Operation(name, (source,), (output,), attributes={"axis": 1}),),
++        )
++        artifact, target_ir = _compile_with_iteration_mode(program, True)
++        assert target_ir.plans[0].reduction.reduction_size == 0
++        if name == "reduce_sum":
++            result = HostTensor.zeros("float32", (2,))
++            _run(artifact, [HostTensor("float32", (2, 0))], result)
++            assert result.flat() == (0.0, 0.0)
++        else:
++            with pytest.raises(CpuVectorExecutionError, match="empty reduction group"):
++                _run(artifact, [HostTensor("float32", (2, 0))], HostTensor.zeros("float32", (2,)))
++
++    for left_shape, right_shape, output_shape in (
++        ((0, 3), (3, 2), (0, 2)),
++        ((2, 0), (0, 3), (2, 3)),
++        ((2, 3), (3, 0), (2, 0)),
++    ):
++        left_ref = ValueRef("left", CoreType.tensor("float32", left_shape))
++        right_ref = ValueRef("right", CoreType.tensor("float32", right_shape))
++        output_ref = ValueRef("output", CoreType.tensor("float32", output_shape))
++        program = _program(
++            "zero_matmul",
++            (left_ref, right_ref),
++            (output_ref,),
++            (Operation("matmul", (left_ref, right_ref), (output_ref,)),),
++        )
++        artifact, target_ir = _compile_with_iteration_mode(program, True)
++        output = HostTensor.zeros("float32", output_shape)
++        _run(
++            artifact,
++            [HostTensor("float32", left_shape), HostTensor("float32", right_shape)],
++            output,
++        )
++        assert output.flat() == tuple(0.0 for _ in range(len(output)))
++        assert target_ir.plans[0].matmul.output_iteration.compact is True
++
++
++def test_compact_scalar_output_and_fp32_accumulation_order():
++    scalar_type = CoreType.scalar("float32")
++    left = ValueRef("left", scalar_type)
++    right = ValueRef("right", scalar_type)
++    output = ValueRef("output", scalar_type)
++    program = _program(
++        "scalar_add",
++        (left, right),
++        (output,),
++        (Operation("add", (left, right), (output,)),),
++    )
++    artifact, target_ir = _compile_with_iteration_mode(program, True)
++    assert target_ir.plans[0].iteration.compact is True
++    result = CpuVectorRuntime().launch(
++        LaunchRequest(artifact, inputs=[], outputs=[], scalars={"left": 1.25, "right": 2.5})
++    )
++    assert result == (3.75,)
++
++    left_type = CoreType.tensor("float32", (1, 3))
++    right_type = CoreType.tensor("float32", (3, 1))
++    output_type = CoreType.tensor("float32", (1, 1))
++    left_ref = ValueRef("left", left_type)
++    right_ref = ValueRef("right", right_type)
++    output_ref = ValueRef("output", output_type)
++    matmul_program = _program(
++        "fp32_order",
++        (left_ref, right_ref),
++        (output_ref,),
++        (Operation("matmul", (left_ref, right_ref), (output_ref,)),),
++    )
++    artifact, _ = _compile_with_iteration_mode(matmul_program, True)
++    result = HostTensor.zeros("float32", (1, 1))
++    _run(
++        artifact,
++        [
++            HostTensor("float32", (1, 3), [1.0, 2.0 ** -24, -1.0]),
++            HostTensor("float32", (3, 1), [1.0, 1.0, 1.0]),
++        ],
++        result,
++    )
++    # Each inner step is rounded to FP32, preserving the left-to-right
++    # reduction order used by the materialized and compact plans.
++    assert result.flat() == (0.0,)
++
++
+ def test_reduce_plan_and_executor_differential():
+     input_type = CoreType.tensor("float32", (2, 3, 5))
+     output_type = CoreType.tensor("float32", (2, 5))

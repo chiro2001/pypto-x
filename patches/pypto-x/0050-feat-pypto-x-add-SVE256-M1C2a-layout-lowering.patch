@@ -1,0 +1,1179 @@
+From 93e7f1eb1d79c299678b66d1af6a41f32e47c7c6 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Tue, 8 Sep 2026 21:19:44 +0800
+Subject: [PATCH 50/96] feat(pypto-x): add SVE256 M1C2a layout lowering
+
+---
+ python/pypto/backends/cpu/aarch64/sve256.py       | 108 +++++++++++++-
+ python/pypto/backends/cpu/vector/runtime.py       |  13 ++
+ python/pypto/compiler/targets/cpu_sve256.py       | 175 ++++++++++++++++++++--
+ python/pypto/lowering/cpu/vector/plan.py          | 338 +++++++++++++++++++++++++++++++++++++++++-
+ python/tests/ut/pypto_x/test_cpu_sve256_layout.py | 248 +++++++++++++++++++++++++++++++
+ 5 files changed, 862 insertions(+), 20 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/aarch64/sve256.py b/python/pypto/backends/cpu/aarch64/sve256.py
+index 29b377e29..f46e862c0 100644
+--- a/python/pypto/backends/cpu/aarch64/sve256.py
++++ b/python/pypto/backends/cpu/aarch64/sve256.py
+@@ -104,6 +104,7 @@ _WIRE_REQUEST = struct.Struct("<6I4Q")
+ _WIRE_RESPONSE = struct.Struct("<4IQ")
+ _WIRE_MAGIC = b"PXSV"
+ _WIRE_VERSION = 1
++_LAYOUT_WIRE_VERSION = 2
+ _OP_CODES = {
+     "identity": 0,
+     "neg": 1,
+@@ -123,6 +124,11 @@ _OP_CODES = {
+     "reduce_mean": 15,
+     "broadcast": 16,
+     "where": 17,
++    "reshape": 18,
++    "view": 19,
++    "contiguous": 20,
++    "transpose": 21,
++    "slice": 22,
+ }
+ _DTYPE_CODES = {"float32": 0, "bf16": 1}
+ _CAST_DTYPE_CODES = {("float32", "bf16"): 2, ("bf16", "float32"): 3}
+@@ -378,6 +384,12 @@ def _validate_primary_artifact(artifact: Artifact) -> Mapping[str, Any]:
+         raise CpuSve256ArtifactError("SVE256 host pre-expansion metadata is invalid")
+     if metadata.get("sve_math_operations") != ["rsqrt", "where", "broadcast", "cast", "reduce_mean"]:
+         raise CpuSve256ArtifactError("SVE256 math operation metadata is invalid")
++    if metadata.get("layout_plan_version") != 1:
++        raise CpuSve256ArtifactError("SVE256 layout plan version is unsupported")
++    if metadata.get("layout_index_map_wire") != "uint64_le+fnv1a64":
++        raise CpuSve256ArtifactError("SVE256 layout index-map wire contract is invalid")
++    if metadata.get("layout_scalar_lane_fallback") != ["bf16_reorder"]:
++        raise CpuSve256ArtifactError("SVE256 layout BF16 conversion metadata is invalid")
+     required = set(_string_sequence(metadata.get("required_features"), "required_features"))
+     if required != {"sve", "vl256"}:
+         raise CpuSve256ArtifactError("SVE256 required_features must contain only sve and vl256")
+@@ -448,6 +460,31 @@ def _decode_artifact(artifact: Artifact, available: CpuFeatureSet) -> LoadedSve2
+         raise CpuSve256ArtifactError("SVE256 CoreProgram/plan is invalid: {}".format(exc)) from exc
+     if target_ir.vector_program.to_dict() != dict(plan_data):
+         raise CpuSve256ArtifactError("SVE256 vector plan metadata mismatch")
++    expected_layout_metadata = [
++        {
++            "operation": plan.operation,
++            "kind": plan.layout_plan.kind,
++            "source_elements": plan.layout_plan.source_elements,
++            "output_elements": plan.layout_plan.output_elements,
++            "index_map_digest": plan.layout_plan.index_map_digest,
++        }
++        for plan in target_ir.plans
++        if plan.layout_plan is not None
++    ]
++    if metadata.get("layout_operations") != expected_layout_metadata:
++        raise CpuSve256ArtifactError("SVE256 layout operation metadata mismatch")
++    expected_copy = [
++        plan.operation for plan in target_ir.plans
++        if plan.layout_plan is not None and plan.layout_plan.kind == "logical_layout_copy"
++    ]
++    expected_reorder = [
++        plan.operation for plan in target_ir.plans
++        if plan.layout_plan is not None and plan.layout_plan.kind in ("transpose", "slice")
++    ]
++    if metadata.get("logical_layout_copy_operations") != expected_copy:
++        raise CpuSve256ArtifactError("SVE256 logical-layout-copy metadata mismatch")
++    if metadata.get("native_layout_reorder_operations") != expected_reorder:
++        raise CpuSve256ArtifactError("SVE256 native layout reorder metadata mismatch")
+     _verify_embedded_markers(native_bytes, metadata, target_ir)
+     program_digest = hashlib.sha256(program.canonical_json().encode("utf-8")).hexdigest()
+     if metadata.get("program_digest") != program_digest:
+@@ -665,6 +702,18 @@ def _wire_values(dtype: str, values: Sequence[Any]) -> bytes:
+     return struct.pack("<{}H".format(len(values)), *[_bf16_bits(value) for value in values])
+ 
+ 
++def _index_map_wire_hash(index_map: Sequence[int]) -> int:
++    """Match the native runner's little-endian FNV-1a schedule tag."""
++
++    result = 1469598103934665603
++    for value in index_map:
++        encoded = int(value).to_bytes(8, "little", signed=False)
++        for byte in encoded:
++            result ^= byte
++            result = (result * 1099511628211) & ((1 << 64) - 1)
++    return result
++
++
+ def _decode_wire_values(dtype: str, payload: bytes, count: int) -> List[Any]:
+     if dtype == "float32":
+         expected = count * 4
+@@ -867,6 +916,7 @@ class Sve256Runtime:
+         n: int = 0,
+         input_dtype: Optional[str] = None,
+         output_dtype: Optional[str] = None,
++        index_map: Optional[Sequence[int]] = None,
+     ) -> List[Any]:
+         if operation not in _OP_CODES:
+             raise CpuSve256ExecutionError("unsupported SVE256 runner operation {!r}".format(operation))
+@@ -875,7 +925,34 @@ class Sve256Runtime:
+         if output_dtype not in _DTYPE_CODES:
+             raise CpuSve256ExecutionError("SVE256 runner supports float32 and bf16 only")
+         input_dtype = canonical_dtype(input_dtype or dtype)
+-        if operation == "matmul":
++        layout_operation = operation in ("reshape", "view", "contiguous", "transpose", "slice")
++        if layout_operation:
++            if len(values) != 1 or index_map is None:
++                raise CpuSve256ExecutionError("SVE256 layout runner requires one input and an index map")
++            source_count = len(values[0])
++            if dtype == "float32" and source_count > (1 << 32) - 1:
++                raise CpuSve256ExecutionError(
++                    "SVE256 float32 layout gather source count exceeds uint32 index contract"
++                )
++            if len(index_map) != count:
++                raise CpuSve256ExecutionError("SVE256 layout index map length does not match output count")
++            normalized_map = []
++            for map_index, source_index in enumerate(index_map):
++                if isinstance(source_index, bool) or not isinstance(source_index, int):
++                    raise CpuSve256ExecutionError(
++                        "SVE256 layout index map entry {} is not an integer".format(map_index)
++                    )
++                if source_index < 0 or source_index >= source_count:
++                    raise CpuSve256ExecutionError(
++                        "SVE256 layout index map entry {} is outside source range".format(map_index)
++                    )
++                normalized_map.append(source_index)
++            m = source_count
++            k = count
++            n = _index_map_wire_hash(normalized_map)
++            wire_version = _LAYOUT_WIRE_VERSION
++            expected_values = (source_count,)
++        elif operation == "matmul":
+             expected_values = (m * k, k * n)
+         elif operation in ("reduce_sum", "reduce_max", "reduce_mean", "identity", "neg",
+                            "exp", "rsqrt", "sigmoid", "silu", "softplus", "broadcast"):
+@@ -897,10 +974,15 @@ class Sve256Runtime:
+         else:
+             wire_dtype = _DTYPE_CODES[output_dtype]
+         header = _WIRE_REQUEST.pack(
+-            int.from_bytes(_WIRE_MAGIC, "little"), _WIRE_VERSION, _OP_CODES[operation],
++            int.from_bytes(_WIRE_MAGIC, "little"), wire_version if layout_operation else _WIRE_VERSION,
++            _OP_CODES[operation],
+             wire_dtype, 0, 0, count, m, k, n,
+         )
+-        if operation == "cast":
++        if layout_operation:
++            payload_values = _wire_values(output_dtype, values[0]) + struct.pack(
++                "<{}Q".format(len(normalized_map)), *normalized_map
++            )
++        elif operation == "cast":
+             payload_values = _wire_values(input_dtype, values[0])
+         elif operation == "where":
+             payload_values = (
+@@ -936,7 +1018,8 @@ class Sve256Runtime:
+         magic, version, status, response_dtype, response_count = _WIRE_RESPONSE.unpack(
+             result.stdout[:_WIRE_RESPONSE.size]
+         )
+-        if magic != int.from_bytes(_WIRE_MAGIC, "little") or version != _WIRE_VERSION:
++        expected_wire_version = _LAYOUT_WIRE_VERSION if layout_operation else _WIRE_VERSION
++        if magic != int.from_bytes(_WIRE_MAGIC, "little") or version != expected_wire_version:
+             raise CpuSve256ExecutionError("SVE256 runner response header is invalid")
+         if status != 0 or result.returncode != 0:
+             raise CpuSve256ExecutionError(
+@@ -1099,6 +1182,23 @@ class Sve256Runtime:
+                 artifact, "matmul", dtype, [inputs[0][1], inputs[1][1]],
+                 matmul.output_elements, matmul.m, matmul.k, matmul.n,
+             )
++        elif name in ("reshape", "view", "transpose", "contiguous", "slice"):
++            layout = plan.layout_plan
++            if layout is None or layout.operation != name:
++                raise CpuSve256ArtifactError("SVE256 layout plan is missing or mismatched")
++            if len(inputs[0][1]) != layout.source_elements:
++                raise CpuSve256ExecutionError("SVE256 layout source length does not match plan")
++            # The host supplies only static schedule metadata.  Input data is
++            # sent to the native runner unchanged; reordering happens in the
++            # AArch64 ELF, never in this Python process.
++            values = self._run_runner(
++                artifact,
++                name,
++                dtype,
++                [inputs[0][1]],
++                layout.output_elements,
++                index_map=layout.index_map,
++            )
+         else:
+             raise CpuSve256ExecutionError("SVE256 operation {!r} is unsupported".format(operation.name))
+         environment[output_ref.name] = (output_ref.type, values)
+diff --git a/python/pypto/backends/cpu/vector/runtime.py b/python/pypto/backends/cpu/vector/runtime.py
+index 58feb283e..46ce3518c 100644
+--- a/python/pypto/backends/cpu/vector/runtime.py
++++ b/python/pypto/backends/cpu/vector/runtime.py
+@@ -513,6 +513,19 @@ def _execute_operation(
+             )
+         elif name == "matmul":
+             result = _execute_matmul(inputs[0], inputs[1], output_ref.type, plan, context)
++        elif name in ("reshape", "view", "transpose", "contiguous", "slice"):
++            source, scalar = _value_sequence(inputs[0].data, inputs[0].type, context + ".input")
++            layout = plan.layout_plan
++            if layout is None or layout.operation != name:
++                raise CpuVectorExecutionError("{} layout plan is missing or mismatched".format(context))
++            if len(source) != layout.source_elements:
++                raise CpuVectorExecutionError("{} source length does not match layout plan".format(context))
++            result = _vector_map(
++                plan,
++                [source[source_index] for source_index in layout.index_map],
++                lambda value: _cast_value(value, plan.dtype),
++                context,
++            )
+         else:
+             raise CpuVectorExecutionError("{} operation {!r} is unsupported".format(context, operation.name))
+     except CpuVectorExecutionError:
+diff --git a/python/pypto/compiler/targets/cpu_sve256.py b/python/pypto/compiler/targets/cpu_sve256.py
+index 44d2a972a..aa0cab6ae 100644
+--- a/python/pypto/compiler/targets/cpu_sve256.py
++++ b/python/pypto/compiler/targets/cpu_sve256.py
+@@ -34,7 +34,7 @@ from pypto.target._utils import mapping_copy, sha256_bytes, sha256_text
+ 
+ ARTIFACT_PAYLOAD_VERSION = 1
+ DEFAULT_ARTIFACT_FORMAT = "pypto-x.cpu.sve256"
+-RUNNER_PROTOCOL = "pypto-x.cpu.sve256.runner.v1"
++RUNNER_PROTOCOL = "pypto-x.cpu.sve256.runner.v2"
+ 
+ 
+ _NATIVE_SOURCE = r'''
+@@ -49,7 +49,7 @@ _NATIVE_SOURCE = r'''
+ #include <unistd.h>
+ 
+ #define PTX_MAGIC 0x56535850U /* little-endian bytes: PXSV */
+-#define PTX_VERSION 1U
++#define PTX_VERSION 2U
+ #define PTX_STATUS_OK 0U
+ #define PTX_STATUS_BAD_REQUEST 2U
+ #define PTX_STATUS_RUNTIME 3U
+@@ -80,7 +80,9 @@ enum { PTX_COPY = 0, PTX_NEG = 1, PTX_ADD = 2, PTX_SUB = 3,
+        PTX_REDUCE_MAX = 7, PTX_MATMUL = 8, PTX_CAST = 9,
+        PTX_EXP = 10, PTX_RSQRT = 11, PTX_SIGMOID = 12,
+        PTX_SILU = 13, PTX_SOFTPLUS = 14, PTX_REDUCE_MEAN = 15,
+-       PTX_BROADCAST = 16, PTX_WHERE = 17 };
++       PTX_BROADCAST = 16, PTX_WHERE = 17,
++       PTX_RESHAPE = 18, PTX_VIEW = 19, PTX_CONTIGUOUS = 20,
++       PTX_TRANSPOSE = 21, PTX_SLICE = 22 };
+ 
+ typedef struct {
+     uint32_t magic;
+@@ -145,10 +147,10 @@ static int write_all(const void *source, size_t size) {
+     return 0;
+ }
+ 
+-static int ptx_error_response(uint32_t status, uint32_t dtype) {
++static int ptx_error_response(uint32_t status, uint32_t dtype, uint32_t version) {
+     PtxResponse response;
+     response.magic = PTX_MAGIC;
+-    response.version = PTX_VERSION;
++    response.version = version == 1U ? 1U : PTX_VERSION;
+     response.status = status;
+     response.dtype = dtype <= 1 ? dtype : 0;
+     response.count = 0;
+@@ -180,7 +182,11 @@ static int ptx_size_mul(size_t left, size_t right, size_t *result) {
+ }
+ 
+ static int ptx_valid_operation(uint32_t operation) {
+-    return operation <= PTX_WHERE;
++    return operation <= PTX_SLICE;
++}
++
++static int ptx_is_layout_operation(uint32_t operation) {
++    return operation >= PTX_RESHAPE && operation <= PTX_SLICE;
+ }
+ 
+ static int ptx_validate_request(const PtxRequest *request, size_t *item_size,
+@@ -199,7 +205,17 @@ static int ptx_validate_request(const PtxRequest *request, size_t *item_size,
+         if (request->dtype > 1) return PTX_STATUS_BAD_REQUEST;
+         *item_size = request->dtype == 0 ? sizeof(float) : sizeof(uint16_t);
+     }
+-    if (request->operation == PTX_MATMUL) {
++    if (ptx_is_layout_operation(request->operation)) {
++        uint64_t map_bytes;
++        if (request->count != request->k ||
++            ptx_u64_mul(request->k, sizeof(uint64_t), &map_bytes) != PTX_STATUS_OK ||
++            ptx_u64_to_size(request->m, &left_size) != PTX_STATUS_OK ||
++            ptx_size_mul(left_size, *item_size, &left_size) != PTX_STATUS_OK ||
++            ptx_u64_to_size(map_bytes, &right_size) != PTX_STATUS_OK ||
++            ptx_size_add(left_size, right_size, payload_size) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        *output_count = request->count;
++    } else if (request->operation == PTX_MATMUL) {
+         if (ptx_u64_mul(request->m, request->k, &left_count) != PTX_STATUS_OK ||
+             ptx_u64_mul(request->k, request->n, &right_count) != PTX_STATUS_OK ||
+             ptx_u64_mul(request->m, request->n, &output_count_u64) != PTX_STATUS_OK ||
+@@ -293,6 +309,61 @@ static void ptx_copy_f32(const float *input, float *output, uint64_t count) {
+     }
+ }
+ 
++/* The map is a serialized logical schedule.  FNV-1a is intentionally kept
++ * in the wire contract as a cheap in-process tamper check; the artifact also
++ * carries the SHA-256 map digest for cache identity and metadata validation. */
++static uint64_t ptx_index_map_hash(const uint64_t *map, uint64_t count) {
++    uint64_t hash = UINT64_C(1469598103934665603);
++    uint64_t index;
++    for (index = 0; index < count; ++index) {
++        uint64_t value = map[index];
++        unsigned int byte;
++        for (byte = 0; byte < 8; ++byte) {
++            hash ^= (value >> (byte * 8)) & UINT64_C(0xff);
++            hash *= UINT64_C(1099511628211);
++        }
++    }
++    return hash;
++}
++
++__attribute__((noinline))
++static void ptx_layout_f32(uint32_t operation, const float *input, float *output,
++                           const uint64_t *map, uint64_t count) {
++    uint64_t index = 0;
++    if (operation == PTX_RESHAPE || operation == PTX_VIEW || operation == PTX_CONTIGUOUS) {
++        ptx_copy_f32(input, output, count);
++        return;
++    }
++    /* The map is narrowed to SVE1's 32-bit indexed-gather contract only
++     * after the runner has checked the uint32 source-range bound. */
++    while (index < count) {
++        uint64_t end = index + (count - index > svcntw() ? svcntw() : count - index);
++        uint32_t index_values[8];
++        uint64_t lane;
++        svbool_t pg32 = svwhilelt_b32(index, end);
++        for (lane = 0; index + lane < end; ++lane) index_values[lane] = (uint32_t)map[index + lane];
++        svuint32_t indices = svld1_u32(pg32, index_values);
++        svfloat32_t values = svld1_gather_u32index_f32(pg32, input, indices);
++        svst1(pg32, output + index, values);
++        index = end;
++    }
++}
++
++__attribute__((noinline))
++static void ptx_layout_bf16(uint32_t operation, const uint16_t *input, uint16_t *output,
++                            const uint64_t *map, uint64_t count) {
++    uint64_t index = 0;
++    if (operation == PTX_RESHAPE || operation == PTX_VIEW || operation == PTX_CONTIGUOUS) {
++        for (index = 0; index < count; ++index) output[index] = input[index];
++        return;
++    }
++    /* GCC's SVE1 ACLE has no predicated u16 indexed gather.  Keep the BF16
++     * element reorder native (the runner owns the memory move), but make the
++     * scalar-lane limitation explicit rather than pretending to emit a BF16
++     * gather instruction. */
++    for (index = 0; index < count; ++index) output[index] = input[map[index]];
++}
++
+ static void ptx_neg_f32(const float *input, float *output, uint64_t count) {
+     uint64_t index = 0;
+     svfloat32_t zero = svdup_n_f32(0.0f);
+@@ -530,6 +601,32 @@ static int ptx_run(const PtxRequest *request, const unsigned char *payload,
+         if (request->dtype > 1) return PTX_STATUS_BAD_REQUEST;
+         item_size = request->dtype == 0 ? sizeof(float) : sizeof(uint16_t);
+     }
++    if (ptx_is_layout_operation(request->operation)) {
++        size_t source_elements, source_bytes, map_elements, map_bytes;
++        const unsigned char *map_payload;
++        const uint64_t *map;
++        uint64_t index;
++        if (ptx_u64_to_size(request->m, &source_elements) != PTX_STATUS_OK ||
++            ptx_u64_to_size(request->k, &map_elements) != PTX_STATUS_OK ||
++            ptx_size_mul(source_elements, item_size, &source_bytes) != PTX_STATUS_OK ||
++            ptx_size_mul(map_elements, sizeof(uint64_t), &map_bytes) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        if (request->dtype == 0 && request->m > UINT32_MAX)
++            return PTX_STATUS_BAD_REQUEST;
++        (void)map_bytes;
++        map_payload = payload + source_bytes;
++        map = (const uint64_t *)map_payload;
++        if (ptx_index_map_hash(map, request->k) != request->n)
++            return PTX_STATUS_BAD_REQUEST;
++        for (index = 0; index < request->k; ++index)
++            if (map[index] >= request->m) return PTX_STATUS_BAD_REQUEST;
++        if (request->dtype == 0)
++            ptx_layout_f32(request->operation, (const float *)payload, (float *)result, map, count);
++        else
++            ptx_layout_bf16(request->operation, (const uint16_t *)payload,
++                            (uint16_t *)result, map, count);
++        return PTX_STATUS_OK;
++    }
+     if (request->operation == PTX_MATMUL) {
+         uint64_t left_count, right_count;
+         size_t left_bytes, left_elements, right_elements, output_elements;
+@@ -770,6 +867,29 @@ static int ptx_guarded_self_test(void) {
+         memcpy(&output_value, output_raw + 1 + index * sizeof(float), sizeof(float));
+         if (output_value != (float)(index + 2)) return 2;
+     }
++    {
++        enum { layout_count = 9 };
++        unsigned char layout_input_raw[layout_count * sizeof(float) + 2];
++        unsigned char layout_output_raw[layout_count * sizeof(float) + 2];
++        uint64_t layout_map[layout_count] = {8, 7, 6, 5, 4, 3, 2, 1, 0};
++        const float *layout_input = (const float *)(layout_input_raw + 1);
++        float *layout_output = (float *)(layout_output_raw + 1);
++        layout_input_raw[0] = 0xa5; layout_input_raw[sizeof(layout_input_raw) - 1] = 0x5a;
++        layout_output_raw[0] = 0xa5; layout_output_raw[sizeof(layout_output_raw) - 1] = 0x5a;
++        for (index = 0; index < layout_count; ++index) {
++            float value = (float)index;
++            memcpy(layout_input_raw + 1 + index * sizeof(float), &value, sizeof(float));
++        }
++        ptx_layout_f32(PTX_TRANSPOSE, layout_input, layout_output, layout_map, layout_count);
++        if (layout_input_raw[0] != 0xa5 || layout_input_raw[sizeof(layout_input_raw) - 1] != 0x5a ||
++            layout_output_raw[0] != 0xa5 || layout_output_raw[sizeof(layout_output_raw) - 1] != 0x5a)
++            return 3;
++        for (index = 0; index < layout_count; ++index) {
++            float value;
++            memcpy(&value, layout_output_raw + 1 + index * sizeof(float), sizeof(float));
++            if (value != (float)(layout_count - index - 1)) return 4;
++        }
++    }
+     return 0;
+ }
+ 
+@@ -796,28 +916,33 @@ int main(int argc, char **argv) {
+         return ptx_guarded_self_test();
+     if (read_all(&input, &input_size) != 0) return 10;
+     if (input_size < sizeof(PtxRequest)) {
+-        free(input); return ptx_error_response(PTX_STATUS_BAD_REQUEST, 0);
++        /* Preserve the v1 malformed-request response for callers that have
++         * not yet negotiated the layout v2 wire extension. */
++        free(input); return ptx_error_response(PTX_STATUS_BAD_REQUEST, 0, 1U);
+     }
+     memcpy(&request, input, sizeof(request));
+-    if (request.magic != PTX_MAGIC || request.version != PTX_VERSION || request.reserved || request.reserved2) {
++    if (request.magic != PTX_MAGIC ||
++        (request.version != 1U && request.version != PTX_VERSION) ||
++        (request.version == 1U && ptx_is_layout_operation(request.operation)) ||
++        request.reserved || request.reserved2) {
+         uint32_t dtype = request.dtype;
+-        free(input); return ptx_error_response(PTX_STATUS_BAD_REQUEST, dtype);
++        free(input); return ptx_error_response(PTX_STATUS_BAD_REQUEST, dtype, request.version);
+     }
+     status = ptx_validate_request(&request, &item_size, &payload_size,
+                                   &output_count, &result_size);
+     if (status != PTX_STATUS_OK) {
+         uint32_t dtype = request.dtype;
+-        free(input); return ptx_error_response((uint32_t)status, dtype);
++        free(input); return ptx_error_response((uint32_t)status, dtype, request.version);
+     }
+     if (payload_offset > input_size || payload_size != input_size - payload_offset) {
+         uint32_t dtype = request.dtype;
+-        free(input); return ptx_error_response(PTX_STATUS_BAD_REQUEST, dtype);
++        free(input); return ptx_error_response(PTX_STATUS_BAD_REQUEST, dtype, request.version);
+     }
+     result = result_size ? (unsigned char *)malloc(result_size) : NULL;
+     if (result_size && !result) { free(input); return 13; }
+     status = ptx_run(&request, input + payload_offset, result);
+     response.magic = PTX_MAGIC;
+-    response.version = PTX_VERSION;
++    response.version = request.version;
+     response.status = (uint32_t)status;
+     response.dtype = request.operation == PTX_CAST
+         ? (request.dtype == 2 ? 1U : 0U) : request.dtype;
+@@ -1095,6 +1220,30 @@ class Sve256Compiler:
+             "sve_math_operations": ["rsqrt", "where", "broadcast", "cast", "reduce_mean"],
+             "execution_modes": ["native", "qemu"],
+             "guarded_buffer_self_test": True,
++            "layout_plan_version": 1,
++            "layout_operations": [
++                {
++                    "operation": plan.operation,
++                    "kind": plan.layout_plan.kind,
++                    "source_elements": plan.layout_plan.source_elements,
++                    "output_elements": plan.layout_plan.output_elements,
++                    "index_map_digest": plan.layout_plan.index_map_digest,
++                }
++                for plan in target_ir.plans
++                if plan.layout_plan is not None
++            ],
++            "layout_index_map_wire": "uint64_le+fnv1a64",
++            "layout_scalar_lane_fallback": ["bf16_reorder"],
++            "logical_layout_copy_operations": [
++                plan.operation
++                for plan in target_ir.plans
++                if plan.layout_plan is not None and plan.layout_plan.kind == "logical_layout_copy"
++            ],
++            "native_layout_reorder_operations": [
++                plan.operation
++                for plan in target_ir.plans
++                if plan.layout_plan is not None and plan.layout_plan.kind in ("transpose", "slice")
++            ],
+         }
+         if options is not None:
+             option_metadata = _plain_mapping(options.metadata)
+diff --git a/python/pypto/lowering/cpu/vector/plan.py b/python/pypto/lowering/cpu/vector/plan.py
+index e4324303f..3deded867 100644
+--- a/python/pypto/lowering/cpu/vector/plan.py
++++ b/python/pypto/lowering/cpu/vector/plan.py
+@@ -33,6 +33,7 @@ from pypto.target._utils import canonical_json, frozen_mapping, mapping_copy, sh
+ 
+ 
+ VECTOR_PLAN_VERSION = 1
++LAYOUT_PLAN_VERSION = 1
+ VECTOR_LOWERING_VERSION = 1
+ CPU_VECTOR_BACKEND = "cpu.vector.common"
+ DEFAULT_LANE_COUNT = 4
+@@ -57,8 +58,14 @@ VECTOR_SUPPORTED_OPERATIONS = frozenset(
+         "broadcast",
+         "where",
+         "matmul",
++        "reshape",
++        "view",
++        "transpose",
++        "contiguous",
++        "slice",
+     )
+ )
++_UINT64_MAX = (1 << 64) - 1
+ _SSA_NAME_RE = re.compile(r"^(?:%[A-Za-z0-9_.$-]+|[A-Za-z_][A-Za-z0-9_.$-]*)$")
+ 
+ 
+@@ -122,6 +129,21 @@ def _product(values: Sequence[int]) -> int:
+     return result
+ 
+ 
++def _bounded_product(values: Sequence[int], field: str) -> int:
++    """Return a tensor element count representable by the portable wire ABI."""
++
++    result = 1
++    for index, value in enumerate(values):
++        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
++            raise CpuVectorValidationError(
++                "{}[{}] must be a non-negative integer".format(field, index)
++            )
++        if value and result > _UINT64_MAX // value:
++            raise CpuVectorValidationError("{} element count overflows uint64".format(field))
++        result *= value
++    return result
++
++
+ def _normalise_names(values: Any, field: str) -> Tuple[str, ...]:
+     if values is None:
+         return ()
+@@ -503,6 +525,86 @@ class MatmulPlan:
+         }
+ 
+ 
++@dataclass(frozen=True)
++class LayoutPlan:
++    """Static logical-layout schedule for one M1B operation.
++
++    ``index_map[i]`` is the source logical element read for output element
++    ``i``.  It is deliberately part of the target plan/artifact contract;
++    neither the reference runtime nor a native runner may infer it from
++    input data.  The map is a schedule, not a host-side output buffer.
++    """
++
++    operation: str
++    kind: str
++    input_shape: Tuple[int, ...]
++    output_shape: Tuple[int, ...]
++    source_elements: int
++    output_elements: int
++    index_map: Tuple[int, ...]
++    index_map_digest: str
++
++    def __post_init__(self) -> None:
++        if self.operation not in ("reshape", "view", "transpose", "contiguous", "slice"):
++            raise CpuVectorValidationError(
++                "unsupported layout plan operation {!r}".format(self.operation)
++            )
++        if self.kind not in ("logical_layout_copy", "transpose", "slice"):
++            raise CpuVectorValidationError("unsupported layout plan kind {!r}".format(self.kind))
++        input_shape = _validate_shape(self.input_shape, "layout.input_shape")
++        output_shape = _validate_shape(self.output_shape, "layout.output_shape")
++        source_elements = _bounded_product(input_shape, "layout.input_shape")
++        output_elements = _bounded_product(output_shape, "layout.output_shape")
++        if source_elements != self.source_elements:
++            raise CpuVectorValidationError("layout source element count does not match input shape")
++        if output_elements != self.output_elements:
++            raise CpuVectorValidationError("layout output element count does not match output shape")
++        if isinstance(self.index_map, (str, bytes)):
++            raise CpuVectorValidationError("layout index_map must be an integer sequence")
++        try:
++            index_map = tuple(self.index_map)
++        except TypeError as exc:
++            raise CpuVectorValidationError("layout index_map must be an integer sequence") from exc
++        if len(index_map) != output_elements:
++            raise CpuVectorValidationError(
++                "layout index_map length {} does not match output element count {}".format(
++                    len(index_map), output_elements
++                )
++            )
++        for index, source_index in enumerate(index_map):
++            if isinstance(source_index, bool) or not isinstance(source_index, int):
++                raise CpuVectorValidationError("layout index_map[{}] must be an integer".format(index))
++            if source_index < 0 or source_index >= source_elements:
++                raise CpuVectorValidationError(
++                    "layout index_map[{}]={} is outside source element range {}".format(
++                        index, source_index, source_elements
++                    )
++                )
++        expected_digest = sha256_text(list(index_map))
++        if self.index_map_digest != expected_digest:
++            raise CpuVectorValidationError("layout index_map digest mismatch")
++        object.__setattr__(self, "input_shape", input_shape)
++        object.__setattr__(self, "output_shape", output_shape)
++        object.__setattr__(self, "index_map", index_map)
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "layout_plan_version": LAYOUT_PLAN_VERSION,
++            "operation": self.operation,
++            "kind": self.kind,
++            "input_shape": list(self.input_shape),
++            "output_shape": list(self.output_shape),
++            "source_elements": self.source_elements,
++            "output_elements": self.output_elements,
++            "index_map": list(self.index_map),
++            "index_map_digest": self.index_map_digest,
++        }
++
++    @property
++    def is_identity(self) -> bool:
++        return self.index_map == tuple(range(self.output_elements))
++
++
+ def _is_tensor(value_type: CoreType) -> bool:
+     return value_type.kind in ("tensor", "view", "tile")
+ 
+@@ -691,6 +793,189 @@ def _target_specialization(target: TargetSpec, specialization: Optional[Mapping[
+     return frozen_mapping(value)
+ 
+ 
++def _layout_attr(attributes: Mapping[str, Any], keys: Sequence[str], context: str, default: Any = None) -> Any:
++    present = [key for key in keys if key in attributes]
++    if not present:
++        return default
++    first = attributes[present[0]]
++    if any(attributes[key] != first for key in present[1:]):
++        raise CpuVectorValidationError(
++            "{} contains conflicting attributes {}".format(context, ", ".join(present))
++        )
++    return first
++
++
++def _layout_int_sequence(value: Any, context: str, allow_scalar: bool = False) -> Tuple[int, ...]:
++    if allow_scalar and isinstance(value, int) and not isinstance(value, bool):
++        values = (value,)
++    else:
++        if isinstance(value, (str, bytes)):
++            raise CpuVectorValidationError("{} must be a sequence of integers".format(context))
++        try:
++            values = tuple(value)
++        except TypeError as exc:
++            raise CpuVectorValidationError("{} must be a sequence of integers".format(context)) from exc
++    result = []
++    for index, item in enumerate(values):
++        if isinstance(item, bool) or not isinstance(item, int):
++            raise CpuVectorValidationError("{}[{}] must be an integer".format(context, index))
++        result.append(item)
++    return tuple(result)
++
++
++def _layout_axis(axis: Any, rank: int, context: str) -> int:
++    if isinstance(axis, bool) or not isinstance(axis, int):
++        raise CpuVectorValidationError("{} must be an integer".format(context))
++    normalized = axis + rank if axis < 0 else axis
++    if normalized < 0 or normalized >= rank:
++        raise CpuVectorValidationError("{} axis {} is outside rank {}".format(context, axis, rank))
++    return normalized
++
++
++def _layout_permutation(input_shape: Sequence[int], attributes: Mapping[str, Any], context: str) -> Tuple[int, ...]:
++    rank = len(input_shape)
++    raw_permutation = _layout_attr(attributes, ("permutation", "perm", "dims", "axes"), context)
++    raw_dim0 = _layout_attr(attributes, ("dim0", "axis0"), context)
++    raw_dim1 = _layout_attr(attributes, ("dim1", "axis1"), context)
++    if raw_permutation is not None and (raw_dim0 is not None or raw_dim1 is not None):
++        raise CpuVectorValidationError("{} cannot combine permutation with dim0/dim1".format(context))
++    if raw_permutation is None:
++        if raw_dim0 is None or raw_dim1 is None:
++            raise CpuVectorValidationError("{} requires permutation or dim0/dim1".format(context))
++        dim0 = _layout_axis(raw_dim0, rank, context + ".dim0")
++        dim1 = _layout_axis(raw_dim1, rank, context + ".dim1")
++        permutation = list(range(rank))
++        permutation[dim0], permutation[dim1] = permutation[dim1], permutation[dim0]
++        return tuple(permutation)
++    permutation = _layout_int_sequence(raw_permutation, context + ".permutation")
++    if len(permutation) != rank:
++        raise CpuVectorValidationError("{} permutation rank does not match input rank".format(context))
++    normalized = tuple(_layout_axis(axis, rank, context + ".permutation") for axis in permutation)
++    if len(set(normalized)) != rank:
++        raise CpuVectorValidationError("{} permutation must contain each axis exactly once".format(context))
++    return normalized
++
++
++def _layout_slice_spec(
++    input_shape: Sequence[int], attributes: Mapping[str, Any], context: str
++) -> Tuple[Tuple[int, int, int, int], ...]:
++    starts = _layout_attr(attributes, ("starts", "start"), context)
++    stops = _layout_attr(attributes, ("stops", "stop"), context)
++    if starts is None or stops is None:
++        raise CpuVectorValidationError("{} requires starts and stops".format(context))
++    starts = _layout_int_sequence(starts, context + ".starts", allow_scalar=True)
++    stops = _layout_int_sequence(stops, context + ".stops", allow_scalar=True)
++    if len(starts) != len(stops):
++        raise CpuVectorValidationError("{} starts and stops must have the same length".format(context))
++    axes_raw = _layout_attr(attributes, ("axes", "axis"), context)
++    axes = tuple(range(len(starts))) if axes_raw is None else _layout_int_sequence(
++        axes_raw, context + ".axes", allow_scalar=True
++    )
++    steps_raw = _layout_attr(attributes, ("steps", "step"), context)
++    steps = (1,) * len(starts) if steps_raw is None else _layout_int_sequence(
++        steps_raw, context + ".steps", allow_scalar=True
++    )
++    if not (len(axes) == len(steps) == len(starts)):
++        raise CpuVectorValidationError("{} starts/stops/axes/steps lengths must match".format(context))
++    normalized_axes = tuple(_layout_axis(axis, len(input_shape), context + ".axes") for axis in axes)
++    if len(set(normalized_axes)) != len(normalized_axes):
++        raise CpuVectorValidationError("{} axes must not contain duplicates".format(context))
++    result = []
++    for index, axis in enumerate(normalized_axes):
++        step = steps[index]
++        if step <= 0:
++            raise CpuVectorUnsupportedError("{} only supports positive step values".format(context))
++        dimension = input_shape[axis]
++        start = starts[index]
++        stop = stops[index]
++        if start < -dimension or start > dimension or stop < -dimension or stop > dimension:
++            raise CpuVectorValidationError(
++                "{} bound at index {} is outside dimension {}".format(context, index, dimension)
++            )
++        normalized_start = start + dimension if start < 0 else start
++        normalized_stop = stop + dimension if stop < 0 else stop
++        result.append((axis, normalized_start, normalized_stop, step))
++    return tuple(result)
++
++
++def _layout_unravel(index: int, shape: Sequence[int]) -> Tuple[int, ...]:
++    coordinates = [0] * len(shape)
++    remaining = index
++    for axis in range(len(shape) - 1, -1, -1):
++        dimension = shape[axis]
++        if dimension:
++            coordinates[axis] = remaining % dimension
++            remaining //= dimension
++    return tuple(coordinates)
++
++
++def _layout_ravel(coordinates: Sequence[int], shape: Sequence[int]) -> int:
++    result = 0
++    for coordinate, dimension in zip(coordinates, shape):
++        if coordinate < 0 or coordinate >= dimension:
++            raise CpuVectorValidationError("layout index coordinate is outside source shape")
++        result = result * dimension + coordinate
++    return result
++
++
++def _make_layout_plan(operation: Operation, input_shape: Tuple[int, ...], output_shape: Tuple[int, ...]) -> LayoutPlan:
++    name = canonical_operation_name(operation.name)
++    source_elements = _bounded_product(input_shape, "layout.input_shape")
++    output_elements = _bounded_product(output_shape, "layout.output_shape")
++    if name in ("reshape", "view", "contiguous"):
++        if source_elements != output_elements:
++            raise CpuVectorValidationError("{} layout element count mismatch".format(name))
++        index_map = tuple(range(output_elements))
++        kind = "logical_layout_copy"
++    elif name == "transpose":
++        permutation = _layout_permutation(input_shape, operation.attributes, "vector.transpose")
++        expected = tuple(input_shape[axis] for axis in permutation)
++        if output_shape != expected:
++            raise CpuVectorValidationError(
++                "vector.transpose output shape {} does not match {}".format(output_shape, expected)
++            )
++        index_map_values = []
++        for output_index in range(output_elements):
++            output_coordinates = _layout_unravel(output_index, output_shape)
++            input_coordinates = [0] * len(input_shape)
++            for output_axis, input_axis in enumerate(permutation):
++                input_coordinates[input_axis] = output_coordinates[output_axis]
++            index_map_values.append(_layout_ravel(input_coordinates, input_shape))
++        index_map = tuple(index_map_values)
++        kind = "transpose"
++    elif name == "slice":
++        spec = _layout_slice_spec(input_shape, operation.attributes, "vector.slice")
++        expected_shape = list(input_shape)
++        for axis, start, stop, step in spec:
++            expected_shape[axis] = max(0, (stop - start + step - 1) // step)
++        if output_shape != tuple(expected_shape):
++            raise CpuVectorValidationError(
++                "vector.slice output shape {} does not match {}".format(output_shape, tuple(expected_shape))
++            )
++        starts = {axis: (start, step) for axis, start, _stop, step in spec}
++        index_map_values = []
++        for output_index in range(output_elements):
++            output_coordinates = _layout_unravel(output_index, output_shape)
++            input_coordinates = list(output_coordinates)
++            for axis, (start, step) in starts.items():
++                input_coordinates[axis] = start + output_coordinates[axis] * step
++            index_map_values.append(_layout_ravel(input_coordinates, input_shape))
++        index_map = tuple(index_map_values)
++        kind = "slice"
++    else:
++        raise CpuVectorUnsupportedError("unsupported vector layout operation {!r}".format(name))
++    return LayoutPlan(
++        operation=name,
++        kind=kind,
++        input_shape=input_shape,
++        output_shape=output_shape,
++        source_elements=source_elements,
++        output_elements=output_elements,
++        index_map=index_map,
++        index_map_digest=sha256_text(list(index_map)),
++    )
++
++
+ @dataclass(frozen=True, init=False)
+ class VectorPlan:
+     """Target-owned plan for one Core IR operation."""
+@@ -712,6 +997,7 @@ class VectorPlan:
+     specialization: Mapping[str, Any]
+     reduction: Optional[ReductionPlan]
+     matmul: Optional[MatmulPlan]
++    layout_plan: Optional[LayoutPlan]
+ 
+     def __init__(
+         self,
+@@ -732,12 +1018,13 @@ class VectorPlan:
+         specialization: Optional[Mapping[str, Any]] = None,
+         reduction: Optional[ReductionPlan] = None,
+         matmul: Optional[MatmulPlan] = None,
++        layout_plan: Optional[LayoutPlan] = None,
+     ) -> None:
+         if plan_version != VECTOR_PLAN_VERSION:
+             raise CpuVectorValidationError("unsupported vector plan version {!r}".format(plan_version))
+         if not isinstance(operation, str) or not operation.strip():
+             raise CpuVectorValidationError("plan operation must be a non-empty string")
+-        if plan_kind not in ("elementwise", "reduction", "matmul"):
++        if plan_kind not in ("elementwise", "reduction", "matmul", "layout"):
+             raise CpuVectorValidationError("unknown vector plan kind {!r}".format(plan_kind))
+         if isinstance(operation_index, bool) or not isinstance(operation_index, int) or operation_index < 0:
+             raise CpuVectorValidationError("operation_index must be a non-negative integer")
+@@ -785,12 +1072,21 @@ class VectorPlan:
+         object.__setattr__(self, "specialization", frozen_mapping(specialization))
+         object.__setattr__(self, "reduction", reduction)
+         object.__setattr__(self, "matmul", matmul)
++        object.__setattr__(self, "layout_plan", layout_plan)
+         if plan_kind == "reduction" and reduction is None:
+             raise CpuVectorValidationError("reduction plan kind requires reduction details")
+         if plan_kind == "matmul" and matmul is None:
+             raise CpuVectorValidationError("matmul plan kind requires matmul details")
+-        if plan_kind == "elementwise" and (reduction is not None or matmul is not None):
+-            raise CpuVectorValidationError("elementwise plan cannot carry reduction/matmul details")
++        if plan_kind == "layout" and layout_plan is None:
++            raise CpuVectorValidationError("layout plan kind requires layout details")
++        if plan_kind == "elementwise" and (reduction is not None or matmul is not None or layout_plan is not None):
++            raise CpuVectorValidationError("elementwise plan cannot carry reduction/matmul/layout details")
++        if plan_kind == "reduction" and (matmul is not None or layout_plan is not None):
++            raise CpuVectorValidationError("reduction plan cannot carry matmul/layout details")
++        if plan_kind == "matmul" and (reduction is not None or layout_plan is not None):
++            raise CpuVectorValidationError("matmul plan cannot carry reduction/layout details")
++        if plan_kind == "layout" and (reduction is not None or matmul is not None):
++            raise CpuVectorValidationError("layout plan cannot carry reduction/matmul details")
+ 
+     @property
+     def vector_blocks(self) -> Tuple[VectorChunk, ...]:
+@@ -854,6 +1150,7 @@ class VectorPlan:
+             "specialization": mapping_copy(self.specialization),
+             "reduction": None if self.reduction is None else self.reduction.to_dict(),
+             "matmul": None if self.matmul is None else self.matmul.to_dict(),
++            "layout_plan": None if self.layout_plan is None else self.layout_plan.to_dict(),
+         }
+ 
+     def canonical_json(self) -> str:
+@@ -889,6 +1186,39 @@ def _make_plan_for_operation(
+     output = operation.outputs[0]
+     output_type = output.type
+     output_shape = static_shape(output_type, "vector operation output") if _is_tensor(output_type) else ()
++    if name in ("reshape", "view", "transpose", "contiguous", "slice"):
++        if len(operation.inputs) != 1 or not _is_tensor(operation.inputs[0].type) or not _is_tensor(output_type):
++            raise CpuVectorUnsupportedError(
++                "CPU vector layout operation {!r} requires one tensor input and one tensor output".format(name)
++            )
++        input_shape = static_shape(operation.inputs[0].type, "vector layout input")
++        # Layout descriptors are validated independently.  A reshape may
++        # change rank, and transpose/slice may change the output stride axis;
++        # requiring one shared numeric axis here would reject valid plans.
++        _check_layout(program, operation, (operation.inputs[0],), "function operation {}".format(operation_index))
++        _check_layout(program, operation, (output,), "function operation {}".format(operation_index))
++        layout_plan = _make_layout_plan(operation, input_shape, output_shape)
++        count = output_elements = layout_plan.output_elements
++        output_axis = len(output_shape) - 1 if output_shape else None
++        iteration = make_iteration_plan(count, lane_count, output_axis, tail_policy)
++        return VectorPlan(
++            VECTOR_PLAN_VERSION,
++            name,
++            "layout",
++            operation_index,
++            tuple(ref.name for ref in operation.inputs),
++            output.name,
++            canonical_dtype(output_type.dtype),
++            output_shape,
++            "row_major_contiguous",
++            output_axis,
++            output_elements,
++            lane_count,
++            iteration,
++            required_features,
++            specialization,
++            layout_plan=layout_plan,
++        )
+     # Reduction outputs may have a different rank (and therefore a different
+     # innermost-axis number) from their input.  The reduction iteration axis
+     # is defined by the input domain; elementwise/matmul outputs must share
+@@ -1244,6 +1574,8 @@ __all__ = [
+     "FeatureMismatch",
+     "FeatureSet",
+     "IterationPlan",
++    "LAYOUT_PLAN_VERSION",
++    "LayoutPlan",
+     "MatmulPlan",
+     "ReductionPlan",
+     "TailPlan",
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256_layout.py b/python/tests/ut/pypto_x/test_cpu_sve256_layout.py
+new file mode 100644
+index 000000000..3dea226d7
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cpu_sve256_layout.py
+@@ -0,0 +1,248 @@
++"""M1C2a row-major layout plans and native SVE256 data movement."""
++
++from __future__ import annotations
++
++import re
++import shutil
++import struct
++import subprocess
++
++import pytest
++
++from pypto.abi import LaunchRequest
++from pypto.backends.cpu import CpuScalarRuntime, HostTensor
++from pypto.backends.cpu.aarch64 import CpuSve256ArtifactError, CpuSve256ExecutionError, Sve256Runtime
++from pypto.compiler import Artifact, CompileOptions
++from pypto.compiler.targets.cpu_sve256 import Sve256Compiler
++from pypto.compiler.targets.cpu import CpuScalarCompiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu.x86.avx2 import Avx2UnsupportedError, lower_avx2
++from pypto.lowering.cpu.x86.avx512 import Avx512UnsupportedError, lower_avx512
++from pypto.target import TargetSpec
++from pypto.target._utils import sha256_text
++
++
++def _program(name, input_shape, output_shape, attributes=None, dtype="float32"):
++    input_type = CoreType.tensor(dtype, input_shape)
++    output_type = CoreType.tensor(dtype, output_shape)
++    source = ValueRef("source", input_type)
++    output = ValueRef("output", output_type)
++    operation = Operation(name, (source,), (output,), attributes=attributes or {})
++    return CoreProgram(functions=(CoreFunction(name, (source,), (output,), Region((operation,))),))
++
++
++def _target():
++    return TargetSpec("cpu", "aarch64-linux-gnu", features=("sve", "sve2"), attributes={"vl_bytes": 32})
++
++
++def _compile(program, tmp_path):
++    compiler = Sve256Compiler()
++    target_ir = compiler.lower(program, _target())
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format="pypto-x.cpu.sve256",
++            extra={"build_dir": str(tmp_path / "build")},
++        ),
++    )
++    return target_ir, artifact
++
++
++def _run(program, tmp_path, source, output):
++    _target_ir, artifact = _compile(program, tmp_path)
++    Sve256Runtime(execution_mode="qemu").launch(
++        LaunchRequest(
++            artifact,
++            inputs=[source.descriptor(readonly=True)],
++            outputs=[output.descriptor()],
++        )
++    )
++    return artifact
++
++
++def _scalar_run(program, source, output):
++    compiler = CpuScalarCompiler()
++    artifact = compiler.compile(compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu")))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[source.descriptor(readonly=True)],
++            outputs=[output.descriptor()],
++        )
++    )
++
++
++def test_layout_plan_is_serializable_and_distinguishes_copy_from_reorder(tmp_path):
++    copy_ir, copy_artifact = _compile(
++        _program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}), tmp_path / "reshape"
++    )
++    transpose_ir, transpose_artifact = _compile(
++        _program("transpose", (3, 5), (5, 3), {"permutation": [-1, 0]}),
++        tmp_path / "transpose",
++    )
++    copy_plan = copy_ir.plans[0].layout_plan
++    transpose_plan = transpose_ir.plans[0].layout_plan
++    assert copy_plan.kind == "logical_layout_copy"
++    assert transpose_plan.kind == "transpose"
++    assert copy_plan.index_map == tuple(range(15))
++    assert transpose_plan.index_map == (0, 5, 10, 1, 6, 11, 2, 7, 12, 3, 8, 13, 4, 9, 14)
++    assert copy_artifact.metadata["logical_layout_copy_operations"] == ("reshape",)
++    assert transpose_artifact.metadata["native_layout_reorder_operations"] == ("transpose",)
++    assert copy_artifact.metadata["layout_index_map_wire"] == "uint64_le+fnv1a64"
++    assert copy_plan.index_map_digest == sha256_text(list(copy_plan.index_map))
++
++
++@pytest.mark.parametrize("dtype", ("float32", "bf16"))
++@pytest.mark.parametrize("name", ("reshape", "view", "contiguous"))
++def test_logical_layout_copy_preserves_row_major_sequence(dtype, name, tmp_path):
++    attributes = {"shape": [5, 3]} if name != "contiguous" else {}
++    output_shape = (5, 3) if name != "contiguous" else (3, 5)
++    program = _program(name, (3, 5), output_shape, attributes, dtype)
++    source = HostTensor(dtype, (3, 5), [index * 0.25 - 1.0 for index in range(15)])
++    output = HostTensor.zeros(dtype, output_shape)
++    _run(program, tmp_path / name / dtype, source, output)
++    expected = HostTensor.zeros(dtype, output_shape)
++    _scalar_run(program, source, expected)
++    assert output.flat() == expected.flat() == source.flat()
++
++
++@pytest.mark.parametrize("dtype", ("float32", "bf16"))
++def test_transpose_permutation_and_dim_swap_are_native_reorders(dtype, tmp_path):
++    permutation_program = _program(
++        "transpose", (3, 5, 2), (2, 3, 5), {"permutation": [-1, 0, 1]}, dtype
++    )
++    source = HostTensor(dtype, (3, 5, 2), [index * 0.5 for index in range(30)])
++    actual = HostTensor.zeros(dtype, (2, 3, 5))
++    artifact = _run(permutation_program, tmp_path / "perm" / dtype, source, actual)
++    expected_scalar = HostTensor.zeros(dtype, (2, 3, 5))
++    _scalar_run(permutation_program, source, expected_scalar)
++    expected = []
++    for axis0 in range(2):
++        for axis1 in range(3):
++            for axis2 in range(5):
++                expected.append(source.flat()[(axis1 * 5 + axis2) * 2 + axis0])
++    assert actual.flat() == expected_scalar.flat() == tuple(expected)
++    assert artifact.metadata["native_layout_reorder_operations"] == ("transpose",)
++
++    dim_program = _program("transpose", (3, 5, 2), (3, 2, 5), {"dim0": -1, "dim1": -2}, dtype)
++    dim_actual = HostTensor.zeros(dtype, (3, 2, 5))
++    _run(dim_program, tmp_path / "dim" / dtype, source, dim_actual)
++    dim_expected = HostTensor.zeros(dtype, (3, 2, 5))
++    _scalar_run(dim_program, source, dim_expected)
++    expected_dim = []
++    for axis0 in range(3):
++        for axis1 in range(2):
++            for axis2 in range(5):
++                expected_dim.append(source.flat()[(axis0 * 5 + axis2) * 2 + axis1])
++    assert dim_actual.flat() == dim_expected.flat() == tuple(expected_dim)
++
++
++@pytest.mark.parametrize("dtype", ("float32", "bf16"))
++def test_slice_negative_bounds_positive_step_and_empty_output(dtype, tmp_path):
++    source = HostTensor(dtype, (2, 5), [index * 0.5 for index in range(10)])
++    output = HostTensor.zeros(dtype, (2, 2))
++    slice_program = _program(
++        "slice", (2, 5), (2, 2),
++        {"starts": [-4], "stops": [-1], "axes": [-1], "steps": [2]}, dtype,
++    )
++    _run(
++        slice_program,
++        tmp_path / "slice" / dtype,
++        source,
++        output,
++    )
++    expected = HostTensor.zeros(dtype, (2, 2))
++    _scalar_run(slice_program, source, expected)
++    assert output.flat() == expected.flat() == (0.5, 1.5, 3.0, 4.0)
++
++    empty = HostTensor.zeros(dtype, (2, 0))
++    empty_program = _program("slice", (2, 5), (2, 0), {"starts": [4], "stops": [2], "axes": [1]}, dtype)
++    empty_artifact = _run(
++        empty_program,
++        tmp_path / "empty" / dtype,
++        source,
++        empty,
++    )
++    empty_expected = HostTensor.zeros(dtype, (2, 0))
++    _scalar_run(empty_program, source, empty_expected)
++    assert empty.flat() == empty_expected.flat() == ()
++    assert empty_artifact.metadata["layout_operations"][0]["output_elements"] == 0
++
++
++def test_layout_index_map_metadata_tamper_is_rejected(tmp_path):
++    _target_ir, artifact = _compile(
++        _program("transpose", (3, 5), (5, 3), {"permutation": [1, 0]}), tmp_path
++    )
++    metadata = dict(artifact.metadata)
++    metadata["layout_operations"] = [dict(metadata["layout_operations"][0], index_map_digest="0" * 64)]
++    tampered = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        path=artifact.path,
++        metadata=metadata,
++    )
++    with pytest.raises(CpuSve256ArtifactError, match="layout operation metadata"):
++        Sve256Runtime(execution_mode="qemu").load(tampered)
++
++
++def test_layout_runner_rejects_bad_map_and_wire_tamper_before_memory_access(tmp_path):
++    _target_ir, artifact = _compile(
++        _program("transpose", (3, 5), (5, 3), {"permutation": [1, 0]}), tmp_path
++    )
++    runtime = Sve256Runtime(execution_mode="qemu")
++    with pytest.raises(CpuSve256ExecutionError, match="outside source range"):
++        runtime._run_runner(artifact, "transpose", "float32", [[1.0] * 15], 15, index_map=[0] * 14 + [15])
++
++    qemu = shutil.which("qemu-aarch64")
++    if qemu is None:
++        pytest.skip("qemu-aarch64 is unavailable")
++    header = struct.pack(
++        "<6I4Q", 0x56535850, 2, 21, 0, 0, 0, 1, 1, 1, 0
++    )
++    # A map entry outside the source range must produce a structured error,
++    # never an out-of-bounds access or a signal.
++    payload = header + struct.pack("<fQ", 1.0, 1)
++    result = subprocess.run(
++        [qemu, "-L", "/usr/aarch64-linux-gnu", "-cpu", "max,sve256=on", artifact.path],
++        input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
++    )
++    assert result.returncode != 0 and result.returncode != -11
++    assert len(result.stdout) >= 24
++    magic, version, status, _dtype, _count = struct.unpack("<4IQ", result.stdout[:24])
++    assert magic == 0x56535850 and version == 2 and status != 0
++
++
++def test_avx2_avx512_keep_explicit_rejection_for_layout_operations():
++    program = _program("transpose", (2, 3), (3, 2), {"permutation": [1, 0]})
++    avx2_target = TargetSpec("cpu", "x86_64-linux-gnu", features=("avx", "avx2", "osxsave", "ymm"))
++    avx512_target = TargetSpec(
++        "cpu", "x86_64-linux-gnu", features=("avx", "avx512f", "osxsave", "ymm", "opmask", "zmm")
++    )
++    with pytest.raises(Avx2UnsupportedError, match="transpose"):
++        lower_avx2(program, avx2_target)
++    with pytest.raises(Avx512UnsupportedError, match="transpose"):
++        lower_avx512(program, avx512_target)
++
++
++def test_layout_sve_hotspot_has_predicated_gather_and_no_neon(tmp_path):
++    _target_ir, artifact = _compile(
++        _program("transpose", (3, 5), (5, 3), {"permutation": [1, 0]}), tmp_path
++    )
++    objdump = shutil.which("aarch64-linux-gnu-objdump")
++    if objdump is None:
++        pytest.skip("AArch64 objdump is unavailable")
++    result = subprocess.run(
++        [objdump, "-d", "--disassemble=ptx_layout_f32", artifact.path],
++        stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=True,
++    )
++    text = result.stdout.lower()
++    function_text = text.split("<ptx_layout_f32>:", 1)[-1]
++    assert "whilelo" in function_text
++    assert re.search(r"\bld1w\b", function_text)
++    assert re.search(r"\bst1w\b", function_text)
++    assert re.search(r"\bld1d\b", function_text)
++    assert re.search(r"\bz[0-9]+\.[sdh]\b", function_text)
++    assert re.search(r"\bp[0-9]+\.[bhsd]\b", function_text)
++    assert not re.search(r"\b[vq][0-9]+(?:\.[bhsd])?\b", function_text)

@@ -1,0 +1,181 @@
+From fcf037efc90530c15fa4c78a2fcad67374ce0ce4 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Wed, 9 Sep 2026 14:37:41 +0800
+Subject: [PATCH 74/96] fix(pypto-x): preserve qwen gated norm bf16 boundary
+
+---
+ python/pypto/portable/qwen35.py                                 | 21 ++++---
+ .../tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py   | 87 +++++++++++++++++++++++++++++
+ 2 files changed, 99 insertions(+), 9 deletions(-)
+
+diff --git a/python/pypto/portable/qwen35.py b/python/pypto/portable/qwen35.py
+index a081ee357..f5d391ac1 100644
+--- a/python/pypto/portable/qwen35.py
++++ b/python/pypto/portable/qwen35.py
+@@ -619,9 +619,9 @@ def _rms_gated_core(
+     """Build Qwen3.5's post-GDR ``RMSNormGated`` body.
+ 
+     The checkpoint's gated norm stores a direct scale initialized to one.  It
+-    therefore differs from the decoder RMSNorm delta convention above: the
+-    scale is multiplied directly, and the gate is applied as ``silu(z)``
+-    after normalization.
++    therefore differs from the decoder RMSNorm delta convention above.  The
++    upstream order is explicit: normalize in FP32, cast the normalized value
++    to BF16, multiply by the BF16 weight, then apply ``silu(z)`` in FP32.
+     """
+ 
+     f32 = "float32"
+@@ -659,17 +659,17 @@ def _rms_gated_core(
+         (x_f32, inverse_full),
+         ((prefix + "_normalized", _tensor(f32, shape)),),
+     )[0]
+-    weight_f32 = _as_f32(builder, weight, dtype, prefix + "_weight")
++    normalized_bf16 = _cast_from_f32(builder, normalized, dtype, prefix + "_normalized_bf16")
+     weight_full = builder.op(
+         "broadcast",
+-        (weight_f32,),
+-        ((prefix + "_weight_full", _tensor(f32, shape)),),
++        (weight,),
++        ((prefix + "_weight_full", _tensor(dtype, shape)),),
+         {"shape": list(shape)},
+     )[0]
+     return builder.op(
+         "mul",
+-        (normalized, weight_full),
+-        ((prefix + "_scaled", _tensor(f32, shape)),),
++        (normalized_bf16, weight_full),
++        ((prefix + "_scaled_bf16", _tensor(dtype, shape)),),
+     )[0]
+ 
+ 
+@@ -2502,7 +2502,7 @@ def _append_gdr_graph(
+         prefix + "_recurrent",
+     )
+     core_f32 = _as_f32(builder, core_output, "bf16", prefix + "_core_output_f32")
+-    gated_norm = _rms_gated_core(
++    gated_norm_bf16 = _rms_gated_core(
+         builder,
+         core_f32,
+         norm_weight,
+@@ -2511,6 +2511,9 @@ def _append_gdr_graph(
+         (batch, steps, value_heads, value_dim),
+         prefix + "_gated_norm",
+     )
++    # The upstream BF16 weight product is promoted explicitly before the
++    # FP32 SiLU gate multiply; Core IR must not rely on mixed-dtype inference.
++    gated_norm = _as_f32(builder, gated_norm_bf16, dtype, prefix + "_gated_norm")
+     z_gate = builder.op(
+         "silu",
+         (_as_f32(builder, z, dtype, prefix + "_z_f32"),),
+diff --git a/python/tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py b/python/tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py
+index a47514255..300f242bf 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py
++++ b/python/tests/ut/pypto_x/test_qwen35_full_decoder_connectivity.py
+@@ -9,6 +9,9 @@ allowed to build target-owned plans, but must not be asked to materialize a
+ 
+ from __future__ import annotations
+ 
++import math
++import struct
++
+ from pypto.abi import LaunchRequest
+ from pypto.backends.cpu import CpuScalarRuntime, HostTensor
+ from pypto.compiler.targets.cpu import CpuScalarCompiler
+@@ -58,6 +61,15 @@ def _count(shape):
+     return result
+ 
+ 
++def _bf16_bits(value):
++    bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++    return (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16
++
++
++def _bf16_value(bits):
++    return struct.unpack("<f", struct.pack("<I", int(bits) << 16))[0]
++
++
+ def test_full_manifest_parameter_and_route_contract():
+     manifest = qwen35_text_decoder_manifest(1, 1, past_length=4096)
+     assert manifest["graph_kind"] == "text_decoder_full_no_weight"
+@@ -129,6 +141,81 @@ def test_model_profile_builds_compact_for_decode_cache_lengths():
+         assert "identity" not in program.metadata["executable_operations"]
+ 
+ 
++def test_gated_norm_preserves_upstream_bf16_rounding_order():
++    """Check both Core dtype edges and the independent published bit sample."""
++
++    program = build_qwen35_text_decoder_graph(1, 1, shape_profile="synthetic_test")
++    operations = program.functions[0].body.operations
++    by_output = {operation.outputs[0].name: operation for operation in operations}
++    op_index = {
++        operation.outputs[0].name: index
++        for index, operation in enumerate(operations)
++        if operation.outputs
++    }
++    scaled = [
++        operation
++        for operation in operations
++        if operation.outputs and operation.outputs[0].name.endswith("_scaled_bf16")
++    ]
++    assert len(scaled) == 18
++    for operation in scaled:
++        assert operation.outputs[0].type.dtype == "bf16"
++        normalized_bf16_name, weight_name = (ref.name for ref in operation.inputs)
++        normalized_cast = by_output[normalized_bf16_name]
++        weight_broadcast = by_output[weight_name]
++        assert normalized_cast.name == "cast"
++        assert normalized_cast.inputs[0].name.endswith("_normalized")
++        assert normalized_cast.inputs[0].type.dtype == "float32"
++        assert normalized_cast.outputs[0].type.dtype == "bf16"
++        assert weight_broadcast.name == "broadcast"
++        assert weight_broadcast.inputs[0].type.dtype == "bf16"
++        assert weight_broadcast.outputs[0].type.dtype == "bf16"
++        cast_back = next(
++            candidate
++            for candidate in operations
++            if candidate.name == "cast"
++            and candidate.inputs
++            and candidate.inputs[0].name == operation.outputs[0].name
++            and candidate.outputs[0].name.endswith("_gated_norm_f32")
++        )
++        assert cast_back.outputs[0].type.dtype == "float32"
++        gate = by_output[cast_back.outputs[0].name.replace("_gated_norm_f32", "_z_gate")]
++        assert gate.name == "silu"
++        assert gate.outputs[0].type.dtype == "float32"
++        gated = by_output[cast_back.outputs[0].name.replace("_gated_norm_f32", "_gated_core")]
++        assert gated.name == "mul"
++        assert gated.outputs[0].type.dtype == "float32"
++        assert op_index[normalized_cast.outputs[0].name] < op_index[operation.outputs[0].name]
++        assert op_index[weight_broadcast.outputs[0].name] < op_index[operation.outputs[0].name]
++        assert op_index[operation.outputs[0].name] < op_index[cast_back.outputs[0].name]
++        assert op_index[cast_back.outputs[0].name] < op_index[gate.outputs[0].name]
++        assert op_index[gate.outputs[0].name] < op_index[gated.outputs[0].name]
++
++    # Same pure-standard-library BF16-RNE sample used by the independent
++    # acceptance audit.  It must distinguish the old FP32 weight product from
++    # the upstream normalized->BF16->weight->SiLU ordering.
++    x = (0.1234567, -0.2345678, 0.3456789, -0.4567891)
++    weight = (0.8765432, 1.1234567, 0.7654321, 1.2345678)
++    gate = (0.3333, -0.8888, 1.2345, -0.4321)
++    mean = sum(value * value for value in x) / len(x) + 1.0e-6
++    normalized = tuple(value / math.sqrt(mean) for value in x)
++    normalized_bf16 = tuple(_bf16_value(_bf16_bits(value)) for value in normalized)
++    weight_bf16 = tuple(_bf16_value(_bf16_bits(value)) for value in weight)
++    silu = tuple(value / (1.0 + math.exp(-value)) for value in gate)
++    upstream = tuple(
++        _bf16_value(_bf16_bits(normalized_bf16[index] * weight_bf16[index] * silu[index]))
++        for index in range(len(x))
++    )
++    current = tuple(
++        _bf16_value(_bf16_bits(normalized[index] * weight_bf16[index] * silu[index]))
++        for index in range(len(x))
++    )
++    assert [_bf16_bits(value) for value in upstream] == [15752, 15965, 16205, 16027]
++    assert [_bf16_bits(value) for value in current] == [15752, 15966, 16205, 16028]
++    assert max(abs(left - right) for left, right in zip(upstream, current)) == 0.001953125
++    assert upstream != current
++
++
+ def test_synthetic_full_graph_executes_and_returns_functional_state():
+     program = build_qwen35_text_decoder_graph(1, 1, shape_profile="synthetic_test")
+     artifact = _compile_scalar(program)

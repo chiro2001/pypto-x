@@ -1,0 +1,450 @@
+From 2c99c4b319164006ba96696a42fe80757119cab7 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Wed, 9 Sep 2026 07:25:50 +0800
+Subject: [PATCH 69/96] fix(cuda): harden ptx artifact and edge validation
+
+---
+ python/pypto/backends/cuda/driver.py            |   7 ++-
+ python/pypto/compiler/targets/cuda.py           |  85 ++++++++++++++++++++++---
+ python/tests/ut/pypto_x/test_cuda_driver_ptx.py | 150 +++++++++++++++++++++++++++++++++++++++++++-
+ scripts/smoke/cuda_driver_matrix_smoke.py       |  28 ++++++++-
+ 4 files changed, 255 insertions(+), 15 deletions(-)
+
+diff --git a/python/pypto/backends/cuda/driver.py b/python/pypto/backends/cuda/driver.py
+index 6e88141a1..4a8efedbe 100644
+--- a/python/pypto/backends/cuda/driver.py
++++ b/python/pypto/backends/cuda/driver.py
+@@ -150,11 +150,12 @@ class CudaDriver:
+         218: "CUDA_ERROR_INVALID_PTX",
+         400: "CUDA_ERROR_INVALID_HANDLE",
+         500: "CUDA_ERROR_NOT_FOUND",
+-        600: "CUDA_ERROR_LAUNCH_FAILED",
+-        700: "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES",
++        600: "CUDA_ERROR_NOT_READY",
++        700: "CUDA_ERROR_ILLEGAL_ADDRESS",
++        701: "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES",
+         718: "CUDA_ERROR_INVALID_IMAGE",
+         719: "CUDA_ERROR_LAUNCH_FAILED",
+-        7000: "CUDA_ERROR_JIT_COMPILER_NOT_FOUND",
++        221: "CUDA_ERROR_JIT_COMPILER_NOT_FOUND",
+     }
+ 
+     def __init__(self, library: Any = None, library_path: Optional[str] = None) -> None:
+diff --git a/python/pypto/compiler/targets/cuda.py b/python/pypto/compiler/targets/cuda.py
+index d0623618e..d5dac88d6 100644
+--- a/python/pypto/compiler/targets/cuda.py
++++ b/python/pypto/compiler/targets/cuda.py
+@@ -40,7 +40,10 @@ CUDA_BACKEND = "cuda.ptx"
+ CUDA_PTX_VERSION = "8.0"
+ DEFAULT_PTX_TARGET = "sm_80"
+ CUDA_LOWERING_VERSION = 1
++MAX_INLINE_CONSTANT_ELEMENTS = 4096
+ _PTX_TARGET_RE = re.compile(r"^sm_[0-9]+$")
++_PTX_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+$")
++_SUPPORTED_PTX_VERSIONS = frozenset((CUDA_PTX_VERSION,))
+ 
+ 
+ class CudaPtxError(ValueError):
+@@ -55,6 +58,26 @@ class CudaPtxArtifactError(CudaPtxError):
+     """Malformed, tampered or incompatible CUDA/PTX artifact."""
+ 
+ 
++def _validate_ptx_version(value: Any) -> str:
++    """Validate the exact PTX version grammar and supported emitter range."""
++
++    if not isinstance(value, str) or not _PTX_VERSION_RE.fullmatch(value):
++        raise CudaPtxError("PTX version must be a plain N.N token")
++    if value not in _SUPPORTED_PTX_VERSIONS:
++        raise CudaPtxError(
++            "unsupported PTX version {!r}; supported versions: {}".format(
++                value, ", ".join(sorted(_SUPPORTED_PTX_VERSIONS))
++            )
++        )
++    return value
++
++
++def _validate_ptx_target(value: Any) -> str:
++    if not isinstance(value, str) or not _PTX_TARGET_RE.fullmatch(value):
++        raise CudaPtxError("PTX target must have the form sm_<number>")
++    return value
++
++
+ def _plain(value: Any) -> Any:
+     if isinstance(value, Mapping):
+         return {key: _plain(item) for key, item in value.items()}
+@@ -261,9 +284,16 @@ class _Kernel:
+         name = self.plan.operation
+         output = self.output
+         if name == "constant":
++            count = _shape_count(self.plan.shape)
++            if count > MAX_INLINE_CONSTANT_ELEMENTS:
++                raise CudaPtxUnsupportedError(
++                    "inline constant has {} elements; CUDA PTX bootstrap limit is {}".format(
++                        count, MAX_INLINE_CONSTANT_ELEMENTS
++                    )
++                )
+             raw = self.operation.attributes.get("values", self.operation.attributes.get("value"))
+             values = list(flatten_values(raw))
+-            if len(values) != _shape_count(self.plan.shape):
++            if len(values) != count:
+                 raise CudaPtxError("constant value count does not match output shape")
+             self.line("    mov.u64 %rd13, %rd0;")
+             # A constant tensor is emitted as one deterministic immediate per
+@@ -407,12 +437,16 @@ def render_ptx(gpu_program: GpuProgram, ptx_target: str = DEFAULT_PTX_TARGET, pt
+ 
+     if not isinstance(gpu_program, GpuProgram):
+         raise TypeError("render_ptx requires GpuProgram")
+-    if not isinstance(ptx_target, str) or not _PTX_TARGET_RE.fullmatch(ptx_target):
+-        raise CudaPtxError("PTX target must have the form sm_<number>")
++    ptx_target = _validate_ptx_target(ptx_target)
++    ptx_version = _validate_ptx_version(ptx_version)
+     try:
+         kernels = []
+         function = next(function for function in gpu_program.program.functions if function.name == gpu_program.entrypoint)
+         for index, (operation, plan) in enumerate(zip(function.body.operations, gpu_program.plans)):
++            if plan.operation == "reduce_max" and plan.reduction is not None and plan.reduction.reduction_size == 0:
++                raise CudaPtxUnsupportedError(
++                    "CUDA reduce_max does not support an empty reduction"
++                )
+             kernels.append(_Kernel(index, operation, plan).render())
+     except StopIteration as exc:
+         raise CudaPtxError("GPU entrypoint is missing") from exc
+@@ -449,6 +483,20 @@ class CudaProgram:
+     def plan_digest(self) -> str:
+         return self.gpu_program.plan_digest
+ 
++    def validate(self) -> "CudaProgram":
++        """Re-derive target PTX and bindings before compilation/cache use."""
++
++        _validate_ptx_target(self.ptx_target)
++        _validate_ptx_version(self.ptx_version)
++        self.gpu_program.validate()
++        expected_ptx = render_ptx(self.gpu_program, self.ptx_target, self.ptx_version)
++        if self.ptx != expected_ptx:
++            raise CudaPtxError("CUDA PTX does not match the canonical GPU plan")
++        expected_bindings = _all_bindings(self.gpu_program)
++        if self.bindings != expected_bindings:
++            raise CudaPtxError("CUDA kernel bindings do not match Core IR")
++        return self
++
+     def to_dict(self) -> Mapping[str, Any]:
+         return {
+             "cuda_lowering_version": CUDA_LOWERING_VERSION,
+@@ -475,12 +523,12 @@ class CudaPtxCompiler:
+         ptx_version: str = CUDA_PTX_VERSION,
+         probe_jit: bool = False,
+     ) -> None:
+-        if not isinstance(ptx_target, str) or not _PTX_TARGET_RE.fullmatch(ptx_target):
+-            raise ValueError("ptx_target must have the form sm_<number>")
++        _validate_ptx_target(ptx_target)
++        _validate_ptx_version(ptx_version)
+         self.driver = driver
+         self.device_index = int(device_index)
+         self.ptx_target = ptx_target
+-        self.ptx_version = str(ptx_version)
++        self.ptx_version = ptx_version
+         self.probe_jit = bool(probe_jit)
+ 
+     def lower(self, program: CoreProgram, target: TargetSpec) -> CudaProgram:
+@@ -517,7 +565,7 @@ class CudaPtxCompiler:
+             raise TypeError("CUDA compile() requires CudaProgram from lower()")
+         if options is not None and not isinstance(options, CompileOptions):
+             raise TypeError("options must be CompileOptions")
+-        target_ir.gpu_program.validate()
++        target_ir.validate()
+         program_json = target_ir.program.canonical_json()
+         program_data = json.loads(program_json)
+         program_digest = hashlib.sha256(program_json.encode("utf-8")).hexdigest()
+@@ -677,6 +725,15 @@ def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
+         raise CudaPtxArtifactError("unsupported CUDA lowering version")
+     if decoded["gpu_common_backend"] != GPU_COMMON_BACKEND or metadata["gpu_common_backend"] != GPU_COMMON_BACKEND:
+         raise CudaPtxArtifactError("GPU common backend mismatch")
++    for field, expected in (
++        ("gpu_ir_version", GPU_IR_VERSION),
++        ("lowering_version", GPU_LOWERING_VERSION),
++        ("plan_version", GPU_PLAN_VERSION),
++    ):
++        if decoded[field] != expected or metadata[field] != expected or decoded[field] != metadata[field]:
++            raise CudaPtxArtifactError(
++                "CUDA GPU common {} mismatch: expected {!r}".format(field, expected)
++            )
+     if decoded["target"] != artifact.target.to_dict() or metadata["target_digest"] != sha256_text(decoded["target"]):
+         raise CudaPtxArtifactError("CUDA artifact target mismatch")
+     if decoded["entrypoint"] != artifact.entrypoint or metadata["entrypoint"] != artifact.entrypoint:
+@@ -702,7 +759,10 @@ def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
+     ptx_digest = hashlib.sha256(ptx.encode("utf-8")).hexdigest()
+     if decoded["ptx_digest"] != ptx_digest or metadata["ptx_digest"] != ptx_digest:
+         raise CudaPtxArtifactError("CUDA PTX digest mismatch")
+-    expected_ptx = render_ptx(gpu_program, decoded["ptx_target"], decoded["ptx_version"])
++    try:
++        expected_ptx = render_ptx(gpu_program, decoded["ptx_target"], decoded["ptx_version"])
++    except CudaPtxError as exc:
++        raise CudaPtxArtifactError("CUDA PTX header is invalid: {}".format(exc)) from exc
+     if ptx != expected_ptx:
+         raise CudaPtxArtifactError("CUDA PTX does not match the canonical GPU plan")
+     expected_bindings = _all_bindings(gpu_program)
+@@ -723,16 +783,21 @@ def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
+             raise CudaPtxArtifactError("CUDA artifact format/ABI options mismatch")
+     elif artifact.format != DEFAULT_ARTIFACT_FORMAT or artifact.abi_version != ABI_VERSION:
+         raise CudaPtxArtifactError("CUDA artifact format/ABI mismatch")
+-    return CudaProgram(
++    decoded_program = CudaProgram(
+         gpu_program, ptx, decoded["ptx_target"], decoded["ptx_version"],
+         frozen_mapping(decoded["device"]), frozen_mapping(decoded["jit"]),
+         tuple(tuple(frozen_mapping(item) for item in group) for group in decoded["bindings"]),
+     )
++    try:
++        decoded_program.validate()
++    except CudaPtxError as exc:
++        raise CudaPtxArtifactError("CUDA target IR validation failed: {}".format(exc)) from exc
++    return decoded_program
+ 
+ 
+ __all__ = [
+     "ARTIFACT_PAYLOAD_VERSION", "CUDA_ARTIFACT_FORMAT", "CUDA_BACKEND", "CUDA_LOWERING_VERSION",
+     "CUDACompiler", "CudaCompiler", "CudaPtxArtifactError", "CudaPtxCompiler", "CudaPtxError",
+     "CudaPtxUnsupportedError", "CudaProgram", "DEFAULT_ARTIFACT_FORMAT", "DEFAULT_PTX_TARGET",
+-    "compile_cuda_ptx", "render_ptx",
++    "MAX_INLINE_CONSTANT_ELEMENTS", "compile_cuda_ptx", "render_ptx",
+ ]
+diff --git a/python/tests/ut/pypto_x/test_cuda_driver_ptx.py b/python/tests/ut/pypto_x/test_cuda_driver_ptx.py
+index 7e2cec994..836ccc61c 100644
+--- a/python/tests/ut/pypto_x/test_cuda_driver_ptx.py
++++ b/python/tests/ut/pypto_x/test_cuda_driver_ptx.py
+@@ -12,9 +12,18 @@ from pypto.backends.cpu import HostTensor
+ from pypto.backends.cuda import CudaDeviceInfo
+ from pypto.backends.cuda.runtime import CudaArtifactError, CudaRuntime
+ from pypto.compiler import Artifact
+-from pypto.compiler.targets.cuda import CudaPtxCompiler, CudaPtxArtifactError, render_ptx
++from pypto.compiler.targets.cuda import (
++    MAX_INLINE_CONSTANT_ELEMENTS,
++    CudaPtxArtifactError,
++    CudaPtxCompiler,
++    CudaPtxError,
++    CudaPtxUnsupportedError,
++    CudaProgram,
++    render_ptx,
++)
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
+ from pypto.target import TargetSpec
++from pypto.backends.cuda.driver import CudaDriver
+ 
+ 
+ TARGET = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,)})
+@@ -103,6 +112,59 @@ def _compile(program, driver=None, probe_jit=False):
+     return compiler, target_ir, compiler.compile(target_ir)
+ 
+ 
++def _rebuild_artifact(artifact, payload_updates=None, metadata_updates=None):
++    payload = json.loads(artifact.payload.decode("utf-8"))
++    payload.update(payload_updates or {})
++    rebuilt_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    metadata = dict(artifact.metadata)
++    metadata.update(metadata_updates or {})
++    metadata["payload_digest"] = hashlib.sha256(rebuilt_payload).hexdigest()
++    return Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        payload=rebuilt_payload,
++        metadata=metadata,
++    )
++
++
++def _reduction_program(operation_name, input_shape, output_shape, axis):
++    input_type = CoreType.tensor("float32", input_shape)
++    output_type = CoreType.tensor("float32", output_shape)
++    x = ValueRef("x", input_type)
++    z = ValueRef("z", output_type)
++    return CoreProgram(
++        functions=(
++            CoreFunction(
++                operation_name,
++                (x,),
++                (z,),
++                Region((Operation(operation_name, (x,), (z,), attributes={"axis": axis}),)),
++            ),
++        )
++    )
++
++
++def _matmul_program(m, k, n, dtype="float32"):
++    left_type = CoreType.tensor(dtype, (m, k))
++    right_type = CoreType.tensor(dtype, (k, n))
++    output_type = CoreType.tensor(dtype, (m, n))
++    left = ValueRef("left", left_type)
++    right = ValueRef("right", right_type)
++    output = ValueRef("out", output_type)
++    return CoreProgram(
++        functions=(
++            CoreFunction(
++                "matmul",
++                (left, right),
++                (output,),
++                Region((Operation("matmul", (left, right), (output,)),)),
++            ),
++        )
++    )
++
++
+ def test_cuda_ptx_is_deterministic_and_bf16_conversion_is_explicit():
+     _, first_ir, first = _compile(_program())
+     _, second_ir, second = _compile(_program())
+@@ -157,6 +219,19 @@ def test_cuda_artifact_fails_closed_on_ptx_and_binding_tamper():
+         CudaRuntime().load(tampered)
+ 
+ 
++@pytest.mark.parametrize("field,value", (("gpu_ir_version", "gpu.ir.tampered"), ("lowering_version", 99), ("plan_version", 99)))
++def test_gpu_common_version_tamper_is_fail_closed_and_changes_cache_key(field, value):
++    _, _, artifact = _compile(_program())
++    tampered = _rebuild_artifact(
++        artifact,
++        payload_updates={field: value},
++        metadata_updates={field: value},
++    )
++    assert tampered.cache_key != artifact.cache_key
++    with pytest.raises((CudaPtxArtifactError, CudaArtifactError), match=field):
++        CudaRuntime().load(tampered)
++
++
+ def test_fake_driver_launch_validates_geometry_and_uses_driver_abi():
+     driver = _FakeDriver()
+     _, target_ir, artifact = _compile(_program(), driver=driver)
+@@ -184,3 +259,76 @@ def test_render_ptx_rejects_non_target_syntax_without_hardcoding_device_cc():
+     _, target_ir, _ = _compile(_program())
+     with pytest.raises(ValueError, match="sm_"):
+         render_ptx(target_ir.gpu_program, "compute_120")
++
++
++@pytest.mark.parametrize("version", ("8.0\n.target sm_120", "8.0 extra", "7.0"))
++def test_ptx_version_is_strictly_grammared_and_bounded(version):
++    _, target_ir, _ = _compile(_program())
++    with pytest.raises(CudaPtxError, match="PTX version|unsupported"):
++        render_ptx(target_ir.gpu_program, ptx_version=version)
++    with pytest.raises(CudaPtxError, match="PTX version|unsupported"):
++        CudaPtxCompiler(ptx_version=version)
++
++
++def test_compile_rejects_dirty_manually_constructed_target_ir():
++    compiler, target_ir, _ = _compile(_program())
++    dirty = CudaProgram(
++        target_ir.gpu_program,
++        target_ir.ptx + "\n// dirty",
++        target_ir.ptx_target,
++        target_ir.ptx_version,
++        target_ir.device,
++        target_ir.jit,
++        target_ir.bindings,
++    )
++    with pytest.raises(CudaPtxError, match="PTX"):
++        compiler.compile(dirty)
++    dirty_bindings = CudaProgram(
++        target_ir.gpu_program,
++        target_ir.ptx,
++        target_ir.ptx_target,
++        target_ir.ptx_version,
++        target_ir.device,
++        target_ir.jit,
++        ((({"name": "wrong", "kind": "tensor", "dtype": "float32", "role": "input"}),),),
++    )
++    with pytest.raises(CudaPtxError, match="bindings"):
++        compiler.compile(dirty_bindings)
++
++
++def test_driver_error_code_fallback_names_are_correct():
++    assert CudaDriver._ERROR_NAMES[600] == "CUDA_ERROR_NOT_READY"
++    assert CudaDriver._ERROR_NAMES[700] == "CUDA_ERROR_ILLEGAL_ADDRESS"
++    assert CudaDriver._ERROR_NAMES[701] == "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES"
++    assert CudaDriver._ERROR_NAMES[719] == "CUDA_ERROR_LAUNCH_FAILED"
++    assert CudaDriver._ERROR_NAMES[221] == "CUDA_ERROR_JIT_COMPILER_NOT_FOUND"
++    assert 7000 not in CudaDriver._ERROR_NAMES
++
++
++def test_empty_reduction_semantics_and_k_zero_matmul_gate():
++    empty_sum = _reduction_program("reduce_sum", (0, 3), (3,), 0)
++    _, sum_ir, _ = _compile(empty_sum)
++    assert sum_ir.gpu_program.plans[0].reduction.reduction_size == 0
++    empty_max = _reduction_program("reduce_max", (0, 3), (3,), 0)
++    with pytest.raises(CudaPtxUnsupportedError, match="empty reduction"):
++        CudaPtxCompiler().lower(empty_max, TARGET)
++    _, k_zero_ir, _ = _compile(_matmul_program(2, 0, 3))
++    assert k_zero_ir.gpu_program.plans[0].matmul.k == 0
++    assert "MM_LOOP" in k_zero_ir.ptx
++
++
++def test_large_constant_is_explicitly_bounded():
++    value_type = CoreType.tensor("float32", (MAX_INLINE_CONSTANT_ELEMENTS + 1,))
++    output = ValueRef("out", value_type)
++    program = CoreProgram(
++        functions=(
++            CoreFunction(
++                "constant",
++                (),
++                (output,),
++                Region((Operation("constant", (), (output,), attributes={"values": [0.0] * (MAX_INLINE_CONSTANT_ELEMENTS + 1)}),)),
++            ),
++        )
++    )
++    with pytest.raises(CudaPtxUnsupportedError, match="inline constant|limit"):
++        CudaPtxCompiler().lower(program, TARGET)
+diff --git a/scripts/smoke/cuda_driver_matrix_smoke.py b/scripts/smoke/cuda_driver_matrix_smoke.py
+index 4f63bad8f..fd480b57d 100644
+--- a/scripts/smoke/cuda_driver_matrix_smoke.py
++++ b/scripts/smoke/cuda_driver_matrix_smoke.py
+@@ -39,6 +39,16 @@ def main():
+     bout = HostTensor.zeros("bf16", (5,))
+     runtime.launch(request(ba, bir.gpu_program.plans[0], [HostTensor("bf16", (5,), [1.0] * 5), HostTensor("bf16", (5,), [0.5] * 5)], bout))
+     assert bout.flat() == (1.5,) * 5, bout.flat()
++    rne_out = HostTensor.zeros("bf16", (5,))
++    runtime.launch(
++        request(
++            ba,
++            bir.gpu_program.plans[0],
++            [HostTensor("bf16", (5,), [1.0, 1.0078125, 1.0, 1.0078125, 1.0]), HostTensor("bf16", (5,), [0.00390625] * 5)],
++            rne_out,
++        )
++    )
++    assert rne_out.flat() == (1.0, 1.015625, 1.0, 1.015625, 1.0), rne_out.flat()
+ 
+     et = CoreType.tensor("float32", (10,))
+     cz = ValueRef("z", et)
+@@ -72,6 +82,13 @@ def main():
+     rmout = HostTensor.zeros("float32", (2, 5))
+     runtime.launch(request(rma, rmir.gpu_program.plans[0], [HostTensor("float32", (2, 3, 5), list(range(30)))], rmout))
+     assert rmout.tolist() == [[10.0, 11.0, 12.0, 13.0, 14.0], [25.0, 26.0, 27.0, 28.0, 29.0]], rmout.tolist()
++    negative = [
++        -10, -1, -3, -2, -5, -4, -5, -6, -7, -8, -9, -2, -4, -8, -6,
++        -20, -11, -13, -12, -15, -14, -15, -16, -17, -18, -19, -22, -14, -18, -16,
++    ]
++    negative_out = HostTensor.zeros("float32", (2, 5))
++    runtime.launch(request(rma, rmir.gpu_program.plans[0], [HostTensor("float32", (2, 3, 5), negative)], negative_out))
++    assert negative_out.tolist() == [[-4.0, -1.0, -3.0, -2.0, -5.0], [-14.0, -11.0, -13.0, -12.0, -15.0]], negative_out.tolist()
+ 
+     # Rectangular rank-2 matmul.
+     lt, rt, mt = CoreType.tensor("float32", (2, 3)), CoreType.tensor("float32", (3, 4)), CoreType.tensor("float32", (2, 4))
+@@ -83,6 +100,15 @@ def main():
+     runtime.launch(request(ma, mir.gpu_program.plans[0], [HostTensor("float32", (2, 3), [[1, 2, 3], [4, 5, 6]]), HostTensor("float32", (3, 4), [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]])], mout))
+     assert mout.tolist() == [[38.0, 44.0, 50.0, 56.0], [83.0, 98.0, 113.0, 128.0]], mout.tolist()
+ 
++    k0t_left, k0t_right, k0t_out = CoreType.tensor("float32", (2, 0)), CoreType.tensor("float32", (0, 3)), CoreType.tensor("float32", (2, 3))
++    k0left, k0right, k0out = ValueRef("left", k0t_left), ValueRef("right", k0t_right), ValueRef("out", k0t_out)
++    k0p = program("k0_matmul", (k0left, k0right), (k0out,), Operation("matmul", (k0left, k0right), (k0out,)))
++    k0ir = compiler.lower(k0p, TARGET)
++    k0a = compiler.compile(k0ir)
++    k0result = HostTensor.zeros("float32", (2, 3))
++    runtime.launch(request(k0a, k0ir.gpu_program.plans[0], [HostTensor("float32", (2, 0)), HostTensor("float32", (0, 3))], k0result))
++    assert k0result.tolist() == [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]], k0result.tolist()
++
+     blt, brt, bmt = CoreType.tensor("bf16", (2, 3)), CoreType.tensor("bf16", (3, 4)), CoreType.tensor("bf16", (2, 4))
+     bl, br, bm = ValueRef("left", blt), ValueRef("right", brt), ValueRef("out", bmt)
+     bmp = program("bf16_matmul", (bl, br), (bm,), Operation("matmul", (bl, br), (bm,)))
+@@ -116,7 +142,7 @@ def main():
+     runtime.launch(request(za, zir.gpu_program.plans[0], [HostTensor("float32", (0,)), HostTensor("float32", (0,))], canary))
+     assert canary.writes == 0
+     print("cuda_driver_matrix_smoke=PASS")
+-    print("bf16={} reduce_sum={} reduce_max={} matmul={} bf16_matmul={} zero={} canary_writes={}".format(bout.flat(), rout.tolist(), rmout.tolist(), mout.tolist(), bmout.tolist(), zout.flat(), canary.writes))
++    print("bf16={} bf16_rne={} reduce_sum={} reduce_max={} negative_max={} matmul={} k0_matmul={} bf16_matmul={} zero={} canary_writes={}".format(bout.flat(), rne_out.flat(), rout.tolist(), rmout.tolist(), negative_out.tolist(), mout.tolist(), k0result.tolist(), bmout.tolist(), zout.flat(), canary.writes))
+     print("jit_info_log={}".format(runtime.last_jit_info_log))
+     print("jit_error_log={}".format(runtime.last_jit_error_log))
+     runtime.close()

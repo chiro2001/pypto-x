@@ -1,0 +1,803 @@
+From d39e0a5be52c9a2d17ace0cd211cb93c66731140 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Wed, 9 Sep 2026 04:14:34 +0800
+Subject: [PATCH 64/96] feat(pypto-x): close qwen gated delta recurrent state
+
+---
+ python/pypto/portable/__init__.py                       |   6 +
+ python/pypto/portable/qwen35.py                         | 360 ++++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_qwen35_sve256_gdr_state.py | 378 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 744 insertions(+)
+
+diff --git a/python/pypto/portable/__init__.py b/python/pypto/portable/__init__.py
+index 59e282a4f..4ef529674 100644
+--- a/python/pypto/portable/__init__.py
++++ b/python/pypto/portable/__init__.py
+@@ -13,8 +13,11 @@ from .qwen35 import (
+     build_causal_conv1d,
+     build_causal_conv1d_state,
+     build_decoder_subgraph,
++    build_gated_delta_recurrent_state,
+     build_gqa_repeat_kv,
+     build_l2_norm,
++    build_qwen35_gdr_recurrent_state,
++    build_qwen35_gated_delta_recurrent_state,
+     build_qwen35_gated_delta_conv_state,
+     build_qwen35_attention_kv_cache,
+     build_rms_norm,
+@@ -32,8 +35,11 @@ __all__ = [
+     "build_causal_conv1d",
+     "build_causal_conv1d_state",
+     "build_decoder_subgraph",
++    "build_gated_delta_recurrent_state",
+     "build_gqa_repeat_kv",
+     "build_l2_norm",
++    "build_qwen35_gdr_recurrent_state",
++    "build_qwen35_gated_delta_recurrent_state",
+     "build_qwen35_gated_delta_conv_state",
+     "build_qwen35_attention_kv_cache",
+     "build_rms_norm",
+diff --git a/python/pypto/portable/qwen35.py b/python/pypto/portable/qwen35.py
+index 3d32aa19b..554c89298 100644
+--- a/python/pypto/portable/qwen35.py
++++ b/python/pypto/portable/qwen35.py
+@@ -1343,6 +1343,363 @@ def build_qwen35_attention_kv_cache(
+     )
+ 
+ 
++# ---------------------------------------------------------------------------
++# Gated DeltaNet recurrent matrix state
++# ---------------------------------------------------------------------------
++
++
++def _gdr_time_slice(
++    builder: _Builder,
++    value: ValueRef,
++    time_index: int,
++    output_shape: Tuple[int, ...],
++    prefix: str,
++) -> ValueRef:
++    """Select one static time row from a Qwen GDR input.
++
++    The recurrent reference intentionally uses static SSA unrolling.  A
++    ``slice`` therefore preserves the input buffer as read-only and makes the
++    decode and chunk paths use exactly the same graph construction.
++    """
++
++    return builder.op(
++        "slice",
++        (value,),
++        ((prefix, _tensor(value.type.dtype, output_shape)),),
++        {
++            "starts": [time_index],
++            "stops": [time_index + 1],
++            "axes": [1],
++            "steps": [1],
++        },
++    )[0]
++
++
++def _gdr_step(
++    builder: _Builder,
++    query: ValueRef,
++    key: ValueRef,
++    value: ValueRef,
++    gate: ValueRef,
++    beta: ValueRef,
++    state: ValueRef,
++    scale: ValueRef,
++    batch: int,
++    heads: int,
++    key_dim: int,
++    value_dim: int,
++    time_index: int,
++    prefix: str,
++) -> Tuple[ValueRef, ValueRef]:
++    """Append one sequential GDR recurrence step to ``builder``.
++
++    State uses the upstream Qwen layout ``[B, H, K, V]``.  The rank-4
++    matmuls below are deliberately ordinary Core ``matmul`` operations:
++
++    * ``k[1,K] @ state[K,V]`` predicts the value;
++    * ``(beta*k)[K,1] @ delta[1,V]`` is the rank-one update;
++    * ``q[1,K] @ new_state[K,V]`` emits the updated-state output.
++
++    All operands entering these operations are FP32, while the public q/k/v
++    contract remains BF16.  ``state`` is never mutated; each operation
++    creates the next SSA value.
++    """
++
++    row_q_shape = (batch, heads, 1, key_dim)
++    row_v_shape = (batch, heads, 1, value_dim)
++    gate_shape = (batch, heads, 1)
++    gate_4d_shape = (batch, heads, 1, 1)
++    state_shape = (batch, heads, key_dim, value_dim)
++    beta_k_shape = row_q_shape
++    beta_k_transposed_shape = (batch, heads, key_dim, 1)
++
++    # Inputs are [B,T,H,D] / [B,T,H].  Slice one time row and transpose to
++    # [B,H,1,D], so each rank-4 matmul has an exact equal batch prefix.
++    q_t = _gdr_time_slice(
++        builder, query, time_index, (batch, 1, heads, key_dim), prefix + "_q_slice"
++    )
++    k_t = _gdr_time_slice(
++        builder, key, time_index, (batch, 1, heads, key_dim), prefix + "_k_slice"
++    )
++    v_t = _gdr_time_slice(
++        builder, value, time_index, (batch, 1, heads, value_dim), prefix + "_v_slice"
++    )
++    g_t = _gdr_time_slice(
++        builder, gate, time_index, (batch, 1, heads), prefix + "_g_slice"
++    )
++    beta_t = _gdr_time_slice(
++        builder, beta, time_index, (batch, 1, heads), prefix + "_beta_slice"
++    )
++    q_t = builder.op(
++        "transpose",
++        (q_t,),
++        ((prefix + "_q", _tensor("bf16", row_q_shape)),),
++        {"permutation": [0, 2, 1, 3]},
++    )[0]
++    k_t = builder.op(
++        "transpose",
++        (k_t,),
++        ((prefix + "_k", _tensor("bf16", row_q_shape)),),
++        {"permutation": [0, 2, 1, 3]},
++    )[0]
++    v_t = builder.op(
++        "transpose",
++        (v_t,),
++        ((prefix + "_v", _tensor("bf16", row_v_shape)),),
++        {"permutation": [0, 2, 1, 3]},
++    )[0]
++    g_t = builder.op(
++        "transpose",
++        (g_t,),
++        ((prefix + "_g", _tensor("float32", gate_shape)),),
++        {"permutation": [0, 2, 1]},
++    )[0]
++    beta_t = builder.op(
++        "transpose",
++        (beta_t,),
++        ((prefix + "_beta", _tensor("float32", gate_shape)),),
++        {"permutation": [0, 2, 1]},
++    )[0]
++
++    q_f32 = _as_f32(builder, q_t, "bf16", prefix + "_q")
++    k_f32 = _as_f32(builder, k_t, "bf16", prefix + "_k")
++    v_f32 = _as_f32(builder, v_t, "bf16", prefix + "_v")
++    decay = builder.op(
++        "exp",
++        (g_t,),
++        ((prefix + "_decay", _tensor("float32", gate_shape)),),
++    )[0]
++    decay_4d = builder.op(
++        "reshape",
++        (decay,),
++        ((prefix + "_decay_4d", _tensor("float32", gate_4d_shape)),),
++        {"shape": list(gate_4d_shape)},
++    )[0]
++    decay_full = builder.op(
++        "broadcast",
++        (decay_4d,),
++        ((prefix + "_decay_full", _tensor("float32", state_shape)),),
++        {"shape": list(state_shape)},
++    )[0]
++    decayed_state = builder.op(
++        "mul",
++        (state, decay_full),
++        ((prefix + "_decayed_state", _tensor("float32", state_shape)),),
++    )[0]
++
++    predicted = builder.op(
++        "matmul",
++        (k_f32, decayed_state),
++        ((prefix + "_predicted", _tensor("float32", row_v_shape)),),
++    )[0]
++    delta = builder.op(
++        "sub",
++        (v_f32, predicted),
++        ((prefix + "_delta", _tensor("float32", row_v_shape)),),
++    )[0]
++    beta_4d = builder.op(
++        "reshape",
++        (beta_t,),
++        ((prefix + "_beta_4d", _tensor("float32", gate_4d_shape)),),
++        {"shape": list(gate_4d_shape)},
++    )[0]
++    beta_full = builder.op(
++        "broadcast",
++        (beta_4d,),
++        ((prefix + "_beta_full", _tensor("float32", beta_k_shape)),),
++        {"shape": list(beta_k_shape)},
++    )[0]
++    beta_key = builder.op(
++        "mul",
++        (k_f32, beta_full),
++        ((prefix + "_beta_key", _tensor("float32", beta_k_shape)),),
++    )[0]
++    beta_key_transposed = builder.op(
++        "transpose",
++        (beta_key,),
++        ((prefix + "_beta_key_t", _tensor("float32", beta_k_transposed_shape)),),
++        {"permutation": [0, 1, 3, 2]},
++    )[0]
++    update = builder.op(
++        "matmul",
++        (beta_key_transposed, delta),
++        ((prefix + "_update", _tensor("float32", state_shape)),),
++    )[0]
++    new_state = builder.op(
++        "add",
++        (decayed_state, update),
++        ((prefix + "_new_state", _tensor("float32", state_shape)),),
++    )[0]
++    output_f32 = builder.op(
++        "matmul",
++        (q_f32, new_state),
++        ((prefix + "_output_f32", _tensor("float32", row_v_shape)),),
++    )[0]
++    scaled = builder.op(
++        "mul",
++        (output_f32, scale),
++        ((prefix + "_scaled", _tensor("float32", row_v_shape)),),
++    )[0]
++    output_bf16 = builder.op(
++        "cast",
++        (scaled,),
++        ((prefix + "_output", _tensor("bf16", row_v_shape)),),
++        {"dtype": "bf16"},
++    )[0]
++    output_time = builder.op(
++        "transpose",
++        (output_bf16,),
++        ((prefix + "_output_time", _tensor("bf16", (batch, 1, heads, value_dim))),),
++        {"permutation": [0, 2, 1, 3]},
++    )[0]
++    return output_time, new_state
++
++
++def _build_gdr_recurrent_state(
++    batch: int,
++    steps: int,
++    heads: int,
++    key_dim: int,
++    value_dim: int,
++    *,
++    function_name: str,
++    composite: str,
++) -> CoreProgram:
++    """Internal static-unroll builder used by the fixed Qwen public wrapper."""
++
++    input_shape = (batch, steps, heads, key_dim)
++    gate_shape = (batch, steps, heads)
++    state_shape = (batch, heads, key_dim, value_dim)
++    builder = _Builder(function_name, composite, input_shape)
++    query = builder.parameter("query", _tensor("bf16", input_shape))
++    key = builder.parameter("key", _tensor("bf16", input_shape))
++    value = builder.parameter("value", _tensor("bf16", (batch, steps, heads, value_dim)))
++    gate = builder.parameter("gate", _tensor("float32", gate_shape))
++    beta = builder.parameter("beta", _tensor("float32", gate_shape))
++    prior_state = builder.parameter("prior_state", _tensor("float32", state_shape))
++    scale = builder.parameter("scale", _scalar("float32"))
++
++    state = prior_state
++    outputs = []
++    for time_index in range(steps):
++        output, state = _gdr_step(
++            builder,
++            query,
++            key,
++            value,
++            gate,
++            beta,
++            state,
++            scale,
++            batch,
++            heads,
++            key_dim,
++            value_dim,
++            time_index,
++            "step_{}".format(time_index),
++        )
++        outputs.append(output)
++
++    if len(outputs) == 1:
++        output = outputs[0]
++    else:
++        output = builder.op(
++            "concat",
++            tuple(outputs),
++            (("output_concat", _tensor("bf16", (batch, steps, heads, value_dim))),),
++            {"axis": 1},
++        )[0]
++    output = builder.op(
++        "identity",
++        (output,),
++        (("output", _tensor("bf16", (batch, steps, heads, value_dim))),),
++    )[0]
++    new_state = builder.op(
++        "identity",
++        (state,),
++        (("new_state", _tensor("float32", state_shape)),),
++    )[0]
++    return builder.finish(
++        (output, new_state),
++        {
++            "formula": "S_t=exp(g_t)*S_(t-1)+(beta_t*k_t) outer (v_t-k_t^T*(exp(g_t)*S_(t-1))); o_t=scale*q_t^T*S_t",
++            "state_layout": "[B,H,K,V] with K before V",
++            "state_layout_axes": ["batch", "value_head", "key_dim", "value_dim"],
++            "state_input_dtype": "float32",
++            "state_output_dtype": "float32",
++            "qkv_input_dtype": "bf16",
++            "gate_dtype": "float32",
++            "beta_dtype": "float32",
++            "gate_semantics": "log_space_increment; exp applied once per token",
++            "beta_semantics": "post_sigmoid_delta_scale",
++            "qk_contract": "q_and_k_are_l2_normalized_by_upstream",
++            "scale_semantics": "runtime_float32_scalar_applied_after_updated_state_matmul",
++            "state_semantics": "functional_pure_ssa_output",
++            "prefill_decode_shared_graph": True,
++            "unroll": "static_sequential_reference",
++            "chunk_mode": "sequential_correctness_reference; no_fused_chunk_or_wy_inverse",
++            "matmul_contract": "rank4_equal_prefix_batched_matmul",
++            "sve_batched_matmul": "host_batch_loop_rank2_runner",
++            "avx2_avx512_batched_matmul": "explicit_rejection",
++            "accumulation_dtype": "float32",
++            "fixed_qwen_shape": {
++                "heads": 16,
++                "key_dim": 128,
++                "value_dim": 128,
++            },
++            "fallbacks": [
++                "primitive_composition_not_fused",
++                "static_time_unroll",
++                "sve_batched_matmul_host_batch_loop_rank2_runner",
++                "avx2_avx512_batched_matmul_explicit_rejection",
++                "scalar_math_lane_fallback:exp",
++                "host_broadcast_pre_expansion",
++                "python_list_wire_staging",
++            ],
++        },
++    )
++
++
++def build_qwen35_gdr_recurrent_state(
++    batch: int,
++    steps: int,
++    dtype: str = "bf16",
++    output_dtype: Optional[str] = None,
++) -> CoreProgram:
++    """Build Qwen3.5-0.8B's fixed BF16 GDR recurrent matrix transition.
++
++    Public shapes are intentionally fixed to the Qwen linear-attention
++    contract: q/k/v ``[B,T,16,128]``, gate/beta ``[B,T,16]``, and state
++    ``[B,16,128,128]``.  ``scale`` is an explicit FP32 scalar LaunchRequest
++    input (the model normally supplies ``128**-0.5``).  Both ``T=1`` decode
++    and ``T>1`` prefill/chunk use the same static sequential SSA graph.
++    """
++
++    if isinstance(batch, bool) or not isinstance(batch, int) or batch <= 0:
++        raise ValueError("batch must be a positive integer")
++    if isinstance(steps, bool) or not isinstance(steps, int) or steps <= 0:
++        raise ValueError("steps must be a positive integer")
++    dtype = _dtype(dtype, "dtype")
++    output_dtype = _output_dtype(dtype, output_dtype)
++    if dtype != "bf16" or output_dtype != "bf16":
++        raise ValueError("Qwen3.5 GDR recurrent state requires BF16 q/k/v and BF16 output")
++    return _build_gdr_recurrent_state(
++        batch,
++        steps,
++        QWEN35_08B_SHAPE_METADATA["linear_num_value_heads"],
++        QWEN35_08B_SHAPE_METADATA["linear_key_head_dim"],
++        QWEN35_08B_SHAPE_METADATA["linear_value_head_dim"],
++        function_name="qwen35_gdr_recurrent_state",
++        composite="gdr_recurrent_state",
++    )
++
++
++# Descriptive short spelling for callers that use the operator name rather
++# than the model-prefixed name.  The public Qwen wrapper remains fixed-shape.
++build_gated_delta_recurrent_state = build_qwen35_gdr_recurrent_state
++build_qwen35_gated_delta_recurrent_state = build_qwen35_gdr_recurrent_state
++
++
+ # Short spelling kept for callers that do not need the model prefix.
+ build_attention_kv_cache = build_qwen35_attention_kv_cache
+ 
+@@ -1473,8 +1830,11 @@ __all__ = [
+     "build_causal_conv1d_state",
+     "build_decoder_subgraph",
+     "build_gqa_repeat_kv",
++    "build_gated_delta_recurrent_state",
+     "build_qwen35_gated_delta_conv_state",
+     "build_qwen35_attention_kv_cache",
++    "build_qwen35_gdr_recurrent_state",
++    "build_qwen35_gated_delta_recurrent_state",
+     "build_l2_norm",
+     "build_rms_norm",
+     "build_rope_rotate_half",
+diff --git a/python/tests/ut/pypto_x/test_qwen35_sve256_gdr_state.py b/python/tests/ut/pypto_x/test_qwen35_sve256_gdr_state.py
+new file mode 100644
+index 000000000..ed3823728
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_qwen35_sve256_gdr_state.py
+@@ -0,0 +1,378 @@
++"""Qwen3.5 M1G functional Gated DeltaNet recurrent-state closure.
++
++The public builder is fixed to the Qwen3.5-0.8B linear-attention contract
++(``H=16, K=V=128``).  The tests use the private small-shape construction
++helper for scalar/vector/SVE differential execution so that correctness tests
++remain bounded; a fixed-shape SVE decode is also executed and a fixed-shape
++chunk is compiled.  All tensors are synthetic and no model weights are read.
++"""
++
++from __future__ import annotations
++
++import math
++from pathlib import Path
++from typing import Iterable, List, Sequence, Tuple
++
++import pytest
++
++from pypto.abi import LaunchRequest
++from pypto.backends.cpu import CpuScalarRuntime, HostTensor
++from pypto.backends.cpu.aarch64.sve256 import Sve256Runtime
++from pypto.backends.cpu.vector import CpuVectorRuntime
++from pypto.compiler import CompileOptions
++from pypto.compiler.targets.cpu import CpuScalarCompiler
++from pypto.compiler.targets.cpu_sve256 import Sve256Compiler
++from pypto.compiler.targets.cpu_vector import CpuVectorCompiler
++from pypto.core_ir import CoreProgram
++from pypto.portable.qwen35 import (
++    QWEN35_08B_SHAPE_METADATA,
++    _build_gdr_recurrent_state,
++    build_qwen35_gdr_recurrent_state,
++)
++from pypto.target import TargetSpec
++
++
++SCALAR_TARGET = TargetSpec("cpu", "x86_64-linux-gnu")
++VECTOR_TARGET = TargetSpec(
++    "cpu",
++    "x86_64-linux-gnu",
++    attributes={"lane_count": 4, "specialization": {"compact_iteration": True}},
++)
++SVE_TARGET = TargetSpec(
++    "cpu",
++    "aarch64-linux-gnu",
++    features=("sve", "sve2"),
++    attributes={"vl_bytes": 32},
++)
++
++
++def _count(shape: Sequence[int]) -> int:
++    result = 1
++    for dimension in shape:
++        result *= dimension
++    return result
++
++
++def _small_program(steps: int = 2) -> CoreProgram:
++    return _build_gdr_recurrent_state(
++        1,
++        steps,
++        2,
++        3,
++        2,
++        function_name="test_qwen35_gdr_recurrent_state",
++        composite="test_gdr_recurrent_state",
++    )
++
++
++def _small_inputs(steps: int = 2):
++    # Values are intentionally asymmetric across heads and time so that a
++    # wrong transpose, state axis, or token ordering cannot pass by symmetry.
++    q = HostTensor(
++        "bf16",
++        (1, steps, 2, 3),
++        [
++            0.10,
++            0.20,
++            0.30,
++            0.40,
++            0.50,
++            0.60,
++            0.70,
++            0.80,
++            0.90,
++            1.00,
++            1.10,
++            1.20,
++        ][: steps * 2 * 3],
++    )
++    k = HostTensor(
++        "bf16",
++        (1, steps, 2, 3),
++        [
++            0.20,
++            0.10,
++            0.40,
++            0.30,
++            0.60,
++            0.50,
++            0.80,
++            0.70,
++            1.00,
++            0.90,
++            1.20,
++            1.10,
++        ][: steps * 2 * 3],
++    )
++    v = HostTensor(
++        "bf16",
++        (1, steps, 2, 2),
++        [
++            1.00,
++            2.00,
++            3.00,
++            4.00,
++            5.00,
++            6.00,
++            7.00,
++            8.00,
++        ][: steps * 2 * 2],
++    )
++    gate = HostTensor(
++        "float32",
++        (1, steps, 2),
++        [-0.10, -0.20, -0.30, -0.40][: steps * 2],
++    )
++    beta = HostTensor(
++        "float32",
++        (1, steps, 2),
++        [0.50, 0.60, 0.70, 0.80][: steps * 2],
++    )
++    prior = HostTensor(
++        "float32",
++        (1, 2, 3, 2),
++        [0.25, -0.50, 1.00, -1.50, 2.00, -2.50, 3.00, -3.50, 4.00, -4.50, 5.00, -5.50],
++    )
++    return [q, k, v, gate, beta, prior]
++
++
++def _golden(inputs, steps: int, scale: float) -> Tuple[List[float], List[float]]:
++    query, key, value, gate, beta, prior = inputs
++    q_values = query.flat()
++    k_values = key.flat()
++    v_values = value.flat()
++    g_values = gate.flat()
++    beta_values = beta.flat()
++    state_values = [float(item) for item in prior.flat()]
++    output: List[float] = []
++    heads, key_dim, value_dim = 2, 3, 2
++    for time_index in range(steps):
++        for head in range(heads):
++            gate_index = time_index * heads + head
++            decay = math.exp(float(g_values[gate_index]))
++            for key_index in range(key_dim):
++                for value_index in range(value_dim):
++                    state_index = (head * key_dim + key_index) * value_dim + value_index
++                    state_values[state_index] *= decay
++
++            predicted = []
++            for value_index in range(value_dim):
++                predicted.append(
++                    sum(
++                        float(k_values[(time_index * heads + head) * key_dim + key_index])
++                        * state_values[(head * key_dim + key_index) * value_dim + value_index]
++                        for key_index in range(key_dim)
++                    )
++                )
++            delta = [
++                float(v_values[(time_index * heads + head) * value_dim + value_index]) - predicted[value_index]
++                for value_index in range(value_dim)
++            ]
++            beta_value = float(beta_values[gate_index])
++            for key_index in range(key_dim):
++                key_value = float(k_values[(time_index * heads + head) * key_dim + key_index])
++                for value_index in range(value_dim):
++                    state_index = (head * key_dim + key_index) * value_dim + value_index
++                    state_values[state_index] += beta_value * key_value * delta[value_index]
++
++            for value_index in range(value_dim):
++                output.append(
++                    scale
++                    * sum(
++                        float(q_values[(time_index * heads + head) * key_dim + key_index])
++                        * state_values[(head * key_dim + key_index) * value_dim + value_index]
++                        for key_index in range(key_dim)
++                    )
++                )
++    return output, state_values
++
++
++def _compile_scalar(program: CoreProgram):
++    compiler = CpuScalarCompiler()
++    return compiler.compile(compiler.lower(program, SCALAR_TARGET))
++
++
++def _compile_vector(program: CoreProgram):
++    compiler = CpuVectorCompiler()
++    return compiler.compile(compiler.lower(program, VECTOR_TARGET))
++
++
++def _compile_sve(program: CoreProgram, tmp_path: Path):
++    compiler = Sve256Compiler()
++    target_ir = compiler.lower(program, SVE_TARGET)
++    return compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format="pypto-x.cpu.sve256",
++            extra={"build_dir": str(tmp_path / "build")},
++        ),
++    )
++
++
++def _launch(artifact, inputs, outputs, runtime, scale: float = 1.0):
++    return runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[item.descriptor(readonly=True) for item in inputs],
++            outputs=[item.descriptor() for item in outputs],
++            scalars={"scale": scale},
++        )
++    )
++
++
++def _assert_close(actual: Iterable[float], expected: Iterable[float], tolerance: float = 0.04):
++    actual = list(actual)
++    expected = list(expected)
++    assert len(actual) == len(expected)
++    for left, right in zip(actual, expected):
++        assert math.isclose(float(left), float(right), rel_tol=tolerance, abs_tol=tolerance), (left, right)
++
++
++def test_gdr_contract_is_fixed_and_functional_ssa():
++    program = build_qwen35_gdr_recurrent_state(1, 1)
++    function = program.functions[0]
++    assert [ref.name for ref in function.returns] == ["output", "new_state"]
++    assert [ref.type.shape for ref in function.returns] == [(1, 1, 16, 128), (1, 16, 128, 128)]
++    assert [ref.type.dtype for ref in function.returns] == ["bf16", "float32"]
++    assert program.metadata["state_layout"] == "[B,H,K,V] with K before V"
++    assert program.metadata["state_semantics"] == "functional_pure_ssa_output"
++    assert program.metadata["prefill_decode_shared_graph"] is True
++    assert program.metadata["chunk_mode"].startswith("sequential_correctness_reference")
++    assert program.metadata["avx2_avx512_batched_matmul"] == "explicit_rejection"
++    assert "gdr_recurrent_state" not in {operation.name for operation in function.body.operations}
++
++    with pytest.raises(ValueError, match="positive integer"):
++        build_qwen35_gdr_recurrent_state(0, 1)
++    with pytest.raises(ValueError, match="positive integer"):
++        build_qwen35_gdr_recurrent_state(1, 0)
++    with pytest.raises(ValueError, match="requires BF16"):
++        build_qwen35_gdr_recurrent_state(1, 1, dtype="float32")
++
++
++def test_gdr_prefill_decode_state_carry_scalar_vector_sve(tmp_path):
++    steps = 2
++    inputs = _small_inputs(steps)
++    expected_output, expected_state = _golden(inputs, steps, scale=0.75)
++    snapshots = [tuple(item.flat()) for item in inputs]
++    program = _small_program(steps)
++
++    scalar_output = HostTensor.zeros("bf16", (1, steps, 2, 2))
++    scalar_state = HostTensor.zeros("float32", (1, 2, 3, 2))
++    _launch(_compile_scalar(program), inputs, [scalar_output, scalar_state], CpuScalarRuntime(), scale=0.75)
++    _assert_close(scalar_output.flat(), HostTensor("bf16", scalar_output.shape, expected_output).flat())
++    _assert_close(scalar_state.flat(), expected_state, tolerance=2.0e-5)
++
++    vector_output = HostTensor.zeros("bf16", scalar_output.shape)
++    vector_state = HostTensor.zeros("float32", scalar_state.shape)
++    _launch(_compile_vector(program), inputs, [vector_output, vector_state], CpuVectorRuntime(), scale=0.75)
++    _assert_close(vector_output.flat(), scalar_output.flat())
++    _assert_close(vector_state.flat(), scalar_state.flat(), tolerance=2.0e-5)
++
++    sve_output = HostTensor.zeros("bf16", scalar_output.shape)
++    sve_state = HostTensor.zeros("float32", scalar_state.shape)
++    sve_artifact = _compile_sve(program, tmp_path / "prefill")
++    assert sve_artifact.metadata["batched_matmul_fallback"] == "host_batch_loop_rank2_runner"
++    _launch(
++        sve_artifact,
++        inputs,
++        [sve_output, sve_state],
++        Sve256Runtime(execution_mode="qemu"),
++        scale=0.75,
++    )
++    _assert_close(sve_output.flat(), scalar_output.flat())
++    _assert_close(sve_state.flat(), scalar_state.flat(), tolerance=2.0e-5)
++    assert [tuple(item.flat()) for item in inputs] == snapshots
++
++    # Two static T=1 graphs must equal one T=2 graph, including the explicit
++    # state carry.  This is the decode/prefill equivalence requirement.
++    decode_program = _small_program(1)
++    decode_artifact = _compile_scalar(decode_program)
++    decode_state = inputs[-1]
++    decode_outputs = []
++    for time_index in range(steps):
++        one_inputs = [
++            HostTensor("bf16", (1, 1, 2, 3), list(inputs[0].flat()[time_index * 6 : (time_index + 1) * 6])),
++            HostTensor("bf16", (1, 1, 2, 3), list(inputs[1].flat()[time_index * 6 : (time_index + 1) * 6])),
++            HostTensor("bf16", (1, 1, 2, 2), list(inputs[2].flat()[time_index * 4 : (time_index + 1) * 4])),
++            HostTensor("float32", (1, 1, 2), list(inputs[3].flat()[time_index * 2 : (time_index + 1) * 2])),
++            HostTensor("float32", (1, 1, 2), list(inputs[4].flat()[time_index * 2 : (time_index + 1) * 2])),
++            decode_state,
++        ]
++        one_output = HostTensor.zeros("bf16", (1, 1, 2, 2))
++        one_state = HostTensor.zeros("float32", (1, 2, 3, 2))
++        _launch(decode_artifact, one_inputs, [one_output, one_state], CpuScalarRuntime(), scale=0.75)
++        decode_outputs.extend(one_output.flat())
++        decode_state = one_state
++    _assert_close(decode_outputs, scalar_output.flat())
++    _assert_close(decode_state.flat(), scalar_state.flat(), tolerance=2.0e-5)
++
++
++def test_gdr_zero_decay_and_zero_beta_are_identity_state_update():
++    program = _small_program(1)
++    inputs = _small_inputs(1)
++    # Keep state nonzero while exp(g)=1 and beta=0: state must be carried
++    # exactly and output must be q @ prior_state times scale.
++    inputs[3] = HostTensor("float32", (1, 1, 2), [0.0, 0.0])
++    inputs[4] = HostTensor("float32", (1, 1, 2), [0.0, 0.0])
++    output = HostTensor.zeros("bf16", (1, 1, 2, 2))
++    state = HostTensor.zeros("float32", (1, 2, 3, 2))
++    _launch(_compile_scalar(program), inputs, [output, state], CpuScalarRuntime(), scale=1.0)
++    assert state.flat() == inputs[-1].flat()
++    expected = []
++    for head in range(2):
++        for value_index in range(2):
++            expected.append(
++                sum(
++                    float(inputs[0].flat()[head * 3 + key_index])
++                    * float(inputs[-1].flat()[(head * 3 + key_index) * 2 + value_index])
++                    for key_index in range(3)
++                )
++            )
++    _assert_close(output.flat(), HostTensor("bf16", output.shape, expected).flat())
++
++
++def test_gdr_fixed_qwen_decode_executes_and_chunk_compiles_sve(tmp_path):
++    decode = build_qwen35_gdr_recurrent_state(1, 1)
++    assert decode.functions[0].parameters[0].type.shape == (1, 1, 16, 128)
++    assert decode.functions[0].parameters[5].type.shape == (1, 16, 128, 128)
++    zero_qkv = [HostTensor.zeros("bf16", (1, 1, 16, 128)) for _ in range(3)]
++    gate = HostTensor.zeros("float32", (1, 1, 16))
++    beta = HostTensor.zeros("float32", (1, 1, 16))
++    prior = HostTensor.zeros("float32", (1, 16, 128, 128))
++    output = HostTensor.zeros("bf16", (1, 1, 16, 128))
++    state = HostTensor.zeros("float32", (1, 16, 128, 128))
++    artifact = _compile_sve(decode, tmp_path / "fixed_decode")
++    _launch(
++        artifact,
++        zero_qkv + [gate, beta, prior],
++        [output, state],
++        Sve256Runtime(execution_mode="qemu"),
++        scale=1.0 / math.sqrt(128.0),
++    )
++    assert all(float(value) == 0.0 for value in output.flat())
++    assert all(float(value) == 0.0 for value in state.flat())
++
++    chunk = build_qwen35_gdr_recurrent_state(1, 2)
++    chunk_ir = Sve256Compiler().lower(chunk, SVE_TARGET)
++    assert all(plan.iteration.compact for plan in chunk_ir.plans)
++    _compile_sve(chunk, tmp_path / "fixed_chunk")
++
++
++def test_gdr_runtime_rejects_state_shape_and_dtype():
++    program = _small_program(1)
++    artifact = _compile_scalar(program)
++    inputs = _small_inputs(1)
++    output = HostTensor.zeros("bf16", (1, 1, 2, 2))
++    bad_shape = HostTensor.zeros("float32", (1, 2, 3, 1))
++    with pytest.raises(Exception, match="descriptor dtype/shape"):
++        _launch(artifact, inputs[:-1] + [bad_shape], [output, HostTensor.zeros("float32", (1, 2, 3, 2))], CpuScalarRuntime())
++    bad_dtype = HostTensor.zeros("bf16", (1, 2, 3, 2))
++    with pytest.raises(Exception, match="descriptor dtype/shape"):
++        _launch(artifact, inputs[:-1] + [bad_dtype], [output, HostTensor.zeros("float32", (1, 2, 3, 2))], CpuScalarRuntime())
++
++
++def test_gdr_contract_points_to_fixed_qwen_dimensions():
++    assert QWEN35_08B_SHAPE_METADATA["linear_num_value_heads"] == 16
++    assert QWEN35_08B_SHAPE_METADATA["linear_key_head_dim"] == 128
++    assert QWEN35_08B_SHAPE_METADATA["linear_value_head_dim"] == 128
++

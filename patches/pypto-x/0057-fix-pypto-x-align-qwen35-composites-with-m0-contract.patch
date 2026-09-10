@@ -1,0 +1,634 @@
+From f7e16fea7ca258f90e4bb95b16f9927c248e64c6 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Wed, 9 Sep 2026 00:30:10 +0800
+Subject: [PATCH 57/96] fix(pypto-x): align qwen35 composites with m0 contract
+
+---
+ docs/pypto_x/qwen35_m1d_composites.md                    |  33 ++++++--
+ python/pypto/portable/qwen35.py                          | 144 ++++++++++++++++++++++++++++-------
+ python/tests/ut/pypto_x/test_qwen35_sve256_composites.py | 124 ++++++++++++++++++++++--------
+ 3 files changed, 238 insertions(+), 63 deletions(-)
+
+diff --git a/docs/pypto_x/qwen35_m1d_composites.md b/docs/pypto_x/qwen35_m1d_composites.md
+index 405636dbf..0c4336144 100644
+--- a/docs/pypto_x/qwen35_m1d_composites.md
++++ b/docs/pypto_x/qwen35_m1d_composites.md
+@@ -4,22 +4,38 @@
+ `python/pypto/portable/qwen35.py`，只生成已有 Core IR primitive；不读取或
+ 下载 Qwen 权重，也不把按元素调度写入 artifact。
+ 
++固定 M0 metadata revision 为
++`2fc06364715b967f1860aea9cf38778875588b17`。Qwen3.5-0.8B text contract
++是 hidden=1024、intermediate=3584、24 层、attention/KV heads=8/2、
++head_dim=256；linear key/value heads=16/16、head_dim=128/128、causal
++conv kernel=4；full-attention interval=4，zero-based layers 为
++`[3, 7, 11, 15, 19, 23]`；max position=262144；partial rotary factor=0.25，
++rotary_dim=64，mrope_section=`(11, 11, 10)`。这些值是只读 shape metadata，
++不是权重或运行时模型加载。
++
+ ## 已闭包的组合
+ 
+ | composite | Core primitive 组合 | contract 要点 |
+ | --- | --- | --- |
+-| RMSNorm | `mul -> reduce_mean -> add -> rsqrt -> broadcast -> mul` | `mean(x*x) + epsilon` 后 `rsqrt`，epsilon 在 `rsqrt` 前相加；BF16 输入的中间累加为 FP32 |
++| RMSNorm | `cast -> mul -> reduce_mean -> add -> rsqrt -> broadcast -> constant/add/broadcast -> mul` | `x_f32 * rsqrt(mean(x_f32*x_f32)+epsilon) * (1+weight.float())`；checkpoint weight 是 delta 参数，zero delta 恢复 identity scale |
+ | L2Norm | `mul -> reduce_sum -> add -> rsqrt -> broadcast -> mul` | `sum(x*x) + epsilon` 后 `rsqrt`，不隐含 `max(sum, epsilon)` 或 clamp |
+ | SwiGLU | `split -> silu -> mul` | packed last axis 拆成 gate/up |
+ | stable Softmax | `reduce_max -> broadcast -> sub -> exp -> reduce_sum -> broadcast -> div` | 沿最后一轴，先减最大值 |
+-| RoPE rotate-half | `slice -> neg -> concat -> mul -> mul -> add` | cos/sin 是输入；仅为纯文本 rotate-half，不是视觉 MRoPE |
+-| GQA repeat-KV | `gather(axis=1)` | head indices 是 runtime `int32/int64` 输入，不在 host 固化最终结果 |
++| RoPE rotate-half | `slice -> neg -> concat -> mul -> mul -> add -> concat` | 前 `rotary_dim` 做 partial rotate-half，尾部原样拼回；cos/sin 是已按 query leading axes 展开的 runtime 输入，仅为纯文本 contract |
++| GQA repeat-KV | `gather(axis=1)` | head indices 是 runtime `int32/int64` 输入；调用方必须提供 canonical repeat-interleave mapping，builder 不生成 iota/index |
+ | causal mask | `where` | bool mask 与 fill value 都是输入，host 不预计算 masked tensor |
+ 
+ 所有 builder 都输出稳定函数名和 SSA 名称，并在 CoreProgram metadata 中记录
+ input/output 的 kind、dtype、shape、静态 shape contract 与数学语义。BF16
+ builder 先转 FP32 完成组合，再按 `output_dtype` 转回 BF16（默认输出 dtype
+-与输入一致）。
++与输入一致）。RMSNorm 的 epsilon 输入在固定 Qwen adapter 中必须使用 M0
++的 `1e-6`；测试也覆盖 delta weight 与 zero-delta regression。
++
++RoPE builder 的 `cos`/`sin` shape 是
++`q.shape[:-1] + (rotary_dim,)`，并要求 leading axes 已经扩展到 q；metadata
++明确记录 `cos_sin_preexpanded=true` 和
++`unsqueeze_broadcast_supported=false`。它没有实现上游
++`[B,S,R] -> [B,H,S,R]` 的 `unsqueeze_dim`/broadcast，也不扩大到视觉 MRoPE。
+ 
+ ## 当前运行路径与诚实边界
+ 
+@@ -50,7 +66,9 @@ synthetic tensors，覆盖 FP32/BF16、奇数尾块、极值稳定性、runtime
+    更新和生命周期/alias contract；不能用普通 host tensor copy 冒充 state。
+ 4. **比较、iota 与 position primitives**：缺 `less/equal/greater`、`iota`、
+    position/sequence-id 生成及由此构造 causal/attention mask 和 gather index
+-   的 portable 语义。当前测试把 mask/indices 作为已生成输入。
++   的 portable 语义。M1D 已精确覆盖 mask/indices 的消费语义，但仍由 model
++   adapter 提供 precomputed mask、position-derived cos/sin 和 canonical
++   repeat-interleave indices。
+ 5. **Attention score/value 的 batched 或 transpose matmul**：当前公共
+    matmul 只接受 rank-2、非转置输入，尚不足以表达完整 QK^T 与概率乘 V。
+ 6. **W8A8 linear 闭包**：还缺 int8 activation/weight wire、per-tensor 或
+@@ -62,7 +80,8 @@ synthetic tensors，覆盖 FP32/BF16、奇数尾块、极值稳定性、runtime
+ ## Qwen3.5-0.8B 静态 shape harness
+ 
+ `QWEN35_08B_SHAPE_METADATA` 仅作为不分配真实 tensor 的 shape metadata，固定
+-`hidden_size=1024`、`head_dim=64`、`num_attention_heads=16`、
+-`num_key_value_heads=8` 和 `num_hidden_layers=24`。它用于检查大 shape
++上述 revision、`hidden_size=1024`、`intermediate_size=3584`、
++`head_dim=256`、`num_attention_heads=8`、`num_key_value_heads=2` 和
++`num_hidden_layers=24`。它用于检查大 shape
+ CoreProgram/artifact 规模与 `numel` 无关，不代表已加载模型配置或已完成完整
+ 模型推理。
+diff --git a/python/pypto/portable/qwen35.py b/python/pypto/portable/qwen35.py
+index 28e8e98b4..bf7f76120 100644
+--- a/python/pypto/portable/qwen35.py
++++ b/python/pypto/portable/qwen35.py
+@@ -10,7 +10,8 @@ dtype、epsilon/mask/index 语义则保存在 CoreType、operation attributes 
+ * ``bf16`` 输入先逐元素 cast 到 ``float32``，组合中的累加/数学运算在
+   ``float32`` 中完成，最后按 builder 的 ``output_dtype`` cast 回去；
+ * ``float32`` 直接在 ``float32`` 中组合；
+-* RMSNorm 使用 ``mean(x*x) + epsilon`` 后 ``rsqrt``；
++* Qwen RMSNorm 使用 ``mean(x*x) + epsilon`` 后 ``rsqrt``，再乘
++  ``1 + weight.float()``；checkpoint 的 ``weight`` 是 delta 参数；
+ * L2Norm 使用 ``sum(x*x) + epsilon`` 后 ``rsqrt``，不隐含 clamp；
+ * stable softmax 采用 ``max -> subtract -> exp -> sum -> divide``，并显式
+   broadcast 两个 reduction 结果；
+@@ -39,13 +40,30 @@ _SUPPORTED_INDEX_DTYPES = frozenset(("int32", "int64"))
+ # their concrete shapes from the caller.
+ QWEN35_08B_SHAPE_METADATA = {
+     "model_id": "Qwen/Qwen3.5-0.8B",
++    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+     "contract": "text-only-bf16-w8a8-linear-m1d",
+     "shape_only": True,
++    "source_model_type": "qwen3_5_text",
++    "source_dtype": "bfloat16",
++    "normalized_dtype": "bf16",
+     "hidden_size": 1024,
+-    "head_dim": 64,
+-    "num_attention_heads": 16,
+-    "num_key_value_heads": 8,
++    "intermediate_size": 3584,
+     "num_hidden_layers": 24,
++    "num_attention_heads": 8,
++    "num_key_value_heads": 2,
++    "head_dim": 256,
++    "linear_num_key_heads": 16,
++    "linear_num_value_heads": 16,
++    "linear_key_head_dim": 128,
++    "linear_value_head_dim": 128,
++    "linear_conv_kernel_dim": 4,
++    "full_attention_interval": 4,
++    "full_attention_indices_zero_based": (3, 7, 11, 15, 19, 23),
++    "max_position_embeddings": 262144,
++    "rms_norm_eps": 1e-6,
++    "partial_rotary_factor": 0.25,
++    "rotary_dim": 64,
++    "mrope_section": (11, 11, 10),
+ }
+ 
+ 
+@@ -99,6 +117,15 @@ def _output_dtype(dtype: str, output_dtype: Optional[str]) -> str:
+     return dtype if output_dtype is None else _dtype(output_dtype, "output_dtype")
+ 
+ 
++def _resolve_rotary_dim(shape: Tuple[int, ...], rotary_dim: Optional[int], field: str) -> int:
++    value = shape[-1] if rotary_dim is None else rotary_dim
++    if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value % 2:
++        raise ValueError("{} must be a positive even integer".format(field))
++    if value > shape[-1]:
++        raise ValueError("{} must not exceed head dimension {}".format(field, shape[-1]))
++    return value
++
++
+ def _tensor(dtype: str, shape: Sequence[int]) -> CoreType:
+     return CoreType.tensor(dtype, tuple(shape))
+ 
+@@ -223,9 +250,20 @@ def _rms_core(
+     f32 = "float32"
+     x_f32 = _as_f32(builder, x, dtype, prefix + "_x")
+     weight_f32 = _as_f32(builder, weight, dtype, prefix + "_weight")
++    one = builder.op(
++        "constant",
++        (),
++        ((prefix + "_one", _scalar(f32)),),
++        {"value": 1.0},
++    )[0]
++    shifted_weight = builder.op(
++        "add",
++        (weight_f32, one),
++        ((prefix + "_weight_plus_one", _tensor(f32, weight.type.shape)),),
++    )[0]
+     weight_full = builder.op(
+         "broadcast",
+-        (weight_f32,),
++        (shifted_weight,),
+         ((prefix + "_weight_full", _tensor(f32, shape)),),
+         {"shape": list(shape)},
+     )[0]
+@@ -276,24 +314,41 @@ def _rope_core(
+     sin: ValueRef,
+     dtype: str,
+     shape: Tuple[int, ...],
++    rotary_dim: int,
+     prefix: str,
+ ) -> ValueRef:
+     x_f32 = _as_f32(builder, x, dtype, prefix + "_x")
+     cos_f32 = _as_f32(builder, cos, dtype, prefix + "_cos")
+     sin_f32 = _as_f32(builder, sin, dtype, prefix + "_sin")
+-    half = shape[-1] // 2
++    rotary_shape = shape[:-1] + (rotary_dim,)
++    q_rot = builder.op(
++        "slice",
++        (x_f32,),
++        ((prefix + "_rotary_input", _tensor("float32", rotary_shape)),),
++        {"starts": [0], "stops": [rotary_dim], "axes": [-1], "steps": [1]},
++    )[0]
++    tail_dim = shape[-1] - rotary_dim
++    q_pass = None
++    if tail_dim:
++        q_pass = builder.op(
++            "slice",
++            (x_f32,),
++            ((prefix + "_pass", _tensor("float32", shape[:-1] + (tail_dim,))),),
++            {"starts": [rotary_dim], "stops": [shape[-1]], "axes": [-1], "steps": [1]},
++        )[0]
++    half = rotary_dim // 2
+     first_shape = shape[:-1] + (half,)
+     first = builder.op(
+         "slice",
+-        (x_f32,),
++        (q_rot,),
+         ((prefix + "_first", _tensor("float32", first_shape)),),
+         {"starts": [0], "stops": [half], "axes": [-1], "steps": [1]},
+     )[0]
+     second = builder.op(
+         "slice",
+-        (x_f32,),
++        (q_rot,),
+         ((prefix + "_second", _tensor("float32", first_shape)),),
+-        {"starts": [half], "stops": [shape[-1]], "axes": [-1], "steps": [1]},
++        {"starts": [half], "stops": [rotary_dim], "axes": [-1], "steps": [1]},
+     )[0]
+     negative = builder.op(
+         "neg",
+@@ -303,23 +358,31 @@ def _rope_core(
+     rotated = builder.op(
+         "concat",
+         (negative, first),
+-        ((prefix + "_rotated", _tensor("float32", shape)),),
++        ((prefix + "_rotated", _tensor("float32", rotary_shape)),),
+         {"axis": -1},
+     )[0]
+     left = builder.op(
+         "mul",
+-        (x_f32, cos_f32),
+-        ((prefix + "_cos_part", _tensor("float32", shape)),),
++        (q_rot, cos_f32),
++        ((prefix + "_cos_part", _tensor("float32", rotary_shape)),),
+     )[0]
+     right = builder.op(
+         "mul",
+         (rotated, sin_f32),
+-        ((prefix + "_sin_part", _tensor("float32", shape)),),
++        ((prefix + "_sin_part", _tensor("float32", rotary_shape)),),
+     )[0]
+-    return builder.op(
++    rotated_result = builder.op(
+         "add",
+         (left, right),
+-        ((prefix + "_result", _tensor("float32", shape)),),
++        ((prefix + "_result", _tensor("float32", rotary_shape)),),
++    )[0]
++    if q_pass is None:
++        return rotated_result
++    return builder.op(
++        "concat",
++        (rotated_result, q_pass),
++        ((prefix + "_full_result", _tensor("float32", shape)),),
++        {"axis": -1},
+     )[0]
+ 
+ 
+@@ -342,7 +405,10 @@ def build_rms_norm(
+         (output,),
+         {
+             "formula": "x * rsqrt(mean(x*x,axis=-1,keepdims=True)+epsilon) * weight",
++            "weight_semantics": "delta_from_identity",
++            "scale_formula": "1 + weight.float()",
+             "epsilon_semantics": "add_before_rsqrt",
++            "qwen_rms_norm_eps": QWEN35_08B_SHAPE_METADATA["rms_norm_eps"],
+             "accumulation_dtype": "float32",
+             "fallbacks": ["bf16_cast_lane", "host_broadcast_pre_expansion", "python_list_wire_staging"],
+         },
+@@ -520,27 +586,41 @@ def build_stable_softmax(
+ 
+ 
+ def build_rope_rotate_half(
+-    shape: Sequence[int], dtype: str = "bf16", output_dtype: Optional[str] = None
++    shape: Sequence[int],
++    dtype: str = "bf16",
++    output_dtype: Optional[str] = None,
++    rotary_dim: Optional[int] = None,
+ ) -> CoreProgram:
+-    """Build text-only RoPE rotate-half with caller-provided cos/sin tensors."""
++    """Build text-only partial RoPE with caller-provided, preexpanded cos/sin.
++
++    ``cos`` and ``sin`` have shape ``shape[:-1] + (rotary_dim,)``.  Their
++    leading dimensions must already be expanded to the query shape; this
++    builder does not implement the upstream ``unsqueeze_dim`` transform.
++    """
+ 
+     shape = _shape(shape, "shape")
+     _require_rank(shape, "shape", 1)
+     if shape[-1] == 0 or shape[-1] % 2:
+         raise ValueError("shape last axis must be a positive even number")
++    rotary_dim = _resolve_rotary_dim(shape, rotary_dim, "rotary_dim")
+     dtype = _dtype(dtype, "dtype")
+     output_dtype = _output_dtype(dtype, output_dtype)
++    rotary_shape = shape[:-1] + (rotary_dim,)
+     builder = _Builder("qwen35_rope_rotate_half", "rope_rotate_half", shape)
+     x = builder.parameter("x", _tensor(dtype, shape))
+-    cos = builder.parameter("cos", _tensor(dtype, shape))
+-    sin = builder.parameter("sin", _tensor(dtype, shape))
+-    rotated = _rope_core(builder, x, cos, sin, dtype, shape, "rope")
++    cos = builder.parameter("cos", _tensor(dtype, rotary_shape))
++    sin = builder.parameter("sin", _tensor(dtype, rotary_shape))
++    rotated = _rope_core(builder, x, cos, sin, dtype, shape, rotary_dim, "rope")
+     output = _cast_from_f32(builder, rotated, output_dtype, "output")
+     return builder.finish(
+         (output,),
+         {
+-            "formula": "x*cos + concat(-x[...,d/2:],x[...,:d/2])*sin",
+-            "contract": "text_only_rotate_half",
++            "formula": "concat(x[..., :rotary_dim]*cos + rotate_half(x[..., :rotary_dim])*sin, x[..., rotary_dim:])",
++            "contract": "text_only_partial_rotate_half",
++            "rotary_dim": rotary_dim,
++            "cos_sin_preexpanded": True,
++            "cos_sin_shape": list(rotary_shape),
++            "unsqueeze_broadcast_supported": False,
+             "visual_mrope": False,
+             "fallbacks": ["scalar_math_not_used", "bf16_cast_lane", "bf16_layout_indexing_fallback", "python_list_wire_staging"],
+         },
+@@ -584,6 +664,8 @@ def build_gqa_repeat_kv(
+             "query_heads": query_heads,
+             "repeat_factor": query_heads // kv_shape[1],
+             "indices_runtime": True,
++            "indices_contract": "caller_provides_canonical_repeat_interleave_mapping",
++            "index_generation": "not_in_builder",
+             "fallbacks": ["bf16_indexing_scalar_lane_fallback", "python_list_wire_staging"],
+         },
+     )
+@@ -632,7 +714,7 @@ def build_causal_mask(
+ def build_decoder_subgraph(
+     rows: int,
+     hidden: int = 1024,
+-    intermediate: int = 2048,
++    intermediate: int = 3584,
+     dtype: str = "bf16",
+     output_dtype: Optional[str] = None,
+ ) -> CoreProgram:
+@@ -687,6 +769,9 @@ def build_decoder_subgraph(
+             "chain": ["rms_norm", "matmul", "split", "silu", "mul"],
+             "hidden": hidden,
+             "intermediate": intermediate,
++            "weight_semantics": "delta_from_identity",
++            "scale_formula": "1 + norm_weight.float()",
++            "qwen_rms_norm_eps": QWEN35_08B_SHAPE_METADATA["rms_norm_eps"],
+             "fallbacks": ["scalar_math_lane_fallback:silu", "split_indexing_compact_descriptor", "python_list_wire_staging"],
+         },
+     )
+@@ -699,6 +784,7 @@ def build_attention_subgraph(
+     query_heads: int,
+     dtype: str = "bf16",
+     index_dtype: str = "int64",
++    rotary_dim: Optional[int] = None,
+ ) -> CoreProgram:
+     """Build connected text-attention branches for RoPE, mask/softmax and GQA.
+ 
+@@ -713,6 +799,7 @@ def build_attention_subgraph(
+     _require_rank(rope_shape, "rope_shape", 1)
+     if rope_shape[-1] == 0 or rope_shape[-1] % 2:
+         raise ValueError("rope_shape last axis must be a positive even number")
++    rotary_dim = _resolve_rotary_dim(rope_shape, rotary_dim, "rotary_dim")
+     _require_rank(attention_shape, "attention_shape", 2)
+     _require_rank(kv_shape, "kv_shape", 2)
+     if kv_shape[1] <= 0:
+@@ -723,16 +810,17 @@ def build_attention_subgraph(
+         raise ValueError("query_heads must be divisible by kv_shape[1]")
+     dtype = _dtype(dtype, "dtype")
+     index_dtype = _index_dtype(index_dtype)
++    rotary_shape = rope_shape[:-1] + (rotary_dim,)
+     builder = _Builder("qwen35_attention_subgraph", "attention_subgraph", attention_shape)
+     q = builder.parameter("q", _tensor(dtype, rope_shape))
+-    cos = builder.parameter("cos", _tensor(dtype, rope_shape))
+-    sin = builder.parameter("sin", _tensor(dtype, rope_shape))
++    cos = builder.parameter("cos", _tensor(dtype, rotary_shape))
++    sin = builder.parameter("sin", _tensor(dtype, rotary_shape))
+     logits = builder.parameter("logits", _tensor(dtype, attention_shape))
+     mask = builder.parameter("causal_mask", _tensor("bool", attention_shape))
+     fill = builder.parameter("fill_value", _scalar(dtype))
+     kv = builder.parameter("kv", _tensor(dtype, kv_shape))
+     head_indices = builder.parameter("head_indices", _tensor(index_dtype, (query_heads,)))
+-    rotary_f32 = _rope_core(builder, q, cos, sin, dtype, rope_shape, "attention_rope")
++    rotary_f32 = _rope_core(builder, q, cos, sin, dtype, rope_shape, rotary_dim, "attention_rope")
+     logits_f32 = _as_f32(builder, logits, dtype, "attention_logits")
+     fill_f32 = fill if dtype == "float32" else builder.op(
+         "cast", (fill,), (("attention_fill_f32", _scalar("float32")),), {"dtype": "float32"}
+@@ -794,6 +882,10 @@ def build_attention_subgraph(
+         (rotary, probabilities, repeated),
+         {
+             "branches": ["rope_rotate_half", "causal_mask", "stable_softmax", "gqa_repeat_kv"],
++            "rotary_dim": rotary_dim,
++            "cos_sin_preexpanded": True,
++            "cos_sin_shape": list(rotary_shape),
++            "unsqueeze_broadcast_supported": False,
+             "attention_score_matmul": False,
+             "kv_state": "external_input_only",
+             "fallbacks": ["scalar_math_lane_fallback:exp", "host_broadcast_pre_expansion", "bf16_indexing_scalar_lane_fallback", "python_list_wire_staging"],
+diff --git a/python/tests/ut/pypto_x/test_qwen35_sve256_composites.py b/python/tests/ut/pypto_x/test_qwen35_sve256_composites.py
+index 082c0923f..10777a46b 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_sve256_composites.py
++++ b/python/tests/ut/pypto_x/test_qwen35_sve256_composites.py
+@@ -123,16 +123,23 @@ def _count(shape: Sequence[int]) -> int:
+ def test_rms_norm_three_way_fp32_accumulation_and_odd_tail(dtype, tmp_path):
+     shape = (2, 3, 9)
+     values = [((index * 7) % 19 - 9) * 0.125 for index in range(_count(shape))]
+-    weight_values = [1.0 + 0.03125 * index for index in range(shape[-1])]
++    # Qwen3.5 stores a delta weight initialized to zero; the builder must
++    # construct ``1 + weight.float()`` inside Core IR.
++    weight_values = [0.03125 * ((index % 5) - 2) for index in range(shape[-1])]
+     x = HostTensor(dtype, shape, values)
+     weight = HostTensor(dtype, (shape[-1],), weight_values)
+-    epsilon = 0.001
++    epsilon = 1e-6
+     golden = []
+     for row in _rows(x.flat(), shape):
+         mean = sum(float(item) * float(item) for item in row) / len(row)
+         scale = 1.0 / math.sqrt(mean + epsilon)
+-        golden.extend(scale * float(item) * float(weight_value) for item, weight_value in zip(row, weight.flat()))
++        golden.extend(
++            scale * float(item) * (1.0 + float(weight_value))
++            for item, weight_value in zip(row, weight.flat())
++        )
+     program = build_rms_norm(shape, dtype)
++    assert program.metadata["weight_semantics"] == "delta_from_identity"
++    assert program.metadata["scale_formula"] == "1 + weight.float()"
+     _three_way(
+         program,
+         [x, weight],
+@@ -144,6 +151,20 @@ def test_rms_norm_three_way_fp32_accumulation_and_odd_tail(dtype, tmp_path):
+     )
+ 
+ 
++@pytest.mark.parametrize("dtype", ("float32", "bf16"))
++def test_rms_norm_zero_delta_regression(dtype, tmp_path):
++    shape = (1, 2, 9)
++    x = HostTensor(dtype, shape, [((index * 3) % 11 - 5) * 0.2 for index in range(_count(shape))])
++    weight = HostTensor.zeros(dtype, (shape[-1],))
++    epsilon = 1e-6
++    golden = []
++    for row in _rows(x.flat(), shape):
++        scale = 1.0 / math.sqrt(sum(float(item) * float(item) for item in row) / len(row) + epsilon)
++        golden.extend(scale * float(item) for item in row)
++    program = build_rms_norm(shape, dtype)
++    _three_way(program, [x, weight], [shape], [dtype], {"epsilon": epsilon}, [golden], tmp_path)
++
++
+ @pytest.mark.parametrize("dtype", ("float32", "bf16"))
+ def test_l2_norm_three_way_explicit_add_before_rsqrt(dtype, tmp_path):
+     shape = (2, 3, 9)
+@@ -202,22 +223,29 @@ def test_stable_softmax_three_way_extreme_values_and_tail(dtype, tmp_path):
+ @pytest.mark.parametrize("dtype", ("float32", "bf16"))
+ def test_rope_rotate_half_three_way_precomputed_text_contract(dtype, tmp_path):
+     shape = (2, 3, 10)
++    rotary_dim = 6
++    rotary_shape = shape[:-1] + (rotary_dim,)
+     x_values = [((index * 3) % 17 - 8) * 0.1 for index in range(_count(shape))]
+-    cos_values = [math.cos(index / 13.0) for index in range(_count(shape))]
+-    sin_values = [math.sin(index / 17.0) for index in range(_count(shape))]
++    cos_values = [math.cos(index / 13.0) for index in range(_count(rotary_shape))]
++    sin_values = [math.sin(index / 17.0) for index in range(_count(rotary_shape))]
+     x = HostTensor(dtype, shape, x_values)
+-    cos = HostTensor(dtype, shape, cos_values)
+-    sin = HostTensor(dtype, shape, sin_values)
+-    half = shape[-1] // 2
++    cos = HostTensor(dtype, rotary_shape, cos_values)
++    sin = HostTensor(dtype, rotary_shape, sin_values)
++    half = rotary_dim // 2
+     golden = []
+-    for x_row, cos_row, sin_row in zip(_rows(x.flat(), shape), _rows(cos.flat(), shape), _rows(sin.flat(), shape)):
+-        rotated = [-float(item) for item in x_row[half:]] + [float(item) for item in x_row[:half]]
++    for x_row, cos_row, sin_row in zip(
++        _rows(x.flat(), shape), _rows(cos.flat(), rotary_shape), _rows(sin.flat(), rotary_shape)
++    ):
++        rotary_row = x_row[:rotary_dim]
++        rotated = [-float(item) for item in rotary_row[half:]] + [float(item) for item in rotary_row[:half]]
+         golden.extend(
+             float(item) * float(c) + float(r) * float(s)
+-            for item, c, s, r in zip(x_row, cos_row, sin_row, rotated)
++            for item, c, s, r in zip(rotary_row, cos_row, sin_row, rotated)
+         )
+-    program = build_rope_rotate_half(shape, dtype)
++        golden.extend(float(item) for item in x_row[rotary_dim:])
++    program = build_rope_rotate_half(shape, dtype, rotary_dim=rotary_dim)
+     assert program.metadata["visual_mrope"] is False
++    assert program.metadata["cos_sin_preexpanded"] is True
+     _three_way(program, [x, cos, sin], [shape], [dtype], {}, [golden], tmp_path)
+ 
+ 
+@@ -225,14 +253,15 @@ def test_rope_rotate_half_three_way_precomputed_text_contract(dtype, tmp_path):
+ def test_gqa_repeat_kv_three_way_runtime_indices(dtype, tmp_path):
+     kv_shape = (1, 3, 5, 5)
+     query_heads = 6
++    head_mapping = [0, 0, 1, 1, 2, 2]
+     values = [float(index) * 0.125 - 2.0 for index in range(_count(kv_shape))]
+     kv = HostTensor(dtype, kv_shape, values)
+-    indices = HostTensor("int64", (query_heads,), [0, 1, 2, 0, 1, 2])
++    indices = HostTensor("int64", (query_heads,), head_mapping)
+     output_shape = (1, query_heads, 5, 5)
+     golden = []
+     source = kv.flat()
+     for batch in range(kv_shape[0]):
+-        for head in (0, 1, 2, 0, 1, 2):
++        for head in head_mapping:
+             start = (batch * kv_shape[1] + head) * kv_shape[2] * kv_shape[3]
+             golden.extend(source[start:start + kv_shape[2] * kv_shape[3]])
+     program = build_gqa_repeat_kv(kv_shape, query_heads, dtype)
+@@ -258,17 +287,20 @@ def test_decoder_subgraph_three_way_connects_norm_matmul_split_swiglu(dtype, tmp
+     rows, hidden, intermediate = 3, 8, 10
+     shape = (rows, hidden)
+     x_values = [((index * 5) % 17 - 8) * 0.1 for index in range(rows * hidden)]
+-    norm_values = [1.0 + index * 0.05 for index in range(hidden)]
++    norm_values = [0.05 * ((index % 5) - 2) for index in range(hidden)]
+     projection_values = [((index * 7) % 23 - 11) * 0.03 for index in range(hidden * intermediate * 2)]
+     x = HostTensor(dtype, shape, x_values)
+     norm_weight = HostTensor(dtype, (hidden,), norm_values)
+     projection = HostTensor(dtype, (hidden, intermediate * 2), projection_values)
+-    epsilon = 0.001
++    epsilon = 1e-6
+     normalized = []
+     for row in _rows(x.flat(), shape):
+         mean = sum(float(item) * float(item) for item in row) / hidden
+         scale = 1.0 / math.sqrt(mean + epsilon)
+-        normalized.extend(scale * float(item) * float(weight) for item, weight in zip(row, norm_weight.flat()))
++        normalized.extend(
++            scale * float(item) * (1.0 + float(weight))
++            for item, weight in zip(row, norm_weight.flat())
++        )
+     projected = []
+     for row in range(rows):
+         for column in range(intermediate * 2):
+@@ -278,6 +310,8 @@ def test_decoder_subgraph_three_way_connects_norm_matmul_split_swiglu(dtype, tmp
+         golden.extend(_silu(float(value)) * float(row[intermediate + index]) for index, value in enumerate(row[:intermediate]))
+     program = build_decoder_subgraph(rows, hidden, intermediate, dtype)
+     assert program.metadata["chain"] == ("rms_norm", "matmul", "split", "silu", "mul")
++    assert program.metadata["weight_semantics"] == "delta_from_identity"
++    assert program.metadata["scale_formula"] == "1 + norm_weight.float()"
+     _three_way(
+         program,
+         [x, norm_weight, projection],
+@@ -295,23 +329,30 @@ def test_attention_subgraph_three_way_connects_rope_mask_softmax_gqa(dtype, tmp_
+     attention_shape = (3, 9)
+     kv_shape = (1, 3, 2, 5)
+     query_heads = 6
++    head_mapping = [0, 0, 1, 1, 2, 2]
+     q = HostTensor(dtype, rope_shape, [((index * 3) % 17 - 8) * 0.1 for index in range(20)])
+-    cos = HostTensor(dtype, rope_shape, [math.cos(index / 11.0) for index in range(20)])
+-    sin = HostTensor(dtype, rope_shape, [math.sin(index / 13.0) for index in range(20)])
+     logits = HostTensor(dtype, attention_shape, [((index * 5) % 19 - 9) * 0.15 for index in range(27)])
+     mask = HostTensor("bool", attention_shape, [column <= row + 1 for row in range(3) for column in range(9)])
+     kv = HostTensor(dtype, kv_shape, [index * 0.1 - 1.0 for index in range(_count(kv_shape))])
+-    indices = HostTensor("int64", (query_heads,), [0, 1, 2, 0, 1, 2])
++    indices = HostTensor("int64", (query_heads,), head_mapping)
+     fill = -10000.0
+ 
+-    half = rope_shape[-1] // 2
++    rotary_dim = 6
++    rotary_shape = rope_shape[:-1] + (rotary_dim,)
++    cos = HostTensor(dtype, rotary_shape, [math.cos(index / 11.0) for index in range(_count(rotary_shape))])
++    sin = HostTensor(dtype, rotary_shape, [math.sin(index / 13.0) for index in range(_count(rotary_shape))])
++    half = rotary_dim // 2
+     rotary_golden = []
+-    for x_row, cos_row, sin_row in zip(_rows(q.flat(), rope_shape), _rows(cos.flat(), rope_shape), _rows(sin.flat(), rope_shape)):
+-        rotated = [-float(item) for item in x_row[half:]] + [float(item) for item in x_row[:half]]
++    for x_row, cos_row, sin_row in zip(
++        _rows(q.flat(), rope_shape), _rows(cos.flat(), rotary_shape), _rows(sin.flat(), rotary_shape)
++    ):
++        rotary_row = x_row[:rotary_dim]
++        rotated = [-float(item) for item in rotary_row[half:]] + [float(item) for item in rotary_row[:half]]
+         rotary_golden.extend(
+             float(item) * float(c) + float(r) * float(s)
+-            for item, c, s, r in zip(x_row, cos_row, sin_row, rotated)
++            for item, c, s, r in zip(rotary_row, cos_row, sin_row, rotated)
+         )
++        rotary_golden.extend(float(item) for item in x_row[rotary_dim:])
+     softmax_golden = []
+     for row in range(attention_shape[0]):
+         masked = [float(logits.flat()[row * attention_shape[1] + column]) if mask.flat()[row * attention_shape[1] + column] else fill for column in range(attention_shape[1])]
+@@ -320,10 +361,12 @@ def test_attention_subgraph_three_way_connects_rope_mask_softmax_gqa(dtype, tmp_
+         total = sum(exponents)
+         softmax_golden.extend(value / total for value in exponents)
+     repeated_golden = []
+-    for head in (0, 1, 2, 0, 1, 2):
++    for head in head_mapping:
+         start = head * kv_shape[2] * kv_shape[3]
+         repeated_golden.extend(kv.flat()[start:start + kv_shape[2] * kv_shape[3]])
+-    program = build_attention_subgraph(rope_shape, attention_shape, kv_shape, query_heads, dtype)
++    program = build_attention_subgraph(
++        rope_shape, attention_shape, kv_shape, query_heads, dtype, rotary_dim=rotary_dim
++    )
+     outputs = _three_way(
+         program,
+         [q, cos, sin, logits, mask, kv, indices],
+@@ -340,7 +383,7 @@ def test_composite_programs_are_canonical_and_do_not_embed_tensor_constants():
+     programs = (
+         build_rms_norm((2, 3, 1024)),
+         build_stable_softmax((2, 3, 1024)),
+-        build_decoder_subgraph(2, 1024, 2048),
++        build_decoder_subgraph(2, 1024, 3584),
+     )
+     for program in programs:
+         canonical = program.canonical_json()
+@@ -357,7 +400,7 @@ def test_composite_programs_are_canonical_and_do_not_embed_tensor_constants():
+ def test_qwen35_large_shape_plan_and_artifact_stay_compact(tmp_path):
+     """Use Qwen hidden/intermediate metadata without allocating model tensors."""
+ 
+-    program = build_decoder_subgraph(1, hidden=1024, intermediate=2048, dtype="bf16")
++    program = build_decoder_subgraph(1, hidden=1024, intermediate=3584, dtype="bf16")
+     scalar_artifact = _compile_scalar(program)
+     sve_artifact = _compile_sve(program, tmp_path)
+     assert len(program.canonical_json()) < 20000
+@@ -377,11 +420,32 @@ def test_qwen35_large_shape_plan_and_artifact_stay_compact(tmp_path):
+ 
+ def test_qwen35_shape_harness_is_static_and_explicit():
+     assert QWEN35_08B_SHAPE_METADATA["shape_only"] is True
++    assert QWEN35_08B_SHAPE_METADATA["revision"] == "2fc06364715b967f1860aea9cf38778875588b17"
+     assert QWEN35_08B_SHAPE_METADATA["hidden_size"] == 1024
+-    assert QWEN35_08B_SHAPE_METADATA["head_dim"] == 64
+-    large = build_decoder_subgraph(1, 1024, 2048)
++    assert QWEN35_08B_SHAPE_METADATA["intermediate_size"] == 3584
++    assert QWEN35_08B_SHAPE_METADATA["num_hidden_layers"] == 24
++    assert QWEN35_08B_SHAPE_METADATA["num_attention_heads"] == 8
++    assert QWEN35_08B_SHAPE_METADATA["num_key_value_heads"] == 2
++    assert QWEN35_08B_SHAPE_METADATA["head_dim"] == 256
++    assert QWEN35_08B_SHAPE_METADATA["linear_num_key_heads"] == 16
++    assert QWEN35_08B_SHAPE_METADATA["linear_num_value_heads"] == 16
++    assert QWEN35_08B_SHAPE_METADATA["linear_key_head_dim"] == 128
++    assert QWEN35_08B_SHAPE_METADATA["linear_value_head_dim"] == 128
++    assert QWEN35_08B_SHAPE_METADATA["linear_conv_kernel_dim"] == 4
++    assert QWEN35_08B_SHAPE_METADATA["full_attention_interval"] == 4
++    assert QWEN35_08B_SHAPE_METADATA["full_attention_indices_zero_based"] == (3, 7, 11, 15, 19, 23)
++    assert QWEN35_08B_SHAPE_METADATA["max_position_embeddings"] == 262144
++    assert QWEN35_08B_SHAPE_METADATA["partial_rotary_factor"] == 0.25
++    assert QWEN35_08B_SHAPE_METADATA["mrope_section"] == (11, 11, 10)
++    large = build_decoder_subgraph(1, 1024, 3584)
+     assert len(large.canonical_json()) < 20000
+     assert large.metadata["hidden"] == 1024
++    qwen_rope = build_rope_rotate_half((1, 8, 3, 256), rotary_dim=64)
++    assert qwen_rope.metadata["rotary_dim"] == 64
++    assert qwen_rope.functions[0].parameters[1].type.shape == (1, 8, 3, 64)
++    qwen_gqa = build_gqa_repeat_kv((1, 2, 3, 256), 8)
++    assert qwen_gqa.metadata["repeat_factor"] == 4
++    assert qwen_gqa.metadata["indices_contract"] == "caller_provides_canonical_repeat_interleave_mapping"
+     with pytest.raises(ValueError, match="empty last axis"):
+         build_stable_softmax((2, 0))
+     with pytest.raises(ValueError, match="even"):

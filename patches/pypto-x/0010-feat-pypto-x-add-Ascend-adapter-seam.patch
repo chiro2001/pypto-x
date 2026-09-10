@@ -1,0 +1,854 @@
+From 2be3dfdd8ebbf2c5b83a0daa45231117147a247d Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Mon, 7 Sep 2026 01:56:51 +0800
+Subject: [PATCH 10/96] feat(pypto-x): add Ascend adapter seam
+
+---
+ python/pypto/backends/ascend/__init__.py       |  40 ++++
+ python/pypto/backends/ascend/adapter.py        | 523 +++++++++++++++++++++++++++++++++++++++++++++
+ python/pypto/compiler/targets/ascend.py        |  57 +++++
+ python/tests/ut/pypto_x/test_ascend_adapter.py | 198 +++++++++++++++++
+ 4 files changed, 818 insertions(+)
+
+diff --git a/python/pypto/backends/ascend/__init__.py b/python/pypto/backends/ascend/__init__.py
+new file mode 100644
+index 000000000..d483c310f
+--- /dev/null
++++ b/python/pypto/backends/ascend/__init__.py
+@@ -0,0 +1,40 @@
++"""Dependency-injected Ascend compiler/runtime adapter seam.
++
++Importing this package is safe on hosts without CANN, ``pypto_pro`` or
++``torch_npu``.  The concrete vendor bridge is loaded only when requested by
++the default factory or supplied explicitly by the caller.
++"""
++
++from .adapter import (
++    ASCEND_BACKEND_NAME,
++    ASCEND_HOOK_ENV,
++    ASCEND_SEAM_VERSION,
++    AscendAdapter,
++    AscendArtifactPayload,
++    AscendBackend,
++    AscendCompilerBackend,
++    AscendCompilerHooks,
++    AscendHooks,
++    AscendLoweredProgram,
++    AscendRuntimeBackend,
++    AscendRuntimeHooks,
++    create_default_ascend_hooks,
++    default_ascend_hooks,
++)
++
++__all__ = [
++    "ASCEND_BACKEND_NAME",
++    "ASCEND_HOOK_ENV",
++    "ASCEND_SEAM_VERSION",
++    "AscendAdapter",
++    "AscendArtifactPayload",
++    "AscendBackend",
++    "AscendCompilerBackend",
++    "AscendCompilerHooks",
++    "AscendHooks",
++    "AscendLoweredProgram",
++    "AscendRuntimeBackend",
++    "AscendRuntimeHooks",
++    "create_default_ascend_hooks",
++    "default_ascend_hooks",
++]
+diff --git a/python/pypto/backends/ascend/adapter.py b/python/pypto/backends/ascend/adapter.py
+new file mode 100644
+index 000000000..bd0041630
+--- /dev/null
++++ b/python/pypto/backends/ascend/adapter.py
+@@ -0,0 +1,523 @@
++"""Ascend adapter seam for PyPTO-X.
++
++This module intentionally does not import CANN, ``pypto_pro`` or
++``torch_npu`` at module import time.  The current checkout does not provide a
++stable public Python signature for the Pro CCE/Bisheng path, so the seam is
++defined by explicit hook protocols.  A deployment with CANN must inject a
++small implementation of those protocols (or expose one through
++``PYPTO_X_ASCEND_HOOKS``); this module must not guess a vendor call
++signature.
++
++The objects whose names start with ``Ascend`` are adapter-private values.  In
++particular, ``AscendArtifactPayload`` may carry an opaque compiler-owned
++handle, while the public ``Artifact`` created from it only contains the W1
++vendor-neutral fields.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++import importlib
++import importlib.util
++import os
++from typing import Any, Dict, Mapping, MutableMapping, Optional, Protocol, Tuple, runtime_checkable
++
++from pypto.abi.descriptors import LaunchRequest
++from pypto.abi.runtime import Availability
++from pypto.compiler.api import CompileOptions
++from pypto.compiler.artifact import ABI_VERSION, Artifact
++from pypto.target._utils import frozen_mapping, mapping_copy
++from pypto.target.errors import (
++    ABIValidationError,
++    BackendContractError,
++    BackendUnavailableError,
++)
++from pypto.target.spec import TargetSpec
++
++
++ASCEND_BACKEND_NAME = "ascend"
++ASCEND_HOOK_ENV = "PYPTO_X_ASCEND_HOOKS"
++ASCEND_SEAM_VERSION = "1"
++
++
++def _backend_unavailable(status: Availability) -> BackendUnavailableError:
++    return BackendUnavailableError(
++        status.backend,
++        status.reason or "Ascend adapter is unavailable",
++        status.reason_code or "backend_unavailable",
++        mapping_copy(status.details),
++    )
++
++
++@dataclass(frozen=True)
++class AscendArtifactPayload:
++    """Private result type returned by an injected Ascend compiler hook.
++
++    ``opaque`` is deliberately not copied into the public :class:`Artifact`.
++    It exists for a real CCE/Bisheng bridge to retain a compiler-owned handle
++    that is needed by its loader.  The hook, not the common ABI, defines its
++    meaning.
++    """
++
++    format: str
++    entrypoint: str
++    payload: Optional[bytes] = None
++    path: Optional[str] = None
++    metadata: Mapping[str, Any] = field(default_factory=dict)
++    opaque: Any = field(default=None, repr=False, compare=False)
++
++    def __post_init__(self) -> None:
++        if not isinstance(self.format, str) or not self.format.strip():
++            raise BackendContractError("Ascend compiler artifact format must be non-empty")
++        if not isinstance(self.entrypoint, str) or not self.entrypoint.strip():
++            raise BackendContractError("Ascend compiler artifact entrypoint must be non-empty")
++        if self.payload is None and self.path is None:
++            raise BackendContractError("Ascend compiler artifact needs payload or path")
++        if self.payload is not None and self.path is not None:
++            raise BackendContractError("Ascend compiler artifact accepts payload or path, not both")
++        if self.payload is not None:
++            if not isinstance(self.payload, (bytes, bytearray, memoryview)):
++                raise BackendContractError("Ascend compiler artifact payload must be bytes-like")
++            object.__setattr__(self, "payload", bytes(self.payload))
++        if self.path is not None:
++            try:
++                path = os.fspath(self.path)
++            except TypeError as exc:
++                raise BackendContractError("Ascend compiler artifact path must be path-like") from exc
++            if isinstance(path, bytes) or not path.strip():
++                raise BackendContractError("Ascend compiler artifact path must be a non-empty text path")
++            object.__setattr__(self, "path", path)
++        try:
++            normalized_metadata = frozen_mapping(self.metadata)
++        except (TypeError, ValueError) as exc:
++            raise BackendContractError("Ascend compiler artifact metadata is not stable ABI data") from exc
++        object.__setattr__(self, "format", self.format.strip().lower())
++        object.__setattr__(self, "entrypoint", self.entrypoint.strip())
++        object.__setattr__(self, "metadata", normalized_metadata)
++
++    def to_public_artifact(self, target: TargetSpec, abi_version: str = ABI_VERSION) -> Artifact:
++        """Convert the private result into the W1 public artifact value."""
++
++        return Artifact(
++            format=self.format,
++            entrypoint=self.entrypoint,
++            target=target,
++            abi_version=abi_version,
++            payload=self.payload,
++            path=self.path,
++            metadata=mapping_copy(self.metadata),
++        )
++
++    @classmethod
++    def from_public_artifact(cls, artifact: Artifact) -> "AscendArtifactPayload":
++        if not isinstance(artifact, Artifact):
++            raise BackendContractError("Ascend runtime expects an Artifact")
++        return cls(
++            format=artifact.format,
++            entrypoint=artifact.entrypoint,
++            payload=artifact.payload,
++            path=artifact.path,
++            metadata=mapping_copy(artifact.metadata),
++        )
++
++
++@dataclass(frozen=True)
++class AscendLoweredProgram:
++    """Private wrapper retaining the target for the later compile call."""
++
++    target_ir: Any
++    target: TargetSpec
++
++
++@runtime_checkable
++class AscendCompilerHooks(Protocol):
++    """Explicit bridge contract for Pro CCECodegen/Bisheng compilation.
++
++    The signatures are the PyPTO-X seam, not claims about the current
++    upstream implementation.  A real integration adapter owns translation to
++    the exact CCE/Bisheng API and can retain that code outside the common
++    backend.
++    """
++
++    def lower(self, program: Any, target: TargetSpec) -> Any:
++        """Lower one CoreProgram to an Ascend-owned IR value."""
++
++    def compile(self, target_ir: Any, options: CompileOptions) -> AscendArtifactPayload:
++        """Compile Ascend-owned IR and return a private artifact payload."""
++
++
++@runtime_checkable
++class AscendRuntimeHooks(Protocol):
++    """Explicit bridge contract for CANN loading, workspace and launch."""
++
++    def load(self, artifact: AscendArtifactPayload) -> Any:
++        """Load one private artifact payload and return an opaque handle."""
++
++    def workspace_size(self, request: LaunchRequest, loaded: Any) -> int:
++        """Return required workspace bytes for a loaded artifact."""
++
++    def launch(self, request: LaunchRequest, loaded: Any) -> Any:
++        """Launch one validated public request through the loaded handle."""
++
++
++@runtime_checkable
++class AscendHooks(AscendCompilerHooks, AscendRuntimeHooks, Protocol):
++    """Combined hook contract used by :class:`AscendBackend`."""
++
++
++def _validate_hook_methods(hooks: Any, names: Tuple[str, ...]) -> None:
++    missing = [name for name in names if not callable(getattr(hooks, name, None))]
++    if missing:
++        raise BackendContractError(
++            "Ascend hook is missing required methods: {}".format(", ".join(missing)),
++            details={"required": list(names)},
++        )
++
++
++def _hook_availability(hooks: Any) -> Availability:
++    """Read optional hook availability without importing a vendor runtime."""
++
++    status = getattr(hooks, "availability", None)
++    try:
++        if callable(status):
++            status = status()
++    except Exception as exc:  # pragma: no cover - defensive vendor boundary
++        return Availability.no(
++            ASCEND_BACKEND_NAME,
++            "Ascend hook availability probe failed",
++            "availability_probe_failed",
++            {"exception": type(exc).__name__, "message": str(exc)},
++        )
++    if isinstance(status, Availability):
++        return status
++    if isinstance(status, bool):
++        if status:
++            return Availability.yes(ASCEND_BACKEND_NAME)
++        return Availability.no(ASCEND_BACKEND_NAME, "Ascend hook reports unavailable")
++    # Injected test/deployment hooks without a probe are considered available;
++    # calls still fail loudly if the hook itself cannot access CANN.
++    return Availability.yes(ASCEND_BACKEND_NAME)
++
++
++class _UnavailableAscendHooks:
++    """Hook object used when no explicit CANN bridge can be constructed."""
++
++    def __init__(self, status: Availability):
++        self._status = status
++
++    def availability(self) -> Availability:
++        return self._status
++
++    def is_available(self) -> bool:
++        return False
++
++    def _raise(self) -> None:
++        raise _backend_unavailable(self._status)
++
++    def lower(self, program: Any, target: TargetSpec) -> Any:
++        del program, target
++        self._raise()
++
++    def compile(self, target_ir: Any, options: CompileOptions) -> AscendArtifactPayload:
++        del target_ir, options
++        self._raise()
++
++    def load(self, artifact: AscendArtifactPayload) -> Any:
++        del artifact
++        self._raise()
++
++    def workspace_size(self, request: LaunchRequest, loaded: Any) -> int:
++        del request, loaded
++        self._raise()
++
++    def launch(self, request: LaunchRequest, loaded: Any) -> Any:
++        del request, loaded
++        self._raise()
++
++
++def _module_available(module_name: str) -> bool:
++    try:
++        return importlib.util.find_spec(module_name) is not None
++    except (ImportError, ModuleNotFoundError, ValueError):
++        return False
++
++
++def _default_unavailable_hooks() -> _UnavailableAscendHooks:
++    """Build a structured unavailable result without importing CANN modules."""
++
++    detected = {
++        "pypto_pro": _module_available("pypto_pro"),
++        "cce_codegen": _module_available("pypto.pypto_impl.codegen"),
++        "torch_npu": _module_available("torch_npu"),
++    }
++    missing = [name for name, present in detected.items() if not present]
++    if not detected["pypto_pro"] or not detected["cce_codegen"]:
++        reason_code = "missing_toolkit"
++        reason = "CANN/PyPTO Pro compiler components are not available"
++    elif not detected["torch_npu"]:
++        reason_code = "missing_device_runtime"
++        reason = "torch_npu device runtime is not available"
++    else:
++        reason_code = "integration_hook_not_configured"
++        reason = "CANN components were detected but no PyPTO-X Ascend hook is configured"
++    return _UnavailableAscendHooks(
++        Availability.no(
++            ASCEND_BACKEND_NAME,
++            reason,
++            reason_code,
++            {
++                "detected": detected,
++                "missing": missing,
++                "integration": "pending: inject explicit AscendHooks; vendor signatures are not inferred",
++                "seam_version": ASCEND_SEAM_VERSION,
++            },
++        )
++    )
++
++
++def default_ascend_hooks() -> AscendHooks:
++    """Lazily resolve an optional site-provided hook module.
++
++    ``PYPTO_X_ASCEND_HOOKS`` names a module that exports
++    ``create_ascend_hooks()``.  The module is imported only when a caller
++    constructs the default backend.  No import of CANN or torch_npu is made
++    by importing this package.  Without this explicit bridge the return value
++    is an unavailable hook object with a diagnostic reason.
++    """
++
++    module_name = os.environ.get(ASCEND_HOOK_ENV, "").strip()
++    if not module_name:
++        return _default_unavailable_hooks()
++    try:
++        module = importlib.import_module(module_name)
++    except Exception as exc:  # pragma: no cover - exercised by deployment
++        status = Availability.no(
++            ASCEND_BACKEND_NAME,
++            "configured Ascend hook module could not be imported",
++            "hook_import_failed",
++            {"module": module_name, "exception": type(exc).__name__, "message": str(exc)},
++        )
++        return _UnavailableAscendHooks(status)
++    factory = getattr(module, "create_ascend_hooks", None)
++    if not callable(factory):
++        status = Availability.no(
++            ASCEND_BACKEND_NAME,
++            "configured Ascend hook module has no create_ascend_hooks()",
++            "hook_factory_missing",
++            {"module": module_name},
++        )
++        return _UnavailableAscendHooks(status)
++    try:
++        hooks = factory()
++    except Exception as exc:  # pragma: no cover - exercised by deployment
++        status = Availability.no(
++            ASCEND_BACKEND_NAME,
++            "configured Ascend hook factory failed",
++            "hook_factory_failed",
++            {"module": module_name, "exception": type(exc).__name__, "message": str(exc)},
++        )
++        return _UnavailableAscendHooks(status)
++    try:
++        _validate_hook_methods(hooks, ("lower", "compile", "load", "workspace_size", "launch"))
++    except BackendContractError as exc:
++        return _UnavailableAscendHooks(
++            Availability.no(
++                ASCEND_BACKEND_NAME,
++                "configured Ascend hook does not implement the PyPTO-X seam",
++                "hook_contract_invalid",
++                {"module": module_name, "error": str(exc)},
++            )
++        )
++    return hooks
++
++
++class AscendCompilerBackend:
++    """Compiler half of the Ascend adapter seam."""
++
++    name = ASCEND_BACKEND_NAME
++
++    def __init__(self, hooks: Optional[AscendCompilerHooks] = None):
++        self._hooks = hooks if hooks is not None else default_ascend_hooks()
++        _validate_hook_methods(self._hooks, ("lower", "compile"))
++        self._artifact_payloads: MutableMapping[str, AscendArtifactPayload] = {}
++
++    @property
++    def hooks(self) -> AscendCompilerHooks:
++        """Return the injected hook object for diagnostics and integration."""
++
++        return self._hooks
++
++    def availability(self) -> Availability:
++        return _hook_availability(self._hooks)
++
++    def is_available(self) -> bool:
++        return self.availability().available
++
++    def _require_available(self) -> None:
++        status = self.availability()
++        if not status.available:
++            raise _backend_unavailable(status)
++
++    @staticmethod
++    def _validate_target(target: TargetSpec) -> None:
++        if not isinstance(target, TargetSpec):
++            raise TypeError("Ascend compiler target must be a TargetSpec")
++        if target.kind != ASCEND_BACKEND_NAME:
++            raise ValueError("Ascend compiler requires TargetSpec(kind='ascend')")
++
++    def lower(self, program: Any, target: TargetSpec) -> AscendLoweredProgram:
++        self._validate_target(target)
++        self._require_available()
++        lowered = self._hooks.lower(program, target)
++        return AscendLoweredProgram(lowered, target)
++
++    def compile(self, target_ir: Any, options: Optional[CompileOptions] = None) -> Artifact:
++        self._require_available()
++        if options is not None and not isinstance(options, CompileOptions):
++            raise BackendContractError("Ascend compile options must be CompileOptions")
++        if not isinstance(target_ir, AscendLoweredProgram):
++            raise BackendContractError(
++                "Ascend compile() expects the AscendLoweredProgram returned by lower()",
++                details={"expected": "AscendLoweredProgram"},
++            )
++        compile_options = options or CompileOptions(artifact_format="ascend", abi_version=ABI_VERSION)
++        payload = self._hooks.compile(target_ir.target_ir, compile_options)
++        if not isinstance(payload, AscendArtifactPayload):
++            raise BackendContractError(
++                "Ascend compile hook must return AscendArtifactPayload",
++                details={"actual": type(payload).__name__},
++            )
++        metadata = mapping_copy(compile_options.metadata)
++        metadata.update(mapping_copy(payload.metadata))
++        try:
++            artifact = Artifact(
++                format=payload.format,
++                entrypoint=payload.entrypoint,
++                target=target_ir.target,
++                abi_version=compile_options.abi_version,
++                payload=payload.payload,
++                path=payload.path,
++                metadata=metadata,
++            )
++            artifact.validate()
++        except (ABIValidationError, TypeError, ValueError, OSError) as exc:
++            raise BackendContractError(
++                "Ascend compile hook returned an invalid artifact: {}".format(exc),
++                details={"exception": type(exc).__name__},
++            ) from exc
++        self._artifact_payloads[str(artifact.cache_key)] = payload
++        return artifact
++
++
++class AscendRuntimeBackend:
++    """Runtime half of the Ascend adapter seam."""
++
++    name = ASCEND_BACKEND_NAME
++
++    def __init__(
++        self,
++        hooks: Optional[AscendRuntimeHooks] = None,
++        artifact_payloads: Optional[MutableMapping[str, AscendArtifactPayload]] = None,
++    ):
++        self._hooks = hooks if hooks is not None else default_ascend_hooks()
++        _validate_hook_methods(self._hooks, ("load", "workspace_size", "launch"))
++        self._artifact_payloads = artifact_payloads if artifact_payloads is not None else {}
++        self._loaded: Dict[str, Any] = {}
++
++    @property
++    def hooks(self) -> AscendRuntimeHooks:
++        return self._hooks
++
++    def availability(self) -> Availability:
++        return _hook_availability(self._hooks)
++
++    def is_available(self) -> bool:
++        return self.availability().available
++
++    def _require_available(self) -> None:
++        status = self.availability()
++        if not status.available:
++            raise _backend_unavailable(status)
++
++    @staticmethod
++    def _request_key(request: LaunchRequest) -> str:
++        if not isinstance(request, LaunchRequest):
++            raise TypeError("Ascend runtime expects a LaunchRequest")
++        return str(request.artifact.cache_key)
++
++    def load(self, artifact: Artifact) -> Any:
++        self._require_available()
++        if not isinstance(artifact, Artifact):
++            raise TypeError("Ascend runtime expects an Artifact")
++        artifact.validate()
++        key = str(artifact.cache_key)
++        payload = self._artifact_payloads.get(key)
++        if payload is None:
++            payload = AscendArtifactPayload.from_public_artifact(artifact)
++        loaded = self._hooks.load(payload)
++        self._loaded[key] = loaded
++        return loaded
++
++    def workspace_size(self, request: LaunchRequest) -> int:
++        self._require_available()
++        if not isinstance(request, LaunchRequest):
++            raise TypeError("Ascend runtime expects a LaunchRequest")
++        request.validate(require_storage=False)
++        key = self._request_key(request)
++        if key not in self._loaded:
++            raise BackendContractError(
++                "Ascend workspace_size() requires a loaded artifact",
++                details={"artifact": key},
++            )
++        size = self._hooks.workspace_size(request, self._loaded[key])
++        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
++            raise BackendContractError(
++                "Ascend workspace hook must return a non-negative integer",
++                details={"actual": repr(size)},
++            )
++        return size
++
++    def launch(self, request: LaunchRequest) -> Any:
++        self._require_available()
++        if not isinstance(request, LaunchRequest):
++            raise TypeError("Ascend runtime expects a LaunchRequest")
++        request.validate(require_storage=True)
++        key = self._request_key(request)
++        if key not in self._loaded:
++            raise BackendContractError(
++                "Ascend launch() requires a loaded artifact",
++                details={"artifact": key},
++            )
++        return self._hooks.launch(request, self._loaded[key])
++
++
++class AscendBackend(AscendCompilerBackend, AscendRuntimeBackend):
++    """Combined compiler/runtime backend sharing one explicit hook seam."""
++
++    def __init__(self, hooks: Optional[AscendHooks] = None):
++        selected = hooks if hooks is not None else default_ascend_hooks()
++        AscendCompilerBackend.__init__(self, selected)
++        AscendRuntimeBackend.__init__(self, selected, self._artifact_payloads)
++
++
++# Short aliases make the seam convenient without exposing a second ABI.
++AscendAdapter = AscendBackend
++create_default_ascend_hooks = default_ascend_hooks
++
++
++__all__ = [
++    "ASCEND_BACKEND_NAME",
++    "ASCEND_HOOK_ENV",
++    "ASCEND_SEAM_VERSION",
++    "AscendAdapter",
++    "AscendArtifactPayload",
++    "AscendBackend",
++    "AscendCompilerBackend",
++    "AscendCompilerHooks",
++    "AscendLoweredProgram",
++    "AscendRuntimeBackend",
++    "AscendRuntimeHooks",
++    "AscendHooks",
++    "create_default_ascend_hooks",
++    "default_ascend_hooks",
++]
+diff --git a/python/pypto/compiler/targets/ascend.py b/python/pypto/compiler/targets/ascend.py
+new file mode 100644
+index 000000000..f7cd1c455
+--- /dev/null
++++ b/python/pypto/compiler/targets/ascend.py
+@@ -0,0 +1,57 @@
++"""Ascend target factory for the PyPTO-X public compiler boundary.
++
++The factory only exposes the target-neutral W1 compiler/runtime methods.  All
++CCE/Bisheng/CANN details remain behind the injected hooks in
++``pypto.backends.ascend``.
++"""
++
++from __future__ import annotations
++
++from typing import Optional
++
++from pypto.backends.ascend import (
++    AscendBackend,
++    AscendCompilerBackend,
++    AscendCompilerHooks,
++    AscendHooks,
++    AscendRuntimeBackend,
++    AscendRuntimeHooks,
++)
++
++
++def create_ascend_backend(hooks: Optional[AscendHooks] = None) -> AscendBackend:
++    """Construct a combined Ascend backend, unavailable until a bridge exists."""
++
++    return AscendBackend(hooks)
++
++
++def create_ascend_compiler(hooks: Optional[AscendCompilerHooks] = None) -> AscendCompilerBackend:
++    """Construct only the compiler half of the Ascend adapter."""
++
++    return AscendCompilerBackend(hooks)
++
++
++def create_ascend_runtime(hooks: Optional[AscendRuntimeHooks] = None) -> AscendRuntimeBackend:
++    """Construct only the runtime half of the Ascend adapter."""
++
++    return AscendRuntimeBackend(hooks)
++
++
++# Explicit aliases are useful to target registries without auto-registering a
++# global factory during import.
++create_backend = create_ascend_backend
++AscendCompiler = AscendCompilerBackend
++AscendRuntime = AscendRuntimeBackend
++
++
++__all__ = [
++    "AscendBackend",
++    "AscendCompiler",
++    "AscendCompilerBackend",
++    "AscendRuntime",
++    "AscendRuntimeBackend",
++    "create_ascend_backend",
++    "create_ascend_compiler",
++    "create_ascend_runtime",
++    "create_backend",
++]
+diff --git a/python/tests/ut/pypto_x/test_ascend_adapter.py b/python/tests/ut/pypto_x/test_ascend_adapter.py
+new file mode 100644
+index 000000000..5a86f39b0
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_ascend_adapter.py
+@@ -0,0 +1,198 @@
++"""W2 Ascend adapter seam tests.
++
++These tests exercise only the dependency-injected seam.  They deliberately do
++not import CANN, torch_npu or model weights, and therefore cannot be used as a
++claim of CCE/NPU compatibility.
++"""
++
++from __future__ import annotations
++
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++
++def _import_contracts():
++    repository_root = Path(__file__).resolve().parents[4]
++    package_root = repository_root / "python" / "pypto"
++    saved_modules = {
++        name: module
++        for name, module in sys.modules.items()
++        if name == "pypto" or name.startswith("pypto.")
++    }
++    for name in list(saved_modules):
++        del sys.modules[name]
++    package = types.ModuleType("pypto")
++    package.__path__ = [str(package_root)]
++    package.__package__ = "pypto"
++    sys.modules["pypto"] = package
++    try:
++        from pypto.abi import Availability, LaunchRequest, TensorDesc
++        from pypto.compiler import Artifact, CompileOptions, compile_program
++        from pypto.compiler.targets.ascend import create_ascend_backend
++        from pypto.backends.ascend import (
++            AscendArtifactPayload,
++            AscendBackend,
++            AscendCompilerBackend,
++            AscendCompilerHooks,
++            AscendRuntimeHooks,
++        )
++        from pypto.target import BackendContractError, BackendUnavailableError, TargetSpec
++
++        return locals()
++    finally:
++        for name in list(sys.modules):
++            if name == "pypto" or name.startswith("pypto."):
++                del sys.modules[name]
++        sys.modules.update(saved_modules)
++
++
++_C = _import_contracts()
++Artifact = _C["Artifact"]
++AscendArtifactPayload = _C["AscendArtifactPayload"]
++AscendBackend = _C["AscendBackend"]
++AscendCompilerBackend = _C["AscendCompilerBackend"]
++AscendCompilerHooks = _C["AscendCompilerHooks"]
++AscendRuntimeHooks = _C["AscendRuntimeHooks"]
++Availability = _C["Availability"]
++BackendContractError = _C["BackendContractError"]
++BackendUnavailableError = _C["BackendUnavailableError"]
++CompileOptions = _C["CompileOptions"]
++LaunchRequest = _C["LaunchRequest"]
++TargetSpec = _C["TargetSpec"]
++TensorDesc = _C["TensorDesc"]
++compile_program = _C["compile_program"]
++create_ascend_backend = _C["create_ascend_backend"]
++
++
++def _target():
++    return TargetSpec("ascend", "aarch64-linux-gnu", features=("aiv",))
++
++
++class FakeHooks:
++    def __init__(self):
++        self.calls = []
++
++    def availability(self):
++        return Availability.yes("fake-ascend")
++
++    def lower(self, program, target):
++        self.calls.append(("lower", program, target))
++        return {"fake_ir": program}
++
++    def compile(self, target_ir, options):
++        self.calls.append(("compile", target_ir, options))
++        return AscendArtifactPayload(
++            format="fake-ascend-binary",
++            entrypoint="qwen_kernel",
++            payload=b"fake-binary",
++            metadata={"source": "fake-hook"},
++            opaque={"vendor_handle": "private"},
++        )
++
++    def load(self, artifact):
++        self.calls.append(("load", artifact))
++        assert artifact.opaque == {"vendor_handle": "private"}
++        return "loaded-handle"
++
++    def workspace_size(self, request, loaded):
++        self.calls.append(("workspace", request, loaded))
++        return 128
++
++    def launch(self, request, loaded):
++        self.calls.append(("launch", request, loaded))
++        return "launched"
++
++
++def test_fake_hook_compiler_and_runtime_order_and_artifact_conversion():
++    hooks = FakeHooks()
++    backend = AscendBackend(hooks)
++    target = _target()
++    artifact = compile_program(
++        backend,
++        "core-program",
++        target,
++        CompileOptions(artifact_format="fake-ascend-binary"),
++    )
++
++    assert isinstance(artifact, Artifact)
++    assert artifact.format == "fake-ascend-binary"
++    assert artifact.target == target
++    assert artifact.payload == b"fake-binary"
++    assert artifact.metadata["source"] == "fake-hook"
++    assert not hasattr(artifact, "ub")
++    assert not hasattr(artifact, "aic")
++    assert not hasattr(artifact, "pipe")
++
++    inputs = [TensorDesc("bf16", (2, 2), address=11, readonly=True)]
++    outputs = [TensorDesc("bf16", (2, 2), address=12)]
++    request = LaunchRequest(artifact, inputs=inputs, outputs=outputs)
++    assert backend.load(artifact) == "loaded-handle"
++    assert backend.workspace_size(request) == 128
++    assert backend.launch(request) == "launched"
++    assert [call[0] for call in hooks.calls] == [
++        "lower",
++        "compile",
++        "load",
++        "workspace",
++        "launch",
++    ]
++    assert hooks.calls[1][2].artifact_format == "fake-ascend-binary"
++    assert hooks.calls[3][2] == "loaded-handle"
++    assert hooks.calls[4][2] == "loaded-handle"
++
++
++def test_compiler_requires_its_private_lowered_wrapper():
++    hooks = FakeHooks()
++    backend = AscendCompilerBackend(hooks)
++    with pytest.raises(BackendContractError, match="AscendLoweredProgram"):
++        backend.compile("raw-ir")
++
++
++def test_runtime_requires_load_before_workspace_or_launch():
++    hooks = FakeHooks()
++    backend = AscendBackend(hooks)
++    artifact = compile_program(
++        backend,
++        "core-program",
++        _target(),
++        CompileOptions(artifact_format="fake-ascend-binary"),
++    )
++    request = LaunchRequest(
++        artifact,
++        inputs=[TensorDesc("bf16", (1,), address=1)],
++        outputs=[TensorDesc("bf16", (1,), address=2)],
++    )
++    with pytest.raises(BackendContractError, match="loaded artifact"):
++        backend.workspace_size(request)
++    with pytest.raises(BackendContractError, match="loaded artifact"):
++        backend.launch(request)
++
++
++def test_default_backend_is_structurally_unavailable_without_explicit_hook():
++    backend = create_ascend_backend()
++    status = backend.availability()
++    assert not status.available
++    assert status.reason_code in {
++        "missing_toolkit",
++        "missing_device_runtime",
++        "integration_hook_not_configured",
++    }
++    assert "integration" in status.details
++    with pytest.raises(BackendUnavailableError) as error:
++        backend.lower("program", _target())
++    assert error.value.code == status.reason_code
++
++
++def test_hook_protocols_do_not_add_vendor_fields_to_public_descriptors():
++    assert isinstance(FakeHooks(), AscendCompilerHooks)
++    assert isinstance(FakeHooks(), AscendRuntimeHooks)
++    target_fields = set(TargetSpec.__dataclass_fields__)
++    tensor_fields = set(TensorDesc.__dataclass_fields__)
++    artifact_fields = set(Artifact.__dataclass_fields__)
++    forbidden = {"ub", "l0", "aic", "aiv", "mte", "pipe", "regtensor", "vf"}
++    assert not forbidden.intersection(target_fields)
++    assert not forbidden.intersection(tensor_fields)
++    assert not forbidden.intersection(artifact_fields)

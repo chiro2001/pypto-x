@@ -1,0 +1,1664 @@
+From dba3c9d2fa611bacf65a15ad3886ba556476b44a Mon Sep 17 00:00:00 2001
+From: pypto-x-agent <pypto-x-agent@localhost>
+Date: Thu, 10 Sep 2026 16:45:22 +0800
+Subject: [PATCH 92/96] feat(pypto-x): validate Qwen3.5 GDR chunk path at T=128
+
+Add an auditable T=128 acceptance driver for the fixed Qwen3.5 GDR
+recurrent-state graph plus a stdlib-only Kunpeng 920B native driver and a
+bounded regression test.  No lowering, plan, or artifact contract changes.
+
+Evidence (fixed H=16, K=V=128, state [1,16,128,128], BF16 q/k/v/beta,
+FP32 g/state/scale):
+- scalar/vector-common/AVX2/AVX-512/SVE256 lower 3,843 plans and 4,611
+  iteration domains at T=128, all compact with empty chunk lists;
+  plan 1.19-3.87 MB, ELF 24,584/24,736/881,928 bytes.
+- real execution matches the FP64 token-by-token reference:
+  prediction <= 7.0e-8, state <= 4.4e-8, output within 1 bf16 ULP (3.05e-5).
+- T=1 decode entry carries the chunk new_state (output delta 0.0) and a
+  128-launch T=1 carry chain is bit-identical to the single chunk launch.
+- 920B native runs 6,144 rank-2 runner calls for the chunk plus 48 for the
+  decode entry under the frozen host-batch-loop SVE contract; SVE=1, SVE2=0,
+  VL=32, HWCAP bit22 set, guarded self-test PASS.
+- input immutability and guarded byte-view canaries PASS on every local
+  backend that supports them; vector-common rejects typed byte views.
+
+All heavy stages ran through scripts/resource/run_local_heavy.sh with a
+1,200 s per-stage budget; raw logs live in the task evidence directory.
+---
+ python/tests/ut/pypto_x/qwen35_gdr_t128_920b_driver.py | 521 ++++++++++++++++++++
+ python/tests/ut/pypto_x/qwen35_gdr_t128_driver.py      | 947 +++++++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_qwen35_gdr_t128_driver.py | 146 ++++++
+ 3 files changed, 1614 insertions(+)
+
+diff --git a/python/tests/ut/pypto_x/qwen35_gdr_t128_920b_driver.py b/python/tests/ut/pypto_x/qwen35_gdr_t128_920b_driver.py
+new file mode 100644
+index 000000000..3de17648c
+--- /dev/null
++++ b/python/tests/ut/pypto_x/qwen35_gdr_t128_920b_driver.py
+@@ -0,0 +1,521 @@
++#!/usr/bin/env python3
++"""Kunpeng 920B native T=128 Qwen3.5 GDR acceptance driver (stdlib only).
++
++The static SVE256 ELF built by the pypto-x SVE256 backend is used exactly as
++its documented runtime contract allows: as a rank-2 native matmul runner.  The
++rank-4 ``[B,H,K,V]`` traversal, the ``exp(g)`` decay and the FP32 state update
++stay in this host loop, matching the frozen contract
++``sve_batched_matmul = host_batch_loop_rank2_runner`` and the M1G native
++evidence pattern.  This driver therefore proves *native SVE execution of every
++T=128 matmul in the GDR recurrence*, not a fused native chunk kernel.
++
++Everything is synthetic; no model or checkpoint is read.  The script only uses
++the Python standard library because the ECS has no NumPy or Torch.
++
++Usage on the ECS::
++
++    python3 qwen35_gdr_t128_920b_driver.py <static-sve256.elf> [--steps 128]
++"""
++
++from __future__ import annotations
++
++import ctypes
++import hashlib
++import json
++import math
++import operator
++import os
++import platform
++import struct
++import subprocess
++import sys
++import time
++
++
++REQUEST = struct.Struct("<6I4Q")
++RESPONSE = struct.Struct("<4IQ")
++MAGIC = int.from_bytes(b"PXSV", "little")
++MATMUL = 8
++DTYPES = {"float32": 0, "bf16": 1}
++
++BATCH = 1
++HEADS = 16
++KEY_DIM = 128
++VALUE_DIM = 128
++DEFAULT_STEPS = 128
++INPUT_SEED = 20260910
++
++
++def count(shape):
++    result = 1
++    for value in shape:
++        result *= value
++    return result
++
++
++def bf16_bits(value):
++    bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++    if (bits & 0x7F800000) == 0x7F800000:
++        return (bits >> 16) & 0xFFFF
++    return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) & 0xFFFF
++
++
++def bf16_value(bits):
++    return struct.unpack("<f", struct.pack("<I", (int(bits) & 0xFFFF) << 16))[0]
++
++
++def bf16_round(value):
++    return bf16_value(bf16_bits(value))
++
++
++class Lcg:
++    """Deterministic 31-bit LCG so hosts without NumPy agree on inputs."""
++
++    def __init__(self, seed):
++        self.state = seed & 0x7FFFFFFF
++
++    def uniform(self):
++        self.state = (self.state * 1103515245 + 12345) & 0x7FFFFFFF
++        return self.state / float(0x7FFFFFFF)
++
++
++def pack_values(dtype, values):
++    if dtype == "float32":
++        return struct.pack("<{}f".format(len(values)), *[float(value) for value in values])
++    return struct.pack("<{}H".format(len(values)), *[bf16_bits(value) for value in values])
++
++
++def decode_values(dtype, payload, count_value):
++    if dtype == "float32":
++        return list(struct.unpack("<{}f".format(count_value), payload)) if count_value else []
++    bits = struct.unpack("<{}H".format(count_value), payload) if count_value else ()
++    return [bf16_value(value) for value in bits]
++
++
++def available_kib():
++    values = {}
++    with open("/proc/meminfo", "r") as stream:
++        for line in stream:
++            key, value = line.split(":", 1)
++            if key in ("MemTotal", "MemAvailable"):
++                values[key] = int(value.split()[0])
++    return values
++
++
++def hwcap():
++    try:
++        libc = ctypes.CDLL(None, use_errno=True)
++        libc.getauxval.restype = ctypes.c_ulong
++        return int(libc.getauxval(16))
++    except Exception as exc:  # pragma: no cover - reporting only
++        return "unavailable: {}".format(exc)
++
++
++def vl_bytes():
++    libc = ctypes.CDLL(None)
++    libc.prctl.restype = ctypes.c_int
++    return libc.prctl(51, 0, 0, 0, 0) & 65535
++
++
++def probe(artifact):
++    machine = platform.machine()
++    if machine != "aarch64":
++        raise RuntimeError("native machine is not aarch64: {}".format(machine))
++    features = ""
++    with open("/proc/cpuinfo", "r") as stream:
++        for line in stream:
++            if line.startswith("Features"):
++                features = line.split(":", 1)[1].strip()
++                break
++    feature_list = features.split()
++    if "sve" not in feature_list:
++        raise RuntimeError("SVE is missing from /proc/cpuinfo")
++    raw_vl = vl_bytes()
++    if raw_vl != 32:
++        raise RuntimeError("unexpected SVE VL: {}".format(raw_vl))
++    memory = available_kib()
++    if memory.get("MemAvailable", 0) < 512 * 1024:
++        raise RuntimeError("insufficient native MemAvailable KiB: {}".format(memory))
++    contract = subprocess.run(
++        [artifact, "--contract"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        check=False, timeout=60,
++    )
++    if contract.returncode != 0:
++        raise RuntimeError("contract probe failed: {!r}".format(contract.stderr))
++    raw_hwcap = hwcap()
++    return {
++        "architecture": machine,
++        "sve": True,
++        "sve2": "sve2" in feature_list,
++        "vl_bytes": raw_vl,
++        "hwcap": raw_hwcap,
++        "hwcap_sve_bit_22": bool(raw_hwcap & (1 << 22)) if isinstance(raw_hwcap, int) else None,
++        "mem_kib": memory,
++        "python": platform.python_version(),
++        "emulated": False,
++        "contract": contract.stdout.decode("ascii", "replace").strip().splitlines(),
++    }
++
++
++def guarded_self_test(artifact):
++    result = subprocess.run(
++        [artifact, "--guarded-self-test"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        check=False, timeout=120,
++    )
++    if result.returncode != 0:
++        raise RuntimeError(
++            "guarded self-test failed exit={} stdout={!r} stderr={!r}".format(
++                result.returncode, result.stdout, result.stderr
++            )
++        )
++
++
++def run_matmul(artifact, dtype, left, right, m, k, n, timeout=120):
++    count_value = m * n
++    header = REQUEST.pack(MAGIC, 3, MATMUL, DTYPES[dtype], 0, 0, count_value, m, k, n)
++    completed = subprocess.run(
++        [artifact],
++        input=header + pack_values(dtype, left) + pack_values(dtype, right),
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        check=False,
++        timeout=timeout,
++    )
++    if completed.returncode != 0:
++        raise RuntimeError("matmul exit={} stderr={!r}".format(completed.returncode, completed.stderr))
++    if len(completed.stdout) < RESPONSE.size:
++        raise RuntimeError("matmul returned a short response")
++    magic, version, status, response_dtype, response_count = RESPONSE.unpack(completed.stdout[: RESPONSE.size])
++    if (magic, version, status, response_dtype, response_count) != (
++        MAGIC,
++        3,
++        0,
++        DTYPES[dtype],
++        count_value,
++    ):
++        raise RuntimeError(
++            "matmul response mismatch: {!r}".format((magic, version, status, response_dtype, response_count))
++        )
++    item_size = 4 if dtype == "float32" else 2
++    return decode_values(
++        dtype,
++        completed.stdout[RESPONSE.size : RESPONSE.size + response_count * item_size],
++        response_count,
++    )
++
++
++def build_inputs(steps):
++    """T+1 deterministic tokens; every token differs across t/h/k/v."""
++
++    total = steps + 1
++    rng = Lcg(INPUT_SEED)
++    query = []
++    key = []
++    value = []
++    gate = []
++    beta = []
++    for _time in range(total):
++        for _head in range(HEADS):
++            q_row = [(rng.uniform() - 0.5) * 0.5 for _ in range(KEY_DIM)]
++            k_row = [(rng.uniform() - 0.5) * 0.5 for _ in range(KEY_DIM)]
++            q_norm = math.sqrt(sum(item * item for item in q_row)) or 1.0e-12
++            k_norm = math.sqrt(sum(item * item for item in k_row)) or 1.0e-12
++            query.extend(bf16_round(item / q_norm) for item in q_row)
++            key.extend(bf16_round(item / k_norm) for item in k_row)
++            value.extend(bf16_round((rng.uniform() - 0.5) * 1.2) for _ in range(VALUE_DIM))
++            gate.append(-0.05 - 0.05 * rng.uniform())
++            beta.append(bf16_round(0.10 + 0.50 * rng.uniform()))
++    prior = [rng.uniform() * 0.1 - 0.05 for _ in range(HEADS * KEY_DIM * VALUE_DIM)]
++    return {"query": query, "key": key, "value": value, "gate": gate, "beta": beta, "prior_state": prior}
++
++
++def run_chunk(artifact, steps, inputs):
++    """Execute every T=128 matmul natively and track the golden recurrence."""
++
++    heads, key_dim, value_dim = HEADS, KEY_DIM, VALUE_DIM
++    state_extent = key_dim * value_dim
++    scale = 1.0 / math.sqrt(float(key_dim))
++    golden_state = list(inputs["prior_state"])
++    native_state = list(inputs["prior_state"])
++    prediction_error = 0.0
++    update_error = 0.0
++    output_error = 0.0
++    outputs_nonzero = False
++    runner_calls = 0
++    output_checksum = 0.0
++    started = time.time()
++    for time_index in range(steps):
++        base_time = time_index * heads
++        for head in range(heads):
++            decay = math.exp(inputs["gate"][base_time + head])
++            beta_head = inputs["beta"][base_time + head]
++            head_base = head * state_extent
++            key_row = inputs["key"][(base_time + head) * key_dim : (base_time + head + 1) * key_dim]
++            value_row = inputs["value"][(base_time + head) * value_dim : (base_time + head + 1) * value_dim]
++            query_row = inputs["query"][(base_time + head) * key_dim : (base_time + head + 1) * key_dim]
++
++            # S_decay = exp(g) * S
++            decayed = [item * decay for item in native_state[head_base : head_base + state_extent]]
++            golden_decayed = [item * decay for item in golden_state[head_base : head_base + state_extent]]
++            native_state[head_base : head_base + state_extent] = decayed
++            golden_state[head_base : head_base + state_extent] = golden_decayed
++
++            # predicted = k @ S_decay, executed by the native SVE rank-2 matmul
++            predicted = run_matmul(artifact, "float32", key_row, decayed, 1, key_dim, value_dim)
++            runner_calls += 1
++            golden_predicted = [
++                sum(map(operator.mul, key_row, golden_decayed[column : state_extent : value_dim]))
++                for column in range(value_dim)
++            ]
++            prediction_error = max(
++                prediction_error,
++                max(abs(left - right) for left, right in zip(predicted, golden_predicted)),
++            )
++
++            delta = [left - right for left, right in zip(value_row, predicted)]
++            golden_delta = [left - right for left, right in zip(value_row, golden_predicted)]
++            beta_key = [beta_head * item for item in key_row]
++
++            # update = (beta*k)^T @ delta, executed natively
++            update = run_matmul(artifact, "float32", beta_key, delta, key_dim, 1, value_dim)
++            runner_calls += 1
++            golden_update = [
++                [beta_key[row] * item for item in golden_delta] for row in range(key_dim)
++            ]
++            update_error = max(
++                update_error,
++                max(
++                    abs(update[row * value_dim + column] - golden_update[row][column])
++                    for row in range(key_dim)
++                    for column in range(value_dim)
++                ),
++            )
++            for row in range(key_dim):
++                row_base = head_base + row * value_dim
++                beta_row = beta_key[row]
++                native_row = native_state[row_base : row_base + value_dim]
++                golden_row = golden_state[row_base : row_base + value_dim]
++                native_state[row_base : row_base + value_dim] = [
++                    item + update[row * value_dim + column]
++                    for column, item in enumerate(native_row)
++                ]
++                golden_state[row_base : row_base + value_dim] = [
++                    item + beta_row * golden_delta[column]
++                    for column, item in enumerate(golden_row)
++                ]
++
++            # output = scale * q @ S_new, executed natively on the native state
++            new_state_slice = native_state[head_base : head_base + state_extent]
++            emitted = run_matmul(artifact, "float32", query_row, new_state_slice, 1, key_dim, value_dim)
++            runner_calls += 1
++            golden_state_slice = golden_state[head_base : head_base + state_extent]
++            golden_emitted = [
++                scale
++                * sum(map(operator.mul, query_row, golden_state_slice[column : state_extent : value_dim]))
++                for column in range(value_dim)
++            ]
++            scaled = [scale * item for item in emitted]
++            output_error = max(
++                output_error,
++                max(abs(left - right) for left, right in zip(scaled, golden_emitted)),
++            )
++            if any(abs(item) > 1.0e-9 for item in scaled):
++                outputs_nonzero = True
++            output_checksum += sum(scaled)
++    elapsed = time.time() - started
++
++    state_error = max(abs(left - right) for left, right in zip(native_state, golden_state))
++    if not any(abs(item) > 1.0e-9 for item in native_state):
++        raise RuntimeError("native state is unexpectedly zero")
++    if not outputs_nonzero:
++        raise RuntimeError("native outputs are unexpectedly zero")
++    result = {
++        "steps": steps,
++        "shape": [BATCH, HEADS, KEY_DIM, VALUE_DIM],
++        "runner_rank": 2,
++        "runner_calls": runner_calls,
++        "host_batch_loop": True,
++        "host_elementwise_fallback": True,
++        "beta_dtype": "bf16",
++        "state_dtype": "float32",
++        "wall_seconds": elapsed,
++        "seconds_per_step": elapsed / steps,
++        "max_abs_prediction": prediction_error,
++        "max_abs_update": update_error,
++        "max_abs_state": state_error,
++        "max_abs_output": output_error,
++        "output_checksum": output_checksum,
++        "state_checksum": sum(native_state),
++        "state_first": native_state[:4],
++        "state_last": native_state[-4:],
++    }
++    return result, native_state, golden_state
++
++
++def run_decode_carry(artifact, steps, inputs, native_state, golden_state):
++    """One T=1 decode entry that carries the chunk's final states.
++
++    Both the native runner path and the pure-Python golden path advance one
++    extra token from the *same* state produced by the T=128 chunk, so the
++    result is a real carry-correctness check rather than a re-run.
++    """
++
++    heads, key_dim, value_dim = HEADS, KEY_DIM, VALUE_DIM
++    state_extent = key_dim * value_dim
++    scale = 1.0 / math.sqrt(float(key_dim))
++    base_time = steps * heads
++    state = list(native_state)
++    golden = list(golden_state)
++    prediction_error = 0.0
++    update_error = 0.0
++    output_error = 0.0
++    output_checksum = 0.0
++    runner_calls = 0
++    started = time.time()
++    for head in range(heads):
++        decay = math.exp(inputs["gate"][base_time + head])
++        beta_head = inputs["beta"][base_time + head]
++        head_base = head * state_extent
++        key_row = inputs["key"][(base_time + head) * key_dim : (base_time + head + 1) * key_dim]
++        value_row = inputs["value"][(base_time + head) * value_dim : (base_time + head + 1) * value_dim]
++        query_row = inputs["query"][(base_time + head) * key_dim : (base_time + head + 1) * key_dim]
++        state[head_base : head_base + state_extent] = [
++            item * decay for item in state[head_base : head_base + state_extent]
++        ]
++        golden[head_base : head_base + state_extent] = [
++            item * decay for item in golden[head_base : head_base + state_extent]
++        ]
++        decayed = state[head_base : head_base + state_extent]
++        golden_decayed = golden[head_base : head_base + state_extent]
++        predicted = run_matmul(artifact, "float32", key_row, decayed, 1, key_dim, value_dim)
++        runner_calls += 1
++        golden_predicted = [
++            sum(map(operator.mul, key_row, golden_decayed[column : state_extent : value_dim]))
++            for column in range(value_dim)
++        ]
++        prediction_error = max(
++            prediction_error,
++            max(abs(left - right) for left, right in zip(predicted, golden_predicted)),
++        )
++        delta = [left - right for left, right in zip(value_row, predicted)]
++        golden_delta = [left - right for left, right in zip(value_row, golden_predicted)]
++        beta_key = [beta_head * item for item in key_row]
++        update = run_matmul(artifact, "float32", beta_key, delta, key_dim, 1, value_dim)
++        runner_calls += 1
++        for row in range(key_dim):
++            row_base = head_base + row * value_dim
++            beta_row = beta_key[row]
++            update_error = max(
++                update_error,
++                max(
++                    abs(update[row * value_dim + column] - beta_row * golden_delta[column])
++                    for column in range(value_dim)
++                ),
++            )
++            state[row_base : row_base + value_dim] = [
++                item + update[row * value_dim + column]
++                for column, item in enumerate(state[row_base : row_base + value_dim])
++            ]
++            golden[row_base : row_base + value_dim] = [
++                item + beta_row * golden_delta[column]
++                for column, item in enumerate(golden[row_base : row_base + value_dim])
++            ]
++        emitted = run_matmul(
++            artifact, "float32", query_row, state[head_base : head_base + state_extent], 1, key_dim, value_dim
++        )
++        runner_calls += 1
++        golden_state_slice = golden[head_base : head_base + state_extent]
++        golden_emitted = [
++            scale
++            * sum(map(operator.mul, query_row, golden_state_slice[column : state_extent : value_dim]))
++            for column in range(value_dim)
++        ]
++        scaled = [scale * item for item in emitted]
++        output_error = max(
++            output_error,
++            max(abs(left - right) for left, right in zip(scaled, golden_emitted)),
++        )
++        output_checksum += sum(scaled)
++    elapsed = time.time() - started
++    return {
++        "entry": "T1_decode_with_chunk_new_state",
++        "runner_calls": runner_calls,
++        "wall_seconds": elapsed,
++        "max_abs_prediction": prediction_error,
++        "max_abs_update": update_error,
++        "max_abs_state": max(abs(left - right) for left, right in zip(state, golden)),
++        "max_abs_output": output_error,
++        "output_checksum": output_checksum,
++        "output_nonzero": any(abs(item) > 1.0e-9 for item in scaled),
++    }
++
++
++def main(argv):
++    if len(argv) < 2:
++        raise SystemExit("usage: qwen35_gdr_t128_920b_driver.py STATIC_SVE_ELF [--steps N] [--skip-carry]")
++    artifact = os.path.abspath(argv[1])
++    if not os.path.isfile(artifact):
++        raise SystemExit("artifact does not exist: {}".format(artifact))
++    steps = DEFAULT_STEPS
++    skip_carry = False
++    index = 2
++    while index < len(argv):
++        if argv[index] == "--steps":
++            steps = int(argv[index + 1])
++            index += 2
++        elif argv[index] == "--skip-carry":
++            skip_carry = True
++            index += 1
++        else:
++            raise SystemExit("unknown argument {!r}".format(argv[index]))
++
++    probe_data = probe(artifact)
++    guarded_self_test(artifact)
++    build_started = time.time()
++    inputs = build_inputs(steps)
++    build_seconds = time.time() - build_started
++    snapshots = (
++        tuple(inputs["query"][: 16 * 128]),
++        inputs["gate"][: HEADS],
++        inputs["prior_state"][: 16],
++    )
++    chunk, native_final_state, golden_final_state = run_chunk(artifact, steps, inputs)
++    decode = None
++    if not skip_carry:
++        decode = run_decode_carry(artifact, steps, inputs, native_final_state, golden_final_state)
++    inputs_unchanged = snapshots == (
++        tuple(inputs["query"][: 16 * 128]),
++        inputs["gate"][: HEADS],
++        inputs["prior_state"][: 16],
++    )
++    if not inputs_unchanged:
++        raise RuntimeError("native inputs changed during execution")
++    thresholds = {
++        "max_abs_prediction": 2.0e-4,
++        "max_abs_update": 2.0e-4,
++        "max_abs_state": 2.0e-4,
++        "max_abs_output": 2.0e-4,
++    }
++    for key, limit in thresholds.items():
++        if chunk[key] > limit:
++            raise RuntimeError("native T=128 mismatch {}={}".format(key, chunk[key]))
++    if decode is not None:
++        for key, limit in thresholds.items():
++            if decode[key] > limit:
++                raise RuntimeError("native T=1 decode mismatch {}={}".format(key, decode[key]))
++    with open(artifact, "rb") as stream:
++        digest = hashlib.sha256(stream.read()).hexdigest()
++    print("native_gdr_t128=PASS")
++    print("probe={}".format(json.dumps(probe_data, sort_keys=True)))
++    print("guarded_self_test=PASS")
++    print("input_build_seconds={}".format(build_seconds))
++    print("inputs_unchanged={}".format(inputs_unchanged))
++    print("gdr_chunk={}".format(json.dumps(chunk, sort_keys=True)))
++    if decode is not None:
++        print("decode_entry={}".format(json.dumps(decode, sort_keys=True)))
++    print("artifact_sha256={}".format(digest))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv))
+diff --git a/python/tests/ut/pypto_x/qwen35_gdr_t128_driver.py b/python/tests/ut/pypto_x/qwen35_gdr_t128_driver.py
+new file mode 100644
+index 000000000..7c561cb61
+--- /dev/null
++++ b/python/tests/ut/pypto_x/qwen35_gdr_t128_driver.py
+@@ -0,0 +1,947 @@
++#!/usr/bin/env python3
++"""Qwen3.5-0.8B GDR T=128 acceptance driver (closes ``gdr_t128_not_validated``).
++
++This driver builds the *unmodified* public Qwen3.5 GDR recurrent-state graph
++(:func:`pypto.portable.qwen35.build_qwen35_gdr_recurrent_state`) at the fixed
++model shape (H=16, K=V=128, state ``[B,H,K,V]``) with ``T=128`` and records:
++
++* per-backend lowering/compile facts (plan count, iteration domains, compact
++  flags, empty chunk lists, plan/artifact/ELF bytes, peak RSS);
++* real execution of the T=128 prefill chunk against an independent NumPy
++  token-by-token sequential reference (prediction/state/output);
++* a T=1 decode entry that carries ``new_state`` produced by the chunk, plus an
++  optional 128-step T=1 carry chain compared with the single chunk launch;
++* input immutability and guarded canary checks.
++
++Two graph variants are used deliberately:
++
++``plain``    the shipped public program (2 returns: ``output``, ``new_state``);
++``observe``  the identical SSA graph with the 128 internal ``step_t_predicted``
++             values appended as extra returns.  Only the return list changes;
++             no operation, plan, or contract is modified.  The augmented
++             variant exists because the public ABI intentionally exposes only
++             ``output`` and ``new_state``.
++
++Every sub-command handles exactly one backend in one process so that the raw
++log stays auditable and RSS stays bounded.  All tensors are synthetic; no
++model or checkpoint file is read.
++
++Usage (all heavy commands must run through ``run_local_heavy.sh``)::
++
++    PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=<worktree>/python \\
++        python3 qwen35_gdr_t128_driver.py lower --backend sve256 --steps 128 \\
++        --work-dir <dir> --report <dir>/sve256_lower.json
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import os
++import resource
++import struct
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++
++from pypto.abi import LaunchRequest, TensorDesc
++from pypto.portable.qwen35 import build_qwen35_gdr_recurrent_state
++from pypto.target import TargetSpec
++
++
++BACKENDS = ("scalar", "vector", "avx2", "avx512", "sve256")
++QWEN_BATCH = 1
++QWEN_HEADS = 16
++QWEN_KEY_DIM = 128
++QWEN_VALUE_DIM = 128
++QWEN_SCALE = 128 ** -0.5
++INPUT_SEED = 20260910
++GUARD_HEAD = 0xA5
++GUARD_TAIL = 0x5A
++PREDICTION_PREFIX = "step_{}_predicted"
++
++
++# ---------------------------------------------------------------------------
++# input generation and independent sequential reference
++# ---------------------------------------------------------------------------
++
++
++def _bf16_round(values):
++    """Round an FP32 array to BF16 (round-to-nearest-even), returning FP32."""
++
++    fp32 = np.asarray(values, dtype=np.float32)
++    bits = fp32.view(np.uint32).astype(np.uint32)
++    exponent_mask = np.uint32(0x7F800000)
++    guard = np.uint32(0x7FFF) + ((bits >> np.uint32(16)) & np.uint32(1))
++    finite = (bits & exponent_mask) != exponent_mask
++    rounded = np.where(finite, (bits + guard) & np.uint32(0xFFFF0000), bits & np.uint32(0xFFFF0000))
++    return rounded.astype(np.uint32).view(np.float32).copy()
++
++
++def _l2_normalize(values):
++    fp32 = np.asarray(values, dtype=np.float32)
++    norm = np.sqrt(np.sum(fp32.astype(np.float64) ** 2, axis=-1, keepdims=True))
++    norm = np.maximum(norm, 1.0e-12)
++    return (fp32 / norm.astype(np.float32)).astype(np.float32)
++
++
++def build_inputs(steps):
++    """Deterministic non-symmetric BF16/FP32 inputs for ``steps + 1`` tokens."""
++
++    total = steps + 1
++    rng = np.random.RandomState(INPUT_SEED)
++    query = _bf16_round(_l2_normalize(rng.uniform(-0.5, 0.5, (total, QWEN_HEADS, QWEN_KEY_DIM))))
++    key = _bf16_round(_l2_normalize(rng.uniform(-0.5, 0.5, (total, QWEN_HEADS, QWEN_KEY_DIM))))
++    value = _bf16_round(rng.uniform(-0.6, 0.6, (total, QWEN_HEADS, QWEN_VALUE_DIM)))
++    gate = (-0.05 - 0.05 * rng.uniform(0.0, 1.0, (total, QWEN_HEADS))).astype(np.float32)
++    beta = _bf16_round(0.10 + 0.50 * rng.uniform(0.0, 1.0, (total, QWEN_HEADS)))
++    prior = (rng.uniform(-0.05, 0.05, (QWEN_HEADS, QWEN_KEY_DIM, QWEN_VALUE_DIM))).astype(np.float32)
++    return {
++        "query": query,
++        "key": key,
++        "value": value,
++        "gate": gate,
++        "beta": beta,
++        "prior_state": prior,
++    }
++
++
++def sequential_reference(inputs, steps, dtype=np.float64):
++    """Token-by-token GDR reference: the independent sequential oracle.
++
++    ``S_decay = exp(g) * S``; ``predicted = k @ S_decay``;
++    ``S_new = S_decay + (beta*k)^T @ (v - predicted)``;
++    ``output = scale * q @ S_new``.
++    """
++
++    query = inputs["query"][:steps].astype(dtype)
++    key = inputs["key"][:steps].astype(dtype)
++    value = inputs["value"][:steps].astype(dtype)
++    gate = inputs["gate"][:steps].astype(dtype)
++    beta = inputs["beta"][:steps].astype(dtype)
++    state = inputs["prior_state"].astype(dtype).copy()
++    outputs = np.zeros((steps, QWEN_HEADS, QWEN_VALUE_DIM), dtype=dtype)
++    predictions = np.zeros((steps, QWEN_HEADS, QWEN_VALUE_DIM), dtype=dtype)
++    for time_index in range(steps):
++        decay = np.exp(gate[time_index])
++        decayed = state * decay[:, None, None]
++        predicted = np.einsum("hk,hkv->hv", key[time_index], decayed)
++        delta = value[time_index] - predicted
++        beta_key = beta[time_index][:, None] * key[time_index]
++        state = decayed + np.einsum("hk,hv->hkv", beta_key, delta)
++        predictions[time_index] = predicted
++        outputs[time_index] = (QWEN_SCALE * np.einsum("hk,hkv->hv", query[time_index], state)).astype(dtype)
++    return outputs, state, predictions
++
++
++# ---------------------------------------------------------------------------
++# graph construction
++# ---------------------------------------------------------------------------
++
++
++def build_program(steps):
++    return build_qwen35_gdr_recurrent_state(QWEN_BATCH, steps)
++
++
++def _value_refs(program):
++    found = {}
++    for operation in program.functions[0].body.operations:
++        for ref in operation.outputs:
++            found[ref.name] = ref
++    return found
++
++
++def build_observe_program(steps):
++    """Return the same SSA graph with every ``step_t_predicted`` observable."""
++
++    from pypto.core_ir import CoreFunction, CoreProgram
++
++    program = build_program(steps)
++    function = program.functions[0]
++    refs = _value_refs(program)
++    extra = []
++    for time_index in range(steps):
++        name = PREDICTION_PREFIX.format(time_index)
++        if name not in refs:
++            raise SystemExit("missing observable prediction value {!r}".format(name))
++        extra.append(refs[name])
++    returns = tuple(function.returns) + tuple(extra)
++    observed = CoreFunction(function.name, function.parameters, returns, function.body)
++    return CoreProgram(functions=(observed,), metadata=program.metadata)
++
++
++# ---------------------------------------------------------------------------
++# lowering / compile helpers
++# ---------------------------------------------------------------------------
++
++
++def _target(backend):
++    if backend == "scalar":
++        return TargetSpec("cpu", "x86_64-linux-gnu")
++    if backend == "vector":
++        return TargetSpec(
++            "cpu",
++            "x86_64-linux-gnu",
++            attributes={"lane_count": 4, "specialization": {"compact_iteration": True}},
++        )
++    if backend == "avx2":
++        return TargetSpec(
++            "cpu",
++            "x86_64-linux-gnu",
++            features=("avx", "avx2", "osxsave", "ymm"),
++            attributes={"lane_count": 8},
++        )
++    if backend == "avx512":
++        return TargetSpec(
++            "cpu",
++            "x86_64-linux-gnu",
++            features=("avx512f",),
++            attributes={"lane_count": 16},
++        )
++    if backend == "sve256":
++        return TargetSpec(
++            "cpu",
++            "aarch64-linux-gnu",
++            features=("sve", "sve2"),
++            attributes={"vl_bytes": 32},
++        )
++    raise SystemExit("unknown backend {!r}".format(backend))
++
++
++def _compiler(backend):
++    if backend == "scalar":
++        from pypto.compiler.targets.cpu import CpuScalarCompiler
++
++        return CpuScalarCompiler()
++    if backend == "vector":
++        from pypto.compiler.targets.cpu_vector import CpuVectorCompiler
++
++        return CpuVectorCompiler()
++    if backend == "avx2":
++        from pypto.compiler.targets.cpu_avx2 import Avx2Compiler
++
++        return Avx2Compiler()
++    if backend == "avx512":
++        from pypto.compiler.targets.cpu_avx512 import Avx512Compiler
++
++        return Avx512Compiler()
++    if backend == "sve256":
++        from pypto.compiler.targets.cpu_sve256 import Sve256Compiler
++
++        return Sve256Compiler()
++    raise SystemExit("unknown backend {!r}".format(backend))
++
++
++def _artifact_format(backend):
++    return {
++        "scalar": "pypto-x.cpu.scalar",
++        "vector": "pypto-x.cpu.vector.common",
++        "avx2": "pypto-x.cpu.avx2",
++        "avx512": "pypto-x.cpu.avx512",
++        "sve256": "pypto-x.cpu.sve256",
++    }[backend]
++
++
++def _plans(target_ir):
++    plans = getattr(target_ir, "plans", None)
++    if plans is None:
++        vector_program = getattr(target_ir, "vector_program", None)
++        plans = None if vector_program is None else vector_program.plans
++    return None if plans is None else tuple(plans)
++
++
++def _iteration_nodes(value, path="root"):
++    found = []
++    if isinstance(value, dict):
++        if "compact" in value and "chunks" in value:
++            found.append((path, value))
++        for key, child in value.items():
++            found.extend(_iteration_nodes(child, "{}.{}".format(path, key)))
++    elif isinstance(value, list):
++        for index, child in enumerate(value):
++            found.extend(_iteration_nodes(child, "{}[{}]".format(path, index)))
++    return found
++
++
++def _target_ir_dict(target_ir):
++    if hasattr(target_ir, "to_dict"):
++        return dict(target_ir.to_dict())
++    raise SystemExit("target IR {} has no to_dict()".format(type(target_ir).__name__))
++
++
++def lower_program(backend, program):
++    compiler = _compiler(backend)
++    return compiler.lower(program, _target(backend))
++
++
++def compile_target_ir(backend, target_ir, build_dir):
++    from pypto.compiler import CompileOptions
++
++    compiler = _compiler(backend)
++    options = CompileOptions(
++        artifact_format=_artifact_format(backend),
++        extra={"build_dir": str(build_dir)},
++    )
++    return compiler.compile(target_ir, options)
++
++
++def describe_lowering(backend, target_ir):
++    """Plan/iteration-domain facts for one target IR.
++
++    The scalar backend has no vector plan construct at all: its lowering output
++    is the validated ``CoreProgram`` itself.  That case is reported explicitly
++    instead of being confused with a plan whose compact flag is false.
++    """
++
++    plans = _plans(target_ir)
++    if plans is None:
++        program = getattr(target_ir, "program", None)
++        core_bytes = (
++            len(program.canonical_json().encode("utf-8")) if program is not None else None
++        )
++        described = {
++            "backend": backend,
++            "plan_count": 0,
++            "iteration_domain_count": 0,
++            "iteration_compact_all": None,
++            "iteration_chunks_empty_all": None,
++            "plan_bytes": core_bytes if core_bytes is not None else 0,
++            "plan_construct": "none_scalar_core_program",
++            "target_ir_class": type(target_ir).__name__,
++            "core_program_bytes": core_bytes,
++        }
++        lowering_version = getattr(target_ir, "lowering_version", None)
++        if lowering_version is not None:
++            described["lowering_version"] = lowering_version
++        return described
++
++    data = _target_ir_dict(target_ir)
++    nodes = _iteration_nodes(data)
++    plan_bytes = len(json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8"))
++    compact_flags = [bool(node["compact"]) for _path, node in nodes]
++    chunk_lists = [list(node["chunks"]) for _path, node in nodes]
++    described = {
++        "backend": backend,
++        "plan_count": len(plans),
++        "iteration_domain_count": len(nodes),
++        "iteration_compact_all": all(compact_flags) if compact_flags else None,
++        "iteration_chunks_empty_all": all(len(chunks) == 0 for chunks in chunk_lists) if chunk_lists else None,
++        "plan_bytes": plan_bytes,
++        "plan_construct": "vector_plan",
++        "target_ir_class": type(target_ir).__name__,
++    }
++    for name in ("lowering_version", "plan_version"):
++        value = getattr(target_ir, name, None)
++        if value is not None:
++            described[name] = value
++    if plans:
++        plan_versions = getattr(plans[0], "plan_version", None)
++        if plan_versions is not None:
++            described["vector_plan_version"] = plan_versions
++    return described
++
++
++# ---------------------------------------------------------------------------
++# execution helpers
++# ---------------------------------------------------------------------------
++
++
++def _nbytes(dtype, count):
++    return count * (2 if dtype == "bf16" else 4)
++
++
++def element_count(shape):
++    total = 1
++    for value in shape:
++        total *= value
++    return total
++
++
++class GuardedOutput:
++    """Output descriptor backed by a bytearray with head/tail canaries."""
++
++    def __init__(self, dtype, shape):
++        self.dtype = dtype
++        self.shape = tuple(shape)
++        self.count = element_count(self.shape)
++        self.raw = bytearray(b"\xA5" + b"\x00" * _nbytes(dtype, self.count) + b"\x5A")
++        self.descriptor = TensorDesc(dtype, self.shape, handle=memoryview(self.raw)[1:-1])
++
++    def body(self):
++        return bytes(self.raw[1:-1])
++
++    def canary_ok(self):
++        return self.raw[0] == GUARD_HEAD and self.raw[-1] == GUARD_TAIL
++
++    def values(self):
++        return decode_values(self.dtype, self.body(), self.count)
++
++
++class HostOutput:
++    """Fallback output backed by a HostTensor (vector-common rejects byte views)."""
++
++    def __init__(self, dtype, shape):
++        from pypto.backends.cpu import HostTensor
++
++        self.tensor = HostTensor.zeros(dtype, shape)
++        self.dtype = dtype
++        self.shape = tuple(shape)
++        self.count = element_count(self.shape)
++        self.descriptor = self.tensor.descriptor()
++
++    def body(self):
++        raise NotImplementedError("HostTensor output has no byte view")
++
++    def canary_ok(self):
++        return None
++
++    def values(self):
++        return np.asarray(self.tensor.data, dtype=np.float64)
++
++
++def make_outputs(backend, dtype, shape):
++    """Guarded byte view where supported, HostTensor for vector-common."""
++
++    if backend == "vector":
++        return HostOutput(dtype, shape)
++    return GuardedOutput(dtype, shape)
++
++
++def _canary_state(items):
++    flags = [item.canary_ok() for item in items]
++    known = [flag for flag in flags if flag is not None]
++    if not known:
++        return None
++    return all(known)
++
++
++def decode_values(dtype, payload, count):
++    if dtype == "float32":
++        return np.frombuffer(payload, dtype="<f4", count=count).astype(np.float64)
++    bits = np.frombuffer(payload, dtype="<u2", count=count).astype(np.uint32)
++    return (bits << np.uint32(16)).view(np.float32).astype(np.float64)
++
++
++def host_inputs(inputs, steps, token_offset=0):
++    """HostTensor inputs for one chunk starting at ``token_offset``."""
++
++    from pypto.backends.cpu import HostTensor
++
++    def slice_time(name, dtype):
++        array = inputs[name][token_offset : token_offset + steps]
++        return HostTensor(dtype, (QWEN_BATCH, steps) + array.shape[1:], array.reshape(-1).tolist())
++
++    return [
++        slice_time("query", "bf16"),
++        slice_time("key", "bf16"),
++        slice_time("value", "bf16"),
++        slice_time("gate", "float32"),
++        slice_time("beta", "bf16"),
++        HostTensor(
++            "float32",
++            (QWEN_BATCH, QWEN_HEADS, QWEN_KEY_DIM, QWEN_VALUE_DIM),
++            inputs["prior_state"].reshape(-1).tolist(),
++        ),
++    ]
++
++
++def make_runtime(backend):
++    if backend == "scalar":
++        from pypto.backends.cpu import CpuScalarRuntime
++
++        return CpuScalarRuntime()
++    if backend == "vector":
++        from pypto.backends.cpu.vector import CpuVectorRuntime
++
++        return CpuVectorRuntime()
++    if backend == "avx2":
++        from pypto.backends.cpu.x86 import Avx2Runtime
++
++        return Avx2Runtime()
++    if backend == "avx512":
++        from pypto.backends.cpu.x86 import Avx512Runtime
++
++        return Avx512Runtime()
++    if backend == "sve256":
++        from pypto.backends.cpu.aarch64.sve256 import Sve256Runtime
++
++        return Sve256Runtime(execution_mode="qemu")
++    raise SystemExit("unknown backend {!r}".format(backend))
++
++
++def _runtime_availability(runtime):
++    availability = getattr(runtime, "availability", None)
++    if availability is None:
++        return None
++    try:
++        return availability().to_dict()
++    except Exception as exc:  # pragma: no cover - defensive reporting only
++        return {"probe_error": str(exc)}
++
++
++def guarded_self_test(runtime, artifact):
++    checker = None
++    for name in ("guarded_self_test", "guarded_buffer_self_test"):
++        candidate = getattr(runtime, name, None)
++        if candidate is not None:
++            checker = candidate
++            break
++    if checker is None:
++        return None
++    try:
++        checker(artifact)
++        return True
++    except Exception as exc:
++        return "FAILED: {}".format(exc)
++
++
++def execute_chunk(backend, steps, work_dir, inputs, observe=True, plain=False, carry=False, carry_chain=False):
++    """Execute the T=128 chunk + decode entries and compare with the reference."""
++
++    from pypto.compiler import CompileOptions
++
++    result = {
++        "backend": backend,
++        "steps": steps,
++        "qwen_scale": QWEN_SCALE,
++        "observations": [],
++        "failures": [],
++    }
++    runtime = make_runtime(backend)
++    result["runtime_available"] = getattr(runtime, "is_available", lambda: None)()
++    result["runtime_availability"] = _runtime_availability(runtime)
++    if result["runtime_available"] is False:
++        result["status"] = "SKIPPED_UNAVAILABLE"
++        return result
++
++    chunk_program = build_observe_program(steps) if observe else build_program(steps)
++    compiler = _compiler(backend)
++    target_ir = compiler.lower(chunk_program, _target(backend))
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format=_artifact_format(backend),
++            extra={"build_dir": str(Path(work_dir) / (backend + "_observe_build"))},
++        ),
++    )
++    result["observe_variant"] = bool(observe)
++    result["artifact_metadata"] = {
++        key: artifact.metadata[key]
++        for key in ("backend", "lowering_version", "plan_version", "artifact_payload_version")
++        if key in artifact.metadata
++    }
++    result["guarded_self_test"] = guarded_self_test(runtime, artifact)
++    if artifact.path is not None and Path(artifact.path).is_file():
++        result["artifact_bytes"] = Path(artifact.path).stat().st_size
++        result["artifact_sha256"] = hashlib.sha256(Path(artifact.path).read_bytes()).hexdigest()
++
++    loaded = runtime.load(artifact)
++    result["loaded_plan_count"] = len(_plans(loaded.target_ir) or ())
++
++    chunk_inputs = host_inputs(inputs, steps, 0)
++    snapshots = [list(item.data) for item in chunk_inputs]
++    outputs = []
++    for ref in chunk_program.functions[0].returns:
++        outputs.append(make_outputs(backend, ref.type.dtype, ref.type.shape))
++    request = LaunchRequest(
++        artifact,
++        inputs=[item.descriptor(readonly=True) for item in chunk_inputs],
++        outputs=[item.descriptor for item in outputs],
++        scalars={"scale": QWEN_SCALE},
++    )
++    started = time.time()
++    runtime.launch(request)
++    chunk_seconds = time.time() - started
++    result["chunk_wall_seconds"] = chunk_seconds
++    result["chunk_seconds_per_step"] = chunk_seconds / steps
++    result["chunk_launch_calls"] = 1
++    result["input_immutable"] = all(
++        item.data == snapshot for item, snapshot in zip(chunk_inputs, snapshots)
++    )
++    result["guard_canary_ok"] = _canary_state(outputs)
++
++    output = outputs[0].values().reshape(steps, QWEN_HEADS, QWEN_VALUE_DIM)
++    new_state = outputs[1].values().reshape(QWEN_HEADS, QWEN_KEY_DIM, QWEN_VALUE_DIM)
++    predictions = np.stack(
++        [item.values().reshape(QWEN_HEADS, QWEN_VALUE_DIM) for item in outputs[2:]]
++    ) if observe else None
++    result["chunk_output_bytes_sha256"] = hashlib.sha256(
++        np.asarray(output, dtype=np.float64).tobytes()
++    ).hexdigest()
++    result["chunk_state_bytes_sha256"] = hashlib.sha256(
++        np.asarray(new_state, dtype=np.float64).tobytes()
++    ).hexdigest()
++
++    ref64_output, ref64_state, ref64_pred = sequential_reference(inputs, steps, np.float64)
++    ref32_output, ref32_state, ref32_pred = sequential_reference(inputs, steps, np.float32)
++    bf16_ref_output = _bf16_round(ref64_output).astype(np.float64)
++
++    comparison = {
++        "output_vs_bf16_rounded_reference": float(np.max(np.abs(output - bf16_ref_output))),
++        "output_vs_fp64_reference": float(np.max(np.abs(output - ref64_output))),
++        "output_reference_bf16_quantization": float(np.max(np.abs(bf16_ref_output - ref64_output))),
++        "state_vs_fp64_reference": float(np.max(np.abs(new_state - ref64_state))),
++        "state_vs_fp32_reference": float(np.max(np.abs(new_state - ref32_state.astype(np.float64)))),
++        "state_reference_fp32_noise": float(np.max(np.abs(ref32_state.astype(np.float64) - ref64_state))),
++        "nonzero_output": bool(np.max(np.abs(output)) > 1.0e-6),
++        "nonzero_state": bool(np.max(np.abs(new_state)) > 1.0e-6),
++    }
++    if predictions is not None:
++        comparison["prediction_vs_fp64_reference"] = float(np.max(np.abs(predictions - ref64_pred)))
++        comparison["prediction_vs_fp32_reference"] = float(np.max(np.abs(predictions - ref32_pred.astype(np.float64))))
++    result["comparison"] = comparison
++
++    # T=1 decode entry that carries the chunk's new_state for the next token.
++    decode_program = build_program(1)
++    decode_artifact = compiler.compile(
++        compiler.lower(decode_program, _target(backend)),
++        CompileOptions(
++            artifact_format=_artifact_format(backend),
++            extra={"build_dir": str(Path(work_dir) / (backend + "_decode_build"))},
++        ),
++    )
++    decode_runtime = make_runtime(backend)
++    decode_runtime.load(decode_artifact)
++    if carry:
++        carry_inputs = host_inputs(inputs, 1, steps)
++        carry_inputs[5] = _state_host_tensor(new_state)
++        carry_snapshots = [list(item.data) for item in carry_inputs]
++        carry_outputs = [
++            make_outputs(backend, "bf16", (1, 1, QWEN_HEADS, QWEN_VALUE_DIM)),
++            make_outputs(backend, "float32", (1, QWEN_HEADS, QWEN_KEY_DIM, QWEN_VALUE_DIM)),
++        ]
++        started = time.time()
++        decode_runtime.launch(
++            LaunchRequest(
++                decode_artifact,
++                inputs=[item.descriptor(readonly=True) for item in carry_inputs],
++                outputs=[item.descriptor for item in carry_outputs],
++                scalars={"scale": QWEN_SCALE},
++            )
++        )
++        decode_seconds = time.time() - started
++        full_output, full_state, _full_pred = sequential_reference(inputs, steps + 1, np.float64)
++        total = steps + 1
++        _ = total
++        carry_output = carry_outputs[0].values().reshape(QWEN_HEADS, QWEN_VALUE_DIM)
++        carry_state = carry_outputs[1].values().reshape(QWEN_HEADS, QWEN_KEY_DIM, QWEN_VALUE_DIM)
++        result["decode_carry"] = {
++            "wall_seconds": decode_seconds,
++            "launch_calls": 1,
++            "prior_state_from_chunk_new_state": True,
++            "input_immutable": all(
++                item.data == snapshot for item, snapshot in zip(carry_inputs, carry_snapshots)
++            ),
++            "guard_canary_ok": _canary_state(carry_outputs),
++            "output_vs_reference": float(
++                np.max(np.abs(carry_output - _bf16_round(full_output[steps]).astype(np.float64)))
++            ),
++            "state_vs_reference": float(np.max(np.abs(carry_state - full_state))),
++        }
++
++    if plain:
++        plain_result = _execute_plain(backend, steps, work_dir, inputs, runtime_available=result["runtime_available"])
++        result["plain_variant"] = plain_result
++
++    if carry_chain:
++        result["carry_chain"] = _execute_carry_chain(backend, steps, work_dir, inputs, output, new_state)
++
++    result["peak_rss_kib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
++    result["children_peak_rss_kib"] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
++    result["status"] = "PASS"
++    return result
++
++
++def _state_host_tensor(state):
++    from pypto.backends.cpu import HostTensor
++
++    return HostTensor(
++        "float32",
++        (QWEN_BATCH, QWEN_HEADS, QWEN_KEY_DIM, QWEN_VALUE_DIM),
++        np.asarray(state, dtype=np.float32).reshape(-1).tolist(),
++    )
++
++
++def _execute_plain(backend, steps, work_dir, inputs, runtime_available=None):
++    """Execute the unmodified 2-return public artifact at T=128."""
++
++    from pypto.compiler import CompileOptions
++
++    compiler = _compiler(backend)
++    program = build_program(steps)
++    artifact = compiler.compile(
++        compiler.lower(program, _target(backend)),
++        CompileOptions(
++            artifact_format=_artifact_format(backend),
++            extra={"build_dir": str(Path(work_dir) / (backend + "_plain_build"))},
++        ),
++    )
++    runtime = make_runtime(backend)
++    runtime.load(artifact)
++    chunk_inputs = host_inputs(inputs, steps, 0)
++    outputs = [
++        make_outputs(backend, "bf16", (1, steps, QWEN_HEADS, QWEN_VALUE_DIM)),
++        make_outputs(backend, "float32", (1, QWEN_HEADS, QWEN_KEY_DIM, QWEN_VALUE_DIM)),
++    ]
++    started = time.time()
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[item.descriptor(readonly=True) for item in chunk_inputs],
++            outputs=[item.descriptor for item in outputs],
++            scalars={"scale": QWEN_SCALE},
++        )
++    )
++    elapsed = time.time() - started
++    ref64_output, ref64_state, _ref64_pred = sequential_reference(inputs, steps, np.float64)
++    output = outputs[0].values().reshape(steps, QWEN_HEADS, QWEN_VALUE_DIM)
++    state = outputs[1].values().reshape(QWEN_HEADS, QWEN_KEY_DIM, QWEN_VALUE_DIM)
++    if artifact.path is not None and Path(artifact.path).is_file():
++        payload = Path(artifact.path).read_bytes()
++    else:
++        payload = bytes(artifact.payload or b"")
++    return {
++        "wall_seconds": elapsed,
++        "artifact_bytes": len(payload),
++        "artifact_sha256": hashlib.sha256(payload).hexdigest(),
++        "guard_canary_ok": _canary_state(outputs),
++        "output_bytes_sha256": hashlib.sha256(np.asarray(outputs[0].values(), dtype=np.float64).tobytes()).hexdigest(),
++        "state_bytes_sha256": hashlib.sha256(np.asarray(outputs[1].values(), dtype=np.float64).tobytes()).hexdigest(),
++        "output_vs_bf16_rounded_reference": float(
++            np.max(np.abs(output - _bf16_round(ref64_output).astype(np.float64)))
++        ),
++        "state_vs_fp64_reference": float(np.max(np.abs(state - ref64_state))),
++    }
++
++
++def _execute_carry_chain(backend, steps, work_dir, inputs, chunk_output, chunk_state):
++    """Feed the chunk one token at a time (128 x T=1) and compare with the chunk."""
++
++    from pypto.compiler import CompileOptions
++
++    compiler = _compiler(backend)
++    program = build_program(1)
++    artifact = compiler.compile(
++        compiler.lower(program, _target(backend)),
++        CompileOptions(
++            artifact_format=_artifact_format(backend),
++            extra={"build_dir": str(Path(work_dir) / (backend + "_chain_build"))},
++        ),
++    )
++    runtime = make_runtime(backend)
++    runtime.load(artifact)
++    state = inputs["prior_state"].astype(np.float32).copy()
++    outputs = np.zeros((steps, QWEN_HEADS, QWEN_VALUE_DIM), dtype=np.float64)
++    started = time.time()
++    for time_index in range(steps):
++        decode_inputs = host_inputs(inputs, 1, time_index)
++        decode_inputs[5] = _state_host_tensor(state)
++        decode_outputs = [
++            make_outputs(backend, "bf16", (1, 1, QWEN_HEADS, QWEN_VALUE_DIM)),
++            make_outputs(backend, "float32", (1, QWEN_HEADS, QWEN_KEY_DIM, QWEN_VALUE_DIM)),
++        ]
++        runtime.launch(
++            LaunchRequest(
++                artifact,
++                inputs=[item.descriptor(readonly=True) for item in decode_inputs],
++                outputs=[item.descriptor for item in decode_outputs],
++                scalars={"scale": QWEN_SCALE},
++            )
++        )
++        outputs[time_index] = decode_outputs[0].values().reshape(QWEN_HEADS, QWEN_VALUE_DIM)
++        state = decode_outputs[1].values().reshape(QWEN_HEADS, QWEN_KEY_DIM, QWEN_VALUE_DIM).astype(np.float32)
++    elapsed = time.time() - started
++    return {
++        "wall_seconds": elapsed,
++        "launch_calls": steps,
++        "seconds_per_step": elapsed / steps,
++        "output_vs_chunk": float(np.max(np.abs(outputs - chunk_output))),
++        "state_vs_chunk": float(np.max(np.abs(state.astype(np.float64) - chunk_state))),
++    }
++
++
++# ---------------------------------------------------------------------------
++# sub-commands
++# ---------------------------------------------------------------------------
++
++
++def command_lower(args):
++    work_dir = Path(args.work_dir)
++    work_dir.mkdir(parents=True, exist_ok=True)
++    report = {
++        "command": "lower",
++        "backend": args.backend,
++        "steps": args.steps,
++        "target": _target(args.backend).to_dict(),
++    }
++    program = build_program(args.steps)
++    report["program"] = {
++        "operations": len(program.functions[0].body.operations),
++        "parameters": [ref.name for ref in program.functions[0].parameters],
++        "returns": [ref.name for ref in program.functions[0].returns],
++        "metadata_keys": sorted(program.metadata.keys()),
++        "unroll": program.metadata.get("unroll"),
++        "state_shape": list(program.functions[0].parameters[5].type.shape),
++    }
++    started = time.time()
++    target_ir = lower_program(args.backend, program)
++    report["lower_seconds"] = time.time() - started
++    report["lowering"] = describe_lowering(args.backend, target_ir)
++    started = time.time()
++    artifact = compile_target_ir(args.backend, target_ir, work_dir / (args.backend + "_build"))
++    report["compile_seconds"] = time.time() - started
++    if artifact.path is not None and Path(artifact.path).is_file():
++        payload = Path(artifact.path).read_bytes()
++        report["artifact_kind"] = "file"
++        report["artifact_path"] = str(artifact.path)
++    else:
++        payload = bytes(artifact.payload or b"")
++        report["artifact_kind"] = "payload"
++    report["artifact_bytes"] = len(payload)
++    report["artifact_sha256"] = hashlib.sha256(payload).hexdigest()
++    report["artifact_metadata"] = {
++        key: artifact.metadata[key]
++        for key in sorted(artifact.metadata.keys())
++        if key
++        in (
++            "backend",
++            "lowering_version",
++            "plan_version",
++            "artifact_payload_version",
++            "vector_plan_version",
++            "batched_matmul_fallback",
++            "guarded_self_test",
++        )
++    }
++    if artifact.metadata.get("vector_plan") is not None:
++        vector_plan = artifact.metadata["vector_plan"]
++        report["vector_plan_metadata_keys"] = (
++            sorted(vector_plan.keys()) if hasattr(vector_plan, "keys") else None
++        )
++    runtime = make_runtime(args.backend)
++    available = getattr(runtime, "is_available", lambda: None)()
++    report["runtime_available"] = available
++    report["runtime_availability"] = _runtime_availability(runtime)
++    if available:
++        loaded = runtime.load(artifact)
++        report["loaded_plan_count"] = len(_plans(loaded.target_ir) or ())
++        report["guarded_self_test"] = guarded_self_test(runtime, artifact)
++    report["observe_variant"] = describe_lowering(
++        args.backend, lower_program(args.backend, build_observe_program(args.steps))
++    )
++    report["peak_rss_kib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
++    report["children_peak_rss_kib"] = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
++    report["status"] = "PASS"
++    _write_report(args.report, report)
++    return 0
++
++
++def command_execute(args):
++    work_dir = Path(args.work_dir)
++    work_dir.mkdir(parents=True, exist_ok=True)
++    inputs = build_inputs(args.steps)
++    report = execute_chunk(
++        args.backend,
++        args.steps,
++        work_dir,
++        inputs,
++        observe=not args.no_observe,
++        plain=args.plain,
++        carry=not args.no_carry,
++        carry_chain=args.carry_chain,
++    )
++    report["command"] = "execute"
++    if args.backend == "sve256" and report.get("status") == "PASS":
++        report["sve_runner_subprocess_calls_estimate"] = report.get("loaded_plan_count")
++    _write_report(args.report, report)
++    return 0 if report.get("status") == "PASS" or report.get("status") == "SKIPPED_UNAVAILABLE" else 1
++
++
++def command_reference(args):
++    inputs = build_inputs(args.steps)
++    ref64_output, ref64_state, ref64_pred = sequential_reference(inputs, args.steps, np.float64)
++    ref32_output, ref32_state, _ref32_pred = sequential_reference(inputs, args.steps, np.float32)
++    report = {
++        "command": "reference",
++        "steps": args.steps,
++        "shape": {
++            "query": list(inputs["query"].shape),
++            "state": list(inputs["prior_state"].shape),
++        },
++        "output_checksum": float(np.sum(ref64_output)),
++        "state_checksum": float(np.sum(ref64_state)),
++        "prediction_checksum": float(np.sum(ref64_pred)),
++        "output_max_abs": float(np.max(np.abs(ref64_output))),
++        "state_max_abs": float(np.max(np.abs(ref64_state))),
++        "fp32_vs_fp64_output": float(np.max(np.abs(ref32_output.astype(np.float64) - ref64_output))),
++        "fp32_vs_fp64_state": float(np.max(np.abs(ref32_state.astype(np.float64) - ref64_state))),
++        "bf16_output_rounding": float(
++            np.max(np.abs(_bf16_round(ref64_output).astype(np.float64) - ref64_output))
++        ),
++        "status": "PASS",
++    }
++    _write_report(args.report, report)
++    return 0
++
++
++def _json_default(value):
++    """Serialize frozen mappings and ABI objects that leak into reports."""
++
++    from collections.abc import Mapping as _Mapping
++
++    if isinstance(value, _Mapping):
++        return dict(value)
++    if isinstance(value, (tuple, list, set)):
++        return list(value)
++    to_dict = getattr(value, "to_dict", None)
++    if callable(to_dict):
++        return to_dict()
++    return repr(value)
++
++
++def _write_report(path, report):
++    text = json.dumps(report, indent=2, sort_keys=True, default=_json_default)
++    if path:
++        Path(path).parent.mkdir(parents=True, exist_ok=True)
++        Path(path).write_text(text + "\n", encoding="utf-8")
++    print(text)
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__)
++    sub = parser.add_subparsers(dest="command")
++    lower = sub.add_parser("lower")
++    lower.add_argument("--backend", choices=BACKENDS, required=True)
++    lower.add_argument("--steps", type=int, default=128)
++    lower.add_argument("--work-dir", required=True)
++    lower.add_argument("--report")
++    lower.set_defaults(func=command_lower)
++
++    execute = sub.add_parser("execute")
++    execute.add_argument("--backend", choices=BACKENDS, required=True)
++    execute.add_argument("--steps", type=int, default=128)
++    execute.add_argument("--work-dir", required=True)
++    execute.add_argument("--report")
++    execute.add_argument("--no-observe", action="store_true")
++    execute.add_argument("--plain", action="store_true")
++    execute.add_argument("--no-carry", action="store_true")
++    execute.add_argument("--carry-chain", action="store_true")
++    execute.set_defaults(func=command_execute)
++
++    reference = sub.add_parser("reference")
++    reference.add_argument("--steps", type=int, default=128)
++    reference.add_argument("--report")
++    reference.set_defaults(func=command_reference)
++
++    args = parser.parse_args(argv)
++    if not getattr(args, "func", None):
++        parser.print_help()
++        return 64
++    return args.func(args)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/python/tests/ut/pypto_x/test_qwen35_gdr_t128_driver.py b/python/tests/ut/pypto_x/test_qwen35_gdr_t128_driver.py
+new file mode 100644
+index 000000000..713137b59
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_qwen35_gdr_t128_driver.py
+@@ -0,0 +1,146 @@
++"""Bounded regression tests for the Qwen3.5 GDR T=128 acceptance driver.
++
++The real T=128 matrix is deliberately *not* executed here: it is a heavy,
++locked acceptance run whose raw logs live in the evidence directory.  These
++tests keep the driver's reference math, observability rewrite, guarded output
++buffer and end-to-end scalar comparison honest at a small step count.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++
++import numpy as np
++import pytest
++
++from pypto.backends.cpu import CpuScalarRuntime
++from pypto.portable.qwen35 import build_qwen35_gdr_recurrent_state
++
++
++DRIVER_PATH = Path(__file__).with_name("qwen35_gdr_t128_driver.py")
++
++
++def _load_driver():
++    spec = importlib.util.spec_from_file_location("qwen35_gdr_t128_driver", DRIVER_PATH)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++driver = _load_driver()
++
++
++def test_fixed_qwen_t128_program_shape_is_static_ssa():
++    program = build_qwen35_gdr_recurrent_state(1, 128)
++    function = program.functions[0]
++    assert [ref.type.shape for ref in function.parameters] == [
++        (1, 128, 16, 128),
++        (1, 128, 16, 128),
++        (1, 128, 16, 128),
++        (1, 128, 16),
++        (1, 128, 16),
++        (1, 16, 128, 128),
++        (),
++    ]
++    assert [ref.name for ref in function.returns] == ["output", "new_state"]
++    assert [ref.type.shape for ref in function.returns] == [(1, 128, 16, 128), (1, 16, 128, 128)]
++    assert program.metadata["unroll"] == "static_sequential_reference"
++    assert len(function.body.operations) == 30 * 128 + 3
++
++
++def test_observe_program_only_appends_returns():
++    steps = 2
++    plain = driver.build_program(steps)
++    observed = driver.build_observe_program(steps)
++    assert [ref.name for ref in observed.functions[0].returns] == [
++        "output",
++        "new_state",
++        "step_0_predicted",
++        "step_1_predicted",
++    ]
++    assert len(observed.functions[0].body.operations) == len(plain.functions[0].body.operations)
++    assert observed.metadata == plain.metadata
++
++
++def test_sequential_reference_is_nonzero_and_tracks_fp32():
++    steps = 3
++    inputs = driver.build_inputs(steps)
++    fp64 = driver.sequential_reference(inputs, steps, np.float64)
++    fp32 = driver.sequential_reference(inputs, steps, np.float32)
++    output64, state64, predicted64 = fp64
++    output32, state32, predicted32 = fp32
++    assert np.max(np.abs(output64)) > 1.0e-3
++    assert np.max(np.abs(state64)) > 1.0e-3
++    assert np.max(np.abs(predicted64)) > 1.0e-4
++    # The FP32 oracle differs from FP64 only by accumulation noise.
++    assert np.max(np.abs(output32.astype(np.float64) - output64)) < 1.0e-4
++    assert np.max(np.abs(state32.astype(np.float64) - state64)) < 1.0e-4
++    # Token order matters: reversing the time axis must change the result.
++    reversed_inputs = dict(inputs)
++    for name in ("query", "key", "value", "gate", "beta"):
++        reversed_inputs[name] = inputs[name][::-1]
++    other = driver.sequential_reference(reversed_inputs, steps, np.float64)
++    assert np.max(np.abs(other[0] - output64)) > 1.0e-4
++
++
++def test_guarded_output_buffer_canary_and_decode():
++    output = driver.GuardedOutput("float32", (2, 3))
++    assert output.canary_ok()
++    assert output.descriptor.shape == (2, 3)
++    assert output.descriptor.storage is output.descriptor.storage
++    values = output.values()
++    assert values.shape == (6,)
++    assert float(np.max(np.abs(values))) == 0.0
++    output.raw[0] = 0x00
++    assert not output.canary_ok()
++
++
++def test_scalar_driver_end_to_end_matches_reference(tmp_path):
++    steps = 2
++    inputs = driver.build_inputs(steps)
++    runtime = CpuScalarRuntime()
++    assert runtime.is_available()
++    report = driver.execute_chunk(
++        "scalar",
++        steps,
++        tmp_path,
++        inputs,
++        observe=True,
++        plain=False,
++        carry=True,
++        carry_chain=False,
++    )
++    assert report["status"] == "PASS"
++    assert report["input_immutable"] is True
++    assert report["guard_canary_ok"] is True
++    comparison = report["comparison"]
++    assert comparison["nonzero_output"] and comparison["nonzero_state"]
++    assert comparison["state_vs_fp64_reference"] < 1.0e-5
++    assert comparison["prediction_vs_fp64_reference"] < 1.0e-5
++    assert comparison["output_vs_bf16_rounded_reference"] < 1.0e-6
++    assert report["decode_carry"]["state_vs_reference"] < 1.0e-5
++
++
++@pytest.mark.parametrize("backend", ["vector", "avx2", "avx512"])
++def test_x86_backends_execute_small_chunk_when_available(backend, tmp_path):
++    steps = 2
++    inputs = driver.build_inputs(steps)
++    report = driver.execute_chunk(
++        backend,
++        steps,
++        tmp_path,
++        inputs,
++        observe=True,
++        plain=False,
++        carry=False,
++        carry_chain=False,
++    )
++    if report.get("status") == "SKIPPED_UNAVAILABLE":
++        pytest.skip("{} runtime is unavailable: {}".format(backend, report["runtime_availability"]))
++    assert report["status"] == "PASS"
++    if backend != "vector":
++        assert report["guard_canary_ok"] is True
++    assert report["input_immutable"] is True
++    assert report["comparison"]["state_vs_fp64_reference"] < 1.0e-4
++    assert report["comparison"]["prediction_vs_fp64_reference"] < 1.0e-4

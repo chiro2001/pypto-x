@@ -1,0 +1,456 @@
+From 556a1bb4c8b48ae52b0a7e52c56048b621890dc7 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Tue, 8 Sep 2026 20:38:37 +0800
+Subject: [PATCH 49/96] fix(pypto-x): harden SVE256 M1C1 execution
+
+---
+ python/pypto/backends/cpu/aarch64/sve256.py |  33 +++++++++----
+ python/pypto/compiler/targets/cpu_sve256.py | 122 +++++++++++++++++++++++++++++-------------------
+ python/pypto/lowering/cpu/vector/plan.py    |  25 +++++++---
+ python/tests/ut/pypto_x/test_cpu_avx2.py    |  15 ++++++
+ python/tests/ut/pypto_x/test_cpu_avx512.py  |   6 +++
+ python/tests/ut/pypto_x/test_cpu_sve256.py  |  70 ++++++++++++++++++++++++++-
+ 6 files changed, 208 insertions(+), 63 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/aarch64/sve256.py b/python/pypto/backends/cpu/aarch64/sve256.py
+index 793c3bc32..29b377e29 100644
+--- a/python/pypto/backends/cpu/aarch64/sve256.py
++++ b/python/pypto/backends/cpu/aarch64/sve256.py
+@@ -192,6 +192,9 @@ def _broadcast_values(value: Any, input_type: CoreType, output_type: CoreType, c
+     output_count = element_count(output_shape)
+     output_dtype = canonical_dtype(output_type.dtype)
+     if _is_scalar(input_type):
++        if not isinstance(value, list) or len(value) != 1:
++            raise CpuSve256ExecutionError("{} scalar input storage length mismatch".format(context))
++        value = value[0]
+         return [_cast_value(value, output_dtype) for _ in range(output_count)]
+     input_shape = static_shape(input_type, context + ".input")
+     if len(value) != element_count(input_shape):
+@@ -227,6 +230,9 @@ def _where_values(
+         (false_value, false_type, "other"),
+     ):
+         if _is_scalar(value_type):
++            if not isinstance(value, list) or len(value) != 1:
++                raise CpuSve256ExecutionError("{} {} scalar storage length mismatch".format(context, label))
++            value = value[0]
+             prepared.append((value, None))
+             continue
+         shape = static_shape(value_type, context + "." + label)
+@@ -366,6 +372,10 @@ def _validate_primary_artifact(artifact: Artifact) -> Mapping[str, Any]:
+         raise CpuSve256ArtifactError("SVE256 emitting feature marker is invalid")
+     if metadata.get("scalar_math_lane_fallback") != ["exp", "sigmoid", "silu", "softplus"]:
+         raise CpuSve256ArtifactError("SVE256 scalar math fallback metadata is invalid")
++    if metadata.get("scalar_conversion_lane_fallback") != ["cast", "bf16_math", "bf16_where"]:
++        raise CpuSve256ArtifactError("SVE256 scalar conversion fallback metadata is invalid")
++    if metadata.get("host_preexpanded_operations") != ["broadcast", "where"]:
++        raise CpuSve256ArtifactError("SVE256 host pre-expansion metadata is invalid")
+     if metadata.get("sve_math_operations") != ["rsqrt", "where", "broadcast", "cast", "reduce_mean"]:
+         raise CpuSve256ArtifactError("SVE256 math operation metadata is invalid")
+     required = set(_string_sequence(metadata.get("required_features"), "required_features"))
+@@ -1042,15 +1052,20 @@ class Sve256Runtime:
+             values = self._run_runner(artifact, "neg", dtype, [inputs[0][1]], plan.element_count)
+         elif name == "cast":
+             input_dtype = canonical_dtype(inputs[0][0].dtype)
+-            values = self._run_runner(
+-                artifact,
+-                "cast",
+-                dtype,
+-                [inputs[0][1]],
+-                plan.element_count,
+-                input_dtype=input_dtype,
+-                output_dtype=dtype,
+-            )
++            if input_dtype == dtype:
++                values = self._run_runner(
++                    artifact, "identity", dtype, [inputs[0][1]], plan.element_count
++                )
++            else:
++                values = self._run_runner(
++                    artifact,
++                    "cast",
++                    dtype,
++                    [inputs[0][1]],
++                    plan.element_count,
++                    input_dtype=input_dtype,
++                    output_dtype=dtype,
++                )
+         elif name in ("add", "sub", "mul", "div"):
+             left, right = inputs
+             left_values = left[1] if len(left[1]) == plan.element_count else left[1] * plan.element_count
+diff --git a/python/pypto/compiler/targets/cpu_sve256.py b/python/pypto/compiler/targets/cpu_sve256.py
+index 00616bcd5..44d2a972a 100644
+--- a/python/pypto/compiler/targets/cpu_sve256.py
++++ b/python/pypto/compiler/targets/cpu_sve256.py
+@@ -316,54 +316,64 @@ static void ptx_binary_f32(int operation, const float *left,
+     }
+ }
+ 
+-/* SVE has no portable transcendental instruction set.  Keep the lane
+- * traversal, loads, stores, predicate tail, and ordinary arithmetic in SVE;
+- * only the expf/log1pf calls below are an explicit scalar-per-lane fallback.
+- */
+-static void ptx_math_f32(int operation, const float *input, float *output,
+-                         uint64_t count) {
++/* Keep the native SVE rsqrt hotspot separate from the scalar libm fallback.
++ * This prevents compiler-generated scalar/Advanced-SIMD bookkeeping around
++ * expf/log1pf calls from being mistaken for an SVE rsqrt implementation. */
++__attribute__((noinline))
++static void ptx_rsqrt_f32(const float *input, float *output, uint64_t count) {
++    uint64_t index = 0;
++    while (index < count) {
++        svbool_t pg = svwhilelt_b32(index, count);
++        svfloat32_t value = svld1(pg, input + index);
++        svfloat32_t root = svsqrt_x(pg, value);
++        svfloat32_t result = svdiv_x(pg, svdup_n_f32(1.0f), root);
++        svbool_t zero = svcmpeq(pg, value, svdup_n_f32(0.0f));
++        result = svsel(zero, svdup_n_f32(INFINITY), result);
++        svst1(pg, output + index, result);
++        index += svcntw();
++    }
++}
++
++/* SVE has no portable transcendental instruction set.  Loads, stores, and
++ * predicate tails remain SVE; expf/log1pf evaluation is explicitly scalar
++ * per lane and is reported as such in artifact metadata. */
++__attribute__((noinline))
++static void ptx_scalar_math_f32(int operation, const float *input,
++                                float *output, uint64_t count) {
+     uint64_t index = 0;
+     while (index < count) {
+         uint64_t lane, active = count - index;
+         svbool_t pg = svwhilelt_b32(index, count);
+         svfloat32_t value = svld1(pg, input + index);
++        float lanes[8];
+         if (active > svcntw()) active = svcntw();
+-        if (operation == PTX_RSQRT) {
+-            svfloat32_t root = svsqrt_x(pg, value);
+-            svfloat32_t result = svdiv_x(pg, svdup_n_f32(1.0f), root);
+-            svbool_t zero = svcmpeq(pg, value, svdup_n_f32(0.0f));
+-            result = svsel(zero, svdup_n_f32(INFINITY), result);
+-            svst1(pg, output + index, result);
+-        } else {
+-            float lanes[8];
+-            svst1(pg, lanes, value);
+-            for (lane = 0; lane < active; ++lane) {
+-                float item = lanes[lane];
+-                if (operation == PTX_EXP) {
+-                    lanes[lane] = expf(item);
+-                } else if (operation == PTX_SIGMOID) {
++        svst1(pg, lanes, value);
++        for (lane = 0; lane < active; ++lane) {
++            float item = lanes[lane];
++            if (operation == PTX_EXP) {
++                lanes[lane] = expf(item);
++            } else if (operation == PTX_SIGMOID) {
++                float exponent = item >= 0.0f ? expf(-item) : expf(item);
++                lanes[lane] = item >= 0.0f
++                    ? 1.0f / (1.0f + exponent)
++                    : exponent / (1.0f + exponent);
++            } else if (operation == PTX_SILU) {
++                float sigmoid;
++                if (item == -INFINITY) lanes[lane] = 0.0f;
++                else if (item == INFINITY) lanes[lane] = item;
++                else {
+                     float exponent = item >= 0.0f ? expf(-item) : expf(item);
+-                    lanes[lane] = item >= 0.0f
++                    sigmoid = item >= 0.0f
+                         ? 1.0f / (1.0f + exponent)
+                         : exponent / (1.0f + exponent);
+-                } else if (operation == PTX_SILU) {
+-                    float sigmoid;
+-                    if (item == -INFINITY) lanes[lane] = 0.0f;
+-                    else if (item == INFINITY) lanes[lane] = item;
+-                    else {
+-                        float exponent = item >= 0.0f ? expf(-item) : expf(item);
+-                        sigmoid = item >= 0.0f
+-                            ? 1.0f / (1.0f + exponent)
+-                            : exponent / (1.0f + exponent);
+-                        lanes[lane] = item * sigmoid;
+-                    }
+-                } else if (operation == PTX_SOFTPLUS) {
+-                    lanes[lane] = log1pf(expf(-fabsf(item))) + fmaxf(item, 0.0f);
++                    lanes[lane] = item * sigmoid;
+                 }
++            } else if (operation == PTX_SOFTPLUS) {
++                lanes[lane] = log1pf(expf(-fabsf(item))) + fmaxf(item, 0.0f);
+             }
+-            value = svld1(pg, lanes);
+-            svst1(pg, output + index, value);
+         }
++        value = svld1(pg, lanes);
++        svst1(pg, output + index, value);
+         index += svcntw();
+     }
+ }
+@@ -415,7 +425,8 @@ static int ptx_math_bf16(int operation, const uint16_t *input,
+     values = (float *)malloc(bytes);
+     if (count && !values) return PTX_STATUS_RUNTIME;
+     for (index = 0; index < count; ++index) values[index] = ptx_bf16_to_f32(input[index]);
+-    ptx_math_f32(operation, values, values, count);
++    if (operation == PTX_RSQRT) ptx_rsqrt_f32(values, values, count);
++    else ptx_scalar_math_f32(operation, values, values, count);
+     for (index = 0; index < count; ++index) output[index] = ptx_f32_to_bf16(values[index]);
+     free(values);
+     return PTX_STATUS_OK;
+@@ -424,15 +435,19 @@ static int ptx_math_bf16(int operation, const uint16_t *input,
+ static void ptx_cast_f32_bf16(const float *input, uint16_t *output, uint64_t count) {
+     uint64_t index = 0;
+     while (index < count) {
+-        uint64_t lane, active = count - index;
+-        svbool_t pg32 = svwhilelt_b32(index, count);
++        uint64_t lane, active = count - index, end;
+         float values[8];
+         uint16_t converted[8];
+-        svst1(pg32, values, svld1(pg32, input + index));
+         if (active > svcntw()) active = svcntw();
++        end = index + active;
++        svbool_t pg32 = svwhilelt_b32(index, end);
++        svst1(pg32, values, svld1(pg32, input + index));
+         for (lane = 0; lane < active; ++lane) converted[lane] = ptx_f32_to_bf16(values[lane]);
+         {
+-            svbool_t pg16 = svwhilelt_b16(index, count);
++            /* One loop iteration owns svcntw() logical elements.  Limit the
++             * wider b16 predicate to the same element range so it cannot
++             * read beyond the eight-lane temporary conversion buffer. */
++            svbool_t pg16 = svwhilelt_b16(index, end);
+             svuint16_t bits = svld1_u16(pg16, converted);
+             svst1_u16(pg16, output + index, bits);
+         }
+@@ -443,15 +458,16 @@ static void ptx_cast_f32_bf16(const float *input, uint16_t *output, uint64_t cou
+ static void ptx_cast_bf16_f32(const uint16_t *input, float *output, uint64_t count) {
+     uint64_t index = 0;
+     while (index < count) {
+-        uint64_t lane, active = count - index;
+-        svbool_t pg16 = svwhilelt_b16(index, count);
++        uint64_t lane, active = count - index, end;
+         uint16_t bits[8];
+         float converted[8];
+-        svst1_u16(pg16, bits, svld1_u16(pg16, input + index));
+         if (active > svcntw()) active = svcntw();
++        end = index + active;
++        svbool_t pg16 = svwhilelt_b16(index, end);
++        svst1_u16(pg16, bits, svld1_u16(pg16, input + index));
+         for (lane = 0; lane < active; ++lane) converted[lane] = ptx_bf16_to_f32(bits[lane]);
+         {
+-            svbool_t pg32 = svwhilelt_b32(index, count);
++            svbool_t pg32 = svwhilelt_b32(index, end);
+             svfloat32_t values = svld1(pg32, converted);
+             svst1(pg32, output + index, values);
+         }
+@@ -605,7 +621,11 @@ static int ptx_run(const PtxRequest *request, const unsigned char *payload,
+         request->operation == PTX_SIGMOID || request->operation == PTX_SILU ||
+         request->operation == PTX_SOFTPLUS) {
+         if (request->dtype == 0) {
+-            ptx_math_f32(request->operation, (const float *)payload, (float *)result, count);
++            if (request->operation == PTX_RSQRT)
++                ptx_rsqrt_f32((const float *)payload, (float *)result, count);
++            else
++                ptx_scalar_math_f32(request->operation, (const float *)payload,
++                                    (float *)result, count);
+         } else {
+             int math_status = ptx_math_bf16(request->operation, (const uint16_t *)payload,
+                                              (uint16_t *)result, count);
+@@ -956,7 +976,13 @@ def _compile_native(target_ir: Sve256Program, options: Optional[CompileOptions])
+     # libm link separately; the transcendental fallback is explicit metadata,
+     # never an implicit scalar fallback in the plan.
+     link_flags = ("-lm",)
+-    command = [compiler_path] + list(native_flags) + [str(source_path)] + list(link_flags) + ["-o", str(temporary_output)]
++    command = (
++        [compiler_path]
++        + list(native_flags)
++        + [str(source_path)]
++        + list(link_flags)
++        + ["-o", str(temporary_output)]
++    )
+     try:
+         source_path.write_text(source, encoding="utf-8")
+         environment = dict(os.environ)
+@@ -1064,6 +1090,8 @@ class Sve256Compiler:
+             "emitting_features": ["sve"],
+             "sve2_required": False,
+             "scalar_math_lane_fallback": ["exp", "sigmoid", "silu", "softplus"],
++            "scalar_conversion_lane_fallback": ["cast", "bf16_math", "bf16_where"],
++            "host_preexpanded_operations": ["broadcast", "where"],
+             "sve_math_operations": ["rsqrt", "where", "broadcast", "cast", "reduce_mean"],
+             "execution_modes": ["native", "qemu"],
+             "guarded_buffer_self_test": True,
+diff --git a/python/pypto/lowering/cpu/vector/plan.py b/python/pypto/lowering/cpu/vector/plan.py
+index 71ec6c7e3..e4324303f 100644
+--- a/python/pypto/lowering/cpu/vector/plan.py
++++ b/python/pypto/lowering/cpu/vector/plan.py
+@@ -893,13 +893,26 @@ def _make_plan_for_operation(
+     # innermost-axis number) from their input.  The reduction iteration axis
+     # is defined by the input domain; elementwise/matmul outputs must share
+     # the input contiguous axis.
+-    refs = tuple(operation.inputs) if name in ("reduce_sum", "reduce_max", "reduce_mean") else tuple(operation.inputs) + (output,)
+-    layout, contiguous_axis = _check_layout(
+-        program,
+-        operation,
+-        refs,
+-        "function operation {}".format(operation_index),
++    refs = (
++        tuple(operation.inputs)
++        if name in ("reduce_sum", "reduce_max", "reduce_mean")
++        else tuple(operation.inputs) + (output,)
+     )
++    layout_context = "function operation {}".format(operation_index)
++    if name in ("broadcast", "where"):
++        # Broadcast operands may have different ranks, so their innermost
++        # contiguous axes have different numeric indices.  Validate each
++        # input independently, then use the output iteration domain.
++        for ref in operation.inputs:
++            _check_layout(program, operation, (ref,), layout_context)
++        layout, contiguous_axis = _check_layout(program, operation, (output,), layout_context)
++    else:
++        layout, contiguous_axis = _check_layout(
++            program,
++            operation,
++            refs,
++            layout_context,
++        )
+     count = element_count(output_shape)
+     output_axis = len(output_shape) - 1 if output_shape else None
+     if name in ("reduce_sum", "reduce_max", "reduce_mean"):
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx2.py b/python/tests/ut/pypto_x/test_cpu_avx2.py
+index 8017f14f7..edd03ba32 100644
+--- a/python/tests/ut/pypto_x/test_cpu_avx2.py
++++ b/python/tests/ut/pypto_x/test_cpu_avx2.py
+@@ -121,6 +121,21 @@ def _float32(value):
+     return struct.unpack("<f", struct.pack("<f", float(value)))[0]
+ 
+ 
++def test_m1c1_vector_plan_does_not_open_unimplemented_avx2_lowering():
++    input_type = CoreType.tensor("float32", (2, 3))
++    output_type = CoreType.tensor("float32", (2,))
++    source = ValueRef("source", input_type)
++    output = ValueRef("output", output_type)
++    program = _program(
++        "reduce_mean",
++        (source,),
++        (output,),
++        (Operation("reduce_mean", (source,), (output,), attributes={"axis": 1}),),
++    )
++    with pytest.raises(Avx2UnsupportedError, match="no emitting lowering"):
++        lower_avx2(program, _target("avx2"))
++
++
+ def _float32_add(left, right):
+     return _float32(_float32(left) + _float32(right))
+ 
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx512.py b/python/tests/ut/pypto_x/test_cpu_avx512.py
+index 997be6dce..309813cb2 100644
+--- a/python/tests/ut/pypto_x/test_cpu_avx512.py
++++ b/python/tests/ut/pypto_x/test_cpu_avx512.py
+@@ -196,6 +196,12 @@ def _float32(value):
+     return struct.unpack("<f", struct.pack("<f", float(value)))[0]
+ 
+ 
++def test_m1c1_vector_plan_does_not_open_unimplemented_avx512_lowering():
++    program = _reduction("float32", (2, 3), (2,), "reduce_mean", {"axis": 1})
++    with pytest.raises(Avx512UnsupportedError, match="no emitting lowering"):
++        lower_avx512(program, _target("avx512f"))
++
++
+ def _disassemble(path):
+     objdump = shutil.which("objdump")
+     if objdump is None:
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256.py b/python/tests/ut/pypto_x/test_cpu_sve256.py
+index a72052a9a..d8db41616 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256.py
+@@ -18,6 +18,7 @@ import types
+ 
+ import pytest
+ 
++import pypto.compiler.targets.cpu_sve256 as sve_compiler_module
+ from pypto.abi import LaunchRequest, TensorDesc
+ from pypto.backends.cpu import CpuScalarRuntime, FlatBuffer, HostTensor
+ from pypto.backends.cpu.aarch64 import (
+@@ -104,12 +105,13 @@ def _compile(program, tmp_path, target=None):
+     return compiler, target_ir, artifact
+ 
+ 
+-def _run(artifact, inputs, output, runtime=None):
++def _run(artifact, inputs, output, runtime=None, scalars=None):
+     (runtime or Sve256Runtime(execution_mode="qemu")).launch(
+         LaunchRequest(
+             artifact,
+             inputs=[value.descriptor(readonly=True) for value in inputs],
+             outputs=[output.descriptor()],
++            scalars=scalars or {},
+         )
+     )
+ 
+@@ -489,6 +491,72 @@ def test_sve_m1c1_cast_reduce_mean_broadcast_and_where(tmp_path):
+     assert where_actual.flat() == where_expected.flat()
+ 
+ 
++def test_sve_m1c1_scalar_rank_broadcast_and_same_dtype_cast(tmp_path):
++    scalar_type = CoreType.scalar("float32")
++    broadcast_type = CoreType.tensor("float32", (2, 3))
++    scalar = ValueRef("scalar", scalar_type)
++    broadcast = ValueRef("broadcast", broadcast_type)
++    broadcast_program = _program(
++        "scalar_broadcast",
++        (scalar,),
++        (broadcast,),
++        (Operation("broadcast", (scalar,), (broadcast,), attributes={"shape": [2, 3]}),),
++    )
++    _, _, broadcast_artifact = _compile(broadcast_program, tmp_path / "scalar-broadcast")
++    broadcast_output = HostTensor.zeros("float32", (2, 3))
++    _run(broadcast_artifact, [], broadcast_output, scalars={"scalar": 2.5})
++    assert broadcast_output.tolist() == [[2.5, 2.5, 2.5], [2.5, 2.5, 2.5]]
++    assert tuple(broadcast_artifact.metadata["host_preexpanded_operations"]) == ("broadcast", "where")
++    assert tuple(broadcast_artifact.metadata["scalar_conversion_lane_fallback"]) == (
++        "cast", "bf16_math", "bf16_where"
++    )
++
++    condition_type = CoreType.tensor("bool", (2, 1, 1))
++    other_type = CoreType.tensor("float32", (3,))
++    selected_type = CoreType.tensor("float32", (2, 1, 3))
++    condition = ValueRef("condition", condition_type)
++    selected_value = ValueRef("selected_value", scalar_type)
++    other = ValueRef("other", other_type)
++    selected = ValueRef("selected", selected_type)
++    where_program = _program(
++        "rank_broadcast_where",
++        (condition, selected_value, other),
++        (selected,),
++        (Operation("where", (condition, selected_value, other), (selected,)),),
++    )
++    _, _, where_artifact = _compile(where_program, tmp_path / "rank-broadcast-where")
++    where_output = HostTensor.zeros("float32", (2, 1, 3))
++    _run(
++        where_artifact,
++        [HostTensor("bool", (2, 1, 1), [True, False]), HostTensor("float32", (3,), [10, 20, 30])],
++        where_output,
++        scalars={"selected_value": 1.5},
++    )
++    assert where_output.tolist() == [[[1.5, 1.5, 1.5]], [[10.0, 20.0, 30.0]]]
++
++    cast_type = CoreType.tensor("float32", (19,))
++    cast_input = ValueRef("cast_input", cast_type)
++    cast_output = ValueRef("cast_output", cast_type)
++    cast_program = _program(
++        "same_dtype_cast",
++        (cast_input,),
++        (cast_output,),
++        (Operation("cast", (cast_input,), (cast_output,), attributes={"dtype": "float32"}),),
++    )
++    _, _, cast_artifact = _compile(cast_program, tmp_path / "same-dtype-cast")
++    cast_values = [index * 0.25 for index in range(19)]
++    actual = HostTensor.zeros("float32", (19,))
++    _run(cast_artifact, [HostTensor("float32", (19,), cast_values)], actual)
++    assert actual.tolist() == cast_values
++
++
++def test_sve_m1c1_bf16_cast_predicates_are_limited_to_f32_lane_count():
++    source = sve_compiler_module._NATIVE_SOURCE
++    assert source.count("svwhilelt_b16(index, end)") >= 2
++    assert "end = index + active;" in source
++    assert "svwhilelt_b16(index, count)" not in source
++
++
+ def test_sve_scalar_broadcast_uses_shared_launch_scalars(tmp_path):
+     tensor_type = CoreType.tensor("float32", (9,))
+     scalar_type = CoreType.scalar("float32")

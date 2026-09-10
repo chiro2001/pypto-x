@@ -1,0 +1,1256 @@
+From 63c9a4fdd6c1282aa8226b157d81dccbea6b6f21 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Wed, 9 Sep 2026 09:51:19 +0800
+Subject: [PATCH 72/96] feat(pypto-x): close qwen35 avx512 parity
+
+---
+ python/pypto/backends/cpu/x86/avx512.py              | 268 ++++++++++++++++++++++++++---
+ python/pypto/compiler/targets/cpu_avx512.py          | 235 +++++++++++++++++++++++++-
+ python/pypto/lowering/cpu/x86/avx512/lowering.py     |  76 +++++++--
+ python/tests/ut/pypto_x/test_cpu_avx512.py           |   7 +-
+ python/tests/ut/pypto_x/test_cpu_sve256_indexing.py  |   9 +-
+ python/tests/ut/pypto_x/test_cpu_sve256_layout.py    |   9 +-
+ python/tests/ut/pypto_x/test_qwen35_avx512_parity.py | 353 +++++++++++++++++++++++++++++++++++++++
+ 7 files changed, 904 insertions(+), 53 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/x86/avx512.py b/python/pypto/backends/cpu/x86/avx512.py
+index f67eb194e..6bd71a990 100644
+--- a/python/pypto/backends/cpu/x86/avx512.py
++++ b/python/pypto/backends/cpu/x86/avx512.py
+@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+ from pypto.abi import Availability, LaunchRequest, TensorDesc
+ from pypto.compiler.artifact import ABI_VERSION, Artifact
+ from pypto.compiler.targets.cpu_avx2 import DEFAULT_ARTIFACT_FORMAT as DEFAULT_AVX2_ARTIFACT_FORMAT
+-from pypto.compiler.targets.cpu_avx512 import DEFAULT_ARTIFACT_FORMAT
++from pypto.compiler.targets.cpu_avx512 import DEFAULT_ARTIFACT_FORMAT, _execution_metadata
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation
+ from pypto.lowering.cpu import (
+     canonical_dtype,
+@@ -44,6 +44,7 @@ from pypto.lowering.cpu.vector import (
+     FeatureMismatch,
+     VECTOR_PLAN_VERSION,
+ )
++import pypto.backends.cpu.vector.runtime as _vector_runtime
+ from pypto.target import TargetSpec
+ from pypto.target._utils import mapping_copy, sha256_text
+ 
+@@ -171,6 +172,18 @@ def _call_unary(module: Any, name: str, dtype: str, source: _NativeBuffer, desti
+     function(source.pointer, destination.pointer, source.count)
+ 
+ 
++def _call_math(module: Any, name: str, dtype: str, source: _NativeBuffer, destination: _NativeBuffer) -> None:
++    """Invoke the explicit scalar-libm lane fallback for Qwen math ops."""
++
++    operation_code = {"exp": 0, "rsqrt": 1, "sigmoid": 2, "silu": 3, "softplus": 4}[name]
++    function = _safe_symbol(
++        module,
++        "ptx_avx512_math_{}".format(_native_suffix(dtype)),
++        [ctypes.c_int, _pointer(dtype), _pointer(dtype), ctypes.c_size_t],
++    )
++    function(operation_code, source.pointer, destination.pointer, source.count)
++
++
+ def _call_binary(
+     module: Any,
+     name: str,
+@@ -232,6 +245,48 @@ def _call_matmul(
+     function(left.pointer, right.pointer, destination.pointer, m, k, n)
+ 
+ 
++def _reference_operation(
++    operation: Operation,
++    plan: Any,
++    inputs: Sequence[_RuntimeValue],
++    context: str,
++) -> Dict[str, _RuntimeValue]:
++    """Execute one portable operation through the shared vector reference.
++
++    AVX-512 keeps native ZMM/opmask execution for the FP32/BF16 hot core, but
++    layout/indexing/control and mixed-dtype operations deliberately use the
++    exact vector-common semantic reference until a target-owned emitting ABI
++    exists.  The fallback is reflected in artifact metadata and never invokes
++    an AVX2 object implicitly.
++    """
++
++    environment: Dict[str, Any] = {}
++    for ref, value in zip(operation.inputs, inputs):
++        raw = _buffer_values(value.buffer)
++        data = raw[0] if _is_scalar(ref.type) else raw
++        environment[ref.name] = _vector_runtime._RuntimeValue(ref.type, data)
++    try:
++        _vector_runtime._execute_operation(operation, plan, environment, context)
++    except Exception as exc:
++        if isinstance(exc, CpuAvx512ExecutionError):
++            raise
++        raise CpuAvx512ExecutionError("{} reference fallback failed: {}".format(context, exc)) from exc
++    results: Dict[str, _RuntimeValue] = {}
++    for output_ref in operation.outputs:
++        if output_ref.name not in environment:
++            raise CpuAvx512ExecutionError(
++                "{} reference fallback did not produce {!r}".format(context, output_ref.name)
++            )
++        value = environment[output_ref.name]
++        data = value.data if isinstance(value.data, list) else [value.data]
++        dtype = canonical_dtype(output_ref.type.dtype)
++        results[output_ref.name] = _RuntimeValue(
++            output_ref.type,
++            _buffer_from_values(dtype, data, "{}.{}".format(context, output_ref.name)),
++        )
++    return results
++
++
+ def _read_native_bytes(path: str) -> bytes:
+     nofollow = getattr(os, "O_NOFOLLOW", 0)
+     try:
+@@ -283,6 +338,78 @@ def _string_sequence(value: Any, context: str) -> Tuple[str, ...]:
+     return tuple(value)
+ 
+ 
++def _validate_primary_semantics(artifact: Artifact, metadata: Mapping[str, Any]) -> None:
++    """Validate plan and fallback-boundary metadata before capability dispatch.
++
++    Fallback selection must not become a way to bypass a tampered AVX-512
++    plan.  This check deliberately does not probe the host or load the ELF;
++    it only reconstructs the target IR and compares every semantic digest and
++    execution-boundary field.
++    """
++
++    if metadata.get("artifact_payload_version") != 1:
++        raise CpuAvx512ArtifactError("unsupported AVX-512 artifact payload version")
++    if metadata.get("lowering_version") != AVX512_LOWERING_VERSION:
++        raise CpuAvx512ArtifactError("unsupported AVX-512 lowering version")
++    if metadata.get("plan_version") != VECTOR_PLAN_VERSION:
++        raise CpuAvx512ArtifactError("unsupported CPU vector plan version")
++    program_data = metadata.get("program")
++    plan_data = metadata.get("vector_plan")
++    if not isinstance(program_data, Mapping) or not isinstance(plan_data, Mapping):
++        raise CpuAvx512ArtifactError("primary artifact is missing CoreProgram/vector plan metadata")
++    if plan_data.get("plan_version") != VECTOR_PLAN_VERSION:
++        raise CpuAvx512ArtifactError("unsupported CPU vector plan version")
++    required_data = plan_data.get("required_features")
++    if not isinstance(required_data, Mapping):
++        raise CpuAvx512ArtifactError("primary artifact required_features metadata is invalid")
++    required = CpuFeatureSet(
++        required_data.get("features", ()),
++        source=required_data.get("source", metadata.get("required_feature_source", "artifact")),
++    )
++    flags = {
++        "use_fma": _metadata_bool(metadata, "use_fma"),
++        "use_dq": _metadata_bool(metadata, "use_dq"),
++        "use_bw": _metadata_bool(metadata, "use_bw"),
++        "use_vl": _metadata_bool(metadata, "use_vl"),
++        "use_vnni": _metadata_bool(metadata, "use_vnni"),
++        "use_bf16": _metadata_bool(metadata, "use_bf16"),
++    }
++    try:
++        program = CoreProgram.from_dict(program_data)
++        target_ir = lower_avx512(
++            program,
++            artifact.target,
++            plan_data.get("entrypoint"),
++            lane_count=plan_data.get("lane_count"),
++            tail_policy=plan_data.get("tail_policy"),
++            required_features=required,
++            specialization=plan_data.get("specialization", {}),
++            **flags
++        )
++    except Exception as exc:
++        raise CpuAvx512ArtifactError("primary AVX-512 CoreProgram/plan is invalid: {}".format(exc)) from exc
++    if target_ir.vector_program.to_dict() != dict(plan_data):
++        raise CpuAvx512ArtifactError("primary AVX-512 vector plan metadata mismatch")
++    for key, expected in _execution_metadata(target_ir).items():
++        if metadata.get(key) != expected:
++            raise CpuAvx512ArtifactError("primary AVX-512 {} metadata mismatch".format(key))
++    if metadata.get("entrypoint") != artifact.entrypoint or target_ir.entrypoint != artifact.entrypoint:
++        raise CpuAvx512ArtifactError("primary artifact entrypoint is inconsistent")
++    program_digest = hashlib.sha256(program.canonical_json().encode("utf-8")).hexdigest()
++    if metadata.get("program_digest") != program_digest:
++        raise CpuAvx512ArtifactError("primary artifact program digest mismatch")
++    if metadata.get("plan_digest") != target_ir.plan_digest:
++        raise CpuAvx512ArtifactError("primary artifact plan digest mismatch")
++    if metadata.get("target_digest") != sha256_text(artifact.target.to_dict()):
++        raise CpuAvx512ArtifactError("primary artifact target digest mismatch")
++    if metadata.get("native_variant") != target_ir.native_variant:
++        raise CpuAvx512ArtifactError("primary artifact native variant metadata is inconsistent")
++    if tuple(metadata.get("required_features", ())) != tuple(required.features):
++        raise CpuAvx512ArtifactError("primary artifact required feature metadata mismatch")
++    if metadata.get("required_feature_source") != required.source:
++        raise CpuAvx512ArtifactError("primary artifact required feature source mismatch")
++
++
+ def _validate_primary_artifact(artifact: Artifact) -> Mapping[str, Any]:
+     """Validate primary metadata before capability dispatch or fallback use."""
+ 
+@@ -318,6 +445,7 @@ def _validate_primary_artifact(artifact: Artifact) -> Mapping[str, Any]:
+     if not {"avx", "avx512f", "osxsave", "ymm", "opmask", "zmm"}.issubset(required):
+         raise CpuAvx512ArtifactError("primary artifact required_features omit AVX/ZMM safety fields")
+     _program_digest_from_metadata(metadata, "primary artifact")
++    _validate_primary_semantics(artifact, metadata)
+     return metadata
+ 
+ 
+@@ -470,6 +598,10 @@ def _decode_artifact(
+         raise CpuAvx512ArtifactError("AVX-512 CoreProgram/plan is invalid: {}".format(exc)) from exc
+     if target_ir.vector_program.to_dict() != dict(plan_data):
+         raise CpuAvx512ArtifactError("AVX-512 vector plan metadata mismatch")
++    expected_execution = _execution_metadata(target_ir)
++    for key, expected in expected_execution.items():
++        if metadata.get(key) != expected:
++            raise CpuAvx512ArtifactError("AVX-512 {} metadata mismatch".format(key))
+     if target_ir.native_variant != metadata.get("native_variant"):
+         raise CpuAvx512ArtifactError("AVX-512 native variant metadata is inconsistent")
+     program_digest = hashlib.sha256(program.canonical_json().encode("utf-8")).hexdigest()
+@@ -561,7 +693,7 @@ def _decode_artifact(
+         raise CpuAvx512ArtifactError("AVX-512 native safety marker is missing or malformed") from exc
+     if native_variant != target_ir.native_variant or metadata.get("native_source_digest") != native_source_digest:
+         raise CpuAvx512ArtifactError("AVX-512 native variant/source marker does not match metadata")
+-    if native_feature_mask != expected_mask or native_abi != "pypto-x.cpu.avx512:1":
++    if native_feature_mask != expected_mask or native_abi != "pypto-x.cpu.avx512:2":
+         raise CpuAvx512ArtifactError("AVX-512 native safety marker does not match ABI metadata")
+     return LoadedAvx512Artifact(artifact, target_ir, mismatch, module)
+ 
+@@ -713,11 +845,10 @@ class Avx512Runtime:
+         if not isinstance(request, LaunchRequest):
+             raise CpuAvx512ExecutionError("AVX-512 launch requires LaunchRequest")
+         if request.artifact.format != DEFAULT_ARTIFACT_FORMAT:
+-            try:
+-                self._selected_artifact = request.artifact
+-                return _avx2.Avx2Runtime().launch(request)
+-            except Exception as exc:
+-                raise CpuAvx512ExecutionError("unsupported fallback artifact format") from exc
++            raise CpuAvx512ExecutionError(
++                "AVX2 fallback must be supplied explicitly via fallback_artifact; "
++                "an AVX2 artifact cannot masquerade as an AVX-512 launch"
++            )
+         _validate_primary_artifact(request.artifact)
+         # Validate every candidate before choosing one.  This is metadata-only;
+         # no fallback shared object is opened by this loop.
+@@ -864,8 +995,16 @@ class Avx512Runtime:
+             if ref.name not in environment:
+                 raise CpuAvx512ExecutionError("AVX-512 input {!r} is unavailable".format(ref.name))
+             inputs.append(environment[ref.name])
++        if name == "split":
++            environment.update(
++                _reference_operation(
++                    operation, plan, inputs, "AVX-512 {} split".format(operation.name)
++                )
++            )
++            return
+         output_ref = operation.outputs[0]
+         dtype = canonical_dtype(output_ref.type.dtype)
++        native_float = dtype in ("float32", "bf16")
+         try:
+             if name == "constant":
+                 raw = operation.attributes.get("value", operation.attributes.get("values"))
+@@ -874,12 +1013,18 @@ class Avx512Runtime:
+                     output_ref.type, _buffer_from_values(dtype, values, output_ref.name)
+                 )
+             elif name == "identity":
+-                source = inputs[0].buffer
+-                destination = _buffer_from_values(dtype, [0] * source.count, output_ref.name)
+-                _call_copy(module, dtype, source, destination)
+-                environment[output_ref.name] = _RuntimeValue(output_ref.type, destination)
++                if native_float:
++                    source = inputs[0].buffer
++                    destination = _buffer_from_values(dtype, [0] * source.count, output_ref.name)
++                    _call_copy(module, dtype, source, destination)
++                    environment[output_ref.name] = _RuntimeValue(output_ref.type, destination)
++                else:
++                    environment.update(_reference_operation(operation, plan, inputs, "AVX-512 identity"))
+             elif name in ("add", "sub", "mul", "div"):
+                 left, right = inputs
++                if not native_float:
++                    environment.update(_reference_operation(operation, plan, inputs, "AVX-512 {}".format(name)))
++                    return
+                 if name == "div" and any(value == 0 for value in _buffer_values(right.buffer)):
+                     raise CpuAvx512ExecutionError("division by zero")
+                 destination = _buffer_from_values(dtype, [0] * plan.element_count, output_ref.name)
+@@ -895,34 +1040,103 @@ class Avx512Runtime:
+                 )
+                 environment[output_ref.name] = _RuntimeValue(output_ref.type, destination)
+             elif name == "neg":
++                if native_float:
++                    source = inputs[0].buffer
++                    destination = _buffer_from_values(dtype, [0] * plan.element_count, output_ref.name)
++                    _call_unary(module, "neg", dtype, source, destination)
++                    environment[output_ref.name] = _RuntimeValue(output_ref.type, destination)
++                else:
++                    environment.update(_reference_operation(operation, plan, inputs, "AVX-512 neg"))
++            elif name in ("reduce_sum", "reduce_max", "reduce_mean"):
++                if not native_float:
++                    environment.update(_reference_operation(operation, plan, inputs, "AVX-512 {}".format(name)))
++                    return
++                result = self._execute_reduction(name, inputs[0], output_ref.type, plan, module, output_ref.name)
++                environment[output_ref.name] = _RuntimeValue(output_ref.type, result)
++            elif name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++                if not native_float:
++                    environment.update(_reference_operation(operation, plan, inputs, "AVX-512 {}".format(name)))
++                    return
+                 source = inputs[0].buffer
+                 destination = _buffer_from_values(dtype, [0] * plan.element_count, output_ref.name)
+-                _call_unary(module, "neg", dtype, source, destination)
++                _call_math(module, name, dtype, source, destination)
+                 environment[output_ref.name] = _RuntimeValue(output_ref.type, destination)
+-            elif name in ("reduce_sum", "reduce_max"):
+-                result = self._execute_reduction(name, inputs[0], output_ref.type, plan, module, output_ref.name)
+-                environment[output_ref.name] = _RuntimeValue(output_ref.type, result)
+             elif name == "matmul":
+                 matmul = plan.matmul
+-                destination = _buffer_from_values(dtype, [0] * matmul.output_elements, output_ref.name)
+-                _call_matmul(
+-                    module,
+-                    dtype,
+-                    inputs[0].buffer,
+-                    inputs[1].buffer,
+-                    destination,
+-                    matmul.m,
+-                    matmul.k,
+-                    matmul.n,
+-                )
++                if not native_float:
++                    environment.update(_reference_operation(operation, plan, inputs, "AVX-512 matmul"))
++                    return
++                if matmul.batch_shape:
++                    values = self._execute_batched_matmul(
++                        inputs[0], inputs[1], dtype, matmul, module, output_ref.name
++                    )
++                    destination = _buffer_from_values(dtype, values, output_ref.name)
++                else:
++                    destination = _buffer_from_values(dtype, [0] * matmul.output_elements, output_ref.name)
++                    _call_matmul(
++                        module,
++                        dtype,
++                        inputs[0].buffer,
++                        inputs[1].buffer,
++                        destination,
++                        matmul.m,
++                        matmul.k,
++                        matmul.n,
++                    )
+                 environment[output_ref.name] = _RuntimeValue(output_ref.type, destination)
+             else:
+-                raise CpuAvx512ExecutionError("AVX-512 operation {!r} is unsupported".format(operation.name))
++                environment.update(
++                    _reference_operation(operation, plan, inputs, "AVX-512 {}".format(name))
++                )
+         except CpuAvx512RuntimeError:
+             raise
+         except Exception as exc:
+             raise CpuAvx512ExecutionError("AVX-512 operation {} failed: {}".format(name, exc)) from exc
+ 
++    def _execute_batched_matmul(
++        self,
++        left: _RuntimeValue,
++        right: _RuntimeValue,
++        dtype: str,
++        matmul: Any,
++        module: Any,
++        context: str,
++    ) -> List[Any]:
++        """Run rank-2 native ZMM matmul once per batch on the host.
++
++        The AVX-512 native ABI remains rank-2.  This is intentionally a host
++        batch loop over real AVX-512 rank-2 kernels, not a fused batched SIMD
++        lowering; the distinction is part of artifact metadata.
++        """
++
++        batch_count = 1
++        for dimension in matmul.batch_shape:
++            batch_count *= dimension
++        left_matrix_elements = matmul.m * matmul.k
++        right_matrix_elements = matmul.k * matmul.n
++        left_values = _buffer_raw(left.buffer)
++        right_values = _buffer_raw(right.buffer)
++        if len(left_values) != batch_count * left_matrix_elements or len(right_values) != batch_count * right_matrix_elements:
++            raise CpuAvx512ExecutionError("{} batched matmul input length mismatch".format(context))
++        result: List[Any] = []
++        for batch_index in range(batch_count):
++            left_batch = _buffer_from_raw(
++                dtype,
++                left_values[batch_index * left_matrix_elements:(batch_index + 1) * left_matrix_elements],
++                context + ".left_batch",
++            )
++            right_batch = _buffer_from_raw(
++                dtype,
++                right_values[batch_index * right_matrix_elements:(batch_index + 1) * right_matrix_elements],
++                context + ".right_batch",
++            )
++            output_batch = _buffer_from_values(
++                dtype, [0] * (matmul.m * matmul.n), context + ".output_batch"
++            )
++            _call_matmul(module, dtype, left_batch, right_batch, output_batch, matmul.m, matmul.k, matmul.n)
++            result.extend(_buffer_values(output_batch))
++        return result
++
+     def _execute_reduction(
+         self,
+         name: str,
+diff --git a/python/pypto/compiler/targets/cpu_avx512.py b/python/pypto/compiler/targets/cpu_avx512.py
+index a1772069d..7c18e06fe 100644
+--- a/python/pypto/compiler/targets/cpu_avx512.py
++++ b/python/pypto/compiler/targets/cpu_avx512.py
+@@ -31,6 +31,7 @@ DEFAULT_ARTIFACT_FORMAT = "pypto-x.cpu.avx512"
+ 
+ _NATIVE_SOURCE = r'''
+ #include <immintrin.h>
++#include <math.h>
+ #include <stddef.h>
+ #include <stdint.h>
+ 
+@@ -56,7 +57,7 @@ _NATIVE_SOURCE = r'''
+ __attribute__((visibility("default"))) const char *ptx_avx512_variant = PTX_VARIANT;
+ __attribute__((visibility("default"))) const char *ptx_avx512_source_digest = PTX_SOURCE_DIGEST;
+ __attribute__((visibility("default"))) const unsigned int ptx_avx512_feature_mask = PTX_FEATURE_MASK;
+-__attribute__((visibility("default"))) const char *ptx_avx512_abi = "pypto-x.cpu.avx512:1";
++__attribute__((visibility("default"))) const char *ptx_avx512_abi = "pypto-x.cpu.avx512:2";
+ 
+ static inline __m512 ptx_binary_f32(int op, __m512 a, __m512 b) {
+     if (op == 0) return _mm512_add_ps(a, b);
+@@ -131,6 +132,45 @@ void ptx_avx512_binary_f32(int op, const float *left, int left_scalar,
+     }
+ }
+ 
++static inline float ptx_avx512_math_scalar(int operation, float value) {
++    if (operation == 0) return expf(value);
++    if (operation == 1) {
++        if (isnan(value) || value < 0.0f) return NAN;
++        if (value == 0.0f) return INFINITY;
++        return 1.0f / sqrtf(value);
++    }
++    if (operation == 2) {
++        if (value >= 0.0f) return 1.0f / (1.0f + expf(-value));
++        {
++            float exponent = expf(value);
++            return exponent / (1.0f + exponent);
++        }
++    }
++    if (operation == 3) {
++        if (value == -INFINITY) return 0.0f;
++        if (value == INFINITY) return value;
++        return value * ptx_avx512_math_scalar(2, value);
++    }
++    if (operation == 4) return log1pf(expf(-fabsf(value))) + fmaxf(value, 0.0f);
++    return NAN;
++}
++
++/* These are intentionally scalar libm lanes.  They are a correctness
++ * fallback for transcendental Core ops, and are recorded as such in the
++ * artifact metadata; they must not be mistaken for a fused ZMM math path. */
++__attribute__((visibility("default")))
++void ptx_avx512_math_f32(int operation, const float *input, float *output, size_t n) {
++    size_t i;
++    for (i = 0; i < n; ++i) output[i] = ptx_avx512_math_scalar(operation, input[i]);
++}
++
++__attribute__((visibility("default")))
++void ptx_avx512_math_bf16(int operation, const uint16_t *input, uint16_t *output, size_t n) {
++    size_t i;
++    for (i = 0; i < n; ++i)
++        output[i] = ptx_f32_to_bf16(ptx_avx512_math_scalar(operation, ptx_bf16_to_f32(input[i])));
++}
++
+ static inline void ptx_load_bf16(const uint16_t *input, float *output, size_t start, size_t count) {
+     size_t lane;
+     for (lane = 0; lane < count; ++lane) output[lane] = ptx_bf16_to_f32(input[start + lane]);
+@@ -235,6 +275,24 @@ void ptx_avx512_reduce_max_f32(const float *input, float *output, size_t n) {
+     for (; i < n; ++i) if (input[i] > *output) *output = input[i];
+ }
+ 
++__attribute__((visibility("default")))
++void ptx_avx512_reduce_mean_f32(const float *input, float *output, size_t n) {
++    size_t i = 0, lane;
++    float values[16];
++    __m512 accumulator = _mm512_setzero_ps();
++    if (n == 0) return;
++    for (; i + 16 <= n; i += 16)
++        accumulator = _mm512_add_ps(accumulator, _mm512_loadu_ps(input + i));
++    if (i < n) {
++        __mmask16 mask = (__mmask16)((1U << (n - i)) - 1U);
++        accumulator = _mm512_add_ps(accumulator, _mm512_maskz_loadu_ps(mask, input + i));
++    }
++    _mm512_storeu_ps(values, accumulator);
++    *output = 0.0f;
++    for (lane = 0; lane < 16; ++lane) *output += values[lane];
++    *output /= (float)n;
++}
++
+ __attribute__((visibility("default")))
+ void ptx_avx512_reduce_sum_bf16(const uint16_t *input, uint16_t *output, size_t n) {
+     size_t i = 0, lane;
+@@ -282,6 +340,28 @@ void ptx_avx512_reduce_max_bf16(const uint16_t *input, uint16_t *output, size_t
+     *output = ptx_f32_to_bf16(maximum);
+ }
+ 
++__attribute__((visibility("default")))
++void ptx_avx512_reduce_mean_bf16(const uint16_t *input, uint16_t *output, size_t n) {
++    size_t i = 0, lane;
++    float values[16], lanes[16];
++    __m512 accumulator = _mm512_setzero_ps();
++    if (n == 0) return;
++    for (; i + 16 <= n; i += 16) {
++        ptx_load_bf16(input, values, i, 16);
++        accumulator = _mm512_add_ps(accumulator, _mm512_loadu_ps(values));
++    }
++    if (i < n) {
++        size_t count = n - i;
++        __mmask16 mask = (__mmask16)((1U << count) - 1U);
++        ptx_load_bf16(input, values, i, count);
++        accumulator = _mm512_add_ps(accumulator, _mm512_maskz_loadu_ps(mask, values));
++    }
++    _mm512_storeu_ps(lanes, accumulator);
++    values[0] = 0.0f;
++    for (lane = 0; lane < 16; ++lane) values[0] += lanes[lane];
++    *output = ptx_f32_to_bf16(values[0] / (float)n);
++}
++
+ __attribute__((visibility("default")))
+ void ptx_avx512_matmul_f32(const float *left, const float *right, float *output,
+                            size_t m, size_t k, size_t n) {
+@@ -400,6 +480,152 @@ def _cacheable_extra(value: Mapping[str, Any]) -> dict:
+     return {key: _plain_value(item) for key, item in value.items() if key not in volatile}
+ 
+ 
++def _layout_metadata(target_ir: Avx512Program) -> list:
++    return [
++        {
++            "operation": plan.operation,
++            "kind": plan.layout_plan.kind,
++            "input_shape": list(plan.layout_plan.input_shape),
++            "output_shape": list(plan.layout_plan.output_shape),
++            "source_elements": plan.layout_plan.source_elements,
++            "output_elements": plan.layout_plan.output_elements,
++            "source_strides": list(plan.layout_plan.source_strides),
++            "permutation": list(plan.layout_plan.permutation),
++            "slice_starts": list(plan.layout_plan.slice_starts),
++            "slice_steps": list(plan.layout_plan.slice_steps),
++            "descriptor_digest": plan.layout_plan.descriptor_digest,
++        }
++        for plan in target_ir.plans
++        if plan.layout_plan is not None
++    ]
++
++
++def _indexing_metadata(target_ir: Avx512Program) -> list:
++    return [
++        {
++            "operation": plan.operation,
++            "source_shape": list(plan.indexing_plan.source_shape),
++            "index_shape": list(plan.indexing_plan.index_shape),
++            "output_shape": list(plan.indexing_plan.output_shape),
++            "axis": plan.indexing_plan.axis,
++            "source_strides": list(plan.indexing_plan.source_strides),
++            "source_elements": plan.indexing_plan.source_elements,
++            "index_elements": plan.indexing_plan.index_elements,
++            "output_elements": plan.indexing_plan.output_elements,
++            "descriptor_digest": plan.indexing_plan.descriptor_digest,
++        }
++        for plan in target_ir.plans
++        if plan.indexing_plan is not None
++    ]
++
++
++def _split_metadata(target_ir: Avx512Program) -> list:
++    return [
++        {
++            "operation": plan.operation,
++            "input_shape": list(plan.split_plan.input_shape),
++            "output_shapes": [list(shape) for shape in plan.split_plan.output_shapes],
++            "axis": plan.split_plan.axis,
++            "sizes": list(plan.split_plan.sizes),
++            "source_elements": plan.split_plan.source_elements,
++            "descriptor_digest": plan.split_plan.descriptor_digest,
++        }
++        for plan in target_ir.plans
++        if plan.split_plan is not None
++    ]
++
++
++def _concat_metadata(target_ir: Avx512Program) -> list:
++    return [
++        {
++            "operation": plan.operation,
++            "input_shapes": [list(shape) for shape in plan.concat_plan.input_shapes],
++            "output_shape": list(plan.concat_plan.output_shape),
++            "axis": plan.concat_plan.axis,
++            "sizes": list(plan.concat_plan.sizes),
++            "output_elements": plan.concat_plan.output_elements,
++            "descriptor_digest": plan.concat_plan.descriptor_digest,
++        }
++        for plan in target_ir.plans
++        if plan.concat_plan is not None
++    ]
++
++
++def _execution_metadata(target_ir: Avx512Program) -> dict:
++    """Describe the immutable AVX-512 native/reference boundary."""
++
++    operations = []
++    native_operations = []
++    math_fallback = []
++    position_operations = []
++    host_operations = []
++    for plan in target_ir.plans:
++        name = plan.operation
++        dtype = plan.dtype
++        if name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++            mode = "native_scalar_math_lane"
++            if name not in math_fallback:
++                math_fallback.append(name)
++        elif name == "matmul" and plan.matmul is not None and plan.matmul.batch_shape:
++            mode = "host_batch_loop_rank2_native"
++        elif name in (
++            "identity", "add", "sub", "mul", "div", "neg",
++            "reduce_sum", "reduce_max", "reduce_mean", "matmul",
++        ) and dtype in ("float32", "bf16"):
++            mode = "native_avx512_zmm"
++            native_operations.append(name)
++        elif name in ("compare", "iota"):
++            mode = "host_reference"
++            position_operations.append(name)
++        elif name == "constant":
++            mode = "host_materialize"
++        else:
++            mode = "host_reference"
++            host_operations.append(name)
++        operations.append({"operation_index": plan.operation_index, "operation": name, "mode": mode})
++    return {
++        "execution_modes": operations,
++        "native_operations": native_operations,
++        "native_vector_mode": "zmm+opmask",
++        "avx2_fallback_policy": "explicit_fallback_artifact_only",
++        "scalar_math_lane_fallback": math_fallback,
++        "host_preexpanded_operations": [
++            name for name in ("broadcast", "where")
++            if any(plan.operation == name for plan in target_ir.plans)
++        ],
++        "position_control_operations": position_operations,
++        "position_control_fallback": "host_reference",
++        "host_reference_operations": host_operations,
++        "layout_plan_version": 2,
++        "layout_operations": _layout_metadata(target_ir),
++        "layout_descriptor_wire": "host-reference:v1",
++        "layout_scalar_lane_fallback": [],
++        "indexing_descriptor_wire": "host-reference:v1",
++        "indexing_scalar_lane_fallback": [],
++        "indexing_operations": _indexing_metadata(target_ir),
++        "split_operations": _split_metadata(target_ir),
++        "concat_operations": _concat_metadata(target_ir),
++        "logical_layout_copy_operations": [
++            plan.operation for plan in target_ir.plans
++            if plan.layout_plan is not None and plan.layout_plan.kind == "logical_layout_copy"
++        ],
++        "native_layout_reorder_operations": [],
++        "batched_matmul_fallback": "host_batch_loop_rank2_native",
++        "batched_matmul_operations": [
++            {
++                "operation": plan.operation,
++                "batch_shape": list(plan.matmul.batch_shape),
++                "m": plan.matmul.m,
++                "k": plan.matmul.k,
++                "n": plan.matmul.n,
++                "mode": "host_batch_loop_rank2_native",
++            }
++            for plan in target_ir.plans
++            if plan.matmul is not None and plan.matmul.batch_shape
++        ],
++    }
++
++
+ def _build_directory(options: Optional[CompileOptions]) -> Path:
+     extra = {} if options is None else mapping_copy(options.extra)
+     selected = extra.get("build_dir") or os.environ.get("PYPTO_X_AVX512_BUILD_DIR")
+@@ -543,7 +769,7 @@ def _compile_native(target_ir: Avx512Program, options: Optional[CompileOptions])
+         if target_ir.use_bf16:
+             command.append("-mavx512bf16")
+             feature_flags.append("-mavx512bf16")
+-        command.extend([str(source_path), "-o", str(temporary_output)])
++        command.extend([str(source_path), "-lm", "-o", str(temporary_output)])
+         environment = dict(os.environ)
+         environment["TMPDIR"] = str(build_dir / "tmp")
+         result = subprocess.run(
+@@ -587,8 +813,8 @@ def _compile_native(target_ir: Avx512Program, options: Optional[CompileOptions])
+             if publication.exists():
+                 publication.unlink()
+     normalized = [Path(compiler_path).name]
+-    normalized.extend(command[1:-3])
+-    normalized.extend([source_path.name, "-o", output_path.name])
++    normalized.extend(command[1:-4])
++    normalized.extend([source_path.name, "-lm", "-o", output_path.name])
+     return (
+         output_path,
+         source_digest,
+@@ -674,6 +900,7 @@ class Avx512Compiler:
+             "public_core_vnni": False,
+             "public_core_bf16": target_ir.use_bf16,
+         }
++        metadata.update(_execution_metadata(target_ir))
+         if options is not None:
+             option_metadata = _plain_mapping(options.metadata)
+             reserved = set(metadata).intersection(option_metadata)
+diff --git a/python/pypto/lowering/cpu/x86/avx512/lowering.py b/python/pypto/lowering/cpu/x86/avx512/lowering.py
+index 964239bce..9e05a6659 100644
+--- a/python/pypto/lowering/cpu/x86/avx512/lowering.py
++++ b/python/pypto/lowering/cpu/x86/avx512/lowering.py
+@@ -17,7 +17,11 @@ from pypto.target import TargetSpec
+ 
+ 
+ AVX512_BACKEND = "cpu.avx512"
+-AVX512_LOWERING_VERSION = 1
++# M1A--M1H parity extends the original AVX-512 native core with the same
++# portable semantic surface as AVX2.  Keep this version separate from the
++# common vector-plan version so old AVX-512 artifacts cannot be reinterpreted
++# as the new host-reference/native mixed execution contract.
++AVX512_LOWERING_VERSION = 2
+ AVX512_LANE_COUNT = 16
+ AVX512_TAIL_POLICY = TailPolicy.MASKED
+ _BASE_FEATURES = frozenset(("avx", "avx512f", "osxsave", "ymm", "opmask", "zmm"))
+@@ -34,9 +38,20 @@ _ISA_FEATURES = frozenset(
+ )
+ # Keep vector-common growth separate from the currently emitted AVX-512 ABI.
+ # A plan for a portable primitive must not silently become an AVX fallback.
+-_NATIVE_SUPPORTED_OPERATIONS = frozenset(
+-    ("constant", "identity", "add", "sub", "mul", "div", "neg", "reduce_sum", "reduce_max", "matmul")
++_SUPPORTED_OPERATIONS = frozenset(
++    (
++        "constant", "identity", "add", "sub", "mul", "div", "neg",
++        "cast", "exp", "rsqrt", "sigmoid", "silu", "softplus",
++        "reduce_sum", "reduce_max", "reduce_mean", "broadcast", "where",
++        "matmul", "reshape", "view", "transpose", "contiguous", "slice",
++        "split", "concat", "gather", "embedding", "compare", "iota",
++    )
++)
++_FLOAT_DTYPES = frozenset(("float32", "bf16"))
++_INTEGER_DTYPES = frozenset(
++    ("int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64")
+ )
++_SUPPORTED_DTYPES = _FLOAT_DTYPES | _INTEGER_DTYPES | frozenset(("bool",))
+ 
+ 
+ class Avx512Error(ValueError):
+@@ -218,19 +233,56 @@ class Avx512Program:
+                 raise Avx512ValidationError("{} variant must declare {}".format(feature, feature))
+             if not enabled and feature in required:
+                 raise Avx512ValidationError("disabled variant must not declare {}".format(feature))
++        function = next(
++            function
++            for function in self.vector_program.program.functions
++            if function.name == self.vector_program.entrypoint
++        )
+         for plan in self.vector_program.plans:
+-            if plan.operation not in _NATIVE_SUPPORTED_OPERATIONS:
++            if plan.operation not in _SUPPORTED_OPERATIONS:
+                 raise Avx512UnsupportedError(
+-                    "AVX-512 has no emitting lowering for operation {!r}".format(plan.operation)
++                    "AVX-512 shared vector plan has no lowering or declared fallback for operation {!r}".format(
++                        plan.operation
++                    )
+                 )
+-            if plan.matmul is not None and plan.matmul.batch_shape:
++            plan_dtype = canonical_dtype(plan.dtype)
++            if plan_dtype not in _SUPPORTED_DTYPES:
+                 raise Avx512UnsupportedError(
+-                    "AVX-512 batched matmul is not lowered yet; use scalar/vector-common or SVE256 fallback"
++                    "AVX-512 supports float32/bf16 and integer/boolean reference plans, got {!r}".format(
++                        plan.dtype
++                    )
+                 )
+-            if canonical_dtype(plan.dtype) not in ("float32", "bf16"):
+-                raise Avx512UnsupportedError(
+-                    "AVX-512 supports float32 and bf16 plans, got {!r}".format(plan.dtype)
++            operation = function.body.operations[plan.operation_index]
++            iteration_domains = [("iteration", plan.iteration)]
++            if plan.reduction is not None:
++                iteration_domains.extend(
++                    (
++                        ("reduction.output_iteration", plan.reduction.output_iteration),
++                        ("reduction.reduction_iteration", plan.reduction.reduction_iteration),
++                    )
++                )
++            if plan.matmul is not None:
++                iteration_domains.extend(
++                    (
++                        ("matmul.output_iteration", plan.matmul.output_iteration),
++                        ("matmul.reduction_iteration", plan.matmul.reduction_iteration),
++                    )
+                 )
++            for domain_name, iteration in iteration_domains:
++                if not iteration.compact:
++                    raise Avx512ValidationError(
++                        "AVX-512 lowering version {} requires compact {} for {!r}".format(
++                            AVX512_LOWERING_VERSION, domain_name, plan.operation
++                        )
++                    )
++            for input_ref in operation.inputs:
++                input_dtype = canonical_dtype(input_ref.type.dtype)
++                if input_dtype not in _SUPPORTED_DTYPES:
++                    raise Avx512UnsupportedError(
++                        "AVX-512 does not support {!r} input dtype for operation {!r}".format(
++                            input_dtype, plan.operation
++                        )
++                    )
+ 
+     @property
+     def program(self) -> CoreProgram:
+@@ -390,6 +442,8 @@ def lower_avx512(
+     if selected_tail not in (AVX512_TAIL_POLICY, AVX512_TAIL_POLICY.value, "mask"):
+         raise Avx512ValidationError("AVX-512 requires tail_policy='masked'")
+     required = _normalised_required(required_features, options)
++    selected_specialization = dict(specialization or {})
++    selected_specialization.setdefault("compact_iteration", True)
+     vector_program = lower_cpu_vector(
+         program,
+         target,
+@@ -397,7 +451,7 @@ def lower_avx512(
+         lane_count=AVX512_LANE_COUNT,
+         tail_policy=AVX512_TAIL_POLICY,
+         required_features=required,
+-        specialization=specialization,
++        specialization=selected_specialization,
+     )
+     result = Avx512Program(
+         vector_program,
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx512.py b/python/tests/ut/pypto_x/test_cpu_avx512.py
+index 89780a37e..145a61bc2 100644
+--- a/python/tests/ut/pypto_x/test_cpu_avx512.py
++++ b/python/tests/ut/pypto_x/test_cpu_avx512.py
+@@ -196,10 +196,11 @@ def _float32(value):
+     return struct.unpack("<f", struct.pack("<f", float(value)))[0]
+ 
+ 
+-def test_m1c1_vector_plan_does_not_open_unimplemented_avx512_lowering():
++def test_m1a_reduce_mean_is_in_avx512_portable_parity():
+     program = _reduction("float32", (2, 3), (2,), "reduce_mean", {"axis": 1})
+-    with pytest.raises(Avx512UnsupportedError, match="no emitting lowering"):
+-        lower_avx512(program, _target("avx512f"))
++    target_ir = lower_avx512(program, _target("avx512f"))
++    assert target_ir.plans[0].operation == "reduce_mean"
++    assert target_ir.plans[0].iteration.compact
+ 
+ 
+ def _disassemble(path):
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py b/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py
+index abcc132c7..999eb5b5b 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py
+@@ -26,7 +26,7 @@ from pypto.compiler.targets.cpu_vector import CpuVectorCompiler
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
+ from pypto.lowering.cpu.vector import CpuVectorValidationError, lower_cpu_vector
+ from pypto.lowering.cpu.x86.avx2 import lower_avx2
+-from pypto.lowering.cpu.x86.avx512 import Avx512UnsupportedError, lower_avx512
++from pypto.lowering.cpu.x86.avx512 import lower_avx512
+ from pypto.lowering.gpu import lower_gpu_common
+ from pypto.target import TargetSpec
+ 
+@@ -329,7 +329,7 @@ def test_indexing_lowering_rejects_unrepresentable_strides_and_native_rank_limit
+ 
+ 
+ @pytest.mark.parametrize("operation", ("split", "concat", "gather", "embedding"))
+-def test_avx2_and_gpu_accept_indexing_while_avx512_stays_closed(operation):
++def test_avx2_avx512_and_gpu_accept_indexing_with_explicit_avx512_fallback(operation):
+     if operation == "split":
+         source = ValueRef("source", CoreType.tensor("float32", (2, 4)))
+         left = ValueRef("left", CoreType.tensor("float32", (2, 1)))
+@@ -352,7 +352,8 @@ def test_avx2_and_gpu_accept_indexing_while_avx512_stays_closed(operation):
+         program = _program(operation, (source, indices), (output,))
+     avx2_ir = lower_avx2(program, AVX2_TARGET)
+     assert avx2_ir.plans[0].operation == operation
+-    with pytest.raises(Avx512UnsupportedError, match=operation):
+-        lower_avx512(program, AVX512_TARGET)
++    avx512_ir = lower_avx512(program, AVX512_TARGET)
++    assert avx512_ir.plans[0].operation == operation
++    assert all(plan.iteration.compact for plan in avx512_ir.plans)
+     target_ir = lower_gpu_common(program, GPU_TARGET)
+     assert target_ir.plans[0].operation == operation
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256_layout.py b/python/tests/ut/pypto_x/test_cpu_sve256_layout.py
+index a728b665d..a4a9434c0 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256_layout.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256_layout.py
+@@ -19,7 +19,7 @@ from pypto.compiler.targets.cpu_sve256 import Sve256Compiler
+ from pypto.compiler.targets.cpu import CpuScalarCompiler
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
+ from pypto.lowering.cpu.x86.avx2 import lower_avx2
+-from pypto.lowering.cpu.x86.avx512 import Avx512UnsupportedError, lower_avx512
++from pypto.lowering.cpu.x86.avx512 import lower_avx512
+ from pypto.lowering.cpu.vector import CpuVectorValidationError
+ from pypto.target import TargetSpec
+ from pypto.target._utils import sha256_text
+@@ -336,7 +336,7 @@ def test_layout_descriptor_rank_permutation_slice_and_overflow_gates(
+         )
+ 
+ 
+-def test_avx2_accepts_layout_with_host_reference_and_avx512_stays_closed():
++def test_avx2_and_avx512_accept_layout_with_host_reference():
+     program = _program("transpose", (2, 3), (3, 2), {"permutation": [1, 0]})
+     avx2_target = TargetSpec("cpu", "x86_64-linux-gnu", features=("avx", "avx2", "osxsave", "ymm"))
+     avx512_target = TargetSpec(
+@@ -345,8 +345,9 @@ def test_avx2_accepts_layout_with_host_reference_and_avx512_stays_closed():
+     avx2_ir = lower_avx2(program, avx2_target)
+     assert avx2_ir.plans[0].operation == "transpose"
+     assert avx2_ir.lowering_version == 2
+-    with pytest.raises(Avx512UnsupportedError, match="transpose"):
+-        lower_avx512(program, avx512_target)
++    avx512_ir = lower_avx512(program, avx512_target)
++    assert avx512_ir.plans[0].operation == "transpose"
++    assert avx512_ir.plans[0].iteration.compact
+ 
+ 
+ def test_layout_sve_hotspot_has_predicated_gather_and_no_neon(tmp_path):
+diff --git a/python/tests/ut/pypto_x/test_qwen35_avx512_parity.py b/python/tests/ut/pypto_x/test_qwen35_avx512_parity.py
+new file mode 100644
+index 000000000..6cc5ed8ae
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_qwen35_avx512_parity.py
+@@ -0,0 +1,353 @@
++"""Qwen3.5 portable-subset parity for the AVX-512 backend.
++
++All tensors in this file are synthetic; no checkpoint or model loader is used.
++The test intentionally checks both the native ZMM core and the explicit
++host-reference/scalar-lane boundary recorded in the artifact.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++import pytest
++
++from pypto.abi import LaunchRequest
++from pypto.backends.cpu import CpuScalarRuntime, HostTensor
++from pypto.backends.cpu.x86 import Avx512Runtime, CpuAvx512ExecutionError
++from pypto.compiler import CompileOptions
++from pypto.compiler.targets.cpu import CpuScalarCompiler
++from pypto.compiler.targets.cpu_avx512 import Avx512Compiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.portable.qwen35 import (
++    build_attention_subgraph,
++    build_batched_matmul,
++    build_causal_conv1d_state,
++    build_decoder_subgraph,
++    build_qwen35_gdr_recurrent_state,
++    build_qwen35_position_control,
++    build_rms_norm,
++    build_stable_softmax,
++    build_swiglu,
++)
++from pypto.target import TargetSpec
++
++
++AVX512_TARGET = TargetSpec(
++    "cpu",
++    "x86_64-linux-gnu",
++    features=("avx512f",),
++    attributes={"lane_count": 16},
++)
++SCALAR_TARGET = TargetSpec("cpu", "x86_64-linux-gnu")
++
++
++def _runtime():
++    runtime = Avx512Runtime()
++    if not runtime.is_available():
++        pytest.skip("host lacks AVX-512/ZMM capability: {}".format(runtime.availability().to_dict()))
++    return runtime
++
++
++def _compile_avx512(program: CoreProgram, tmp_path: Path):
++    compiler = Avx512Compiler()
++    return compiler.compile(
++        compiler.lower(program, AVX512_TARGET),
++        CompileOptions(
++            artifact_format="pypto-x.cpu.avx512",
++            extra={"build_dir": str(tmp_path / "avx512")},
++        ),
++    )
++
++
++def _compile_scalar(program: CoreProgram):
++    compiler = CpuScalarCompiler()
++    return compiler.compile(compiler.lower(program, SCALAR_TARGET))
++
++
++def _launch(artifact, inputs, outputs, *, runtime, scalars=None):
++    return runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[item.descriptor(readonly=True) for item in inputs],
++            outputs=[item.descriptor() for item in outputs],
++            scalars=scalars or {},
++        )
++    )
++
++
++def _assert_close(left, right, tolerance=3.0e-5):
++    assert len(left) == len(right)
++    for actual, expected in zip(left, right):
++        assert abs(float(actual) - float(expected)) <= tolerance + tolerance * abs(float(expected))
++
++
++def test_avx512_position_softmax_and_batched_matmul_parity(tmp_path):
++    runtime = _runtime()
++    position = build_qwen35_position_control(1, 3, past_length=2, index_dtype="int32")
++    avx_position = _compile_avx512(position, tmp_path / "position")
++    scalar_position = _compile_scalar(position)
++    avx_outputs = [HostTensor("int32", (1, 3)), HostTensor("bool", (1, 8, 3, 5))]
++    scalar_outputs = [HostTensor("int32", (1, 3)), HostTensor("bool", (1, 8, 3, 5))]
++    _launch(avx_position, [], avx_outputs, runtime=runtime)
++    _launch(scalar_position, [], scalar_outputs, runtime=CpuScalarRuntime())
++    assert avx_outputs[0].flat() == scalar_outputs[0].flat() == (2, 3, 4)
++    assert avx_outputs[1].flat() == scalar_outputs[1].flat()
++    assert all(plan.iteration.compact for plan in Avx512Compiler().lower(position, AVX512_TARGET).plans)
++    assert avx_position.metadata["position_control_fallback"] == "host_reference"
++    assert avx_position.metadata["native_operations"] == ()
++
++    softmax = build_stable_softmax((2, 17), "float32")
++    avx_softmax = _compile_avx512(softmax, tmp_path / "softmax")
++    scalar_softmax = _compile_scalar(softmax)
++    logits = HostTensor("float32", (2, 17), [float(index - 7) for index in range(34)])
++    avx_softmax_output = HostTensor.zeros("float32", (2, 17))
++    scalar_softmax_output = HostTensor.zeros("float32", (2, 17))
++    _launch(avx_softmax, [logits], [avx_softmax_output], runtime=runtime)
++    _launch(scalar_softmax, [logits], [scalar_softmax_output], runtime=CpuScalarRuntime())
++    _assert_close(avx_softmax_output.flat(), scalar_softmax_output.flat())
++    assert "exp" in avx_softmax.metadata["scalar_math_lane_fallback"]
++    assert "reduce_max" in avx_softmax.metadata["native_operations"]
++    assert "broadcast" in avx_softmax.metadata["host_preexpanded_operations"]
++
++    batched = build_batched_matmul((2, 2, 3), (2, 3, 17), "float32")
++    avx_batched = _compile_avx512(batched, tmp_path / "batched")
++    scalar_batched = _compile_scalar(batched)
++    left = HostTensor("float32", (2, 2, 3), [float(index + 1) for index in range(12)])
++    right = HostTensor("float32", (2, 3, 17), [float(index + 1) for index in range(102)])
++    avx_output = HostTensor.zeros("float32", (2, 2, 17))
++    scalar_output = HostTensor.zeros("float32", (2, 2, 17))
++    _launch(avx_batched, [left, right], [avx_output], runtime=runtime)
++    _launch(scalar_batched, [left, right], [scalar_output], runtime=CpuScalarRuntime())
++    _assert_close(avx_output.flat(), scalar_output.flat(), tolerance=3.0e-4)
++    assert avx_batched.metadata["batched_matmul_fallback"] == "host_batch_loop_rank2_native"
++    assert avx_batched.metadata["batched_matmul_operations"][0]["mode"] == "host_batch_loop_rank2_native"
++
++
++def test_avx512_connected_attention_layout_indexing_and_guarded_shapes(tmp_path):
++    runtime = _runtime()
++    program = build_attention_subgraph(
++        (2, 10), (3, 9), (1, 3, 2, 5), 6, "float32", rotary_dim=6
++    )
++    artifact = _compile_avx512(program, tmp_path / "attention")
++    scalar_artifact = _compile_scalar(program)
++    q = HostTensor("float32", (2, 10), [((index * 3) % 17 - 8) * 0.1 for index in range(20)])
++    cos = HostTensor("float32", (2, 6), [0.5] * 12)
++    sin = HostTensor("float32", (2, 6), [0.25] * 12)
++    logits = HostTensor("float32", (3, 9), [((index * 5) % 19 - 9) * 0.15 for index in range(27)])
++    mask = HostTensor("bool", (3, 9), [column <= row + 1 for row in range(3) for column in range(9)])
++    kv = HostTensor("float32", (1, 3, 2, 5), [index * 0.1 - 1.0 for index in range(30)])
++    indices = HostTensor("int64", (6,), [0, 0, 1, 1, 2, 2])
++    avx_outputs = [
++        HostTensor.zeros("float32", (2, 10)),
++        HostTensor.zeros("float32", (3, 9)),
++        HostTensor.zeros("float32", (1, 6, 2, 5)),
++    ]
++    scalar_outputs = [
++        HostTensor.zeros("float32", (2, 10)),
++        HostTensor.zeros("float32", (3, 9)),
++        HostTensor.zeros("float32", (1, 6, 2, 5)),
++    ]
++    inputs = [q, cos, sin, logits, mask, kv, indices]
++    _launch(artifact, inputs, avx_outputs, runtime=runtime, scalars={"fill_value": -10000.0})
++    _launch(scalar_artifact, inputs, scalar_outputs, runtime=CpuScalarRuntime(), scalars={"fill_value": -10000.0})
++    for actual, expected in zip(avx_outputs, scalar_outputs):
++        _assert_close(actual.flat(), expected.flat())
++    assert artifact.metadata["position_control_operations"] == ()
++    assert any(item["mode"] == "host_reference" for item in artifact.metadata["execution_modes"])
++    assert artifact.metadata["native_vector_mode"] == "zmm+opmask"
++
++
++def test_avx512_m1a_m1d_and_decoder_composites_differential(tmp_path):
++    runtime = _runtime()
++    cases = [
++        (
++            build_rms_norm((2, 17), "float32"),
++            [HostTensor("float32", (2, 17), [0.1 + i * 0.01 for i in range(34)]), HostTensor("float32", (17,), [0.01] * 17)],
++            [HostTensor.zeros("float32", (2, 17))],
++            {"epsilon": 1.0e-5},
++        ),
++        (
++            build_swiglu((2, 34), "float32"),
++            [HostTensor("float32", (2, 34), [((i % 13) - 6) * 0.1 for i in range(68)])],
++            [HostTensor.zeros("float32", (2, 17))],
++            {},
++        ),
++        (
++            build_decoder_subgraph(2, hidden=8, intermediate=10, dtype="float32"),
++            [
++                HostTensor("float32", (2, 8), [0.1 + i * 0.01 for i in range(16)]),
++                HostTensor("float32", (8,), [0.01] * 8),
++                HostTensor("float32", (8, 20), [0.02] * 160),
++            ],
++            [HostTensor.zeros("float32", (2, 10))],
++            {"epsilon": 1.0e-5},
++        ),
++    ]
++    for index, (program, inputs, outputs, scalars) in enumerate(cases):
++        avx = _compile_avx512(program, tmp_path / "composite" / str(index))
++        scalar = _compile_scalar(program)
++        expected = [HostTensor.zeros(item.dtype, item.shape) for item in outputs]
++        _launch(avx, inputs, outputs, runtime=runtime, scalars=scalars)
++        _launch(scalar, inputs, expected, runtime=CpuScalarRuntime(), scalars=scalars)
++        for actual, reference in zip(outputs, expected):
++            _assert_close(actual.flat(), reference.flat(), tolerance=4.0e-4)
++        assert any(item["mode"] == "host_reference" for item in avx.metadata["execution_modes"])
++
++
++def test_avx512_bf16_qwen_math_and_layout_parity(tmp_path):
++    runtime = _runtime()
++    cases = [
++        (
++            build_rms_norm((2, 17), "bf16"),
++            [HostTensor("bf16", (2, 17), [0.1 + i * 0.01 for i in range(34)]), HostTensor("bf16", (17,), [0.01] * 17)],
++            [HostTensor.zeros("bf16", (2, 17))],
++            {"epsilon": 1.0e-5},
++        ),
++        (
++            build_stable_softmax((2, 17), "bf16"),
++            [HostTensor("bf16", (2, 17), [float(i - 10) * 0.1 for i in range(34)])],
++            [HostTensor.zeros("bf16", (2, 17))],
++            {},
++        ),
++        (
++            build_swiglu((2, 34), "bf16"),
++            [HostTensor("bf16", (2, 34), [((i % 13) - 6) * 0.1 for i in range(68)])],
++            [HostTensor.zeros("bf16", (2, 17))],
++            {},
++        ),
++    ]
++    for index, (program, inputs, outputs, scalars) in enumerate(cases):
++        avx = _compile_avx512(program, tmp_path / "bf16" / str(index))
++        scalar = _compile_scalar(program)
++        expected = [HostTensor.zeros(item.dtype, item.shape) for item in outputs]
++        _launch(avx, inputs, outputs, runtime=runtime, scalars=scalars)
++        _launch(scalar, inputs, expected, runtime=CpuScalarRuntime(), scalars=scalars)
++        for actual, reference in zip(outputs, expected):
++            _assert_close(actual.flat(), reference.flat(), tolerance=2.0e-3)
++        assert "bf16" not in avx.metadata["host_reference_operations"]
++
++
++def test_avx512_conv_state_graph_and_plan_boundaries(tmp_path):
++    runtime = _runtime()
++    program = build_causal_conv1d_state((1, 4, 3), "float32")
++    avx = _compile_avx512(program, tmp_path / "conv")
++    scalar = _compile_scalar(program)
++    mixed = HostTensor("float32", (1, 4, 3), [0.1 + i * 0.05 for i in range(12)])
++    prior = HostTensor("float32", (1, 4, 4), [0.02] * 16)
++    weight = HostTensor("float32", (4, 4), [0.03] * 16)
++    actual = [HostTensor.zeros("float32", (1, 4, 3)), HostTensor.zeros("float32", (1, 4, 4))]
++    expected = [HostTensor.zeros("float32", (1, 4, 3)), HostTensor.zeros("float32", (1, 4, 4))]
++    _launch(avx, [mixed, prior, weight], actual, runtime=runtime)
++    _launch(scalar, [mixed, prior, weight], expected, runtime=CpuScalarRuntime())
++    for left, right in zip(actual, expected):
++        _assert_close(left.flat(), right.flat(), tolerance=4.0e-4)
++    assert avx.metadata["batched_matmul_operations"] == ()
++    assert "silu" in avx.metadata["scalar_math_lane_fallback"]
++    assert all(plan.iteration.compact for plan in Avx512Compiler().lower(program, AVX512_TARGET).plans)
++
++
++def test_avx512_gdr_recurrent_graph_zero_state_differential(tmp_path):
++    """Exercise the fixed Qwen GDR graph without loading checkpoint weights."""
++
++    runtime = _runtime()
++    program = build_qwen35_gdr_recurrent_state(1, 1)
++    avx = _compile_avx512(program, tmp_path / "gdr")
++    scalar = _compile_scalar(program)
++    query = HostTensor("bf16", (1, 1, 16, 128), [0.0] * (16 * 128))
++    key = HostTensor("bf16", (1, 1, 16, 128), [0.0] * (16 * 128))
++    value = HostTensor("bf16", (1, 1, 16, 128), [0.0] * (16 * 128))
++    gate = HostTensor("float32", (1, 1, 16), [0.0] * 16)
++    beta = HostTensor("bf16", (1, 1, 16), [0.0] * 16)
++    prior = HostTensor("float32", (1, 16, 128, 128), [0.0] * (16 * 128 * 128))
++    actual = [
++        HostTensor.zeros("bf16", (1, 1, 16, 128)),
++        HostTensor.zeros("float32", (1, 16, 128, 128)),
++    ]
++    expected = [
++        HostTensor.zeros("bf16", (1, 1, 16, 128)),
++        HostTensor.zeros("float32", (1, 16, 128, 128)),
++    ]
++    inputs = [query, key, value, gate, beta, prior]
++    _launch(avx, inputs, actual, runtime=runtime, scalars={"scale": 2.0 ** -0.5})
++    _launch(scalar, inputs, expected, runtime=CpuScalarRuntime(), scalars={"scale": 2.0 ** -0.5})
++    for left, right in zip(actual, expected):
++        _assert_close(left.flat(), right.flat(), tolerance=1.0e-5)
++    assert "exp" in avx.metadata["scalar_math_lane_fallback"]
++    assert avx.metadata["batched_matmul_fallback"] == "host_batch_loop_rank2_native"
++
++
++def test_avx512_compare_iota_cast_and_bad_index_boundaries(tmp_path):
++    runtime = _runtime()
++    left = ValueRef("left", CoreType.tensor("int32", (9,)))
++    right = ValueRef("right", CoreType.tensor("int32", (9,)))
++    for predicate in ("eq", "ne", "lt", "le", "gt", "ge"):
++        output = ValueRef("output", CoreType.tensor("bool", (9,)))
++        operation = Operation("compare", (left, right), (output,), {"predicate": predicate})
++        program = CoreProgram(
++            functions=(CoreFunction("compare_" + predicate, (left, right), (output,), Region((operation,))),)
++        )
++        avx = _compile_avx512(program, tmp_path / "compare" / predicate)
++        scalar = _compile_scalar(program)
++        values_left = HostTensor("int32", (9,), [-2, -1, 0, 1, 2, 3, 4, 5, 6])
++        values_right = HostTensor("int32", (9,), [-1, -1, 1, 1, 1, 2, 5, 7, 6])
++        actual = HostTensor.zeros("bool", (9,))
++        expected = HostTensor.zeros("bool", (9,))
++        _launch(avx, [values_left, values_right], [actual], runtime=runtime)
++        _launch(scalar, [values_left, values_right], [expected], runtime=CpuScalarRuntime())
++        assert actual.flat() == expected.flat()
++        assert avx.metadata["position_control_fallback"] == "host_reference"
++
++    cast_input = ValueRef("input", CoreType.tensor("bf16", (17,)))
++    cast_output = ValueRef("output", CoreType.tensor("float32", (17,)))
++    cast_operation = Operation("cast", (cast_input,), (cast_output,), {"dtype": "float32"})
++    cast_program = CoreProgram(
++        functions=(CoreFunction("cast", (cast_input,), (cast_output,), Region((cast_operation,))),)
++    )
++    avx_cast = _compile_avx512(cast_program, tmp_path / "cast")
++    scalar_cast = _compile_scalar(cast_program)
++    cast_values = HostTensor("bf16", (17,), [0.1 + i * 0.01 for i in range(17)])
++    actual_cast = HostTensor.zeros("float32", (17,))
++    expected_cast = HostTensor.zeros("float32", (17,))
++    _launch(avx_cast, [cast_values], [actual_cast], runtime=runtime)
++    _launch(scalar_cast, [cast_values], [expected_cast], runtime=CpuScalarRuntime())
++    assert actual_cast.flat() == expected_cast.flat()
++    assert avx_cast.metadata["host_reference_operations"] == ("cast",)
++
++    iota_type = CoreType.tensor("int64", (2, 17))
++    iota_output = ValueRef("output", iota_type)
++    iota_operation = Operation(
++        "iota", (), (iota_output,), {"axis": 1, "start": -3, "step": 2}
++    )
++    iota_program = CoreProgram(
++        functions=(CoreFunction("iota", (), (iota_output,), Region((iota_operation,))),)
++    )
++    avx_iota = _compile_avx512(iota_program, tmp_path / "iota")
++    scalar_iota = _compile_scalar(iota_program)
++    actual_iota = HostTensor.zeros("int64", (2, 17))
++    expected_iota = HostTensor.zeros("int64", (2, 17))
++    _launch(avx_iota, [], [actual_iota], runtime=runtime)
++    _launch(scalar_iota, [], [expected_iota], runtime=CpuScalarRuntime())
++    assert actual_iota.flat() == expected_iota.flat()
++    assert actual_iota.flat()[:4] == (-3, -1, 1, 3)
++
++    # Position/control itself has no gather; use a connected attention graph
++    # with an invalid runtime head index to ensure the explicit fallback keeps
++    # the vector-common bounds contract.
++    attention = build_attention_subgraph((1, 8), (1, 4), (1, 2, 2, 2), 4, "float32", rotary_dim=8)
++    avx_attention = _compile_avx512(attention, tmp_path / "bad-index")
++    inputs = [
++        HostTensor("float32", (1, 8), [0.1] * 8),
++        HostTensor("float32", (1, 8), [0.5] * 8),
++        HostTensor("float32", (1, 8), [0.25] * 8),
++        HostTensor("float32", (1, 4), [0.1] * 4),
++        HostTensor("bool", (1, 4), [True] * 4),
++        HostTensor("float32", (1, 2, 2, 2), [0.2] * 8),
++        HostTensor("int64", (4,), [0, 1, 2, 9]),
++    ]
++    outputs = [
++        HostTensor.zeros("float32", (1, 8)),
++        HostTensor.zeros("float32", (1, 4)),
++        HostTensor.zeros("float32", (1, 4, 2, 2)),
++    ]
++    with pytest.raises(CpuAvx512ExecutionError, match="outside axis"):
++        _launch(avx_attention, inputs, outputs, runtime=runtime, scalars={"fill_value": -100.0})

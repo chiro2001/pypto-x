@@ -1,0 +1,1517 @@
+From 5b0474f0db26d611526070dc4298170672e264af Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Wed, 9 Sep 2026 09:09:19 +0800
+Subject: [PATCH 71/96] feat(cuda): add qwen c2 math layout and indexing
+
+---
+ python/pypto/backends/cuda/runtime.py                |  85 ++++--
+ python/pypto/compiler/targets/cuda.py                | 590 +++++++++++++++++++++++++++++++++++----
+ python/pypto/lowering/gpu/plan.py                    |  80 ++++--
+ python/tests/ut/pypto_x/cuda_c2_device_validation.py | 163 +++++++++++
+ python/tests/ut/pypto_x/test_cpu_sve256_indexing.py  |   8 +-
+ python/tests/ut/pypto_x/test_cuda_qwen_c2.py         | 277 ++++++++++++++++++
+ 6 files changed, 1097 insertions(+), 106 deletions(-)
+
+diff --git a/python/pypto/backends/cuda/runtime.py b/python/pypto/backends/cuda/runtime.py
+index e8f7bece3..10abeabf2 100644
+--- a/python/pypto/backends/cuda/runtime.py
++++ b/python/pypto/backends/cuda/runtime.py
+@@ -1,4 +1,4 @@
+-"""CUDA Driver/PTX runtime for the initial PyPTO-X GPU common subset."""
++"""CUDA Driver/PTX runtime for the PyPTO-X GPU common and C2 subset."""
+ 
+ from __future__ import annotations
+ 
+@@ -71,7 +71,13 @@ def _pack(dtype: str, values: Sequence[Any]) -> bytes:
+         return b"".join(struct.pack("<f", float(value)) for value in values)
+     if dtype == "bf16":
+         return b"".join(struct.pack("<H", _bf16_bits(value)) for value in values)
+-    raise CudaExecutionError("CUDA bootstrap only supports float32 and bf16 host buffers")
++    formats = {
++        "bool": "<?", "int8": "<b", "uint8": "<B", "int16": "<h", "uint16": "<H",
++        "int32": "<i", "uint32": "<I", "int64": "<q", "uint64": "<Q",
++    }
++    if dtype in formats:
++        return b"".join(struct.pack(formats[dtype], value) for value in values)
++    raise CudaExecutionError("CUDA host buffers do not support dtype {!r}".format(dtype))
+ 
+ 
+ def _unpack(dtype: str, payload: bytes) -> list:
+@@ -88,16 +94,29 @@ def _unpack(dtype: str, payload: bytes) -> list:
+             bits = struct.unpack_from("<H", payload, index)[0]
+             result.append(struct.unpack("<f", struct.pack("<I", bits << 16))[0])
+         return result
+-    raise CudaExecutionError("CUDA bootstrap only supports float32 and bf16 result buffers")
++    formats = {
++        "bool": ("<?", 1), "int8": ("<b", 1), "uint8": ("<B", 1), "int16": ("<h", 2),
++        "uint16": ("<H", 2), "int32": ("<i", 4), "uint32": ("<I", 4),
++        "int64": ("<q", 8), "uint64": ("<Q", 8),
++    }
++    if dtype in formats:
++        fmt, itemsize = formats[dtype]
++        if len(payload) % itemsize:
++            raise CudaExecutionError("{} result byte count is not aligned".format(dtype))
++        return [struct.unpack_from(fmt, payload, index)[0] for index in range(0, len(payload), itemsize)]
++    raise CudaExecutionError("CUDA result buffers do not support dtype {!r}".format(dtype))
+ 
+ 
+ def _itemsize(dtype: str) -> int:
+     dtype = canonical_dtype(dtype)
+-    if dtype == "float32":
+-        return 4
+-    if dtype == "bf16":
+-        return 2
+-    raise CudaExecutionError("unsupported CUDA dtype {!r}".format(dtype))
++    sizes = {
++        "bool": 1, "int8": 1, "uint8": 1, "int16": 2, "uint16": 2,
++        "bf16": 2, "int32": 4, "uint32": 4, "float32": 4, "int64": 8, "uint64": 8,
++    }
++    try:
++        return sizes[dtype]
++    except KeyError as exc:
++        raise CudaExecutionError("unsupported CUDA dtype {!r}".format(dtype)) from exc
+ 
+ 
+ def _is_tensor(value_type: CoreType) -> bool:
+@@ -316,21 +335,23 @@ class CudaRuntime:
+                     return_descriptors[ref.name] = gpu_request.outputs[tensor_return_index]
+                     tensor_return_index += 1
+             for index, operation in enumerate(function.body.operations):
+-                output = operation.outputs[0]
+-                if _is_tensor(output.type):
+-                    if output.name in return_names:
+-                        allocation = self._prepare_output(
+-                            return_descriptors[output.name], output.type, allocations
+-                        )
+-                        output_allocations[output.name] = allocation
+-                    else:
++                output_allocations_for_operation = []
++                for output in operation.outputs:
++                    if _is_tensor(output.type):
++                        if output.name in return_names:
++                            allocation = self._prepare_output(
++                                return_descriptors[output.name], output.type, allocations
++                            )
++                            output_allocations[output.name] = allocation
++                        else:
++                            allocation = self._allocate_for_type(output.type, allocations)
++                        values[output.name] = allocation.pointer
++                    elif _is_scalar(output.type):
+                         allocation = self._allocate_for_type(output.type, allocations)
+-                    values[output.name] = allocation.pointer
+-                elif _is_scalar(output.type):
+-                    allocation = self._allocate_for_type(output.type, allocations)
+-                    values[output.name] = allocation.pointer
+-                else:
+-                    raise CudaExecutionError("unsupported CUDA operation output kind {!r}".format(output.type.kind))
++                        values[output.name] = allocation.pointer
++                    else:
++                        raise CudaExecutionError("unsupported CUDA operation output kind {!r}".format(output.type.kind))
++                    output_allocations_for_operation.append((output, allocation))
+                 function_handle = module.get_function("px_op{}".format(index))
+                 parameters = []
+                 for ref in operation.inputs:
+@@ -340,7 +361,7 @@ class CudaRuntime:
+                         parameters.append(self._scalar_parameter(scalar_values.get(ref.name, values.get(ref.name)), ref.type))
+                     else:
+                         raise CudaExecutionError("unsupported CUDA operation input kind {!r}".format(ref.type.kind))
+-                if _is_tensor(output.type) or _is_scalar(output.type):
++                for output, _allocation in output_allocations_for_operation:
+                     parameters.append(values[output.name])
+                 plan = loaded.target_ir.gpu_program.plans[index]
+                 self.driver.launch_kernel(
+@@ -351,6 +372,20 @@ class CudaRuntime:
+                     gpu_request.stream_handle,
+                     plan.geometry.dynamic_workgroup_memory_bytes,
+                 )
++                scalar_outputs = [output for output in operation.outputs if _is_scalar(output.type)]
++                if scalar_outputs:
++                    # Scalar SSA values are represented as ordinary device
++                    # results in the kernel ABI.  Until a scalar device-value
++                    # ABI is introduced, synchronize and materialize them on
++                    # the host before the next kernel consumes them.  This is
++                    # an explicit orchestration fallback, not a fused path.
++                    self.driver.context_synchronize()
++                    for scalar_output in scalar_outputs:
++                        raw = self.driver.memcpy_dtoh(
++                            values[scalar_output.name], _itemsize(scalar_output.type.dtype)
++                        )
++                        unpacked = _unpack(scalar_output.type.dtype, raw)
++                        scalar_values[scalar_output.name] = unpacked[0] if unpacked else 0
+             if gpu_request.stream_handle is not None and hasattr(self.driver, "stream_synchronize"):
+                 self.driver.stream_synchronize(gpu_request.stream_handle)
+             else:
+@@ -423,7 +458,9 @@ class CudaRuntime:
+     @staticmethod
+     def _scalar_parameter(value: Any, value_type: CoreType) -> Any:
+         dtype = canonical_dtype(value_type.dtype)
+-        if dtype in ("float32", "bf16", "float16"):
++        if dtype == "bf16":
++            return ctypes.c_uint16(_bf16_bits(value))
++        if dtype in ("float32", "float16"):
+             return ctypes.c_float(float(value))
+         return ctypes.c_uint64(int(value))
+ 
+diff --git a/python/pypto/compiler/targets/cuda.py b/python/pypto/compiler/targets/cuda.py
+index d5dac88d6..66bc644e8 100644
+--- a/python/pypto/compiler/targets/cuda.py
++++ b/python/pypto/compiler/targets/cuda.py
+@@ -33,13 +33,13 @@ from pypto.target import TargetSpec
+ from pypto.target._utils import frozen_mapping, mapping_copy, sha256_text
+ 
+ 
+-ARTIFACT_PAYLOAD_VERSION = 1
++ARTIFACT_PAYLOAD_VERSION = 2
+ CUDA_ARTIFACT_FORMAT = "pypto-x.cuda.ptx"
+ DEFAULT_ARTIFACT_FORMAT = CUDA_ARTIFACT_FORMAT
+ CUDA_BACKEND = "cuda.ptx"
+ CUDA_PTX_VERSION = "8.0"
+ DEFAULT_PTX_TARGET = "sm_80"
+-CUDA_LOWERING_VERSION = 1
++CUDA_LOWERING_VERSION = 2
+ MAX_INLINE_CONSTANT_ELEMENTS = 4096
+ _PTX_TARGET_RE = re.compile(r"^sm_[0-9]+$")
+ _PTX_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+$")
+@@ -138,15 +138,15 @@ def _operation_bindings(operation: Operation) -> Tuple[Mapping[str, Any], ...]:
+                 "role": "input",
+             }
+         )
+-    output = operation.outputs[0]
+-    bindings.append(
+-        {
+-            "name": output.name,
+-            "kind": "tensor" if _is_tensor(output.type) else "scalar",
+-            "dtype": canonical_dtype(output.type.dtype),
+-            "role": "output",
+-        }
+-    )
++    for output in operation.outputs:
++        bindings.append(
++            {
++                "name": output.name,
++                "kind": "tensor" if _is_tensor(output.type) else "scalar",
++                "dtype": canonical_dtype(output.type.dtype),
++                "role": "output",
++            }
++        )
+     return tuple(bindings)
+ 
+ 
+@@ -190,9 +190,11 @@ class _Kernel:
+                     declarations.append("    .param .u64 p{}".format(index))
+             else:
+                 raise CudaPtxUnsupportedError("unsupported kernel parameter kind {!r}".format(ref.type.kind))
+-        # Every operation result is written through a device pointer, even
+-        # when the Core IR result is a scalar.
+-        declarations.append("    .param .u64 p{}".format(len(self.operation.inputs)))
++        # Every operation result is written through a device pointer.  Split
++        # is the one portable multi-result operation and therefore contributes
++        # one pointer parameter per result.
++        for output_index, _output in enumerate(self.operation.outputs):
++            declarations.append("    .param .u64 p{}".format(len(self.operation.inputs) + output_index))
+         return tuple(declarations)
+ 
+     def preamble(self) -> None:
+@@ -252,8 +254,16 @@ class _Kernel:
+             if dtype == "bf16":
+                 self.line("    ld.param.b16 %rs0, [p{}];".format(param_index))
+                 self.line("    cvt.f32.bf16 %f{}, %rs0;".format(float_register))
+-            else:
++            elif dtype in ("float32", "float16"):
+                 self.line("    ld.param.f32 %f{}, [p{}];".format(float_register, param_index))
++            elif dtype in ("int32", "uint32", "bool"):
++                self.line("    ld.param.u64 %rd{}, [p{}];".format(result_register, param_index))
++                self.line("    cvt.rn.f32.u64 %f{}, %rd{};".format(float_register, result_register))
++            elif dtype in ("int64", "uint64"):
++                self.line("    ld.param.u64 %rd{}, [p{}];".format(result_register, param_index))
++                self.line("    cvt.rn.f32.s64 %f{}, %rd{};".format(float_register, result_register))
++            else:
++                raise CudaPtxUnsupportedError("PTX scalar load does not support dtype {!r}".format(dtype))
+             return
+         self.address(param_index, index_register, _dtype_itemsize(dtype), result_register)
+         if dtype == "bf16":
+@@ -264,6 +274,36 @@ class _Kernel:
+         else:
+             raise CudaPtxUnsupportedError("PTX load does not support dtype {!r}".format(dtype))
+ 
++    def load_integer(self, ref: ValueRef, param_index: int, index_register: int, address_register: int, result_register: int = 40) -> None:
++        """Load an index/integer value without narrowing it through f32."""
++
++        dtype = canonical_dtype(ref.type.dtype)
++        if _is_scalar(ref.type):
++            self.line("    ld.param.u64 %rd{}, [p{}];".format(result_register, param_index))
++            return
++        self.address(param_index, index_register, _dtype_itemsize(dtype), address_register)
++        if dtype in ("int32", "uint32", "bool"):
++            self.line("    ld.global.u32 %r0, [%rd{}];".format(address_register))
++            self.line("    cvt.u64.u32 %rd{}, %r0;".format(result_register))
++            if dtype == "int32":
++                self.line("    cvt.s64.s32 %rd{}, %r0;".format(result_register))
++        elif dtype in ("int64", "uint64"):
++            self.line("    ld.global.u64 %rd{}, [%rd{}];".format(result_register, address_register))
++        else:
++            raise CudaPtxUnsupportedError("PTX integer load does not support dtype {!r}".format(dtype))
++
++    def load_predicate(self, ref: ValueRef, param_index: int, index_register: int, address_register: int, predicate: int = 1) -> None:
++        dtype = canonical_dtype(ref.type.dtype)
++        if dtype != "bool":
++            raise CudaPtxUnsupportedError("predicate load requires bool, got {!r}".format(dtype))
++        if _is_scalar(ref.type):
++            self.line("    ld.param.u64 %rd40, [p{}];".format(param_index))
++            self.line("    setp.ne.u64 %p{}, %rd40, 0;".format(predicate))
++            return
++        self.address(param_index, index_register, 1, address_register)
++        self.line("    ld.global.u8 %r0, [%rd{}];".format(address_register))
++        self.line("    setp.ne.u32 %p{}, %r0, 0;".format(predicate))
++
+     def store_value(self, ref: ValueRef, param_index: int, index_register: int, float_register: int, address_register: int = 20) -> None:
+         dtype = canonical_dtype(ref.type.dtype)
+         if not _is_tensor(ref.type) and not _is_scalar(ref.type):
+@@ -275,52 +315,478 @@ class _Kernel:
+             self.line("    st.global.b16 [%rd{}], %rs1;".format(address_register))
+         elif dtype == "float32":
+             self.line("    st.global.f32 [%rd{}], %f{};".format(address_register, float_register))
++        elif dtype in ("float16",):
++            self.line("    cvt.rn.f16.f32 %rs1, %f{};".format(float_register))
++            self.line("    st.global.b16 [%rd{}], %rs1;".format(address_register))
+         else:
+             raise CudaPtxUnsupportedError("PTX store does not support dtype {!r}".format(dtype))
+ 
+-    def emit_elementwise(self) -> None:
+-        self.linear_thread_index()
+-        done = self.guard_count(_shape_count(self.plan.shape))
+-        name = self.plan.operation
+-        output = self.output
+-        if name == "constant":
+-            count = _shape_count(self.plan.shape)
+-            if count > MAX_INLINE_CONSTANT_ELEMENTS:
+-                raise CudaPtxUnsupportedError(
+-                    "inline constant has {} elements; CUDA PTX bootstrap limit is {}".format(
+-                        count, MAX_INLINE_CONSTANT_ELEMENTS
+-                    )
++    def store_integer(self, ref: ValueRef, param_index: int, index_register: int, value_register: int = 40, address_register: int = 20) -> None:
++        dtype = canonical_dtype(ref.type.dtype)
++        self.address(param_index, index_register, _dtype_itemsize(dtype), address_register)
++        if dtype == "bool":
++            self.line("    setp.ne.u64 %p2, %rd{}, 0;".format(value_register))
++            self.line("    selp.u32 %r0, 1, 0, %p2;")
++            self.line("    st.global.u8 [%rd{}], %r0;".format(address_register))
++        elif dtype in ("int32", "uint32"):
++            self.line("    cvt.u32.u64 %r0, %rd{};".format(value_register))
++            self.line("    st.global.u32 [%rd{}], %r0;".format(address_register))
++        elif dtype in ("int64", "uint64"):
++            self.line("    st.global.u64 [%rd{}], %rd{};".format(address_register, value_register))
++        else:
++            raise CudaPtxUnsupportedError("PTX integer store does not support dtype {!r}".format(dtype))
++
++    def store_predicate(self, ref: ValueRef, param_index: int, index_register: int, predicate: int = 1, address_register: int = 20) -> None:
++        if canonical_dtype(ref.type.dtype) != "bool":
++            raise CudaPtxUnsupportedError("predicate store requires bool output")
++        self.address(param_index, index_register, 1, address_register)
++        self.line("    selp.u32 %r0, 1, 0, %p{};".format(predicate))
++        self.line("    st.global.u8 [%rd{}], %r0;".format(address_register))
++
++    @staticmethod
++    def _shape(ref: ValueRef) -> Tuple[int, ...]:
++        return tuple(int(value) for value in ref.type.shape)
++
++    def _emit_coords(self, flat_register: int, shape: Sequence[int], base: int = 30) -> Tuple[int, ...]:
++        """Unravel one row-major flat index into 64-bit coordinate registers."""
++
++        shape = tuple(int(value) for value in shape)
++        coordinates = []
++        strides = _strides(shape)
++        for axis, (dimension, stride) in enumerate(zip(shape, strides)):
++            coordinate = base + axis
++            divisor = base + len(shape) + axis
++            self.line("    mov.u64 %rd{}, {};".format(divisor, stride))
++            self.line("    div.u64 %rd{}, %rd{}, %rd{};".format(coordinate, flat_register, divisor))
++            self.line("    mov.u64 %rd{}, {};".format(divisor, dimension))
++            self.line("    rem.u64 %rd{}, %rd{}, %rd{};".format(coordinate, coordinate, divisor))
++            coordinates.append(coordinate)
++        return tuple(coordinates)
++
++    def _emit_ravel(self, coordinates: Sequence[int], shape: Sequence[int], destination: int = 50) -> int:
++        self.line("    mov.u64 %rd{}, 0;".format(destination))
++        for coordinate, stride in zip(coordinates, _strides(tuple(shape))):
++            if coordinate == 0:
++                continue
++            self.line("    mul.lo.u64 %rd62, %rd{}, {};".format(coordinate, stride))
++            self.line("    add.u64 %rd{}, %rd{}, %rd62;".format(destination, destination))
++        return destination
++
++    def _emit_broadcast_index(self, source_shape: Sequence[int], output_shape: Sequence[int], destination: int = 50) -> int:
++        source_shape = tuple(int(value) for value in source_shape)
++        output_shape = tuple(int(value) for value in output_shape)
++        if not source_shape:
++            self.line("    mov.u64 %rd{}, 0;".format(destination))
++            return destination
++        output_coords = self._emit_coords(0, output_shape, 30)
++        delta = len(output_shape) - len(source_shape)
++        source_coords = tuple(0 if dimension == 1 else output_coords[axis + delta] for axis, dimension in enumerate(source_shape))
++        return self._emit_ravel(source_coords, source_shape, destination)
++
++    def _emit_store_any(self, ref: ValueRef, param_index: int, index_register: int, float_register: int = 0) -> None:
++        dtype = canonical_dtype(ref.type.dtype)
++        if dtype == "bool":
++            self.store_predicate(ref, param_index, index_register, 1)
++        elif dtype in ("int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"):
++            self.store_integer(ref, param_index, index_register, 40)
++        else:
++            self.store_value(ref, param_index, index_register, float_register)
++
++    def _emit_copy_value(self, source: ValueRef, output: ValueRef, source_index: int, output_index: int = 0) -> None:
++        dtype = canonical_dtype(source.type.dtype)
++        if dtype == "bool":
++            self.load_predicate(source, source_index, 0, 20, 1)
++            self.store_predicate(output, len(self.operation.inputs) + output_index, 0, 1)
++        elif dtype in ("int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"):
++            self.load_integer(source, source_index, 0, 20, 40)
++            self.store_integer(output, len(self.operation.inputs) + output_index, 0, 40)
++        else:
++            self.load_value(source, source_index, 0, 14, 0)
++            self.store_value(output, len(self.operation.inputs) + output_index, 0, 0)
++
++    def _emit_constant(self, output: ValueRef) -> None:
++        count = _shape_count(self._shape(output))
++        if count > MAX_INLINE_CONSTANT_ELEMENTS:
++            raise CudaPtxUnsupportedError(
++                "inline constant has {} elements; CUDA PTX bootstrap limit is {}".format(
++                    count, MAX_INLINE_CONSTANT_ELEMENTS
+                 )
+-            raw = self.operation.attributes.get("values", self.operation.attributes.get("value"))
+-            values = list(flatten_values(raw))
+-            if len(values) != count:
+-                raise CudaPtxError("constant value count does not match output shape")
+-            self.line("    mov.u64 %rd13, %rd0;")
+-            # A constant tensor is emitted as one deterministic immediate per
+-            # lane.  This is a correctness bootstrap, not a compact constant
+-            # memory strategy.
+-            for index, value in enumerate(values or [0]):
+-                skip = self.label("CONST_SKIP")
+-                self.line("    setp.ne.u64 %p1, %rd0, {};".format(index))
+-                self.line("    @%p1 bra {};".format(skip))
++            )
++        raw = self.operation.attributes.get("values", self.operation.attributes.get("value"))
++        values = list(flatten_values(raw))
++        if len(values) != count:
++            raise CudaPtxError("constant value count does not match output shape")
++        dtype = canonical_dtype(output.type.dtype)
++        for index, value in enumerate(values or [0]):
++            skip = self.label("CONST_SKIP")
++            self.line("    setp.ne.u64 %p1, %rd0, {};".format(index))
++            self.line("    @%p1 bra {};".format(skip))
++            if dtype == "bool" or dtype in ("int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"):
++                self.line("    mov.u64 %rd40, {};".format(int(value)))
++                self.store_integer(output, len(self.operation.inputs), 0, 40)
++            else:
+                 self.line("    mov.f32 %f0, {};".format(_f32_literal(value)))
+                 self.store_value(output, len(self.operation.inputs), 0, 0)
+-                self.line("{}:".format(skip))
++            self.line("{}:".format(skip))
++
++    def _emit_math(self, name: str, output: ValueRef) -> None:
++        source = self.operation.inputs[0]
++        self.load_value(source, 0, 0, 14, 0)
++        if name == "exp":
++            self.line("    mul.f32 %f1, %f0, 0f3FB8AA3B;")  # log2(e)
++            self.line("    ex2.approx.f32 %f0, %f1;")
++        elif name == "rsqrt":
++            zero = self.label("RSQRT_ZERO")
++            done = self.label("RSQRT_DONE")
++            self.line("    setp.eq.f32 %p2, %f0, 0f00000000;")
++            self.line("    @%p2 bra {};".format(zero))
++            self.line("    rsqrt.approx.f32 %f0, %f0;")
++            self.line("    bra {};".format(done))
++            self.line("{}:".format(zero))
++            self.line("    mov.f32 %f0, 0f7F800000;")
++            self.line("{}:".format(done))
++        elif name in ("sigmoid", "silu"):
++            negative = self.label("SIG_NEG")
++            done = self.label("SIG_DONE")
++            self.line("    setp.lt.f32 %p2, %f0, 0f00000000;")
++            self.line("    @%p2 bra {};".format(negative))
++            self.line("    neg.f32 %f1, %f0;")
++            self.line("    mul.f32 %f1, %f1, 0f3FB8AA3B;")
++            self.line("    ex2.approx.f32 %f1, %f1;")
++            self.line("    add.f32 %f1, %f1, 0f3F800000;")
++            self.line("    rcp.approx.f32 %f1, %f1;")
++            if name == "silu":
++                self.line("    mul.f32 %f0, %f0, %f1;")
++            else:
++                self.line("    mov.f32 %f0, %f1;")
++            self.line("    bra {};".format(done))
++            self.line("{}:".format(negative))
++            if name == "silu":
++                neg_inf = self.label("SIG_NEG_INF")
++                self.line("    setp.eq.f32 %p3, %f0, 0fFF800000;")
++                self.line("    @%p3 bra {};".format(neg_inf))
++            else:
++                neg_inf = None
++            self.line("    mul.f32 %f1, %f0, 0f3FB8AA3B;")
++            self.line("    ex2.approx.f32 %f1, %f1;")
++            self.line("    add.f32 %f2, %f1, 0f3F800000;")
++            if name == "silu":
++                self.line("    div.approx.f32 %f1, %f1, %f2;")
++                self.line("    mul.f32 %f0, %f0, %f1;")
++            else:
++                self.line("    div.approx.f32 %f0, %f1, %f2;")
++            if neg_inf is not None:
++                self.line("    bra {};".format(done))
++                self.line("{}:".format(neg_inf))
++                self.line("    mov.f32 %f0, 0f00000000;")
++            self.line("{}:".format(done))
++        elif name == "softplus":
++            negative = self.label("SP_NEG")
++            done = self.label("SP_DONE")
++            self.line("    setp.lt.f32 %p2, %f0, 0f00000000;")
++            self.line("    @%p2 bra {};".format(negative))
++            self.line("    neg.f32 %f1, %f0;")
++            self.line("    mul.f32 %f1, %f1, 0f3FB8AA3B;")
++            self.line("    ex2.approx.f32 %f1, %f1;")
++            self.line("    add.f32 %f1, %f1, 0f3F800000;")
++            self.line("    lg2.approx.f32 %f1, %f1;")
++            self.line("    mul.f32 %f1, %f1, 0f3F317218;")  # ln(2)
++            self.line("    add.f32 %f0, %f0, %f1;")
++            self.line("    bra {};".format(done))
++            self.line("{}:".format(negative))
++            self.line("    mul.f32 %f1, %f0, 0f3FB8AA3B;")
++            self.line("    ex2.approx.f32 %f1, %f1;")
++            self.line("    add.f32 %f1, %f1, 0f3F800000;")
++            self.line("    lg2.approx.f32 %f1, %f1;")
++            self.line("    mul.f32 %f0, %f1, 0f3F317218;")
++            self.line("{}:".format(done))
+         else:
+-            for value_index, ref in enumerate(self.operation.inputs):
+-                self.load_value(ref, value_index, 0, 14 + value_index * 2, value_index)
+-            if name == "identity":
+-                self.line("    mov.f32 %f0, %f0;")
+-            elif name in ("add", "sub", "mul", "div"):
+-                op = {"add": "add", "sub": "sub", "mul": "mul", "div": "div"}[name]
+-                self.line("    {}.f32 %f0, %f0, %f1;".format(op))
+-            elif name == "neg":
+-                self.line("    neg.f32 %f0, %f0;")
++            raise CudaPtxUnsupportedError("unsupported CUDA math operation {!r}".format(name))
++        self.store_value(output, len(self.operation.inputs), 0, 0)
++
++    def _emit_elementwise(self) -> None:
++        self.linear_thread_index()
++        name = self.plan.operation
++        output = self.output
++        element_count = _shape_count(self.plan.shape)
++        if name == "split":
++            element_count = max(_shape_count(self._shape(ref)) for ref in self.operation.outputs)
++        done = self.guard_count(element_count)
++        if name == "constant":
++            self._emit_constant(output)
++        elif name in ("identity", "reshape", "view", "contiguous"):
++            self._emit_copy_value(self.operation.inputs[0], output, 0)
++        elif name == "cast":
++            self.load_value(self.operation.inputs[0], 0, 0, 14, 0)
++            self.store_value(output, len(self.operation.inputs), 0, 0)
++        elif name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++            self._emit_math(name, output)
++        elif name in ("add", "sub", "mul", "div"):
++            for index, ref in enumerate(self.operation.inputs):
++                source_shape = self._shape(ref) if _is_tensor(ref.type) else ()
++                output_shape = self._shape(output) if _is_tensor(output.type) else ()
++                source_index = self._emit_broadcast_index(source_shape, output_shape, 50 + index)
++                self.load_value(ref, index, source_index, 14 + index, index)
++            op = {"add": "add", "sub": "sub", "mul": "mul"}.get(name)
++            if op is None:
++                self.line("    div.approx.f32 %f0, %f0, %f1;")
+             else:
+-                raise CudaPtxUnsupportedError("unsupported elementwise operation {!r}".format(name))
++                self.line("    {}.f32 %f0, %f0, %f1;".format(op))
++            self.store_value(output, len(self.operation.inputs), 0, 0)
++        elif name == "neg":
++            self.load_value(self.operation.inputs[0], 0, 0, 14, 0)
++            self.line("    neg.f32 %f0, %f0;")
++            self.store_value(output, len(self.operation.inputs), 0, 0)
++        elif name == "broadcast":
++            source = self.operation.inputs[0]
++            source_index = self._emit_broadcast_index(self._shape(source) if _is_tensor(source.type) else (), self._shape(output), 50)
++            self.load_value(source, 0, source_index, 14, 0)
++            self.store_value(output, len(self.operation.inputs), 0, 0)
++        elif name == "where":
++            condition, true_value, false_value = self.operation.inputs
++            output_shape = self._shape(output)
++            for ref, register in ((condition, 50), (true_value, 51), (false_value, 52)):
++                ref_shape = self._shape(ref) if _is_tensor(ref.type) else ()
++                self._emit_broadcast_index(ref_shape, output_shape, register)
++            self.load_predicate(condition, 0, 50, 20, 1)
++            self.load_value(true_value, 1, 51, 14, 0)
++            self.load_value(false_value, 2, 52, 16, 1)
++            self.line("    selp.f32 %f0, %f0, %f1, %p1;")
+             self.store_value(output, len(self.operation.inputs), 0, 0)
++        elif name == "compare":
++            self._emit_compare(output)
++        elif name == "iota":
++            self._emit_iota(output)
++        elif name == "transpose":
++            self._emit_transpose(output)
++        elif name == "slice":
++            self._emit_slice(output)
++        elif name == "concat":
++            self._emit_concat(output)
++        elif name in ("gather", "embedding"):
++            self._emit_gather(output)
++        elif name == "split":
++            self._emit_split()
++        else:
++            raise CudaPtxUnsupportedError("unsupported elementwise operation {!r}".format(name))
+         self.line("{}:".format(done))
+ 
++    def _emit_compare(self, output: ValueRef) -> None:
++        left, right = self.operation.inputs
++        output_shape = self._shape(output)
++        left_index = self._emit_broadcast_index(self._shape(left) if _is_tensor(left.type) else (), output_shape, 50)
++        right_index = self._emit_broadcast_index(self._shape(right) if _is_tensor(right.type) else (), output_shape, 51)
++        dtype = canonical_dtype(left.type.dtype)
++        predicate = str(self.operation.attributes.get("predicate", self.operation.attributes.get("comparison", "eq"))).lower()
++        if predicate not in ("eq", "ne", "lt", "le", "gt", "ge"):
++            raise CudaPtxUnsupportedError("unsupported compare predicate {!r}".format(predicate))
++        if dtype == "bool":
++            self.load_predicate(left, 0, left_index, 20, 1)
++            self.load_predicate(right, 1, right_index, 21, 2)
++            if predicate == "eq":
++                self.line("    setp.eq.pred %p3, %p1, %p2;")
++            elif predicate == "ne":
++                self.line("    setp.ne.pred %p3, %p1, %p2;")
++            else:
++                raise CudaPtxUnsupportedError("ordered bool compare is unsupported")
++        elif dtype in ("float32", "bf16"):
++            self.load_value(left, 0, left_index, 14, 0)
++            self.load_value(right, 1, right_index, 16, 1)
++            self.line("    setp.{}.f32 %p3, %f0, %f1;".format(predicate))
++            if predicate == "ne":
++                # PTX ordered comparisons return false for NaN, while the
++                # portable scalar contract defines NaN != anything.  Detect
++                # unordered operands through the self-equality predicate.
++                ordered = self.label("COMPARE_ORDERED")
++                self.line("    setp.eq.f32 %p4, %f0, %f0;")
++                self.line("    setp.eq.f32 %p5, %f1, %f1;")
++                self.line("    and.pred %p6, %p4, %p5;")
++                self.line("    @%p6 bra {};".format(ordered))
++                self.line("    mov.u32 %r0, 1;")
++                self.line("    setp.eq.u32 %p3, %r0, %r0;")
++                self.line("{}:".format(ordered))
++        else:
++            self.load_integer(left, 0, left_index, 20, 40)
++            self.load_integer(right, 1, right_index, 21, 41)
++            signed = dtype.startswith("int")
++            self.line("    setp.{}.{}64 %p3, %rd40, %rd41;".format(predicate, "s" if signed else "u"))
++        self.store_predicate(output, len(self.operation.inputs), 0, 3)
++
++    def _emit_iota(self, output: ValueRef) -> None:
++        shape = self._shape(output)
++        axis = int(self.operation.attributes.get("axis", 0))
++        if axis < 0:
++            axis += len(shape)
++        if axis < 0 or axis >= len(shape):
++            raise CudaPtxError("iota axis is outside output rank")
++        coordinates = self._emit_coords(0, shape, 30)
++        start = int(self.operation.attributes.get("start", 0))
++        step = int(self.operation.attributes.get("step", 1))
++        self.line("    mov.s64 %rd40, {};".format(start))
++        self.line("    mov.s64 %rd41, {};".format(step))
++        self.line("    mul.lo.s64 %rd41, %rd41, %rd{};".format(coordinates[axis]))
++        self.line("    add.s64 %rd40, %rd40, %rd41;")
++        self.store_integer(output, len(self.operation.inputs), 0, 40)
++
++    def _emit_transpose(self, output: ValueRef) -> None:
++        source = self.operation.inputs[0]
++        input_shape = self._shape(source)
++        output_shape = self._shape(output)
++        permutation = self.operation.attributes.get("permutation", self.operation.attributes.get("perm", self.operation.attributes.get("dims", self.operation.attributes.get("axes"))))
++        if permutation is None:
++            dim0 = int(self.operation.attributes.get("dim0", self.operation.attributes.get("axis0")))
++            dim1 = int(self.operation.attributes.get("dim1", self.operation.attributes.get("axis1")))
++            permutation = list(range(len(input_shape)))
++            if dim0 < 0:
++                dim0 += len(input_shape)
++            if dim1 < 0:
++                dim1 += len(input_shape)
++            permutation[dim0], permutation[dim1] = permutation[dim1], permutation[dim0]
++        permutation = tuple(int(axis) + len(input_shape) if int(axis) < 0 else int(axis) for axis in permutation)
++        output_coordinates = self._emit_coords(0, output_shape, 30)
++        input_coordinates = tuple(output_coordinates[output_axis] for output_axis in permutation)
++        source_index = self._emit_ravel(input_coordinates, input_shape, 50)
++        if canonical_dtype(source.type.dtype) == "bool":
++            self.load_predicate(source, 0, source_index, 20, 1)
++            self.store_predicate(output, len(self.operation.inputs), 0, 1)
++        elif canonical_dtype(source.type.dtype) in ("int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"):
++            self.load_integer(source, 0, source_index, 20, 40)
++            self.store_integer(output, len(self.operation.inputs), 0, 40)
++        else:
++            self.load_value(source, 0, source_index, 20, 0)
++            self.store_value(output, len(self.operation.inputs), 0, 0)
++
++    def _emit_slice(self, output: ValueRef) -> None:
++        source = self.operation.inputs[0]
++        input_shape = self._shape(source)
++        output_shape = self._shape(output)
++        starts = self.operation.attributes.get("starts", self.operation.attributes.get("start"))
++        stops = self.operation.attributes.get("stops", self.operation.attributes.get("stop"))
++        axes = self.operation.attributes.get("axes", self.operation.attributes.get("axis"))
++        steps = self.operation.attributes.get("steps", self.operation.attributes.get("step"))
++        starts = (starts,) if isinstance(starts, int) else tuple(starts)
++        stops = (stops,) if isinstance(stops, int) else tuple(stops)
++        axes = tuple(range(len(starts))) if axes is None else ((axes,) if isinstance(axes, int) else tuple(axes))
++        steps = (1,) * len(starts) if steps is None else ((steps,) if isinstance(steps, int) else tuple(steps))
++        output_coordinates = self._emit_coords(0, output_shape, 30)
++        input_coordinates = list(output_coordinates)
++        for start, axis, step in zip(starts, axes, steps):
++            axis = int(axis) + len(input_shape) if int(axis) < 0 else int(axis)
++            start = int(start) + input_shape[axis] if int(start) < 0 else int(start)
++            input_coordinates[axis] = 30 + axis
++            self.line("    mul.lo.u64 %rd{}, %rd{}, {};".format(30 + axis, 30 + axis, int(step)))
++            self.line("    add.u64 %rd{}, %rd{}, {};".format(30 + axis, 30 + axis, start))
++        source_index = self._emit_ravel(input_coordinates, input_shape, 50)
++        if canonical_dtype(source.type.dtype) == "bool":
++            self.load_predicate(source, 0, source_index, 20, 1)
++            self.store_predicate(output, len(self.operation.inputs), 0, 1)
++        elif canonical_dtype(source.type.dtype) in ("int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"):
++            self.load_integer(source, 0, source_index, 20, 40)
++            self.store_integer(output, len(self.operation.inputs), 0, 40)
++        else:
++            self.load_value(source, 0, source_index, 20, 0)
++            self.store_value(output, len(self.operation.inputs), 0, 0)
++
++    def _emit_concat(self, output: ValueRef) -> None:
++        output_shape = self._shape(output)
++        axis = self.operation.attributes.get("axis", self.operation.attributes.get("dim", 0))
++        axis = int(axis) + len(output_shape) if int(axis) < 0 else int(axis)
++        output_coordinates = self._emit_coords(0, output_shape, 30)
++        running = 0
++        selected = self.label("CONCAT_SELECTED")
++        for segment_index, source in enumerate(self.operation.inputs):
++            source_shape = self._shape(source)
++            stop = running + source_shape[axis]
++            label = self.label("CONCAT_SEG")
++            next_test = self.label("CONCAT_NEXT")
++            self.line("    setp.ge.u64 %p4, %rd{}, {};".format(output_coordinates[axis], running))
++            self.line("    setp.lt.u64 %p5, %rd{}, {};".format(output_coordinates[axis], stop))
++            self.line("    and.pred %p6, %p4, %p5;")
++            self.line("    @%p6 bra {};".format(label))
++            self.line("    bra {};".format(next_test))
++            self.line("{}:".format(label))
++            source_coordinates = list(output_coordinates)
++            source_coordinates[axis] = 30 + axis
++            self.line("    sub.u64 %rd{}, %rd{}, {};".format(30 + axis, 30 + axis, running))
++            source_index = self._emit_ravel(source_coordinates, source_shape, 50)
++            if canonical_dtype(source.type.dtype) == "bool":
++                self.load_predicate(source, segment_index, source_index, 20, 1)
++                self.store_predicate(output, len(self.operation.inputs), 0, 1)
++            else:
++                self.load_value(source, segment_index, source_index, 20, 0)
++                self.store_value(output, len(self.operation.inputs), 0, 0)
++            self.line("    bra {};".format(selected))
++            self.line("{}:".format(next_test))
++            running = stop
++        self.line("{}:".format(selected))
++
++    def _emit_split(self) -> None:
++        source = self.operation.inputs[0]
++        input_shape = self._shape(source)
++        axis = self.operation.attributes.get("axis", self.operation.attributes.get("dim", 0))
++        axis = int(axis) + len(input_shape) if int(axis) < 0 else int(axis)
++        sizes = self.operation.attributes.get("sizes", self.operation.attributes.get("split_sizes", self.operation.attributes.get("sections")))
++        if sizes is None:
++            count = int(self.operation.attributes.get("num_splits"))
++            sizes = [input_shape[axis] // count] * count
++        running = 0
++        for output_index, (output, size) in enumerate(zip(self.operation.outputs, sizes)):
++            output_shape = self._shape(output)
++            skip = self.label("SPLIT_SKIP")
++            self.line("    setp.ge.u64 %p4, %rd0, {};".format(_shape_count(output_shape)))
++            self.line("    @%p4 bra {};".format(skip))
++            output_coordinates = self._emit_coords(0, output_shape, 30)
++            input_coordinates = list(output_coordinates)
++            self.line("    add.u64 %rd{}, %rd{}, {};".format(30 + axis, 30 + axis, running))
++            source_index = self._emit_ravel(input_coordinates, input_shape, 50)
++            if canonical_dtype(source.type.dtype) == "bool":
++                self.load_predicate(source, 0, source_index, 20, 1)
++                self.store_predicate(output, len(self.operation.inputs) + output_index, 0, 1)
++            else:
++                self.load_value(source, 0, source_index, 20, 0)
++                self.store_value(output, len(self.operation.inputs) + output_index, 0, 0)
++            self.line("{}:".format(skip))
++            running += int(size)
++
++    def _emit_gather(self, output: ValueRef) -> None:
++        source, indices = self.operation.inputs
++        source_shape = self._shape(source)
++        index_shape = self._shape(indices)
++        output_shape = self._shape(output)
++        axis = 0 if self.plan.operation == "embedding" else int(self.operation.attributes.get("axis", self.operation.attributes.get("dim", 0)))
++        axis = axis + len(source_shape) if axis < 0 else axis
++        output_coordinates = self._emit_coords(0, output_shape, 30)
++        index_coordinates = tuple(output_coordinates[axis + offset] for offset in range(len(index_shape)))
++        index_flat = self._emit_ravel(index_coordinates, index_shape, 50)
++        self.load_integer(indices, 1, index_flat, 20, 40)
++        if canonical_dtype(indices.type.dtype).startswith("int"):
++            self.line("    setp.lt.s64 %p4, %rd40, 0;")
++        else:
++            self.line("    setp.eq.u64 %p4, %rd40, 0;")
++        self.line("    setp.ge.u64 %p5, %rd40, {};".format(source_shape[axis]))
++        if canonical_dtype(indices.type.dtype).startswith("int"):
++            self.line("    or.pred %p6, %p4, %p5;")
++        else:
++            self.line("    mov.pred %p6, %p5;")
++        bad = self.label("BAD_INDEX")
++        good = self.label("GOOD_INDEX")
++        self.line("    @%p6 bra {};".format(bad))
++        self.line("    bra {};".format(good))
++        self.line("{}:".format(bad))
++        self.line("    trap;")
++        self.line("{}:".format(good))
++        source_coordinates = []
++        for source_axis in range(len(source_shape)):
++            if source_axis < axis:
++                source_coordinates.append(output_coordinates[source_axis])
++            elif source_axis == axis:
++                source_coordinates.append(40)
++            else:
++                source_coordinates.append(output_coordinates[axis + len(index_shape) + source_axis - axis - 1])
++        source_flat = self._emit_ravel(source_coordinates, source_shape, 51)
++        self.load_value(source, 0, source_flat, 20, 0)
++        self.store_value(output, len(self.operation.inputs), 0, 0)
++
+     def _coord_from_linear(self, source_register: int, stride: int, dimension: int, result: int) -> None:
+         self.line("    mov.u64 %rd{}, {};".format(result + 1, stride))
+         self.line("    div.u64 %rd{}, %rd{}, %rd{};".format(result, source_register, result + 1))
+@@ -331,7 +797,7 @@ class _Kernel:
+         reduction = self.plan.reduction
+         self.linear_thread_index()
+         done = self.guard_count(reduction.output_elements)
+-        self.line("    mov.f32 %f0, {};".format(_f32_literal(0.0 if self.plan.operation == "reduce_sum" else float("-inf"))))
++        self.line("    mov.f32 %f0, {};".format(_f32_literal(0.0 if self.plan.operation in ("reduce_sum", "reduce_mean") else float("-inf"))))
+         self.line("    mov.u64 %rd3, 0;")
+         red_done = self.label("RED_DONE")
+         red_loop = self.label("RED_LOOP")
+@@ -357,13 +823,15 @@ class _Kernel:
+             self.line("    mul.lo.u64 %rd32, %rd{}, {};".format(coord_reg, stride))
+             self.line("    add.u64 %rd13, %rd13, %rd32;")
+         self.load_value(self.operation.inputs[0], 0, 13, 14, 1)
+-        if self.plan.operation == "reduce_sum":
++        if self.plan.operation in ("reduce_sum", "reduce_mean"):
+             self.line("    add.f32 %f0, %f0, %f1;")
+         else:
+             self.line("    max.f32 %f0, %f0, %f1;")
+         self.line("    add.u64 %rd3, %rd3, 1;")
+         self.line("    bra {};".format(red_loop))
+         self.line("{}:".format(red_done))
++        if self.plan.operation == "reduce_mean":
++            self.line("    div.approx.f32 %f0, %f0, {};".format(_f32_literal(float(reduction.reduction_size))))
+         self.store_value(self.output, len(self.operation.inputs), 0, 0)
+         self.line("{}:".format(done))
+ 
+@@ -378,6 +846,10 @@ class _Kernel:
+         # correctness workgroup cover the whole tile without changing the
+         # vendor-neutral plan or ABI.
+         self.line("    mov.u64 %rd30, %rd0;")
++        matrix_elements = matmul.m * matmul.n
++        self.line("    mov.u64 %rd31, {};".format(matrix_elements))
++        self.line("    div.u64 %rd32, %rd30, %rd31;")
++        self.line("    rem.u64 %rd30, %rd30, %rd31;")
+         self.line("    mov.u64 %rd31, {};".format(matmul.n))
+         self.line("    div.u64 %rd7, %rd30, %rd31;")
+         self.line("    rem.u64 %rd8, %rd30, %rd31;")
+@@ -388,10 +860,14 @@ class _Kernel:
+         self.line("    setp.ge.u64 %p2, %rd9, {};".format(matmul.k))
+         acc_done = self.label("MM_ACC_DONE")
+         self.line("    @%p2 bra {};".format(acc_done))
+-        self.line("    mul.lo.u64 %rd10, %rd7, {};".format(matmul.k))
++        self.line("    mul.lo.u64 %rd10, %rd32, {};".format(matmul.m * matmul.k))
++        self.line("    mul.lo.u64 %rd11, %rd7, {};".format(matmul.k))
++        self.line("    add.u64 %rd10, %rd10, %rd11;")
+         self.line("    add.u64 %rd10, %rd10, %rd9;")
+         self.load_value(self.operation.inputs[0], 0, 10, 14, 1)
+-        self.line("    mul.lo.u64 %rd11, %rd9, {};".format(matmul.n))
++        self.line("    mul.lo.u64 %rd11, %rd32, {};".format(matmul.k * matmul.n))
++        self.line("    mul.lo.u64 %rd12, %rd9, {};".format(matmul.n))
++        self.line("    add.u64 %rd11, %rd11, %rd12;")
+         self.line("    add.u64 %rd11, %rd11, %rd8;")
+         self.load_value(self.operation.inputs[1], 1, 11, 16, 2)
+         self.line("    mul.f32 %f3, %f1, %f2;")
+@@ -417,7 +893,7 @@ class _Kernel:
+         elif self.plan.plan_kind == "reduction":
+             self.emit_reduction()
+         else:
+-            self.emit_elementwise()
++            self._emit_elementwise()
+         self.line("    ret;")
+         self.line("}")
+         return "\n".join(self.lines)
+@@ -443,9 +919,9 @@ def render_ptx(gpu_program: GpuProgram, ptx_target: str = DEFAULT_PTX_TARGET, pt
+         kernels = []
+         function = next(function for function in gpu_program.program.functions if function.name == gpu_program.entrypoint)
+         for index, (operation, plan) in enumerate(zip(function.body.operations, gpu_program.plans)):
+-            if plan.operation == "reduce_max" and plan.reduction is not None and plan.reduction.reduction_size == 0:
++            if plan.operation in ("reduce_max", "reduce_mean") and plan.reduction is not None and plan.reduction.reduction_size == 0:
+                 raise CudaPtxUnsupportedError(
+-                    "CUDA reduce_max does not support an empty reduction"
++                    "CUDA {} does not support an empty reduction".format(plan.operation)
+                 )
+             kernels.append(_Kernel(index, operation, plan).render())
+     except StopIteration as exc:
+diff --git a/python/pypto/lowering/gpu/plan.py b/python/pypto/lowering/gpu/plan.py
+index 996d1af9c..c823b8dd9 100644
+--- a/python/pypto/lowering/gpu/plan.py
++++ b/python/pypto/lowering/gpu/plan.py
+@@ -37,13 +37,18 @@ from pypto.target._utils import canonical_json, frozen_mapping, mapping_copy, sh
+ 
+ 
+ GPU_PLAN_VERSION = 1
+-GPU_LOWERING_VERSION = 1
++GPU_LOWERING_VERSION = 2
+ GPU_COMMON_BACKEND = "gpu.common"
+-GPU_IR_VERSION = "gpu.ir.v1"
++GPU_IR_VERSION = "gpu.ir.v2"
+ GPU_SUPPORTED_DTYPES = frozenset(("float32", "bf16"))
+ GPU_COPY_DTYPES = frozenset(SUPPORTED_DTYPES)
+ GPU_SUPPORTED_OPERATIONS = frozenset(
+-    ("constant", "identity", "add", "sub", "mul", "div", "neg", "reduce_sum", "reduce_max", "matmul")
++    (
++        "constant", "identity", "add", "sub", "mul", "div", "neg", "cast",
++        "exp", "rsqrt", "sigmoid", "silu", "softplus", "reduce_sum", "reduce_max",
++        "reduce_mean", "broadcast", "where", "reshape", "view", "transpose", "contiguous",
++        "slice", "split", "concat", "gather", "embedding", "compare", "iota", "matmul",
++    )
+ )
+ MAX_LOGICAL_INDEX = (1 << 64) - 1
+ _SSA_NAME_RE = re.compile(r"^(?:%[A-Za-z0-9_.$-]+|[A-Za-z_][A-Za-z0-9_.$-]*)$")
+@@ -422,9 +427,10 @@ class MatmulPlan:
+     m: int
+     k: int
+     n: int
+-    output_shape: Tuple[int, int]
++    output_shape: Tuple[int, ...]
+     output_elements: int
+     tile: TilePlan
++    batch_shape: Tuple[int, ...] = ()
+ 
+     def __post_init__(self) -> None:
+         _non_negative_int(self.m, "matmul.m")
+@@ -433,17 +439,19 @@ class MatmulPlan:
+         try:
+             output_shape = tuple(self.output_shape)
+         except TypeError as exc:
+-            raise GpuValidationError("matmul.output_shape must be a 2D shape") from exc
+-        if output_shape != (self.m, self.n):
+-            raise GpuValidationError("matmul output shape must be (m, n)")
++            raise GpuValidationError("matmul.output_shape must be a rank-2 through rank-4 shape") from exc
++        batch_shape = _shape(self.batch_shape, "matmul.batch_shape")
++        if output_shape != batch_shape + (self.m, self.n):
++            raise GpuValidationError("matmul output shape must be batch_shape + (m, n)")
+         _product((self.m, self.k), "matmul.left")
+         _product((self.k, self.n), "matmul.right")
+-        output_count = _product((self.m, self.n), "matmul.output")
++        output_count = _product(batch_shape + (self.m, self.n), "matmul.output")
+         if self.output_elements != output_count:
+             raise GpuValidationError("matmul output element count does not match m*n")
+         if not isinstance(self.tile, TilePlan):
+             raise GpuValidationError("matmul tile must be TilePlan")
+         object.__setattr__(self, "output_shape", output_shape)
++        object.__setattr__(self, "batch_shape", batch_shape)
+ 
+     def to_dict(self) -> Mapping[str, Any]:
+         return {
+@@ -453,6 +461,7 @@ class MatmulPlan:
+             "output_shape": list(self.output_shape),
+             "output_elements": self.output_elements,
+             "tile": self.tile.to_dict(),
++            "batch_shape": list(self.batch_shape),
+         }
+ 
+ 
+@@ -460,7 +469,7 @@ def _storage_for(operation: str, inputs: Sequence[Any], output: Any) -> Mapping[
+     result = {ref.name: AddressSpace.GLOBAL.value for ref in inputs if ref.type.kind in ("tensor", "view", "tile")}
+     if output.type.kind in ("tensor", "view", "tile"):
+         result[output.name] = AddressSpace.GLOBAL.value
+-    if operation in ("reduce_sum", "reduce_max", "matmul"):
++    if operation in ("reduce_sum", "reduce_max", "reduce_mean", "matmul"):
+         result["accumulator"] = AddressSpace.PRIVATE.value
+     return result
+ 
+@@ -733,7 +742,9 @@ def _make_plan_for_operation(
+         raise GpuUnsupportedError(
+             "GPU common does not support operation {!r}; it is pending a later target lowering".format(name)
+         )
+-    if len(operation.outputs) != 1:
++    if not operation.outputs:
++        raise GpuValidationError("operation {} must have at least one output".format(operation_index))
++    if name != "split" and len(operation.outputs) != 1:
+         raise GpuValidationError("operation {} must have exactly one output".format(operation_index))
+     output = operation.outputs[0]
+     output_type = output.type
+@@ -743,7 +754,7 @@ def _make_plan_for_operation(
+     refs = tuple(operation.inputs) + (output,)
+     layout = _layout(program, operation, refs, "function operation {}".format(operation_index))
+     dtype = canonical_dtype(output_type.dtype)
+-    if name in ("constant", "identity"):
++    if name in ("constant", "identity", "reshape", "view", "transpose", "contiguous", "slice", "concat", "split", "broadcast", "compare", "iota"):
+         allowed_dtypes = GPU_COPY_DTYPES
+     else:
+         allowed_dtypes = GPU_SUPPORTED_DTYPES
+@@ -752,13 +763,31 @@ def _make_plan_for_operation(
+     for ref in operation.inputs:
+         if ref.type.kind in ("tensor", "view", "tile"):
+             input_dtype = canonical_dtype(ref.type.dtype)
+-            if input_dtype not in allowed_dtypes:
++            if input_dtype not in allowed_dtypes and not (
++                input_dtype in GPU_COPY_DTYPES
++                and (
++                    name in ("compare", "gather", "embedding", "iota")
++                    or (name == "where" and ref is operation.inputs[0] and input_dtype == "bool")
++                )
++            ):
+                 raise GpuUnsupportedError("GPU common does not support dtype {!r} for {}".format(input_dtype, name))
++    if name == "split":
++        if len(operation.outputs) < 1 or any(output.type.kind not in ("tensor", "view", "tile") for output in operation.outputs):
++            raise GpuUnsupportedError("GPU split requires tensor outputs")
++        if any(canonical_dtype(output.type.dtype) != dtype for output in operation.outputs):
++            raise GpuValidationError("GPU split outputs must have one dtype")
++    if name == "iota" and dtype not in ("int32", "int64"):
++        raise GpuUnsupportedError("GPU iota supports int32 and int64 outputs")
++    if name == "compare" and dtype != "bool":
++        raise GpuValidationError("GPU compare output must have bool dtype")
++    if name in ("gather", "embedding"):
++        if len(operation.inputs) != 2 or canonical_dtype(operation.inputs[1].type.dtype) not in ("int32", "int64"):
++            raise GpuUnsupportedError("GPU indexing requires int32 or int64 indices")
+     count = _product(output_shape, "output_shape")
+     tile = _tile_from_target(target, name, operation.attributes)
+     reduction = None
+     matmul = None
+-    if name in ("reduce_sum", "reduce_max"):
++    if name in ("reduce_sum", "reduce_max", "reduce_mean"):
+         if output_type.kind != "tensor":
+             raise GpuUnsupportedError("GPU reductions require tensor outputs")
+         input_shape = static_shape(operation.inputs[0].type, "GPU reduction input")
+@@ -785,26 +814,35 @@ def _make_plan_for_operation(
+             raise GpuUnsupportedError("GPU matmul requires tensor outputs")
+         left_shape = static_shape(operation.inputs[0].type, "GPU matmul left")
+         right_shape = static_shape(operation.inputs[1].type, "GPU matmul right")
+-        if len(left_shape) != 2 or len(right_shape) != 2 or len(output_shape) != 2:
+-            raise GpuValidationError("GPU matmul requires rank-2 values")
+-        m, k = left_shape
+-        right_k, n = right_shape
+-        if right_k != k or output_shape != (m, n):
++        if len(left_shape) < 2 or len(left_shape) > 4 or len(right_shape) != len(left_shape) or len(output_shape) != len(left_shape):
++            raise GpuValidationError("GPU matmul requires equal rank-2 through rank-4 values")
++        if left_shape[:-2] != right_shape[:-2]:
++            raise GpuValidationError("GPU matmul requires identical batch prefixes")
++        batch_shape = tuple(left_shape[:-2])
++        m, k = left_shape[-2:]
++        right_k, n = right_shape[-2:]
++        if right_k != k or output_shape != batch_shape + (m, n):
+             raise GpuValidationError("GPU matmul shapes are inconsistent")
+         tile_m = tile.output[0]
+         tile_n = tile.output[1] if len(tile.output) > 1 else tile.output[0]
+         tile = TilePlan((tile_m, tile_n), tile.reduction)
+         geometry = _target_geometry(
+             target,
+-            grid=(_ceildiv(n, tile_n), _ceildiv(m, tile_m), 1),
++            grid=(_ceildiv(n, tile_n), _ceildiv(m, tile_m) * max(1, _product(batch_shape, "matmul.batch_shape")), 1),
+             workgroup=operation.attributes.get("workgroup", _target_workgroup(target) or (tile_m, tile_n)),
+         )
+         bounds = BoundsPredicate("matrix", output_shape, "row < {} and column < {}".format(m, n))
+-        matmul = MatmulPlan(m, k, n, (m, n), count, tile)
++        matmul = MatmulPlan(m, k, n, output_shape, count, tile, batch_shape)
+         kind = "matmul"
+     else:
+         workgroup_hint = _dims(_target_workgroup(target), "workgroup", (128,))[0]
+-        geometry = _target_geometry(target, grid=(_ceildiv(count, workgroup_hint), 1, 1))
++        geometry_count = count
++        if name == "split":
++            geometry_count = max(
++                _product(static_shape(output.type, "GPU split output"), "GPU split output")
++                for output in operation.outputs
++            )
++        geometry = _target_geometry(target, grid=(_ceildiv(geometry_count, workgroup_hint), 1, 1))
+         bounds = BoundsPredicate("flat", output_shape, "logical_index < {}".format(count))
+         kind = "elementwise"
+     return GpuKernelPlan(
+diff --git a/python/tests/ut/pypto_x/cuda_c2_device_validation.py b/python/tests/ut/pypto_x/cuda_c2_device_validation.py
+new file mode 100644
+index 000000000..380926f97
+--- /dev/null
++++ b/python/tests/ut/pypto_x/cuda_c2_device_validation.py
+@@ -0,0 +1,163 @@
++"""Weight-free CUDA C2 device validation driver (no pytest/model weights)."""
++
++from __future__ import annotations
++
++import math
++
++from pypto.abi import GpuLaunchRequest, TensorDesc
++from pypto.backends.cpu import HostTensor
++from pypto.backends.cuda import CudaDriver, CudaRuntime
++from pypto.compiler.targets.cuda import CudaPtxCompiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.portable.qwen35 import (
++    build_causal_mask,
++    build_decoder_subgraph,
++    build_gqa_repeat_kv,
++    build_rope_rotate_half,
++    build_rms_norm,
++    build_stable_softmax,
++)
++from pypto.target import TargetSpec
++
++
++TARGET = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,)})
++
++
++def _program(parameters, returns, operation):
++    return CoreProgram(
++        functions=(CoreFunction("main", tuple(parameters), tuple(returns), Region((operation,))),)
++    )
++
++
++def _run(compiler, runtime, program, inputs, outputs, scalars=None):
++    target_ir = compiler.lower(program, TARGET)
++    artifact = compiler.compile(target_ir)
++    runtime.launch(
++        GpuLaunchRequest(
++            artifact,
++            geometries=tuple(plan.geometry for plan in target_ir.gpu_program.plans),
++            inputs=tuple(TensorDesc(x.dtype, x.shape, device="gpu", handle=x, readonly=True) for x in inputs),
++            outputs=tuple(TensorDesc(x.dtype, x.shape, device="gpu", handle=x) for x in outputs),
++            scalars=scalars or {},
++        )
++    )
++
++
++def _close(actual, expected, rel=3e-3, absolute=3e-4):
++    for left, right in zip(actual, expected):
++        if math.isnan(right):
++            assert math.isnan(left), (left, right)
++        elif math.isinf(right):
++            assert math.isinf(left) and (left > 0) == (right > 0), (left, right)
++        else:
++            assert math.isclose(left, right, rel_tol=rel, abs_tol=absolute), (left, right)
++
++
++def main():
++    driver = CudaDriver()
++    compiler = CudaPtxCompiler(driver=driver, probe_jit=True)
++    runtime = CudaRuntime(driver=driver)
++    try:
++        print("device={}".format(driver.device_info().to_dict()))
++        values = [-float("inf"), -3.0, -0.0, 0.0, 3.0, float("inf"), float("nan")]
++        for name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++            dtype = CoreType.tensor("float32", (7,))
++            x, z = ValueRef("x", dtype), ValueRef("z", dtype)
++            actual = HostTensor.zeros("float32", (7,))
++            _run(compiler, runtime, _program((x,), (z,), Operation(name, (x,), (z,))), [HostTensor("float32", (7,), values)], [actual])
++            expected = []
++            for value in values:
++                if name == "exp":
++                    expected.append(math.exp(value))
++                elif name == "rsqrt":
++                    expected.append(float("nan") if value < 0 else (float("inf") if value == 0 else 1.0 / math.sqrt(value)))
++                elif name == "sigmoid":
++                    expected.append(1.0 / (1.0 + math.exp(-value)) if value >= 0 else math.exp(value) / (1.0 + math.exp(value)))
++                elif name == "silu":
++                    if value == -float("inf"):
++                        expected.append(0.0)
++                    elif value == float("inf"):
++                        expected.append(float("inf"))
++                    else:
++                        sigmoid = 1.0 / (1.0 + math.exp(-value)) if value >= 0 else math.exp(value) / (1.0 + math.exp(value))
++                        expected.append(value * sigmoid)
++                else:
++                    expected.append(math.log1p(math.exp(-abs(value))) + max(value, 0.0))
++            print("math_name={} actual={} expected={}".format(name, actual.flat(), expected))
++            _close(actual.flat(), expected)
++        print("math_edge=PASS")
++
++        btype = CoreType.tensor("bf16", (5,))
++        left, right, bout = ValueRef("left", btype), ValueRef("right", btype), ValueRef("bout", btype)
++        bf = HostTensor.zeros("bf16", (5,))
++        _run(compiler, runtime, _program((left, right), (bout,), Operation("add", (left, right), (bout,))), [HostTensor("bf16", (5,), [1] * 5), HostTensor("bf16", (5,), [.5] * 5)], [bf])
++        assert bf.flat() == (1.5,) * 5
++        itype, otype = CoreType.tensor("float32", (2, 3)), CoreType.tensor("float32", (2, 1))
++        ix, oz = ValueRef("ix", itype), ValueRef("oz", otype)
++        mean = HostTensor.zeros("float32", (2, 1))
++        _run(compiler, runtime, _program((ix,), (oz,), Operation("reduce_mean", (ix,), (oz,), attributes={"axis": 1, "keepdims": True})), [HostTensor("float32", (2, 3), [1, 2, 3, 4, 5, 6])], [mean])
++        assert mean.flat() == (2.0, 5.0)
++        maxtype, maxouttype = CoreType.tensor("float32", (1, 3)), CoreType.tensor("float32", (1,))
++        mx, mo = ValueRef("mx", maxtype), ValueRef("mo", maxouttype)
++        maximum = HostTensor.zeros("float32", (1,))
++        _run(compiler, runtime, _program((mx,), (mo,), Operation("reduce_max", (mx,), (mo,), attributes={"axis": 1})), [HostTensor("float32", (1, 3), [-9, -4, -7])], [maximum])
++        assert maximum.flat() == (-4.0,)
++        et, eo = CoreType.tensor("float32", (0, 3)), CoreType.tensor("float32", (3,))
++        ex, ez = ValueRef("ex", et), ValueRef("ez", eo)
++        empty = HostTensor.zeros("float32", (3,))
++        _run(compiler, runtime, _program((ex,), (ez,), Operation("reduce_sum", (ex,), (ez,), attributes={"axis": 0})), [HostTensor("float32", (0, 3))], [empty])
++        assert empty.flat() == (0.0, 0.0, 0.0)
++        print("bf16_reduction_edges=PASS")
++
++        iota_ref = ValueRef("iota", CoreType.tensor("int64", (2, 5)))
++        iota = HostTensor.zeros("int64", (2, 5))
++        _run(compiler, runtime, _program((), (iota_ref,), Operation("iota", (), (iota_ref,), attributes={"axis": 1, "start": 7, "step": 2})), [], [iota])
++        assert iota.flat() == (7, 9, 11, 13, 15) * 2
++        ctype, ztype = CoreType.tensor("int32", (5,)), CoreType.tensor("bool", (5,))
++        cx, cy, cz = ValueRef("cx", ctype), ValueRef("cy", ctype), ValueRef("cz", ztype)
++        comparison = HostTensor.zeros("bool", (5,))
++        _run(compiler, runtime, _program((cx, cy), (cz,), Operation("compare", (cx, cy), (cz,), attributes={"predicate": "le"})), [HostTensor("int32", (5,), [1, 3, 2, 4, 5]), HostTensor("int32", (5,), [2, 2, 2, 3, 5])], [comparison])
++        assert comparison.flat() == (True, False, True, False, True)
++        bsource, btarget = ValueRef("bs", CoreType.tensor("float32", (2, 1))), ValueRef("bt", CoreType.tensor("float32", (2, 3)))
++        broadcast = HostTensor.zeros("float32", (2, 3))
++        _run(compiler, runtime, _program((bsource,), (btarget,), Operation("broadcast", (bsource,), (btarget,), attributes={"shape": [2, 3]})), [HostTensor("float32", (2, 1), [2, 5])], [broadcast])
++        assert broadcast.flat() == (2.0, 2.0, 2.0, 5.0, 5.0, 5.0)
++        print("position_broadcast=PASS")
++
++        source, indices, gathered = ValueRef("source", CoreType.tensor("float32", (3, 4))), ValueRef("indices", CoreType.tensor("int64", (2,))), ValueRef("gathered", CoreType.tensor("float32", (2, 4)))
++        gather = HostTensor.zeros("float32", (2, 4))
++        _run(compiler, runtime, _program((source, indices), (gathered,), Operation("gather", (source, indices), (gathered,), attributes={"axis": 0})), [HostTensor("float32", (3, 4), list(range(12))), HostTensor("int64", (2,), [2, 0])], [gather])
++        assert gather.flat() == (8.0, 9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0)
++        sx, sa, sb = ValueRef("sx", CoreType.tensor("float32", (2, 6))), ValueRef("sa", CoreType.tensor("float32", (2, 2))), ValueRef("sb", CoreType.tensor("float32", (2, 4)))
++        split_a, split_b = HostTensor.zeros("float32", (2, 2)), HostTensor.zeros("float32", (2, 4))
++        _run(compiler, runtime, _program((sx,), (sa, sb), Operation("split", (sx,), (sa, sb), attributes={"axis": 1, "sizes": [2, 4]})), [HostTensor("float32", (2, 6), list(range(12)))], [split_a, split_b])
++        assert split_a.flat() == (0.0, 1.0, 6.0, 7.0)
++        assert split_b.flat() == (2.0, 3.0, 4.0, 5.0, 8.0, 9.0, 10.0, 11.0)
++        print("layout_indexing_split=PASS")
++
++        softmax = HostTensor.zeros("bf16", (2, 4))
++        _run(compiler, runtime, build_stable_softmax((2, 4)), [HostTensor("bf16", (2, 4), [1, 2, 3, 4, 4, 3, 2, 1])], [softmax])
++        assert abs(sum(softmax.flat()[:4]) - 1.0) < .02
++        rms = HostTensor.zeros("bf16", (2, 4))
++        _run(compiler, runtime, build_rms_norm((2, 4)), [HostTensor("bf16", (2, 4), [1, 2, 3, 4, 5, 6, 7, 8]), HostTensor("bf16", (4,), [1] * 4)], [rms], {"epsilon": 1e-5})
++        causal = HostTensor.zeros("bf16", (2, 3))
++        _run(compiler, runtime, build_causal_mask((2, 3), dtype="bf16"), [HostTensor("bf16", (2, 3), [1, 2, 3, 4, 5, 6]), HostTensor("bool", (2, 3), [True, False, True, False, True, False])], [causal], {"fill_value": -100.0})
++        assert causal.flat() == (1.0, -100.0, 3.0, -100.0, 5.0, -100.0)
++        rope = HostTensor.zeros("bf16", (1, 2, 3, 8))
++        _run(compiler, runtime, build_rope_rotate_half((1, 2, 3, 8), rotary_dim=4), [HostTensor("bf16", (1, 2, 3, 8), list(range(48))), HostTensor("bf16", (1, 2, 3, 4), [1] * 24), HostTensor("bf16", (1, 2, 3, 4), [0] * 24)], [rope])
++        assert rope.flat() == tuple(float(index) for index in range(48))
++        gqa = HostTensor.zeros("bf16", (3, 4))
++        _run(compiler, runtime, build_gqa_repeat_kv((3, 2), 4), [HostTensor("bf16", (3, 2), list(range(6))), HostTensor("int64", (4,), [0, 1, 0, 1])], [gqa])
++        assert gqa.flat() == (0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 2.0, 3.0, 4.0, 5.0, 4.0, 5.0)
++        decoder = HostTensor.zeros("bf16", (2, 4))
++        _run(compiler, runtime, build_decoder_subgraph(2, hidden=4, intermediate=4), [HostTensor("bf16", (2, 4), [1, 2, 3, 4, 5, 6, 7, 8]), HostTensor("bf16", (4,), [1] * 4), HostTensor("bf16", (4, 8), [.1] * 32)], [decoder], {"epsilon": 1e-5})
++        assert all(math.isfinite(value) for value in decoder.flat())
++        print("qwen_composites=PASS")
++        print("cuda_c2_device=PASS")
++    finally:
++        runtime.close()
++        driver.close()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py b/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py
+index f549cd5de..abcc132c7 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py
+@@ -27,7 +27,7 @@ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region
+ from pypto.lowering.cpu.vector import CpuVectorValidationError, lower_cpu_vector
+ from pypto.lowering.cpu.x86.avx2 import lower_avx2
+ from pypto.lowering.cpu.x86.avx512 import Avx512UnsupportedError, lower_avx512
+-from pypto.lowering.gpu import GpuUnsupportedError, lower_gpu_common
++from pypto.lowering.gpu import lower_gpu_common
+ from pypto.target import TargetSpec
+ 
+ 
+@@ -329,7 +329,7 @@ def test_indexing_lowering_rejects_unrepresentable_strides_and_native_rank_limit
+ 
+ 
+ @pytest.mark.parametrize("operation", ("split", "concat", "gather", "embedding"))
+-def test_avx2_accepts_indexing_with_host_reference_avx512_and_gpu_stay_closed(operation):
++def test_avx2_and_gpu_accept_indexing_while_avx512_stays_closed(operation):
+     if operation == "split":
+         source = ValueRef("source", CoreType.tensor("float32", (2, 4)))
+         left = ValueRef("left", CoreType.tensor("float32", (2, 1)))
+@@ -354,5 +354,5 @@ def test_avx2_accepts_indexing_with_host_reference_avx512_and_gpu_stay_closed(op
+     assert avx2_ir.plans[0].operation == operation
+     with pytest.raises(Avx512UnsupportedError, match=operation):
+         lower_avx512(program, AVX512_TARGET)
+-    with pytest.raises(GpuUnsupportedError, match=operation):
+-        lower_gpu_common(program, GPU_TARGET)
++    target_ir = lower_gpu_common(program, GPU_TARGET)
++    assert target_ir.plans[0].operation == operation
+diff --git a/python/tests/ut/pypto_x/test_cuda_qwen_c2.py b/python/tests/ut/pypto_x/test_cuda_qwen_c2.py
+new file mode 100644
+index 000000000..ec89fe951
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cuda_qwen_c2.py
+@@ -0,0 +1,277 @@
++"""CUDA C2 math/layout/indexing and Qwen composite coverage.
++
++The device test is intentionally weight-free.  It runs when a CUDA Driver API
++device is available (the RTX 5080 validation host) and skips on ordinary
++development hosts without a device.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import math
++
++import pytest
++
++from pypto.abi import GpuLaunchRequest, TensorDesc
++from pypto.backends.cpu import HostTensor
++from pypto.backends.cuda import CudaArtifactError, CudaDriver, CudaDriverUnavailable, CudaRuntime
++from pypto.compiler import Artifact
++from pypto.compiler.targets.cuda import (
++    CudaPtxArtifactError,
++    CudaPtxCompiler,
++    CudaPtxUnsupportedError,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.portable.qwen35 import (
++    build_decoder_subgraph,
++    build_gqa_repeat_kv,
++    build_rope_rotate_half,
++    build_rms_norm,
++    build_stable_softmax,
++)
++from pypto.target import TargetSpec
++
++
++TARGET = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,)})
++
++
++def _program(parameters, returns, operation):
++    return CoreProgram(
++        functions=(CoreFunction("main", tuple(parameters), tuple(returns), Region((operation,))),)
++    )
++
++
++def _unary(name, dtype="float32", shape=(7,)):
++    value_type = CoreType.tensor(dtype, shape)
++    x = ValueRef("x", value_type)
++    z = ValueRef("z", value_type)
++    return _program((x,), (z,), Operation(name, (x,), (z,))), x, z
++
++
++def _driver_or_skip():
++    try:
++        driver = CudaDriver()
++        driver.device_info()
++        return driver
++    except (CudaDriverUnavailable, Exception) as exc:
++        pytest.skip("CUDA Driver API device unavailable: {}".format(exc))
++
++
++def _run(compiler, runtime, program, inputs, outputs, scalars=None):
++    target_ir = compiler.lower(program, TARGET)
++    artifact = compiler.compile(target_ir)
++    request = GpuLaunchRequest(
++        artifact,
++        geometries=tuple(plan.geometry for plan in target_ir.gpu_program.plans),
++        inputs=tuple(
++            TensorDesc(value.dtype, value.shape, device="gpu", handle=value, readonly=True)
++            for value in inputs
++        ),
++        outputs=tuple(
++            TensorDesc(value.dtype, value.shape, device="gpu", handle=value)
++            for value in outputs
++        ),
++        scalars=scalars or {},
++    )
++    runtime.launch(request)
++    return target_ir, artifact
++
++
++def test_c2_lowering_is_explicit_and_artifact_versions_are_fail_closed():
++    program, _x, _z = _unary("softplus")
++    compiler = CudaPtxCompiler()
++    target_ir = compiler.lower(program, TARGET)
++    artifact = compiler.compile(target_ir)
++    assert artifact.metadata["cuda_lowering_version"] == 2
++    assert "ex2.approx.f32" in target_ir.ptx
++    assert "gpu.ir.v2" == artifact.metadata["gpu_ir_version"]
++
++    payload = json.loads(bytes(artifact.payload).decode("utf-8"))
++    payload["cuda_lowering_version"] = 1
++    rebuilt = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    tampered = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        payload=rebuilt,
++        metadata=dict(
++            artifact.metadata,
++            cuda_lowering_version=1,
++            payload_digest=hashlib.sha256(rebuilt).hexdigest(),
++        ),
++    )
++    with pytest.raises((CudaArtifactError, CudaPtxArtifactError, ValueError), match="lowering|version|digest"):
++        CudaRuntime().load(tampered)
++
++
++def test_c2_plan_accepts_qwen_math_layout_indexing_and_batched_matmul():
++    from pypto.lowering.gpu import lower_gpu_common
++
++    values = []
++    for name, program in (
++        ("rms", build_rms_norm((2, 4))),
++        ("softmax", build_stable_softmax((2, 4))),
++        ("rope", build_rope_rotate_half((1, 2, 3, 8), rotary_dim=4)),
++        ("gqa", build_gqa_repeat_kv((3, 2), 4)),
++        ("decoder", build_decoder_subgraph(2, hidden=4, intermediate=4)),
++    ):
++        target_ir = lower_gpu_common(program, TARGET)
++        values.append((name, len(target_ir.plans)))
++    assert all(count > 0 for _name, count in values)
++
++
++@pytest.mark.parametrize("name", ("exp", "rsqrt", "sigmoid", "silu", "softplus"))
++def test_c2_math_and_bf16_rne_on_driver_device(name):
++    driver = _driver_or_skip()
++    compiler = CudaPtxCompiler(driver=driver, probe_jit=True)
++    runtime = CudaRuntime(driver=driver)
++    try:
++        program, _x, _z = _unary(name, shape=(7,))
++        actual = HostTensor.zeros("float32", (7,))
++        values = [-float("inf"), -3.0, -0.0, 0.0, 3.0, float("inf"), float("nan")]
++        _run(compiler, runtime, program, [HostTensor("float32", (7,), values)], [actual])
++        for value, result in zip(values, actual.flat()):
++            if math.isnan(value):
++                assert math.isnan(result)
++            elif name == "rsqrt" and value < 0:
++                assert math.isnan(result)
++            elif name == "rsqrt" and value == 0:
++                assert math.isinf(result)
++            elif name == "exp" and value == float("inf"):
++                assert math.isinf(result)
++            else:
++                if name == "exp":
++                    expected = math.exp(value)
++                elif name == "rsqrt":
++                    expected = 1.0 / math.sqrt(value)
++                elif name == "sigmoid":
++                    expected = 1.0 / (1.0 + math.exp(-value)) if value >= 0 else math.exp(value) / (1.0 + math.exp(value))
++                elif name == "silu":
++                    if value == -float("inf"):
++                        expected = 0.0
++                    elif value == float("inf"):
++                        expected = float("inf")
++                    else:
++                        sigmoid = 1.0 / (1.0 + math.exp(-value)) if value >= 0 else math.exp(value) / (1.0 + math.exp(value))
++                        expected = value * sigmoid
++                else:
++                    expected = math.log1p(math.exp(-abs(value))) + max(value, 0.0)
++                assert result == pytest.approx(expected, rel=3e-3, abs=3e-4)
++
++        bf_program, bx, bz = _unary("add", dtype="bf16", shape=(5,))
++        # Replace the unary-shaped helper with a binary operation for the RNE check.
++        value_type = CoreType.tensor("bf16", (5,))
++        left = ValueRef("left", value_type)
++        right = ValueRef("right", value_type)
++        output = ValueRef("output", value_type)
++        bf_program = _program((left, right), (output,), Operation("add", (left, right), (output,)))
++        bf_actual = HostTensor.zeros("bf16", (5,))
++        _run(
++            compiler,
++            runtime,
++            bf_program,
++            [HostTensor("bf16", (5,), [1.0] * 5), HostTensor("bf16", (5,), [0.5] * 5)],
++            [bf_actual],
++        )
++        assert bf_actual.flat() == (1.5,) * 5
++    finally:
++        runtime.close()
++        driver.close()
++
++
++def test_c2_reduction_position_broadcast_where_and_indexing_on_driver_device():
++    driver = _driver_or_skip()
++    compiler = CudaPtxCompiler(driver=driver, probe_jit=True)
++    runtime = CudaRuntime(driver=driver)
++    try:
++        input_type = CoreType.tensor("float32", (2, 3))
++        output_type = CoreType.tensor("float32", (2, 1))
++        x = ValueRef("x", input_type)
++        z = ValueRef("z", output_type)
++        mean_program = _program(
++            (x,), (z,), Operation("reduce_mean", (x,), (z,), attributes={"axis": 1, "keepdims": True})
++        )
++        mean = HostTensor.zeros("float32", (2, 1))
++        _run(compiler, runtime, mean_program, [HostTensor("float32", (2, 3), [1, 2, 3, 4, 5, 6])], [mean])
++        assert mean.flat() == pytest.approx((2.0, 5.0))
++
++        empty_input = CoreType.tensor("float32", (0, 3))
++        empty_output = CoreType.tensor("float32", (3,))
++        ex = ValueRef("ex", empty_input)
++        ez = ValueRef("ez", empty_output)
++        empty_program = _program(
++            (ex,), (ez,), Operation("reduce_sum", (ex,), (ez,), attributes={"axis": 0})
++        )
++        empty = HostTensor.zeros("float32", (3,))
++        _run(compiler, runtime, empty_program, [HostTensor("float32", (0, 3))], [empty])
++        assert empty.flat() == (0.0, 0.0, 0.0)
++
++        index_type = CoreType.tensor("int64", (2,))
++        source_type = CoreType.tensor("float32", (3, 4))
++        gather_type = CoreType.tensor("float32", (2, 4))
++        source = ValueRef("source", source_type)
++        indices = ValueRef("indices", index_type)
++        gathered = ValueRef("gathered", gather_type)
++        gather_program = _program(
++            (source, indices), (gathered,), Operation("gather", (source, indices), (gathered,), attributes={"axis": 0})
++        )
++        gathered_actual = HostTensor.zeros("float32", (2, 4))
++        _run(
++            compiler,
++            runtime,
++            gather_program,
++            [HostTensor("float32", (3, 4), list(range(12))), HostTensor("int64", (2,), [2, 0])],
++            [gathered_actual],
++        )
++        assert gathered_actual.flat() == (8.0, 9.0, 10.0, 11.0, 0.0, 1.0, 2.0, 3.0)
++
++        float_type = CoreType.tensor("float32", (3,))
++        bool_type = CoreType.tensor("bool", (3,))
++        left = ValueRef("left", float_type)
++        right = ValueRef("right", float_type)
++        compare_output = ValueRef("compare_output", bool_type)
++        compare_actual = HostTensor.zeros("bool", (3,))
++        compare_program = _program(
++            (left, right),
++            (compare_output,),
++            Operation("compare", (left, right), (compare_output,), attributes={"predicate": "ne"}),
++        )
++        _run(
++            compiler,
++            runtime,
++            compare_program,
++            [HostTensor("float32", (3,), [float("nan"), 1.0, 2.0]), HostTensor("float32", (3,), [0.0, 1.0, float("nan")])],
++            [compare_actual],
++        )
++        assert compare_actual.flat() == (True, False, True)
++    finally:
++        runtime.close()
++        driver.close()
++
++
++def test_c2_qwen_composites_execute_as_multi_kernel_graph_on_driver_device():
++    driver = _driver_or_skip()
++    compiler = CudaPtxCompiler(driver=driver, probe_jit=True)
++    runtime = CudaRuntime(driver=driver)
++    try:
++        program = build_stable_softmax((2, 4))
++        actual = HostTensor.zeros("bf16", (2, 4))
++        _run(compiler, runtime, program, [HostTensor("bf16", (2, 4), [1, 2, 3, 4, 4, 3, 2, 1])], [actual])
++        assert all(value > 0 for value in actual.flat())
++        assert sum(actual.flat()[:4]) == pytest.approx(1.0, abs=2e-2)
++
++        program = build_gqa_repeat_kv((3, 2), 4)
++        actual = HostTensor.zeros("bf16", (3, 4))
++        _run(
++            compiler,
++            runtime,
++            program,
++            [HostTensor("bf16", (3, 2), list(range(6))), HostTensor("int64", (4,), [0, 1, 0, 1])],
++            [actual],
++        )
++        assert actual.flat() == (0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 2.0, 3.0, 4.0, 5.0, 4.0, 5.0)
++    finally:
++        runtime.close()
++        driver.close()

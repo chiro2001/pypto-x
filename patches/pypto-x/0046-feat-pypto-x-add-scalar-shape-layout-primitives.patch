@@ -1,0 +1,1734 @@
+From 23ccb729a7e1c7f10b39a13d2a06ec3b7f619c5f Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Tue, 8 Sep 2026 19:19:27 +0800
+Subject: [PATCH 46/96] feat(pypto-x): add scalar shape layout primitives
+
+---
+ python/pypto/backends/cpu/runtime.py               | 200 +++++++++++++++++
+ python/pypto/frontend/pil_core_bridge.py           | 445 +++++++++++++++++++++++++++++++++++--
+ python/pypto/lowering/cpu/__init__.py              | 487 +++++++++++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_cpu_scalar_m1b.py     | 376 +++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_tensor_core_bridge.py |  55 +++++
+ 5 files changed, 1547 insertions(+), 16 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/runtime.py b/python/pypto/backends/cpu/runtime.py
+index dbe814fef..3860ea6cc 100644
+--- a/python/pypto/backends/cpu/runtime.py
++++ b/python/pypto/backends/cpu/runtime.py
+@@ -14,6 +14,11 @@ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation
+ from pypto.lowering.cpu import (
+     CPU_SCALAR_BACKEND,
+     CpuScalarProgram,
++    _m1b_attribute,
++    _m1b_gather_axis,
++    _m1b_permutation,
++    _m1b_slice_spec,
++    _m1b_split_sizes,
+     canonical_dtype,
+     canonical_operation_name,
+     element_count,
+@@ -358,6 +363,23 @@ def _execute_operation(operation: Operation, environment: Dict[str, _RuntimeValu
+         if value.type != ref.type:
+             raise CpuScalarExecutionError("{} input {!r} has a type mismatch".format(context, ref.name))
+         inputs.append(value)
++    if name == "split":
++        if len(operation.outputs) < 1:
++            raise CpuScalarExecutionError("{} split must have at least one output".format(context))
++        try:
++            split_values = _split_value(
++                inputs[0].data,
++                inputs[0].type,
++                tuple(output.type for output in operation.outputs),
++                operation.attributes,
++            )
++        except CpuScalarExecutionError:
++            raise
++        except (TypeError, ValueError, OverflowError) as exc:
++            raise CpuScalarExecutionError("{} failed: {}".format(context, exc)) from exc
++        for output_ref, result in zip(operation.outputs, split_values):
++            environment[output_ref.name] = _RuntimeValue(output_ref.type, result)
++        return
+     if len(operation.outputs) != 1:
+         raise CpuScalarExecutionError("{} must have one output".format(context))
+     output_ref = operation.outputs[0]
+@@ -394,6 +416,31 @@ def _execute_operation(operation: Operation, environment: Dict[str, _RuntimeValu
+                 inputs[2].type,
+                 output_ref.type,
+             )
++        elif name in ("reshape", "view"):
++            result = _reshape_value(inputs[0].data, output_ref.type)
++        elif name == "transpose":
++            result = _transpose_value(inputs[0].data, inputs[0].type, output_ref.type, operation.attributes)
++        elif name == "contiguous":
++            result = _copy_value(inputs[0].data)
++        elif name == "slice":
++            result = _slice_value(inputs[0].data, inputs[0].type, output_ref.type, operation.attributes)
++        elif name == "concat":
++            result = _concat_value(
++                tuple(item.data for item in inputs),
++                tuple(item.type for item in inputs),
++                output_ref.type,
++                operation.attributes,
++            )
++        elif name in ("gather", "embedding"):
++            result = _gather_value(
++                inputs[0].data,
++                inputs[0].type,
++                inputs[1].data,
++                inputs[1].type,
++                output_ref.type,
++                operation.attributes,
++                embedding=name == "embedding",
++            )
+         elif name == "matmul":
+             result = _matmul_value(
+                 inputs[0].data,
+@@ -415,6 +462,159 @@ def _copy_value(value: Any) -> Any:
+     return list(value) if isinstance(value, list) else value
+ 
+ 
++def _reshape_value(value: Any, output_type: CoreType) -> List[Any]:
++    if not isinstance(value, list):
++        raise CpuScalarExecutionError("reshape/view requires tensor storage")
++    output_shape = static_shape(output_type, "reshape output")
++    if len(value) != element_count(output_shape):
++        raise CpuScalarExecutionError("reshape/view storage length does not match output shape")
++    # Row-major flattening is the only scalar layout.  A reshape changes the
++    # static shape while preserving this logical sequence byte-for-byte.
++    return list(value)
++
++
++def _transpose_value(
++    value: Any,
++    input_type: CoreType,
++    output_type: CoreType,
++    attributes: Mapping[str, Any],
++) -> List[Any]:
++    if not isinstance(value, list):
++        raise CpuScalarExecutionError("transpose requires tensor storage")
++    input_shape = static_shape(input_type, "transpose input")
++    output_shape = static_shape(output_type, "transpose output")
++    permutation = _m1b_permutation(input_shape, attributes, "transpose")
++    result = []
++    for output_index in range(element_count(output_shape)):
++        output_coords = _unravel(output_index, output_shape)
++        input_coords = [0] * len(input_shape)
++        for output_axis, input_axis in enumerate(permutation):
++            input_coords[input_axis] = output_coords[output_axis]
++        result.append(value[_ravel(input_coords, input_shape)])
++    return result
++
++
++def _slice_value(
++    value: Any,
++    input_type: CoreType,
++    output_type: CoreType,
++    attributes: Mapping[str, Any],
++) -> List[Any]:
++    if not isinstance(value, list):
++        raise CpuScalarExecutionError("slice requires tensor storage")
++    input_shape = static_shape(input_type, "slice input")
++    output_shape = static_shape(output_type, "slice output")
++    spec = _m1b_slice_spec(input_shape, attributes, "slice")
++    starts = {axis: (start, stop, step) for axis, start, stop, step in spec}
++    result = []
++    for output_index in range(element_count(output_shape)):
++        output_coords = _unravel(output_index, output_shape)
++        input_coords = list(output_coords)
++        for axis, (start, _stop, step) in starts.items():
++            input_coords[axis] = start + output_coords[axis] * step
++        result.append(value[_ravel(input_coords, input_shape)])
++    return result
++
++
++def _split_value(
++    value: Any,
++    input_type: CoreType,
++    output_types: Sequence[CoreType],
++    attributes: Mapping[str, Any],
++) -> Tuple[List[Any], ...]:
++    if not isinstance(value, list):
++        raise CpuScalarExecutionError("split requires tensor storage")
++    input_shape = static_shape(input_type, "split input")
++    axis, sizes = _m1b_split_sizes(input_shape, output_types, attributes, "split")
++    results = []
++    offset = 0
++    for output_type, size in zip(output_types, sizes):
++        output_shape = static_shape(output_type, "split output")
++        output_values = []
++        for output_index in range(element_count(output_shape)):
++            output_coords = _unravel(output_index, output_shape)
++            input_coords = list(output_coords)
++            input_coords[axis] += offset
++            output_values.append(value[_ravel(input_coords, input_shape)])
++        results.append(output_values)
++        offset += size
++    return tuple(results)
++
++
++def _concat_value(
++    values: Sequence[Any],
++    input_types: Sequence[CoreType],
++    output_type: CoreType,
++    attributes: Mapping[str, Any],
++) -> List[Any]:
++    if not values:
++        raise CpuScalarExecutionError("concat requires at least one input")
++    input_shapes = [static_shape(value_type, "concat input") for value_type in input_types]
++    output_shape = static_shape(output_type, "concat output")
++    axis = _m1b_attribute(attributes, ("axis", "dim"), "concat", default=0)
++    axis = axis + len(output_shape) if axis < 0 else axis
++    if axis < 0 or axis >= len(output_shape):
++        raise CpuScalarExecutionError("concat axis is outside output rank")
++    boundaries = []
++    running = 0
++    for shape in input_shapes:
++        boundaries.append((running, running + shape[axis]))
++        running += shape[axis]
++    result = []
++    for output_index in range(element_count(output_shape)):
++        output_coords = _unravel(output_index, output_shape)
++        source_index = None
++        local_axis = None
++        for index, (start, stop) in enumerate(boundaries):
++            if start <= output_coords[axis] < stop:
++                source_index = index
++                local_axis = output_coords[axis] - start
++                break
++        if source_index is None:
++            # This is only reachable for an empty output axis.  There are no
++            # output indices in that case, but retain an explicit guard.
++            raise CpuScalarExecutionError("concat output coordinate is outside input segments")
++        source_coords = list(output_coords)
++        source_coords[axis] = local_axis
++        source_shape = input_shapes[source_index]
++        result.append(values[source_index][_ravel(source_coords, source_shape)])
++    return result
++
++
++def _gather_value(
++    source: Any,
++    source_type: CoreType,
++    indices: Any,
++    index_type: CoreType,
++    output_type: CoreType,
++    attributes: Mapping[str, Any],
++    *,
++    embedding: bool = False,
++) -> List[Any]:
++    if not isinstance(source, list) or not isinstance(indices, list):
++        raise CpuScalarExecutionError("gather/embedding requires tensor storage")
++    source_shape = static_shape(source_type, "gather source")
++    index_shape = static_shape(index_type, "gather indices")
++    output_shape = static_shape(output_type, "gather output")
++    axis = 0 if embedding else _m1b_gather_axis(source_shape, attributes, "gather")
++    index_rank = len(index_shape)
++    result = []
++    for output_index in range(element_count(output_shape)):
++        output_coords = _unravel(output_index, output_shape)
++        index_coords = output_coords[axis : axis + index_rank]
++        index_offset = _ravel(index_coords, index_shape) if index_shape else 0
++        selected = indices[index_offset]
++        if isinstance(selected, bool) or not isinstance(selected, int):
++            raise CpuScalarExecutionError("gather index is not an integer")
++        if selected < 0 or selected >= source_shape[axis]:
++            raise CpuScalarExecutionError(
++                "gather index {} is outside axis {} length {}".format(selected, axis, source_shape[axis])
++            )
++        source_coords = list(output_coords[:axis]) + [selected] + list(output_coords[axis + index_rank :])
++        result.append(source[_ravel(source_coords, source_shape)])
++    return result
++
++
+ def _cast_value_for_operation(value: Any, output_type: CoreType) -> Any:
+     """Cast a scalar or flat tensor to the already-validated output dtype."""
+ 
+diff --git a/python/pypto/frontend/pil_core_bridge.py b/python/pypto/frontend/pil_core_bridge.py
+index d3b2ac578..6f47cd783 100644
+--- a/python/pypto/frontend/pil_core_bridge.py
++++ b/python/pypto/frontend/pil_core_bridge.py
+@@ -111,6 +111,54 @@ _PORTABLE_OP_NAMES = {
+     "pypto.op.other.where": "where",
+     "tensor.identity": "identity",
+     "tensor.copy": "copy",
++    # M1B aliases are enumerated from the public Tensor frontend paths.  Do
++    # not infer portability from a generic suffix (a target/vendor op must
++    # remain visible and conservatively effectful).
++    "tensor.reshape": "reshape",
++    "pypto.reshape": "reshape",
++    "pypto.operation.reshape": "reshape",
++    "pil.reshape": "reshape",
++    "tensor.view": "view",
++    "pypto.view": "view",
++    "pypto.operation.view": "view",
++    "pil.view": "view",
++    "tensor.transpose": "transpose",
++    "pypto.transpose": "transpose",
++    "pypto.op.mutating.transpose": "transpose",
++    "pil.transpose": "transpose",
++    "tensor.permute": "transpose",
++    "pypto.permute": "transpose",
++    "pypto.op.mutating.permute": "transpose",
++    "pil.permute": "transpose",
++    "tensor.contiguous": "contiguous",
++    "pypto.contiguous": "contiguous",
++    "pil.contiguous": "contiguous",
++    "tensor.slice": "slice",
++    "pypto.slice": "slice",
++    "pypto.op.indexing.slice": "slice",
++    "pil.slice": "slice",
++    "tensor.split": "split",
++    "pypto.split": "split",
++    "pypto.op.joining.split": "split",
++    "pil.split": "split",
++    "tensor.concat": "concat",
++    "tensor.cat": "concat",
++    "pypto.concat": "concat",
++    "pypto.cat": "concat",
++    "pypto.op.joining.concat": "concat",
++    "pil.concat": "concat",
++    "tensor.gather": "gather",
++    "pypto.gather": "gather",
++    "pypto.op.indexing.gather": "gather",
++    "pil.gather": "gather",
++    "tensor.index_select": "gather",
++    "pypto.index_select": "gather",
++    "pypto.op.indexing.index_select": "gather",
++    "pil.index_select": "gather",
++    "tensor.embedding": "embedding",
++    "pypto.embedding": "embedding",
++    "pypto.op.indexing.embedding": "embedding",
++    "pil.embedding": "embedding",
+ }
+ _DTYPE_ALIASES = {
+     "bool": "bool",
+@@ -527,6 +575,8 @@ class _PilExporter:
+         output: ValueRef,
+         path: str,
+         value_id: Optional[int] = None,
++        attributes: Optional[Mapping[str, Any]] = None,
++        output_index: Optional[int] = None,
+     ) -> ValueRef:
+         if not inputs or output.type.kind != "unknown":
+             if inputs and output.type.kind != "unknown":
+@@ -570,6 +620,138 @@ class _PilExporter:
+                     inferred = CoreType("tensor", left.type.dtype, (left.type.shape[0], right.type.shape[1]))
+                 else:
+                     self.diagnostic(path, "type_conflict", "matmul 输入 CoreType 不一致，不能推导 result")
++        elif op_name in {"reshape", "view"} and len(inputs) == 1 and self._type_known(inputs[0].type):
++            raw_shape = (attributes or {}).get("shape", (attributes or {}).get("target_shape"))
++            if raw_shape is not None and inputs[0].type.kind in {"tensor", "view", "tile"}:
++                try:
++                    requested = tuple(raw_shape)
++                    if all(isinstance(item, int) and not isinstance(item, bool) for item in requested):
++                        input_count = 1
++                        for dimension in inputs[0].type.shape:
++                            input_count *= dimension
++                        unknown = [item for item in requested if item == -1]
++                        known_product = 1
++                        for item in requested:
++                            if item != -1:
++                                known_product *= item
++                        if len(unknown) <= 1 and known_product and input_count % known_product == 0:
++                            shape = list(requested)
++                            if unknown:
++                                shape[requested.index(-1)] = input_count // known_product
++                            inferred = CoreType(inputs[0].type.kind, inputs[0].type.dtype, tuple(shape))
++                except (CoreIRError, TypeError, ValueError):
++                    inferred = None
++        elif op_name == "transpose" and len(inputs) == 1 and self._type_known(inputs[0].type):
++            attributes = attributes or {}
++            input_type = inputs[0].type
++            if input_type.kind in {"tensor", "view", "tile"}:
++                raw = attributes.get(
++                    "permutation",
++                    attributes.get("perm", attributes.get("dims", attributes.get("axes"))),
++                )
++                if raw is None and "dim0" in attributes and "dim1" in attributes:
++                    raw = list(range(len(input_type.shape)))
++                    dim0, dim1 = attributes["dim0"], attributes["dim1"]
++                    if isinstance(dim0, int) and isinstance(dim1, int):
++                        dim0 = dim0 + len(raw) if dim0 < 0 else dim0
++                        dim1 = dim1 + len(raw) if dim1 < 0 else dim1
++                        if 0 <= dim0 < len(raw) and 0 <= dim1 < len(raw):
++                            raw[dim0], raw[dim1] = raw[dim1], raw[dim0]
++                if raw is not None:
++                    try:
++                        permutation = tuple(raw)
++                        if len(permutation) == len(input_type.shape) and all(
++                            isinstance(item, int) and not isinstance(item, bool) for item in permutation
++                        ):
++                            permutation = tuple(
++                                item + len(input_type.shape) if item < 0 else item for item in permutation
++                            )
++                            if sorted(permutation) == list(range(len(input_type.shape))):
++                                inferred = CoreType(
++                                    input_type.kind,
++                                    input_type.dtype,
++                                    tuple(input_type.shape[item] for item in permutation),
++                                )
++                    except (CoreIRError, TypeError, ValueError):
++                        inferred = None
++        elif op_name == "contiguous" and len(inputs) == 1 and self._type_known(inputs[0].type):
++            inferred = inputs[0].type
++        elif op_name == "split" and len(inputs) == 1 and output_index is not None and self._type_known(inputs[0].type):
++            attributes = attributes or {}
++            source = inputs[0].type
++            raw_sizes = attributes.get("sizes", attributes.get("split_sizes", attributes.get("sections")))
++            axis = attributes.get("axis", attributes.get("dim", 0))
++            if raw_sizes is not None and source.kind in {"tensor", "view", "tile"}:
++                try:
++                    sizes = tuple(raw_sizes)
++                    axis = axis + len(source.shape) if axis < 0 else axis
++                    if 0 <= axis < len(source.shape) and 0 <= output_index < len(sizes):
++                        shape = list(source.shape)
++                        shape[axis] = sizes[output_index]
++                        inferred = CoreType(source.kind, source.dtype, tuple(shape))
++                except (CoreIRError, TypeError, ValueError, IndexError):
++                    inferred = None
++        elif op_name == "slice" and len(inputs) == 1 and self._type_known(inputs[0].type):
++            attributes = attributes or {}
++            source = inputs[0].type
++            starts = attributes.get("starts", attributes.get("start"))
++            stops = attributes.get("stops", attributes.get("stop"))
++            axes = attributes.get("axes", attributes.get("axis"))
++            steps = attributes.get("steps", attributes.get("step"))
++            if starts is not None and stops is not None and source.kind in {"tensor", "view", "tile"}:
++                try:
++                    starts = (starts,) if isinstance(starts, int) else tuple(starts)
++                    stops = (stops,) if isinstance(stops, int) else tuple(stops)
++                    axes = tuple(range(len(starts))) if axes is None else ((axes,) if isinstance(axes, int) else tuple(axes))
++                    steps = (1,) * len(starts) if steps is None else ((steps,) if isinstance(steps, int) else tuple(steps))
++                    shape = list(source.shape)
++                    if len(starts) == len(stops) == len(axes) == len(steps):
++                        for start, stop, axis, step in zip(starts, stops, axes, steps):
++                            axis = axis + len(shape) if axis < 0 else axis
++                            start = start + shape[axis] if start < 0 else start
++                            stop = stop + shape[axis] if stop < 0 else stop
++                            shape[axis] = max(0, (stop - start + step - 1) // step)
++                        inferred = CoreType(source.kind, source.dtype, tuple(shape))
++                except (CoreIRError, TypeError, ValueError, IndexError):
++                    inferred = None
++        elif op_name == "concat" and len(inputs) >= 1 and all(self._type_known(item.type) for item in inputs):
++            attributes = attributes or {}
++            if all(item.type.kind in {"tensor", "view", "tile"} for item in inputs):
++                axis = attributes.get("axis", attributes.get("dim", 0))
++                try:
++                    axis = axis + len(inputs[0].type.shape) if axis < 0 else axis
++                    if 0 <= axis < len(inputs[0].type.shape):
++                        shape = list(inputs[0].type.shape)
++                        for item in inputs[1:]:
++                            if len(item.type.shape) != len(shape):
++                                raise ValueError("rank")
++                            if any(
++                                left != right
++                                for index, (left, right) in enumerate(zip(shape, item.type.shape))
++                                if index != axis
++                            ):
++                                raise ValueError("shape")
++                            shape[axis] += item.type.shape[axis]
++                        if all(item.type.dtype == inputs[0].type.dtype for item in inputs):
++                            inferred = CoreType(inputs[0].type.kind, inputs[0].type.dtype, tuple(shape))
++                except (CoreIRError, TypeError, ValueError, IndexError):
++                    inferred = None
++        elif op_name in {"gather", "embedding"} and len(inputs) == 2 and all(
++            self._type_known(item.type) for item in inputs
++        ):
++            source, indices = inputs
++            if source.type.kind in {"tensor", "view", "tile"} and indices.type.kind in {"tensor", "view", "tile"}:
++                axis = 0 if op_name == "embedding" else (attributes or {}).get("axis", (attributes or {}).get("dim", 0))
++                try:
++                    axis = axis + len(source.type.shape) if axis < 0 else axis
++                    if 0 <= axis < len(source.type.shape):
++                        inferred = CoreType(
++                            source.type.kind,
++                            source.type.dtype,
++                            tuple(source.type.shape[:axis]) + tuple(indices.type.shape) + tuple(source.type.shape[axis + 1 :]),
++                        )
++                except (CoreIRError, TypeError, ValueError, IndexError):
++                    inferred = None
+         if inferred is None:
+             return output
+         if value_id is None:
+@@ -896,6 +1078,40 @@ class _PilExporter:
+                 "constant",
+                 "identity",
+                 "copy",
++                "reshape",
++                "view",
++                "transpose",
++                "permute",
++                "contiguous",
++                "slice",
++                "split",
++                "concat",
++                "cat",
++                "gather",
++                "index_select",
++                "embedding",
++                "pypto.reshape",
++                "pypto.view",
++                "pypto.transpose",
++                "pypto.permute",
++                "pypto.contiguous",
++                "pypto.slice",
++                "pypto.split",
++                "pypto.concat",
++                "pypto.cat",
++                "pypto.gather",
++                "pypto.index_select",
++                "pypto.embedding",
++                "pypto.operation.reshape",
++                "pypto.operation.view",
++                "pypto.op.mutating.transpose",
++                "pypto.op.mutating.permute",
++                "pypto.op.indexing.slice",
++                "pypto.op.joining.split",
++                "pypto.op.joining.concat",
++                "pypto.op.indexing.gather",
++                "pypto.op.indexing.index_select",
++                "pypto.op.indexing.embedding",
+                 "pil.const",
+                 "pil.fstring",
+                 "builtins.tuple",
+@@ -931,6 +1147,136 @@ class _PilExporter:
+                 result[name] = item
+         return result
+ 
++    def _portable_call_attributes(
++        self,
++        op_name: str,
++        args: tuple[Any, ...],
++        kwargs: Any,
++        call: Any,
++        path: str,
++    ) -> dict[str, Any]:
++        """Lift public shape arguments into explicit Core operation attrs.
++
++        PIL keeps positional literals in ``Call.args``.  A target-neutral
++        operation must expose those semantics in serializable attributes so a
++        scalar runtime does not need to interpret a frontend-specific call
++        signature.  Only the audited M1B fields are lifted here.
++        """
++
++        result: dict[str, Any] = {}
++        recognized = {
++            "shape",
++            "target_shape",
++            "out_shape",
++            "permutation",
++            "perm",
++            "dims",
++            "dim0",
++            "dim1",
++            "axis0",
++            "axis1",
++            "starts",
++            "start",
++            "stops",
++            "stop",
++            "axes",
++            "steps",
++            "step",
++            "sizes",
++            "split_sizes",
++            "sections",
++            "num_splits",
++            "axis",
++            "dim",
++            "offsets",
++            "offset",
++            "valid_shape",
++            "valid_shapes",
++        }
++
++        def put(key: str, value: Any, value_path: str) -> None:
++            if key in result and result[key] != value:
++                raise PilCoreBridgeError("{} contains conflicting attribute {}".format(value_path, key))
++            result[key] = value
++
++        supplied = _get(call, "attributes", "attrs", default={})
++        if isinstance(supplied, Mapping):
++            for key, value in supplied.items():
++                if key in recognized:
++                    put(key, self._encode_literal(value, path + ".attributes." + key), path + ".attributes")
++
++        def literal(value: Any, value_path: str) -> Any:
++            if _is_pil_value(value) or isinstance(value, ValueRef):
++                return _MISSING
++            return self._encode_literal(value, value_path)
++
++        items = kwargs.items() if isinstance(kwargs, Mapping) else kwargs
++        try:
++            items = tuple(items or ())
++        except TypeError:
++            items = ()
++        for item in items:
++            if isinstance(item, tuple) and len(item) == 2:
++                key, value = item
++            elif _is_wrapper(item, "Keyword"):
++                key = _get(item, "arg", "name", default=None)
++                value = _get(item, "value", default=_MISSING)
++            else:
++                continue
++            if isinstance(key, str) and key in recognized and value is not _MISSING:
++                encoded = literal(value, path + ".kwargs." + key)
++                if encoded is not _MISSING:
++                    put(key, encoded, path + ".kwargs")
++
++        # Public Tensor operation signatures put the source tensor first.
++        # The bridge already records Value operands separately; these fields
++        # only carry literals and therefore cannot smuggle a hidden tuple ABI.
++        if op_name in {"reshape", "view"} and len(args) >= 2:
++            encoded = literal(args[1], path + ".args[1]")
++            if encoded is not _MISSING:
++                put("shape", encoded, path + ".args")
++        elif op_name == "transpose":
++            if len(args) >= 3:
++                for key, position in (("dim0", 1), ("dim1", 2)):
++                    encoded = literal(args[position], path + ".args[{}]".format(position))
++                    if encoded is not _MISSING:
++                        put(key, encoded, path + ".args")
++            elif len(args) >= 2:
++                encoded = literal(args[1], path + ".args[1]")
++                if encoded is not _MISSING:
++                    put("permutation", encoded, path + ".args")
++        elif op_name == "slice":
++            keys = ("starts", "stops", "axes", "steps")
++            for index, key in enumerate(keys, 1):
++                if len(args) > index:
++                    encoded = literal(args[index], path + ".args[{}]".format(index))
++                    if encoded is not _MISSING:
++                        put(key, encoded, path + ".args")
++        elif op_name == "split":
++            if len(args) >= 2:
++                encoded = literal(args[1], path + ".args[1]")
++                if encoded is not _MISSING:
++                    put("sizes", encoded, path + ".args")
++            if len(args) >= 3:
++                encoded = literal(args[2], path + ".args[2]")
++                if encoded is not _MISSING:
++                    put("axis", encoded, path + ".args")
++        elif op_name == "concat":
++            if len(args) >= 2:
++                encoded = literal(args[1], path + ".args[1]")
++                if encoded is not _MISSING:
++                    put("axis", encoded, path + ".args")
++        elif op_name in {"gather", "embedding"}:
++            if op_name == "gather" and len(args) >= 3:
++                encoded = literal(args[1], path + ".args[1]")
++                if encoded is not _MISSING:
++                    put("axis", encoded, path + ".args")
++            elif op_name == "embedding" and len(args) >= 3:
++                encoded = literal(args[2], path + ".args[2]")
++                if encoded is not _MISSING:
++                    put("axis", encoded, path + ".args")
++        return result
++
+     def convert_call(self, call: Any, path: str, env: dict[str, ValueRef]) -> Optional[Operation]:
+         if not _is_pil_call(call):
+             raise UnsupportedPILNodeError(path, call, "期望 Call")
+@@ -995,21 +1341,57 @@ class _PilExporter:
+             for nested_ref in self._collect_operand_refs(value, f"{path}.kwargs[{index}].value"):
+                 inputs.append(nested_ref)
+ 
++        op_name = _portable_op_name(source_op_name)
++        portable_attributes = self._portable_call_attributes(op_name, args, kwargs, call, path)
+         result_value = _get(call, "result", default=None)
+         result_id: Optional[int] = None
++        result_ids: list[Optional[int]] = []
+         outputs: tuple[ValueRef, ...] = ()
+         if result_value is not None:
+-            result_type_hint = _get(call, "result_type", "output_type", "type", default=_MISSING)
+-            result_ref = self.ref_for_value(result_value, path + ".result", type_hint=result_type_hint)
+-            result_id = self._value_id(result_value, path + ".result")
+-            self._defined_value_ids.add(result_id)
+-            self._external_value_refs.pop(result_id, None)
+-            outputs = (result_ref,)
++            multiple_result_values = (
++                op_name == "split"
++                and isinstance(result_value, (list, tuple))
++                and not isinstance(result_value, (str, bytes))
++            )
++            if multiple_result_values:
++                raw_type_hints = _get(call, "result_types", "output_types", default=_MISSING)
++                if raw_type_hints is _MISSING or raw_type_hints is None:
++                    type_hints = ()
++                else:
++                    try:
++                        type_hints = tuple(raw_type_hints)
++                    except TypeError as exc:
++                        raise UnsupportedPILNodeError(
++                            path + ".result_types", raw_type_hints, "result_types 必须是序列"
++                        ) from exc
++                result_refs: list[ValueRef] = []
++                for index, result_item in enumerate(tuple(result_value)):
++                    hint = type_hints[index] if index < len(type_hints) else _MISSING
++                    result_ref = self.ref_for_value(
++                        result_item,
++                        path + ".result[{}]".format(index),
++                        type_hint=hint,
++                    )
++                    value_id = self._value_id(result_item, path + ".result[{}]".format(index))
++                    self._defined_value_ids.add(value_id)
++                    self._external_value_refs.pop(value_id, None)
++                    result_refs.append(result_ref)
++                    result_ids.append(value_id)
++                outputs = tuple(result_refs)
++                if result_ids:
++                    result_id = result_ids[0]
++            else:
++                result_type_hint = _get(call, "result_type", "output_type", "type", default=_MISSING)
++                result_ref = self.ref_for_value(result_value, path + ".result", type_hint=result_type_hint)
++                result_id = self._value_id(result_value, path + ".result")
++                result_ids = [result_id]
++                self._defined_value_ids.add(result_id)
++                self._external_value_refs.pop(result_id, None)
++                outputs = (result_ref,)
+ 
+         load_source_ref = None
+         if source_op_name == "pil.load" and args and isinstance(args[0], str):
+             load_source_ref = env.get(args[0]) or self._parameter_by_source_name.get(args[0])
+-        op_name = _portable_op_name(source_op_name)
+         if load_source_ref is not None:
+             op_name = "identity"
+ 
+@@ -1018,6 +1400,7 @@ class _PilExporter:
+             "args": encoded_args,
+             "kwargs": encoded_kwargs,
+         }
++        attrs.update(portable_attributes)
+         if op_name != source_op_name:
+             attrs["semantic_op"] = op_name
+         span_attrs = self._span_attributes(call)
+@@ -1043,7 +1426,21 @@ class _PilExporter:
+             else:
+                 self.diagnostic(path + ".args[0]", "unresolved_variable", "pil.load 的变量没有已知绑定")
+         if outputs:
+-            outputs = (self._infer_result_type(op_name, tuple(inputs), outputs[0], path + ".result", result_id),)
++            inferred_outputs = []
++            for index, output_ref in enumerate(outputs):
++                output_value_id = result_ids[index] if index < len(result_ids) else result_id
++                inferred_outputs.append(
++                    self._infer_result_type(
++                        op_name,
++                        tuple(inputs),
++                        output_ref,
++                        path + ".result{}".format("[{}]".format(index) if len(outputs) > 1 else ""),
++                        output_value_id,
++                        attrs,
++                        index,
++                    )
++                )
++            outputs = tuple(inferred_outputs)
+         if op_name == "pil.store" and args and isinstance(args[0], str):
+             attrs["variable"] = args[0]
+             if len(args) > 1:
+@@ -1183,15 +1580,31 @@ class _PilExporter:
+         result = _get(body, "result", default=None)
+         return_refs: tuple[ValueRef, ...] = ()
+         if result is not None:
+-            _, result_ref = self._encode_operand(result, "function.body.result", None, env)
+-            if result_ref is None:
+-                self.diagnostic(
+-                    "function.body.result",
+-                    "non_value_result",
+-                    "函数 result 不是 Value，不能声明 CoreFunction return",
+-                )
++            if isinstance(result, (list, tuple)) and not isinstance(result, (str, bytes)):
++                result_refs = []
++                for index, item in enumerate(result):
++                    if not _is_pil_value(item) and not isinstance(item, ValueRef):
++                        result_refs = []
++                        break
++                    result_refs.append(self.ref_for_value(item, "function.body.result[{}]".format(index)))
++                if result_refs:
++                    return_refs = tuple(result_refs)
++                else:
++                    self.diagnostic(
++                        "function.body.result",
++                        "non_value_result",
++                        "函数 result 序列含非 Value，不能声明 CoreFunction return",
++                    )
+             else:
+-                return_refs = (result_ref,)
++                _, result_ref = self._encode_operand(result, "function.body.result", None, env)
++                if result_ref is None:
++                    self.diagnostic(
++                        "function.body.result",
++                        "non_value_result",
++                        "函数 result 不是 Value，不能声明 CoreFunction return",
++                    )
++                else:
++                    return_refs = (result_ref,)
+         external_operations = [
+             Operation(
+                 "external",
+diff --git a/python/pypto/lowering/cpu/__init__.py b/python/pypto/lowering/cpu/__init__.py
+index ea26cb436..ba5f7711b 100644
+--- a/python/pypto/lowering/cpu/__init__.py
++++ b/python/pypto/lowering/cpu/__init__.py
+@@ -153,10 +153,81 @@ OP_ALIASES = {
+     "pypto.where": "where",
+     "pypto.op.other.where": "where",
+     "operator.where": "where",
++    # M1B shape/layout primitives.  Keep aliases explicit: a suffix-based
++    # fallback would make an unrelated vendor op look portable.
++    "reshape": "reshape",
++    "tensor.reshape": "reshape",
++    "core.reshape": "reshape",
++    "pypto.reshape": "reshape",
++    "pypto.operation.reshape": "reshape",
++    "pil.reshape": "reshape",
++    "view": "view",
++    "tensor.view": "view",
++    "core.view": "view",
++    "pypto.view": "view",
++    "pypto.operation.view": "view",
++    "pil.view": "view",
++    "transpose": "transpose",
++    "tensor.transpose": "transpose",
++    "core.transpose": "transpose",
++    "pypto.transpose": "transpose",
++    "pypto.op.mutating.transpose": "transpose",
++    "pil.transpose": "transpose",
++    "permute": "transpose",
++    "tensor.permute": "transpose",
++    "pypto.permute": "transpose",
++    "pypto.op.mutating.permute": "transpose",
++    "pil.permute": "transpose",
++    "contiguous": "contiguous",
++    "tensor.contiguous": "contiguous",
++    "core.contiguous": "contiguous",
++    "pypto.contiguous": "contiguous",
++    "pil.contiguous": "contiguous",
++    "slice": "slice",
++    "tensor.slice": "slice",
++    "core.slice": "slice",
++    "pypto.slice": "slice",
++    "pypto.op.indexing.slice": "slice",
++    "pil.slice": "slice",
++    "split": "split",
++    "tensor.split": "split",
++    "core.split": "split",
++    "pypto.split": "split",
++    "pypto.op.joining.split": "split",
++    "pil.split": "split",
++    "concat": "concat",
++    "cat": "concat",
++    "tensor.concat": "concat",
++    "tensor.cat": "concat",
++    "core.concat": "concat",
++    "pypto.concat": "concat",
++    "pypto.cat": "concat",
++    "pypto.op.joining.concat": "concat",
++    "pil.concat": "concat",
++    "gather": "gather",
++    "tensor.gather": "gather",
++    "core.gather": "gather",
++    "pypto.gather": "gather",
++    "pypto.op.indexing.gather": "gather",
++    "pil.gather": "gather",
++    "index_select": "gather",
++    "tensor.index_select": "gather",
++    "pypto.index_select": "gather",
++    "pypto.op.indexing.index_select": "gather",
++    "pil.index_select": "gather",
++    "embedding": "embedding",
++    "tensor.embedding": "embedding",
++    "core.embedding": "embedding",
++    "pypto.embedding": "embedding",
++    "pypto.op.indexing.embedding": "embedding",
++    "pil.embedding": "embedding",
+ }
+ SUPPORTED_OPERATIONS = frozenset(OP_ALIASES)
+ DIVISION_DTYPES = frozenset({"float16", "bf16", "float32", "float64"})
+ FLOAT_DTYPES = frozenset({"float16", "bf16", "float32", "float64"})
++INTEGER_DTYPES = frozenset(
++    {"int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64"}
++)
+ 
+ 
+ def canonical_operation_name(name: str) -> str:
+@@ -335,6 +406,241 @@ def _shape_attribute(attributes: Mapping[str, Any], context: str) -> Optional[Tu
+     return dimensions
+ 
+ 
++def _m1b_attribute(
++    attributes: Mapping[str, Any],
++    keys: Sequence[str],
++    context: str,
++    *,
++    default: Any = None,
++) -> Any:
++    """Read one logical attribute from explicit, audited spellings.
++
++    Core IR is serialized, so accepting two spellings with different values
++    would make the same operation depend on the consumer.  Equal aliases are
++    harmless and are accepted; conflicting aliases fail during lowering.
++    """
++
++    present = [key for key in keys if key in attributes]
++    if not present:
++        return default
++    first = attributes[present[0]]
++    for key in present[1:]:
++        if attributes[key] != first:
++            raise CpuScalarValidationError(
++                "{} contains conflicting attributes {}".format(context, ", ".join(present))
++            )
++    return first
++
++
++def _m1b_int(value: Any, context: str) -> int:
++    if isinstance(value, bool) or not isinstance(value, int):
++        raise CpuScalarValidationError("{} must be an integer".format(context))
++    return value
++
++
++def _m1b_int_sequence(
++    value: Any,
++    context: str,
++    *,
++    allow_scalar: bool = False,
++    allow_negative: bool = True,
++) -> Tuple[int, ...]:
++    if allow_scalar and isinstance(value, int) and not isinstance(value, bool):
++        values = (value,)
++    else:
++        if isinstance(value, (str, bytes)):
++            raise CpuScalarValidationError("{} must be a sequence of integers".format(context))
++        try:
++            values = tuple(value)
++        except TypeError as exc:
++            raise CpuScalarValidationError("{} must be a sequence of integers".format(context)) from exc
++    result = []
++    for index, item in enumerate(values):
++        item = _m1b_int(item, "{}[{}]".format(context, index))
++        if not allow_negative and item < 0:
++            raise CpuScalarValidationError("{}[{}] cannot be negative".format(context, index))
++        result.append(item)
++    return tuple(result)
++
++
++def _m1b_normalize_axis(axis: Any, rank: int, context: str) -> int:
++    axis = _m1b_int(axis, context)
++    normalized = axis + rank if axis < 0 else axis
++    if normalized < 0 or normalized >= rank:
++        raise CpuScalarValidationError("{} axis {} is outside rank {}".format(context, axis, rank))
++    return normalized
++
++
++def _m1b_reshape_shape(
++    input_shape: Sequence[int],
++    output_type: CoreType,
++    attributes: Mapping[str, Any],
++    context: str,
++) -> Tuple[int, ...]:
++    raw = _m1b_attribute(attributes, ("shape", "target_shape", "out_shape"), context)
++    if raw is None:
++        # A static CoreType is authoritative when the front-end has already
++        # materialized the result type.  The element-count check below still
++        # prevents an accidental reorder or truncation.
++        requested = tuple(output_type.shape)
++    else:
++        requested_values = _m1b_int_sequence(raw, context + ".shape", allow_negative=True)
++        if any(item < -1 for item in requested_values):
++            raise CpuScalarValidationError("{} shape dimensions may only be -1 or non-negative".format(context))
++        if sum(item == -1 for item in requested_values) > 1:
++            raise CpuScalarValidationError("{} shape may contain at most one -1".format(context))
++        requested = requested_values
++    input_count = element_count(tuple(input_shape))
++    unknown = [index for index, item in enumerate(requested) if item == -1]
++    if unknown:
++        known_product = element_count(tuple(item for item in requested if item != -1))
++        if known_product == 0 or input_count % known_product != 0:
++            raise CpuScalarValidationError(
++                "{} cannot infer -1 from input element count {} and shape {}".format(
++                    context, input_count, requested
++                )
++            )
++        resolved_values = list(requested)
++        resolved_values[unknown[0]] = input_count // known_product
++        resolved = tuple(resolved_values)
++    else:
++        resolved = tuple(requested)
++    if element_count(resolved) != input_count:
++        raise CpuScalarValidationError(
++            "{} element count {} does not match input count {}".format(
++                context, element_count(resolved), input_count
++            )
++        )
++    output_shape = static_shape(output_type, context + ".output")
++    if output_shape != resolved:
++        raise CpuScalarValidationError(
++            "{} output shape {} does not match resolved shape {}".format(context, output_shape, resolved)
++        )
++    return resolved
++
++
++def _m1b_permutation(input_shape: Sequence[int], attributes: Mapping[str, Any], context: str) -> Tuple[int, ...]:
++    rank = len(input_shape)
++    raw_permutation = _m1b_attribute(attributes, ("permutation", "perm", "dims", "axes"), context)
++    raw_dim0 = _m1b_attribute(attributes, ("dim0", "axis0"), context)
++    raw_dim1 = _m1b_attribute(attributes, ("dim1", "axis1"), context)
++    if raw_permutation is not None and (raw_dim0 is not None or raw_dim1 is not None):
++        raise CpuScalarValidationError("{} cannot combine permutation with dim0/dim1".format(context))
++    if raw_permutation is None:
++        if raw_dim0 is None and raw_dim1 is None:
++            raise CpuScalarValidationError("{} requires permutation or dim0/dim1".format(context))
++        if raw_dim0 is None or raw_dim1 is None:
++            raise CpuScalarValidationError("{} requires both dim0 and dim1".format(context))
++        dim0 = _m1b_normalize_axis(raw_dim0, rank, context + ".dim0")
++        dim1 = _m1b_normalize_axis(raw_dim1, rank, context + ".dim1")
++        permutation = list(range(rank))
++        permutation[dim0], permutation[dim1] = permutation[dim1], permutation[dim0]
++        return tuple(permutation)
++    permutation = _m1b_int_sequence(raw_permutation, context + ".permutation", allow_negative=True)
++    if len(permutation) != rank:
++        raise CpuScalarValidationError(
++            "{} permutation rank {} does not match input rank {}".format(context, len(permutation), rank)
++        )
++    normalized = tuple(_m1b_normalize_axis(axis, rank, context + ".permutation") for axis in permutation)
++    if len(set(normalized)) != rank:
++        raise CpuScalarValidationError("{} permutation must contain each axis exactly once".format(context))
++    return normalized
++
++
++def _m1b_slice_spec(
++    input_shape: Sequence[int], attributes: Mapping[str, Any], context: str
++) -> Tuple[Tuple[int, int, int, int], ...]:
++    starts = _m1b_attribute(attributes, ("starts", "start"), context)
++    stops = _m1b_attribute(attributes, ("stops", "stop"), context)
++    if starts is None or stops is None:
++        raise CpuScalarValidationError("{} requires starts and stops".format(context))
++    starts = _m1b_int_sequence(starts, context + ".starts", allow_scalar=True)
++    stops = _m1b_int_sequence(stops, context + ".stops", allow_scalar=True)
++    if len(starts) != len(stops):
++        raise CpuScalarValidationError("{} starts and stops must have the same length".format(context))
++    axes_raw = _m1b_attribute(attributes, ("axes", "axis"), context)
++    axes = (
++        tuple(range(len(starts)))
++        if axes_raw is None
++        else _m1b_int_sequence(axes_raw, context + ".axes", allow_scalar=True)
++    )
++    steps_raw = _m1b_attribute(attributes, ("steps", "step"), context)
++    steps = (
++        (1,) * len(starts)
++        if steps_raw is None
++        else _m1b_int_sequence(steps_raw, context + ".steps", allow_scalar=True)
++    )
++    if not (len(axes) == len(steps) == len(starts)):
++        raise CpuScalarValidationError("{} starts/stops/axes/steps lengths must match".format(context))
++    rank = len(input_shape)
++    normalized_axes = tuple(_m1b_normalize_axis(axis, rank, context + ".axes") for axis in axes)
++    if len(set(normalized_axes)) != len(normalized_axes):
++        raise CpuScalarValidationError("{} axes must not contain duplicates".format(context))
++    spec = []
++    for index, axis in enumerate(normalized_axes):
++        step = steps[index]
++        if step <= 0:
++            raise CpuScalarUnsupportedError("{} only supports positive step values".format(context))
++        dimension = input_shape[axis]
++        start = starts[index]
++        stop = stops[index]
++        if start < -dimension or start > dimension or stop < -dimension or stop > dimension:
++            raise CpuScalarValidationError(
++                "{} bound at index {} is outside dimension {}".format(context, index, dimension)
++            )
++        normalized_start = start + dimension if start < 0 else start
++        normalized_stop = stop + dimension if stop < 0 else stop
++        spec.append((axis, normalized_start, normalized_stop, step))
++    return tuple(spec)
++
++
++def _m1b_split_sizes(
++    input_shape: Sequence[int], output_types: Sequence[CoreType], attributes: Mapping[str, Any], context: str
++) -> Tuple[int, Tuple[int, ...]]:
++    axis_raw = _m1b_attribute(attributes, ("axis", "dim"), context, default=0)
++    axis = _m1b_normalize_axis(axis_raw, len(input_shape), context)
++    sizes_raw = _m1b_attribute(attributes, ("sizes", "split_sizes", "sections"), context)
++    if sizes_raw is None:
++        count_raw = _m1b_attribute(attributes, ("num_splits",), context)
++        if count_raw is None:
++            raise CpuScalarValidationError("{} requires sizes/sections".format(context))
++        count = _m1b_int(count_raw, context + ".num_splits")
++        if count <= 0 or input_shape[axis] % count != 0:
++            raise CpuScalarValidationError("{} num_splits must divide the split dimension".format(context))
++        sizes = (input_shape[axis] // count,) * count
++    else:
++        sizes = _m1b_int_sequence(sizes_raw, context + ".sizes", allow_negative=False)
++    if not sizes:
++        raise CpuScalarValidationError("{} sizes must not be empty".format(context))
++    if sum(sizes) != input_shape[axis]:
++        raise CpuScalarValidationError(
++            "{} sizes {} do not cover axis length {}".format(context, sizes, input_shape[axis])
++        )
++    if len(output_types) != len(sizes):
++        raise CpuScalarValidationError(
++            "{} has {} outputs but sizes declares {}".format(context, len(output_types), len(sizes))
++        )
++    expected_shapes = []
++    for size in sizes:
++        shape = list(input_shape)
++        shape[axis] = size
++        expected_shapes.append(tuple(shape))
++    for index, (output_type, expected) in enumerate(zip(output_types, expected_shapes)):
++        if not _is_tensor(output_type):
++            raise CpuScalarUnsupportedError("{} output {} must be a tensor".format(context, index))
++        _validate_dtype(output_type, "{} output {}".format(context, index))
++        if static_shape(output_type, "{} output {}".format(context, index)) != expected:
++            raise CpuScalarValidationError(
++                "{} output {} shape {} does not match {}".format(context, index, output_type.shape, expected)
++            )
++    return axis, sizes
++
++
++def _m1b_gather_axis(input_shape: Sequence[int], attributes: Mapping[str, Any], context: str) -> int:
++    raw_axis = _m1b_attribute(attributes, ("axis", "dim"), context, default=0)
++    return _m1b_normalize_axis(raw_axis, len(input_shape), context)
++
++
+ def _cast_target_dtype(operation: Operation, output_type: CoreType, context: str) -> str:
+     """Validate optional cast target attributes against the output CoreType."""
+ 
+@@ -534,6 +840,186 @@ def _validate_operation(operation: Operation, context: str) -> None:
+         if _is_tensor(output_type):
+             static_shape(output_type, context + ".output")
+         return
++    if name in ("reshape", "view"):
++        if len(inputs) != 1:
++            raise CpuScalarValidationError("{} {} requires one input".format(context, name))
++        input_type = inputs[0].type
++        output_type = _one_output(operation, name)
++        if not _is_tensor(input_type) or not _is_tensor(output_type):
++            raise CpuScalarUnsupportedError("{} {} only supports tensor values".format(context, name))
++        _validate_dtype(input_type, context + ".input")
++        _validate_dtype(output_type, context + ".output")
++        if canonical_dtype(input_type.dtype) != canonical_dtype(output_type.dtype):
++            raise CpuScalarValidationError("{} input and output dtypes must match".format(context))
++        input_shape = static_shape(input_type, context + ".input")
++        _m1b_reshape_shape(input_shape, output_type, _attrs(operation), context + ".{}".format(name))
++        # The upstream view API can also describe a partial memory view.  A
++        # portable scalar view has no target layout, so only a zero-offset,
++        # full-shape view is accepted; silently dropping offsets is unsafe.
++        if name == "view":
++            offsets = _m1b_attribute(_attrs(operation), ("offsets", "offset"), context + ".view")
++            valid_shape = _m1b_attribute(
++                _attrs(operation), ("valid_shape", "valid_shapes"), context + ".view"
++            )
++            if offsets is not None:
++                values = _m1b_int_sequence(offsets, context + ".view.offsets", allow_negative=False)
++                if len(values) != len(input_shape) or any(value != 0 for value in values):
++                    raise CpuScalarUnsupportedError(
++                        "{} view offsets are not portable; use a logical slice first".format(context)
++                    )
++            if valid_shape is not None:
++                values = _m1b_int_sequence(valid_shape, context + ".view.valid_shape", allow_negative=False)
++                if tuple(values) != static_shape(output_type, context + ".view.output"):
++                    raise CpuScalarUnsupportedError(
++                        "{} view valid_shape differs from output shape".format(context)
++                    )
++        return
++    if name == "transpose":
++        if len(inputs) != 1:
++            raise CpuScalarValidationError("{} transpose requires one input".format(context))
++        input_type = inputs[0].type
++        output_type = _one_output(operation, name)
++        if not _is_tensor(input_type) or not _is_tensor(output_type):
++            raise CpuScalarUnsupportedError("{} transpose only supports tensor values".format(context))
++        _validate_dtype(input_type, context + ".input")
++        _validate_dtype(output_type, context + ".output")
++        if canonical_dtype(input_type.dtype) != canonical_dtype(output_type.dtype):
++            raise CpuScalarValidationError("{} input and output dtypes must match".format(context))
++        input_shape = static_shape(input_type, context + ".input")
++        permutation = _m1b_permutation(input_shape, _attrs(operation), context + ".transpose")
++        expected_shape = tuple(input_shape[axis] for axis in permutation)
++        output_shape = static_shape(output_type, context + ".output")
++        if output_shape != expected_shape:
++            raise CpuScalarValidationError(
++                "{} output shape {} does not match permutation result {}".format(
++                    context, output_shape, expected_shape
++                )
++            )
++        return
++    if name == "contiguous":
++        if len(inputs) != 1:
++            raise CpuScalarValidationError("{} contiguous requires one input".format(context))
++        output_type = _one_output(operation, name)
++        _same_type(inputs[0].type, output_type, context + ".contiguous")
++        _validate_dtype(output_type, context + ".output")
++        if not _is_tensor(output_type):
++            raise CpuScalarUnsupportedError("{} contiguous only supports tensor values".format(context))
++        static_shape(output_type, context + ".output")
++        return
++    if name == "slice":
++        if len(inputs) != 1:
++            raise CpuScalarValidationError("{} slice requires one input".format(context))
++        input_type = inputs[0].type
++        output_type = _one_output(operation, name)
++        if not _is_tensor(input_type) or not _is_tensor(output_type):
++            raise CpuScalarUnsupportedError("{} slice only supports tensor values".format(context))
++        _validate_dtype(input_type, context + ".input")
++        _validate_dtype(output_type, context + ".output")
++        if canonical_dtype(input_type.dtype) != canonical_dtype(output_type.dtype):
++            raise CpuScalarValidationError("{} input and output dtypes must match".format(context))
++        input_shape = static_shape(input_type, context + ".input")
++        output_shape = static_shape(output_type, context + ".output")
++        spec = _m1b_slice_spec(input_shape, _attrs(operation), context + ".slice")
++        expected_shape = list(input_shape)
++        for axis, start, stop, step in spec:
++            expected_shape[axis] = max(0, (stop - start + step - 1) // step)
++        if output_shape != tuple(expected_shape):
++            raise CpuScalarValidationError(
++                "{} output shape {} does not match slice result {}".format(
++                    context, output_shape, tuple(expected_shape)
++                )
++            )
++        return
++    if name == "split":
++        if len(inputs) != 1:
++            raise CpuScalarValidationError("{} split requires one input".format(context))
++        input_type = inputs[0].type
++        if not _is_tensor(input_type):
++            raise CpuScalarUnsupportedError("{} split only supports tensor input".format(context))
++        _validate_dtype(input_type, context + ".input")
++        input_shape = static_shape(input_type, context + ".input")
++        for index, output in enumerate(operation.outputs):
++            if not _is_tensor(output.type):
++                raise CpuScalarUnsupportedError("{} split output {} must be a tensor".format(context, index))
++        _m1b_split_sizes(input_shape, tuple(output.type for output in operation.outputs), _attrs(operation), context + ".split")
++        if any(canonical_dtype(output.type.dtype) != canonical_dtype(input_type.dtype) for output in operation.outputs):
++            raise CpuScalarValidationError("{} split input and outputs must have one dtype".format(context))
++        return
++    if name == "concat":
++        if len(inputs) < 1:
++            raise CpuScalarValidationError("{} concat requires at least one input".format(context))
++        output_type = _one_output(operation, name)
++        if not _is_tensor(output_type) or not all(_is_tensor(ref.type) for ref in inputs):
++            raise CpuScalarUnsupportedError("{} concat only supports tensor values".format(context))
++        _validate_dtype(output_type, context + ".output")
++        input_shapes = []
++        input_dtype = None
++        for index, ref in enumerate(inputs):
++            _validate_dtype(ref.type, "{} input {}".format(context, index))
++            shape = static_shape(ref.type, "{} input {}".format(context, index))
++            input_shapes.append(shape)
++            dtype = canonical_dtype(ref.type.dtype)
++            if input_dtype is None:
++                input_dtype = dtype
++            elif dtype != input_dtype:
++                raise CpuScalarValidationError("{} concat inputs must have one dtype".format(context))
++            if len(shape) != len(input_shapes[0]):
++                raise CpuScalarValidationError("{} concat inputs must have one rank".format(context))
++        if canonical_dtype(output_type.dtype) != input_dtype:
++            raise CpuScalarValidationError("{} concat output dtype does not match inputs".format(context))
++        axis = _m1b_normalize_axis(
++            _m1b_attribute(_attrs(operation), ("axis", "dim"), context + ".concat", default=0),
++            len(input_shapes[0]),
++            context + ".concat",
++        )
++        expected_shape = list(input_shapes[0])
++        expected_shape[axis] = sum(shape[axis] for shape in input_shapes)
++        for shape in input_shapes[1:]:
++            for dimension, (left, right) in enumerate(zip(input_shapes[0], shape)):
++                if dimension != axis and left != right:
++                    raise CpuScalarValidationError(
++                        "{} input shape {} is incompatible with {} on axis {}".format(
++                            context, input_shapes[0], shape, dimension
++                        )
++                    )
++        if static_shape(output_type, context + ".output") != tuple(expected_shape):
++            raise CpuScalarValidationError(
++                "{} output shape {} does not match concat result {}".format(
++                    context, output_type.shape, tuple(expected_shape)
++                )
++            )
++        return
++    if name in ("gather", "embedding"):
++        if len(inputs) != 2:
++            raise CpuScalarValidationError("{} {} requires source and indices".format(context, name))
++        source_type, index_type = (ref.type for ref in inputs)
++        output_type = _one_output(operation, name)
++        if not _is_tensor(source_type) or not _is_tensor(index_type) or not _is_tensor(output_type):
++            raise CpuScalarUnsupportedError("{} {} only supports tensor values".format(context, name))
++        _validate_dtype(source_type, context + ".source")
++        _validate_dtype(index_type, context + ".indices")
++        _validate_dtype(output_type, context + ".output")
++        if canonical_dtype(index_type.dtype) not in INTEGER_DTYPES:
++            raise CpuScalarValidationError("{} indices must have an explicit integer dtype".format(context))
++        if canonical_dtype(source_type.dtype) != canonical_dtype(output_type.dtype):
++            raise CpuScalarValidationError("{} output dtype must match source dtype".format(context))
++        source_shape = static_shape(source_type, context + ".source")
++        index_shape = static_shape(index_type, context + ".indices")
++        if name == "embedding":
++            declared_axis = _m1b_attribute(_attrs(operation), ("axis", "dim"), context + ".embedding")
++            if declared_axis is not None and _m1b_normalize_axis(declared_axis, len(source_shape), context + ".embedding") != 0:
++                raise CpuScalarValidationError("{} embedding only supports axis=0".format(context))
++            axis = 0
++        else:
++            axis = _m1b_gather_axis(source_shape, _attrs(operation), context + ".gather")
++        expected_shape = source_shape[:axis] + index_shape + source_shape[axis + 1 :]
++        if static_shape(output_type, context + ".output") != expected_shape:
++            raise CpuScalarValidationError(
++                "{} output shape {} does not match gather result {}".format(
++                    context, output_type.shape, expected_shape
++                )
++            )
++        return
+     if name == "cast":
+         if len(inputs) != 1:
+             raise CpuScalarValidationError("{} cast requires one input".format(context))
+@@ -766,6 +1252,7 @@ __all__ = [
+     "element_count",
+     "flatten_values",
+     "FLOAT_DTYPES",
++    "INTEGER_DTYPES",
+     "lower",
+     "lower_cpu_scalar",
+     "reduced_shape",
+diff --git a/python/tests/ut/pypto_x/test_cpu_scalar_m1b.py b/python/tests/ut/pypto_x/test_cpu_scalar_m1b.py
+new file mode 100644
+index 000000000..f88fa4ad0
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cpu_scalar_m1b.py
+@@ -0,0 +1,376 @@
++"""M1B portable shape/layout semantics for the CPU scalar reference.
++
++Only the standard-library HostTensor ABI is used here.  The tests deliberately
++exercise the Core multi-result path for split instead of hiding outputs in a
++Python tuple value.
++"""
++
++from __future__ import annotations
++
++import sys
++import types
++from pathlib import Path
++
++import pytest
++
++
++def _imports():
++    package_root = Path(__file__).parents[3] / "pypto"
++    saved = {name: module for name, module in sys.modules.items() if name == "pypto" or name.startswith("pypto.")}
++    for name in list(saved):
++        del sys.modules[name]
++    package = types.ModuleType("pypto")
++    package.__path__ = [str(package_root)]
++    sys.modules["pypto"] = package
++    try:
++        from pypto.abi import LaunchRequest
++        from pypto.backends.cpu import CpuScalarRuntime, HostTensor
++        from pypto.compiler.targets.cpu import CpuScalarCompiler
++        from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++        from pypto.lowering.cpu import CpuScalarUnsupportedError, CpuScalarValidationError, canonical_operation_name
++        from pypto.target import TargetSpec
++        return locals()
++    finally:
++        for name in list(sys.modules):
++            if name == "pypto" or name.startswith("pypto."):
++                del sys.modules[name]
++        sys.modules.update(saved)
++
++
++_C = _imports()
++LaunchRequest = _C["LaunchRequest"]
++CpuScalarRuntime = _C["CpuScalarRuntime"]
++HostTensor = _C["HostTensor"]
++CpuScalarCompiler = _C["CpuScalarCompiler"]
++CoreFunction = _C["CoreFunction"]
++CoreProgram = _C["CoreProgram"]
++CoreType = _C["CoreType"]
++Operation = _C["Operation"]
++Region = _C["Region"]
++ValueRef = _C["ValueRef"]
++CpuScalarUnsupportedError = _C["CpuScalarUnsupportedError"]
++CpuScalarValidationError = _C["CpuScalarValidationError"]
++canonical_operation_name = _C["canonical_operation_name"]
++TargetSpec = _C["TargetSpec"]
++
++
++TARGET = TargetSpec("cpu", "x86_64-linux-gnu")
++
++
++def _program(name, parameters, returns, operations):
++    return CoreProgram(functions=(CoreFunction(name, parameters, returns, Region(tuple(operations))),))
++
++
++def _compile(program):
++    compiler = CpuScalarCompiler()
++    return compiler.compile(compiler.lower(program, TARGET))
++
++
++def _run(program, inputs, outputs):
++    if not isinstance(outputs, (list, tuple)):
++        outputs = (outputs,)
++    artifact = _compile(program)
++    return CpuScalarRuntime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[tensor.descriptor(readonly=True) for tensor in inputs],
++            outputs=[tensor.descriptor() for tensor in outputs],
++        )
++    )
++
++
++def test_m1b_aliases_are_explicit_and_stable():
++    aliases = {
++        "pypto.operation.reshape": "reshape",
++        "pypto.operation.view": "view",
++        "pypto.op.mutating.permute": "transpose",
++        "pypto.contiguous": "contiguous",
++        "pypto.op.indexing.slice": "slice",
++        "pypto.op.joining.split": "split",
++        "pypto.op.joining.concat": "concat",
++        "pypto.op.indexing.index_select": "gather",
++        "pypto.op.indexing.embedding": "embedding",
++    }
++    assert {key: canonical_operation_name(key) for key in aliases} == aliases
++    with pytest.raises(CpuScalarUnsupportedError):
++        canonical_operation_name("vendor.reshape_like")
++
++
++def test_reshape_and_view_preserve_row_major_sequence_and_infer_one_unknown():
++    source_type = CoreType.tensor("float32", (2, 3))
++    output_type = CoreType.tensor("float32", (3, 2))
++    source = ValueRef("source", source_type)
++    reshaped = ValueRef("reshaped", output_type)
++    program = _program(
++        "reshape",
++        (source,),
++        (reshaped,),
++        (Operation("reshape", (source,), (reshaped,), attributes={"shape": [-1, 2]}),),
++    )
++    output = HostTensor.zeros("float32", (3, 2))
++    _run(program, [HostTensor("float32", (2, 3), [[1, 2, 3], [4, 5, 6]])], output)
++    assert output.tolist() == [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]
++
++    viewed = ValueRef("viewed", CoreType.tensor("float32", (6,)))
++    view_program = _program(
++        "view",
++        (source,),
++        (viewed,),
++        (Operation("view", (source,), (viewed,), attributes={"shape": [-1]}),),
++    )
++    view_output = HostTensor.zeros("float32", (6,))
++    _run(view_program, [HostTensor("float32", (2, 3), [[1, 2, 3], [4, 5, 6]])], view_output)
++    assert view_output.flat() == (1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
++
++
++@pytest.mark.parametrize(
++    "attributes",
++    ({"shape": [4, 2]}, {"shape": [-1, -1]}, {"shape": [5, -1]}),
++)
++def test_reshape_rejects_element_count_or_inference_errors(attributes):
++    source_type = CoreType.tensor("float32", (2, 3))
++    output_type = CoreType.tensor("float32", (6,))
++    source = ValueRef("source", source_type)
++    output = ValueRef("output", output_type)
++    program = _program(
++        "bad_reshape",
++        (source,),
++        (output,),
++        (Operation("reshape", (source,), (output,), attributes=attributes),),
++    )
++    with pytest.raises(CpuScalarValidationError):
++        CpuScalarCompiler().lower(program, TARGET)
++
++
++def test_transpose_supports_permutation_negative_axes_and_contiguous_materializes():
++    source_type = CoreType.tensor("int32", (2, 3, 4))
++    transposed_type = CoreType.tensor("int32", (4, 2, 3))
++    source = ValueRef("source", source_type)
++    transposed = ValueRef("transposed", transposed_type)
++    program = _program(
++        "transpose",
++        (source,),
++        (transposed,),
++        (Operation("transpose", (source,), (transposed,), attributes={"permutation": [-1, 0, 1]}),),
++    )
++    values = list(range(24))
++    output = HostTensor.zeros("int32", (4, 2, 3))
++    _run(program, [HostTensor("int32", (2, 3, 4), values)], output)
++    assert output.tolist() == [
++        [[0, 4, 8], [12, 16, 20]],
++        [[1, 5, 9], [13, 17, 21]],
++        [[2, 6, 10], [14, 18, 22]],
++        [[3, 7, 11], [15, 19, 23]],
++    ]
++
++    dim0 = ValueRef("dim0", CoreType.tensor("int32", (2, 4, 3)))
++    dim_program = _program(
++        "transpose_dims",
++        (source,),
++        (dim0,),
++        (Operation("transpose", (source,), (dim0,), attributes={"dim0": -1, "dim1": -2}),),
++    )
++    dim_output = HostTensor.zeros("int32", (2, 4, 3))
++    _run(dim_program, [HostTensor("int32", (2, 3, 4), values)], dim_output)
++    assert dim_output.tolist() == [
++        [[0, 4, 8], [1, 5, 9], [2, 6, 10], [3, 7, 11]],
++        [[12, 16, 20], [13, 17, 21], [14, 18, 22], [15, 19, 23]],
++    ]
++
++    contiguous = ValueRef("contiguous", transposed_type)
++    contiguous_program = _program(
++        "contiguous",
++        (transposed,),
++        (contiguous,),
++        (Operation("contiguous", (transposed,), (contiguous,)),),
++    )
++    contiguous_output = HostTensor.zeros("int32", (4, 2, 3))
++    _run(contiguous_program, [output], contiguous_output)
++    assert contiguous_output.flat() == output.flat()
++
++
++def test_slice_handles_negative_bounds_positive_step_and_empty_output():
++    source_type = CoreType.tensor("int32", (2, 5))
++    output_type = CoreType.tensor("int32", (2, 2))
++    source = ValueRef("source", source_type)
++    output = ValueRef("output", output_type)
++    program = _program(
++        "slice",
++        (source,),
++        (output,),
++        (
++            Operation(
++                "slice",
++                (source,),
++                (output,),
++                attributes={"starts": [-4], "stops": [-1], "axes": [-1], "steps": [2]},
++            ),
++        ),
++    )
++    destination = HostTensor.zeros("int32", (2, 2))
++    _run(program, [HostTensor("int32", (2, 5), list(range(10)))], destination)
++    assert destination.tolist() == [[1, 3], [6, 8]]
++
++    empty_type = CoreType.tensor("int32", (2, 0))
++    empty = ValueRef("empty", empty_type)
++    empty_program = _program(
++        "slice_empty",
++        (source,),
++        (empty,),
++        (Operation("slice", (source,), (empty,), attributes={"starts": [4], "stops": [2], "axes": [1]}),),
++    )
++    empty_output = HostTensor.zeros("int32", (2, 0))
++    _run(empty_program, [HostTensor("int32", (2, 5), list(range(10)))], empty_output)
++    assert empty_output.flat() == ()
++
++
++@pytest.mark.parametrize(
++    "attributes",
++    (
++        {"starts": [0], "stops": [5], "steps": [0]},
++        {"starts": [-6], "stops": [2]},
++        {"starts": [0], "stops": [2], "axis": 0, "axes": [1]},
++    ),
++)
++def test_slice_rejects_zero_step_bounds_and_conflicting_attributes(attributes):
++    source_type = CoreType.tensor("int32", (2, 5))
++    output_type = CoreType.tensor("int32", (2, 2))
++    source = ValueRef("source", source_type)
++    output = ValueRef("output", output_type)
++    program = _program(
++        "bad_slice",
++        (source,),
++        (output,),
++        (Operation("slice", (source,), (output,), attributes=attributes),),
++    )
++    with pytest.raises((CpuScalarValidationError, CpuScalarUnsupportedError)):
++        CpuScalarCompiler().lower(program, TARGET)
++
++
++def test_split_uses_serializable_multi_output_operation_for_non_equal_sizes_and_negative_axis():
++    source_type = CoreType.tensor("int32", (2, 6))
++    left_type = CoreType.tensor("int32", (2, 2))
++    middle_type = CoreType.tensor("int32", (2, 1))
++    right_type = CoreType.tensor("int32", (2, 3))
++    source = ValueRef("source", source_type)
++    left = ValueRef("left", left_type)
++    middle = ValueRef("middle", middle_type)
++    right = ValueRef("right", right_type)
++    split = Operation(
++        "split",
++        (source,),
++        (left, middle, right),
++        attributes={"sizes": [2, 1, 3], "axis": -1},
++    )
++    program = _program("split", (source,), (left, middle, right), (split,))
++    assert program.to_dict()["functions"][0]["body"]["operations"][0]["outputs"]
++    outputs = [HostTensor.zeros("int32", shape) for shape in ((2, 2), (2, 1), (2, 3))]
++    _run(program, [HostTensor("int32", (2, 6), list(range(12)))], outputs)
++    assert outputs[0].tolist() == [[0, 1], [6, 7]]
++    assert outputs[1].tolist() == [[2], [8]]
++    assert outputs[2].tolist() == [[3, 4, 5], [9, 10, 11]]
++
++
++def test_concat_supports_variadic_negative_axis_and_zero_length_fragment():
++    first_type = CoreType.tensor("float32", (2, 0))
++    second_type = CoreType.tensor("float32", (2, 2))
++    third_type = CoreType.tensor("float32", (2, 1))
++    output_type = CoreType.tensor("float32", (2, 3))
++    first = ValueRef("first", first_type)
++    second = ValueRef("second", second_type)
++    third = ValueRef("third", third_type)
++    output = ValueRef("output", output_type)
++    program = _program(
++        "concat",
++        (first, second, third),
++        (output,),
++        (Operation("concat", (first, second, third), (output,), attributes={"axis": -1}),),
++    )
++    destination = HostTensor.zeros("float32", (2, 3))
++    _run(
++        program,
++        [
++            HostTensor.zeros("float32", (2, 0)),
++            HostTensor("float32", (2, 2), [[1, 2], [3, 4]]),
++            HostTensor("float32", (2, 1), [[5], [6]]),
++        ],
++        destination,
++    )
++    assert destination.tolist() == [[1.0, 2.0, 5.0], [3.0, 4.0, 6.0]]
++
++
++def test_gather_and_embedding_use_prefix_indices_suffix_shape_and_reject_negative_index():
++    source_type = CoreType.tensor("float32", (2, 3, 4))
++    indices_type = CoreType.tensor("int64", (2, 1))
++    output_type = CoreType.tensor("float32", (2, 2, 1, 4))
++    source = ValueRef("source", source_type)
++    indices = ValueRef("indices", indices_type)
++    output = ValueRef("output", output_type)
++    gather_program = _program(
++        "gather",
++        (source, indices),
++        (output,),
++        (Operation("gather", (source, indices), (output,), attributes={"axis": 1}),),
++    )
++    values = [float(index) for index in range(24)]
++    gathered = HostTensor.zeros("float32", (2, 2, 1, 4))
++    _run(gather_program, [HostTensor("float32", (2, 3, 4), values), HostTensor("int64", (2, 1), [[2], [0]])], gathered)
++    assert gathered.tolist() == [
++        [[[8.0, 9.0, 10.0, 11.0]], [[0.0, 1.0, 2.0, 3.0]]],
++        [[[20.0, 21.0, 22.0, 23.0]], [[12.0, 13.0, 14.0, 15.0]]],
++    ]
++
++    embedding_source_type = CoreType.tensor("float32", (4, 2))
++    embedding_indices_type = CoreType.tensor("int32", (2,))
++    embedding_output_type = CoreType.tensor("float32", (2, 2))
++    embedding_source = ValueRef("embedding_source", embedding_source_type)
++    embedding_indices = ValueRef("embedding_indices", embedding_indices_type)
++    embedding_output = ValueRef("embedding_output", embedding_output_type)
++    embedding_program = _program(
++        "embedding",
++        (embedding_source, embedding_indices),
++        (embedding_output,),
++        (Operation("embedding", (embedding_source, embedding_indices), (embedding_output,)),),
++    )
++    embedding = HostTensor.zeros("float32", (2, 2))
++    _run(
++        embedding_program,
++        [HostTensor("float32", (4, 2), list(range(8))), HostTensor("int32", (2,), [3, 1])],
++        embedding,
++    )
++    assert embedding.tolist() == [[6.0, 7.0], [2.0, 3.0]]
++
++    bad = HostTensor.zeros("float32", (2, 2, 1, 4))
++    with pytest.raises(RuntimeError, match="outside axis"):
++        _run(
++            gather_program,
++            [HostTensor("float32", (2, 3, 4), values), HostTensor("int64", (2, 1), [[-1], [0]])],
++            bad,
++        )
++
++
++def test_gather_rejects_non_integer_indices_and_embedding_nonzero_axis():
++    source_type = CoreType.tensor("float32", (4, 2))
++    index_type = CoreType.tensor("float32", (2,))
++    output_type = CoreType.tensor("float32", (2, 2))
++    source = ValueRef("source", source_type)
++    indices = ValueRef("indices", index_type)
++    output = ValueRef("output", output_type)
++    bad_gather = _program(
++        "bad_gather",
++        (source, indices),
++        (output,),
++        (Operation("gather", (source, indices), (output,)),),
++    )
++    with pytest.raises(CpuScalarValidationError, match="integer"):
++        CpuScalarCompiler().lower(bad_gather, TARGET)
++
++    int_indices = ValueRef("int_indices", CoreType.tensor("int32", (2,)))
++    bad_embedding = _program(
++        "bad_embedding",
++        (source, int_indices),
++        (output,),
++        (Operation("embedding", (source, int_indices), (output,), attributes={"axis": 1}),),
++    )
++    with pytest.raises(CpuScalarValidationError, match="axis=0"):
++        CpuScalarCompiler().lower(bad_embedding, TARGET)
+diff --git a/python/tests/ut/pypto_x/test_tensor_core_bridge.py b/python/tests/ut/pypto_x/test_tensor_core_bridge.py
+index 637f39cfe..46a9fcf0b 100644
+--- a/python/tests/ut/pypto_x/test_tensor_core_bridge.py
++++ b/python/tests/ut/pypto_x/test_tensor_core_bridge.py
+@@ -405,3 +405,58 @@ def test_operation_inputs_preserve_repeated_value_positions():
+     operation = next(operation for operation in program.functions[0].body.operations if operation.name == "add")
+     assert [ref.name for ref in operation.inputs] == ["%v1", "%v1"]
+     assert list(operation.attributes["args"]) == [{"value": "%v1"}, {"value": "%v1"}]
++
++
++def test_m1b_public_alias_lifts_shape_attributes_and_keeps_pure_effect():
++    input_type = CoreType.tensor("DT_FP32", (2, 3))
++    output_type = CoreType.tensor("DT_FP32", (3, 2))
++    parameter = FakeParameter("x", input_type, id=1)
++    loaded = FakeValue(2, input_type)
++    result = FakeValue(3, output_type)
++    body = FakeBlock(
++        id=0,
++        args=(),
++        calls=[
++            FakeCall(loaded, "pil.load", ("x",)),
++            FakeCall(result, "pypto.operation.reshape", (loaded, [-1, 2])),
++        ],
++        result=result,
++        jump="RETURN",
++    )
++    program = BRIDGE.export_pil_function(FakeFunction("reshape", body, parameters=(parameter,)))
++    assert program.verify() is True
++    operation = program.functions[0].body.operations[1]
++    assert operation.name == "reshape"
++    assert operation.effect is Effect.PURE
++    assert list(operation.attributes["shape"]) == [-1, 2]
++    assert operation.outputs[0].type == CoreType.tensor("float32", (3, 2))
++
++
++def test_m1b_split_bridge_has_serializable_multiple_outputs_and_pure_effect():
++    input_type = CoreType.tensor("DT_FP32", (2, 6))
++    left_type = CoreType.tensor("DT_FP32", (2, 2))
++    right_type = CoreType.tensor("DT_FP32", (2, 4))
++    parameter = FakeParameter("x", input_type, id=1)
++    loaded = FakeValue(2, input_type)
++    left = FakeValue(3, left_type)
++    right = FakeValue(4, right_type)
++    body = FakeBlock(
++        id=0,
++        args=(),
++        calls=[
++            FakeCall(loaded, "pil.load", ("x",)),
++            FakeCall((left, right), "pypto.op.joining.split", (loaded, [2, 4], -1)),
++        ],
++        result=(left, right),
++        jump="RETURN",
++    )
++    program = BRIDGE.export_pil_function(FakeFunction("split", body, parameters=(parameter,)))
++    assert program.verify() is True
++    operation = program.functions[0].body.operations[1]
++    assert operation.name == "split"
++    assert operation.effect is Effect.PURE
++    assert tuple(operation.attributes["sizes"]) == (2, 4)
++    assert operation.attributes["axis"] == -1
++    assert tuple(ref.name for ref in operation.outputs) == ("%v3", "%v4")
++    assert tuple(ref.name for ref in program.functions[0].returns) == ("%v3", "%v4")
++    assert "tuple" not in operation.name

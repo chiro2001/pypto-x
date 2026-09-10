@@ -1,0 +1,2148 @@
+From 7eff3a05649cb04c61f8a8456b25d562e5c9c1ca Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Wed, 9 Sep 2026 07:15:42 +0800
+Subject: [PATCH 68/96] feat(cuda): add driver api and ptx bootstrap
+
+---
+ python/pypto/backends/cuda/__init__.py          |  27 ++
+ python/pypto/backends/cuda/driver.py            | 462 +++++++++++++++++++++++++++
+ python/pypto/backends/cuda/runtime.py           | 468 ++++++++++++++++++++++++++++
+ python/pypto/compiler/targets/__init__.py       |  20 ++
+ python/pypto/compiler/targets/cuda.py           | 738 ++++++++++++++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_cuda_driver_ptx.py | 186 +++++++++++
+ scripts/smoke/cuda_driver_matrix_smoke.py       | 127 ++++++++
+ scripts/smoke/cuda_driver_smoke.py              |  46 +++
+ 8 files changed, 2074 insertions(+)
+
+diff --git a/python/pypto/backends/cuda/__init__.py b/python/pypto/backends/cuda/__init__.py
+new file mode 100644
+index 000000000..3235522f7
+--- /dev/null
++++ b/python/pypto/backends/cuda/__init__.py
+@@ -0,0 +1,27 @@
++"""CUDA Driver/PTX backend for PyPTO-X."""
++
++from .driver import (
++    CUDA_SUCCESS,
++    CudaContext,
++    CudaDeviceInfo,
++    CudaDriver,
++    CudaDriverError,
++    CudaDriverUnavailable,
++    CudaModule,
++)
++from .runtime import (
++    CudaArtifactError,
++    CudaBackend,
++    CudaDriverRuntime,
++    CudaExecutionError,
++    CudaRuntime,
++    CudaRuntimeError,
++    LoadedCudaArtifact,
++    launch,
++)
++
++__all__ = [
++    "CUDA_SUCCESS", "CudaArtifactError", "CudaBackend", "CudaContext", "CudaDeviceInfo", "CudaDriver",
++    "CudaDriverError", "CudaDriverRuntime", "CudaDriverUnavailable", "CudaExecutionError", "CudaModule",
++    "CudaRuntime", "CudaRuntimeError", "LoadedCudaArtifact", "launch",
++]
+diff --git a/python/pypto/backends/cuda/driver.py b/python/pypto/backends/cuda/driver.py
+new file mode 100644
+index 000000000..6e88141a1
+--- /dev/null
++++ b/python/pypto/backends/cuda/driver.py
+@@ -0,0 +1,462 @@
++"""Small CUDA Driver API adapter implemented without CUDA headers.
++
++The CUDA toolkit is deliberately not a dependency of PyPTO-X.  This module
++binds the stable Driver API through :mod:`ctypes`, which is sufficient for
++loading PTX, allocating/copying device memory, launching a kernel and
++synchronizing it.  The public classes are also intentionally easy to fake in
++unit tests: the higher-level runtime only relies on these small methods.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import ctypes.util
++from dataclasses import dataclass
++from typing import Any, Optional, Sequence
++
++
++CUDA_SUCCESS = 0
++
++# CU_JIT_* values are part of the Driver API enum.  We only use the log
++# buffers; no toolkit headers are needed to pass these numeric values.
++CU_JIT_INFO_LOG_BUFFER = 3
++CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES = 4
++CU_JIT_ERROR_LOG_BUFFER = 5
++CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES = 6
++
++
++class CudaDriverUnavailable(RuntimeError):
++    """The driver library or a required Driver API symbol is unavailable."""
++
++
++class CudaDriverError(RuntimeError):
++    """A CUDA Driver API call returned a non-zero ``CUresult``."""
++
++    def __init__(self, operation: str, code: int, name: str = "unknown", message: str = "") -> None:
++        self.operation = operation
++        self.code = int(code)
++        self.name = name or "unknown"
++        self.message = message or "unknown CUDA driver error"
++        super().__init__(
++            "{} failed with {} ({}): {}".format(operation, self.name, self.code, self.message)
++        )
++
++
++@dataclass(frozen=True)
++class CudaDeviceInfo:
++    """Stable device facts recorded in CUDA artifact metadata."""
++
++    index: int
++    name: str
++    major: int
++    minor: int
++    total_memory: int
++
++    @property
++    def compute_capability(self) -> str:
++        return "{}.{}".format(self.major, self.minor)
++
++    def to_dict(self):
++        return {
++            "index": self.index,
++            "name": self.name,
++            "compute_capability": self.compute_capability,
++            "major": self.major,
++            "minor": self.minor,
++            "total_memory": self.total_memory,
++        }
++
++
++def _as_int(value: Any) -> int:
++    if isinstance(value, ctypes._SimpleCData):  # type: ignore[attr-defined]
++        return int(value.value)
++    return int(value)
++
++
++def _as_ptr(value: Any) -> ctypes.c_void_p:
++    if isinstance(value, ctypes.c_void_p):
++        return value
++    if value is None:
++        return ctypes.c_void_p()
++    if hasattr(value, "value") and isinstance(value.value, int):
++        return ctypes.c_void_p(int(value.value))
++    return ctypes.c_void_p(int(value))
++
++
++class CudaModule:
++    """Loaded PTX module with its JIT diagnostics."""
++
++    def __init__(self, driver: "CudaDriver", handle: Any, info_log: str, error_log: str) -> None:
++        self.driver = driver
++        self.handle = handle
++        self.info_log = info_log
++        self.error_log = error_log
++        self._closed = False
++
++    def get_function(self, name: str) -> Any:
++        if self._closed:
++            raise CudaDriverError("cuModuleGetFunction", 1, "CUDA_ERROR_INVALID_HANDLE", "module is closed")
++        return self.driver.module_get_function(self.handle, name)
++
++    def close(self) -> None:
++        if not self._closed:
++            self.driver.module_unload(self.handle)
++            self._closed = True
++
++    def __enter__(self) -> "CudaModule":
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback) -> None:
++        self.close()
++
++
++class CudaContext:
++    """A Driver API context owned by :class:`CudaDriver`."""
++
++    def __init__(self, driver: "CudaDriver", handle: Any, device: int) -> None:
++        self.driver = driver
++        self.handle = handle
++        self.device = device
++        self._closed = False
++
++    def close(self) -> None:
++        if not self._closed:
++            self.driver.context_destroy(self.handle)
++            self._closed = True
++
++    def __enter__(self) -> "CudaContext":
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback) -> None:
++        self.close()
++
++
++class CudaDriver:
++    """Lazy, header-free binding for the subset of the CUDA Driver API used here."""
++
++    _LIBRARY_CANDIDATES = (
++        "libcuda.so.1",
++        "libcuda.so",
++        "/usr/lib/wsl/lib/libcuda.so.1",
++    )
++
++    _ERROR_NAMES = {
++        1: "CUDA_ERROR_INVALID_VALUE",
++        2: "CUDA_ERROR_OUT_OF_MEMORY",
++        3: "CUDA_ERROR_NOT_INITIALIZED",
++        4: "CUDA_ERROR_DEINITIALIZED",
++        100: "CUDA_ERROR_NO_DEVICE",
++        201: "CUDA_ERROR_INVALID_DEVICE",
++        218: "CUDA_ERROR_INVALID_PTX",
++        400: "CUDA_ERROR_INVALID_HANDLE",
++        500: "CUDA_ERROR_NOT_FOUND",
++        600: "CUDA_ERROR_LAUNCH_FAILED",
++        700: "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES",
++        718: "CUDA_ERROR_INVALID_IMAGE",
++        719: "CUDA_ERROR_LAUNCH_FAILED",
++        7000: "CUDA_ERROR_JIT_COMPILER_NOT_FOUND",
++    }
++
++    def __init__(self, library: Any = None, library_path: Optional[str] = None) -> None:
++        if library is None:
++            library = self._load_library(library_path)
++        self._lib = library
++        self._bind_symbols()
++        self._initialized = False
++        self._closed = False
++
++    @classmethod
++    def _load_library(cls, library_path: Optional[str]) -> Any:
++        candidates = []
++        if library_path:
++            candidates.append(library_path)
++        discovered = ctypes.util.find_library("cuda")
++        if discovered:
++            candidates.append(discovered)
++        candidates.extend(cls._LIBRARY_CANDIDATES)
++        errors = []
++        for candidate in candidates:
++            try:
++                return ctypes.CDLL(candidate)
++            except OSError as exc:
++                errors.append("{}: {}".format(candidate, exc))
++        raise CudaDriverUnavailable("CUDA Driver library is unavailable ({})".format("; ".join(errors)))
++
++    def _resolve(self, *names: str) -> Any:
++        for name in names:
++            symbol = getattr(self._lib, name, None)
++            if symbol is not None:
++                return symbol
++        raise CudaDriverUnavailable("CUDA Driver API symbol is unavailable: {}".format("/".join(names)))
++
++    def _bind(self, names: Sequence[str], restype: Any, argtypes: Sequence[Any]) -> Any:
++        symbol = self._resolve(*names)
++        try:
++            symbol.restype = restype
++            symbol.argtypes = list(argtypes)
++        except (AttributeError, TypeError):
++            # A deliberately small fake library need not expose ctypes
++            # function metadata.  Calls still work through the same adapter.
++            pass
++        return symbol
++
++    def _bind_symbols(self) -> None:
++        u32 = ctypes.c_uint
++        i32 = ctypes.c_int
++        u64 = ctypes.c_uint64
++        size_t = ctypes.c_size_t
++        ptr = ctypes.c_void_p
++        self._cuInit = self._bind(("cuInit",), i32, (u32,))
++        self._cuDeviceGet = self._bind(("cuDeviceGet",), i32, (ctypes.POINTER(i32), i32))
++        self._cuDeviceGetName = self._bind(
++            ("cuDeviceGetName",), i32, (ctypes.c_char_p, i32, i32)
++        )
++        self._cuDeviceComputeCapability = self._bind(
++            ("cuDeviceComputeCapability",), i32, (ctypes.POINTER(i32), ctypes.POINTER(i32), i32)
++        )
++        self._cuDeviceTotalMem = self._bind(
++            ("cuDeviceTotalMem_v2", "cuDeviceTotalMem"), i32, (ctypes.POINTER(size_t), i32)
++        )
++        self._cuCtxCreate = self._bind(
++            ("cuCtxCreate_v2", "cuCtxCreate"), i32, (ctypes.POINTER(ptr), u32, i32)
++        )
++        self._cuCtxDestroy = self._bind(("cuCtxDestroy_v2", "cuCtxDestroy"), i32, (ptr,))
++        self._cuCtxSynchronize = self._bind(("cuCtxSynchronize",), i32, ())
++        self._cuStreamSynchronize = self._bind(("cuStreamSynchronize",), i32, (ptr,))
++        self._cuModuleLoadDataEx = self._bind(
++            ("cuModuleLoadDataEx",),
++            i32,
++            (ctypes.POINTER(ptr), ptr, u32, ctypes.POINTER(u32), ctypes.POINTER(ptr)),
++        )
++        self._cuModuleUnload = self._bind(("cuModuleUnload",), i32, (ptr,))
++        self._cuModuleGetFunction = self._bind(
++            ("cuModuleGetFunction",), i32, (ctypes.POINTER(ptr), ptr, ctypes.c_char_p)
++        )
++        self._cuMemAlloc = self._bind(("cuMemAlloc_v2", "cuMemAlloc"), i32, (ctypes.POINTER(u64), size_t))
++        self._cuMemFree = self._bind(("cuMemFree_v2", "cuMemFree"), i32, (u64,))
++        self._cuMemcpyHtoD = self._bind(("cuMemcpyHtoD_v2", "cuMemcpyHtoD"), i32, (u64, ptr, size_t))
++        self._cuMemcpyDtoH = self._bind(("cuMemcpyDtoH_v2", "cuMemcpyDtoH"), i32, (ptr, u64, size_t))
++        self._cuLaunchKernel = self._bind(
++            ("cuLaunchKernel",),
++            i32,
++            (
++                ptr,
++                u32,
++                u32,
++                u32,
++                u32,
++                u32,
++                u32,
++                u32,
++                ptr,
++                ctypes.POINTER(ptr),
++                ptr,
++            ),
++        )
++        self._cuGetErrorName = self._bind(("cuGetErrorName",), i32, (i32, ctypes.POINTER(ctypes.c_char_p)))
++        self._cuGetErrorString = self._bind(
++            ("cuGetErrorString",), i32, (i32, ctypes.POINTER(ctypes.c_char_p))
++        )
++
++    def _check(self, operation: str, result: Any) -> None:
++        code = _as_int(result)
++        if code == CUDA_SUCCESS:
++            return
++        name = self._ERROR_NAMES.get(code, "CUDA_ERROR_{}".format(code))
++        message = "driver call returned error {}".format(code)
++        try:
++            name_ptr = ctypes.c_char_p()
++            if _as_int(self._cuGetErrorName(code, ctypes.byref(name_ptr))) == CUDA_SUCCESS and name_ptr.value:
++                name = name_ptr.value.decode("utf-8", "replace")
++            text_ptr = ctypes.c_char_p()
++            if _as_int(self._cuGetErrorString(code, ctypes.byref(text_ptr))) == CUDA_SUCCESS and text_ptr.value:
++                message = text_ptr.value.decode("utf-8", "replace")
++        except Exception:
++            pass
++        raise CudaDriverError(operation, code, name, message)
++
++    def init(self) -> None:
++        if not self._initialized:
++            self._check("cuInit", self._cuInit(0))
++            self._initialized = True
++
++    def device_get(self, index: int = 0) -> int:
++        self.init()
++        value = ctypes.c_int()
++        self._check("cuDeviceGet", self._cuDeviceGet(ctypes.byref(value), int(index)))
++        return int(value.value)
++
++    def device_info(self, index: int = 0) -> CudaDeviceInfo:
++        device = self.device_get(index)
++        name = ctypes.create_string_buffer(256)
++        self._check("cuDeviceGetName", self._cuDeviceGetName(name, len(name), device))
++        major = ctypes.c_int()
++        minor = ctypes.c_int()
++        self._check(
++            "cuDeviceComputeCapability",
++            self._cuDeviceComputeCapability(ctypes.byref(major), ctypes.byref(minor), device),
++        )
++        total = ctypes.c_size_t()
++        self._check("cuDeviceTotalMem", self._cuDeviceTotalMem(ctypes.byref(total), device))
++        return CudaDeviceInfo(
++            int(index), name.value.decode("utf-8", "replace"), int(major.value), int(minor.value), int(total.value)
++        )
++
++    def context_create(self, index: int = 0) -> CudaContext:
++        device = self.device_get(index)
++        handle = ctypes.c_void_p()
++        self._check("cuCtxCreate", self._cuCtxCreate(ctypes.byref(handle), 0, device))
++        return CudaContext(self, handle, int(index))
++
++    def context_destroy(self, handle: Any) -> None:
++        self._check("cuCtxDestroy", self._cuCtxDestroy(_as_ptr(handle)))
++
++    def context_synchronize(self) -> None:
++        self._check("cuCtxSynchronize", self._cuCtxSynchronize())
++
++    def stream_synchronize(self, stream: Any = None) -> None:
++        self._check("cuStreamSynchronize", self._cuStreamSynchronize(_as_ptr(stream)))
++
++    def module_load_data(self, ptx: str, *, log_bytes: int = 8192) -> CudaModule:
++        if not isinstance(ptx, str) or not ptx:
++            raise ValueError("PTX must be a non-empty string")
++        image = ctypes.create_string_buffer(ptx.encode("utf-8") + b"\0")
++        info = ctypes.create_string_buffer(max(256, int(log_bytes)))
++        error = ctypes.create_string_buffer(max(256, int(log_bytes)))
++        info_size = ctypes.c_uint(len(info))
++        error_size = ctypes.c_uint(len(error))
++        options = (ctypes.c_uint * 4)(
++            CU_JIT_INFO_LOG_BUFFER,
++            CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
++            CU_JIT_ERROR_LOG_BUFFER,
++        )
++        option_values = (ctypes.c_void_p * 4)()
++        option_values[0] = ctypes.cast(info, ctypes.c_void_p)
++        option_values[1] = ctypes.cast(ctypes.byref(info_size), ctypes.c_void_p)
++        option_values[2] = ctypes.cast(error, ctypes.c_void_p)
++        # The fourth slot is paired with the error-log option below.  Keeping
++        # the arrays explicit makes the ABI visible and avoids a toolkit.
++        options[3] = CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES
++        option_values[3] = ctypes.cast(ctypes.byref(error_size), ctypes.c_void_p)
++        handle = ctypes.c_void_p()
++        try:
++            result = self._cuModuleLoadDataEx(
++                ctypes.byref(handle),
++                ctypes.cast(image, ctypes.c_void_p),
++                len(options),
++                options,
++                option_values,
++            )
++            self._check("cuModuleLoadDataEx", result)
++        except CudaDriverError as exc:
++            jit_error = error.value.decode("utf-8", "replace").strip()
++            if jit_error:
++                raise CudaDriverError(
++                    exc.operation, exc.code, exc.name, "{}; JIT error log: {}".format(exc.message, jit_error)
++                ) from exc
++            raise
++        except Exception:
++            # The driver fills the error log even when module loading fails.
++            raise
++        return CudaModule(
++            self,
++            handle,
++            info.value.decode("utf-8", "replace"),
++            error.value.decode("utf-8", "replace"),
++        )
++
++    def module_unload(self, handle: Any) -> None:
++        self._check("cuModuleUnload", self._cuModuleUnload(_as_ptr(handle)))
++
++    def module_get_function(self, module: Any, name: str) -> Any:
++        if not isinstance(name, str) or not name:
++            raise ValueError("kernel name must be non-empty")
++        handle = ctypes.c_void_p()
++        self._check(
++            "cuModuleGetFunction",
++            self._cuModuleGetFunction(ctypes.byref(handle), _as_ptr(module), name.encode("utf-8")),
++        )
++        return handle
++
++    def mem_alloc(self, size: int) -> int:
++        size = max(1, int(size))
++        value = ctypes.c_uint64()
++        self._check("cuMemAlloc", self._cuMemAlloc(ctypes.byref(value), size))
++        return int(value.value)
++
++    def mem_free(self, pointer: Any) -> None:
++        self._check("cuMemFree", self._cuMemFree(ctypes.c_uint64(_as_int(pointer))))
++
++    def memcpy_htod(self, pointer: Any, data: bytes) -> None:
++        raw = bytes(data)
++        source = ctypes.create_string_buffer(raw if raw else b"\0")
++        self._check(
++            "cuMemcpyHtoD",
++            self._cuMemcpyHtoD(ctypes.c_uint64(_as_int(pointer)), ctypes.cast(source, ctypes.c_void_p), len(raw)),
++        )
++
++    def memcpy_dtoh(self, pointer: Any, size: int) -> bytes:
++        size = int(size)
++        destination = ctypes.create_string_buffer(max(1, size))
++        self._check(
++            "cuMemcpyDtoH",
++            self._cuMemcpyDtoH(ctypes.cast(destination, ctypes.c_void_p), ctypes.c_uint64(_as_int(pointer)), size),
++        )
++        return destination.raw[:size]
++
++    def launch_kernel(
++        self,
++        function: Any,
++        grid: Sequence[int],
++        block: Sequence[int],
++        parameters: Sequence[Any],
++        stream: Any = None,
++        shared_memory: int = 0,
++    ) -> None:
++        if len(grid) != 3 or len(block) != 3:
++            raise ValueError("CUDA launch grid and block must have three dimensions")
++        keepalive = []
++        values = (ctypes.c_void_p * len(parameters))()
++        for index, parameter in enumerate(parameters):
++            if isinstance(parameter, ctypes.c_void_p):
++                holder = parameter
++            elif isinstance(parameter, ctypes._SimpleCData):  # type: ignore[attr-defined]
++                holder = parameter
++            elif isinstance(parameter, float):
++                holder = ctypes.c_float(parameter)
++            else:
++                holder = ctypes.c_uint64(int(parameter))
++            keepalive.append(holder)
++            values[index] = ctypes.cast(ctypes.byref(holder), ctypes.c_void_p)
++        self._check(
++            "cuLaunchKernel",
++            self._cuLaunchKernel(
++                _as_ptr(function),
++                int(grid[0]), int(grid[1]), int(grid[2]),
++                int(block[0]), int(block[1]), int(block[2]),
++                int(shared_memory),
++                _as_ptr(stream),
++                values,
++                None,
++            ),
++        )
++
++    def close(self) -> None:
++        self._closed = True
++
++    def __enter__(self) -> "CudaDriver":
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback) -> None:
++        self.close()
++
++
++__all__ = [
++    "CUDA_SUCCESS",
++    "CudaContext",
++    "CudaDeviceInfo",
++    "CudaDriver",
++    "CudaDriverError",
++    "CudaDriverUnavailable",
++    "CudaModule",
++]
+diff --git a/python/pypto/backends/cuda/runtime.py b/python/pypto/backends/cuda/runtime.py
+new file mode 100644
+index 000000000..e8f7bece3
+--- /dev/null
++++ b/python/pypto/backends/cuda/runtime.py
+@@ -0,0 +1,468 @@
++"""CUDA Driver/PTX runtime for the initial PyPTO-X GPU common subset."""
++
++from __future__ import annotations
++
++import ctypes
++import struct
++from dataclasses import dataclass
++from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
++
++from pypto.abi import Availability, GpuLaunchRequest, LaunchRequest, TensorDesc
++from pypto.backends.cpu.tensor import FlatBuffer, HostTensor
++from pypto.compiler.artifact import Artifact
++from pypto.compiler.targets.cuda import (
++    CudaPtxArtifactError,
++    CudaProgram,
++    _decode_cuda_artifact,
++)
++from pypto.core_ir import CoreFunction, CoreType
++from pypto.lowering.cpu import canonical_dtype, element_count, flatten_values, static_shape
++
++from .driver import CudaContext, CudaDriver, CudaDriverError, CudaDriverUnavailable
++
++
++class CudaRuntimeError(RuntimeError):
++    """Base CUDA runtime error."""
++
++
++class CudaArtifactError(CudaRuntimeError):
++    """Artifact validation failed before any device work was attempted."""
++
++
++class CudaExecutionError(CudaRuntimeError):
++    """Request, memory, launch or result-copy failure."""
++
++
++@dataclass(frozen=True)
++class LoadedCudaArtifact:
++    artifact: Artifact
++    target_ir: CudaProgram
++    module: Any = None
++    jit_info_log: str = ""
++    jit_error_log: str = ""
++
++    @property
++    def program(self) -> CudaProgram:
++        return self.target_ir
++
++
++@dataclass
++class _Allocation:
++    pointer: int
++    size: int
++    owned: bool
++    host_storage: Any = None
++    dtype: Optional[str] = None
++    shape: Tuple[int, ...] = ()
++
++
++def _bf16_bits(value: Any) -> int:
++    raw = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++    upper = raw >> 16
++    lower = raw & 0xFFFF
++    if lower > 0x8000 or (lower == 0x8000 and (upper & 1)):
++        upper += 1
++    return upper & 0xFFFF
++
++
++def _pack(dtype: str, values: Sequence[Any]) -> bytes:
++    dtype = canonical_dtype(dtype)
++    if dtype == "float32":
++        return b"".join(struct.pack("<f", float(value)) for value in values)
++    if dtype == "bf16":
++        return b"".join(struct.pack("<H", _bf16_bits(value)) for value in values)
++    raise CudaExecutionError("CUDA bootstrap only supports float32 and bf16 host buffers")
++
++
++def _unpack(dtype: str, payload: bytes) -> list:
++    dtype = canonical_dtype(dtype)
++    if dtype == "float32":
++        if len(payload) % 4:
++            raise CudaExecutionError("float32 result byte count is not aligned")
++        return list(struct.unpack("<{}f".format(len(payload) // 4), payload)) if payload else []
++    if dtype == "bf16":
++        if len(payload) % 2:
++            raise CudaExecutionError("bf16 result byte count is not aligned")
++        result = []
++        for index in range(0, len(payload), 2):
++            bits = struct.unpack_from("<H", payload, index)[0]
++            result.append(struct.unpack("<f", struct.pack("<I", bits << 16))[0])
++        return result
++    raise CudaExecutionError("CUDA bootstrap only supports float32 and bf16 result buffers")
++
++
++def _itemsize(dtype: str) -> int:
++    dtype = canonical_dtype(dtype)
++    if dtype == "float32":
++        return 4
++    if dtype == "bf16":
++        return 2
++    raise CudaExecutionError("unsupported CUDA dtype {!r}".format(dtype))
++
++
++def _is_tensor(value_type: CoreType) -> bool:
++    return value_type.kind in ("tensor", "view", "tile")
++
++
++def _is_scalar(value_type: CoreType) -> bool:
++    return value_type.kind == "scalar"
++
++
++def _pointer(value: Any) -> Optional[int]:
++    if isinstance(value, bool):
++        return None
++    if isinstance(value, int):
++        return int(value) if value else None
++    if isinstance(value, ctypes.c_void_p):
++        return int(value.value) if value.value else None
++    if hasattr(value, "value") and isinstance(value.value, int):
++        return int(value.value) if value.value else None
++    return None
++
++
++def _storage(desc: TensorDesc) -> Any:
++    return desc.address if desc.address is not None else desc.handle
++
++
++def _host_values(storage: Any) -> list:
++    if isinstance(storage, HostTensor):
++        return list(storage.data)
++    if isinstance(storage, FlatBuffer):
++        return list(storage.data)
++    if isinstance(storage, (str, bytes, bytearray, Mapping)) or storage is None:
++        raise CudaExecutionError("host tensor storage must be a flat numeric sequence")
++    if isinstance(storage, (list, tuple)):
++        return list(flatten_values(storage))
++    if hasattr(storage, "data") and isinstance(storage.data, (list, tuple)):
++        return list(storage.data)
++    try:
++        return [storage[index] for index in range(len(storage))]
++    except (TypeError, IndexError, KeyError, AttributeError) as exc:
++        raise CudaExecutionError("host tensor storage does not support flat sequence access") from exc
++
++
++def _write_host(storage: Any, values: Sequence[Any], expected: int) -> None:
++    if isinstance(storage, HostTensor):
++        destination = storage.data
++    elif isinstance(storage, FlatBuffer):
++        destination = storage.data
++    elif isinstance(storage, list):
++        destination = storage
++    elif hasattr(storage, "data") and isinstance(storage.data, list):
++        destination = storage.data
++    else:
++        destination = storage
++    try:
++        if len(destination) != expected:
++            raise CudaExecutionError("host output storage length does not match tensor shape")
++        for index, value in enumerate(values):
++            destination[index] = value
++    except (TypeError, IndexError, AttributeError) as exc:
++        raise CudaExecutionError("host output storage is not mutable") from exc
++
++
++def _find_function(program: CudaProgram, name: str) -> CoreFunction:
++    for function in program.program.functions:
++        if function.name == name:
++            return function
++    raise CudaExecutionError("CUDA entrypoint {!r} is not present".format(name))
++
++
++def _as_gpu_request(request: Any, target_ir: CudaProgram) -> GpuLaunchRequest:
++    if isinstance(request, GpuLaunchRequest):
++        return request
++    if not isinstance(request, LaunchRequest):
++        raise CudaExecutionError("CUDA launch requires GpuLaunchRequest or LaunchRequest")
++    return GpuLaunchRequest(
++        request.artifact,
++        geometries=tuple(plan.geometry for plan in target_ir.gpu_program.plans),
++        inputs=request.inputs,
++        outputs=request.outputs,
++        scalars=request.scalars,
++        workspace=request.workspace,
++        stream_handle=request.stream_handle,
++    )
++
++
++def _validate_request(request: GpuLaunchRequest, target_ir: CudaProgram, function: CoreFunction) -> None:
++    try:
++        request.validate()
++    except Exception as exc:
++        raise CudaExecutionError("invalid CUDA launch request: {}".format(exc)) from exc
++    if request.artifact.target != target_ir.target:
++        raise CudaExecutionError("CUDA launch target does not match artifact")
++    if len(request.geometries) != len(target_ir.gpu_program.plans):
++        raise CudaExecutionError("CUDA geometry sequence does not match artifact plan count")
++    for index, (actual, plan) in enumerate(zip(request.geometries, target_ir.gpu_program.plans)):
++        if actual.to_dict() != plan.geometry.to_dict():
++            raise CudaExecutionError("CUDA geometry at operation {} does not match artifact".format(index))
++    for index, descriptor in enumerate(request.inputs + request.outputs):
++        if descriptor.device not in ("gpu", "device"):
++            raise CudaExecutionError("CUDA tensor descriptor {} must use device='gpu'".format(index))
++        if descriptor.strides != _contiguous_strides(descriptor.shape):
++            raise CudaExecutionError("CUDA bootstrap requires contiguous tensor descriptors")
++    tensor_parameters = [ref for ref in function.parameters if _is_tensor(ref.type)]
++    tensor_returns = [ref for ref in function.returns if _is_tensor(ref.type)]
++    if len(request.inputs) != len(tensor_parameters) or len(request.outputs) != len(tensor_returns):
++        raise CudaExecutionError("CUDA tensor argument count does not match Core IR")
++    for descriptor, ref in zip(request.inputs, tensor_parameters):
++        if canonical_dtype(descriptor.dtype) != canonical_dtype(ref.type.dtype) or descriptor.shape != static_shape(ref.type, ref.name):
++            raise CudaExecutionError("CUDA input descriptor does not match {!r}".format(ref.name))
++    for descriptor, ref in zip(request.outputs, tensor_returns):
++        if canonical_dtype(descriptor.dtype) != canonical_dtype(ref.type.dtype) or descriptor.shape != static_shape(ref.type, ref.name):
++            raise CudaExecutionError("CUDA output descriptor does not match {!r}".format(ref.name))
++
++
++def _contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
++    result = [1] * len(shape)
++    running = 1
++    for index in range(len(shape) - 1, -1, -1):
++        result[index] = running
++        running *= int(shape[index])
++    return tuple(result)
++
++
++class CudaRuntime:
++    """Driver API runtime for deterministic PTX artifacts."""
++
++    name = "cuda.ptx"
++
++    def __init__(self, driver: Any = None, device_index: int = 0) -> None:
++        self.device_index = int(device_index)
++        self._driver_error: Optional[str] = None
++        if driver is not None:
++            self.driver = driver
++        else:
++            try:
++                self.driver = CudaDriver()
++            except CudaDriverUnavailable as exc:
++                self.driver = None
++                self._driver_error = str(exc)
++        self._context: Optional[CudaContext] = None
++        self.last_jit_info_log = ""
++        self.last_jit_error_log = ""
++
++    def availability(self) -> Availability:
++        if self.driver is None:
++            return Availability.no(self.name, self._driver_error or "CUDA Driver API unavailable", "missing_driver")
++        try:
++            info = self.driver.device_info(self.device_index)
++            details = info.to_dict() if hasattr(info, "to_dict") else info
++            return Availability(True, self.name, details=details)
++        except Exception as exc:
++            return Availability.no(self.name, str(exc), "device_unavailable")
++
++    def is_available(self) -> bool:
++        return self.availability().available
++
++    def _ensure_context(self) -> Any:
++        if self.driver is None:
++            raise CudaExecutionError(self._driver_error or "CUDA Driver API unavailable")
++        if self._context is None:
++            try:
++                self._context = self.driver.context_create(self.device_index)
++            except Exception as exc:
++                raise CudaExecutionError("CUDA context creation failed: {}".format(exc)) from exc
++        return self._context
++
++    def load(self, artifact: Artifact) -> LoadedCudaArtifact:
++        try:
++            target_ir = _decode_cuda_artifact(artifact)
++        except CudaPtxArtifactError as exc:
++            raise CudaArtifactError(str(exc)) from exc
++        except Exception as exc:
++            raise CudaArtifactError("CUDA artifact validation failed: {}".format(exc)) from exc
++        return LoadedCudaArtifact(artifact, target_ir)
++
++    def workspace_size(self, request: Any) -> int:
++        if not isinstance(request, (LaunchRequest, GpuLaunchRequest)):
++            raise CudaExecutionError("CUDA workspace_size requires a launch request")
++        loaded = self.load(request.artifact)
++        del loaded
++        return 0
++
++    def launch(self, request: Any) -> Tuple[Any, ...]:
++        loaded = self.load(request.artifact if isinstance(request, (LaunchRequest, GpuLaunchRequest)) else None)
++        gpu_request = _as_gpu_request(request, loaded.target_ir)
++        function = _find_function(loaded.target_ir, loaded.target_ir.entrypoint)
++        _validate_request(gpu_request, loaded.target_ir, function)
++        context = self._ensure_context()
++        module = None
++        allocations = []
++        values: Dict[str, Any] = {}
++        scalar_values: Dict[str, Any] = {}
++        output_allocations: Dict[str, _Allocation] = {}
++        try:
++            module = self.driver.module_load_data(loaded.target_ir.ptx)
++            self.last_jit_info_log = getattr(module, "info_log", "")
++            self.last_jit_error_log = getattr(module, "error_log", "")
++            input_index = 0
++            for ref in function.parameters:
++                if _is_tensor(ref.type):
++                    descriptor = gpu_request.inputs[input_index]
++                    values[ref.name] = self._prepare_input(descriptor, ref.type, allocations)
++                    input_index += 1
++                elif _is_scalar(ref.type):
++                    if ref.name not in gpu_request.scalars:
++                        raise CudaExecutionError("missing CUDA scalar input {!r}".format(ref.name))
++                    scalar_values[ref.name] = gpu_request.scalars[ref.name]
++                else:
++                    raise CudaExecutionError("unsupported CUDA parameter kind {!r}".format(ref.type.kind))
++            tensor_return_index = 0
++            return_names = set(ref.name for ref in function.returns)
++            return_descriptors = {}
++            for ref in function.returns:
++                if _is_tensor(ref.type):
++                    return_descriptors[ref.name] = gpu_request.outputs[tensor_return_index]
++                    tensor_return_index += 1
++            for index, operation in enumerate(function.body.operations):
++                output = operation.outputs[0]
++                if _is_tensor(output.type):
++                    if output.name in return_names:
++                        allocation = self._prepare_output(
++                            return_descriptors[output.name], output.type, allocations
++                        )
++                        output_allocations[output.name] = allocation
++                    else:
++                        allocation = self._allocate_for_type(output.type, allocations)
++                    values[output.name] = allocation.pointer
++                elif _is_scalar(output.type):
++                    allocation = self._allocate_for_type(output.type, allocations)
++                    values[output.name] = allocation.pointer
++                else:
++                    raise CudaExecutionError("unsupported CUDA operation output kind {!r}".format(output.type.kind))
++                function_handle = module.get_function("px_op{}".format(index))
++                parameters = []
++                for ref in operation.inputs:
++                    if _is_tensor(ref.type):
++                        parameters.append(values[ref.name])
++                    elif _is_scalar(ref.type):
++                        parameters.append(self._scalar_parameter(scalar_values.get(ref.name, values.get(ref.name)), ref.type))
++                    else:
++                        raise CudaExecutionError("unsupported CUDA operation input kind {!r}".format(ref.type.kind))
++                if _is_tensor(output.type) or _is_scalar(output.type):
++                    parameters.append(values[output.name])
++                plan = loaded.target_ir.gpu_program.plans[index]
++                self.driver.launch_kernel(
++                    function_handle,
++                    plan.geometry.grid.dims,
++                    plan.geometry.workgroup.dims,
++                    parameters,
++                    gpu_request.stream_handle,
++                    plan.geometry.dynamic_workgroup_memory_bytes,
++                )
++            if gpu_request.stream_handle is not None and hasattr(self.driver, "stream_synchronize"):
++                self.driver.stream_synchronize(gpu_request.stream_handle)
++            else:
++                self.driver.context_synchronize()
++            results = []
++            tensor_return_index = 0
++            for ref in function.returns:
++                allocation = _allocation_for_name(ref.name, values, output_allocations, allocations)
++                if _is_tensor(ref.type):
++                    descriptor = gpu_request.outputs[tensor_return_index]
++                    if _pointer(_storage(descriptor)) is None:
++                        size = element_count(static_shape(ref.type, ref.name)) * _itemsize(ref.type.dtype)
++                        raw = self.driver.memcpy_dtoh(allocation.pointer, size) if size else b""
++                        _write_host(_storage(descriptor), _unpack(ref.type.dtype, raw), element_count(static_shape(ref.type, ref.name)))
++                    results.append(_storage(descriptor))
++                    tensor_return_index += 1
++                elif _is_scalar(ref.type):
++                    size = _itemsize(ref.type.dtype)
++                    raw = self.driver.memcpy_dtoh(allocation.pointer, size)
++                    unpacked = _unpack(ref.type.dtype, raw)
++                    results.append(unpacked[0] if unpacked else 0.0)
++            return tuple(results)
++        except (CudaRuntimeError, CudaDriverError):
++            raise
++        except Exception as exc:
++            raise CudaExecutionError("CUDA launch failed: {}".format(exc)) from exc
++        finally:
++            if module is not None:
++                try:
++                    module.close()
++                except Exception:
++                    pass
++            for allocation in reversed(allocations):
++                if allocation.owned:
++                    try:
++                        self.driver.mem_free(allocation.pointer)
++                    except Exception:
++                        pass
++
++    def _prepare_input(self, descriptor: TensorDesc, value_type: CoreType, allocations: list) -> int:
++        pointer = _pointer(_storage(descriptor))
++        if pointer is not None:
++            return pointer
++        shape = static_shape(value_type, value_type.kind)
++        values = _host_values(_storage(descriptor))
++        expected = element_count(shape)
++        if len(values) != expected:
++            raise CudaExecutionError("CUDA input storage length does not match shape")
++        size = expected * _itemsize(value_type.dtype)
++        pointer = self.driver.mem_alloc(size)
++        allocation = _Allocation(pointer, size, True)
++        allocations.append(allocation)
++        self.driver.memcpy_htod(pointer, _pack(value_type.dtype, values))
++        return pointer
++
++    def _prepare_output(self, descriptor: TensorDesc, value_type: CoreType, allocations: list) -> _Allocation:
++        pointer = _pointer(_storage(descriptor))
++        if pointer is not None:
++            return _Allocation(pointer, element_count(static_shape(value_type, value_type.kind)) * _itemsize(value_type.dtype), False)
++        return self._allocate_for_type(value_type, allocations, _storage(descriptor))
++
++    def _allocate_for_type(self, value_type: CoreType, allocations: list, host_storage: Any = None) -> _Allocation:
++        shape = static_shape(value_type, value_type.kind)
++        size = element_count(shape) * _itemsize(value_type.dtype)
++        pointer = self.driver.mem_alloc(size)
++        allocation = _Allocation(pointer, size, True, host_storage, canonical_dtype(value_type.dtype), shape)
++        allocations.append(allocation)
++        return allocation
++
++    @staticmethod
++    def _scalar_parameter(value: Any, value_type: CoreType) -> Any:
++        dtype = canonical_dtype(value_type.dtype)
++        if dtype in ("float32", "bf16", "float16"):
++            return ctypes.c_float(float(value))
++        return ctypes.c_uint64(int(value))
++
++    def close(self) -> None:
++        if self._context is not None:
++            try:
++                self._context.close()
++            finally:
++                self._context = None
++
++    def __enter__(self) -> "CudaRuntime":
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback) -> None:
++        self.close()
++
++
++def _allocation_for_name(name: str, values: Mapping[str, Any], output_allocations: Mapping[str, _Allocation], allocations: Sequence[_Allocation]) -> _Allocation:
++    allocation = output_allocations.get(name)
++    if allocation is not None:
++        return allocation
++    pointer = _pointer(values.get(name))
++    if pointer is None:
++        raise CudaExecutionError("CUDA return value {!r} has no device allocation".format(name))
++    for candidate in allocations:
++        if candidate.pointer == pointer:
++            return candidate
++    return _Allocation(pointer, 0, False)
++
++
++CudaBackend = CudaRuntime
++CudaDriverRuntime = CudaRuntime
++
++
++def launch(request: Any) -> Tuple[Any, ...]:
++    return CudaRuntime().launch(request)
++
++
++__all__ = [
++    "CudaArtifactError", "CudaBackend", "CudaDriverRuntime", "CudaExecutionError", "CudaRuntime",
++    "CudaRuntimeError", "LoadedCudaArtifact", "launch",
++]
+diff --git a/python/pypto/compiler/targets/__init__.py b/python/pypto/compiler/targets/__init__.py
+index a7f74b5d7..c8ffeb119 100644
+--- a/python/pypto/compiler/targets/__init__.py
++++ b/python/pypto/compiler/targets/__init__.py
+@@ -15,6 +15,17 @@ from .gpu import (
+     GpuCompiler,
+     compile_gpu_common,
+ )
++from .cuda import (
++    CUDACompiler,
++    CudaCompiler,
++    CudaPtxArtifactError,
++    CudaPtxCompiler,
++    CudaPtxError,
++    CudaPtxUnsupportedError,
++    CudaProgram,
++    compile_cuda_ptx,
++    render_ptx,
++)
+ 
+ __all__ = [
+     "CPUSVE256Compiler",
+@@ -28,4 +39,13 @@ __all__ = [
+     "GpuCommonCompiler",
+     "GpuCompiler",
+     "compile_gpu_common",
++    "CUDACompiler",
++    "CudaCompiler",
++    "CudaPtxArtifactError",
++    "CudaPtxCompiler",
++    "CudaPtxError",
++    "CudaPtxUnsupportedError",
++    "CudaProgram",
++    "compile_cuda_ptx",
++    "render_ptx",
+ ]
+diff --git a/python/pypto/compiler/targets/cuda.py b/python/pypto/compiler/targets/cuda.py
+new file mode 100644
+index 000000000..d0623618e
+--- /dev/null
++++ b/python/pypto/compiler/targets/cuda.py
+@@ -0,0 +1,738 @@
++"""Header-free CUDA/PTX target adapter for the GPU common plans.
++
++The common GPU lowering remains vendor-neutral.  This module consumes its
++validated plans and emits a deliberately boring PTX correctness kernel for
++each Core IR operation.  The PTX target is configurable (``sm_80`` is the
++conservative default for BF16-capable forward JIT) and the actual device
++compute capability is metadata supplied by the Driver API at compile/probe
++time; no ``sm_120`` syntax is invented here.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++import struct
++from dataclasses import dataclass
++from typing import Any, Mapping, Optional, Sequence, Tuple
++
++from pypto.compiler.api import CompileOptions
++from pypto.compiler.artifact import ABI_VERSION, Artifact
++from pypto.core_ir import CoreProgram, CoreType, Operation, ValueRef
++from pypto.lowering.cpu import canonical_dtype, flatten_values
++from pypto.lowering.gpu import (
++    GPU_COMMON_BACKEND,
++    GPU_IR_VERSION,
++    GPU_LOWERING_VERSION,
++    GPU_PLAN_VERSION,
++    GpuProgram,
++    lower_gpu_common,
++)
++from pypto.target import TargetSpec
++from pypto.target._utils import frozen_mapping, mapping_copy, sha256_text
++
++
++ARTIFACT_PAYLOAD_VERSION = 1
++CUDA_ARTIFACT_FORMAT = "pypto-x.cuda.ptx"
++DEFAULT_ARTIFACT_FORMAT = CUDA_ARTIFACT_FORMAT
++CUDA_BACKEND = "cuda.ptx"
++CUDA_PTX_VERSION = "8.0"
++DEFAULT_PTX_TARGET = "sm_80"
++CUDA_LOWERING_VERSION = 1
++_PTX_TARGET_RE = re.compile(r"^sm_[0-9]+$")
++
++
++class CudaPtxError(ValueError):
++    """Base error for CUDA target lowering and artifact validation."""
++
++
++class CudaPtxUnsupportedError(CudaPtxError):
++    """A common GPU operation that this initial CUDA adapter cannot emit."""
++
++
++class CudaPtxArtifactError(CudaPtxError):
++    """Malformed, tampered or incompatible CUDA/PTX artifact."""
++
++
++def _plain(value: Any) -> Any:
++    if isinstance(value, Mapping):
++        return {key: _plain(item) for key, item in value.items()}
++    if isinstance(value, (tuple, list)):
++        return [_plain(item) for item in value]
++    return value
++
++
++def _shape_count(shape: Sequence[int]) -> int:
++    result = 1
++    for dimension in shape:
++        result *= int(dimension)
++    return result
++
++
++def _f32_bits(value: Any) -> int:
++    raw = struct.pack("<f", float(value))
++    return struct.unpack("<I", raw)[0]
++
++
++def _f32_literal(value: Any) -> str:
++    return "0f{:08X}".format(_f32_bits(value))
++
++
++def _u64(value: int) -> str:
++    return str(int(value))
++
++
++def _dtype_itemsize(dtype: str) -> int:
++    dtype = canonical_dtype(dtype)
++    if dtype in ("float32", "int32", "uint32"):
++        return 4
++    if dtype in ("bf16", "float16", "int16", "uint16"):
++        return 2
++    if dtype in ("int8", "uint8", "bool"):
++        return 1
++    if dtype in ("int64", "uint64", "float64"):
++        return 8
++    raise CudaPtxUnsupportedError("CUDA PTX adapter does not support dtype {!r}".format(dtype))
++
++
++def _is_tensor(value_type: CoreType) -> bool:
++    return value_type.kind in ("tensor", "view", "tile")
++
++
++def _is_scalar(value_type: CoreType) -> bool:
++    return value_type.kind == "scalar"
++
++
++def _operation_bindings(operation: Operation) -> Tuple[Mapping[str, Any], ...]:
++    bindings = []
++    for ref in operation.inputs:
++        bindings.append(
++            {
++                "name": ref.name,
++                "kind": "tensor" if _is_tensor(ref.type) else "scalar",
++                "dtype": canonical_dtype(ref.type.dtype),
++                "role": "input",
++            }
++        )
++    output = operation.outputs[0]
++    bindings.append(
++        {
++            "name": output.name,
++            "kind": "tensor" if _is_tensor(output.type) else "scalar",
++            "dtype": canonical_dtype(output.type.dtype),
++            "role": "output",
++        }
++    )
++    return tuple(bindings)
++
++
++def _all_bindings(program: GpuProgram) -> Tuple[Tuple[Mapping[str, Any], ...], ...]:
++    function = next(function for function in program.program.functions if function.name == program.entrypoint)
++    return tuple(_operation_bindings(operation) for operation in function.body.operations)
++
++
++class _Kernel:
++    def __init__(self, index: int, operation: Operation, plan: Any) -> None:
++        self.index = index
++        self.operation = operation
++        self.plan = plan
++        self.lines = []
++        self.label_counter = 0
++
++    def line(self, text: str = "") -> None:
++        self.lines.append(text)
++
++    def label(self, prefix: str) -> str:
++        value = "{}_{}".format(prefix, self.label_counter)
++        self.label_counter += 1
++        return value
++
++    @property
++    def output(self) -> ValueRef:
++        return self.operation.outputs[0]
++
++    def param_declarations(self) -> Tuple[str, ...]:
++        declarations = []
++        for index, ref in enumerate(self.operation.inputs):
++            if _is_tensor(ref.type):
++                declarations.append("    .param .u64 p{}".format(index))
++            elif _is_scalar(ref.type):
++                dtype = canonical_dtype(ref.type.dtype)
++                if dtype == "bf16":
++                    declarations.append("    .param .b16 p{}".format(index))
++                elif dtype in ("float32", "float16"):
++                    declarations.append("    .param .f32 p{}".format(index))
++                else:
++                    declarations.append("    .param .u64 p{}".format(index))
++            else:
++                raise CudaPtxUnsupportedError("unsupported kernel parameter kind {!r}".format(ref.type.kind))
++        # Every operation result is written through a device pointer, even
++        # when the Core IR result is a scalar.
++        declarations.append("    .param .u64 p{}".format(len(self.operation.inputs)))
++        return tuple(declarations)
++
++    def preamble(self) -> None:
++        self.line("    .reg .pred %p<16>;")
++        self.line("    .reg .b32 %r<16>;")
++        self.line("    .reg .b64 %rd<64>;")
++        self.line("    .reg .f32 %f<32>;")
++        self.line("    .reg .b16 %rs<8>;")
++
++    def u64_special(self, target: int, special: str, temp: int) -> None:
++        self.line("    mov.u32 %r{}, %{};".format(temp, special))
++        self.line("    cvt.u64.u32 %rd{}, %r{};".format(target, temp,))
++
++    def linear_thread_index(self) -> None:
++        # A logical GPU common workgroup may be 1-, 2- or 3-dimensional.  Use
++        # compile-time launch extents for the flattening.  This avoids relying
++        # on optional grid-dimension special registers in conservative PTX
++        # accepted by older forward-JIT paths.
++        self.u64_special(1, "ctaid.x", 0)
++        self.u64_special(2, "ctaid.y", 1)
++        self.u64_special(3, "ctaid.z", 2)
++        self.u64_special(8, "tid.x", 3)
++        self.u64_special(9, "tid.y", 4)
++        self.u64_special(10, "tid.z", 5)
++        grid = self.plan.geometry.grid
++        workgroup = self.plan.geometry.workgroup
++        self.line("    mov.u64 %rd11, {};".format(grid.y))
++        self.line("    mul.lo.u64 %rd11, %rd3, %rd11;")
++        self.line("    add.u64 %rd11, %rd11, %rd2;")
++        self.line("    mov.u64 %rd12, {};".format(grid.x))
++        self.line("    mul.lo.u64 %rd11, %rd11, %rd12;")
++        self.line("    add.u64 %rd11, %rd11, %rd1;")
++        self.line("    mov.u64 %rd12, {};".format(workgroup.count))
++        self.line("    mul.lo.u64 %rd11, %rd11, %rd12;")
++        self.line("    mov.u64 %rd12, {};".format(workgroup.x))
++        self.line("    mul.lo.u64 %rd13, %rd9, %rd12;")
++        self.line("    add.u64 %rd13, %rd13, %rd8;")
++        self.line("    mov.u64 %rd12, {};".format(workgroup.x * workgroup.y))
++        self.line("    mul.lo.u64 %rd14, %rd10, %rd12;")
++        self.line("    add.u64 %rd13, %rd13, %rd14;")
++        self.line("    add.u64 %rd0, %rd11, %rd13;")
++
++    def guard_count(self, count: int) -> str:
++        done = self.label("DONE")
++        self.line("    setp.ge.u64 %p0, %rd0, {};".format(_u64(count)))
++        self.line("    @%p0 bra {};".format(done))
++        return done
++
++    def address(self, pointer_param: int, index_register: int, itemsize: int, result_register: int) -> None:
++        self.line("    ld.param.u64 %rd{}, [p{}];".format(result_register, pointer_param))
++        self.line("    mul.lo.u64 %rd{}, %rd{}, {};".format(result_register + 1, index_register, itemsize))
++        self.line("    add.u64 %rd{}, %rd{}, %rd{};".format(result_register, result_register, result_register + 1))
++
++    def load_value(self, ref: ValueRef, param_index: int, index_register: int, result_register: int, float_register: int) -> None:
++        dtype = canonical_dtype(ref.type.dtype)
++        if _is_scalar(ref.type):
++            if dtype == "bf16":
++                self.line("    ld.param.b16 %rs0, [p{}];".format(param_index))
++                self.line("    cvt.f32.bf16 %f{}, %rs0;".format(float_register))
++            else:
++                self.line("    ld.param.f32 %f{}, [p{}];".format(float_register, param_index))
++            return
++        self.address(param_index, index_register, _dtype_itemsize(dtype), result_register)
++        if dtype == "bf16":
++            self.line("    ld.global.b16 %rs0, [%rd{}];".format(result_register))
++            self.line("    cvt.f32.bf16 %f{}, %rs0;".format(float_register))
++        elif dtype == "float32":
++            self.line("    ld.global.f32 %f{}, [%rd{}];".format(float_register, result_register))
++        else:
++            raise CudaPtxUnsupportedError("PTX load does not support dtype {!r}".format(dtype))
++
++    def store_value(self, ref: ValueRef, param_index: int, index_register: int, float_register: int, address_register: int = 20) -> None:
++        dtype = canonical_dtype(ref.type.dtype)
++        if not _is_tensor(ref.type) and not _is_scalar(ref.type):
++            raise CudaPtxUnsupportedError("PTX store does not support {!r}".format(ref.type.kind))
++        self.address(param_index, index_register, _dtype_itemsize(dtype), address_register)
++        if dtype == "bf16":
++            # cvt.rn.bf16.f32 is explicitly round-to-nearest-even in PTX.
++            self.line("    cvt.rn.bf16.f32 %rs1, %f{};".format(float_register))
++            self.line("    st.global.b16 [%rd{}], %rs1;".format(address_register))
++        elif dtype == "float32":
++            self.line("    st.global.f32 [%rd{}], %f{};".format(address_register, float_register))
++        else:
++            raise CudaPtxUnsupportedError("PTX store does not support dtype {!r}".format(dtype))
++
++    def emit_elementwise(self) -> None:
++        self.linear_thread_index()
++        done = self.guard_count(_shape_count(self.plan.shape))
++        name = self.plan.operation
++        output = self.output
++        if name == "constant":
++            raw = self.operation.attributes.get("values", self.operation.attributes.get("value"))
++            values = list(flatten_values(raw))
++            if len(values) != _shape_count(self.plan.shape):
++                raise CudaPtxError("constant value count does not match output shape")
++            self.line("    mov.u64 %rd13, %rd0;")
++            # A constant tensor is emitted as one deterministic immediate per
++            # lane.  This is a correctness bootstrap, not a compact constant
++            # memory strategy.
++            for index, value in enumerate(values or [0]):
++                skip = self.label("CONST_SKIP")
++                self.line("    setp.ne.u64 %p1, %rd0, {};".format(index))
++                self.line("    @%p1 bra {};".format(skip))
++                self.line("    mov.f32 %f0, {};".format(_f32_literal(value)))
++                self.store_value(output, len(self.operation.inputs), 0, 0)
++                self.line("{}:".format(skip))
++        else:
++            for value_index, ref in enumerate(self.operation.inputs):
++                self.load_value(ref, value_index, 0, 14 + value_index * 2, value_index)
++            if name == "identity":
++                self.line("    mov.f32 %f0, %f0;")
++            elif name in ("add", "sub", "mul", "div"):
++                op = {"add": "add", "sub": "sub", "mul": "mul", "div": "div"}[name]
++                self.line("    {}.f32 %f0, %f0, %f1;".format(op))
++            elif name == "neg":
++                self.line("    neg.f32 %f0, %f0;")
++            else:
++                raise CudaPtxUnsupportedError("unsupported elementwise operation {!r}".format(name))
++            self.store_value(output, len(self.operation.inputs), 0, 0)
++        self.line("{}:".format(done))
++
++    def _coord_from_linear(self, source_register: int, stride: int, dimension: int, result: int) -> None:
++        self.line("    mov.u64 %rd{}, {};".format(result + 1, stride))
++        self.line("    div.u64 %rd{}, %rd{}, %rd{};".format(result, source_register, result + 1))
++        self.line("    mov.u64 %rd{}, {};".format(result + 1, dimension))
++        self.line("    rem.u64 %rd{}, %rd{}, %rd{};".format(result, result, result + 1))
++
++    def emit_reduction(self) -> None:
++        reduction = self.plan.reduction
++        self.linear_thread_index()
++        done = self.guard_count(reduction.output_elements)
++        self.line("    mov.f32 %f0, {};".format(_f32_literal(0.0 if self.plan.operation == "reduce_sum" else float("-inf"))))
++        self.line("    mov.u64 %rd3, 0;")
++        red_done = self.label("RED_DONE")
++        red_loop = self.label("RED_LOOP")
++        self.line("    mov.u64 %rd4, {};".format(reduction.reduction_size))
++        self.line("{}:".format(red_loop))
++        self.line("    setp.ge.u64 %p1, %rd3, %rd4;")
++        self.line("    @%p1 bra {};".format(red_done))
++        self.line("    mov.u64 %rd13, 0;")
++        input_shape = tuple(reduction.input_shape)
++        input_strides = _strides(input_shape)
++        axes = set(reduction.axes)
++        nonreduced_index = 0
++        for axis, (dimension, stride) in enumerate(zip(input_shape, input_strides)):
++            if axis in axes:
++                self._coord_from_linear(3, _strides(tuple(input_shape[a] for a in reduction.axes))[list(reduction.axes).index(axis)], dimension, 30)
++            else:
++                out_axis = axis if reduction.keepdims else nonreduced_index
++                out_shape = tuple(reduction.output_shape)
++                out_stride = _strides(out_shape)[out_axis] if out_shape else 1
++                self._coord_from_linear(0, out_stride, dimension, 31)
++                nonreduced_index += 1
++            coord_reg = 30 if axis in axes else 31
++            self.line("    mul.lo.u64 %rd32, %rd{}, {};".format(coord_reg, stride))
++            self.line("    add.u64 %rd13, %rd13, %rd32;")
++        self.load_value(self.operation.inputs[0], 0, 13, 14, 1)
++        if self.plan.operation == "reduce_sum":
++            self.line("    add.f32 %f0, %f0, %f1;")
++        else:
++            self.line("    max.f32 %f0, %f0, %f1;")
++        self.line("    add.u64 %rd3, %rd3, 1;")
++        self.line("    bra {};".format(red_loop))
++        self.line("{}:".format(red_done))
++        self.store_value(self.output, len(self.operation.inputs), 0, 0)
++        self.line("{}:".format(done))
++
++    def emit_matmul(self) -> None:
++        matmul = self.plan.matmul
++        self.linear_thread_index()
++        done = self.guard_count(matmul.output_elements)
++        loop = self.label("MM_OUT_LOOP")
++        self.line("{}:".format(loop))
++        # The common plan is allowed to use a logical tile larger than the
++        # concrete workgroup.  Striding the flat output domain lets a small
++        # correctness workgroup cover the whole tile without changing the
++        # vendor-neutral plan or ABI.
++        self.line("    mov.u64 %rd30, %rd0;")
++        self.line("    mov.u64 %rd31, {};".format(matmul.n))
++        self.line("    div.u64 %rd7, %rd30, %rd31;")
++        self.line("    rem.u64 %rd8, %rd30, %rd31;")
++        self.line("    mov.f32 %f0, 0f00000000;")
++        self.line("    mov.u64 %rd9, 0;")
++        inner_loop = self.label("MM_LOOP")
++        self.line("{}:".format(inner_loop))
++        self.line("    setp.ge.u64 %p2, %rd9, {};".format(matmul.k))
++        acc_done = self.label("MM_ACC_DONE")
++        self.line("    @%p2 bra {};".format(acc_done))
++        self.line("    mul.lo.u64 %rd10, %rd7, {};".format(matmul.k))
++        self.line("    add.u64 %rd10, %rd10, %rd9;")
++        self.load_value(self.operation.inputs[0], 0, 10, 14, 1)
++        self.line("    mul.lo.u64 %rd11, %rd9, {};".format(matmul.n))
++        self.line("    add.u64 %rd11, %rd11, %rd8;")
++        self.load_value(self.operation.inputs[1], 1, 11, 16, 2)
++        self.line("    mul.f32 %f3, %f1, %f2;")
++        self.line("    add.f32 %f0, %f0, %f3;")
++        self.line("    add.u64 %rd9, %rd9, 1;")
++        self.line("    bra {};".format(inner_loop))
++        self.line("{}:".format(acc_done))
++        self.store_value(self.output, 2, 0, 0)
++        self.line("    add.u64 %rd0, %rd0, {};".format(self.plan.geometry.logical_threads))
++        self.line("    setp.lt.u64 %p3, %rd0, {};".format(matmul.output_elements))
++        self.line("    @%p3 bra {};".format(loop))
++        self.line("{}:".format(done))
++
++    def render(self) -> str:
++        self.line(".visible .entry px_op{}(".format(self.index))
++        declarations = self.param_declarations()
++        if declarations:
++            self.line(",\n".join(declarations))
++        self.line(") {")
++        self.preamble()
++        if self.plan.plan_kind == "matmul":
++            self.emit_matmul()
++        elif self.plan.plan_kind == "reduction":
++            self.emit_reduction()
++        else:
++            self.emit_elementwise()
++        self.line("    ret;")
++        self.line("}")
++        return "\n".join(self.lines)
++
++
++def _strides(shape: Sequence[int]) -> Tuple[int, ...]:
++    result = [1] * len(shape)
++    running = 1
++    for index in range(len(shape) - 1, -1, -1):
++        result[index] = running
++        running *= int(shape[index])
++    return tuple(result)
++
++
++def render_ptx(gpu_program: GpuProgram, ptx_target: str = DEFAULT_PTX_TARGET, ptx_version: str = CUDA_PTX_VERSION) -> str:
++    """Render deterministic PTX for a validated GPU common program."""
++
++    if not isinstance(gpu_program, GpuProgram):
++        raise TypeError("render_ptx requires GpuProgram")
++    if not isinstance(ptx_target, str) or not _PTX_TARGET_RE.fullmatch(ptx_target):
++        raise CudaPtxError("PTX target must have the form sm_<number>")
++    try:
++        kernels = []
++        function = next(function for function in gpu_program.program.functions if function.name == gpu_program.entrypoint)
++        for index, (operation, plan) in enumerate(zip(function.body.operations, gpu_program.plans)):
++            kernels.append(_Kernel(index, operation, plan).render())
++    except StopIteration as exc:
++        raise CudaPtxError("GPU entrypoint is missing") from exc
++    return ".version {}\n.target {}\n.address_size 64\n\n{}\n".format(
++        str(ptx_version), ptx_target, "\n\n".join(kernels)
++    )
++
++
++@dataclass(frozen=True)
++class CudaProgram:
++    """CUDA target IR: common plans plus immutable PTX and binding metadata."""
++
++    gpu_program: GpuProgram
++    ptx: str
++    ptx_target: str
++    ptx_version: str
++    device: Mapping[str, Any]
++    jit: Mapping[str, Any]
++    bindings: Tuple[Tuple[Mapping[str, Any], ...], ...]
++
++    @property
++    def program(self) -> CoreProgram:
++        return self.gpu_program.program
++
++    @property
++    def target(self) -> TargetSpec:
++        return self.gpu_program.target
++
++    @property
++    def entrypoint(self) -> str:
++        return self.gpu_program.entrypoint
++
++    @property
++    def plan_digest(self) -> str:
++        return self.gpu_program.plan_digest
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "cuda_lowering_version": CUDA_LOWERING_VERSION,
++            "ptx_target": self.ptx_target,
++            "ptx_version": self.ptx_version,
++            "gpu_program": self.gpu_program.to_dict(),
++            "ptx_digest": hashlib.sha256(self.ptx.encode("utf-8")).hexdigest(),
++            "device": mapping_copy(self.device),
++            "jit": mapping_copy(self.jit),
++            "bindings": [[mapping_copy(binding) for binding in sequence] for sequence in self.bindings],
++        }
++
++
++class CudaPtxCompiler:
++    """Compiler facade consuming only the existing vendor-neutral GPU plans."""
++
++    name = CUDA_BACKEND
++
++    def __init__(
++        self,
++        driver: Any = None,
++        device_index: int = 0,
++        ptx_target: str = DEFAULT_PTX_TARGET,
++        ptx_version: str = CUDA_PTX_VERSION,
++        probe_jit: bool = False,
++    ) -> None:
++        if not isinstance(ptx_target, str) or not _PTX_TARGET_RE.fullmatch(ptx_target):
++            raise ValueError("ptx_target must have the form sm_<number>")
++        self.driver = driver
++        self.device_index = int(device_index)
++        self.ptx_target = ptx_target
++        self.ptx_version = str(ptx_version)
++        self.probe_jit = bool(probe_jit)
++
++    def lower(self, program: CoreProgram, target: TargetSpec) -> CudaProgram:
++        gpu_program = lower_gpu_common(program, target)
++        ptx = render_ptx(gpu_program, self.ptx_target, self.ptx_version)
++        device = {"status": "not_probed", "index": self.device_index}
++        jit = {"status": "deferred", "info_log": "", "error_log": ""}
++        if self.driver is not None and hasattr(self.driver, "device_info"):
++            info = self.driver.device_info(self.device_index)
++            device = {"status": "available", **mapping_copy(info.to_dict() if hasattr(info, "to_dict") else info)}
++            if self.probe_jit and hasattr(self.driver, "module_load_data"):
++                context = None
++                try:
++                    # cuModuleLoadDataEx needs a current context on the real
++                    # Driver API.  Fake drivers can omit context_create.
++                    if hasattr(self.driver, "context_create"):
++                        context = self.driver.context_create(self.device_index)
++                    module = self.driver.module_load_data(ptx)
++                    jit = {
++                        "status": "validated",
++                        "info_log": getattr(module, "info_log", ""),
++                        "error_log": getattr(module, "error_log", ""),
++                    }
++                    if hasattr(module, "close"):
++                        module.close()
++                finally:
++                    if context is not None and hasattr(context, "close"):
++                        context.close()
++        bindings = _all_bindings(gpu_program)
++        return CudaProgram(gpu_program, ptx, self.ptx_target, self.ptx_version, device, jit, bindings)
++
++    def compile(self, target_ir: CudaProgram, options: Optional[CompileOptions] = None) -> Artifact:
++        if not isinstance(target_ir, CudaProgram):
++            raise TypeError("CUDA compile() requires CudaProgram from lower()")
++        if options is not None and not isinstance(options, CompileOptions):
++            raise TypeError("options must be CompileOptions")
++        target_ir.gpu_program.validate()
++        program_json = target_ir.program.canonical_json()
++        program_data = json.loads(program_json)
++        program_digest = hashlib.sha256(program_json.encode("utf-8")).hexdigest()
++        target_data = target_ir.target.to_dict()
++        ptx_digest = hashlib.sha256(target_ir.ptx.encode("utf-8")).hexdigest()
++        envelope = {
++            "artifact_payload_version": ARTIFACT_PAYLOAD_VERSION,
++            "backend": CUDA_BACKEND,
++            "cuda_lowering_version": CUDA_LOWERING_VERSION,
++            "gpu_common_backend": GPU_COMMON_BACKEND,
++            "gpu_ir_version": GPU_IR_VERSION,
++            "lowering_version": GPU_LOWERING_VERSION,
++            "plan_version": GPU_PLAN_VERSION,
++            "entrypoint": target_ir.entrypoint,
++            "target": target_data,
++            "program": program_data,
++            "program_digest": program_digest,
++            "gpu_program": target_ir.gpu_program.to_dict(),
++            "plan_digest": target_ir.plan_digest,
++            "ptx": target_ir.ptx,
++            "ptx_digest": ptx_digest,
++            "ptx_target": target_ir.ptx_target,
++            "ptx_version": target_ir.ptx_version,
++            "device": _plain(target_ir.device),
++            "jit": _plain(target_ir.jit),
++            "bindings": _plain(target_ir.bindings),
++        }
++        if options is not None:
++            envelope["compile_options"] = {
++                "artifact_format": options.artifact_format,
++                "abi_version": options.abi_version,
++                "metadata": _plain(options.metadata),
++                "extra": _plain(options.extra),
++            }
++        payload = json.dumps(
++            envelope, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
++        ).encode("utf-8")
++        payload_digest = hashlib.sha256(payload).hexdigest()
++        metadata = {
++            "backend": CUDA_BACKEND,
++            "artifact_payload_version": ARTIFACT_PAYLOAD_VERSION,
++            "cuda_lowering_version": CUDA_LOWERING_VERSION,
++            "gpu_common_backend": GPU_COMMON_BACKEND,
++            "gpu_ir_version": GPU_IR_VERSION,
++            "lowering_version": GPU_LOWERING_VERSION,
++            "plan_version": GPU_PLAN_VERSION,
++            "entrypoint": target_ir.entrypoint,
++            "program_digest": program_digest,
++            "plan_digest": target_ir.plan_digest,
++            "ptx_digest": ptx_digest,
++            "payload_digest": payload_digest,
++            "target_digest": sha256_text(target_data),
++            "ptx_target": target_ir.ptx_target,
++            "ptx_version": target_ir.ptx_version,
++            "device": _plain(target_ir.device),
++            "jit": _plain(target_ir.jit),
++            "geometry": [plan.geometry.to_dict() for plan in target_ir.gpu_program.plans],
++            "bindings": _plain(target_ir.bindings),
++            "dtypes": sorted(set(plan.dtype for plan in target_ir.gpu_program.plans)),
++            "layouts": sorted(set(plan.layout for plan in target_ir.gpu_program.plans)),
++        }
++        if options is not None:
++            option_metadata = _plain(options.metadata)
++            reserved = set(metadata).intersection(option_metadata)
++            if reserved:
++                raise ValueError("compile option metadata uses reserved CUDA keys: {}".format(
++                    ", ".join(sorted(reserved))
++                ))
++            metadata.update(option_metadata)
++            metadata["compile_options"] = envelope["compile_options"]
++            artifact_format = options.artifact_format
++            abi_version = options.abi_version
++        else:
++            artifact_format = DEFAULT_ARTIFACT_FORMAT
++            abi_version = ABI_VERSION
++        artifact = Artifact(
++            format=artifact_format,
++            entrypoint=target_ir.entrypoint,
++            target=target_ir.target,
++            abi_version=abi_version,
++            payload=payload,
++            metadata=metadata,
++        )
++        artifact.validate()
++        return artifact
++
++
++CudaCompiler = CudaPtxCompiler
++CUDACompiler = CudaPtxCompiler
++
++
++def compile_cuda_ptx(program: CoreProgram, target: TargetSpec, options: Optional[CompileOptions] = None) -> Artifact:
++    compiler = CudaPtxCompiler()
++    return compiler.compile(compiler.lower(program, target), options)
++
++
++def _required_envelope() -> set:
++    return {
++        "artifact_payload_version", "backend", "cuda_lowering_version", "gpu_common_backend",
++        "gpu_ir_version", "lowering_version", "plan_version", "entrypoint", "target", "program",
++        "program_digest", "gpu_program", "plan_digest", "ptx", "ptx_digest", "ptx_target",
++        "ptx_version", "device", "jit", "bindings",
++    }
++
++
++def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
++    """Strictly decode and re-derive every derived CUDA artifact field."""
++
++    if not isinstance(artifact, Artifact):
++        raise CudaPtxArtifactError("CUDA runtime requires Artifact")
++    try:
++        artifact.validate()
++    except Exception as exc:
++        raise CudaPtxArtifactError("artifact validation failed: {}".format(exc)) from exc
++    if artifact.payload is None:
++        raise CudaPtxArtifactError("CUDA artifact requires an inline payload")
++    try:
++        decoded = json.loads(bytes(artifact.payload).decode("utf-8"))
++    except Exception as exc:
++        raise CudaPtxArtifactError("CUDA payload is not UTF-8 JSON") from exc
++    if not isinstance(decoded, dict) or set(decoded) - (_required_envelope() | {"compile_options"}) or not _required_envelope().issubset(decoded):
++        raise CudaPtxArtifactError("CUDA payload has unknown or missing fields")
++    canonical = json.dumps(decoded, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    if canonical != bytes(artifact.payload):
++        raise CudaPtxArtifactError("CUDA payload is not canonical JSON")
++    metadata = mapping_copy(artifact.metadata)
++    required_metadata = {
++        "backend", "artifact_payload_version", "cuda_lowering_version", "gpu_common_backend", "gpu_ir_version",
++        "lowering_version", "plan_version", "entrypoint", "program_digest", "plan_digest", "ptx_digest",
++        "payload_digest", "target_digest", "ptx_target", "ptx_version", "device", "jit", "geometry",
++        "bindings", "dtypes", "layouts",
++    }
++    if not required_metadata.issubset(metadata):
++        raise CudaPtxArtifactError("CUDA artifact metadata has unknown or missing fields")
++    option_metadata = {}
++    if "compile_options" in decoded:
++        options = decoded["compile_options"]
++        if not isinstance(options, dict) or set(options) != {"artifact_format", "abi_version", "metadata", "extra"}:
++            raise CudaPtxArtifactError("CUDA compile options are malformed")
++        if not isinstance(options["metadata"], dict) or not isinstance(options["extra"], dict):
++            raise CudaPtxArtifactError("CUDA compile option metadata/extra must be objects")
++        option_metadata = options["metadata"]
++    allowed_metadata = required_metadata | {"compile_options"} | set(option_metadata)
++    if set(metadata) - allowed_metadata:
++        raise CudaPtxArtifactError("CUDA artifact metadata has unknown fields")
++    for key, value in option_metadata.items():
++        if metadata.get(key) != value:
++            raise CudaPtxArtifactError("CUDA option metadata does not match payload")
++    payload_digest = hashlib.sha256(bytes(artifact.payload)).hexdigest()
++    if metadata.get("payload_digest") != payload_digest or artifact.content_digest != payload_digest:
++        raise CudaPtxArtifactError("CUDA payload digest mismatch")
++    if decoded["backend"] != CUDA_BACKEND or metadata["backend"] != CUDA_BACKEND:
++        raise CudaPtxArtifactError("CUDA backend mismatch")
++    if decoded["artifact_payload_version"] != ARTIFACT_PAYLOAD_VERSION or metadata["artifact_payload_version"] != ARTIFACT_PAYLOAD_VERSION:
++        raise CudaPtxArtifactError("unsupported CUDA artifact payload version")
++    if decoded["cuda_lowering_version"] != CUDA_LOWERING_VERSION or metadata["cuda_lowering_version"] != CUDA_LOWERING_VERSION:
++        raise CudaPtxArtifactError("unsupported CUDA lowering version")
++    if decoded["gpu_common_backend"] != GPU_COMMON_BACKEND or metadata["gpu_common_backend"] != GPU_COMMON_BACKEND:
++        raise CudaPtxArtifactError("GPU common backend mismatch")
++    if decoded["target"] != artifact.target.to_dict() or metadata["target_digest"] != sha256_text(decoded["target"]):
++        raise CudaPtxArtifactError("CUDA artifact target mismatch")
++    if decoded["entrypoint"] != artifact.entrypoint or metadata["entrypoint"] != artifact.entrypoint:
++        raise CudaPtxArtifactError("CUDA artifact entrypoint mismatch")
++    program = CoreProgram.from_dict(decoded["program"])
++    program_json = program.canonical_json()
++    program_digest = hashlib.sha256(program_json.encode("utf-8")).hexdigest()
++    if decoded["program"] != program.to_dict() or decoded["program_digest"] != program_digest or metadata["program_digest"] != program_digest:
++        raise CudaPtxArtifactError("CUDA program digest mismatch")
++    try:
++        gpu_program = lower_gpu_common(
++            program,
++            artifact.target,
++            decoded["gpu_program"]["entrypoint"],
++            required_capabilities=decoded["gpu_program"].get("required_capabilities", ()),
++            specialization=decoded["gpu_program"].get("specialization", {}),
++        )
++    except Exception as exc:
++        raise CudaPtxArtifactError("GPU common plan is invalid: {}".format(exc)) from exc
++    if decoded["gpu_program"] != gpu_program.to_dict() or decoded["plan_digest"] != gpu_program.plan_digest:
++        raise CudaPtxArtifactError("CUDA plan digest mismatch")
++    ptx = decoded["ptx"]
++    ptx_digest = hashlib.sha256(ptx.encode("utf-8")).hexdigest()
++    if decoded["ptx_digest"] != ptx_digest or metadata["ptx_digest"] != ptx_digest:
++        raise CudaPtxArtifactError("CUDA PTX digest mismatch")
++    expected_ptx = render_ptx(gpu_program, decoded["ptx_target"], decoded["ptx_version"])
++    if ptx != expected_ptx:
++        raise CudaPtxArtifactError("CUDA PTX does not match the canonical GPU plan")
++    expected_bindings = _all_bindings(gpu_program)
++    if tuple(tuple(mapping_copy(item) for item in group) for group in decoded["bindings"]) != expected_bindings:
++        raise CudaPtxArtifactError("CUDA kernel bindings do not match Core IR")
++    expected_geometry = [plan.geometry.to_dict() for plan in gpu_program.plans]
++    if metadata["geometry"] != expected_geometry or metadata["bindings"] != _plain(expected_bindings):
++        raise CudaPtxArtifactError("CUDA geometry/binding metadata mismatch")
++    if metadata["ptx_target"] != decoded["ptx_target"] or metadata["ptx_version"] != decoded["ptx_version"]:
++        raise CudaPtxArtifactError("CUDA PTX target metadata mismatch")
++    if metadata["device"] != decoded["device"] or metadata["jit"] != decoded["jit"]:
++        raise CudaPtxArtifactError("CUDA device/JIT metadata mismatch")
++    if metadata["dtypes"] != sorted(set(plan.dtype for plan in gpu_program.plans)) or metadata["layouts"] != sorted(set(plan.layout for plan in gpu_program.plans)):
++        raise CudaPtxArtifactError("CUDA dtype/layout metadata mismatch")
++    if "compile_options" in decoded:
++        options = decoded["compile_options"]
++        if metadata.get("compile_options") != options or artifact.format != options["artifact_format"] or artifact.abi_version != options["abi_version"]:
++            raise CudaPtxArtifactError("CUDA artifact format/ABI options mismatch")
++    elif artifact.format != DEFAULT_ARTIFACT_FORMAT or artifact.abi_version != ABI_VERSION:
++        raise CudaPtxArtifactError("CUDA artifact format/ABI mismatch")
++    return CudaProgram(
++        gpu_program, ptx, decoded["ptx_target"], decoded["ptx_version"],
++        frozen_mapping(decoded["device"]), frozen_mapping(decoded["jit"]),
++        tuple(tuple(frozen_mapping(item) for item in group) for group in decoded["bindings"]),
++    )
++
++
++__all__ = [
++    "ARTIFACT_PAYLOAD_VERSION", "CUDA_ARTIFACT_FORMAT", "CUDA_BACKEND", "CUDA_LOWERING_VERSION",
++    "CUDACompiler", "CudaCompiler", "CudaPtxArtifactError", "CudaPtxCompiler", "CudaPtxError",
++    "CudaPtxUnsupportedError", "CudaProgram", "DEFAULT_ARTIFACT_FORMAT", "DEFAULT_PTX_TARGET",
++    "compile_cuda_ptx", "render_ptx",
++]
+diff --git a/python/tests/ut/pypto_x/test_cuda_driver_ptx.py b/python/tests/ut/pypto_x/test_cuda_driver_ptx.py
+new file mode 100644
+index 000000000..7e2cec994
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cuda_driver_ptx.py
+@@ -0,0 +1,186 @@
++"""CUDA Driver/PTX bootstrap tests; no CUDA toolkit or model is required."""
++
++from __future__ import annotations
++
++import hashlib
++import json
++
++import pytest
++
++from pypto.abi import GpuLaunchRequest, TensorDesc
++from pypto.backends.cpu import HostTensor
++from pypto.backends.cuda import CudaDeviceInfo
++from pypto.backends.cuda.runtime import CudaArtifactError, CudaRuntime
++from pypto.compiler import Artifact
++from pypto.compiler.targets.cuda import CudaPtxCompiler, CudaPtxArtifactError, render_ptx
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.target import TargetSpec
++
++
++TARGET = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,)})
++
++
++def _program(operation_name="add", dtype="float32", shape=(5,)):
++    value_type = CoreType.tensor(dtype, shape)
++    x = ValueRef("x", value_type)
++    y = ValueRef("y", value_type)
++    z = ValueRef("z", value_type)
++    operation = Operation(operation_name, (x, y), (z,))
++    return CoreProgram(functions=(CoreFunction("main", (x, y), (z,), Region((operation,))),))
++
++
++class _FakeContext:
++    def __init__(self):
++        self.closed = False
++
++    def close(self):
++        self.closed = True
++
++
++class _FakeModule:
++    info_log = "fake-jit-info"
++    error_log = ""
++
++    def __init__(self, driver):
++        self.driver = driver
++        self.closed = False
++
++    def get_function(self, name):
++        self.driver.calls.append(("get_function", name))
++        return name
++
++    def close(self):
++        self.closed = True
++        self.driver.calls.append(("module_close",))
++
++
++class _FakeDriver:
++    def __init__(self):
++        self.calls = []
++        self.next_pointer = 1000
++        self.memory = {}
++
++    def device_info(self, index=0):
++        self.calls.append(("device_info", index))
++        return CudaDeviceInfo(index, "Fake GPU", 12, 0, 16 * 1024**3)
++
++    def context_create(self, index=0):
++        self.calls.append(("context_create", index))
++        return _FakeContext()
++
++    def module_load_data(self, ptx):
++        self.calls.append(("module_load_data", hashlib.sha256(ptx.encode()).hexdigest()))
++        return _FakeModule(self)
++
++    def mem_alloc(self, size):
++        self.next_pointer += 1
++        self.memory[self.next_pointer] = bytearray(max(1, size))
++        self.calls.append(("mem_alloc", size))
++        return self.next_pointer
++
++    def mem_free(self, pointer):
++        self.calls.append(("mem_free", pointer))
++        self.memory.pop(pointer, None)
++
++    def memcpy_htod(self, pointer, payload):
++        self.calls.append(("memcpy_htod", len(payload)))
++        self.memory[pointer][: len(payload)] = payload
++
++    def memcpy_dtoh(self, pointer, size):
++        self.calls.append(("memcpy_dtoh", size))
++        return bytes(self.memory[pointer][:size])
++
++    def launch_kernel(self, function, grid, block, parameters, stream=None, shared_memory=0):
++        self.calls.append(("launch_kernel", function, tuple(grid), tuple(block), len(parameters)))
++
++    def context_synchronize(self):
++        self.calls.append(("context_synchronize",))
++
++
++def _compile(program, driver=None, probe_jit=False):
++    compiler = CudaPtxCompiler(driver=driver, probe_jit=probe_jit)
++    target_ir = compiler.lower(program, TARGET)
++    return compiler, target_ir, compiler.compile(target_ir)
++
++
++def test_cuda_ptx_is_deterministic_and_bf16_conversion_is_explicit():
++    _, first_ir, first = _compile(_program())
++    _, second_ir, second = _compile(_program())
++    assert first.payload == second.payload
++    assert first_ir.ptx == second_ir.ptx
++    _, bf_ir, _ = _compile(_program(dtype="bf16"))
++    assert "cvt.f32.bf16" in bf_ir.ptx
++    assert "cvt.rn.bf16.f32" in bf_ir.ptx
++    assert ".target sm_80" in bf_ir.ptx
++
++
++def test_fake_driver_records_device_cc_and_jit_metadata():
++    driver = _FakeDriver()
++    _, target_ir, artifact = _compile(_program(), driver=driver, probe_jit=True)
++    assert target_ir.device["compute_capability"] == "12.0"
++    assert target_ir.jit["status"] == "validated"
++    assert target_ir.jit["info_log"] == "fake-jit-info"
++    assert artifact.metadata["device"]["compute_capability"] == "12.0"
++    assert artifact.metadata["jit"]["info_log"] == "fake-jit-info"
++    assert ("context_create", 0) in driver.calls
++    assert any(call[0] == "module_load_data" for call in driver.calls)
++
++
++def test_cuda_artifact_fails_closed_on_ptx_and_binding_tamper():
++    _, target_ir, artifact = _compile(_program())
++    payload = json.loads(artifact.payload.decode("utf-8"))
++    payload["ptx"] += "\n// tampered\n"
++    rebuilt_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    tampered = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        payload=rebuilt_payload,
++        metadata=dict(artifact.metadata, payload_digest=hashlib.sha256(rebuilt_payload).hexdigest()),
++    )
++    with pytest.raises((CudaPtxArtifactError, CudaArtifactError), match="PTX|canonical|digest"):
++        CudaRuntime().load(tampered)
++
++    payload = json.loads(artifact.payload.decode("utf-8"))
++    payload["bindings"][0][0]["name"] = "wrong"
++    rebuilt_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    tampered = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        payload=rebuilt_payload,
++        metadata=dict(artifact.metadata, payload_digest=hashlib.sha256(rebuilt_payload).hexdigest()),
++    )
++    with pytest.raises((CudaPtxArtifactError, CudaArtifactError), match="binding|digest"):
++        CudaRuntime().load(tampered)
++
++
++def test_fake_driver_launch_validates_geometry_and_uses_driver_abi():
++    driver = _FakeDriver()
++    _, target_ir, artifact = _compile(_program(), driver=driver)
++    left = HostTensor("float32", (5,), [1, 2, 3, 4, 5])
++    right = HostTensor("float32", (5,), [10, 20, 30, 40, 50])
++    output = HostTensor.zeros("float32", (5,))
++    request = GpuLaunchRequest(
++        artifact,
++        geometries=(target_ir.gpu_program.plans[0].geometry,),
++        inputs=(
++            TensorDesc("float32", (5,), device="gpu", handle=left, readonly=True),
++            TensorDesc("float32", (5,), device="gpu", handle=right, readonly=True),
++        ),
++        outputs=(TensorDesc("float32", (5,), device="gpu", handle=output),),
++    )
++    runtime = CudaRuntime(driver=driver)
++    runtime.launch(request)
++    assert any(call[0] == "launch_kernel" for call in driver.calls)
++    assert ("context_synchronize",) in driver.calls
++    assert any(call[0] == "module_close" for call in driver.calls)
++    assert runtime.last_jit_info_log == "fake-jit-info"
++
++
++def test_render_ptx_rejects_non_target_syntax_without_hardcoding_device_cc():
++    _, target_ir, _ = _compile(_program())
++    with pytest.raises(ValueError, match="sm_"):
++        render_ptx(target_ir.gpu_program, "compute_120")
+diff --git a/scripts/smoke/cuda_driver_matrix_smoke.py b/scripts/smoke/cuda_driver_matrix_smoke.py
+new file mode 100644
+index 000000000..4f63bad8f
+--- /dev/null
++++ b/scripts/smoke/cuda_driver_matrix_smoke.py
+@@ -0,0 +1,127 @@
++"""Small real-5080 correctness matrix for CUDA C1 (no model/toolkit)."""
++
++from pypto.abi import GpuLaunchRequest, TensorDesc
++from pypto.backends.cpu import HostTensor
++from pypto.backends.cuda import CudaDriver, CudaRuntime
++from pypto.compiler.targets.cuda import CudaPtxCompiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.target import TargetSpec
++
++
++TARGET = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,)})
++
++
++def program(name, parameters, returns, operation):
++    return CoreProgram(functions=(CoreFunction(name, parameters, returns, Region((operation,))),))
++
++
++def request(artifact, plan, inputs, output):
++    return GpuLaunchRequest(
++        artifact,
++        geometries=(plan.geometry,),
++        inputs=tuple(TensorDesc(x.dtype, x.shape, device="gpu", handle=x, readonly=True) for x in inputs),
++        outputs=(TensorDesc(output.dtype, output.shape, device="gpu", handle=output),),
++    )
++
++
++def main():
++    compiler_driver = CudaDriver()
++    compiler = CudaPtxCompiler(driver=compiler_driver, probe_jit=True)
++    runtime = CudaRuntime()
++
++    # Odd-tail elementwise and BF16 explicit convert/RNE store.
++    bf = CoreType.tensor("bf16", (5,))
++    bx, by, bz = ValueRef("x", bf), ValueRef("y", bf), ValueRef("z", bf)
++    bp = program("bf16_add", (bx, by), (bz,), Operation("add", (bx, by), (bz,)))
++    bir = compiler.lower(bp, TARGET)
++    ba = compiler.compile(bir)
++    print("artifact_device={} artifact_jit={}".format(ba.metadata["device"], ba.metadata["jit"]))
++    bout = HostTensor.zeros("bf16", (5,))
++    runtime.launch(request(ba, bir.gpu_program.plans[0], [HostTensor("bf16", (5,), [1.0] * 5), HostTensor("bf16", (5,), [0.5] * 5)], bout))
++    assert bout.flat() == (1.5,) * 5, bout.flat()
++
++    et = CoreType.tensor("float32", (10,))
++    cz = ValueRef("z", et)
++    cp = program("constant", (), (cz,), Operation("constant", (), (cz,), attributes={"values": list(range(10))}))
++    cir = compiler.lower(cp, TARGET)
++    ca = compiler.compile(cir)
++    cout = HostTensor.zeros("float32", (10,))
++    runtime.launch(request(ca, cir.gpu_program.plans[0], [], cout))
++    assert cout.flat() == tuple(float(x) for x in range(10)), cout.flat()
++    ex, ey, ez = ValueRef("x", et), ValueRef("y", et), ValueRef("z", et)
++    ep = program("elementwise", (ex, ey), (ez,), Operation("add", (ex, ey), (ez,)))
++    eir = compiler.lower(ep, TARGET)
++    ea = compiler.compile(eir)
++    eout = HostTensor.zeros("float32", (10,))
++    runtime.launch(request(ea, eir.gpu_program.plans[0], [HostTensor("float32", (10,), list(range(10))), HostTensor("float32", (10,), [1.0] * 10)], eout))
++    assert eout.flat() == tuple(float(x + 1) for x in range(10)), eout.flat()
++
++    # Non-last-axis reduction with a rectangular output.
++    it, ot = CoreType.tensor("float32", (2, 3, 5)), CoreType.tensor("float32", (2, 5))
++    ix, oz = ValueRef("x", it), ValueRef("z", ot)
++    rp = program("reduce", (ix,), (oz,), Operation("reduce_sum", (ix,), (oz,), attributes={"axis": 1}))
++    rir = compiler.lower(rp, TARGET)
++    ra = compiler.compile(rir)
++    rout = HostTensor.zeros("float32", (2, 5))
++    runtime.launch(request(ra, rir.gpu_program.plans[0], [HostTensor("float32", (2, 3, 5), list(range(30)))], rout))
++    assert rout.tolist() == [[15.0, 18.0, 21.0, 24.0, 27.0], [60.0, 63.0, 66.0, 69.0, 72.0]], rout.tolist()
++
++    rmp = program("reduce_max", (ix,), (oz,), Operation("reduce_max", (ix,), (oz,), attributes={"axis": 1}))
++    rmir = compiler.lower(rmp, TARGET)
++    rma = compiler.compile(rmir)
++    rmout = HostTensor.zeros("float32", (2, 5))
++    runtime.launch(request(rma, rmir.gpu_program.plans[0], [HostTensor("float32", (2, 3, 5), list(range(30)))], rmout))
++    assert rmout.tolist() == [[10.0, 11.0, 12.0, 13.0, 14.0], [25.0, 26.0, 27.0, 28.0, 29.0]], rmout.tolist()
++
++    # Rectangular rank-2 matmul.
++    lt, rt, mt = CoreType.tensor("float32", (2, 3)), CoreType.tensor("float32", (3, 4)), CoreType.tensor("float32", (2, 4))
++    lv, rv, mv = ValueRef("left", lt), ValueRef("right", rt), ValueRef("out", mt)
++    mp = program("matmul", (lv, rv), (mv,), Operation("matmul", (lv, rv), (mv,)))
++    mir = compiler.lower(mp, TARGET)
++    ma = compiler.compile(mir)
++    mout = HostTensor.zeros("float32", (2, 4))
++    runtime.launch(request(ma, mir.gpu_program.plans[0], [HostTensor("float32", (2, 3), [[1, 2, 3], [4, 5, 6]]), HostTensor("float32", (3, 4), [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]])], mout))
++    assert mout.tolist() == [[38.0, 44.0, 50.0, 56.0], [83.0, 98.0, 113.0, 128.0]], mout.tolist()
++
++    blt, brt, bmt = CoreType.tensor("bf16", (2, 3)), CoreType.tensor("bf16", (3, 4)), CoreType.tensor("bf16", (2, 4))
++    bl, br, bm = ValueRef("left", blt), ValueRef("right", brt), ValueRef("out", bmt)
++    bmp = program("bf16_matmul", (bl, br), (bm,), Operation("matmul", (bl, br), (bm,)))
++    bmir = compiler.lower(bmp, TARGET)
++    bma = compiler.compile(bmir)
++    bmout = HostTensor.zeros("bf16", (2, 4))
++    runtime.launch(request(bma, bmir.gpu_program.plans[0], [HostTensor("bf16", (2, 3), [[1, 2, 3], [4, 5, 6]]), HostTensor("bf16", (3, 4), [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]])], bmout))
++    assert bmout.tolist() == [[38.0, 44.0, 50.0, 56.0], [83.0, 98.0, 113.0, 128.0]], bmout.tolist()
++
++    # Zero work must not touch the host output storage.
++    zt = CoreType.tensor("float32", (0,))
++    zx, zy, zz = ValueRef("x", zt), ValueRef("y", zt), ValueRef("z", zt)
++    zp = program("zero", (zx, zy), (zz,), Operation("add", (zx, zy), (zz,)))
++    zir = compiler.lower(zp, TARGET)
++    za = compiler.compile(zir)
++    zout = HostTensor.zeros("float32", (0,))
++    runtime.launch(request(za, zir.gpu_program.plans[0], [HostTensor("float32", (0,)), HostTensor("float32", (0,))], zout))
++    assert zout.flat() == ()
++    class Canary:
++        def __init__(self):
++            self.dtype = "float32"
++            self.shape = (0,)
++            self.values = []
++            self.writes = 0
++        def __len__(self):
++            return 0
++        def __setitem__(self, index, value):
++            self.writes += 1
++            self.values.append((index, value))
++    canary = Canary()
++    runtime.launch(request(za, zir.gpu_program.plans[0], [HostTensor("float32", (0,)), HostTensor("float32", (0,))], canary))
++    assert canary.writes == 0
++    print("cuda_driver_matrix_smoke=PASS")
++    print("bf16={} reduce_sum={} reduce_max={} matmul={} bf16_matmul={} zero={} canary_writes={}".format(bout.flat(), rout.tolist(), rmout.tolist(), mout.tolist(), bmout.tolist(), zout.flat(), canary.writes))
++    print("jit_info_log={}".format(runtime.last_jit_info_log))
++    print("jit_error_log={}".format(runtime.last_jit_error_log))
++    runtime.close()
++    compiler_driver.close()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/smoke/cuda_driver_smoke.py b/scripts/smoke/cuda_driver_smoke.py
+new file mode 100644
+index 000000000..57a9a2829
+--- /dev/null
++++ b/scripts/smoke/cuda_driver_smoke.py
+@@ -0,0 +1,46 @@
++"""Tiny CUDA Driver/PTX correctness probe; intentionally no model or toolkit."""
++
++from pypto.abi import GpuLaunchRequest, TensorDesc
++from pypto.backends.cpu import HostTensor
++from pypto.backends.cuda import CudaRuntime
++from pypto.compiler.targets.cuda import CudaPtxCompiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.target import TargetSpec
++
++
++def main():
++    value_type = CoreType.tensor("float32", (5,))
++    x = ValueRef("x", value_type)
++    y = ValueRef("y", value_type)
++    z = ValueRef("z", value_type)
++    program = CoreProgram(
++        functions=(CoreFunction("main", (x, y), (z,), Region((Operation("add", (x, y), (z,)),))),)
++    )
++    target = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,)})
++    compiler = CudaPtxCompiler()
++    target_ir = compiler.lower(program, target)
++    artifact = compiler.compile(target_ir)
++    left = HostTensor("float32", (5,), [1, 2, 3, 4, 5])
++    right = HostTensor("float32", (5,), [10, 20, 30, 40, 50])
++    output = HostTensor.zeros("float32", (5,))
++    request = GpuLaunchRequest(
++        artifact,
++        geometries=(target_ir.gpu_program.plans[0].geometry,),
++        inputs=(
++            TensorDesc("float32", (5,), device="gpu", handle=left, readonly=True),
++            TensorDesc("float32", (5,), device="gpu", handle=right, readonly=True),
++        ),
++        outputs=(TensorDesc("float32", (5,), device="gpu", handle=output),),
++    )
++    runtime = CudaRuntime()
++    runtime.launch(request)
++    assert output.flat() == (11.0, 22.0, 33.0, 44.0, 55.0), output.flat()
++    print("cuda_driver_smoke=PASS")
++    print("output={}".format(output.flat()))
++    print("jit_info_log={}".format(runtime.last_jit_info_log))
++    print("jit_error_log={}".format(runtime.last_jit_error_log))
++    runtime.close()
++
++
++if __name__ == "__main__":
++    main()

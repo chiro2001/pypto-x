@@ -1,0 +1,215 @@
+From bcf9516e6419d232338988238ffa8f79e59079c1 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Thu, 10 Sep 2026 14:49:51 +0800
+Subject: [PATCH 89/96] fix(pypto-x): close c3 underflow and bf16 storage audit
+
+---
+ python/pypto/compiler/targets/hip.py                            |   5 +-
+ .../tests/ut/pypto_x/amd_gfx1036_c3_static_validation_driver.py | 100 +++++++++++++++++++++++++---
+ python/tests/ut/pypto_x/test_hip_gfx1036_static_c3.py           |   7 ++
+ 3 files changed, 101 insertions(+), 11 deletions(-)
+
+diff --git a/python/pypto/compiler/targets/hip.py b/python/pypto/compiler/targets/hip.py
+index c2789cb9a..3405e565c 100644
+--- a/python/pypto/compiler/targets/hip.py
++++ b/python/pypto/compiler/targets/hip.py
+@@ -562,7 +562,10 @@ def _emit_exp_f32(builder: _IRBuilder, value: str) -> str:
+     )
+     low_bound = _llvm_f32_literal(-103.97208404541016)
+     high_bound = _llvm_f32_literal(88.72283935546875)
+-    builder.line("  {} = fcmp olt float {}, {}".format(low, safe, low_bound))
++    # The exact f32 literal is just below ln(2^-150); ordered <= therefore
++    # rounds the threshold and all more-negative values to +0 rather than
++    # manufacturing the smallest subnormal below the RNE half-way point.
++    builder.line("  {} = fcmp ole float {}, {}".format(low, safe, low_bound))
+     builder.line("  {} = fcmp ogt float {}, {}".format(high, safe, high_bound))
+     builder.line(
+         "  {} = select i1 {}, float {}, float {}".format(
+diff --git a/python/tests/ut/pypto_x/amd_gfx1036_c3_static_validation_driver.py b/python/tests/ut/pypto_x/amd_gfx1036_c3_static_validation_driver.py
+index d972fba17..1d8d719d8 100644
+--- a/python/tests/ut/pypto_x/amd_gfx1036_c3_static_validation_driver.py
++++ b/python/tests/ut/pypto_x/amd_gfx1036_c3_static_validation_driver.py
+@@ -25,9 +25,11 @@ from pypto.compiler.targets.hip import (
+     AmdgpuStaticCompiler,
+     _IRBuilder,
+     _emit_exp_f32,
++    _emit_load_f32,
+     _emit_rsqrt_f32,
+     _emit_sigmoid_f32,
+     _emit_silu_f32,
++    _emit_store_f32,
+     _emit_softplus_f32,
+     decode_amdgpu_artifact,
+ )
+@@ -194,6 +196,73 @@ def _host_math_library():
+         directory.cleanup()
+ 
+ 
++def _render_host_bf16_storage_ir(name):
++    emitters = {
++        "exp": _emit_exp_f32,
++        "rsqrt": _emit_rsqrt_f32,
++        "sigmoid": _emit_sigmoid_f32,
++        "silu": _emit_silu_f32,
++        "softplus": _emit_softplus_f32,
++    }
++    builder = _IRBuilder()
++    builder.line('target triple = "x86_64-pc-linux-gnu"')
++    builder.line(
++        "define void @pypto_x_host_bf16_{}(ptr addrspace(1) %input, ptr addrspace(1) %output) {{".format(name)
++    )
++    builder.line("entry:")
++    value = _emit_load_f32(builder, "%input", "0", "bf16")
++    result = emitters[name](builder, value)
++    _emit_store_f32(builder, "%output", "0", "bf16", result)
++    builder.line("  ret void")
++    builder.line("}")
++    return "\n".join(builder.lines) + "\n"
++
++
++@contextmanager
++def _host_bf16_storage_library():
++    """Compile production BF16 load/math/store paths to host executables."""
++
++    directory = tempfile.TemporaryDirectory(prefix="pypto-x-c3-host-bf16-")
++    root = Path(directory.name)
++    libraries = {}
++    try:
++        for name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++            ir_path = root / (name + ".ll")
++            bitcode_path = root / (name + ".bc")
++            object_path = root / (name + ".o")
++            shared_path = root / (name + ".so")
++            ir_path.write_text(_render_host_bf16_storage_ir(name), encoding="utf-8")
++            subprocess.run(["llvm-as", str(ir_path), "-o", str(bitcode_path)], check=True, capture_output=True, text=True)
++            subprocess.run(
++                ["llc", "-mtriple=x86_64-pc-linux-gnu", "-filetype=obj", str(bitcode_path), "-o", str(object_path)],
++                check=True,
++                capture_output=True,
++                text=True,
++            )
++            subprocess.run(
++                ["clang", "-shared", "-fPIC", str(object_path), "-o", str(shared_path)],
++                check=True,
++                capture_output=True,
++                text=True,
++            )
++            library = ctypes.CDLL(str(shared_path))
++            function = getattr(library, "pypto_x_host_bf16_{}".format(name))
++            uint16_pointer = ctypes.POINTER(ctypes.c_uint16)
++            function.argtypes = (uint16_pointer, uint16_pointer)
++            function.restype = None
++            libraries[name] = function
++        yield libraries
++    finally:
++        directory.cleanup()
++
++
++def _host_bf16_storage_call(function, input_raw):
++    input_cell = (ctypes.c_uint16 * 1)(int(input_raw) & 0xFFFF)
++    output_cell = (ctypes.c_uint16 * 1)(0xA5A5)
++    function(input_cell, output_cell)
++    return int(output_cell[0])
++
++
+ def _host_call(function, input_bits):
+     value = _float_from_bits(input_bits)
+     actual = function(ctypes.c_float(value))
+@@ -243,12 +312,13 @@ def _compare_float32(name, input_bits, actual_bits):
+     return error <= tolerance * scale + 2.0e-7, error / scale
+ 
+ 
+-def _compare_bf16(name, input_raw, actual_bits):
++def _compare_bf16_storage(name, input_raw, actual_raw):
++    """Compare a raw value returned by the production i16 store path."""
++
+     input_bits = int(input_raw) << 16
+     reference = _reference_math(name, _float_from_bits(input_bits))
+-    actual_raw = _round_bf16_bits(_float_from_bits(actual_bits))
+     reference_class = _classify_bits(_float_bits(reference))
+-    actual_class = _classify_bits(int(actual_raw) << 16)
++    actual_class = _classify_bits((int(actual_raw) & 0xFFFF) << 16)
+     if reference_class == "nan":
+         return actual_class == "nan", 0
+     if reference_class in ("+inf", "-inf"):
+@@ -296,7 +366,7 @@ def _numeric_math_audit():
+         "max_finite": 0x7F7FFFFF,
+     }
+     result = {"fp32": {}, "bf16": {}, "exp_underflow_boundary": {}, "extremes": {}}
+-    with _host_math_library() as functions:
++    with _host_math_library() as functions, _host_bf16_storage_library() as bf16_storage_functions:
+         for name, function in functions.items():
+             mismatches = []
+             mismatch_total = 0
+@@ -318,15 +388,15 @@ def _numeric_math_audit():
+             bf16_mismatch_total = 0
+             bf16_max_distance = 0
+             for input_raw in range(0x10000):
+-                actual_bits = _host_call(function, input_raw << 16)
+-                passed, distance = _compare_bf16(name, input_raw, actual_bits)
++                actual_raw = _host_bf16_storage_call(bf16_storage_functions[name], input_raw)
++                passed, distance = _compare_bf16_storage(name, input_raw, actual_raw)
+                 bf16_max_distance = max(bf16_max_distance, distance)
+                 if not passed:
+                     bf16_mismatch_total += 1
+                     if len(bf16_mismatches) < 8:
+                         bf16_mismatches.append({
+                             "input_raw": "0x{:04x}".format(input_raw),
+-                            "actual_bits": "0x{:08x}".format(actual_bits),
++                            "actual_raw": "0x{:04x}".format(actual_raw),
+                             "input_class": _classify_bits(input_raw << 16),
+                             "distance": distance,
+                         })
+@@ -341,6 +411,8 @@ def _numeric_math_audit():
+                 "mismatch_count": bf16_mismatch_total,
+                 "mismatches": bf16_mismatches,
+                 "max_bf16_ulp_distance": bf16_max_distance,
++                "actual_path": "production_emit_load_f32_math_emit_store_f32",
++                "direct_raw_output": True,
+             }
+             for label, input_bits in edge_names.items():
+                 actual_bits = _host_call(function, input_bits)
+@@ -349,10 +421,18 @@ def _numeric_math_audit():
+                     "output_bits": "0x{:08x}".format(actual_bits),
+                     "output_class": _classify_bits(actual_bits),
+                 }
+-        for value in (-104.2, -103.972084, -103.5, -103.27893, -103.0, -102.5):
+-            input_bits = _float_bits(value)
++        threshold_bits = _float_bits(-103.97208404541016)
++        boundary_inputs = {
++            "threshold": threshold_bits,
++            "more_negative_neighbor": threshold_bits + 1,
++            "less_negative_neighbor": threshold_bits - 1,
++        }
++        for label, input_bits in boundary_inputs.items():
++            value = _float_from_bits(input_bits)
+             actual_bits = _host_call(functions["exp"], input_bits)
+-            result["exp_underflow_boundary"][str(value)] = {
++            result["exp_underflow_boundary"][label] = {
++                "input_bits": "0x{:08x}".format(input_bits),
++                "input_value": value,
+                 "actual_bits": "0x{:08x}".format(actual_bits),
+                 "actual_class": _classify_bits(actual_bits),
+                 "reference": _reference_math("exp", value),
+diff --git a/python/tests/ut/pypto_x/test_hip_gfx1036_static_c3.py b/python/tests/ut/pypto_x/test_hip_gfx1036_static_c3.py
+index c2e476af3..a12642d73 100644
+--- a/python/tests/ut/pypto_x/test_hip_gfx1036_static_c3.py
++++ b/python/tests/ut/pypto_x/test_hip_gfx1036_static_c3.py
+@@ -105,10 +105,17 @@ def test_c3_host_compiled_math_regressions_cover_subnormal_and_infinity_contract
+     assert spec.loader is not None
+     spec.loader.exec_module(driver)
+     with driver._host_math_library() as functions:
++        underflow_threshold = driver._float_bits(-103.97208404541016)
++        threshold_output = driver._host_call(functions["exp"], underflow_threshold)
++        more_negative_output = driver._host_call(functions["exp"], underflow_threshold + 1)
++        less_negative_output = driver._host_call(functions["exp"], underflow_threshold - 1)
+         minimum_subnormal = driver._host_call(functions["rsqrt"], 0x00000001)
+         two_pow_minus_140 = driver._host_call(functions["rsqrt"], driver._float_bits(2.0 ** -140))
+         negative_zero = driver._host_call(functions["rsqrt"], 0x80000000)
+         negative_infinity_silu = driver._host_call(functions["silu"], 0xFF800000)
++    assert threshold_output == 0x00000000
++    assert more_negative_output == 0x00000000
++    assert less_negative_output == 0x00000001
+     assert driver._classify_bits(minimum_subnormal) == "finite"
+     assert driver._classify_bits(two_pow_minus_140) == "finite"
+     assert negative_zero == 0x7F800000

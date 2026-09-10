@@ -1,0 +1,944 @@
+From 99460184f8e79716f86e02d6a0836a75dea0f62a Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Tue, 8 Sep 2026 18:38:52 +0800
+Subject: [PATCH 44/96] feat(pypto-x): add portable scalar math primitives
+
+---
+ python/pypto/backends/cpu/runtime.py           | 161 +++++++++++++++++++++++++-
+ python/pypto/frontend/pil_core_bridge.py       |  44 ++++++-
+ python/pypto/lowering/cpu/__init__.py          | 280 ++++++++++++++++++++++++++++++++++++++++++++-
+ python/pypto/lowering/cpu/vector/plan.py       |   8 ++
+ python/pypto/lowering/gpu/plan.py              |   4 +
+ python/tests/ut/pypto_x/test_cpu_scalar_m1a.py | 258 +++++++++++++++++++++++++++++++++++++++++
+ 6 files changed, 751 insertions(+), 4 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/runtime.py b/python/pypto/backends/cpu/runtime.py
+index a2a02f447..61036d510 100644
+--- a/python/pypto/backends/cpu/runtime.py
++++ b/python/pypto/backends/cpu/runtime.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import hashlib
+ import json
++import math
+ from dataclasses import dataclass
+ from typing import Any, Callable, Dict, List, Mapping, Sequence, Tuple
+ 
+@@ -371,12 +372,28 @@ def _execute_operation(operation: Operation, environment: Dict[str, _RuntimeValu
+                 result = [_cast_value(value, canonical_dtype(output_ref.type.dtype)) for value in flatten_values(raw)]
+         elif name == "identity":
+             result = _copy_value(inputs[0].data)
++        elif name == "cast":
++            result = _cast_value_for_operation(inputs[0].data, output_ref.type)
+         elif name in ("add", "sub", "mul", "div"):
+             result = _binary_value(name, inputs[0].data, inputs[1].data, output_ref.type)
+         elif name == "neg":
+             result = _unary_value(inputs[0].data, lambda value: -value, output_ref.type)
+-        elif name in ("reduce_sum", "reduce_max"):
++        elif name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++            result = _math_value(name, inputs[0].data, output_ref.type)
++        elif name in ("reduce_sum", "reduce_max", "reduce_mean"):
+             result = _reduce_value(name, inputs[0].data, inputs[0].type, output_ref.type, operation.attributes)
++        elif name == "broadcast":
++            result = _broadcast_value(inputs[0].data, inputs[0].type, output_ref.type)
++        elif name == "where":
++            result = _where_value(
++                inputs[0].data,
++                inputs[0].type,
++                inputs[1].data,
++                inputs[1].type,
++                inputs[2].data,
++                inputs[2].type,
++                output_ref.type,
++            )
+         elif name == "matmul":
+             result = _matmul_value(
+                 inputs[0].data,
+@@ -398,6 +415,56 @@ def _copy_value(value: Any) -> Any:
+     return list(value) if isinstance(value, list) else value
+ 
+ 
++def _cast_value_for_operation(value: Any, output_type: CoreType) -> Any:
++    """Cast a scalar or flat tensor to the already-validated output dtype."""
++
++    dtype = canonical_dtype(output_type.dtype)
++    if isinstance(value, list):
++        return [_cast_value(item, dtype) for item in value]
++    return _cast_value(value, dtype)
++
++
++def _math_scalar(name: str, value: Any) -> Any:
++    """Evaluate one portable scalar math primitive with stable edge handling."""
++
++    value = float(value)
++    if name == "exp":
++        return math.exp(value)
++    if name == "rsqrt":
++        if value <= 0.0:
++            raise CpuScalarExecutionError("rsqrt input must be greater than zero")
++        return 1.0 / math.sqrt(value)
++    if name == "sigmoid":
++        # Avoid exp(-x) overflow for large negative x.
++        if value >= 0.0:
++            return 1.0 / (1.0 + math.exp(-value))
++        exp_value = math.exp(value)
++        return exp_value / (1.0 + exp_value)
++    if name == "silu":
++        if value == float("-inf"):
++            return 0.0
++        if value == float("inf"):
++            return value
++        if value >= 0.0:
++            sigmoid = 1.0 / (1.0 + math.exp(-value))
++        else:
++            exp_value = math.exp(value)
++            sigmoid = exp_value / (1.0 + exp_value)
++        return value * sigmoid
++    if name == "softplus":
++        # log1p(exp(-abs(x))) + max(x, 0) is finite for the useful finite
++        # range and does not overflow on large positive activations.
++        return math.log1p(math.exp(-abs(value))) + max(value, 0.0)
++    raise CpuScalarExecutionError("unsupported scalar math operation {!r}".format(name))
++
++
++def _math_value(name: str, value: Any, output_type: CoreType) -> Any:
++    dtype = canonical_dtype(output_type.dtype)
++    if isinstance(value, list):
++        return [_cast_value(_math_scalar(name, item), dtype) for item in value]
++    return _cast_value(_math_scalar(name, value), dtype)
++
++
+ def _binary_value(name: str, left: Any, right: Any, output_type: CoreType) -> Any:
+     output_dtype = canonical_dtype(output_type.dtype)
+     operation: Callable[[Any, Any], Any]
+@@ -431,6 +498,80 @@ def _unary_value(value: Any, operation: Callable[[Any], Any], output_type: CoreT
+     return _cast_value(operation(value), dtype)
+ 
+ 
++def _broadcast_value(value: Any, input_type: CoreType, output_type: CoreType) -> List[Any]:
++    """Materialize a validated logical broadcast into a flat output tensor."""
++
++    output_shape = static_shape(output_type, "broadcast output")
++    output_count = element_count(output_shape)
++    output_dtype = canonical_dtype(output_type.dtype)
++    if _is_scalar(input_type):
++        return [_cast_value(value, output_dtype) for _ in range(output_count)]
++    input_shape = static_shape(input_type, "broadcast input")
++    if not isinstance(value, list) or len(value) != element_count(input_shape):
++        raise CpuScalarExecutionError("broadcast input storage length mismatch")
++    rank_delta = len(output_shape) - len(input_shape)
++    result = []
++    for output_index in range(output_count):
++        output_coords = _unravel(output_index, output_shape)
++        input_coords = []
++        for axis, dimension in enumerate(input_shape):
++            output_axis = axis + rank_delta
++            coordinate = output_coords[output_axis]
++            input_coords.append(0 if dimension == 1 else coordinate)
++        input_index = _ravel(input_coords, input_shape)
++        result.append(_cast_value(value[input_index], output_dtype))
++    return result
++
++
++def _where_value(
++    condition: Any,
++    condition_type: CoreType,
++    true_value: Any,
++    true_type: CoreType,
++    false_value: Any,
++    false_type: CoreType,
++    output_type: CoreType,
++) -> Any:
++    """Execute a validated, trailing-axis broadcasted selection."""
++
++    output_shape = static_shape(output_type, "where output") if _is_tensor(output_type) else ()
++    output_count = element_count(output_shape) if _is_tensor(output_type) else 1
++    output_dtype = canonical_dtype(output_type.dtype)
++    sources = (
++        (condition, condition_type, "where condition"),
++        (true_value, true_type, "where input"),
++        (false_value, false_type, "where other"),
++    )
++    prepared = []
++    for value, value_type, context in sources:
++        if _is_scalar(value_type):
++            prepared.append((value, value_type, None))
++            continue
++        input_shape = static_shape(value_type, context)
++        if not isinstance(value, list) or len(value) != element_count(input_shape):
++            raise CpuScalarExecutionError("{} storage length mismatch".format(context))
++        prepared.append((value, value_type, input_shape))
++
++    def source_at(item: Tuple[Any, CoreType, Any], output_coords: Tuple[int, ...]) -> Any:
++        value, value_type, input_shape = item
++        if input_shape is None:
++            return value
++        rank_delta = len(output_shape) - len(input_shape)
++        coordinates = []
++        for axis, dimension in enumerate(input_shape):
++            coordinate = output_coords[axis + rank_delta]
++            coordinates.append(0 if dimension == 1 else coordinate)
++        return value[_ravel(coordinates, input_shape)]
++
++    selected = []
++    for output_index in range(output_count):
++        coordinates = _unravel(output_index, output_shape)
++        predicate = source_at(prepared[0], coordinates)
++        selected_value = source_at(prepared[1], coordinates) if predicate else source_at(prepared[2], coordinates)
++        selected.append(_cast_value(selected_value, output_dtype))
++    return selected[0] if _is_scalar(output_type) else selected
++
++
+ def _reduce_value(
+     name: str,
+     values: Sequence[Any],
+@@ -470,6 +611,13 @@ def _reduce_value(
+             aggregate = 0
+             for value in candidates:
+                 aggregate += value
++        elif name == "reduce_mean":
++            if not candidates:
++                raise CpuScalarExecutionError("reduce_mean has an empty reduction group")
++            aggregate = 0
++            for value in candidates:
++                aggregate += value
++            aggregate /= len(candidates)
+         else:
+             if not candidates:
+                 raise CpuScalarExecutionError("reduce_max has an empty reduction group")
+@@ -531,6 +679,17 @@ def _unravel(index: int, shape: Sequence[int]) -> Tuple[int, ...]:
+     return tuple(coordinates)
+ 
+ 
++def _ravel(coordinates: Sequence[int], shape: Sequence[int]) -> int:
++    if len(coordinates) != len(shape):
++        raise CpuScalarExecutionError("coordinate rank does not match shape rank")
++    index = 0
++    for coordinate, dimension in zip(coordinates, shape):
++        if coordinate < 0 or coordinate >= dimension:
++            raise CpuScalarExecutionError("coordinate is outside tensor shape")
++        index = index * dimension + coordinate
++    return index
++
++
+ __all__ = [
+     "CPUScalarRuntime",
+     "CpuScalarBackend",
+diff --git a/python/pypto/frontend/pil_core_bridge.py b/python/pypto/frontend/pil_core_bridge.py
+index 8f4e9b327..5ad1b1ffe 100644
+--- a/python/pypto/frontend/pil_core_bridge.py
++++ b/python/pypto/frontend/pil_core_bridge.py
+@@ -73,7 +73,39 @@ _PORTABLE_OP_NAMES = {
+     "pypto.op.math.neg": "neg",
+     "pypto.op.reduction.sum": "reduce_sum",
+     "pypto.op.reduction.amax": "reduce_max",
++    "tensor.reduce_mean": "reduce_mean",
++    "pil.reduce_mean": "reduce_mean",
++    "pypto.reduce_mean": "reduce_mean",
++    "pypto.op.reduction.mean": "reduce_mean",
++    "pypto.op.reduction.reduce_mean": "reduce_mean",
+     "pypto.op.matmul.matmul": "matmul",
++    "tensor.cast": "cast",
++    "pypto.cast": "cast",
++    "pypto.op.mutating.cast": "cast",
++    "tensor.exp": "exp",
++    "pypto.exp": "exp",
++    "pypto.op.math.exp": "exp",
++    "tensor.rsqrt": "rsqrt",
++    "pypto.rsqrt": "rsqrt",
++    "pypto.op.math.rsqrt": "rsqrt",
++    "tensor.sigmoid": "sigmoid",
++    "pypto.sigmoid": "sigmoid",
++    "pypto.operator.sigmoid": "sigmoid",
++    "pypto.op.math.sigmoid": "sigmoid",
++    "tensor.silu": "silu",
++    "pypto.silu": "silu",
++    "pypto.op.math.silu": "silu",
++    "pypto.operator.silu": "silu",
++    "tensor.softplus": "softplus",
++    "pypto.softplus": "softplus",
++    "pypto.op.math.softplus": "softplus",
++    "pypto.operator.softplus": "softplus",
++    "tensor.broadcast": "broadcast",
++    "pypto.broadcast": "broadcast",
++    "pypto.op.other.broadcast": "broadcast",
++    "tensor.where": "where",
++    "pypto.where": "where",
++    "pypto.op.other.where": "where",
+     "tensor.identity": "identity",
+     "tensor.copy": "copy",
+ }
+@@ -498,7 +530,11 @@ class _PilExporter:
+                 self._check_inferred_type(op_name, inputs, output, path)
+             return output
+         inferred: Optional[CoreType] = None
+-        if op_name in {"identity", "neg"} and len(inputs) == 1 and self._type_known(inputs[0].type):
++        if (
++            op_name in {"identity", "neg", "exp", "rsqrt", "sigmoid", "silu", "softplus"}
++            and len(inputs) == 1
++            and self._type_known(inputs[0].type)
++        ):
+             inferred = inputs[0].type
+         elif op_name in {"add", "sub", "mul", "div"} and len(inputs) == 2:
+             left, right = inputs
+@@ -544,7 +580,11 @@ class _PilExporter:
+         output: ValueRef,
+         path: str,
+     ) -> None:
+-        if op_name in {"identity", "neg"} and len(inputs) == 1 and self._type_known(inputs[0].type):
++        if (
++            op_name in {"identity", "neg", "exp", "rsqrt", "sigmoid", "silu", "softplus"}
++            and len(inputs) == 1
++            and self._type_known(inputs[0].type)
++        ):
+             if inputs[0].type != output.type:
+                 self.diagnostic(path, "type_conflict", f"{op_name} result CoreType 与输入不一致")
+         elif op_name in {"add", "sub", "mul", "div"} and len(inputs) == 2:
+diff --git a/python/pypto/lowering/cpu/__init__.py b/python/pypto/lowering/cpu/__init__.py
+index 99256b560..36e783102 100644
+--- a/python/pypto/lowering/cpu/__init__.py
++++ b/python/pypto/lowering/cpu/__init__.py
+@@ -95,9 +95,65 @@ OP_ALIASES = {
+     "matmul": "matmul",
+     "tensor.matmul": "matmul",
+     "linalg.matmul": "matmul",
++    "cast": "cast",
++    "tensor.cast": "cast",
++    "core.cast": "cast",
++    "pypto.cast": "cast",
++    "pypto.op.mutating.cast": "cast",
++    "exp": "exp",
++    "tensor.exp": "exp",
++    "elementwise.exp": "exp",
++    "pypto.exp": "exp",
++    "pypto.op.math.exp": "exp",
++    "rsqrt": "rsqrt",
++    "tensor.rsqrt": "rsqrt",
++    "elementwise.rsqrt": "rsqrt",
++    "pypto.rsqrt": "rsqrt",
++    "pypto.op.math.rsqrt": "rsqrt",
++    "sigmoid": "sigmoid",
++    "tensor.sigmoid": "sigmoid",
++    "elementwise.sigmoid": "sigmoid",
++    "pypto.sigmoid": "sigmoid",
++    "pypto.operator.sigmoid": "sigmoid",
++    "pypto.op.math.sigmoid": "sigmoid",
++    "silu": "silu",
++    "swish": "silu",
++    "tensor.silu": "silu",
++    "elementwise.silu": "silu",
++    "pypto.silu": "silu",
++    "pypto.op.math.silu": "silu",
++    "pypto.operator.silu": "silu",
++    "softplus": "softplus",
++    "tensor.softplus": "softplus",
++    "elementwise.softplus": "softplus",
++    "pypto.softplus": "softplus",
++    "pypto.op.math.softplus": "softplus",
++    "pypto.operator.softplus": "softplus",
++    "reduce_mean": "reduce_mean",
++    "reduce.mean": "reduce_mean",
++    "tensor.reduce_mean": "reduce_mean",
++    "mean": "reduce_mean",
++    "pypto.reduce_mean": "reduce_mean",
++    "pypto.op.reduction.mean": "reduce_mean",
++    "pypto.op.reduction.reduce_mean": "reduce_mean",
++    "broadcast": "broadcast",
++    "broadcast_to": "broadcast",
++    "tensor.broadcast": "broadcast",
++    "core.broadcast": "broadcast",
++    "pypto.broadcast": "broadcast",
++    "pypto.op.other.broadcast": "broadcast",
++    "expand": "broadcast",
++    "where": "where",
++    "select": "where",
++    "tensor.where": "where",
++    "core.where": "where",
++    "pypto.where": "where",
++    "pypto.op.other.where": "where",
++    "operator.where": "where",
+ }
+ SUPPORTED_OPERATIONS = frozenset(OP_ALIASES)
+ DIVISION_DTYPES = frozenset({"float16", "bf16", "float32", "float64"})
++FLOAT_DTYPES = frozenset({"float16", "bf16", "float32", "float64"})
+ 
+ 
+ def canonical_operation_name(name: str) -> str:
+@@ -221,6 +277,185 @@ def reduced_shape(input_shape: Sequence[int], attributes: Mapping[str, Any], con
+     return tuple(dimension for axis, dimension in enumerate(shape) if axis not in axes)
+ 
+ 
++def _broadcast_shape(shapes: Sequence[Sequence[int]], context: str) -> Tuple[int, ...]:
++    """Return the trailing-axis broadcast shape for concrete tensor shapes.
++
++    The scalar reference uses the same logical rule for ``broadcast`` and
++    ``where``.  A zero-sized axis is compatible with a singleton axis and
++    remains zero, which lets empty tensors stay empty without touching a
++    source element.
++    """
++
++    normalized = [tuple(shape) for shape in shapes]
++    rank = max((len(shape) for shape in normalized), default=0)
++    result = []
++    for offset in range(1, rank + 1):
++        dimensions = [shape[-offset] for shape in normalized if len(shape) >= offset]
++        non_singleton = [dimension for dimension in dimensions if dimension != 1]
++        if not non_singleton:
++            result.append(1)
++            continue
++        if all(dimension in (0, 1) for dimension in dimensions):
++            result.append(0 if 0 in dimensions else 1)
++            continue
++        first = non_singleton[0]
++        if any(dimension != first for dimension in non_singleton):
++            raise CpuScalarValidationError(
++                "{} shapes {} are not broadcast-compatible".format(context, normalized)
++            )
++        result.append(first)
++    return tuple(reversed(result))
++
++
++def _shape_attribute(attributes: Mapping[str, Any], context: str) -> Optional[Tuple[int, ...]]:
++    """Read an optional target shape using the Core operation attribute spellings."""
++
++    present = [key for key in ("shape", "target_shape", "out_shape") if key in attributes]
++    if not present:
++        return None
++    if len(present) > 1:
++        values = [attributes[key] for key in present]
++        if any(value != values[0] for value in values[1:]):
++            raise CpuScalarValidationError("{} contains conflicting target shape attributes".format(context))
++    raw = attributes[present[0]]
++    if isinstance(raw, (str, bytes)):
++        raise CpuScalarValidationError("{} shape must be a sequence of non-negative integers".format(context))
++    try:
++        dimensions = tuple(raw)
++    except TypeError as exc:
++        raise CpuScalarValidationError("{} shape must be a sequence of non-negative integers".format(context)) from exc
++    for index, dimension in enumerate(dimensions):
++        if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension < 0:
++            raise CpuScalarValidationError(
++                "{} shape[{}] must be a non-negative integer".format(context, index)
++            )
++    return dimensions
++
++
++def _cast_target_dtype(operation: Operation, output_type: CoreType, context: str) -> str:
++    """Validate optional cast target attributes against the output CoreType."""
++
++    keys = ("dtype", "to", "target_dtype", "out_dtype")
++    present = [key for key in keys if key in _attrs(operation)]
++    output_dtype = canonical_dtype(output_type.dtype)
++    if not present:
++        return output_dtype
++    normalized = []
++    for key in present:
++        try:
++            normalized.append(canonical_dtype(_attrs(operation)[key]))
++        except (TypeError, ValueError) as exc:
++            raise CpuScalarValidationError("{} cast target dtype is invalid".format(context)) from exc
++    if any(value != normalized[0] for value in normalized[1:]) or normalized[0] != output_dtype:
++        raise CpuScalarValidationError(
++            "{} cast target dtype does not match output dtype {!r}".format(context, output_type.dtype)
++        )
++    return output_dtype
++
++
++def _validate_cast_attributes(operation: Operation, context: str) -> None:
++    """Reject cast modes that the portable scalar contract cannot reproduce."""
++
++    for key in ("mode", "cast_mode"):
++        if key not in _attrs(operation):
++            continue
++        value = _attrs(operation)[key]
++        text = str(getattr(value, "value", value)).strip().lower()
++        if text not in ("none", "cast_none", "0"):
++            raise CpuScalarUnsupportedError(
++                "{} cast mode {!r} is unsupported; only CAST_NONE is portable".format(context, value)
++            )
++    for key in ("satmode", "saturation", "saturate"):
++        if key not in _attrs(operation):
++            continue
++        value = _attrs(operation)[key]
++        text = str(getattr(value, "value", value)).strip().lower()
++        if text not in ("off", "false", "0") and value is not False:
++            raise CpuScalarUnsupportedError(
++                "{} cast saturation {!r} is unsupported in the scalar portable subset".format(context, value)
++            )
++
++
++def _validate_unary_math(operation: Operation, context: str) -> None:
++    if len(operation.inputs) != 1:
++        raise CpuScalarValidationError(
++            "{} {} requires one input".format(context, canonical_operation_name(operation.name))
++        )
++    output_type = _one_output(operation, canonical_operation_name(operation.name))
++    input_type = operation.inputs[0].type
++    if not (_is_tensor(input_type) or _is_scalar(input_type)) or not (
++        _is_tensor(output_type) or _is_scalar(output_type)
++    ):
++        raise CpuScalarUnsupportedError("{} unary math only supports tensor/scalar values".format(context))
++    _validate_dtype(input_type, context + ".input")
++    _validate_dtype(output_type, context + ".output")
++    if input_type.kind != output_type.kind or canonical_dtype(input_type.dtype) != canonical_dtype(output_type.dtype):
++        raise CpuScalarValidationError("{} unary input and output must have matching kind and dtype".format(context))
++    if _is_tensor(input_type) and input_type.shape != output_type.shape:
++        raise CpuScalarValidationError("{} unary input and output shapes must match".format(context))
++    if canonical_dtype(input_type.dtype) not in FLOAT_DTYPES:
++        raise CpuScalarUnsupportedError("{} requires a floating-point dtype".format(context))
++    if _is_tensor(input_type):
++        static_shape(input_type, context + ".input")
++
++
++def _validate_broadcast_input(input_type: CoreType, output_type: CoreType, context: str) -> None:
++    if not _is_tensor(output_type):
++        raise CpuScalarUnsupportedError("{} output must be a tensor".format(context))
++    _validate_dtype(input_type, context + ".input")
++    _validate_dtype(output_type, context + ".output")
++    if canonical_dtype(input_type.dtype) != canonical_dtype(output_type.dtype):
++        raise CpuScalarValidationError("{} input and output dtypes must match".format(context))
++    output_shape = static_shape(output_type, context + ".output")
++    if _is_scalar(input_type):
++        return
++    if not _is_tensor(input_type):
++        raise CpuScalarUnsupportedError("{} input kind {!r} is unsupported".format(context, input_type.kind))
++    input_shape = static_shape(input_type, context + ".input")
++    if _broadcast_shape((input_shape, output_shape), context) != output_shape:
++        raise CpuScalarValidationError(
++            "{} input shape {} cannot produce output shape {}".format(context, input_shape, output_shape)
++        )
++
++
++def _validate_where(operation: Operation, context: str) -> None:
++    if len(operation.inputs) != 3:
++        raise CpuScalarValidationError("{} where requires condition, input, and other".format(context))
++    output_type = _one_output(operation, "where")
++    condition_type, true_type, false_type = (ref.type for ref in operation.inputs)
++    for value_type, label in ((condition_type, "condition"), (true_type, "input"), (false_type, "other")):
++        if not (_is_tensor(value_type) or _is_scalar(value_type)):
++            raise CpuScalarUnsupportedError("{} {} kind {!r} is unsupported".format(context, label, value_type.kind))
++        _validate_dtype(value_type, context + "." + label)
++        if _is_tensor(value_type):
++            static_shape(value_type, context + "." + label)
++    if canonical_dtype(condition_type.dtype) != "bool":
++        raise CpuScalarValidationError("{} condition must have bool dtype".format(context))
++    if not (_is_tensor(output_type) or _is_scalar(output_type)):
++        raise CpuScalarUnsupportedError("{} output kind {!r} is unsupported".format(context, output_type.kind))
++    _validate_dtype(output_type, context + ".output")
++    true_dtype = canonical_dtype(true_type.dtype)
++    false_dtype = canonical_dtype(false_type.dtype)
++    output_dtype = canonical_dtype(output_type.dtype)
++    if true_dtype != false_dtype or true_dtype != output_dtype:
++        raise CpuScalarValidationError("{} selected values and output must have one dtype".format(context))
++    tensor_types = [value_type for value_type in (condition_type, true_type, false_type) if _is_tensor(value_type)]
++    if not tensor_types:
++        if not _is_scalar(output_type):
++            raise CpuScalarValidationError("{} scalar where output must be scalar".format(context))
++        return
++    if not _is_tensor(output_type):
++        raise CpuScalarValidationError("{} tensor where output must be tensor".format(context))
++    shapes = [static_shape(value_type, context + ".shape") for value_type in tensor_types]
++    expected_shape = _broadcast_shape(shapes, context + ".where")
++    if static_shape(output_type, context + ".output") != expected_shape:
++        raise CpuScalarValidationError(
++            "{} output shape {} does not match broadcast shape {}".format(
++                context, output_type.shape, expected_shape
++            )
++        )
++
++
+ def _constant_values(operation: Operation, output_type: CoreType) -> Any:
+     attributes = _attrs(operation)
+     has_value = "value" in attributes
+@@ -296,6 +531,30 @@ def _validate_operation(operation: Operation, context: str) -> None:
+         if _is_tensor(output_type):
+             static_shape(output_type, context + ".output")
+         return
++    if name == "cast":
++        if len(inputs) != 1:
++            raise CpuScalarValidationError("{} cast requires one input".format(context))
++        output_type = _one_output(operation, name)
++        input_type = inputs[0].type
++        if not (_is_tensor(input_type) or _is_scalar(input_type)):
++            raise CpuScalarUnsupportedError("{} cast input kind {!r} is unsupported".format(context, input_type.kind))
++        if not (_is_tensor(output_type) or _is_scalar(output_type)):
++            raise CpuScalarUnsupportedError("{} cast output kind {!r} is unsupported".format(context, output_type.kind))
++        _validate_dtype(input_type, context + ".input")
++        _validate_dtype(output_type, context + ".output")
++        if input_type.kind != output_type.kind:
++            raise CpuScalarValidationError("{} cast must preserve tensor/scalar value kind".format(context))
++        if _is_tensor(input_type):
++            static_shape(input_type, context + ".input")
++            static_shape(output_type, context + ".output")
++            if input_type.shape != output_type.shape:
++                raise CpuScalarValidationError("{} cast cannot change tensor shape".format(context))
++        _cast_target_dtype(operation, output_type, context)
++        _validate_cast_attributes(operation, context)
++        return
++    if name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++        _validate_unary_math(operation, context)
++        return
+     if name in ("add", "sub", "mul", "div"):
+         if len(inputs) != 2:
+             raise CpuScalarValidationError("{} {} requires two inputs".format(context, name))
+@@ -348,7 +607,7 @@ def _validate_operation(operation: Operation, context: str) -> None:
+         if _is_tensor(output_type):
+             static_shape(output_type, context + ".output")
+         return
+-    if name in ("reduce_sum", "reduce_max"):
++    if name in ("reduce_sum", "reduce_max", "reduce_mean"):
+         if len(inputs) != 1:
+             raise CpuScalarValidationError("{} {} requires one input".format(context, name))
+         input_type = inputs[0].type
+@@ -361,6 +620,8 @@ def _validate_operation(operation: Operation, context: str) -> None:
+             raise CpuScalarUnsupportedError(
+                 "{} {} does not support bool; bool is limited to constant and identity".format(context, name)
+             )
++        if name == "reduce_mean" and canonical_dtype(input_type.dtype) not in FLOAT_DTYPES:
++            raise CpuScalarUnsupportedError("{} reduce_mean requires a floating-point dtype".format(context))
+         _same_dtype(input_type, output_type, context + ".reduction dtype")
+         input_shape = static_shape(input_type, context + ".input")
+         output_shape = static_shape(output_type, context + ".output")
+@@ -370,6 +631,22 @@ def _validate_operation(operation: Operation, context: str) -> None:
+                 "{} reduction output shape {} does not match expected {}".format(context, output_shape, expected_shape)
+             )
+         return
++    if name == "broadcast":
++        if len(inputs) != 1:
++            raise CpuScalarValidationError("{} broadcast requires one input".format(context))
++        output_type = _one_output(operation, name)
++        _validate_broadcast_input(inputs[0].type, output_type, context)
++        declared_shape = _shape_attribute(_attrs(operation), context + ".broadcast")
++        if declared_shape is not None and declared_shape != static_shape(output_type, context + ".output"):
++            raise CpuScalarValidationError(
++                "{} declared shape {} does not match output shape {}".format(
++                    context, declared_shape, output_type.shape
++                )
++            )
++        return
++    if name == "where":
++        _validate_where(operation, context)
++        return
+     if name == "matmul":
+         if len(inputs) != 2:
+             raise CpuScalarValidationError("{} matmul requires two inputs".format(context))
+@@ -485,6 +762,7 @@ __all__ = [
+     "canonical_operation_name",
+     "element_count",
+     "flatten_values",
++    "FLOAT_DTYPES",
+     "lower",
+     "lower_cpu_scalar",
+     "reduced_shape",
+diff --git a/python/pypto/lowering/cpu/vector/plan.py b/python/pypto/lowering/cpu/vector/plan.py
+index 9a1e1659f..88bde0030 100644
+--- a/python/pypto/lowering/cpu/vector/plan.py
++++ b/python/pypto/lowering/cpu/vector/plan.py
+@@ -36,6 +36,9 @@ VECTOR_PLAN_VERSION = 1
+ VECTOR_LOWERING_VERSION = 1
+ CPU_VECTOR_BACKEND = "cpu.vector.common"
+ DEFAULT_LANE_COUNT = 4
++VECTOR_SUPPORTED_OPERATIONS = frozenset(
++    ("constant", "identity", "add", "sub", "mul", "div", "neg", "reduce_sum", "reduce_max", "matmul")
++)
+ _SSA_NAME_RE = re.compile(r"^(?:%[A-Za-z0-9_.$-]+|[A-Za-z_][A-Za-z0-9_.$-]*)$")
+ 
+ 
+@@ -857,6 +860,10 @@ def _make_plan_for_operation(
+     specialization: Mapping[str, Any],
+ ) -> VectorPlan:
+     name = canonical_operation_name(operation.name)
++    if name not in VECTOR_SUPPORTED_OPERATIONS:
++        raise CpuVectorUnsupportedError(
++            "CPU vector common does not support operation {!r}; it is pending a later target lowering".format(name)
++        )
+     if len(operation.outputs) != 1:
+         raise CpuVectorValidationError("operation {} must have exactly one output".format(operation_index))
+     output = operation.outputs[0]
+@@ -1187,6 +1194,7 @@ lower = lower_cpu_vector
+ 
+ __all__ = [
+     "CPU_VECTOR_BACKEND",
++    "VECTOR_SUPPORTED_OPERATIONS",
+     "DEFAULT_LANE_COUNT",
+     "VECTOR_LOWERING_VERSION",
+     "VECTOR_PLAN_VERSION",
+diff --git a/python/pypto/lowering/gpu/plan.py b/python/pypto/lowering/gpu/plan.py
+index f6423ffe8..996d1af9c 100644
+--- a/python/pypto/lowering/gpu/plan.py
++++ b/python/pypto/lowering/gpu/plan.py
+@@ -729,6 +729,10 @@ def _make_plan_for_operation(
+     specialization: Mapping[str, Any],
+ ) -> GpuKernelPlan:
+     name = canonical_operation_name(operation.name)
++    if name not in GPU_SUPPORTED_OPERATIONS:
++        raise GpuUnsupportedError(
++            "GPU common does not support operation {!r}; it is pending a later target lowering".format(name)
++        )
+     if len(operation.outputs) != 1:
+         raise GpuValidationError("operation {} must have exactly one output".format(operation_index))
+     output = operation.outputs[0]
+diff --git a/python/tests/ut/pypto_x/test_cpu_scalar_m1a.py b/python/tests/ut/pypto_x/test_cpu_scalar_m1a.py
+new file mode 100644
+index 000000000..f5651170b
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cpu_scalar_m1a.py
+@@ -0,0 +1,258 @@
++"""M1A portable primitive tests for the CPU scalar correctness reference.
++
++The tests intentionally use only the standard library and the existing host
++buffer ABI.  They do not import the native ``pypto`` initializer, third-party
++tensor libraries, or model weights.
++"""
++
++from __future__ import annotations
++
++import math
++import sys
++import types
++from pathlib import Path
++
++import pytest
++from pypto_x.harness import compare_outputs
++
++
++def _imports():
++    package_root = Path(__file__).parents[3] / "pypto"
++    saved = {name: module for name, module in sys.modules.items() if name == "pypto" or name.startswith("pypto.")}
++    for name in list(saved):
++        del sys.modules[name]
++    package = types.ModuleType("pypto")
++    package.__path__ = [str(package_root)]
++    sys.modules["pypto"] = package
++    try:
++        from pypto.abi import LaunchRequest
++        from pypto.backends.cpu import CpuScalarExecutionError, CpuScalarRuntime, HostTensor
++        from pypto.compiler.targets.cpu import CpuScalarCompiler
++        from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++        from pypto.lowering.cpu import CpuScalarUnsupportedError, CpuScalarValidationError, canonical_operation_name
++        from pypto.target import TargetSpec
++        return locals()
++    finally:
++        for name in list(sys.modules):
++            if name == "pypto" or name.startswith("pypto."):
++                del sys.modules[name]
++        sys.modules.update(saved)
++
++
++_C = _imports()
++LaunchRequest = _C["LaunchRequest"]
++CpuScalarExecutionError = _C["CpuScalarExecutionError"]
++CpuScalarRuntime = _C["CpuScalarRuntime"]
++HostTensor = _C["HostTensor"]
++CpuScalarCompiler = _C["CpuScalarCompiler"]
++CoreFunction = _C["CoreFunction"]
++CoreProgram = _C["CoreProgram"]
++CoreType = _C["CoreType"]
++Operation = _C["Operation"]
++Region = _C["Region"]
++ValueRef = _C["ValueRef"]
++CpuScalarUnsupportedError = _C["CpuScalarUnsupportedError"]
++CpuScalarValidationError = _C["CpuScalarValidationError"]
++canonical_operation_name = _C["canonical_operation_name"]
++TargetSpec = _C["TargetSpec"]
++
++
++TARGET = TargetSpec("cpu", "x86_64-linux-gnu")
++
++
++def _program(name, parameters, returns, operations):
++    return CoreProgram(functions=(CoreFunction(name, parameters, returns, Region(tuple(operations))),))
++
++
++def _compile(program):
++    compiler = CpuScalarCompiler()
++    return compiler.compile(compiler.lower(program, TARGET))
++
++
++def _run(program, inputs, output):
++    artifact = _compile(program)
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[tensor.descriptor(readonly=True) for tensor in inputs],
++            outputs=[output.descriptor()],
++        )
++    )
++
++
++def test_m1a_operation_aliases_are_canonical_and_stable():
++    aliases = {
++        "tensor.cast": "cast",
++        "pypto.op.math.exp": "exp",
++        "pypto.op.math.rsqrt": "rsqrt",
++        "pypto.operator.sigmoid": "sigmoid",
++        "swish": "silu",
++        "pypto.op.math.softplus": "softplus",
++        "reduce.mean": "reduce_mean",
++        "broadcast_to": "broadcast",
++        "pypto.op.other.where": "where",
++    }
++    assert {name: canonical_operation_name(name) for name in aliases} == aliases
++
++
++def test_cast_changes_dtype_without_changing_shape():
++    source_type = CoreType.tensor("float32", (4,))
++    output_type = CoreType.tensor("bf16", (4,))
++    source = ValueRef("source", source_type)
++    output = ValueRef("output", output_type)
++    program = _program(
++        "cast",
++        (source,),
++        (output,),
++        (Operation("cast", (source,), (output,), attributes={"dtype": "bfloat16"}),),
++    )
++    destination = HostTensor.zeros("bf16", (4,))
++    _run(program, [HostTensor("float32", (4,), [1.0, -2.5, 0.0, 3.25])], destination)
++    assert destination.tolist() == [1.0, -2.5, 0.0, 3.25]
++
++
++def test_unary_math_is_stable_for_large_inputs():
++    value_type = CoreType.tensor("float32", (5,))
++    source = ValueRef("source", value_type)
++    output = ValueRef("output", value_type)
++    values = [-100.0, -1.0, 0.0, 1.0, 100.0]
++    for name in ("sigmoid", "silu", "softplus"):
++        program = _program(name, (source,), (output,), (Operation(name, (source,), (output,)),))
++        destination = HostTensor.zeros("float32", (5,))
++        _run(program, [HostTensor("float32", (5,), values)], destination)
++        if name == "sigmoid":
++            expected = [
++                1.0 / (1.0 + math.exp(100.0)),
++                1.0 / (1.0 + math.exp(1.0)),
++                0.5,
++                1.0 / (1.0 + math.exp(-1.0)),
++                1.0,
++            ]
++        elif name == "silu":
++            expected = [
++                -100.0 / (1.0 + math.exp(100.0)),
++                -1.0 / (1.0 + math.exp(1.0)),
++                0.0,
++                1.0 / (1.0 + math.exp(-1.0)),
++                100.0,
++            ]
++        else:
++            expected = [
++                math.log1p(math.exp(-100.0)),
++                math.log1p(math.exp(-1.0)),
++                math.log(2.0),
++                math.log1p(math.exp(-1.0)) + 1.0,
++                100.0,
++            ]
++        report = compare_outputs(destination.tolist(), expected, atol=1e-6, rtol=1e-6)
++        assert report.passed, report.message
++
++
++def test_exp_and_rsqrt_execute_and_invalid_rsqrt_is_explicit():
++    value_type = CoreType.tensor("float32", (3,))
++    source = ValueRef("source", value_type)
++    output = ValueRef("output", value_type)
++    exp_program = _program("exp", (source,), (output,), (Operation("exp", (source,), (output,)),))
++    exp_output = HostTensor.zeros("float32", (3,))
++    _run(exp_program, [HostTensor("float32", (3,), [-1.0, 0.0, 1.0])], exp_output)
++    assert exp_output.flat() == pytest.approx([math.exp(-1.0), 1.0, math.exp(1.0)])
++
++    rsqrt_program = _program("rsqrt", (source,), (output,), (Operation("rsqrt", (source,), (output,)),))
++    rsqrt_output = HostTensor.zeros("float32", (3,))
++    _run(rsqrt_program, [HostTensor("float32", (3,), [1.0, 4.0, 16.0])], rsqrt_output)
++    assert rsqrt_output.tolist() == [1.0, 0.5, 0.25]
++    with pytest.raises(CpuScalarExecutionError, match="rsqrt input"):
++        _run(rsqrt_program, [HostTensor("float32", (3,), [1.0, 0.0, 16.0])], rsqrt_output)
++
++
++def test_reduce_mean_broadcast_and_where_use_shape_contract():
++    input_type = CoreType.tensor("float32", (2, 3))
++    mean_type = CoreType.tensor("float32", (2, 1))
++    source = ValueRef("source", input_type)
++    mean = ValueRef("mean", mean_type)
++    mean_program = _program(
++        "mean",
++        (source,),
++        (mean,),
++        (Operation("reduce_mean", (source,), (mean,), attributes={"axis": 1, "keepdims": True}),),
++    )
++    mean_output = HostTensor.zeros("float32", (2, 1))
++    _run(mean_program, [HostTensor("float32", (2, 3), [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])], mean_output)
++    assert mean_output.tolist() == [[2.0], [5.0]]
++
++    broadcast_type = CoreType.tensor("float32", (2, 3))
++    broadcast_source = ValueRef("broadcast_source", mean_type)
++    broadcast_output = ValueRef("broadcast_output", broadcast_type)
++    broadcast_program = _program(
++        "broadcast",
++        (broadcast_source,),
++        (broadcast_output,),
++        (
++            Operation(
++                "broadcast",
++                (broadcast_source,),
++                (broadcast_output,),
++                attributes={"shape": [2, 3]},
++            ),
++        ),
++    )
++    expanded = HostTensor.zeros("float32", (2, 3))
++    _run(broadcast_program, [HostTensor("float32", (2, 1), [[2.0], [5.0]])], expanded)
++    assert expanded.tolist() == [[2.0, 2.0, 2.0], [5.0, 5.0, 5.0]]
++
++    condition_type = CoreType.tensor("bool", (2, 1))
++    true_type = CoreType.tensor("float32", (1, 3))
++    false_type = CoreType.tensor("float32", (2, 3))
++    condition = ValueRef("condition", condition_type)
++    true_value = ValueRef("true_value", true_type)
++    false_value = ValueRef("false_value", false_type)
++    selected = ValueRef("selected", broadcast_type)
++    where_program = _program(
++        "where",
++        (condition, true_value, false_value),
++        (selected,),
++        (Operation("where", (condition, true_value, false_value), (selected,)),),
++    )
++    where_output = HostTensor.zeros("float32", (2, 3))
++    _run(
++        where_program,
++        [
++            HostTensor("bool", (2, 1), [[True], [False]]),
++            HostTensor("float32", (1, 3), [[1.0, 2.0, 3.0]]),
++            HostTensor("float32", (2, 3), [[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]]),
++        ],
++        where_output,
++    )
++    assert where_output.tolist() == [[1.0, 2.0, 3.0], [40.0, 50.0, 60.0]]
++
++
++def test_m1a_invalid_dtypes_shapes_and_attributes_fail_during_lowering():
++    int_type = CoreType.tensor("int32", (2,))
++    float_type = CoreType.tensor("float32", (2,))
++    source = ValueRef("source", int_type)
++    output = ValueRef("output", int_type)
++    int_exp = _program("int_exp", (source,), (output,), (Operation("exp", (source,), (output,)),))
++    with pytest.raises(CpuScalarUnsupportedError, match="floating-point"):
++        CpuScalarCompiler().lower(int_exp, TARGET)
++
++    cast_output = ValueRef("cast_output", float_type)
++    bad_cast = _program(
++        "bad_cast",
++        (source,),
++        (cast_output,),
++        (Operation("cast", (source,), (cast_output,), attributes={"dtype": "float16"}),),
++    )
++    with pytest.raises(CpuScalarValidationError, match="does not match output dtype"):
++        CpuScalarCompiler().lower(bad_cast, TARGET)
++
++    condition = ValueRef("condition", int_type)
++    true_value = ValueRef("true_value", float_type)
++    false_value = ValueRef("false_value", float_type)
++    wrong_where = _program(
++        "wrong_where",
++        (condition, true_value, false_value),
++        (cast_output,),
++        (Operation("where", (condition, true_value, false_value), (cast_output,)),),
++    )
++    with pytest.raises(CpuScalarValidationError, match="condition must have bool"):
++        CpuScalarCompiler().lower(wrong_where, TARGET)

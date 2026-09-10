@@ -1,0 +1,1511 @@
+From 237a27614e2cf773c5026874445f4b141f39e216 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Thu, 10 Sep 2026 12:20:24 +0800
+Subject: [PATCH 85/96] feat(pypto-x): add static gfx1036 layout indexing
+ control c2
+
+---
+ python/pypto/compiler/targets/hip.py                            | 971 +++++++++++++++++++++++++++-
+ .../tests/ut/pypto_x/amd_gfx1036_c2_static_validation_driver.py | 142 ++++
+ .../tests/ut/pypto_x/amd_gfx1036_qwen_capability_gap_driver.py  |  11 +-
+ python/tests/ut/pypto_x/test_hip_gfx1036_static.py              |   2 +-
+ python/tests/ut/pypto_x/test_hip_gfx1036_static_c2.py           | 188 ++++++
+ 5 files changed, 1278 insertions(+), 36 deletions(-)
+
+diff --git a/python/pypto/compiler/targets/hip.py b/python/pypto/compiler/targets/hip.py
+index 49498daf6..9567130f8 100644
+--- a/python/pypto/compiler/targets/hip.py
++++ b/python/pypto/compiler/targets/hip.py
+@@ -20,6 +20,7 @@ import json
+ import os
+ import re
+ import shutil
++import struct
+ import subprocess
+ import tempfile
+ from dataclasses import dataclass
+@@ -29,7 +30,18 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
+ from pypto.compiler.api import CompileOptions
+ from pypto.compiler.artifact import ABI_VERSION, Artifact
+ from pypto.core_ir import CoreProgram, CoreType, Operation, ValueRef
+-from pypto.lowering.cpu import canonical_dtype, canonical_operation_name, static_shape
++from pypto.lowering.cpu import (
++    _m1b_gather_axis,
++    _m1b_permutation,
++    _m1b_slice_spec,
++    _m1b_split_sizes,
++    canonical_dtype,
++    canonical_operation_name,
++    comparison_predicate_for_operation,
++    flatten_values,
++    iota_spec,
++    static_shape,
++)
+ from pypto.lowering.gpu import (
+     GPU_COMMON_BACKEND,
+     GPU_IR_VERSION,
+@@ -48,24 +60,44 @@ from pypto.target import (
+ from pypto.target._utils import frozen_mapping, mapping_copy, sha256_bytes, sha256_text
+ 
+ 
+-ARTIFACT_PAYLOAD_VERSION = 1
++ARTIFACT_PAYLOAD_VERSION = 2
+ AMDGPU_ARTIFACT_FORMAT = "pypto-x.amdgpu.llvm"
+ DEFAULT_ARTIFACT_FORMAT = AMDGPU_ARTIFACT_FORMAT
+ AMDGPU_BACKEND = "amdgpu.llvm.static"
+ AMDGPU_RUNTIME_BACKEND = "amdgpu.runtime.static"
+-AMDGPU_LLVM_IR_VERSION = "llvm.amdgcn.v1"
+-AMDGPU_LOWERING_VERSION = 1
++AMDGPU_LLVM_IR_VERSION = "llvm.amdgcn.v2"
++AMDGPU_LOWERING_VERSION = 2
+ AMDGPU_ABI_VERSION = ABI_VERSION
+ _GFX_RE = re.compile(r"^gfx[0-9]{4}$\Z")
+ AMDGPU_STATIC_SUPPORTED_OPERATIONS = (
+     "identity",
+     "add",
+     "mul",
++    "sub",
++    "div",
++    "neg",
++    "cast",
++    "constant",
++    "reshape",
++    "view",
++    "contiguous",
++    "transpose",
++    "broadcast",
++    "slice",
++    "concat",
++    "split",
++    "gather",
++    "embedding",
++    "compare",
++    "iota",
++    "where",
+     "reduce_sum",
+     "matmul",
+ )
+ _SUPPORTED_OPS = frozenset(AMDGPU_STATIC_SUPPORTED_OPERATIONS)
+ _SUPPORTED_DTYPES = frozenset(("float32", "bf16"))
++_C2_STORAGE_DTYPES = frozenset(("float32", "bf16", "int32", "int64", "bool"))
++_C2_FLOAT_DTYPES = frozenset(("float32", "bf16"))
+ 
+ 
+ class AmdgpuStaticError(ValueError):
+@@ -133,6 +165,12 @@ def _item_type(dtype: str) -> str:
+         # BF16 is storage-only in C1.  Arithmetic is performed in f32 and
+         # rounded back to the two-byte storage representation explicitly.
+         return "i16"
++    if dtype == "int32":
++        return "i32"
++    if dtype == "int64":
++        return "i64"
++    if dtype == "bool":
++        return "i8"
+     raise AmdgpuUnsupportedError("AMDGPU static backend supports only FP32/BF16 storage, got {!r}".format(dtype))
+ 
+ 
+@@ -147,6 +185,57 @@ def _element_count(shape: Sequence[int]) -> int:
+     return result
+ 
+ 
++def _value_shape(value_type: CoreType, context: str) -> Tuple[int, ...]:
++    """Return the logical shape used by the pointer ABI.
++
++    Scalar SSA values use a one-element global storage slot in this static
++    adapter.  That keeps the per-operation kernel ABI uniform and, more
++    importantly, makes Qwen's scalar constants explicit rather than silently
++    dropping them at a kernel boundary.
++    """
++
++    if _is_tensor(value_type):
++        return static_shape(value_type, context)
++    if value_type.kind == "scalar":
++        return ()
++    raise AmdgpuUnsupportedError("{} requires tensor or scalar values".format(context))
++
++
++def _value_count(value_type: CoreType, context: str) -> int:
++    return _element_count(_value_shape(value_type, context))
++
++
++def _contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
++    strides = [1] * len(shape)
++    running = 1
++    for axis in range(len(shape) - 1, -1, -1):
++        strides[axis] = running
++        running *= int(shape[axis])
++    return tuple(strides)
++
++
++def _broadcast_shape(shapes: Sequence[Sequence[int]], context: str) -> Tuple[int, ...]:
++    """Validate NumPy-style right-aligned broadcast and return its shape."""
++
++    normalized = [tuple(int(dimension) for dimension in shape) for shape in shapes]
++    rank = max((len(shape) for shape in normalized), default=0)
++    result = [1] * rank
++    for shape in normalized:
++        delta = rank - len(shape)
++        for axis, dimension in enumerate(shape):
++            target_axis = axis + delta
++            if dimension not in (1, result[target_axis]) and result[target_axis] != 1:
++                raise AmdgpuUnsupportedError(
++                    "{} shapes are not broadcast-compatible: {}".format(context, normalized)
++                )
++            result[target_axis] = max(result[target_axis], dimension)
++    return tuple(result)
++
++
++def _c2_error(context: str, exc: Exception) -> AmdgpuUnsupportedError:
++    return AmdgpuUnsupportedError("static AMDGPU {} is outside the exact C2 contract: {}".format(context, exc))
++
++
+ class _IRBuilder:
+     def __init__(self) -> None:
+         self.lines = []
+@@ -212,6 +301,62 @@ def _emit_index(builder: _IRBuilder, plan: Any) -> str:
+     return result
+ 
+ 
++def _emit_coords(builder: _IRBuilder, index: str, shape: Sequence[int]) -> Tuple[str, ...]:
++    """Unravel a row-major flat index using O(rank) arithmetic."""
++
++    shape = tuple(int(value) for value in shape)
++    coordinates = []
++    strides = _contiguous_strides(shape)
++    for axis, (dimension, stride) in enumerate(zip(shape, strides)):
++        coordinate = builder.temp("coord")
++        if dimension <= 1 or stride == 0:
++            builder.line("  {} = add i64 0, 0".format(coordinate))
++            coordinates.append(coordinate)
++            continue
++        quotient = builder.temp("quot")
++        builder.line("  {} = udiv i64 {}, {}".format(quotient, index, stride))
++        builder.line("  {} = urem i64 {}, {}".format(coordinate, quotient, dimension))
++        coordinates.append(coordinate)
++    return tuple(coordinates)
++
++
++def _emit_ravel(builder: _IRBuilder, coordinates: Sequence[str], shape: Sequence[int]) -> str:
++    """Ravel coordinates with compile-time contiguous strides."""
++
++    result = builder.temp("flat")
++    builder.line("  {} = add i64 0, 0".format(result))
++    for coordinate, stride in zip(coordinates, _contiguous_strides(tuple(shape))):
++        if stride == 0:
++            continue
++        term = builder.temp("term")
++        builder.line("  {} = mul i64 {}, {}".format(term, coordinate, stride))
++        updated = builder.temp("flat")
++        builder.line("  {} = add i64 {}, {}".format(updated, result, term))
++        result = updated
++    return result
++
++
++def _emit_broadcast_index(
++    builder: _IRBuilder,
++    output_index: str,
++    source_shape: Sequence[int],
++    output_shape: Sequence[int],
++) -> str:
++    """Map one output index to a right-aligned broadcast input index."""
++
++    source_shape = tuple(int(value) for value in source_shape)
++    output_shape = tuple(int(value) for value in output_shape)
++    if not source_shape:
++        return "0"
++    output_coords = _emit_coords(builder, output_index, output_shape)
++    delta = len(output_shape) - len(source_shape)
++    source_coords = tuple(
++        "0" if dimension == 1 else output_coords[axis + delta]
++        for axis, dimension in enumerate(source_shape)
++    )
++    return _emit_ravel(builder, source_coords, source_shape)
++
++
+ def _emit_pointer(builder: _IRBuilder, pointer: str, index: str, dtype: str) -> str:
+     item_type = _item_type(dtype)
+     result = builder.temp("ptr")
+@@ -265,6 +410,94 @@ def _emit_store(builder: _IRBuilder, pointer: str, index: str, dtype: str, value
+     builder.line("  store i16 {}, ptr addrspace(1) {}, align 2".format(result, address))
+ 
+ 
++def _emit_load_raw(builder: _IRBuilder, pointer: str, index: str, dtype: str) -> str:
++    """Load one ABI storage element without changing its representation."""
++
++    dtype = canonical_dtype(dtype)
++    item_type = _item_type(dtype)
++    address = _emit_pointer(builder, pointer, index, dtype)
++    loaded = builder.temp("load")
++    alignment = {"float32": 4, "bf16": 2, "int32": 4, "int64": 8, "bool": 1}[dtype]
++    builder.line("  {} = load {}, ptr addrspace(1) {}, align {}".format(loaded, item_type, address, alignment))
++    return loaded
++
++
++def _emit_load_i64(builder: _IRBuilder, pointer: str, index: str, dtype: str) -> str:
++    """Load an index/integer value as signed i64, preserving negative indices."""
++
++    dtype = canonical_dtype(dtype)
++    raw = _emit_load_raw(builder, pointer, index, dtype)
++    if dtype == "int64":
++        return raw
++    if dtype == "int32":
++        result = builder.temp("idx64")
++        builder.line("  {} = sext i32 {} to i64".format(result, raw))
++        return result
++    if dtype == "bool":
++        result = builder.temp("idx64")
++        builder.line("  {} = zext i8 {} to i64".format(result, raw))
++        return result
++    raise AmdgpuUnsupportedError("integer load does not support dtype {!r}".format(dtype))
++
++
++def _emit_store_raw(builder: _IRBuilder, pointer: str, index: str, dtype: str, value: str) -> None:
++    """Store a value that already has the output ABI storage type."""
++
++    dtype = canonical_dtype(dtype)
++    item_type = _item_type(dtype)
++    address = _emit_pointer(builder, pointer, index, dtype)
++    alignment = {"float32": 4, "bf16": 2, "int32": 4, "int64": 8, "bool": 1}[dtype]
++    builder.line("  store {} {}, ptr addrspace(1) {}, align {}".format(item_type, value, address, alignment))
++
++
++def _emit_store_i64(builder: _IRBuilder, pointer: str, index: str, dtype: str, value: str) -> None:
++    """Store an integer expression held in i64 using the declared storage."""
++
++    dtype = canonical_dtype(dtype)
++    if dtype == "int64":
++        _emit_store_raw(builder, pointer, index, dtype, value)
++        return
++    if dtype == "int32":
++        narrowed = builder.temp("i32")
++        builder.line("  {} = trunc i64 {} to i32".format(narrowed, value))
++        _emit_store_raw(builder, pointer, index, dtype, narrowed)
++        return
++    if dtype == "bool":
++        truth = builder.temp("truth")
++        normalized = builder.temp("bool")
++        builder.line("  {} = icmp ne i64 {}, 0".format(truth, value))
++        builder.line("  {} = zext i1 {} to i8".format(normalized, truth))
++        _emit_store_raw(builder, pointer, index, dtype, normalized)
++        return
++    raise AmdgpuUnsupportedError("integer store does not support dtype {!r}".format(dtype))
++
++
++def _emit_load_f32(builder: _IRBuilder, pointer: str, index: str, dtype: str) -> str:
++    """Load FP32/BF16 storage and expose it as f32 for arithmetic."""
++
++    dtype = canonical_dtype(dtype)
++    if dtype not in _C2_FLOAT_DTYPES:
++        raise AmdgpuUnsupportedError("floating load does not support dtype {!r}".format(dtype))
++    return _emit_load(builder, pointer, index, dtype)
++
++
++def _emit_store_f32(builder: _IRBuilder, pointer: str, index: str, dtype: str, value: str) -> None:
++    dtype = canonical_dtype(dtype)
++    if dtype not in _C2_FLOAT_DTYPES:
++        raise AmdgpuUnsupportedError("floating store does not support dtype {!r}".format(dtype))
++    _emit_store(builder, pointer, index, dtype, value)
++
++
++def _emit_load_value(builder: _IRBuilder, pointer: str, index: str, dtype: str) -> str:
++    """Load one value in its ABI type (float, i16, i32, i64, or i8)."""
++
++    return _emit_load_raw(builder, pointer, index, dtype)
++
++
++def _emit_store_value(builder: _IRBuilder, pointer: str, index: str, dtype: str, value: str) -> None:
++    _emit_store_raw(builder, pointer, index, dtype, value)
++
++
+ def _validate_tensor_pair(
+     operation: Operation,
+     name: str,
+@@ -296,6 +529,320 @@ def _validate_tensor_pair(
+     return dtype, output_shape
+ 
+ 
++def _c2_storage_ref(ref: ValueRef, context: str, *, tensor_only: bool = False) -> Tuple[str, Tuple[int, ...]]:
++    if not (_is_tensor(ref.type) or (ref.type.kind == "scalar" and not tensor_only)):
++        raise AmdgpuUnsupportedError("{} requires tensor/scalar storage values".format(context))
++    dtype = canonical_dtype(ref.type.dtype)
++    if dtype not in _C2_STORAGE_DTYPES:
++        raise AmdgpuUnsupportedError("{} does not support dtype {!r}".format(context, dtype))
++    return dtype, _value_shape(ref.type, context)
++
++
++def _c2_one_output(operation: Operation, name: str) -> ValueRef:
++    if len(operation.outputs) != 1:
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires exactly one output".format(name))
++    return operation.outputs[0]
++
++
++def _c2_attrs_call(fn: Any, *args: Any, context: str) -> Any:
++    try:
++        return fn(*args, context=context)
++    except AmdgpuStaticError:
++        raise
++    except Exception as exc:
++        raise _c2_error(context, exc) from exc
++
++
++def _c2_validate_copy(operation: Operation, name: str) -> None:
++    if len(operation.inputs) != 1:
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires one input".format(name))
++    output = _c2_one_output(operation, name)
++    input_dtype, input_shape = _c2_storage_ref(operation.inputs[0], "{} input".format(name), tensor_only=True)
++    output_dtype, output_shape = _c2_storage_ref(output, "{} output".format(name), tensor_only=True)
++    if input_dtype != output_dtype or _element_count(input_shape) != _element_count(output_shape):
++        raise AmdgpuUnsupportedError(
++            "static AMDGPU {} requires exact input/output shapes and matching dtype/element count".format(name)
++        )
++
++
++def _c2_validate_binary(operation: Operation, name: str) -> None:
++    if len(operation.inputs) != 2:
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires two inputs".format(name))
++    output = _c2_one_output(operation, name)
++    if not all(_is_tensor(ref.type) or ref.type.kind == "scalar" for ref in operation.inputs):
++        raise AmdgpuUnsupportedError("static AMDGPU {} supports tensor/scalar operands only".format(name))
++    if not (_is_tensor(output.type) or output.type.kind == "scalar"):
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires tensor/scalar output".format(name))
++    dtypes = [canonical_dtype(ref.type.dtype) for ref in operation.inputs + (output,)]
++    if any(dtype not in _C2_FLOAT_DTYPES for dtype in dtypes) or len(set(dtypes)) != 1:
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires matching FP32/BF16 storage".format(name))
++    input_shapes = [_value_shape(ref.type, "AMDGPU {} input".format(name)) for ref in operation.inputs]
++    output_shape = _value_shape(output.type, "AMDGPU {} output".format(name))
++    if name in ("add", "mul") and any(not _is_tensor(ref.type) for ref in operation.inputs):
++        expected = _broadcast_shape(input_shapes, "{} scalar broadcast".format(name))
++        if expected != output_shape:
++            raise AmdgpuUnsupportedError("static AMDGPU {} output shape is invalid".format(name))
++        return
++    if input_shapes[0] != input_shapes[1] or input_shapes[0] != output_shape:
++        raise AmdgpuUnsupportedError(
++            "static AMDGPU {} requires exact input/output shapes; broadcasting is unsupported".format(name)
++        )
++
++
++def _c2_validate_cast(operation: Operation) -> None:
++    if len(operation.inputs) != 1:
++        raise AmdgpuUnsupportedError("static AMDGPU cast requires one input")
++    output = _c2_one_output(operation, "cast")
++    input_ref = operation.inputs[0]
++    input_dtype, input_shape = _c2_storage_ref(input_ref, "cast input")
++    output_dtype, output_shape = _c2_storage_ref(output, "cast output")
++    if input_ref.type.kind != output.type.kind or input_shape != output_shape:
++        raise AmdgpuUnsupportedError("static AMDGPU cast must preserve value kind and shape")
++    if input_dtype == output_dtype:
++        return
++    allowed = {
++        ("bf16", "float32"),
++        ("float32", "bf16"),
++        ("int32", "int64"),
++        ("int64", "int32"),
++        ("bool", "int32"),
++        ("bool", "int64"),
++        ("int32", "bool"),
++        ("int64", "bool"),
++    }
++    if (input_dtype, output_dtype) not in allowed:
++        raise AmdgpuUnsupportedError(
++            "static AMDGPU cast supports BF16/FP32 and exact integer/bool storage conversions"
++        )
++    declared = operation.attributes.get("dtype")
++    if declared is None:
++        declared = operation.attributes.get("to")
++    if declared is None:
++        declared = operation.attributes.get("target_dtype")
++    if declared is None:
++        declared = operation.attributes.get("out_dtype")
++    if declared is not None:
++        try:
++            declared_dtype = canonical_dtype(declared)
++        except Exception as exc:
++            raise _c2_error("cast target dtype", exc) from exc
++        if declared_dtype != output_dtype:
++            raise AmdgpuUnsupportedError("static AMDGPU cast target dtype does not match output")
++
++
++def _c2_validate_constant(operation: Operation) -> None:
++    if operation.inputs:
++        raise AmdgpuUnsupportedError("static AMDGPU constant must not have inputs")
++    output = _c2_one_output(operation, "constant")
++    dtype, shape = _c2_storage_ref(output, "constant output")
++    del dtype
++    raw = operation.attributes.get("values", operation.attributes.get("value", None))
++    if "values" not in operation.attributes and "value" not in operation.attributes:
++        raise AmdgpuUnsupportedError("static AMDGPU constant requires value/values")
++    try:
++        values = list(flatten_values(raw))
++    except Exception as exc:
++        raise _c2_error("constant values", exc) from exc
++    count = _element_count(shape)
++    if len(values) != count:
++        raise AmdgpuUnsupportedError("static AMDGPU constant value count does not match output shape")
++    # A non-scalar inline table is deliberately bounded.  The backend has no
++    # constant-memory ABI yet; rejecting a large table prevents a Qwen shape
++    # audit from materialising a numel-sized descriptor/code sequence.
++    if count > 64:
++        raise AmdgpuUnsupportedError("static AMDGPU constant tables over 64 elements require a buffer ABI")
++
++
++def _c2_validate_transpose(operation: Operation) -> None:
++    if len(operation.inputs) != 1:
++        raise AmdgpuUnsupportedError("static AMDGPU transpose requires one input")
++    output = _c2_one_output(operation, "transpose")
++    input_ref = operation.inputs[0]
++    input_dtype, input_shape = _c2_storage_ref(input_ref, "transpose input", tensor_only=True)
++    output_dtype, output_shape = _c2_storage_ref(output, "transpose output", tensor_only=True)
++    if input_dtype != output_dtype or len(input_shape) != len(output_shape) or len(input_shape) > 4:
++        raise AmdgpuUnsupportedError("static AMDGPU transpose supports equal-dtype rank <= 4 tensors")
++    permutation = _c2_attrs_call(_m1b_permutation, input_shape, operation.attributes, context="transpose")
++    if output_shape != tuple(input_shape[axis] for axis in permutation):
++        raise AmdgpuUnsupportedError("static AMDGPU transpose output shape does not match permutation")
++
++
++def _c2_validate_slice(operation: Operation) -> None:
++    if len(operation.inputs) != 1:
++        raise AmdgpuUnsupportedError("static AMDGPU slice requires one input")
++    output = _c2_one_output(operation, "slice")
++    input_dtype, input_shape = _c2_storage_ref(operation.inputs[0], "slice input", tensor_only=True)
++    output_dtype, output_shape = _c2_storage_ref(output, "slice output", tensor_only=True)
++    if input_dtype != output_dtype:
++        raise AmdgpuUnsupportedError("static AMDGPU slice requires matching storage dtypes")
++    spec = _c2_attrs_call(_m1b_slice_spec, input_shape, operation.attributes, context="slice")
++    expected = list(input_shape)
++    for axis, start, stop, step in spec:
++        expected[axis] = max(0, (stop - start + step - 1) // step)
++    if output_shape != tuple(expected):
++        raise AmdgpuUnsupportedError("static AMDGPU slice output shape does not match descriptor")
++
++
++def _c2_validate_concat(operation: Operation) -> None:
++    if len(operation.inputs) < 1:
++        raise AmdgpuUnsupportedError("static AMDGPU concat requires at least one input")
++    output = _c2_one_output(operation, "concat")
++    if not _is_tensor(output.type) or not all(_is_tensor(ref.type) for ref in operation.inputs):
++        raise AmdgpuUnsupportedError("static AMDGPU concat supports tensor values only")
++    dtype = canonical_dtype(output.type.dtype)
++    if dtype not in _C2_STORAGE_DTYPES:
++        raise AmdgpuUnsupportedError("static AMDGPU concat dtype is unsupported")
++    shapes = [static_shape(ref.type, "concat input") for ref in operation.inputs]
++    output_shape = static_shape(output.type, "concat output")
++    if any(canonical_dtype(ref.type.dtype) != dtype for ref in operation.inputs):
++        raise AmdgpuUnsupportedError("static AMDGPU concat requires one storage dtype")
++    axis_raw = operation.attributes.get("axis", operation.attributes.get("dim", 0))
++    if isinstance(axis_raw, bool) or not isinstance(axis_raw, int):
++        raise AmdgpuUnsupportedError("static AMDGPU concat axis must be an integer")
++    axis = axis_raw + len(shapes[0]) if axis_raw < 0 else axis_raw
++    if axis < 0 or axis >= len(shapes[0]) or any(len(shape) != len(shapes[0]) for shape in shapes):
++        raise AmdgpuUnsupportedError("static AMDGPU concat axis/rank is invalid")
++    expected = list(shapes[0])
++    expected[axis] = sum(shape[axis] for shape in shapes)
++    if any(shape[other] != expected[other] for shape in shapes for other in range(len(expected)) if other != axis):
++        raise AmdgpuUnsupportedError("static AMDGPU concat non-axis dimensions are incompatible")
++    if output_shape != tuple(expected):
++        raise AmdgpuUnsupportedError("static AMDGPU concat output shape is invalid")
++
++
++def _c2_validate_split(operation: Operation) -> None:
++    if len(operation.inputs) != 1 or len(operation.outputs) < 1:
++        raise AmdgpuUnsupportedError("static AMDGPU split requires one input and outputs")
++    source = operation.inputs[0]
++    if not _is_tensor(source.type) or any(not _is_tensor(ref.type) for ref in operation.outputs):
++        raise AmdgpuUnsupportedError("static AMDGPU split supports tensors only")
++    source_shape = static_shape(source.type, "split input")
++    dtype = canonical_dtype(source.type.dtype)
++    if dtype not in _C2_STORAGE_DTYPES or any(canonical_dtype(ref.type.dtype) != dtype for ref in operation.outputs):
++        raise AmdgpuUnsupportedError("static AMDGPU split requires one storage dtype")
++    _c2_attrs_call(_m1b_split_sizes, source_shape, tuple(ref.type for ref in operation.outputs), operation.attributes, context="split")
++
++
++def _c2_validate_indexing(operation: Operation, name: str) -> None:
++    if len(operation.inputs) != 2:
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires source and indices".format(name))
++    source, indices = operation.inputs
++    output = _c2_one_output(operation, name)
++    source_dtype, source_shape = _c2_storage_ref(source, "{} source".format(name), tensor_only=True)
++    index_dtype, index_shape = _c2_storage_ref(indices, "{} indices".format(name), tensor_only=True)
++    output_dtype, output_shape = _c2_storage_ref(output, "{} output".format(name), tensor_only=True)
++    if index_dtype not in ("int32", "int64"):
++        raise AmdgpuUnsupportedError("static AMDGPU {} indices require int32/int64".format(name))
++    if source_dtype != output_dtype:
++        raise AmdgpuUnsupportedError("static AMDGPU {} output dtype must match source".format(name))
++    axis = 0 if name == "embedding" else _c2_attrs_call(_m1b_gather_axis, source_shape, operation.attributes, context=name)
++    if name == "embedding" and "axis" in operation.attributes and int(operation.attributes["axis"]) != 0:
++        raise AmdgpuUnsupportedError("static AMDGPU embedding supports axis=0 only")
++    expected = source_shape[:axis] + index_shape + source_shape[axis + 1 :]
++    if output_shape != expected:
++        raise AmdgpuUnsupportedError("static AMDGPU {} output shape does not match source/index descriptor".format(name))
++
++
++def _c2_validate_compare(operation: Operation) -> None:
++    if len(operation.inputs) != 2:
++        raise AmdgpuUnsupportedError("static AMDGPU compare requires two inputs")
++    output = _c2_one_output(operation, "compare")
++    if canonical_dtype(output.type.dtype) != "bool" or not (_is_tensor(output.type) or output.type.kind == "scalar"):
++        raise AmdgpuUnsupportedError("static AMDGPU compare output must be bool storage")
++    dtypes = []
++    shapes = []
++    for ref in operation.inputs:
++        dtype, shape = _c2_storage_ref(ref, "compare input")
++        dtypes.append(dtype)
++        shapes.append(shape)
++    if len(set(dtypes)) != 1:
++        raise AmdgpuUnsupportedError("static AMDGPU compare inputs must have one dtype")
++    if dtypes[0] not in _C2_STORAGE_DTYPES:
++        raise AmdgpuUnsupportedError("static AMDGPU compare input dtype is unsupported")
++    output_shape = _value_shape(output.type, "compare output")
++    if _broadcast_shape(shapes, "compare") != output_shape:
++        raise AmdgpuUnsupportedError("static AMDGPU compare output shape is not broadcast-compatible")
++    try:
++        comparison_predicate_for_operation(operation.name, operation.attributes, "compare")
++    except Exception as exc:
++        raise _c2_error("compare predicate", exc) from exc
++
++
++def _c2_validate_where(operation: Operation) -> None:
++    if len(operation.inputs) != 3:
++        raise AmdgpuUnsupportedError("static AMDGPU where requires condition, true, and false values")
++    output = _c2_one_output(operation, "where")
++    condition, true_value, false_value = operation.inputs
++    condition_dtype, condition_shape = _c2_storage_ref(condition, "where condition")
++    true_dtype, true_shape = _c2_storage_ref(true_value, "where true value")
++    false_dtype, false_shape = _c2_storage_ref(false_value, "where false value")
++    output_dtype, output_shape = _c2_storage_ref(output, "where output")
++    if condition_dtype != "bool" or true_dtype != false_dtype or true_dtype != output_dtype:
++        raise AmdgpuUnsupportedError("static AMDGPU where requires bool condition and matching selected dtypes")
++    if _broadcast_shape((condition_shape, true_shape, false_shape), "where") != output_shape:
++        raise AmdgpuUnsupportedError("static AMDGPU where output shape is not broadcast-compatible")
++
++
++def _c2_validate_iota(operation: Operation) -> None:
++    if operation.inputs:
++        raise AmdgpuUnsupportedError("static AMDGPU iota must not have inputs")
++    output = _c2_one_output(operation, "iota")
++    if canonical_dtype(output.type.dtype) not in ("int32", "int64") or not _is_tensor(output.type):
++        raise AmdgpuUnsupportedError("static AMDGPU iota requires int32/int64 tensor output")
++    _c2_attrs_call(iota_spec, output.type, operation.attributes, context="iota")
++
++
++def _validate_c2_operation(operation: Operation, name: str) -> str:
++    """Validate the C2 descriptor/indexing/control subset shared by audit/emitter."""
++
++    if name in ("identity", "reshape", "view", "contiguous"):
++        _c2_validate_copy(operation, name)
++    elif name in ("add", "mul", "sub", "div"):
++        _c2_validate_binary(operation, name)
++    elif name == "neg":
++        if len(operation.inputs) != 1:
++            raise AmdgpuUnsupportedError("static AMDGPU neg requires one tensor input")
++        output = _c2_one_output(operation, name)
++        input_dtype, input_shape = _c2_storage_ref(operation.inputs[0], "neg input", tensor_only=True)
++        output_dtype, output_shape = _c2_storage_ref(output, "neg output", tensor_only=True)
++        if input_dtype not in _C2_FLOAT_DTYPES or input_dtype != output_dtype or input_shape != output_shape:
++            raise AmdgpuUnsupportedError("static AMDGPU neg requires matching FP32/BF16 tensors")
++    elif name == "cast":
++        _c2_validate_cast(operation)
++    elif name == "constant":
++        _c2_validate_constant(operation)
++    elif name == "transpose":
++        _c2_validate_transpose(operation)
++    elif name == "broadcast":
++        if len(operation.inputs) != 1:
++            raise AmdgpuUnsupportedError("static AMDGPU broadcast requires one input")
++        output = _c2_one_output(operation, name)
++        input_dtype, input_shape = _c2_storage_ref(operation.inputs[0], "broadcast input")
++        output_dtype, output_shape = _c2_storage_ref(output, "broadcast output", tensor_only=True)
++        if input_dtype != output_dtype or _broadcast_shape((input_shape, output_shape), "broadcast") != output_shape:
++            raise AmdgpuUnsupportedError("static AMDGPU broadcast descriptor is invalid")
++        declared = operation.attributes.get("shape")
++        if declared is not None and tuple(int(v) for v in declared) != output_shape:
++            raise AmdgpuUnsupportedError("static AMDGPU broadcast declared shape is invalid")
++    elif name == "slice":
++        _c2_validate_slice(operation)
++    elif name == "concat":
++        _c2_validate_concat(operation)
++    elif name == "split":
++        _c2_validate_split(operation)
++    elif name in ("gather", "embedding"):
++        _c2_validate_indexing(operation, name)
++    elif name == "compare":
++        _c2_validate_compare(operation)
++    elif name == "iota":
++        _c2_validate_iota(operation)
++    elif name == "where":
++        _c2_validate_where(operation)
++    else:
++        raise AmdgpuUnsupportedError("static AMDGPU C2 validator has no operation {!r}".format(name))
++    return name
++
++
+ def validate_static_operation(operation: Operation) -> str:
+     """Validate exactly the operation subset emitted by the static backend.
+ 
+@@ -318,14 +865,8 @@ def validate_static_operation(operation: Operation) -> str:
+                 name, ", ".join(AMDGPU_STATIC_SUPPORTED_OPERATIONS)
+             )
+         )
+-    if name in ("identity", "add", "mul"):
+-        expected_inputs = 1 if name == "identity" else 2
+-        if len(operation.inputs) != expected_inputs:
+-            raise AmdgpuUnsupportedError(
+-                "static AMDGPU {} requires {} input tensors".format(name, expected_inputs)
+-            )
+-        _validate_tensor_pair(operation, name, require_exact_shape=True)
+-        return name
++    if name in _SUPPORTED_OPS - {"reduce_sum", "matmul"}:
++        return _validate_c2_operation(operation, name)
+     if name == "reduce_sum":
+         if len(operation.inputs) != 1:
+             raise AmdgpuUnsupportedError("static AMDGPU reduce_sum requires one input tensor")
+@@ -364,29 +905,49 @@ def validate_static_operation(operation: Operation) -> str:
+ 
+ 
+ def _emit_elementwise(builder: _IRBuilder, operation: Operation, plan: Any, kernel_index: int) -> None:
+-    name = canonical_operation_name(operation.name)
+-    dtype, output_shape = _validate_tensor_pair(operation, name, require_exact_shape=True)
+-    expected_inputs = 1 if name == "identity" else 2
+-    if len(operation.inputs) != expected_inputs:
+-        raise AmdgpuUnsupportedError("static AMDGPU {} requires {} input tensors".format(name, expected_inputs))
++    name = validate_static_operation(operation)
++    output_shape = _value_shape(operation.outputs[0].type, "{} output".format(name))
+     index = _emit_index(builder, plan)
+     body = builder.label("body")
+     exit_label = builder.label("exit")
+-    count = _element_count(output_shape)
++    count = max(
++        (_value_count(output.type, "{} output".format(name)) for output in operation.outputs),
++        default=0,
++    ) if name == "split" else _element_count(output_shape)
+     predicate = builder.temp("in_bounds")
+     builder.line("  {} = icmp ult i64 {}, {}".format(predicate, index, count))
+     builder.line("  br i1 {}, label %{}, label %{}".format(predicate, body, exit_label))
+     builder.line("{}:".format(body))
+-    values = []
+-    for operand_index, _ref in enumerate(operation.inputs):
+-        values.append(_emit_load(builder, "%arg{}".format(operand_index), index, dtype))
+-    if name == "identity":
+-        result = values[0]
++    if name in ("identity", "reshape", "view", "contiguous"):
++        _emit_copy_value_c2(builder, operation, index)
++    elif name in ("add", "mul", "sub", "div"):
++        _emit_binary_c2(builder, operation, index)
++    elif name == "neg":
++        _emit_neg_c2(builder, operation, index)
++    elif name == "cast":
++        _emit_cast_c2(builder, operation, index)
++    elif name == "constant":
++        _emit_constant_c2(builder, operation, index)
++    elif name == "transpose":
++        _emit_transpose_c2(builder, operation, index)
++    elif name == "slice":
++        _emit_slice_c2(builder, operation, index)
++    elif name == "concat":
++        _emit_concat_c2(builder, operation, index)
++    elif name == "split":
++        _emit_split_c2(builder, operation, index)
++    elif name in ("gather", "embedding"):
++        _emit_gather_c2(builder, operation, index)
++    elif name == "iota":
++        _emit_iota_c2(builder, operation, index)
++    elif name == "compare":
++        _emit_compare_c2(builder, operation, index)
++    elif name == "where":
++        _emit_where_c2(builder, operation, index)
++    elif name == "broadcast":
++        _emit_broadcast_c2(builder, operation, index)
+     else:
+-        result = builder.temp("result")
+-        opcode = "fadd" if name == "add" else "fmul"
+-        builder.line("  {} = {} float {}, {}".format(result, opcode, values[0], values[1]))
+-    _emit_store(builder, "%arg{}".format(len(operation.inputs)), index, dtype, result)
++        raise AmdgpuUnsupportedError("static AMDGPU elementwise emitter has no operation {!r}".format(name))
+     builder.line("  br label %{}".format(exit_label))
+     builder.line("{}:".format(exit_label))
+     builder.line("  ret void")
+@@ -491,18 +1052,342 @@ def _emit_matmul(builder: _IRBuilder, operation: Operation, plan: Any) -> None:
+     builder.line("  ret void")
+ 
+ 
++def _f32_bits(value: Any) -> int:
++    return struct.unpack("<I", struct.pack("<f", float(value)))[0]
++
++
++def _bf16_bits(value: Any) -> int:
++    bits = _f32_bits(value)
++    upper = bits >> 16
++    lsb = upper & 1
++    rounded = bits + 0x7FFF + lsb
++    return (rounded >> 16) & 0xFFFF
++
++
++def _llvm_f32_literal(value: Any) -> str:
++    return "0x{:016X}".format(_f32_bits(value) << 32)
++
++
++def _llvm_storage_literal(dtype: str, value: Any) -> str:
++    dtype = canonical_dtype(dtype)
++    if dtype == "float32":
++        return _llvm_f32_literal(value)
++    if dtype == "bf16":
++        return str(_bf16_bits(value))
++    if dtype == "bool":
++        return "1" if bool(value) else "0"
++    return str(int(value))
++
++
++def _emit_copy_value_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    source, output = operation.inputs[0], operation.outputs[0]
++    dtype = canonical_dtype(source.type.dtype)
++    value = _emit_load_value(builder, "%arg0", index, dtype)
++    _emit_store_value(builder, "%arg{}".format(len(operation.inputs)), index, dtype, value)
++
++
++def _emit_binary_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    name = canonical_operation_name(operation.name)
++    dtype = canonical_dtype(operation.outputs[0].type.dtype)
++    output_shape = _value_shape(operation.outputs[0].type, "binary output")
++    left_shape = _value_shape(operation.inputs[0].type, "binary left")
++    right_shape = _value_shape(operation.inputs[1].type, "binary right")
++    left_index = _emit_broadcast_index(builder, index, left_shape, output_shape)
++    right_index = _emit_broadcast_index(builder, index, right_shape, output_shape)
++    left = _emit_load_f32(builder, "%arg0", left_index, dtype)
++    right = _emit_load_f32(builder, "%arg1", right_index, dtype)
++    result = builder.temp("result")
++    opcode = {"add": "fadd", "mul": "fmul", "sub": "fsub", "div": "fdiv"}[name]
++    builder.line("  {} = {} float {}, {}".format(result, opcode, left, right))
++    _emit_store_f32(builder, "%arg2", index, dtype, result)
++
++
++def _emit_neg_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    dtype = canonical_dtype(operation.outputs[0].type.dtype)
++    value = _emit_load_f32(builder, "%arg0", index, dtype)
++    result = builder.temp("neg")
++    builder.line("  {} = fneg float {}".format(result, value))
++    _emit_store_f32(builder, "%arg1", index, dtype, result)
++
++
++def _emit_cast_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    input_dtype = canonical_dtype(operation.inputs[0].type.dtype)
++    output_dtype = canonical_dtype(operation.outputs[0].type.dtype)
++    input_pointer = "%arg0"
++    output_pointer = "%arg1"
++    if input_dtype == output_dtype:
++        _emit_copy_value_c2(builder, operation, index)
++        return
++    if input_dtype in _C2_FLOAT_DTYPES and output_dtype in _C2_FLOAT_DTYPES:
++        value = _emit_load_f32(builder, input_pointer, index, input_dtype)
++        _emit_store_f32(builder, output_pointer, index, output_dtype, value)
++        return
++    if input_dtype in ("int32", "int64", "bool") and output_dtype in ("int32", "int64", "bool"):
++        value = _emit_load_i64(builder, input_pointer, index, input_dtype)
++        _emit_store_i64(builder, output_pointer, index, output_dtype, value)
++        return
++    raise AmdgpuUnsupportedError("static AMDGPU cast emitter does not support {} -> {}".format(input_dtype, output_dtype))
++
++
++def _emit_constant_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    output = operation.outputs[0]
++    dtype = canonical_dtype(output.type.dtype)
++    raw = operation.attributes.get("values", operation.attributes.get("value"))
++    values = list(flatten_values(raw))
++    output_pointer = "%arg{}".format(len(operation.inputs))
++    if len(values) == 1:
++        literal = _llvm_storage_literal(dtype, values[0])
++        _emit_store_value(builder, output_pointer, index, dtype, literal)
++        return
++    done = builder.label("constant_done")
++    for value_index, value in enumerate(values):
++        next_label = builder.label("constant_next")
++        match = builder.temp("constant_match")
++        builder.line("  {} = icmp eq i64 {}, {}".format(match, index, value_index))
++        builder.line("  br i1 {}, label %{}, label %{}".format(match, next_label + "_value", next_label))
++        builder.line("{}:".format(next_label + "_value"))
++        _emit_store_value(builder, output_pointer, index, dtype, _llvm_storage_literal(dtype, value))
++        builder.line("  br label %{}".format(done))
++        builder.line("{}:".format(next_label))
++    builder.line("  br label %{}".format(done))
++    builder.line("{}:".format(done))
++
++
++def _emit_transpose_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    source, output = operation.inputs[0], operation.outputs[0]
++    input_shape = static_shape(source.type, "transpose input")
++    output_shape = static_shape(output.type, "transpose output")
++    permutation = _c2_attrs_call(_m1b_permutation, input_shape, operation.attributes, context="transpose")
++    output_coords = _emit_coords(builder, index, output_shape)
++    input_coords = tuple(output_coords[axis] for axis in permutation)
++    source_index = _emit_ravel(builder, input_coords, input_shape)
++    dtype = canonical_dtype(source.type.dtype)
++    value = _emit_load_value(builder, "%arg0", source_index, dtype)
++    _emit_store_value(builder, "%arg1", index, dtype, value)
++
++
++def _emit_slice_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    source, output = operation.inputs[0], operation.outputs[0]
++    input_shape = static_shape(source.type, "slice input")
++    output_shape = static_shape(output.type, "slice output")
++    spec = _c2_attrs_call(_m1b_slice_spec, input_shape, operation.attributes, context="slice")
++    output_coords = list(_emit_coords(builder, index, output_shape))
++    input_coords = list(output_coords)
++    for axis, start, _stop, step in spec:
++        scaled = builder.temp("slice_coord")
++        builder.line("  {} = mul i64 {}, {}".format(scaled, output_coords[axis], step))
++        shifted = builder.temp("slice_coord")
++        builder.line("  {} = add i64 {}, {}".format(shifted, scaled, start))
++        input_coords[axis] = shifted
++    source_index = _emit_ravel(builder, input_coords, input_shape)
++    dtype = canonical_dtype(source.type.dtype)
++    value = _emit_load_value(builder, "%arg0", source_index, dtype)
++    _emit_store_value(builder, "%arg1", index, dtype, value)
++
++
++def _emit_concat_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    output = operation.outputs[0]
++    output_shape = static_shape(output.type, "concat output")
++    axis_raw = operation.attributes.get("axis", operation.attributes.get("dim", 0))
++    axis = axis_raw + len(output_shape) if axis_raw < 0 else axis_raw
++    output_coords = _emit_coords(builder, index, output_shape)
++    selected = builder.label("concat_selected")
++    running = 0
++    for input_index, source in enumerate(operation.inputs):
++        source_shape = static_shape(source.type, "concat input")
++        limit = running + source_shape[axis]
++        segment = builder.label("concat_segment")
++        next_segment = builder.label("concat_next")
++        ge = builder.temp("concat_ge")
++        lt = builder.temp("concat_lt")
++        in_segment = builder.temp("concat_in")
++        builder.line("  {} = icmp uge i64 {}, {}".format(ge, output_coords[axis], running))
++        builder.line("  {} = icmp ult i64 {}, {}".format(lt, output_coords[axis], limit))
++        builder.line("  {} = and i1 {}, {}".format(in_segment, ge, lt))
++        builder.line("  br i1 {}, label %{}, label %{}".format(in_segment, segment, next_segment))
++        builder.line("{}:".format(segment))
++        source_coords = list(output_coords)
++        offset = builder.temp("concat_axis")
++        builder.line("  {} = sub i64 {}, {}".format(offset, output_coords[axis], running))
++        source_coords[axis] = offset
++        source_index = _emit_ravel(builder, source_coords, source_shape)
++        dtype = canonical_dtype(source.type.dtype)
++        value = _emit_load_value(builder, "%arg{}".format(input_index), source_index, dtype)
++        _emit_store_value(builder, "%arg{}".format(len(operation.inputs)), index, dtype, value)
++        builder.line("  br label %{}".format(selected))
++        builder.line("{}:".format(next_segment))
++        running = limit
++    builder.line("  br label %{}".format(selected))
++    builder.line("{}:".format(selected))
++
++
++def _emit_split_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    source = operation.inputs[0]
++    source_shape = static_shape(source.type, "split input")
++    axis, sizes = _c2_attrs_call(
++        _m1b_split_sizes,
++        source_shape,
++        tuple(ref.type for ref in operation.outputs),
++        operation.attributes,
++        context="split",
++    )
++    done = builder.label("split_done")
++    running = 0
++    dtype = canonical_dtype(source.type.dtype)
++    for output_index, (output, size) in enumerate(zip(operation.outputs, sizes)):
++        output_shape = static_shape(output.type, "split output")
++        next_output = builder.label("split_next")
++        write_output = builder.label("split_write")
++        count = _element_count(output_shape)
++        in_bounds = builder.temp("split_in")
++        builder.line("  {} = icmp ult i64 {}, {}".format(in_bounds, index, count))
++        builder.line("  br i1 {}, label %{}, label %{}".format(in_bounds, write_output, next_output))
++        builder.line("{}:".format(write_output))
++        output_coords = list(_emit_coords(builder, index, output_shape))
++        shifted = builder.temp("split_axis")
++        builder.line("  {} = add i64 {}, {}".format(shifted, output_coords[axis], running))
++        output_coords[axis] = shifted
++        source_index = _emit_ravel(builder, output_coords, source_shape)
++        value = _emit_load_value(builder, "%arg0", source_index, dtype)
++        _emit_store_value(builder, "%arg{}".format(1 + output_index), index, dtype, value)
++        builder.line("  br label %{}".format(done))
++        builder.line("{}:".format(next_output))
++        running += int(size)
++    builder.line("  br label %{}".format(done))
++    builder.line("{}:".format(done))
++
++
++def _emit_gather_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    source, indices = operation.inputs
++    output = operation.outputs[0]
++    source_shape = static_shape(source.type, "gather source")
++    index_shape = static_shape(indices.type, "gather indices")
++    output_shape = static_shape(output.type, "gather output")
++    name = canonical_operation_name(operation.name)
++    axis = 0 if name == "embedding" else _c2_attrs_call(_m1b_gather_axis, source_shape, operation.attributes, context=name)
++    output_coords = _emit_coords(builder, index, output_shape)
++    index_coords = tuple(output_coords[axis + offset] for offset in range(len(index_shape)))
++    index_flat = _emit_ravel(builder, index_coords, index_shape)
++    index_dtype = canonical_dtype(indices.type.dtype)
++    dynamic_index = _emit_load_i64(builder, "%arg1", index_flat, index_dtype)
++    negative = builder.temp("bad_negative")
++    too_large = builder.temp("bad_large")
++    bad = builder.temp("bad_index")
++    builder.line("  {} = icmp slt i64 {}, 0".format(negative, dynamic_index))
++    builder.line("  {} = icmp sge i64 {}, {}".format(too_large, dynamic_index, source_shape[axis]))
++    builder.line("  {} = or i1 {}, {}".format(bad, negative, too_large))
++    good_label = builder.label("gather_good")
++    bad_label = builder.label("gather_bad")
++    builder.line("  br i1 {}, label %{}, label %{}".format(bad, bad_label, good_label))
++    builder.line("{}:".format(bad_label))
++    builder.line("  call void @llvm.trap()")
++    builder.line("  br label %{}".format(good_label))
++    builder.line("{}:".format(good_label))
++    source_coords = []
++    for source_axis in range(len(source_shape)):
++        if source_axis < axis:
++            source_coords.append(output_coords[source_axis])
++        elif source_axis == axis:
++            source_coords.append(dynamic_index)
++        else:
++            source_coords.append(output_coords[axis + len(index_shape) + source_axis - axis - 1])
++    source_index = _emit_ravel(builder, source_coords, source_shape)
++    dtype = canonical_dtype(source.type.dtype)
++    value = _emit_load_value(builder, "%arg0", source_index, dtype)
++    _emit_store_value(builder, "%arg2", index, dtype, value)
++
++
++def _emit_iota_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    output = operation.outputs[0]
++    output_shape = static_shape(output.type, "iota output")
++    axis, start, step = _c2_attrs_call(iota_spec, output.type, operation.attributes, context="iota")
++    coordinates = _emit_coords(builder, index, output_shape)
++    scaled = builder.temp("iota_step")
++    value = builder.temp("iota_value")
++    builder.line("  {} = mul i64 {}, {}".format(scaled, coordinates[axis], step))
++    builder.line("  {} = add i64 {}, {}".format(value, scaled, start))
++    _emit_store_i64(builder, "%arg0", index, canonical_dtype(output.type.dtype), value)
++
++
++def _emit_compare_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    left, right = operation.inputs
++    output = operation.outputs[0]
++    output_shape = _value_shape(output.type, "compare output")
++    left_shape = _value_shape(left.type, "compare left")
++    right_shape = _value_shape(right.type, "compare right")
++    left_index = _emit_broadcast_index(builder, index, left_shape, output_shape)
++    right_index = _emit_broadcast_index(builder, index, right_shape, output_shape)
++    dtype = canonical_dtype(left.type.dtype)
++    predicate = comparison_predicate_for_operation(operation.name, operation.attributes, "compare")
++    if dtype in _C2_FLOAT_DTYPES:
++        left_value = _emit_load_f32(builder, "%arg0", left_index, dtype)
++        right_value = _emit_load_f32(builder, "%arg1", right_index, dtype)
++        llvm_predicate = {"eq": "oeq", "ne": "une", "lt": "olt", "le": "ole", "gt": "ogt", "ge": "oge"}[predicate]
++        result = builder.temp("compare")
++        builder.line("  {} = fcmp {} float {}, {}".format(result, llvm_predicate, left_value, right_value))
++    elif dtype == "bool":
++        left_raw = _emit_load_value(builder, "%arg0", left_index, dtype)
++        right_raw = _emit_load_value(builder, "%arg1", right_index, dtype)
++        if predicate not in ("eq", "ne"):
++            raise AmdgpuUnsupportedError("static AMDGPU ordered bool compare is unsupported")
++        result = builder.temp("compare")
++        builder.line("  {} = icmp {} i8 {}, {}".format(result, "eq" if predicate == "eq" else "ne", left_raw, right_raw))
++    else:
++        left_raw = _emit_load_i64(builder, "%arg0", left_index, dtype)
++        right_raw = _emit_load_i64(builder, "%arg1", right_index, dtype)
++        result = builder.temp("compare")
++        llvm_predicate = {"eq": "eq", "ne": "ne", "lt": "slt", "le": "sle", "gt": "sgt", "ge": "sge"}[predicate]
++        builder.line("  {} = icmp {} i64 {}, {}".format(result, llvm_predicate, left_raw, right_raw))
++    normalized = builder.temp("compare_bool")
++    builder.line("  {} = zext i1 {} to i8".format(normalized, result))
++    _emit_store_value(builder, "%arg{}".format(len(operation.inputs)), index, "bool", normalized)
++
++
++def _emit_where_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    condition, true_value, false_value = operation.inputs
++    output = operation.outputs[0]
++    output_shape = _value_shape(output.type, "where output")
++    condition_index = _emit_broadcast_index(builder, index, _value_shape(condition.type, "where condition"), output_shape)
++    true_index = _emit_broadcast_index(builder, index, _value_shape(true_value.type, "where true"), output_shape)
++    false_index = _emit_broadcast_index(builder, index, _value_shape(false_value.type, "where false"), output_shape)
++    condition_raw = _emit_load_value(builder, "%arg0", condition_index, "bool")
++    condition_bit = builder.temp("where_cond")
++    builder.line("  {} = icmp ne i8 {}, 0".format(condition_bit, condition_raw))
++    dtype = canonical_dtype(output.type.dtype)
++    true_raw = _emit_load_value(builder, "%arg1", true_index, dtype)
++    false_raw = _emit_load_value(builder, "%arg2", false_index, dtype)
++    result = builder.temp("where")
++    builder.line(
++        "  {} = select i1 {}, {} {}, {} {}".format(
++            result, condition_bit, _item_type(dtype), true_raw, _item_type(dtype), false_raw
++        )
++    )
++    _emit_store_value(builder, "%arg3", index, dtype, result)
++
++
++def _emit_broadcast_c2(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    source, output = operation.inputs[0], operation.outputs[0]
++    source_shape = _value_shape(source.type, "broadcast input")
++    output_shape = static_shape(output.type, "broadcast output")
++    source_index = _emit_broadcast_index(builder, index, source_shape, output_shape)
++    dtype = canonical_dtype(output.type.dtype)
++    value = _emit_load_value(builder, "%arg0", source_index, dtype)
++    _emit_store_value(builder, "%arg1", index, dtype, value)
++
++
+ def _render_kernel(operation: Operation, plan: Any, index: int, entrypoint: str) -> Tuple[str, Mapping[str, Any]]:
+     name = validate_static_operation(operation)
+     kernel_name = "pypto_x_{}_op{}".format(_safe_identifier(entrypoint), index)
+     builder = _IRBuilder()
+     args = []
+     for arg_index, ref in enumerate(operation.inputs + operation.outputs):
+-        if not _is_tensor(ref.type):
+-            raise AmdgpuUnsupportedError("static AMDGPU supports tensor pointer bindings only")
++        if not (_is_tensor(ref.type) or ref.type.kind == "scalar"):
++            raise AmdgpuUnsupportedError("static AMDGPU supports tensor/scalar pointer bindings only")
+         args.append("ptr addrspace(1) %arg{}".format(arg_index))
+     builder.line("define amdgpu_kernel void @{}({}) {{".format(kernel_name, ", ".join(args)))
+     builder.line("entry:")
+-    if name in ("identity", "add", "mul"):
++    builder.line("  ; operation={}".format(name))
++    if name not in ("reduce_sum", "matmul"):
+         _emit_elementwise(builder, operation, plan, index)
+     elif name == "reduce_sum":
+         _emit_reduce_sum(builder, operation, plan)
+@@ -515,11 +1400,23 @@ def _render_kernel(operation: Operation, plan: Any, index: int, entrypoint: str)
+         "operation_index": index,
+         "entrypoint": entrypoint,
+         "inputs": [
+-            {"name": ref.name, "dtype": canonical_dtype(ref.type.dtype), "address_space": 1}
++            {
++                "name": ref.name,
++                "kind": "tensor" if _is_tensor(ref.type) else "scalar",
++                "dtype": canonical_dtype(ref.type.dtype),
++                "shape": list(_value_shape(ref.type, "binding input")),
++                "address_space": 1,
++            }
+             for ref in operation.inputs
+         ],
+         "outputs": [
+-            {"name": ref.name, "dtype": canonical_dtype(ref.type.dtype), "address_space": 1}
++            {
++                "name": ref.name,
++                "kind": "tensor" if _is_tensor(ref.type) else "scalar",
++                "dtype": canonical_dtype(ref.type.dtype),
++                "shape": list(_value_shape(ref.type, "binding output")),
++                "address_space": 1,
++            }
+             for ref in operation.outputs
+         ],
+         "geometry": plan.geometry.to_dict(),
+@@ -552,6 +1449,7 @@ def render_amdgcn_llvm(gpu_program: GpuProgram, target: Any) -> Tuple[str, Tuple
+         "declare i32 @llvm.amdgcn.workgroup.id.x()",
+         "declare i32 @llvm.amdgcn.workgroup.id.y()",
+         "declare i32 @llvm.amdgcn.workgroup.id.z()",
++        "declare void @llvm.trap()",
+         "",
+     ]
+     return "\n".join(header + kernels) + "\n", tuple(bindings)
+@@ -687,13 +1585,18 @@ def _validate_static_outputs(llvm_ir: str, assembly: str, object_bytes: bytes) -
+         raise AmdgpuToolchainError("AMDGPU LLVM IR target triple is not exact")
+     if "ptr addrspace(1)" not in llvm_ir or "llvm.amdgcn.workitem.id.x" not in llvm_ir:
+         raise AmdgpuToolchainError("AMDGPU LLVM IR lacks explicit global pointers or workitem bounds")
+-    if " load " not in ir_lower or " store " not in ir_lower:
++    source_free = any("; operation={}".format(name) in llvm_ir for name in ("constant", "iota"))
++    if (" load " not in ir_lower and not source_free) or " store " not in ir_lower:
+         raise AmdgpuToolchainError("AMDGPU LLVM IR lacks a real load/ALU/store path")
+     if "gfx1036" not in asm_lower or "amdgpu" not in asm_lower:
+         raise AmdgpuToolchainError("llc output is not tagged as gfx1036 AMDGPU assembly")
+     load_tokens = ("global_load", "flat_load", "buffer_load", "s_load", "ds_read")
+     store_tokens = ("global_store", "flat_store", "buffer_store")
+-    alu_tokens = ("v_add", "v_mul", "v_lshl", "s_add", "s_mul")
++    alu_tokens = (
++        "v_add", "v_sub", "v_mul", "v_div", "v_lshl", "v_lshr", "v_and", "v_or",
++        "v_cmp", "v_cndmask", "v_cvt", "v_mov", "s_add", "s_sub", "s_mul", "s_cmp",
++        "s_and", "s_or", "s_lshl", "s_lshr", "s_cbranch",
++    )
+     if not any(token in asm_lower for token in load_tokens):
+         raise AmdgpuToolchainError("AMDGPU assembly lacks a global load")
+     if not any(token in asm_lower for token in store_tokens):
+diff --git a/python/tests/ut/pypto_x/amd_gfx1036_c2_static_validation_driver.py b/python/tests/ut/pypto_x/amd_gfx1036_c2_static_validation_driver.py
+new file mode 100644
+index 000000000..bf10c2b56
+--- /dev/null
++++ b/python/tests/ut/pypto_x/amd_gfx1036_c2_static_validation_driver.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++"""Static LLVM/ELF evidence and host-oracle audit for AMDGPU C2.
++
++The driver deliberately does not call a HIP runtime.  It compiles one small
++representative program for each C2 layout/indexing/control family and records
++the scalar descriptor oracle alongside the real gfx1036 LLVM/ELF evidence.
++"""
++
++from __future__ import annotations
++
++import base64
++import json
++import shutil
++import subprocess
++import tempfile
++from pathlib import Path
++
++from pypto.compiler.targets.hip import AmdgpuStaticCompiler, decode_amdgpu_artifact
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.target import AMDGCN_PROCESSOR, AMDGCN_TRIPLE, AMD_IGPU_GFX1036
++
++
++def _tensor(name, dtype, shape):
++    return ValueRef(name, CoreType.tensor(dtype, shape))
++
++
++def _program(inputs, outputs, name, attributes=None):
++    operation = Operation(name, tuple(inputs), tuple(outputs), attributes=attributes or {})
++    return CoreProgram(
++        functions=(CoreFunction("main", tuple(inputs), tuple(outputs), Region((operation,))),)
++    )
++
++
++def _cases():
++    f32_5 = lambda name: _tensor(name, "float32", (5,))
++    source = _tensor("source", "float32", (2, 3, 4))
++    return {
++        "sub": (_program((f32_5("left"), f32_5("right")), (f32_5("output"),), "sub"), {"golden": [-1.0] * 5}),
++        "div": (_program((f32_5("left"), f32_5("right")), (f32_5("output"),), "div"), {"golden": [0.5] * 5}),
++        "neg": (_program((f32_5("source"),), (f32_5("output"),), "neg"), {"golden": [-1.0, 0.0, 1.0, 2.0, 3.0]}),
++        "cast": (_program((_tensor("source", "bf16", (5,)),), (_tensor("output", "float32", (5,)),), "cast", {"dtype": "float32"}), {"bf16_rne": True}),
++        "reshape": (_program((_tensor("source", "float32", (2, 3)),), (_tensor("output", "float32", (3, 2)),), "reshape", {"shape": [3, 2]}), {"flat_map": [0, 1, 2, 3, 4, 5]}),
++        "view": (_program((_tensor("source", "float32", (2, 3)),), (_tensor("output", "float32", (3, 2)),), "view", {"shape": [3, 2]}), {"flat_map": [0, 1, 2, 3, 4, 5]}),
++        "contiguous": (_program((_tensor("source", "float32", (2, 3)),), (_tensor("output", "float32", (2, 3)),), "contiguous"), {"flat_map": [0, 1, 2, 3, 4, 5]}),
++        "transpose": (_program((source,), (_tensor("output", "float32", (4, 2, 3)),), "transpose", {"permutation": [2, 0, 1]}), {"source_flat_for_output_0": 0, "source_flat_for_output_1": 4, "source_flat_for_output_2": 8}),
++        "broadcast": (_program((_tensor("source", "float32", (2, 1)),), (_tensor("output", "float32", (2, 3)),), "broadcast", {"shape": [2, 3]}), {"source_flat_for_output": [0, 0, 0, 1, 1, 1]}),
++        "slice": (_program((_tensor("source", "float32", (2, 5)),), (_tensor("output", "float32", (2, 2)),), "slice", {"starts": [1], "stops": [5], "axes": [1], "steps": [2]}), {"source_flat_for_output": [1, 3, 6, 8]}),
++        "concat": (_program((_tensor("a", "float32", (2, 1)), _tensor("b", "float32", (2, 2))), (_tensor("output", "float32", (2, 3)),), "concat", {"axis": 1}), {"segments": [[0, 1], [1, 2]]}),
++        "split": (_program((_tensor("source", "float32", (2, 3)),), (_tensor("a", "float32", (2, 1)), _tensor("b", "float32", (2, 2))), "split", {"axis": 1, "sizes": [1, 2]}), {"segments": [[0, 1], [1, 2]]}),
++        "gather": (_program((_tensor("source", "float32", (3, 4)), _tensor("indices", "int64", (2,))), (_tensor("output", "float32", (2, 4)),), "gather", {"axis": 0}), {"indices": [2, 0], "oob": "llvm.trap"}),
++        "embedding": (_program((_tensor("source", "bf16", (3, 4)), _tensor("indices", "int32", (2,))), (_tensor("output", "bf16", (2, 4)),), "embedding"), {"indices": [1, 2], "oob": "llvm.trap"}),
++        "iota": (_program((), (_tensor("output", "int64", (2, 3)),), "iota", {"axis": 1, "start": -2, "step": 2}), {"golden": [[-2, 0, 2], [-2, 0, 2]]}),
++        "compare": (_program((_tensor("left", "float32", (4,)), _tensor("right", "float32", (4,))), (_tensor("output", "bool", (4,)),), "compare", {"predicate": "ne"}), {"nan_ne": True}),
++        "where": (_program((_tensor("condition", "bool", (2, 1)), _tensor("true", "float32", (2, 3)), _tensor("false", "float32", (2, 3))), (_tensor("output", "float32", (2, 3)),), "where"), {"condition_broadcast": True}),
++        "constant": (_program((), (ValueRef("output", CoreType.scalar("float32")),), "constant", {"value": 1.25}), {"golden": 1.25}),
++    }
++
++
++def _disassemble(object_bytes):
++    objdump = shutil.which("llvm-objdump")
++    if objdump is None:
++        raise RuntimeError("llvm-objdump is required for C2 static evidence")
++    with tempfile.TemporaryDirectory(prefix="pypto-x-amdgpu-c2-disasm-") as directory:
++        path = Path(directory) / "kernel.o"
++        path.write_bytes(object_bytes)
++        result = subprocess.run(
++            [objdump, "-d", str(path)],
++            check=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            text=True,
++        )
++        return result.stdout
++
++
++def build_report():
++    compiler = AmdgpuStaticCompiler()
++    artifacts = []
++    for operation, (program, oracle) in _cases().items():
++        artifact = compiler.compile(compiler.lower(program, AMD_IGPU_GFX1036))
++        # Re-derive all canonical plans/bindings before recording evidence;
++        # this exercises the same digest/tamper fail-closed path used by the
++        # runtime loader, while still making no device call.
++        decode_amdgpu_artifact(artifact)
++        envelope = json.loads(bytes(artifact.payload).decode("utf-8"))
++        object_bytes = base64.b64decode(envelope["object_b64"].encode("ascii"), validate=True)
++        disassembly = _disassemble(object_bytes)
++        assembly_lower = envelope["assembly"].lower()
++        disassembly_lower = disassembly.lower()
++        artifacts.append(
++            {
++                "operation": operation,
++                "program_digest": artifact.metadata["program_digest"],
++                "plan_digest": artifact.metadata["plan_digest"],
++                "llvm_ir_digest": artifact.metadata["llvm_ir_digest"],
++                "assembly_digest": artifact.metadata["assembly_digest"],
++                "object_digest": artifact.metadata["object_digest"],
++                "object_format": envelope["object_format"],
++                "object_bytes": len(object_bytes),
++                "llvm_ir_has_load": " load " in envelope["llvm_ir"].lower(),
++                "llvm_ir_has_store": " store " in envelope["llvm_ir"].lower(),
++                "llvm_ir_has_bounds": "icmp ult i64" in envelope["llvm_ir"],
++                "assembly_has_load": any(token in assembly_lower for token in ("global_load", "flat_load", "s_load")),
++                "assembly_has_store": any(token in assembly_lower for token in ("global_store", "flat_store", "buffer_store")),
++                "assembly_has_alu": any(token in assembly_lower for token in ("v_add", "v_sub", "v_mul", "v_cmp", "v_cndmask", "s_add", "s_mul", "s_cmp")),
++                "disassembly_format": "elf64-amdgpu" in disassembly_lower,
++                "disassembly_has_load": any(token in disassembly_lower for token in ("global_load", "flat_load", "s_load")),
++                "disassembly_has_store": any(token in disassembly_lower for token in ("global_store", "flat_store", "buffer_store")),
++                "disassembly_has_alu": any(token in disassembly_lower for token in ("v_add", "v_sub", "v_mul", "v_cmp", "v_cndmask", "s_add", "s_mul", "s_cmp")),
++                "host_oracle": oracle,
++            }
++        )
++    return {
++        "target": {"name": "amd-igpu-gfx1036", "processor": AMDGCN_PROCESSOR, "triple": AMDGCN_TRIPLE},
++        "static_only": True,
++        "runtime_unverified": True,
++        "native_execution_claim": False,
++        "toolchain": {"llvm_as": shutil.which("llvm-as"), "llc": shutil.which("llc"), "llvm_objdump": shutil.which("llvm-objdump")},
++        "artifacts": artifacts,
++        "notes": [
++            "Each C2 family has a small scalar descriptor/oracle; no device runtime was called.",
++            "Indexing descriptors are compile-time O(rank+segments), never a numel-sized map.",
++            "Gather/embedding negative or out-of-range indices call llvm.trap; runtime execution remains BLOCKED_DEVICE.",
++        ],
++    }
++
++
++def main():
++    import argparse
++
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--output", required=True)
++    args = parser.parse_args()
++    report = build_report()
++    output = Path(args.output)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    output.write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
++    print("validated {} gfx1036 C2 static LLVM artifacts".format(len(report["artifacts"])))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/tests/ut/pypto_x/amd_gfx1036_qwen_capability_gap_driver.py b/python/tests/ut/pypto_x/amd_gfx1036_qwen_capability_gap_driver.py
+index 3a1d374d2..16131172e 100644
+--- a/python/tests/ut/pypto_x/amd_gfx1036_qwen_capability_gap_driver.py
++++ b/python/tests/ut/pypto_x/amd_gfx1036_qwen_capability_gap_driver.py
+@@ -58,6 +58,11 @@ def build_report(batch=1, steps=1, past_length=4096):
+             unsupported[canonical] += 1
+     total = sum(counts.values())
+     status = probe_amd_hip_runtime()
++    # The C1 evidence is frozen for the fixed MVP profile.  Keep this field
++    # explicit so a later report cannot confuse a larger static subset with a
++    # redefined model graph.
++    c1_static_subset_total = 844 if (batch, steps, past_length) == (1, 1, 4096) else None
++    c2_static_subset_total = total - sum(unsupported.values())
+     return {
+         "audit": "qwen35-text-decoder-amd-gfx1036-capability-gap",
+         "metadata_only": True,
+@@ -75,7 +80,11 @@ def build_report(batch=1, steps=1, past_length=4096):
+         "operation_total": total,
+         "operation_counts": dict(sorted(counts.items())),
+         "canonical_operation_counts": dict(sorted(canonical_counts.items())),
+-        "static_subset_operation_total": total - sum(unsupported.values()),
++        "c1_static_subset_operation_total": c1_static_subset_total,
++        "static_subset_operation_total": c2_static_subset_total,
++        "static_subset_delta_from_c1": (
++            None if c1_static_subset_total is None else c2_static_subset_total - c1_static_subset_total
++        ),
+         "unsupported_operation_counts": dict(sorted(unsupported.items())),
+         "runtime": status.to_dict(),
+         "graph_metadata": _plain(program.metadata),
+diff --git a/python/tests/ut/pypto_x/test_hip_gfx1036_static.py b/python/tests/ut/pypto_x/test_hip_gfx1036_static.py
+index ebe35037f..68b43e159 100644
+--- a/python/tests/ut/pypto_x/test_hip_gfx1036_static.py
++++ b/python/tests/ut/pypto_x/test_hip_gfx1036_static.py
+@@ -190,7 +190,7 @@ def test_static_llvm_artifact_is_deterministic_and_has_real_code(operation_name,
+ 
+ def test_unsupported_static_operation_is_explicitly_rejected():
+     with pytest.raises(AmdgpuUnsupportedError, match="explicitly rejects|supported operations"):
+-        AmdgpuStaticCompiler().lower(_program("compare"), AMD_IGPU_GFX1036)
++        AmdgpuStaticCompiler().lower(_program("exp"), AMD_IGPU_GFX1036)
+ 
+ 
+ def test_llvm_ir_and_target_tamper_fail_closed():
+diff --git a/python/tests/ut/pypto_x/test_hip_gfx1036_static_c2.py b/python/tests/ut/pypto_x/test_hip_gfx1036_static_c2.py
+new file mode 100644
+index 000000000..65573941a
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_hip_gfx1036_static_c2.py
+@@ -0,0 +1,188 @@
++"""C2 AMDGPU gfx1036 static layout/indexing/control contract tests.
++
++These tests deliberately stop at LLVM/ELF static evidence.  The GamePC WSL
++environment still has no Linux HIP device, so no numeric device execution is
++claimed here.
++"""
++
++from __future__ import annotations
++
++import json
++import hashlib
++
++import pytest
++
++from pypto.compiler.targets.hip import (
++    AMDGPU_LOWERING_VERSION,
++    AMDGPU_STATIC_SUPPORTED_OPERATIONS,
++    AmdgpuStaticCompiler,
++    AmdgpuArtifactError,
++    AmdgpuUnsupportedError,
++    decode_amdgpu_artifact,
++    render_amdgcn_llvm,
++)
++from pypto.compiler import Artifact
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.target import AMD_IGPU_GFX1036
++
++
++def _program(inputs, outputs, operation_name, attributes=None):
++    operation = Operation(operation_name, tuple(inputs), tuple(outputs), attributes=attributes or {})
++    return CoreProgram(
++        functions=(CoreFunction("main", tuple(inputs), tuple(outputs), Region((operation,))),)
++    )
++
++
++def _compile(program):
++    compiler = AmdgpuStaticCompiler()
++    return compiler.compile(compiler.lower(program, AMD_IGPU_GFX1036))
++
++
++def _tensor(name, dtype, shape):
++    return ValueRef(name, CoreType.tensor(dtype, shape))
++
++
++def test_c2_supported_set_is_explicit_and_versioned():
++    assert AMDGPU_LOWERING_VERSION == 2
++    assert {
++        "sub", "div", "neg", "cast", "constant", "reshape", "view", "contiguous",
++        "transpose", "broadcast", "slice", "concat", "split", "gather", "embedding",
++        "compare", "iota", "where",
++    }.issubset(set(AMDGPU_STATIC_SUPPORTED_OPERATIONS))
++
++
++@pytest.mark.parametrize("name", ("sub", "div", "neg"))
++def test_c2_exact_shape_float_arithmetic_emits_real_alu(name):
++    value_type = CoreType.tensor("float32", (7,))
++    left = ValueRef("left", value_type)
++    right = ValueRef("right", value_type)
++    output = ValueRef("output", value_type)
++    inputs = (left,) if name == "neg" else (left, right)
++    artifact = _compile(_program(inputs, (output,), name))
++    envelope = json.loads(bytes(artifact.payload).decode("utf-8"))
++    assert "load float" in envelope["llvm_ir"]
++    assert any(opcode in envelope["llvm_ir"] for opcode in ("fsub", "fdiv", "fneg"))
++    assert "store float" in envelope["llvm_ir"]
++
++
++def test_c2_scalar_constant_has_pointer_abi_and_bf16_cast_is_rne_storage():
++    scalar = ValueRef("constant", CoreType.scalar("float32"))
++    artifact = _compile(_program((), (scalar,), "constant", {"value": 1.25}))
++    envelope = json.loads(bytes(artifact.payload).decode("utf-8"))
++    assert "store float" in envelope["llvm_ir"]
++    assert envelope["bindings"][0]["outputs"][0]["kind"] == "scalar"
++
++    source = _tensor("source", "bf16", (5,))
++    output = _tensor("output", "float32", (5,))
++    cast_artifact = _compile(_program((source,), (output,), "cast", {"dtype": "float32"}))
++    cast_ir = json.loads(bytes(cast_artifact.payload).decode("utf-8"))["llvm_ir"]
++    assert "zext i16" in cast_ir and "shl i32" in cast_ir and "bitcast i32" in cast_ir
++
++
++def test_c2_copy_layout_ops_use_flat_copy_without_numel_index_map():
++    source = _tensor("source", "float32", (1024, 1024))
++    output = _tensor("output", "float32", (1024, 1024))
++    for name, attrs in (("reshape", {"shape": [1024, 1024]}), ("view", {"shape": [1024, 1024]}), ("contiguous", {})):
++        program = _program((source,), (output,), name, attrs)
++        target_ir = AmdgpuStaticCompiler().lower(program, AMD_IGPU_GFX1036)
++        assert len(target_ir.llvm_ir) < 10000
++        assert "getelementptr" in target_ir.llvm_ir
++
++
++def test_c2_transpose_broadcast_slice_concat_split_emit_rank_segment_formulas():
++    source = _tensor("source", "float32", (2, 3, 4))
++    transposed = _tensor("transposed", "float32", (4, 2, 3))
++    transpose_ir = json.loads(bytes(_compile(_program((source,), (transposed,), "transpose", {"permutation": [2, 0, 1]})).payload).decode("utf-8"))["llvm_ir"]
++    assert "udiv i64" in transpose_ir and "urem i64" in transpose_ir
++
++    broadcast_source = _tensor("broadcast_source", "float32", (2, 1))
++    broadcast_output = _tensor("broadcast_output", "float32", (2, 3))
++    broadcast_ir = json.loads(bytes(_compile(_program((broadcast_source,), (broadcast_output,), "broadcast", {"shape": [2, 3]})).payload).decode("utf-8"))["llvm_ir"]
++    assert "getelementptr" in broadcast_ir
++
++    slice_output = _tensor("slice_output", "float32", (2, 2))
++    slice_ir = json.loads(bytes(_compile(_program((broadcast_output,), (slice_output,), "slice", {"starts": [1], "stops": [3], "axes": [1], "steps": [1]})).payload).decode("utf-8"))["llvm_ir"]
++    assert "mul i64" in slice_ir and "add i64" in slice_ir
++
++    first = _tensor("first", "float32", (2, 1))
++    second = _tensor("second", "float32", (2, 2))
++    joined = _tensor("joined", "float32", (2, 3))
++    concat_ir = json.loads(bytes(_compile(_program((first, second), (joined,), "concat", {"axis": 1})).payload).decode("utf-8"))["llvm_ir"]
++    assert "concat_in" in concat_ir and "icmp uge" in concat_ir
++
++    split_a = _tensor("split_a", "float32", (2, 1))
++    split_b = _tensor("split_b", "float32", (2, 2))
++    split_ir = json.loads(bytes(_compile(_program((joined,), (split_a, split_b), "split", {"axis": 1, "sizes": [1, 2]})).payload).decode("utf-8"))["llvm_ir"]
++    assert split_ir.count("getelementptr") >= 4
++
++
++def test_c2_gather_embedding_have_signed_bounds_and_trap_contract():
++    source = _tensor("source", "float32", (3, 4))
++    indices = _tensor("indices", "int64", (2,))
++    output = _tensor("output", "float32", (2, 4))
++    gather_ir = json.loads(bytes(_compile(_program((source, indices), (output,), "gather", {"axis": 0})).payload).decode("utf-8"))["llvm_ir"]
++    assert "icmp slt i64" in gather_ir and "icmp sge i64" in gather_ir
++    assert "@llvm.trap" in gather_ir
++
++    embedding_ir = json.loads(bytes(_compile(_program((source, indices), (output,), "embedding")).payload).decode("utf-8"))["llvm_ir"]
++    assert "call void @llvm.trap()" in embedding_ir
++
++
++@pytest.mark.parametrize("predicate", ("eq", "ne", "lt", "le", "gt", "ge"))
++def test_c2_compare_predicates_and_nan_contract(predicate):
++    left = _tensor("left", "float32", (4,))
++    right = _tensor("right", "float32", (4,))
++    output = _tensor("output", "bool", (4,))
++    program = _program((left, right), (output,), "compare", {"predicate": predicate})
++    ir = json.loads(bytes(_compile(program).payload).decode("utf-8"))["llvm_ir"]
++    assert "fcmp" in ir
++    if predicate == "ne":
++        assert "fcmp une" in ir
++
++
++def test_c2_iota_where_and_integer_storage_are_real_control_ops():
++    output = _tensor("output", "int64", (2, 3))
++    iota_ir = json.loads(bytes(_compile(_program((), (output,), "iota", {"axis": 1, "start": -2, "step": 2})).payload).decode("utf-8"))["llvm_ir"]
++    assert "mul i64" in iota_ir and "store i64" in iota_ir
++
++    condition = _tensor("condition", "bool", (2, 1))
++    true_value = _tensor("true_value", "bf16", (2, 3))
++    false_value = ValueRef("false_value", CoreType.scalar("bf16"))
++    selected = _tensor("selected", "bf16", (2, 3))
++    where_ir = json.loads(bytes(_compile(_program((condition, true_value, false_value), (selected,), "where")).payload).decode("utf-8"))["llvm_ir"]
++    assert "select i1" in where_ir and "load i16" in where_ir
++
++
++def test_c2_bad_descriptors_remain_fail_closed():
++    source = _tensor("source", "float32", (2, 3))
++    output = _tensor("output", "float32", (3, 2))
++    with pytest.raises(AmdgpuUnsupportedError):
++        AmdgpuStaticCompiler().lower(
++            _program((source,), (output,), "transpose", {"permutation": [0, 0, 1]}), AMD_IGPU_GFX1036
++        )
++    with pytest.raises(AmdgpuUnsupportedError):
++        AmdgpuStaticCompiler().lower(
++            _program((source,), (_tensor("slice", "float32", (2, 2)),), "slice", {"starts": [0], "stops": [3], "axes": [1], "steps": [-1]}),
++            AMD_IGPU_GFX1036,
++        )
++
++
++def test_c1_artifact_version_is_rejected_and_requires_recompile():
++    source = _tensor("source", "float32", (5,))
++    output = _tensor("output", "float32", (5,))
++    artifact = _compile(_program((source,), (output,), "identity"))
++    payload = json.loads(bytes(artifact.payload).decode("utf-8"))
++    payload["amdgpu_lowering_version"] = 1
++    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    metadata = dict(artifact.metadata)
++    metadata["payload_digest"] = hashlib.sha256(encoded).hexdigest()
++    old_artifact = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        payload=encoded,
++        metadata=metadata,
++    )
++    with pytest.raises(AmdgpuArtifactError, match="version field|digest|canonical"):
++        decode_amdgpu_artifact(old_artifact)

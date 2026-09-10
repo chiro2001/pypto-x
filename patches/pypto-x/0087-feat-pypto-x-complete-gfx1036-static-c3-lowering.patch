@@ -1,0 +1,1473 @@
+From 133dcaca64ce342d65279847c01fd29f4e79bee3 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Thu, 10 Sep 2026 14:10:16 +0800
+Subject: [PATCH 87/96] feat(pypto-x): complete gfx1036 static c3 lowering
+
+---
+ python/pypto/compiler/targets/hip.py                            | 692 ++++++++++++++++++++++++----
+ python/tests/ut/pypto_x/amd_gfx1036_c3_static_lower_driver.py   |  94 ++++
+ .../tests/ut/pypto_x/amd_gfx1036_c3_static_validation_driver.py | 287 ++++++++++++
+ python/tests/ut/pypto_x/test_hip_gfx1036_static.py              |   2 +-
+ python/tests/ut/pypto_x/test_hip_gfx1036_static_c2.py           |   2 +-
+ python/tests/ut/pypto_x/test_hip_gfx1036_static_c3.py           | 218 +++++++++
+ 6 files changed, 1193 insertions(+), 102 deletions(-)
+
+diff --git a/python/pypto/compiler/targets/hip.py b/python/pypto/compiler/targets/hip.py
+index 16ff34d2e..429bdff4a 100644
+--- a/python/pypto/compiler/targets/hip.py
++++ b/python/pypto/compiler/targets/hip.py
+@@ -40,6 +40,7 @@ from pypto.lowering.cpu import (
+     comparison_predicate_for_operation,
+     flatten_values,
+     iota_spec,
++    reduced_shape,
+     static_shape,
+ )
+ from pypto.lowering.gpu import (
+@@ -60,13 +61,13 @@ from pypto.target import (
+ from pypto.target._utils import frozen_mapping, mapping_copy, sha256_bytes, sha256_text
+ 
+ 
+-ARTIFACT_PAYLOAD_VERSION = 2
++ARTIFACT_PAYLOAD_VERSION = 3
+ AMDGPU_ARTIFACT_FORMAT = "pypto-x.amdgpu.llvm"
+ DEFAULT_ARTIFACT_FORMAT = AMDGPU_ARTIFACT_FORMAT
+ AMDGPU_BACKEND = "amdgpu.llvm.static"
+ AMDGPU_RUNTIME_BACKEND = "amdgpu.runtime.static"
+-AMDGPU_LLVM_IR_VERSION = "llvm.amdgcn.v2"
+-AMDGPU_LOWERING_VERSION = 2
++AMDGPU_LLVM_IR_VERSION = "llvm.amdgcn.v3"
++AMDGPU_LOWERING_VERSION = 3
+ AMDGPU_ABI_VERSION = ABI_VERSION
+ _GFX_RE = re.compile(r"^gfx[0-9]{4}$\Z")
+ AMDGPU_STATIC_SUPPORTED_OPERATIONS = (
+@@ -91,7 +92,14 @@ AMDGPU_STATIC_SUPPORTED_OPERATIONS = (
+     "compare",
+     "iota",
+     "where",
++    "exp",
++    "rsqrt",
++    "sigmoid",
++    "silu",
++    "softplus",
+     "reduce_sum",
++    "reduce_max",
++    "reduce_mean",
+     "matmul",
+ )
+ _SUPPORTED_OPS = frozenset(AMDGPU_STATIC_SUPPORTED_OPERATIONS)
+@@ -509,6 +517,330 @@ def _emit_store_f32(builder: _IRBuilder, pointer: str, index: str, dtype: str, v
+     _emit_store(builder, pointer, index, dtype, value)
+ 
+ 
++def _emit_f32_from_bits(builder: _IRBuilder, bits: int, prefix: str = "f32bits") -> str:
++    """Materialise an f32 constant without a device-library dependency."""
++
++    raw = builder.temp(prefix + "_raw")
++    value = builder.temp(prefix)
++    builder.line("  {} = add i32 0, {}".format(raw, int(bits) & 0xFFFFFFFF))
++    builder.line("  {} = bitcast i32 {} to float".format(value, raw))
++    return value
++
++
++def _llvm_f32_exact_literal(value: Any) -> str:
++    """Return a decimal literal that is exactly representable as f32."""
++
++    rounded = struct.unpack("<f", struct.pack("<f", float(value)))[0]
++    return repr(rounded)
++
++
++def _emit_exp_f32(builder: _IRBuilder, value: str) -> str:
++    """Emit a finite, explicit expf approximation in LLVM IR.
++
++    The implementation deliberately avoids ``llvm.exp.*`` and libc/device
++    library calls.  Range reduction is to ``[-ln(2), ln(2)]`` followed by an
++    eighth-order Taylor polynomial and an explicitly constructed power of two.
++    Inputs outside the finite f32 range are handled before ``fptosi`` so the
++    generated IR never converts NaN/Inf or an out-of-range value to an integer.
++    """
++
++    nan = builder.temp("exp_nan")
++    safe = builder.temp("exp_safe")
++    low = builder.temp("exp_low")
++    high = builder.temp("exp_high")
++    bounded_low = builder.temp("exp_bounded_low")
++    bounded = builder.temp("exp_bounded")
++    scaled = builder.temp("exp_scaled")
++    exponent = builder.temp("exp_exponent")
++    exponent_f32 = builder.temp("exp_exponent_f32")
++    reduced = builder.temp("exp_reduced")
++    builder.line("  {} = fcmp uno float {}, {}".format(nan, value, value))
++    builder.line(
++        "  {} = select i1 {}, float {}, float {}".format(
++            safe, nan, _llvm_f32_literal(0.0), value
++        )
++    )
++    low_bound = _llvm_f32_literal(-103.97208404541016)
++    high_bound = _llvm_f32_literal(88.72283935546875)
++    builder.line("  {} = fcmp olt float {}, {}".format(low, safe, low_bound))
++    builder.line("  {} = fcmp ogt float {}, {}".format(high, safe, high_bound))
++    builder.line(
++        "  {} = select i1 {}, float {}, float {}".format(
++            bounded_low, low, low_bound, safe
++        )
++    )
++    builder.line(
++        "  {} = select i1 {}, float {}, float {}".format(
++            bounded, high, high_bound, bounded_low
++        )
++    )
++    builder.line(
++        "  {} = fmul float {}, {}".format(
++            scaled, bounded, _llvm_f32_literal(1.4426950408889634)
++        )
++    )
++    # bounded is within [-104, 89], so this conversion is defined and the
++    # integer range is small enough for the bit-level scale construction.
++    builder.line("  {} = fptosi float {} to i32".format(exponent, scaled))
++    builder.line("  {} = sitofp i32 {} to float".format(exponent_f32, exponent))
++    reduced_scale_mul = builder.temp("exp_reduced_scale_mul")
++    builder.line(
++        "  {} = fmul float {}, {}".format(
++            reduced_scale_mul, exponent_f32, _llvm_f32_literal(0.6931471805599453)
++        )
++    )
++    builder.line("  {} = fsub float {}, {}".format(reduced, bounded, reduced_scale_mul))
++
++    # Horner form for exp(reduced).  Keeping every operation explicit makes
++    # the IR auditable and prevents fast-math flags from changing edge cases.
++    polynomial = _llvm_f32_exact_literal(1.0 / 40320.0)
++    for coefficient in (
++        1.0 / 5040.0,
++        1.0 / 720.0,
++        1.0 / 120.0,
++        1.0 / 24.0,
++        1.0 / 6.0,
++        0.5,
++        1.0,
++    ):
++        multiplied = builder.temp("exp_poly_mul")
++        updated = builder.temp("exp_poly")
++        builder.line("  {} = fmul float {}, {}".format(multiplied, reduced, polynomial))
++        builder.line("  {} = fadd float {}, {}".format(updated, multiplied, _llvm_f32_exact_literal(coefficient)))
++        polynomial = updated
++    multiplied = builder.temp("exp_poly_mul")
++    finite = builder.temp("exp_finite")
++    builder.line("  {} = fmul float {}, {}".format(multiplied, reduced, polynomial))
++    builder.line("  {} = fadd float {}, {}".format(finite, multiplied, _llvm_f32_literal(1.0)))
++
++    normal = builder.temp("exp_normal")
++    exponent_plus = builder.temp("exp_exponent_plus")
++    exponent_plus_safe = builder.temp("exp_exponent_plus_safe")
++    normal_bits = builder.temp("exp_normal_bits")
++    builder.line("  {} = icmp sge i32 {}, -126".format(normal, exponent))
++    builder.line("  {} = add i32 {}, 127".format(exponent_plus, exponent))
++    builder.line(
++        "  {} = select i1 {}, i32 {}, i32 0".format(
++            exponent_plus_safe, normal, exponent_plus
++        )
++    )
++    builder.line("  {} = shl i32 {}, 23".format(normal_bits, exponent_plus_safe))
++
++    sub_shift = builder.temp("exp_sub_shift")
++    sub_below = builder.temp("exp_sub_below")
++    sub_above = builder.temp("exp_sub_above")
++    sub_shift_safe_low = builder.temp("exp_sub_shift_safe_low")
++    sub_shift_safe = builder.temp("exp_sub_shift_safe")
++    sub_bits = builder.temp("exp_sub_bits")
++    one = builder.temp("exp_one")
++    builder.line("  {} = add i32 {}, 149".format(sub_shift, exponent))
++    builder.line("  {} = icmp slt i32 {}, -149".format(sub_below, exponent))
++    builder.line("  {} = icmp sgt i32 {}, -127".format(sub_above, exponent))
++    builder.line(
++        "  {} = select i1 {}, i32 0, i32 {}".format(
++            sub_shift_safe_low, sub_below, sub_shift
++        )
++    )
++    builder.line(
++        "  {} = select i1 {}, i32 0, i32 {}".format(
++            sub_shift_safe, sub_above, sub_shift_safe_low
++        )
++    )
++    builder.line("  {} = add i32 0, 1".format(one))
++    builder.line("  {} = shl i32 {}, {}".format(sub_bits, one, sub_shift_safe))
++    scale_bits = builder.temp("exp_scale_bits")
++    scale = builder.temp("exp_scale")
++    builder.line("  {} = select i1 {}, i32 {}, i32 {}".format(scale_bits, normal, normal_bits, sub_bits))
++    builder.line("  {} = bitcast i32 {} to float".format(scale, scale_bits))
++    scaled_finite = builder.temp("exp_scaled_finite")
++    builder.line("  {} = fmul float {}, {}".format(scaled_finite, finite, scale))
++    zero = _llvm_f32_literal(0.0)
++    infinity = _emit_f32_from_bits(builder, 0x7F800000, "exp_inf")
++    bounded_result = builder.temp("exp_bounded_result")
++    high_result = builder.temp("exp_high_result")
++    result = builder.temp("exp_result")
++    builder.line("  {} = select i1 {}, float {}, float {}".format(bounded_result, low, zero, scaled_finite))
++    builder.line("  {} = select i1 {}, float {}, float {}".format(high_result, high, infinity, bounded_result))
++    builder.line("  {} = select i1 {}, float {}, float {}".format(result, nan, value, high_result))
++    return result
++
++
++def _emit_log1p_nonnegative_f32(builder: _IRBuilder, value: str) -> str:
++    """Compute log(1+x), x in [0, 1], with an explicit atanh series."""
++
++    denominator = builder.temp("log1p_denominator")
++    ratio = builder.temp("log1p_ratio")
++    builder.line("  {} = fadd float {}, {}".format(denominator, value, _llvm_f32_literal(2.0)))
++    builder.line("  {} = fdiv float {}, {}".format(ratio, value, denominator))
++    # log(1+x) = 2 * (t + t^3/3 + ...), t=x/(2+x).  For x<=1 the
++    # geometric convergence is fast and needs no external math routine.
++    result = builder.temp("log1p_result")
++    builder.line("  {} = fadd float {}, {}".format(result, ratio, _llvm_f32_literal(0.0)))
++    power = ratio
++    for denominator_value in (3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0):
++        square = builder.temp("log1p_square")
++        power_next = builder.temp("log1p_power")
++        term = builder.temp("log1p_term")
++        updated = builder.temp("log1p_sum")
++        builder.line("  {} = fmul float {}, {}".format(square, ratio, ratio))
++        builder.line("  {} = fmul float {}, {}".format(power_next, power, square))
++        builder.line("  {} = fdiv float {}, {}".format(term, power_next, _llvm_f32_literal(denominator_value)))
++        builder.line("  {} = fadd float {}, {}".format(updated, result, term))
++        result = updated
++        power = power_next
++    doubled = builder.temp("log1p_doubled")
++    builder.line("  {} = fmul float {}, {}".format(doubled, result, _llvm_f32_literal(2.0)))
++    return doubled
++
++
++def _emit_rsqrt_f32(builder: _IRBuilder, value: str) -> str:
++    """Emit a total rsqrt path with explicit zero/negative handling."""
++
++    nan = builder.temp("rsqrt_nan")
++    bits = builder.temp("rsqrt_bits")
++    sign = builder.temp("rsqrt_sign")
++    exponent = builder.temp("rsqrt_exponent")
++    mantissa = builder.temp("rsqrt_mantissa")
++    is_inf = builder.temp("rsqrt_inf")
++    negative = builder.temp("rsqrt_negative")
++    zero = builder.temp("rsqrt_zero")
++    finite_positive = builder.temp("rsqrt_finite_positive")
++    safe = builder.temp("rsqrt_safe")
++    builder.line("  {} = fcmp uno float {}, {}".format(nan, value, value))
++    builder.line("  {} = bitcast float {} to i32".format(bits, value))
++    builder.line("  {} = and i32 {}, -2147483648".format(sign, bits))
++    builder.line("  {} = and i32 {}, 2139095040".format(exponent, bits))
++    builder.line("  {} = and i32 {}, 8388607".format(mantissa, bits))
++    exponent_full = builder.temp("rsqrt_exponent_full")
++    mantissa_nonzero = builder.temp("rsqrt_mantissa_nonzero")
++    builder.line("  {} = icmp eq i32 {}, 2139095040".format(exponent_full, exponent))
++    builder.line("  {} = icmp ne i32 {}, 0".format(mantissa_nonzero, mantissa))
++    mantissa_zero = builder.temp("rsqrt_mantissa_zero")
++    builder.line("  {} = xor i1 {}, true".format(mantissa_zero, mantissa_nonzero))
++    builder.line("  {} = and i1 {}, {}".format(is_inf, exponent_full, mantissa_zero))
++    builder.line("  {} = icmp ne i32 {}, 0".format(negative, sign))
++    builder.line("  {} = fcmp oeq float {}, {}".format(zero, value, _llvm_f32_literal(0.0)))
++    positive = builder.temp("rsqrt_positive")
++    builder.line("  {} = fcmp ogt float {}, {}".format(positive, value, _llvm_f32_literal(0.0)))
++    not_inf = builder.temp("rsqrt_not_inf")
++    builder.line("  {} = xor i1 {}, true".format(not_inf, is_inf))
++    builder.line("  {} = and i1 {}, {}".format(finite_positive, positive, not_inf))
++    builder.line("  {} = select i1 {}, float {}, float {}".format(safe, finite_positive, value, _llvm_f32_literal(1.0)))
++
++    safe_bits = builder.temp("rsqrt_safe_bits")
++    shifted = builder.temp("rsqrt_shifted")
++    magic = builder.temp("rsqrt_magic")
++    estimate = builder.temp("rsqrt_estimate")
++    builder.line("  {} = bitcast float {} to i32".format(safe_bits, safe))
++    builder.line("  {} = lshr i32 {}, 1".format(shifted, safe_bits))
++    builder.line("  {} = sub i32 1597463007, {}".format(magic, shifted))
++    builder.line("  {} = bitcast i32 {} to float".format(estimate, magic))
++    current = estimate
++    for _ in range(3):
++        square = builder.temp("rsqrt_square")
++        product = builder.temp("rsqrt_product")
++        half_product = builder.temp("rsqrt_half_product")
++        correction = builder.temp("rsqrt_correction")
++        updated = builder.temp("rsqrt_updated")
++        builder.line("  {} = fmul float {}, {}".format(square, current, current))
++        builder.line("  {} = fmul float {}, {}".format(product, safe, square))
++        builder.line("  {} = fmul float {}, {}".format(half_product, product, _llvm_f32_literal(0.5)))
++        builder.line("  {} = fsub float {}, {}".format(correction, _llvm_f32_literal(1.5), half_product))
++        builder.line("  {} = fmul float {}, {}".format(updated, current, correction))
++        current = updated
++    qnan = _emit_f32_from_bits(builder, 0x7FC00000, "rsqrt_qnan")
++    signed_infinity_bits = builder.temp("rsqrt_signed_inf_bits")
++    signed_infinity = builder.temp("rsqrt_signed_inf")
++    builder.line("  {} = or i32 2139095040, {}".format(signed_infinity_bits, sign))
++    builder.line("  {} = bitcast i32 {} to float".format(signed_infinity, signed_infinity_bits))
++    negative_nonzero = builder.temp("rsqrt_negative_nonzero")
++    builder.line("  {} = and i1 {}, true".format(negative_nonzero, negative))
++    result_non_nan = builder.temp("rsqrt_result_non_nan")
++    result_not_negative = builder.temp("rsqrt_result_not_negative")
++    result_not_zero = builder.temp("rsqrt_result_not_zero")
++    builder.line("  {} = select i1 {}, float {}, float {}".format(result_non_nan, negative_nonzero, qnan, current))
++    builder.line("  {} = select i1 {}, float {}, float {}".format(result_not_negative, zero, signed_infinity, result_non_nan))
++    # For nonzero negative values, negative_nonzero selects qNaN.  For zero,
++    # the signed infinity result must win; positive zero also receives +Inf.
++    builder.line("  {} = select i1 {}, float {}, float {}".format(result_not_zero, zero, signed_infinity, result_not_negative))
++    # Materialise the complement once so negative infinity remains an invalid
++    # negative input while positive infinity maps to zero.
++    positive_inf = builder.temp("rsqrt_positive_inf")
++    not_negative = builder.temp("rsqrt_not_negative")
++    builder.line("  {} = xor i1 {}, true".format(not_negative, negative))
++    builder.line("  {} = and i1 {}, {}".format(positive_inf, is_inf, not_negative))
++    result_inf = builder.temp("rsqrt_result_inf")
++    builder.line("  {} = select i1 {}, float {}, float {}".format(result_inf, positive_inf, _llvm_f32_literal(0.0), result_not_zero))
++    result = builder.temp("rsqrt_result")
++    builder.line("  {} = select i1 {}, float {}, float {}".format(result, nan, value, result_inf))
++    return result
++
++
++def _emit_sigmoid_f32(builder: _IRBuilder, value: str) -> str:
++    nan = builder.temp("sigmoid_nan")
++    nonnegative = builder.temp("sigmoid_nonnegative")
++    negated = builder.temp("sigmoid_negated")
++    builder.line("  {} = fcmp uno float {}, {}".format(nan, value, value))
++    builder.line("  {} = fcmp oge float {}, {}".format(nonnegative, value, _llvm_f32_literal(0.0)))
++    builder.line("  {} = fsub float {}, {}".format(negated, _llvm_f32_literal(0.0), value))
++    positive_exp = _emit_exp_f32(builder, negated)
++    negative_exp = _emit_exp_f32(builder, value)
++    positive_denominator = builder.temp("sigmoid_positive_denominator")
++    negative_denominator = builder.temp("sigmoid_negative_denominator")
++    positive_result = builder.temp("sigmoid_positive_result")
++    negative_result = builder.temp("sigmoid_negative_result")
++    selected = builder.temp("sigmoid_selected")
++    result = builder.temp("sigmoid_result")
++    builder.line("  {} = fadd float {}, {}".format(positive_denominator, _llvm_f32_literal(1.0), positive_exp))
++    builder.line("  {} = fadd float {}, {}".format(negative_denominator, _llvm_f32_literal(1.0), negative_exp))
++    builder.line("  {} = fdiv float {}, {}".format(positive_result, _llvm_f32_literal(1.0), positive_denominator))
++    builder.line("  {} = fdiv float {}, {}".format(negative_result, negative_exp, negative_denominator))
++    builder.line("  {} = select i1 {}, float {}, float {}".format(selected, nonnegative, positive_result, negative_result))
++    builder.line("  {} = select i1 {}, float {}, float {}".format(result, nan, value, selected))
++    return result
++
++
++def _emit_math_c3(builder: _IRBuilder, operation: Operation, index: str) -> None:
++    name = canonical_operation_name(operation.name)
++    dtype = canonical_dtype(operation.outputs[0].type.dtype)
++    input_shape = _value_shape(operation.inputs[0].type, "{} input".format(name))
++    output_shape = _value_shape(operation.outputs[0].type, "{} output".format(name))
++    source_index = _emit_broadcast_index(builder, index, input_shape, output_shape)
++    value = _emit_load_f32(builder, "%arg0", source_index, dtype)
++    if name == "exp":
++        result = _emit_exp_f32(builder, value)
++    elif name == "rsqrt":
++        result = _emit_rsqrt_f32(builder, value)
++    elif name == "sigmoid":
++        result = _emit_sigmoid_f32(builder, value)
++    elif name == "silu":
++        sigmoid = _emit_sigmoid_f32(builder, value)
++        result = builder.temp("silu_result")
++        builder.line("  {} = fmul float {}, {}".format(result, value, sigmoid))
++    elif name == "softplus":
++        nan = builder.temp("softplus_nan")
++        negative = builder.temp("softplus_negative")
++        negated = builder.temp("softplus_negated")
++        absolute = builder.temp("softplus_absolute")
++        positive_part = builder.temp("softplus_positive_part")
++        builder.line("  {} = fcmp uno float {}, {}".format(nan, value, value))
++        builder.line("  {} = fcmp olt float {}, {}".format(negative, value, _llvm_f32_literal(0.0)))
++        builder.line("  {} = fsub float {}, {}".format(negated, _llvm_f32_literal(0.0), value))
++        builder.line("  {} = select i1 {}, float {}, float {}".format(absolute, negative, negated, value))
++        neg_absolute = builder.temp("softplus_neg_absolute")
++        builder.line("  {} = fsub float {}, {}".format(neg_absolute, _llvm_f32_literal(0.0), absolute))
++        exponential = _emit_exp_f32(builder, neg_absolute)
++        logarithm = _emit_log1p_nonnegative_f32(builder, exponential)
++        builder.line("  {} = select i1 {}, float {}, float {}".format(positive_part, negative, _llvm_f32_literal(0.0), value))
++        combined = builder.temp("softplus_combined")
++        result = builder.temp("softplus_result")
++        builder.line("  {} = fadd float {}, {}".format(combined, positive_part, logarithm))
++        builder.line("  {} = select i1 {}, float {}, float {}".format(result, nan, value, combined))
++    else:
++        raise AmdgpuUnsupportedError("static AMDGPU math emitter has no operation {!r}".format(name))
++    _emit_store_f32(builder, "%arg1", index, dtype, result)
++
++
+ def _emit_load_value(builder: _IRBuilder, pointer: str, index: str, dtype: str) -> str:
+     """Load one value in its ABI type (float, i16, i32, i64, or i8)."""
+ 
+@@ -550,14 +882,20 @@ def _validate_tensor_pair(
+     return dtype, output_shape
+ 
+ 
+-def _c2_storage_ref(ref: ValueRef, context: str, *, tensor_only: bool = False) -> Tuple[str, Tuple[int, ...]]:
++def _c2_storage_ref(
++    ref: ValueRef,
++    context: str,
++    *,
++    tensor_only: bool = False,
++    allow_zero_tensor: bool = False,
++) -> Tuple[str, Tuple[int, ...]]:
+     if not (_is_tensor(ref.type) or (ref.type.kind == "scalar" and not tensor_only)):
+         raise AmdgpuUnsupportedError("{} requires tensor/scalar storage values".format(context))
+     dtype = canonical_dtype(ref.type.dtype)
+     if dtype not in _C2_STORAGE_DTYPES:
+         raise AmdgpuUnsupportedError("{} does not support dtype {!r}".format(context, dtype))
+     shape = _value_shape(ref.type, context)
+-    if _is_tensor(ref.type) and any(int(dimension) == 0 for dimension in shape):
++    if _is_tensor(ref.type) and not allow_zero_tensor and any(int(dimension) == 0 for dimension in shape):
+         raise AmdgpuUnsupportedError("{} rejects zero-sized tensor domains".format(context))
+     return dtype, shape
+ 
+@@ -824,6 +1162,101 @@ def _c2_validate_iota(operation: Operation) -> None:
+     _c2_attrs_call(iota_spec, output.type, operation.attributes, context="iota")
+ 
+ 
++def _c3_validate_math(operation: Operation, name: str) -> None:
++    if len(operation.inputs) != 1:
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires one input".format(name))
++    output = _c2_one_output(operation, name)
++    input_ref = operation.inputs[0]
++    if not (_is_tensor(input_ref.type) or input_ref.type.kind == "scalar"):
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires tensor/scalar input".format(name))
++    if not (_is_tensor(output.type) or output.type.kind == "scalar"):
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires tensor/scalar output".format(name))
++    input_dtype, input_shape = _c2_storage_ref(input_ref, "{} input".format(name))
++    output_dtype, output_shape = _c2_storage_ref(output, "{} output".format(name))
++    if input_dtype not in _C2_FLOAT_DTYPES or input_dtype != output_dtype:
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires matching FP32/BF16 storage".format(name))
++    if input_ref.type.kind != output.type.kind or input_shape != output_shape:
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires matching input/output kind and shape".format(name))
++
++
++def _c3_axes(attributes: Mapping[str, Any], rank: int, context: str) -> Tuple[int, ...]:
++    raw = attributes.get("axes", attributes.get("axis"))
++    if raw is None:
++        raw = tuple(range(rank))
++    elif isinstance(raw, int) and not isinstance(raw, bool):
++        raw = (raw,)
++    elif isinstance(raw, (str, bytes)):
++        raise AmdgpuUnsupportedError("static AMDGPU {} axes are invalid".format(context))
++    try:
++        values = tuple(raw)
++    except TypeError as exc:
++        raise AmdgpuUnsupportedError("static AMDGPU {} axes are invalid".format(context)) from exc
++    normalized = []
++    for axis in values:
++        if isinstance(axis, bool) or not isinstance(axis, int):
++            raise AmdgpuUnsupportedError("static AMDGPU {} axes must contain integers".format(context))
++        axis = axis + rank if axis < 0 else axis
++        if axis < 0 or axis >= rank or axis in normalized:
++            raise AmdgpuUnsupportedError("static AMDGPU {} axes are invalid".format(context))
++        normalized.append(axis)
++    return tuple(sorted(normalized))
++
++
++def _c3_validate_reduction(operation: Operation, name: str) -> None:
++    if len(operation.inputs) != 1:
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires one input tensor".format(name))
++    output = _c2_one_output(operation, name)
++    input_ref = operation.inputs[0]
++    if not _is_tensor(input_ref.type) or not _is_tensor(output.type):
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires tensor input/output".format(name))
++    input_dtype, input_shape = _c2_storage_ref(input_ref, "{} input".format(name), tensor_only=True)
++    output_dtype, output_shape = _c2_storage_ref(output, "{} output".format(name), tensor_only=True)
++    if input_dtype not in _C2_FLOAT_DTYPES or input_dtype != output_dtype:
++        raise AmdgpuUnsupportedError("static AMDGPU {} requires matching FP32/BF16 tensors".format(name))
++    keepdims = operation.attributes.get("keepdims", False)
++    if not isinstance(keepdims, bool):
++        raise AmdgpuUnsupportedError("static AMDGPU {} keepdims must be bool".format(name))
++    axes = _c3_axes(operation.attributes, len(input_shape), name)
++    try:
++        expected_shape = reduced_shape(input_shape, {"axes": axes, "keepdims": keepdims}, "AMDGPU {}".format(name))
++    except Exception as exc:
++        raise _c2_error("{} shape".format(name), exc) from exc
++    if output_shape != expected_shape:
++        raise AmdgpuUnsupportedError("static AMDGPU {} output shape does not match axes/keepdims".format(name))
++    reduction_size = _element_count(tuple(input_shape[axis] for axis in axes))
++    if reduction_size <= 0:
++        raise AmdgpuUnsupportedError("static AMDGPU {} rejects empty reduction domains".format(name))
++
++
++def _c3_validate_matmul(operation: Operation) -> None:
++    if len(operation.inputs) != 2:
++        raise AmdgpuUnsupportedError("static AMDGPU matmul requires two input tensors")
++    output = _c2_one_output(operation, "matmul")
++    if not all(_is_tensor(ref.type) for ref in operation.inputs) or not _is_tensor(output.type):
++        raise AmdgpuUnsupportedError("static AMDGPU matmul supports tensor values only")
++    left_dtype, left_shape = _c2_storage_ref(
++        operation.inputs[0], "matmul left", tensor_only=True, allow_zero_tensor=True
++    )
++    right_dtype, right_shape = _c2_storage_ref(
++        operation.inputs[1], "matmul right", tensor_only=True, allow_zero_tensor=True
++    )
++    output_dtype, output_shape = _c2_storage_ref(output, "matmul output", tensor_only=True)
++    if left_dtype not in _C2_FLOAT_DTYPES or len({left_dtype, right_dtype, output_dtype}) != 1:
++        raise AmdgpuUnsupportedError("static AMDGPU matmul requires matching FP32/BF16 tensors")
++    if not (2 <= len(left_shape) <= 4) or len(right_shape) != len(left_shape):
++        raise AmdgpuUnsupportedError("static AMDGPU matmul supports equal rank 2 through 4 tensors")
++    if left_shape[:-2] != right_shape[:-2]:
++        raise AmdgpuUnsupportedError("static AMDGPU matmul requires exact batch prefix match")
++    m, k = left_shape[-2:]
++    right_k, n = right_shape[-2:]
++    if right_k != k or output_shape != left_shape[:-2] + (m, n):
++        raise AmdgpuUnsupportedError("static AMDGPU matmul shapes are inconsistent")
++    # M/N and batch domains must produce storage, while K=0 is a valid empty
++    # dot product and must lower to a zero accumulator.
++    if m <= 0 or n <= 0 or any(int(value) <= 0 for value in left_shape[:-2]):
++        raise AmdgpuUnsupportedError("static AMDGPU matmul rejects zero-sized output/batch domains")
++
++
+ def _validate_c2_operation(operation: Operation, name: str) -> str:
+     """Validate the C2 descriptor/indexing/control subset shared by audit/emitter."""
+ 
+@@ -897,42 +1330,20 @@ def validate_static_operation(operation: Operation) -> str:
+                 name, ", ".join(AMDGPU_STATIC_SUPPORTED_OPERATIONS)
+             )
+         )
+-    if name in _SUPPORTED_OPS - {"reduce_sum", "matmul"}:
+-        return _validate_c2_operation(operation, name)
+-    if name == "reduce_sum":
+-        if len(operation.inputs) != 1:
+-            raise AmdgpuUnsupportedError("static AMDGPU reduce_sum requires one input tensor")
+-        dtype, output_shape = _validate_tensor_pair(operation, name)
+-        del dtype
+-        input_shape = static_shape(operation.inputs[0].type, "AMDGPU reduce_sum input")
+-        raw_axes = operation.attributes.get("axes", operation.attributes.get("axis"))
+-        if raw_axes is None:
+-            axes = tuple(range(len(input_shape)))
+-        elif isinstance(raw_axes, int) and not isinstance(raw_axes, bool):
+-            axes = (raw_axes,)
+-        else:
+-            try:
+-                axes = tuple(raw_axes)
+-            except TypeError as exc:
+-                raise AmdgpuUnsupportedError("static AMDGPU reduce_sum axes are invalid") from exc
+-        normalized_axes = tuple(sorted(axis + len(input_shape) if axis < 0 else axis for axis in axes))
+-        if normalized_axes != tuple(range(len(input_shape))) or _element_count(output_shape) != 1:
+-            raise AmdgpuUnsupportedError(
+-                "static AMDGPU reduce_sum C1 supports only reduction over all axes into one element"
+-            )
++    if name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++        _c3_validate_math(operation, name)
++        return name
++    if name in ("reduce_sum", "reduce_max", "reduce_mean"):
++        _c3_validate_reduction(operation, name)
+         return name
+     if name == "matmul":
+-        if len(operation.inputs) != 2:
+-            raise AmdgpuUnsupportedError("static AMDGPU matmul requires two input tensors")
+-        _validate_tensor_pair(operation, name)
+-        left_shape = static_shape(operation.inputs[0].type, "AMDGPU matmul left")
+-        right_shape = static_shape(operation.inputs[1].type, "AMDGPU matmul right")
+-        output_shape = static_shape(operation.outputs[0].type, "AMDGPU matmul output")
+-        if len(left_shape) != 2 or len(right_shape) != 2 or len(output_shape) != 2:
+-            raise AmdgpuUnsupportedError("static AMDGPU matmul C1 supports rank-2 matrices only")
+-        if left_shape[1] != right_shape[0] or output_shape != (left_shape[0], right_shape[1]):
+-            raise AmdgpuUnsupportedError("static AMDGPU matmul shapes are inconsistent")
++        _c3_validate_matmul(operation)
+         return name
++    if name in _SUPPORTED_OPS - {
++        "exp", "rsqrt", "sigmoid", "silu", "softplus",
++        "reduce_sum", "reduce_max", "reduce_mean", "matmul",
++    }:
++        return _validate_c2_operation(operation, name)
+     raise AmdgpuUnsupportedError("static AMDGPU operation validation is incomplete")
+ 
+ 
+@@ -978,6 +1389,8 @@ def _emit_elementwise(builder: _IRBuilder, operation: Operation, plan: Any, kern
+         _emit_where_c2(builder, operation, index)
+     elif name == "broadcast":
+         _emit_broadcast_c2(builder, operation, index)
++    elif name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++        _emit_math_c3(builder, operation, index)
+     else:
+         raise AmdgpuUnsupportedError("static AMDGPU elementwise emitter has no operation {!r}".format(name))
+     builder.line("  br label %{}".format(exit_label))
+@@ -985,100 +1398,179 @@ def _emit_elementwise(builder: _IRBuilder, operation: Operation, plan: Any, kern
+     builder.line("  ret void")
+ 
+ 
+-def _emit_reduce_sum(builder: _IRBuilder, operation: Operation, plan: Any) -> None:
+-    dtype, output_shape = _validate_tensor_pair(operation, "reduce_sum")
+-    if len(operation.inputs) != 1:
+-        raise AmdgpuUnsupportedError("static AMDGPU reduce_sum requires one input tensor")
++def _emit_reduction_c3(builder: _IRBuilder, operation: Operation, plan: Any) -> None:
++    """Emit one compact rank-descriptor reduction per output thread."""
++
++    name = canonical_operation_name(operation.name)
++    dtype, output_shape = _c2_storage_ref(operation.outputs[0], "{} output".format(name), tensor_only=True)
+     reduction = plan.reduction
+-    if reduction is None or tuple(reduction.axes) != tuple(range(len(reduction.input_shape))) or _element_count(output_shape) != 1:
+-        raise AmdgpuUnsupportedError(
+-            "static AMDGPU reduce_sum C1 supports only reduction over all axes into one element"
+-        )
++    if reduction is None:
++        raise AmdgpuUnsupportedError("static AMDGPU {} is missing reduction details".format(name))
++    input_shape = tuple(int(value) for value in reduction.input_shape)
++    axes = tuple(int(axis) for axis in reduction.axes)
++    keepdims = bool(reduction.keepdims)
++    output_count = _element_count(output_shape)
+     index = _emit_index(builder, plan)
+-    body = builder.label("body")
+-    exit_label = builder.label("exit")
+-    predicate = builder.temp("in_bounds")
+-    builder.line("  {} = icmp ult i64 {}, 1".format(predicate, index))
++    body = builder.label("reduction_body")
++    exit_label = builder.label("reduction_exit")
++    predicate = builder.temp("reduction_in_bounds")
++    builder.line("  {} = icmp ult i64 {}, {}".format(predicate, index, output_count))
+     builder.line("  br i1 {}, label %{}, label %{}".format(predicate, body, exit_label))
+     builder.line("{}:".format(body))
+-    condition = builder.label("reduce_cond")
+-    reduce_body = builder.label("reduce_body")
+-    done = builder.label("reduce_done")
++
++    output_coords = _emit_coords(builder, index, output_shape)
++    input_coords = []
++    output_axis = 0
++    axis_set = set(axes)
++    for axis in range(len(input_shape)):
++        if axis in axis_set:
++            input_coords.append("0")
++        else:
++            input_coords.append(output_coords[axis] if keepdims else output_coords[output_axis])
++            output_axis += 1
++
++    condition = builder.label("reduction_cond")
++    reduction_body = builder.label("reduction_step")
++    done = builder.label("reduction_done")
++    if name == "reduce_max":
++        initial = _emit_f32_from_bits(builder, 0xFF800000, "reduction_neg_inf")
++    else:
++        initial = _llvm_f32_literal(0.0)
+     builder.line("  br label %{}".format(condition))
+     builder.line("{}:".format(condition))
+-    counter = builder.temp("r")
+-    accumulator = builder.temp("acc")
+-    next_counter = builder.temp("next_r")
+-    next_accumulator = builder.temp("next_acc")
+-    builder.line("  {} = phi i64 [ 0, %{} ], [ {}, %{} ]".format(counter, body, next_counter, reduce_body))
+-    builder.line("  {} = phi float [ 0.000000e+00, %{} ], [ {}, %{} ]".format(accumulator, body, next_accumulator, reduce_body))
+-    input_count = _element_count(reduction.input_shape)
+-    more = builder.temp("more")
+-    builder.line("  {} = icmp ult i64 {}, {}".format(more, counter, input_count))
+-    builder.line("  br i1 {}, label %{}, label %{}".format(more, reduce_body, done))
+-    builder.line("{}:".format(reduce_body))
+-    value = _emit_load(builder, "%arg0", counter, dtype)
+-    builder.line("  {} = fadd float {}, {}".format(next_accumulator, accumulator, value))
++    counter = builder.temp("reduction_index")
++    next_counter = builder.temp("reduction_next_index")
++    accumulator = builder.temp("reduction_accumulator")
++    next_accumulator = builder.temp("reduction_next_accumulator")
++    builder.line(
++        "  {} = phi i64 [ 0, %{} ], [ {}, %{} ]".format(
++            counter, body, next_counter, reduction_body
++        )
++    )
++    builder.line(
++        "  {} = phi float [ {}, %{} ], [ {}, %{} ]".format(
++            accumulator, initial, body, next_accumulator, reduction_body
++        )
++    )
++    more = builder.temp("reduction_more")
++    builder.line("  {} = icmp ult i64 {}, {}".format(more, counter, int(reduction.reduction_size)))
++    builder.line("  br i1 {}, label %{}, label %{}".format(more, reduction_body, done))
++    builder.line("{}:".format(reduction_body))
++
++    # Unravel the compact reduction counter only across reduced axes.  This is
++    # O(rank) IR and remains small for Qwen's rank-3/4 tensors.
++    for reduced_axis_index, axis in enumerate(axes):
++        stride = 1
++        for later_axis in axes[reduced_axis_index + 1 :]:
++            stride *= input_shape[later_axis]
++        quotient = builder.temp("reduction_quotient")
++        coordinate = builder.temp("reduction_coordinate")
++        if stride == 1:
++            builder.line("  {} = add i64 {}, 0".format(quotient, counter))
++        else:
++            builder.line("  {} = udiv i64 {}, {}".format(quotient, counter, stride))
++        if input_shape[axis] == 1:
++            builder.line("  {} = add i64 0, 0".format(coordinate))
++        else:
++            builder.line("  {} = urem i64 {}, {}".format(coordinate, quotient, input_shape[axis]))
++        input_coords[axis] = coordinate
++    input_index = _emit_ravel(builder, tuple(input_coords), input_shape)
++    value = _emit_load_f32(builder, "%arg0", input_index, dtype)
++    if name == "reduce_max":
++        unordered = builder.temp("reduction_unordered")
++        greater = builder.temp("reduction_greater")
++        choose_value = builder.temp("reduction_choose_value")
++        builder.line("  {} = fcmp uno float {}, {}".format(unordered, value, value))
++        builder.line("  {} = fcmp ogt float {}, {}".format(greater, value, accumulator))
++        builder.line("  {} = or i1 {}, {}".format(choose_value, unordered, greater))
++        builder.line(
++            "  {} = select i1 {}, float {}, float {}".format(
++                next_accumulator, choose_value, value, accumulator
++            )
++        )
++    else:
++        builder.line("  {} = fadd float {}, {}".format(next_accumulator, accumulator, value))
+     builder.line("  {} = add i64 {}, 1".format(next_counter, counter))
+     builder.line("  br label %{}".format(condition))
+     builder.line("{}:".format(done))
+-    _emit_store(builder, "%arg1", "0", dtype, accumulator)
++    final_value = accumulator
++    if name == "reduce_mean":
++        divisor = builder.temp("reduction_divisor")
++        final_value = builder.temp("reduction_mean")
++        builder.line("  {} = fdiv float {}, {}".format(divisor, _llvm_f32_literal(float(reduction.reduction_size)), _llvm_f32_literal(1.0)))
++        builder.line("  {} = fdiv float {}, {}".format(final_value, accumulator, divisor))
++    _emit_store_f32(builder, "%arg1", index, dtype, final_value)
+     builder.line("  br label %{}".format(exit_label))
+     builder.line("{}:".format(exit_label))
+     builder.line("  ret void")
+ 
+ 
+ def _emit_matmul(builder: _IRBuilder, operation: Operation, plan: Any) -> None:
+-    dtype, output_shape = _validate_tensor_pair(operation, "matmul")
+-    if len(operation.inputs) != 2:
+-        raise AmdgpuUnsupportedError("static AMDGPU matmul requires two input tensors")
++    """Emit rank-2/3/4 exact-batch matmul with a compact K loop."""
++
++    dtype, output_shape = _c2_storage_ref(operation.outputs[0], "matmul output", tensor_only=True)
+     matmul = plan.matmul
+-    if matmul is None or len(output_shape) != 2:
+-        raise AmdgpuUnsupportedError("static AMDGPU matmul C1 supports rank-2 matrices only")
++    if matmul is None:
++        raise AmdgpuUnsupportedError("static AMDGPU matmul is missing matmul details")
+     m, k, n = int(matmul.m), int(matmul.k), int(matmul.n)
+     index = _emit_index(builder, plan)
+-    body = builder.label("body")
+-    exit_label = builder.label("exit")
+-    predicate = builder.temp("in_bounds")
+-    builder.line("  {} = icmp ult i64 {}, {}".format(predicate, index, _element_count(output_shape)))
++    body = builder.label("matmul_body")
++    exit_label = builder.label("matmul_exit")
++    predicate = builder.temp("matmul_in_bounds")
++    output_count = _element_count(output_shape)
++    builder.line("  {} = icmp ult i64 {}, {}".format(predicate, index, output_count))
+     builder.line("  br i1 {}, label %{}, label %{}".format(predicate, body, exit_label))
+     builder.line("{}:".format(body))
+-    row = builder.temp("row")
+-    col = builder.temp("col")
+-    builder.line("  {} = udiv i64 {}, {}".format(row, index, n))
+-    builder.line("  {} = urem i64 {}, {}".format(col, index, n))
++    matrix_elements = m * n
++    batch_index = builder.temp("matmul_batch")
++    matrix_index = builder.temp("matmul_matrix_index")
++    row = builder.temp("matmul_row")
++    col = builder.temp("matmul_col")
++    builder.line("  {} = udiv i64 {}, {}".format(batch_index, index, matrix_elements))
++    builder.line("  {} = urem i64 {}, {}".format(matrix_index, index, matrix_elements))
++    builder.line("  {} = udiv i64 {}, {}".format(row, matrix_index, n))
++    builder.line("  {} = urem i64 {}, {}".format(col, matrix_index, n))
++
+     condition = builder.label("matmul_cond")
+-    matmul_body = builder.label("matmul_body")
++    matmul_body = builder.label("matmul_step")
+     done = builder.label("matmul_done")
+     builder.line("  br label %{}".format(condition))
+     builder.line("{}:".format(condition))
+-    counter = builder.temp("k")
+-    accumulator = builder.temp("acc")
+-    next_counter = builder.temp("next_k")
+-    next_accumulator = builder.temp("next_acc")
++    counter = builder.temp("matmul_k")
++    next_counter = builder.temp("matmul_next_k")
++    accumulator = builder.temp("matmul_accumulator")
++    next_accumulator = builder.temp("matmul_next_accumulator")
+     builder.line("  {} = phi i64 [ 0, %{} ], [ {}, %{} ]".format(counter, body, next_counter, matmul_body))
+-    builder.line("  {} = phi float [ 0.000000e+00, %{} ], [ {}, %{} ]".format(accumulator, body, next_accumulator, matmul_body))
+-    more = builder.temp("more")
++    builder.line("  {} = phi float [ {}, %{} ], [ {}, %{} ]".format(accumulator, _llvm_f32_literal(0.0), body, next_accumulator, matmul_body))
++    more = builder.temp("matmul_more")
+     builder.line("  {} = icmp ult i64 {}, {}".format(more, counter, k))
+     builder.line("  br i1 {}, label %{}, label %{}".format(more, matmul_body, done))
+     builder.line("{}:".format(matmul_body))
+-    left_row = builder.temp("left_row")
+-    left_index = builder.temp("left_index")
+-    right_row = builder.temp("right_row")
+-    right_index = builder.temp("right_index")
++    batch_left = builder.temp("matmul_batch_left")
++    batch_right = builder.temp("matmul_batch_right")
++    left_row = builder.temp("matmul_left_row")
++    left_base = builder.temp("matmul_left_base")
++    left_index = builder.temp("matmul_left_index")
++    right_row = builder.temp("matmul_right_row")
++    right_base = builder.temp("matmul_right_base")
++    right_index = builder.temp("matmul_right_index")
++    builder.line("  {} = mul i64 {}, {}".format(batch_left, batch_index, m * k))
++    builder.line("  {} = mul i64 {}, {}".format(batch_right, batch_index, k * n))
+     builder.line("  {} = mul i64 {}, {}".format(left_row, row, k))
+-    builder.line("  {} = add i64 {}, {}".format(left_index, left_row, counter))
++    builder.line("  {} = add i64 {}, {}".format(left_base, batch_left, left_row))
++    builder.line("  {} = add i64 {}, {}".format(left_index, left_base, counter))
+     builder.line("  {} = mul i64 {}, {}".format(right_row, counter, n))
+-    builder.line("  {} = add i64 {}, {}".format(right_index, right_row, col))
+-    left = _emit_load(builder, "%arg0", left_index, dtype)
+-    right = _emit_load(builder, "%arg1", right_index, dtype)
+-    product = builder.temp("product")
++    builder.line("  {} = add i64 {}, {}".format(right_base, batch_right, right_row))
++    builder.line("  {} = add i64 {}, {}".format(right_index, right_base, col))
++    left = _emit_load_f32(builder, "%arg0", left_index, dtype)
++    right = _emit_load_f32(builder, "%arg1", right_index, dtype)
++    product = builder.temp("matmul_product")
+     builder.line("  {} = fmul float {}, {}".format(product, left, right))
+     builder.line("  {} = fadd float {}, {}".format(next_accumulator, accumulator, product))
+     builder.line("  {} = add i64 {}, 1".format(next_counter, counter))
+     builder.line("  br label %{}".format(condition))
+     builder.line("{}:".format(done))
+-    _emit_store(builder, "%arg2", index, dtype, accumulator)
++    _emit_store_f32(builder, "%arg2", index, dtype, accumulator)
+     builder.line("  br label %{}".format(exit_label))
+     builder.line("{}:".format(exit_label))
+     builder.line("  ret void")
+@@ -1427,10 +1919,10 @@ def _render_kernel(operation: Operation, plan: Any, index: int, entrypoint: str)
+     builder.line("define amdgpu_kernel void @{}({}) {{".format(kernel_name, ", ".join(args)))
+     builder.line("entry:")
+     builder.line("  ; operation={}".format(name))
+-    if name not in ("reduce_sum", "matmul"):
++    if name not in ("reduce_sum", "reduce_max", "reduce_mean", "matmul"):
+         _emit_elementwise(builder, operation, plan, index)
+-    elif name == "reduce_sum":
+-        _emit_reduce_sum(builder, operation, plan)
++    elif name in ("reduce_sum", "reduce_max", "reduce_mean"):
++        _emit_reduction_c3(builder, operation, plan)
+     elif name == "matmul":
+         _emit_matmul(builder, operation, plan)
+     builder.line("}")
+diff --git a/python/tests/ut/pypto_x/amd_gfx1036_c3_static_lower_driver.py b/python/tests/ut/pypto_x/amd_gfx1036_c3_static_lower_driver.py
+new file mode 100644
+index 000000000..3290f3588
+--- /dev/null
++++ b/python/tests/ut/pypto_x/amd_gfx1036_c3_static_lower_driver.py
+@@ -0,0 +1,94 @@
++#!/usr/bin/env python3
++"""Full Qwen3.5 AMD gfx1036 C3 static-lowering evidence.
++
++This driver performs one complete ``AmdgpuStaticCompiler.lower`` call for the
++fixed no-weight Qwen profile.  It intentionally does not compile/link the
++4,532-kernel LLVM module, allocate checkpoint bytes, or invoke HIP.  Run the
++driver through ``run_local_heavy.sh`` with the task-specific 4 GiB/4 CPU
++limits; the wrapper owns the resource admission and runtime monitor.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import resource
++import time
++from collections import Counter
++from pathlib import Path
++
++from pypto.backends.hip import probe_amd_hip_runtime
++from pypto.compiler.targets.hip import AmdgpuStaticCompiler
++from pypto.lowering.cpu import canonical_operation_name
++from pypto.portable.qwen35 import build_qwen35_text_decoder_graph
++from pypto.target import AMDGCN_PROCESSOR, AMDGCN_TRIPLE, AMD_IGPU_GFX1036
++
++
++def build_report(batch: int, steps: int, past_length: int):
++    program = build_qwen35_text_decoder_graph(batch, steps, past_length=past_length)
++    operations = tuple(program.functions[0].body.operations)
++    counts = Counter(canonical_operation_name(operation.name) for operation in operations)
++    compiler = AmdgpuStaticCompiler()
++    started = time.monotonic()
++    lowered = compiler.lower(program, AMD_IGPU_GFX1036)
++    elapsed = time.monotonic() - started
++    plans = tuple(lowered.gpu_program.plans)
++    ir_bytes = len(lowered.llvm_ir.encode("utf-8"))
++    max_complexity = max((len(plan.canonical_json()) for plan in plans), default=0)
++    rss_mib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
++    runtime = probe_amd_hip_runtime()
++    return {
++        "audit": "qwen35-text-decoder-amd-gfx1036-static-c3-full-lower",
++        "static_only": True,
++        "weights_loaded": False,
++        "native_kernels_generated": False,
++        "native_execution_claim": False,
++        "profile": {"batch": batch, "steps": steps, "past_length": past_length},
++        "target": {
++            "name": "amd-igpu-gfx1036",
++            "processor": AMDGCN_PROCESSOR,
++            "triple": AMDGCN_TRIPLE,
++            "runtime_status": runtime.to_dict(),
++        },
++        "operation_total": len(operations),
++        "plan_total": len(plans),
++        "kernel_total": len(plans),
++        "canonical_operation_counts": dict(sorted(counts.items())),
++        "static_lower_complete": len(plans) == len(operations),
++        "llvm_ir_bytes": ir_bytes,
++        "descriptor_complexity": {
++            "plan_storage": "O(rank+segments)",
++            "max_operation_ir_bytes": max_complexity,
++            "numel_expanded_metadata": False,
++        },
++        "resource": {
++            "lower_seconds": elapsed,
++            "max_rss_mib": rss_mib,
++        },
++        "notes": [
++            "This is one full compiler.lower call; no per-operation substitution is used.",
++            "No LLVM object/link step is performed for the full graph.",
++            "Runtime remains BLOCKED_DEVICE because WSL has no /dev/kfd/HIP/HSA runtime.",
++        ],
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--batch", type=int, default=1)
++    parser.add_argument("--steps", type=int, default=1)
++    parser.add_argument("--past-length", type=int, default=4096)
++    parser.add_argument("--output", required=True)
++    args = parser.parse_args()
++    report = build_report(args.batch, args.steps, args.past_length)
++    output = Path(args.output)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    output.write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
++    print(json.dumps({
++        key: report[key]
++        for key in ("operation_total", "plan_total", "kernel_total", "static_lower_complete", "llvm_ir_bytes", "resource")
++    }, ensure_ascii=False, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/tests/ut/pypto_x/amd_gfx1036_c3_static_validation_driver.py b/python/tests/ut/pypto_x/amd_gfx1036_c3_static_validation_driver.py
+new file mode 100644
+index 000000000..d9e52f780
+--- /dev/null
++++ b/python/tests/ut/pypto_x/amd_gfx1036_c3_static_validation_driver.py
+@@ -0,0 +1,287 @@
++#!/usr/bin/env python3
++"""Independent C3 LLVM/object/oracle audit for AMD gfx1036 static lowering."""
++
++from __future__ import annotations
++
++import argparse
++import base64
++import hashlib
++import json
++import subprocess
++import tempfile
++from pathlib import Path
++
++from pypto.backends.hip import probe_amd_hip_runtime
++from pypto.compiler import Artifact
++from pypto.compiler.targets.hip import (
++    AMDGPU_LLVM_IR_VERSION,
++    AMDGPU_LOWERING_VERSION,
++    AmdgpuArtifactError,
++    AmdgpuStaticCompiler,
++    decode_amdgpu_artifact,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.target import AMDGCN_PROCESSOR, AMDGCN_TRIPLE, AMD_IGPU_GFX1036
++
++
++def _tensor(name, dtype, shape):
++    return ValueRef(name, CoreType.tensor(dtype, tuple(shape)))
++
++
++def _product(values):
++    result = 1
++    for value in values:
++        result *= int(value)
++    return result
++
++
++def _program(operation):
++    seen = set()
++    parameters = []
++    for ref in operation.inputs:
++        if ref.name not in seen:
++            seen.add(ref.name)
++            parameters.append(ref)
++    return CoreProgram(
++        functions=(CoreFunction("main", tuple(parameters), operation.outputs, Region((operation,))),)
++    )
++
++
++def _compile(operation):
++    compiler = AmdgpuStaticCompiler()
++    target_ir = compiler.lower(_program(operation), AMD_IGPU_GFX1036)
++    return compiler, target_ir, compiler.compile(target_ir)
++
++
++def _payload(artifact):
++    return json.loads(bytes(artifact.payload).decode("utf-8"))
++
++
++def _object_evidence(artifact):
++    object_bytes = base64.b64decode(_payload(artifact)["object_b64"])
++    with tempfile.NamedTemporaryFile(prefix="pypto-x-c3-", suffix=".o") as handle:
++        handle.write(object_bytes)
++        handle.flush()
++        nm = subprocess.run(["llvm-nm", "-u", handle.name], check=True, capture_output=True, text=True)
++        objdump = subprocess.run(["llvm-objdump", "-d", handle.name], check=True, capture_output=True, text=True)
++        readobj = subprocess.run(["llvm-readobj", "-h", handle.name], check=True, capture_output=True, text=True)
++    return {
++        "unresolved_symbols": tuple(line for line in nm.stdout.splitlines() if line.strip()),
++        "objdump_has_text": ".text" in objdump.stdout and "v_" in objdump.stdout,
++        "readobj_format": "elf64-amdgpu" in readobj.stdout,
++        "readobj_gfx1036": "GFX1036" in readobj.stdout.upper(),
++    }
++
++
++def _rebuild_version(base, **updates):
++    payload = _payload(base)
++    payload.update(updates)
++    encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode(
++        "utf-8"
++    )
++    metadata = dict(base.metadata)
++    metadata["payload_digest"] = hashlib.sha256(encoded).hexdigest()
++    return Artifact(
++        format=base.format,
++        entrypoint=base.entrypoint,
++        target=base.target,
++        abi_version=base.abi_version,
++        payload=encoded,
++        metadata=metadata,
++    )
++
++
++def _matmul_oracle(left_shape, right_shape):
++    batch_shape = left_shape[:-2]
++    m, k = left_shape[-2:]
++    n = right_shape[-1]
++    left = [float(index + 1) for index in range(_product(left_shape))]
++    right = [float(1 + (index % 7)) for index in range(_product(right_shape))]
++    matrix = m * n
++    left_matrix = m * k
++    right_matrix = k * n
++    values = []
++    for output_index in range(_product(batch_shape) * matrix):
++        batch, matrix_index = divmod(output_index, matrix)
++        row, col = divmod(matrix_index, n)
++        values.append(
++            sum(
++                left[batch * left_matrix + row * k + counter]
++                * right[batch * right_matrix + counter * n + col]
++                for counter in range(k)
++            )
++        )
++    return values
++
++
++def _reduction_oracle(shape, axes, keepdims):
++    output_shape = []
++    for axis, dimension in enumerate(shape):
++        if axis in axes:
++            if keepdims:
++                output_shape.append(1)
++        else:
++            output_shape.append(dimension)
++    output_count = _product(output_shape) if output_shape else 1
++    input_strides = []
++    running = 1
++    for dimension in reversed(shape):
++        input_strides.append(running)
++        running *= dimension
++    input_strides.reverse()
++    reduction_domain = _product(shape[axis] for axis in axes) if axes else 1
++    domains = []
++    for output_index in range(output_count):
++        remaining = output_index
++        coordinates = [0] * len(output_shape)
++        for axis in range(len(output_shape) - 1, -1, -1):
++            coordinates[axis] = remaining % output_shape[axis]
++            remaining //= output_shape[axis]
++        cursor = 0
++        input_base = [0] * len(shape)
++        for axis in range(len(shape)):
++            if axis in axes:
++                continue
++            input_base[axis] = coordinates[axis] if keepdims else coordinates[cursor]
++            cursor += 1
++        flattened = []
++        for reduction_index in range(reduction_domain):
++            remainder = reduction_index
++            for reduced_axis_position, axis in enumerate(reversed(axes)):
++                dimension = shape[axis]
++                coordinate = remainder % dimension
++                remainder //= dimension
++                input_base[axis] = coordinate
++            flattened.append(sum(coordinate * stride for coordinate, stride in zip(input_base, input_strides)))
++        domains.append(flattened)
++    return output_shape, domains
++
++
++def build_report():
++    compiler = AmdgpuStaticCompiler()
++    records = {}
++    math_edges = {
++        "nan": "NaN preserved/quieted by ordered-unordered guard",
++        "+inf": "+Inf maps to +Inf for exp/softplus and one for sigmoid",
++        "-inf": "-Inf maps to zero for exp/sigmoid/softplus",
++        "+0": "positive zero has finite exp/sigmoid/softplus result",
++        "-0": "signed zero is classified before rsqrt zero handling",
++        "negative_rsqrt": "finite negative rsqrt maps to canonical qNaN",
++    }
++    for name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
++        source = _tensor("source", "float32", (7,))
++        output = _tensor("output", "float32", (7,))
++        _compiler, target_ir, artifact = _compile(Operation(name, (source,), (output,)))
++        ir = _payload(artifact)["llvm_ir"]
++        evidence = _object_evidence(artifact)
++        decode_amdgpu_artifact(artifact)
++        records[name] = {
++            "llvm_ir_bytes": len(ir.encode("utf-8")),
++            "object_bytes": len(base64.b64decode(_payload(artifact)["object_b64"])),
++            "unresolved_symbols": list(evidence["unresolved_symbols"]),
++            "objdump_has_text": evidence["objdump_has_text"],
++            "readobj_format": evidence["readobj_format"],
++            "readobj_gfx1036": evidence["readobj_gfx1036"],
++            "has_unordered_guard": "fcmp uno float" in ir,
++            "has_external_math_declaration": any(token in ir for token in ("@llvm.exp", "@llvm.sqrt", "@llvm.log")),
++            "plan_kind": target_ir.gpu_program.plans[0].plan_kind,
++        }
++
++    reduction_cases = {
++        "sum_axis_1": ("reduce_sum", (2, 3, 4), (2, 4), {"axis": 1}),
++        "max_axes_1_2_keep": ("reduce_max", (2, 3, 4), (2, 1, 1), {"axes": (1, 2), "keepdims": True}),
++        "mean_all": ("reduce_mean", (2, 3, 4), (), {"axes": (0, 1, 2)}),
++    }
++    reductions = {}
++    for key, (name, shape, output_shape, attributes) in reduction_cases.items():
++        source = _tensor("source", "float32", shape)
++        output = _tensor("output", "float32", output_shape)
++        _compiler, target_ir, artifact = _compile(Operation(name, (source,), (output,), attributes))
++        ir = _payload(artifact)["llvm_ir"]
++        decode_amdgpu_artifact(artifact)
++        oracle_shape, domains = _reduction_oracle(shape, tuple(attributes.get("axes", (attributes.get("axis"),))), bool(attributes.get("keepdims", False)))
++        evidence = _object_evidence(artifact)
++        reductions[key] = {
++            "oracle_output_shape": oracle_shape,
++            "oracle_first_domain": domains[0],
++            "llvm_index_tokens": {token: token in ir for token in ("udiv i64", "urem i64", "phi i64", "phi float")},
++            "unresolved_symbols": list(evidence["unresolved_symbols"]),
++            "objdump_has_text": evidence["objdump_has_text"],
++            "readobj_format": evidence["readobj_format"],
++            "readobj_gfx1036": evidence["readobj_gfx1036"],
++            "llvm_ir_bytes": len(ir.encode("utf-8")),
++        }
++
++    matmul_cases = {
++        "rank2_asymmetric": ((2, 3), (3, 4), (2, 4)),
++        "rank3_asymmetric": ((2, 3, 5), (2, 5, 4), (2, 3, 4)),
++        "rank4_asymmetric": ((2, 2, 3, 5), (2, 2, 5, 4), (2, 2, 3, 4)),
++        "rank3_k_zero": ((2, 3, 0), (2, 0, 4), (2, 3, 4)),
++    }
++    matmuls = {}
++    for key, (left_shape, right_shape, output_shape) in matmul_cases.items():
++        left = _tensor("left", "float32", left_shape)
++        right = _tensor("right", "float32", right_shape)
++        output = _tensor("output", "float32", output_shape)
++        _compiler, target_ir, artifact = _compile(Operation("matmul", (left, right), (output,)))
++        ir = _payload(artifact)["llvm_ir"]
++        decode_amdgpu_artifact(artifact)
++        evidence = _object_evidence(artifact)
++        oracle = _matmul_oracle(left_shape, right_shape)
++        matmuls[key] = {
++            "oracle_output_sample": oracle[: min(4, len(oracle))],
++            "k": left_shape[-1],
++            "batch_shape": list(left_shape[:-2]),
++            "llvm_index_tokens": {token: token in ir for token in ("matmul_batch", "udiv i64", "urem i64", "matmul_k")},
++            "unresolved_symbols": list(evidence["unresolved_symbols"]),
++            "objdump_has_text": evidence["objdump_has_text"],
++            "readobj_format": evidence["readobj_format"],
++            "readobj_gfx1036": evidence["readobj_gfx1036"],
++            "llvm_ir_bytes": len(ir.encode("utf-8")),
++        }
++
++    source = _tensor("source", "float32", (5,))
++    output = _tensor("output", "float32", (5,))
++    _compiler, _target_ir, base = _compile(Operation("identity", (source,), (output,)))
++    rejected_versions = 0
++    for updates in (
++        {"artifact_payload_version": 1},
++        {"artifact_payload_version": 2},
++        {"amdgpu_lowering_version": 1},
++        {"amdgpu_lowering_version": 2},
++        {"llvm_ir_version": "llvm.amdgcn.v1"},
++        {"llvm_ir_version": "llvm.amdgcn.v2"},
++    ):
++        try:
++            decode_amdgpu_artifact(_rebuild_version(base, **updates))
++        except AmdgpuArtifactError:
++            rejected_versions += 1
++    return {
++        "audit": "amd-gfx1036-static-c3-independent-validation",
++        "target": {"processor": AMDGCN_PROCESSOR, "triple": AMDGCN_TRIPLE},
++        "version": {"amdgpu_lowering": AMDGPU_LOWERING_VERSION, "llvm_ir": AMDGPU_LLVM_IR_VERSION},
++        "math_edge_oracle": math_edges,
++        "math": records,
++        "reduction": reductions,
++        "matmul": matmuls,
++        "old_v1_v2_rejected": rejected_versions == 6,
++        "old_version_rejection_count": rejected_versions,
++        "runtime": probe_amd_hip_runtime().to_dict(),
++        "static_only": True,
++        "native_execution_claim": False,
++    }
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--output", required=True)
++    args = parser.parse_args()
++    report = build_report()
++    output = Path(args.output)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    output.write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
++    print(json.dumps({"pass": report["old_v1_v2_rejected"], "output": str(output)}, ensure_ascii=False))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/python/tests/ut/pypto_x/test_hip_gfx1036_static.py b/python/tests/ut/pypto_x/test_hip_gfx1036_static.py
+index 68b43e159..4fc88689a 100644
+--- a/python/tests/ut/pypto_x/test_hip_gfx1036_static.py
++++ b/python/tests/ut/pypto_x/test_hip_gfx1036_static.py
+@@ -190,7 +190,7 @@ def test_static_llvm_artifact_is_deterministic_and_has_real_code(operation_name,
+ 
+ def test_unsupported_static_operation_is_explicitly_rejected():
+     with pytest.raises(AmdgpuUnsupportedError, match="explicitly rejects|supported operations"):
+-        AmdgpuStaticCompiler().lower(_program("exp"), AMD_IGPU_GFX1036)
++        AmdgpuStaticCompiler().lower(_program("log"), AMD_IGPU_GFX1036)
+ 
+ 
+ def test_llvm_ir_and_target_tamper_fail_closed():
+diff --git a/python/tests/ut/pypto_x/test_hip_gfx1036_static_c2.py b/python/tests/ut/pypto_x/test_hip_gfx1036_static_c2.py
+index 9c3efe7b7..12330b40c 100644
+--- a/python/tests/ut/pypto_x/test_hip_gfx1036_static_c2.py
++++ b/python/tests/ut/pypto_x/test_hip_gfx1036_static_c2.py
+@@ -96,7 +96,7 @@ def _ravel(coordinates, shape):
+ 
+ 
+ def test_c2_supported_set_is_explicit_and_versioned():
+-    assert AMDGPU_LOWERING_VERSION == 2
++    assert AMDGPU_LOWERING_VERSION == 3
+     assert {
+         "sub", "div", "neg", "cast", "constant", "reshape", "view", "contiguous",
+         "transpose", "broadcast", "slice", "concat", "split", "gather", "embedding",
+diff --git a/python/tests/ut/pypto_x/test_hip_gfx1036_static_c3.py b/python/tests/ut/pypto_x/test_hip_gfx1036_static_c3.py
+new file mode 100644
+index 000000000..4489fa39c
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_hip_gfx1036_static_c3.py
+@@ -0,0 +1,218 @@
++"""C3 static AMDGPU gfx1036 math/reduction/matmul contract tests.
++
++The tests stop at LLVM/ELF evidence.  They do not claim that the GamePC
++integrated GPU has a Linux HIP runtime; that runtime remains BLOCKED_DEVICE.
++"""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++import json
++import subprocess
++
++import pytest
++
++from pypto.compiler import Artifact
++from pypto.compiler.targets.hip import (
++    AMDGPU_LLVM_IR_VERSION,
++    AMDGPU_LOWERING_VERSION,
++    AmdgpuArtifactError,
++    AmdgpuStaticCompiler,
++    AmdgpuUnsupportedError,
++    decode_amdgpu_artifact,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.target import AMD_IGPU_GFX1036
++
++
++def _tensor(name, dtype, shape):
++    return ValueRef(name, CoreType.tensor(dtype, tuple(shape)))
++
++
++def _program(operation):
++    seen = set()
++    parameters = []
++    for ref in operation.inputs:
++        if ref.name not in seen:
++            seen.add(ref.name)
++            parameters.append(ref)
++    return CoreProgram(
++        functions=(CoreFunction("main", tuple(parameters), operation.outputs, Region((operation,))),)
++    )
++
++
++def _compile(operation):
++    compiler = AmdgpuStaticCompiler()
++    target_ir = compiler.lower(_program(operation), AMD_IGPU_GFX1036)
++    return compiler, target_ir, compiler.compile(target_ir)
++
++
++def _payload(artifact):
++    return json.loads(bytes(artifact.payload).decode("utf-8"))
++
++
++def _tamper_version(base, **updates):
++    payload = _payload(base)
++    payload.update(updates)
++    encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode(
++        "utf-8"
++    )
++    metadata = dict(base.metadata)
++    metadata["payload_digest"] = hashlib.sha256(encoded).hexdigest()
++    return Artifact(
++        format=base.format,
++        entrypoint=base.entrypoint,
++        target=base.target,
++        abi_version=base.abi_version,
++        payload=encoded,
++        metadata=metadata,
++    )
++
++
++@pytest.mark.parametrize("name", ("exp", "rsqrt", "sigmoid", "silu", "softplus"))
++def test_c3_math_has_explicit_edge_classification_and_no_device_library(name):
++    source = _tensor("source", "float32", (7,))
++    output = _tensor("output", "float32", (7,))
++    _compiler, _target_ir, artifact = _compile(Operation(name, (source,), (output,)))
++    ir = _payload(artifact)["llvm_ir"]
++    assert "fcmp uno float" in ir
++    assert "@llvm.exp" not in ir
++    assert "@llvm.sqrt" not in ir
++    assert "@llvm.log" not in ir
++    assert "store float" in ir
++    if name == "exp":
++        assert "fptosi float" in ir
++        assert "2139095040" in ir  # explicit +Inf bit pattern
++    if name == "rsqrt":
++        assert "1597463007" in ir  # explicit Quake-style finite seed
++        assert "8388607" in ir  # NaN/Inf mantissa classification
++    if name in ("sigmoid", "silu"):
++        assert "fdiv float" in ir
++    if name == "softplus":
++        assert "log1p" in ir
++
++
++def test_c3_math_bf16_storage_uses_f32_arithmetic_and_rne_store():
++    source = _tensor("source", "bf16", (5,))
++    output = _tensor("output", "bf16", (5,))
++    _compiler, _target_ir, artifact = _compile(Operation("softplus", (source,), (output,)))
++    ir = _payload(artifact)["llvm_ir"]
++    assert "zext i16" in ir and "bitcast i32" in ir
++    assert "store i16" in ir
++    assert "fcmp uno float" in ir
++
++
++@pytest.mark.parametrize(
++    "name,shape,output_shape,attributes",
++    (
++        ("reduce_sum", (2, 3, 4), (2, 4), {"axis": 1}),
++        ("reduce_max", (2, 3, 4), (2, 1, 1), {"axes": (1, 2), "keepdims": True}),
++        ("reduce_mean", (2, 3, 4), (), {"axes": (0, 1, 2)}),
++    ),
++)
++def test_c3_reduction_is_compact_rank_descriptor_and_all_negative_max_safe(
++    name, shape, output_shape, attributes
++):
++    source = _tensor("source", "float32", shape)
++    output = _tensor("output", "float32", output_shape)
++    _compiler, target_ir, artifact = _compile(Operation(name, (source,), (output,), attributes))
++    ir = _payload(artifact)["llvm_ir"]
++    assert target_ir.gpu_program.plans[0].reduction.reduction_size > 0
++    assert "phi i64" in ir and "phi float" in ir
++    assert "udiv i64" in ir and "urem i64" in ir
++    assert len(ir) < 12000
++    if name == "reduce_max":
++        assert "4286578688" in ir  # -Inf accumulator, not zero
++        assert "fcmp ogt float" in ir
++    if name == "reduce_mean":
++        assert "fdiv float" in ir
++
++
++def test_c3_reduction_rejects_empty_domain_and_invalid_keepdims():
++    source = _tensor("source", "float32", (2, 0, 3))
++    output = _tensor("output", "float32", (2, 3))
++    with pytest.raises(AmdgpuUnsupportedError, match="empty|zero-sized"):
++        AmdgpuStaticCompiler().lower(
++            _program(Operation("reduce_sum", (source,), (output,), {"axis": 1})), AMD_IGPU_GFX1036
++        )
++    source = _tensor("source", "float32", (2, 3))
++    output = _tensor("output", "float32", (2,))
++    with pytest.raises(AmdgpuUnsupportedError, match="keepdims"):
++        AmdgpuStaticCompiler().lower(
++            _program(Operation("reduce_sum", (source,), (output,), {"axis": 1, "keepdims": 1})), AMD_IGPU_GFX1036
++        )
++
++
++@pytest.mark.parametrize(
++    "left_shape,right_shape,output_shape",
++    (
++        ((2, 3), (3, 4), (2, 4)),
++        ((2, 2, 3), (2, 3, 4), (2, 2, 4)),
++        ((2, 2, 2, 3), (2, 2, 3, 4), (2, 2, 2, 4)),
++        ((2, 2, 0), (2, 0, 4), (2, 2, 4)),
++    ),
++)
++def test_c3_matmul_supports_rank_2_to_4_exact_batch_and_k_zero(left_shape, right_shape, output_shape):
++    left = _tensor("left", "bf16", left_shape)
++    right = _tensor("right", "bf16", right_shape)
++    output = _tensor("output", "bf16", output_shape)
++    _compiler, target_ir, artifact = _compile(Operation("matmul", (left, right), (output,)))
++    ir = _payload(artifact)["llvm_ir"]
++    plan = target_ir.gpu_program.plans[0].matmul
++    assert plan is not None
++    assert plan.batch_shape == left_shape[:-2]
++    assert "matmul_batch" in ir and "matmul_k" in ir
++    assert "fadd float" in ir
++
++
++def test_c3_matmul_rejects_batch_broadcast():
++    left = _tensor("left", "float32", (1, 2, 3))
++    right = _tensor("right", "float32", (2, 3, 4))
++    output = _tensor("output", "float32", (2, 2, 4))
++    with pytest.raises(AmdgpuUnsupportedError, match="batch prefix"):
++        AmdgpuStaticCompiler().lower(_program(Operation("matmul", (left, right), (output,))), AMD_IGPU_GFX1036)
++
++
++@pytest.mark.parametrize(
++    "operation",
++    (
++        Operation("exp", (_tensor("x", "float32", (4,)),), (_tensor("y", "float32", (4,)),)),
++        Operation(
++            "reduce_max",
++            (_tensor("x", "float32", (2, 3, 4)),),
++            (_tensor("y", "float32", (2, 4)),),
++            {"axis": 1},
++        ),
++        Operation(
++            "matmul",
++            (_tensor("a", "float32", (2, 2, 3)), _tensor("b", "float32", (2, 3, 4))),
++            (_tensor("c", "float32", (2, 2, 4)),),
++        ),
++    ),
++)
++def test_c3_representative_objects_have_no_unresolved_symbols(operation, tmp_path):
++    _compiler, _target_ir, artifact = _compile(operation)
++    object_bytes = base64.b64decode(_payload(artifact)["object_b64"])
++    object_path = tmp_path / "kernel.o"
++    object_path.write_bytes(object_bytes)
++    result = subprocess.run(["llvm-nm", "-u", str(object_path)], check=True, capture_output=True, text=True)
++    assert result.stdout.strip() == ""
++
++
++def test_c3_version_v3_rejects_v1_and_v2_payloads():
++    source = _tensor("source", "float32", (5,))
++    output = _tensor("output", "float32", (5,))
++    _compiler, _target_ir, base = _compile(Operation("identity", (source,), (output,)))
++    assert AMDGPU_LOWERING_VERSION == 3
++    assert AMDGPU_LLVM_IR_VERSION.endswith("v3")
++    for updates in (
++        {"artifact_payload_version": 1},
++        {"artifact_payload_version": 2},
++        {"amdgpu_lowering_version": 1},
++        {"amdgpu_lowering_version": 2},
++        {"llvm_ir_version": "llvm.amdgcn.v1"},
++        {"llvm_ir_version": "llvm.amdgcn.v2"},
++    ):
++        with pytest.raises(AmdgpuArtifactError, match="version field|canonical"):
++            decode_amdgpu_artifact(_tamper_version(base, **updates))
