@@ -44,3 +44,4 @@ NNNN-YYYY-MM-DD-<阶段或主题>.zh-CN.md
 | 0027 | 2026-09-09 | M1J BF16 external runtime binding 完成、backend ingestion 就绪 | [BF16 runtime binding 完成快照](0027-2026-09-09-qwen35-bf16-runtime-binding-complete.zh-CN.md) |
 | 0028 | 2026-09-10 | M1K-CPU ingestion 完成、AMD `gfx1036` 核显目标识别 | [CPU ingestion 与 AMD 核显快照](0028-2026-09-10-qwen35-bf16-cpu-ingestion-amd-igpu.zh-CN.md) |
 | 0029 | 2026-09-10 | M1K-CUDA ingestion 完成、AMD `gfx1036` 静态 backend 就绪 | [CUDA ingestion 完成快照](0029-2026-09-10-qwen35-bf16-cuda-ingestion-complete.zh-CN.md) |
+| 0030 | 2026-09-10 | AMD `gfx1036` 静态 C1 完成、C2 layout/indexing 就绪 | [AMDGPU 静态 C1 完成快照](0030-2026-09-10-amdgpu-gfx1036-static-c1-complete.zh-CN.md) |
