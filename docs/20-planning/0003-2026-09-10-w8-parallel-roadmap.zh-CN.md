@@ -46,7 +46,7 @@ PyPTO-X 把官方 PyPTO（同仓 `pypto` Tensor 前端 + `pypto_pro` Professiona
 | **ERR-0002 修复**（W8A driver cos/sin 布局，图契约零改动）+ near-tie 判据修订 | `5f479d1a1` + `verify/qwen35-t18-divergence-localization` |
 | **W8A-C Ascend A2(910B3) 真机验收 PASS**（限定式关闭 `ascend_cann_bisheng_npu_regression_blocked`） | `0e5a51891` + `verify/qwen35-ascend-npu-acceptance` |
 | **W8G 可移植性清理**完成 + 独立验收 PASS | `c464927fa` + `verify/qwen35-portability-cleanup` |
-| **W8H/W8I A2 vllm-ascend E2E / profiling 基线**（原始事实；独立验收 in flight） | `9951a2fe7+a65a37cc3` / `cc1cc7178..dca302ef4` |
+| **W8H/W8I A2 vllm-ascend E2E / profiling 基线**（原始事实；独立验收 PASS，6 条非阻断 discrepancy 已登记） | `9951a2fe7+a65a37cc3` / `cc1cc7178..dca302ef4` |
 
 ### 2.2 主线数值状态（**已收口，ERR-0002 修复后口径**）
 
@@ -277,13 +277,13 @@ A1/A2 数值（真权重，逐 prompt）——判据已改为"相对 gold 自身
 
 ```text
 状态（2026-09-11）：A0–A3 已完成；ERR-0002 修复 + near-tie 修订已收口；W8A-C + W8G 完成；
-W8H/W8I 基线已产出、独立验收 in flight；下一阶段起点待用户决策（§10）。
+W8H/W8I 基线已产出并通过独立验收；下一阶段起点待用户决策（§10）。
 
 A0 配置真值归一化 + 当前 runtime 任务收口（已完成）
  → A1 decay 修复后一次跑齐 T5/T8/T18 的 prefill + 4 步 decode（已完成；数字经 ERR-0002 更正）
  → A2 从最终 HEAD 独立验收（已完成：verify-qwen35-t18-divergence-localization）
  → A3 0036 勘误/快照/配置/补丁收口（本批）
- → W8A-C（已完成，限定式关闭）；W8H/W8I（验收 in flight）
+ → W8A-C（已完成，限定式关闭）；W8H/W8I（验收 PASS）
  → B1 / B2 后端硬化
  → B3a → B3b / B3c → B4 性能分层与冻结
  → W8C 完整后端 DAG（W8A8）
@@ -335,7 +335,7 @@ A0 配置真值归一化 + 当前 runtime 任务收口（已完成）
 
 > 状态更新 2026-09-11（收口于 0036 快照）：评审通过（v1→v2，见 §12）；W8A 的 A0–A3 已完成（0035）；
 > ERR-0002（driver cos/sin 布局）已修复并重定义 chat 口径；**W8A-C A2 真机验收 PASS（限定式）**；
-> **W8G 已完成**；**W8H/W8I vllm-ascend 基线已产出、独立验收 in flight**（A2 卡锁协议已落地）。
+> **W8G 已完成**；**W8H/W8I vllm-ascend 基线已产出并通过独立验收 PASS**（A2 卡锁协议已落地并经运行验证）。
 > 以下是**当前仍待用户决定**的项；新 agent 不要自行开工。
 
 1. **W8B vs W8C 优先级**：先做 W8B 硬化（AVX2 packed / SVE fallback / CUDA cuEvent 与 GEMM 基线 /

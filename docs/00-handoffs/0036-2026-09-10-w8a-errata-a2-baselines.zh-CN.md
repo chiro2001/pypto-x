@@ -4,7 +4,7 @@
 
 归档日期：2026-09-10（Asia/Shanghai）
 
-状态：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFYING`
+状态：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED`
 
 本快照覆盖：ERR-0002（W8A prefill driver cos/sin 布局缺陷）修复与判据修订、W8A-C Ascend A2(910B3) 真机验收、
 W8H vllm-ascend E2E 基线、W8I profiling 基线、W8G 可移植性清理收口、A2 卡占用协议落地。
@@ -114,7 +114,7 @@ classic / Pro JIT / OPC / gym = NOT COVERED。
 
 ---
 
-## 4. W8H：A2 vllm-ascend E2E 基线（PASS，独立验收 in flight）
+## 4. W8H：A2 vllm-ascend E2E 基线（实现 PASS + 独立验收 PASS）
 
 实现 `work/qwen35-a2-vllm-ascend-e2e-baseline @ b4a3a7097`，integration `9951a2fe7 + a65a37cc3`。
 
@@ -130,12 +130,16 @@ classic / Pro JIT / OPC / gym = NOT COVERED。
 限制          vLLM 不暴露完整 logits；ACL graph 口径未做精度复跑；无并发 sweep / 长 prompt
 ```
 
-**独立验收 in flight**：任务 `verify-qwen35-a2-vllm-ascend-baselines`（agent `6418d00a`），
-状态先记 `verification_in_progress`，由父 agent 后续补验收结论。
+**独立验收（PASS）**：任务 `verify-qwen35-a2-vllm-ascend-baselines`（agent `6418d00a`）在冻结点
+`dca302ef4` 复跑并本机重算：prompt ids / 前 4 token / prefill argmax（en 4/4、zh 7/7、chat 17/17）/
+decode argmax 4/4 全部一致，bf16 与 fp32 双 gold 判定相同，零漂移；性能重算与原声称一致
+（eager 0.2016–0.2039 s / 66.1–66.8 ms；ACL graph 0.1625–0.1664 s / 12.19–12.48 ms），
+A2 spot-check（en，R=6）eager 0.2048 s/67.9 ms、graph 0.1693 s/13.20 ms（graph TPOT ≈5.15× 优于 eager，
+TTFT −17.4%），绝对值偏高 +2%~+6% 属单 prompt/宿主方差、**非阻断**。性能协议仍是提案、数字为原始事实。
 
 ---
 
-## 5. W8I：A2 vllm-ascend profiling 基线（PASS，独立验收 in flight）
+## 5. W8I：A2 vllm-ascend profiling 基线（实现 PASS + 独立验收 PASS）
 
 实现 `work/qwen35-a2-vllm-ascend-profiling-baseline`（`4f764edac … fb273fbf6/209e011c2`），
 integration `cc1cc7178 … dca302ef4`；base `0e5a51891`。
@@ -144,14 +148,22 @@ integration `cc1cc7178 … dca302ef4`；base `0e5a51891`。
 API 结论   vLLM 0.21 仅支持 --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=<abs>；
            旧 VLLM_TORCH_PROFILER_DIR 已移除 → harness 版本自适应，无回退重试
 profiler 开销  ×1.65–1.71（0.8B/9B、offline/online）；这是真实开销测量，不得当作模型性能引用
-Ascend 侧  9B MatMulV2 ~75%（offline 75.31% / online 75.73%）；0.8B online MatMulV2 35.75% / Transpose 10.32%
-回传        26 CSV（2,056,724 B）；manifest 107 files；kernel/operator details 只回传 top-5000
-大 trace    ≈8.03 GiB 留在 A2（offline/online × 0.8B/9B）
+              独立复核：6 个交付比值 ×1.649/×1.665/×1.667/×1.665/×1.714/×1.654；
+              A2 0.8B offline 两轮 6 比值 median ×1.665、范围 [1.621,1.716]
+Ascend 侧  9B MatMulV2（total_us 口径）offline 75.306% / online 75.730%；0.8B offline 33.978% / online 35.754%；
+              op_statistic 自带 ratio 与 A2 源 CSV 直接解析三方一致
+回传        26 CSV（2,056,724 B，sha256 全等、errors=0）；manifest 107 files / 6,431,774 B 逐 sha256 全等
+              （manifest 自身不计入 107，含自身为 108 files / 6,458,618 B）
+大 trace    4 目录文件数 139/161/268/332 全对、合计 ≈8.02 GiB（实现方记录 8.03）留在 A2；bytes 正漂移 17–30 KB
 时钟        A2 `date -u` 比真实 UTC 快约 8 小时，跨机对齐注意
 ```
 
-**独立验收 in flight**：同一 `verify-qwen35-a2-vllm-ascend-baselines` 任务，状态先记
-`verification_in_progress`，父 agent 后续补。
+**独立验收（PASS）**：同一任务在 A2 复跑并复核：`ProfilerConfig`/`--profiler-config` 路径成立、
+`VLLM_TORCH_PROFILER_DIR` 不存在、`api_used=config` 且 `attempts=[]`；9B 4 分片 sha256/字节全对
+（19,329,393,248 B）；本地 manifest 与 26 CSV 逐 sha256 全等。非阻断 discrepancy 一并登记：
+manifest 计数不含自身、trace bytes 正漂移 17–30 KB、bundle tar 已删导致 md5 不可重算（改用 sha256/摘要）、
+torch_npu profiler `Incorrect schedule … RECORD` 告警（实现方与复跑均有、数据完整、判上游）、
+验收 fresh profiled 与实现方 0.8B offline 的 MatMulV2 占比差异（35.12% vs 33.98%，负载不同属预期）。
 
 ---
 
@@ -167,7 +179,10 @@ Ascend 侧  9B MatMulV2 ~75%（offline 75.31% / online 75.73%）；0.8B online M
 入仓纪律     仓内只登记协议与目录名；端点、跳板/凭据、脚本实体只在本地私有侧，不得提交
 ```
 
-W8H/W8I/独立验收均通过该锁串行执行（历史保留）；后续所有 A2 NPU 任务必须遵守。
+**运行验证（独立验收实际使用）**：`verify-qwen35-a2-vllm-ascend-baselines` 全程用
+`a2_card_lock.sh run/acquire` 包装 NPU 命令，结束态 `.using` 已释放为 `.done`、无残留 vllm 进程、
+HBM 回落 3441/65536 MiB，自建临时目录已删除——协议已通过真实运行验证。
+后续所有 A2 NPU 任务必须遵守。
 
 ---
 
@@ -190,7 +205,8 @@ W7 README 缺口                   其 tools/cann/README.zh-CN.md 待 W7 自身�
 ## 8. 未解决与下一步
 
 ```text
-1) W8H/W8I 独立验收 in flight（verify-qwen35-a2-vllm-ascend-baselines，agent 6418d00a）→ 父 agent 收口
+1) W8H/W8I 独立验收已完成 PASS（verify-qwen35-a2-vllm-ascend-baselines，agent 6418d00a）→ 无需返工；
+   6 条非阻断 discrepancy 已登记（见 §4/§5）
 2) 若未来要求 chat 严格 18/18：可选 327b17158（--debug-f32-residual，未合入、未采纳）
 3) decode 第 4 步无 gold 参考行；decode 逐步 logits 数字须引用修复后 raw dump
 4) W8A-C 限定式关闭后的真实缺口：Core IR→PTO 桥（W8E/E4）、stable CANN 9.2.0-beta.2 未上卡
@@ -210,7 +226,7 @@ W8A-C 验收      ../worktrees/_meta/pypto-x/verify-qwen35-ascend-npu-acceptance
 W8A-C 实现      ../worktrees/_meta/pypto-x/qwen35-ascend-npu-acceptance/
 W8H 基线        ../worktrees/_meta/pypto-x/qwen35-a2-vllm-ascend-e2e-baseline/
 W8I 基线        ../worktrees/_meta/pypto-x/qwen35-a2-vllm-ascend-profiling-baseline/
-W8H/W8I 验收    ../worktrees/_meta/pypto-x/verify-qwen35-a2-vllm-ascend-baselines/   （in flight）
+W8H/W8I 验收    ../worktrees/_meta/pypto-x/verify-qwen35-a2-vllm-ascend-baselines/（PASS：summary/brief/validation）
 W8G 验收        ../worktrees/_meta/pypto-x/verify-qwen35-portability-cleanup/
 本批收口证据    ../worktrees/_meta/pypto-x/freeze-w8a-errata-0036/（改动清单、自检日志、brief）
 ```

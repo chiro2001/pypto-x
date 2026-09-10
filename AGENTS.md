@@ -11,7 +11,7 @@
 ### 0. 状态行
 
 ```text
-W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFYING
+W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED
 ```
 
 ```text
@@ -52,7 +52,7 @@ W8A-C Ascend A2(910B3) 真机验收 PASS：PTO-ISA tassign NPU ST、CANN mspti a
   注入式最小 hook live 9/9（bisheng 22,728 B / sha256 4d7f704c…，真机 max_abs_err=0.0）；
   ascend_cann_bisheng_npu_regression_blocked 限定式关闭（独立验收 PASS）
 W8G 可移植性清理完成 + 独立验收 PASS（integration c464927fa）
-W8H vllm-ascend E2E 基线 / W8I profiling 基线已产出（精度/性能原始事实），独立验收 in flight
+W8H vllm-ascend E2E 基线 / W8I profiling 基线：实现 PASS + **独立验收 PASS**（零漂移；非阻断差异已登记）
 GDR T=128：五后端 + 920B 原生 PASS（gdr_t128_not_validated 已关闭）
 AMD gfx1036 静态 C1–C3（运行态判定架构性不可达，用户决定长期只保留静态证据）
 基础设施：GamePC CUDA Toolkit（nvcc 13.3.73 + cuBLAS 13.6）、本机 CANN 9.2.0-beta.2 toolkit（cannsim/npusim）、
@@ -62,7 +62,7 @@ AMD gfx1036 静态 C1–C3（运行态判定架构性不可达，用户决定长
 **进行中 / 待办**
 
 ```text
-W8H/W8I 独立验收收口（in flight：verify-qwen35-a2-vllm-ascend-baselines；A2 NPU 任务走 /root/a2-npu-lock/）
+起点选择   W8B 硬化 vs W8C W8A8-linear（路线图 §10 待用户决策；A2 NPU 任务走 /root/a2-npu-lock/）
 W8B     AVX2 packed 参数级算子 / SVE fallback 分类清零 / CUDA cuEvent 计时 + GEMM 基线 / 本机 L0-L1 性能
 W8C     W8A8-linear 实现（契约已冻结；按后端 DAG C1→C8）
 W8D     GDR fused WY、长序列 T=64/128 代价评估
@@ -152,5 +152,6 @@ git -C /home/chiro/projects/pypto/worktrees/pypto-x/integration log --oneline -1
 - 昇腾 A2（910B3）租用环境：容器 256 vCPU / 2 TB 内存 / 1×910B3（64 GB HBM）/ CANN 9.0.0 / 驱动 25.2.0。
   **NPU 执行必须走容器内固定卡锁 `/root/a2-npu-lock/`（`a2_card_lock.sh`）**：request→using→done（历史保留）、
   180 s 轮询、TTL 6 h + PID 僵死判定；**只保护 NPU 执行**，下载权重/编译/环境准备可并行；A2 时钟约快 8 h。
+  该协议已由独立验收任务实际使用验证（`.using→.done`、无残留进程、HBM 回落 3441/65536 MiB）。
   访问方式与访问脚本**只保存在本地私有侧**（`~/tools/a2-910b/`：辅助脚本 + 端点/凭据在 `~/.ssh/a2-910b.env`），**不得提交进本仓**；本仓只登记资源存在与使用纪律。
   该机是租用共享资源 → **约定串行**；出网仅 HTTPS(gitcode/pypi) 可达，无 22 出网、无 TUN/NET_ADMIN（VPN 不可行）。

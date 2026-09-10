@@ -6,7 +6,7 @@ PyPTO-X（PyPTO Cross-Architecture）在保留官方 PyPTO Tensor / Professional
 
 ## 当前状态（2026-09-10）
 
-状态行：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFYING`
+状态行：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED`
 
 ```text
 实现主仓        upstream/pypto @ 34475e0d（只读快照）
@@ -34,7 +34,7 @@ decode (4 步)       11751 → 13 → 198 → 760 逐步与官方 gold 一致（
 **Ascend A2(910B3) 真机验收已 PASS**（PTO-ISA tassign NPU ST、CANN mspti aclnn Add、
 注入式最小 hook live 9/9 / 真机 max_abs_err=0.0），`ascend_cann_bisheng_npu_regression_blocked`
 **限定式关闭**（仅覆盖上述两条路径，不代表 Core IR→PTO 或模型级）；同时产出 W8H vllm-ascend E2E
-与 W8I profiling 基线（独立验收 in flight）。
+与 W8I profiling 基线，二者**独立验收 PASS**（性能协议仍为提案；profiler 开销不得当模型性能引用）。
 
 ## 能力矩阵
 

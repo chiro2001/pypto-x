@@ -10,7 +10,7 @@
 | RTX 5080（`192.168.101.5`） | 在线；GPU 由 PyPTO-X 独占；M1K-CUDA PASS | NVIDIA CUDA/PTX/NVVM 验证 | WSL2、RTX 5080 16,303 MiB、CC 12.0；2026-09-10 复测 KMD **616.92** / CUDA UMD **13.4**（文档旧值 610.62/13.3，已漂移）；Driver/PTX 连续两次执行371-input/51-output external-buffer 24层图 | GPU-only 无需 `gamepc` 锁；host-heavy 才持锁。无 `nvcc`/NVRTC/CUDART/cuBLAS/SDK headers/PyTorch/Triton；空闲时钟约 427–487 MHz vs 峰值 3090 MHz，测性能前必须 warmup 并断言时钟；当前是 correctness kernel，不是 fusion/性能结论 |
 | AMD GamePC 核显 `gfx1036` | 静态 C3 PASS；HIP runtime 判定为**架构性不可达**（见审计 0004）；6750GRE 不在 PCI 总线 | AMDGPU LLVM static codegen；HIP 只能靠裸机 Linux 或换官方支持 dGPU | C3 math/reduction/batched matmul与Qwen 4,532/4,532 static lowering通过（graph v2 计数；v3 为 4,550，AMD 静态 compiler 尚未对新图重跑）；2026-09-10 可行性审计：gfx1036 不在 ROCm 10.0.0 / Radeon / WSL / HIP SDK for Windows 任何官方表内；WSL2 GPU-PV 架构下没有 `/dev/kfd`；第三方一手证据显示 ROCm 7.1.1 裸机可跑 gfx1036 kernel（wave32、2 CU、Fast F16，仅第三方参考） | 静态 LLVM/ELF与host oracle不等于HIP执行；MFMA/WMMA/INT8 dot/XNACK 仍 unknown；WSL 经 Mesa d3d12 可跑 GL compute（已实测），但那是 GLSL→DXIL 路径，不能执行我们的 AMDHSA ELF，且无 bf16/int8/subgroup 扩展；不能代表6750GRE性能 |
 | 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；M1C1–M1I 功能/contract 与24层 synthetic decoder 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；`iota/compare` 是 host-reference；按量计费，状态见 `~/tools/ecs-920B/state.env` |
-| 昇腾 A2（910B3）租用环境 | 在线（HiDevLab）；**W8A-C 真机验收 PASS（限定式）**；W8H/W8I vllm-ascend 基线已产出（独立验收 in flight）；容器 256 vCPU / 2014 GiB / 300 GB；CANN 9.0.0 + 驱动 25.2.0 | Ascend 真机验收：PTO-ISA NPU ST、CANN 样例、Ascend adapter 回归、vllm-ascend E2E/性能基线 | `npu-smi` 显示 1× 910B3、Health OK；`acl.get_soc_name()=Ascend910B3`（需先 `source /usr/local/Ascend/ascend-toolkit/set_env.sh`）；容器内有 vllm 0.21.0 / vllm-ascend 0.21.0rc1 / torch_npu 2.10.0（预置环境）；bisheng clang 15.0.5 | 出网受限：HTTPS 仅 gitcode/pypi 可达、github 与一切 22 端口被封；无 `/dev/net/tun`、无 NET_ADMIN；访问走自建中继上的密钥反向隧道（端点与访问脚本只在本地私有侧，不提交进本仓）；租用共享资源 → **约定串行**；**NPU 执行必须走卡锁 `/root/a2-npu-lock/`（只保护 NPU，下载/编译/环境准备可并行）** |
+| 昇腾 A2（910B3）租用环境 | 在线（HiDevLab）；**W8A-C 真机验收 PASS（限定式）**；W8H/W8I vllm-ascend 基线已产出并**独立验收 PASS**；容器 256 vCPU / 2014 GiB / 300 GB；CANN 9.0.0 + 驱动 25.2.0 | Ascend 真机验收：PTO-ISA NPU ST、CANN 样例、Ascend adapter 回归、vllm-ascend E2E/性能基线 | `npu-smi` 显示 1× 910B3、Health OK；`acl.get_soc_name()=Ascend910B3`（需先 `source /usr/local/Ascend/ascend-toolkit/set_env.sh`）；容器内有 vllm 0.21.0 / vllm-ascend 0.21.0rc1 / torch_npu 2.10.0（预置环境）；bisheng clang 15.0.5 | 出网受限：HTTPS 仅 gitcode/pypi 可达、github 与一切 22 端口被封；无 `/dev/net/tun`、无 NET_ADMIN；访问走自建中继上的密钥反向隧道（端点与访问脚本只在本地私有侧，不提交进本仓）；租用共享资源 → **约定串行**；**NPU 执行必须走卡锁 `/root/a2-npu-lock/`（只保护 NPU，下载/编译/环境准备可并行）** |
 | QEMU AArch64 | 可用 | AArch64/SVE/SVE2 功能和编译验证 | `qemu-aarch64` 11.0.3；已验证 `max,sve256=on` 可报告 SVE/SVE2，VL=32 bytes | 不能代表鲲鹏吞吐、缓存、内存带宽或指令时序 |
 
 ## 网络代理
@@ -210,6 +210,8 @@ A2 的隧道公钥在中继侧 `authorized_keys` 中带 `restrict,port-forwardin
 保护范围  **只保护 NPU 执行**；下载权重、编译、环境准备可并行进行，不需要持卡锁
 等待/防僵 抢锁失败 180 s 轮询重试；TTL 6 h + PID 存活判定（owner 消失可回收）
 时钟      A2 `date -u` 比真实 UTC 快约 8 h（按 CST 标 UTC），跨机对齐注意
+运行验证  已由独立验收任务实际使用：全程 a2_card_lock.sh run/acquire，结束 .using→.done、
+          无残留 vllm 进程、HBM 回落 3441/65536 MiB；临时目录已删除
 入仓纪律  仓内只登记协议与目录名；端点/凭据/脚本实体只在本地私有侧
 ```
 
