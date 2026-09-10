@@ -183,6 +183,7 @@ local 锁：全局排他；启动要求 MemAvailable ≥ 8192 MiB（这是"启�
 | B3b | `cuda-gemm-baseline` | **仅 GEMM** 与 cuBLAS 比（G3）；前置：G1 正确性、G2 稳定性、且非 dispatch-dominated | 五元组 key + 冻结中位数 + 证据 JSON | GamePC（持 `gamepc`） |
 | B3c | `local-perf-l0-l1` | 本机 AVX-512/scalar：L0 microbench + L1（T=1 decode / T=5 prefill） | elementwise/reduction 保持 `T2/T3`、标 `UNGATED`；报 `dispatch_seconds` 差值 | ~3×60 s + 210 s |
 | B4 | `perf-freeze` | 依据 B3b/B3c 冻结 G1–G3 键与阈值（G4 本机不做） | 用户批准 + `configs/perf_lock.yaml` | 0 |
+| B5 | `qwen35-native-reduce-broadcast` | **（2026-09-10 追加）** reduce_sum/reduce_mean/reduce_max 消除 T 超线性（T=18 5.96 s/call vs T=5 0.468 s/call），broadcast 去 `host_reference`；依据 T=18 热点：三者合计 548 s / 695.6 s prefill | 与基线逐位一致差分（T=1/5/18、全零/NaN）+ focused/全量 pytest 收集数不减少 + 前后 per-op ms/call 与 T=18 prefill 墙钟 | local（持锁；预计重段） |
 
 ### W8C W8A8-linear 实现（按契约附录 B 补全后端 DAG）
 
@@ -338,15 +339,15 @@ A0 配置真值归一化 + 当前 runtime 任务收口（已完成）
 > **W8G 已完成**；**W8H/W8I vllm-ascend 基线已产出并通过独立验收 PASS**（A2 卡锁协议已落地并经运行验证）。
 > 以下是**当前仍待用户决定**的项；新 agent 不要自行开工。
 
-1. **W8B vs W8C 优先级**：先做 W8B 硬化（AVX2 packed / SVE fallback / CUDA cuEvent 与 GEMM 基线 /
-   本机 L0–L1），还是先启动 W8C W8A8-linear（契约已冻结）？
-2. **W8C 起点**：按 C1→C8 完整后端 DAG 推进（推荐），还是先只做 C1/C2 打契约底座？
+1. **W8B vs W8C 优先级** — *已决定（2026-09-10）：并行*。W8B 取 B5（原生 reduce/broadcast）+ B3a（CUDA cuEvent），
+   W8C 取 C1+C2 契约底座；B1/B2/B3b/B3c 仍开放。
+2. **W8C 起点** — *已决定（2026-09-10）：先只做 C1/C2 打契约底座*，不立即铺 C3→C8。
 3. **W8D/E 深度**：D2 长序列 T=64/128 代价评估、E4 Core IR→PTO/CCE codegen（A2 限定式关闭后的真实缺口），
-   是否现在启动？
-4. **是否要求 chat 严格 18/18**：若要求，需评估任务分支 `327b17158`（`--debug-f32-residual`，改 `qwen35.py`，
-   未合入、未采纳）的收益/代价；当前按 near-tie 修订判据已 PASS。
-5. **W8H/W8I 后续范围**：是否补做 ACL graph 口径精度复跑、并发 sweep、`logprobs=-1` 全词表往返？
-6. **是否批准 §8 的可删清单**（安装包 / venv / build 目录；本机磁盘约 78 GB 可用）？
+   是否现在启动？*（未决）*
+4. **是否要求 chat 严格 18/18** — *已决定（2026-09-10）：不采用* `327b17158`（`--debug-f32-residual`）；near-tie 判据修订生效，
+   严格口径 17/18 仍保留可见。
+5. **W8H/W8I 后续范围**：是否补做 ACL graph 口径精度复跑、并发 sweep、`logprobs=-1` 全词表往返？*（未决）*
+6. **是否批准 §8 的可删清单**（安装包 / venv / build 目录；本机磁盘约 78 GB 可用）？*（未决）*
 
 已决（2026-09-10，勿再开工）：并发采用 ≤3 subagent + 父 agent 四槽；验收口径 = 相对 gold dtype 带宽 +
 near-tie 例外；W8A-C 以"限定式关闭 blocked"记账；A2 NPU 任务走 `/root/a2-npu-lock/` 卡锁。
