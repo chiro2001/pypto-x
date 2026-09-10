@@ -230,6 +230,15 @@ A1/A2 数值（真权重，逐 prompt）
   G1 正确性 → G2 稳定性（3 轮 × R，中位数离散 ≤10%）→ G3 相对比值（仅 GEMM vs cuBLAS）
   elementwise / reduction / 非 GEMM 的 matmul：保持 T2/T3，`UNGATED`
   CUDA：cuEvent 计时未落地前 `kernel_seconds = null`，`gflops_scope = end_to_end`
+
+冻结流水线（每个阶段收口都要走一遍）
+  1. 实现 worktree commit → 父 agent cherry-pick 进 integration → 固定 exact HEAD
+  2. 独立验收 worktree（源码只读）复跑并出 validation.json
+  3. 更新 configs/development_lock.yaml（task/integration commit、验收数字、known_limits 增删）
+  4. 写 docs/00-handoffs/00NN-*.zh-CN.md 快照 + 更新 HANDOFF.zh-CN.md 状态行 + ERRATA（如有勘误）
+  5. 重跑 `scripts/remote/export_patches.sh` 刷新 `patches/`（机器生成，禁止手工编辑）
+  6. `scripts/remote/publish_public_mirror.sh` 发布公开主仓（同样机器生成）
+  7. 涉及许可/发布边界的改动同步 `LICENSE` / `NOTICE` / `patches/README.md`
 ```
 
 ---
