@@ -5,7 +5,28 @@
 - branch：`work/w8a8-linear-contract`
 - base：`port/pypto-x-integration @ bcf9516e6419d232338988238ffa8f79e59079c1`
 - 证据目录：`/home/chiro/projects/pypto/worktrees/_meta/pypto-x/w8a8-linear-contract/`
-- 本稿状态：**契约冻结候选**；第 8 节列出必须由用户拍板的条目，拍板后升为冻结版。
+- 本稿状态：**契约已冻结**；第 8 节 D1–D12 已由用户于 2026-09-10 全部批准为报告建议默认值（见下方决策记录）。
+
+## 决策记录（2026-09-10，用户批准）
+
+用户于 2026-09-10 明确批准 **第 8 节 D1–D12 全部按报告建议默认值执行**，其中影响后续实现的关键项：
+
+```text
+D2  授权：可以使用已下载的固定 revision BF16 权重计算 W8A8 weight scale（不新增下载，不改变 0033 的权重范围）
+D1  in_proj_b / in_proj_a（36 个 16x1024）首期保持 BF16
+D3  不引入校准语料：weight 用自身 absmax，activation 动态 per-token
+D4  lm_head（tied embedding）首期不量化
+D5  L4-L6 阈值先按 5.2 节暂定值实现；拿到 BF16 整网基线后再冻结
+D6  per-group 只预留字段，运行时 reject
+D7  舍入模式 RNE
+D8  取码区间 [-127,127]（放弃 -128）
+D9  conv1d 首期保持 BF16
+D10 SVE256 首期允许 widening fallback，native SDOT 另附 HWCAP/反汇编证据
+D11 5 个 qlinear_w8a8_* 名字先实现为 builder 组合，不新增融合 opcode
+D12 CUDA/AMD 能力不足时硬失败，需显式声明 precision="bf16" 才回退
+```
+
+实现任务仍排在 BF16 带权整网执行与 logits 对齐之后启动；第 9 节（R1–R14）为后续实现任务的验收依据。
 
 ## 0. 启动协议字段（原样）
 
