@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`EXECUTION_W6_QWEN35_BF16_RUNTIME_BINDING_COMPLETE_BACKEND_INGESTION_READY`
+状态：`EXECUTION_W6_QWEN35_M1K_CPU_COMPLETE_CUDA_INGESTION_READY_AMD_GFX1036_IDENTIFIED`
 
-最后更新：2026-09-09 17:33 CST（Asia/Shanghai）
+最后更新：2026-09-10 00:55 CST（Asia/Shanghai）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -16,7 +16,7 @@
 - AMD GPU：GPU 公共层 → HIP/ROCDL；
 - 现有 Ascend CCE 路径保持为一个 target plugin，并避免功能回退。
 
-目前已完成调研、架构规划、项目整理、资源盘点、上游 edge 刷新、CANN/算子生态审计、C0 控制仓治理、W1/W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2，以及 Qwen3.5-0.8B M0–M1J 与 AVX2/AVX-512 parity。M1I 已形成24层参数化、无权重值、非 identity decoder Core SSA graph；M1J 又冻结3个 runtime、320个 parameter、48个 immutable state input 的 external bytes/mmap binding schema、64-byte storage-relative packed layout、tied storage 与 launcher digest 契约。M1J 在 exact HEAD `0bc15d06ee167d5b6b5c62cffec88083dabb2bdf` 上独立验收为 `506 passed, 7 skipped`，真实 model profile 只计算368个 region、总计1,574,877,952 bytes 的 metadata，没有创建或映射大文件。下一步是 CPU/CUDA external byte-buffer ingestion adapter；下载或加载模型权重仍需用户明确授权。Tensor frontend 是跨架构主入口，Pro 保留为 Ascend expert dialect，并后续提取 portable subset。
+目前已完成 W1/W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2，以及 Qwen3.5-0.8B M0–M1K-CPU 与 AVX2/AVX-512 parity。M1K-CPU 在 M1I decoder 与 M1J binding 之上新增共享 typed byte view：scalar 作为小 tensor reference 解码，AVX2/AVX-512 直接借用 buffer pointer，SVE256 在 wire 边界复制 raw bytes。exact HEAD `0bc662c6af9bdd32f587dbe2a0e9d0aec81290da` 的独立验收为 `516 passed, 7 skipped`；24层 synthetic external-buffer graph 已在 scalar、AVX2、AVX-512、QEMU SVE256 执行。AMD 临时目标改为 GamePC `gfx1036` 核显，但 WSL 缺少 `/dev/kfd` 和 ROCm/HIP runtime，当前为 `BLOCKED_DEVICE`。下一步是 CUDA byte-buffer ingestion；下载或加载模型权重仍需用户明确授权。
 
 ## 2. 已经确定的技术决策
 
@@ -65,7 +65,7 @@ upstream/                         # 五个嵌套 Git 仓库
 ```text
 branch = master
 HEAD   = 34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad
-linked worktree 数 = 48（基线、integration、既有调研/W1-W4、Qwen M1A–M1J、recovery 与独立验收 worktree）
+linked worktree 数 = 52（基线、integration、既有调研/W1-W5、Qwen M1A–M1K、recovery、probe 与独立验收 worktree）
 工作树 = clean
 ```
 
@@ -187,13 +187,13 @@ W1 已完成以下三个 task：
 2. `work/core-ir`：Parser 单次生成目标无关 CoreProgram、稳定 IR dump/serialization。
 3. `work/verification`：无设备/无模型测试门禁、IR snapshot 和 differential harness。
 
-W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2、W6 M0–M1J 与 AVX2/AVX-512 parity 已完成，下一步进入：
+W2/W2B、完整 W3、W4 SVE256/GPU common/CUDA C1–C2、W6 M0–M1K-CPU 与 AVX2/AVX-512 parity 已完成，下一步进入：
 
 ```text
 W3 parity: AVX2/AVX-512 Qwen M1A–M1H（完成）
 W4 CUDA: C2 correctness 已完成 → 后续性能/fusion
-W5: hip
-W6: 无权重 decoder（完成）→ typed buffer/mmap binding（完成）→ backend ingestion → 获授权后 BF16 文本模型 → W8A8-linear
+W5: `amd-igpu-gfx1036` 已识别；HIP runtime `BLOCKED_DEVICE`，先做静态 codegen
+W6: 无权重 decoder（完成）→ binding（完成）→ CPU ingestion（完成）→ CUDA ingestion → 获授权后 BF16 文本模型 → W8A8-linear
 ```
 
 完整文件所有权和依赖见 `configs/agent_tasks.yaml`，不要跳过 GPU common 直接让 CUDA/HIP 各自定义 ABI。
@@ -242,9 +242,9 @@ ssh 192.168.101.5 \
 
 用户于 2026-09-09 确认 GamePC 已恢复且 RTX 5080 由 PyPTO-X 独占。GPU-only probe/执行不申请 `gamepc`；CUDA host-heavy 编译、并行构建或大量远端 CPU/内存阶段才持续持锁。恢复探测确认：RTX 5080 16,303 MiB、compute capability 12.0、KMD 610.62/CUDA UMD 13.3；没有 compute process，后续瞬时探测可用 11,389 MiB；WSL 有 24 CPU、约 30 GiB `MemAvailable`、Clang 18.1.3、CMake 3.28.3、Python 3.12.3 和 `libcuda.so.1`。没有 `nvcc`、NVRTC、CUDART、CUDA SDK headers、PyTorch 或 Triton。首个 CUDA task 可先用 Driver API + PTX JIT + Python `ctypes`，无需安装；若后续需要 Toolkit，安装仍需用户明确授权。
 
-### AMD 6750GRE 12G
+### AMD GamePC 核显 `gfx1036`
 
-卡暂时闲置、尚未接入当前系统。本地没有 `rocminfo`/`rocm-smi`。接入后先确认 ROCm 支持、实际 `gfx` target 和 wavefront，不要预先硬编码。
+6750GRE 实测无法安装，当前暂缓。GamePC 的 Ryzen 9 9900X 核显由 Windows OpenCL 报告为 `gfx1036`、Vulkan 报告为 integrated GPU；AMD 与 RTX 5080 均为 `OK`。WSL 当前只有 `/dev/dxg`，没有 `/dev/kfd`、`/dev/dri`、ROCm/HSA/HIP runtime、`hipcc` 或 device library，因此不能运行 HIP kernel。`gfx1036` 身份来自 Windows OpenCL 而非 `rocminfo`；wave、BF16/INT8/MFMA/WMMA/XNACK 均保持 unknown。正式证据见 `../worktrees/_meta/pypto-x/gamepc-amd-igpu-probe-20260910/validation.json`。
 
 ### 鲲鹏与 QEMU
 
@@ -396,7 +396,10 @@ QEMU 只证明功能路径，不可用于性能结论。
 - M1I 开发期间曾有旧实现代理绕过 heavy runner，以 heredoc Python 在同一进程连续 lower 多个真实后端，进程峰值约23.1 GiB并触发用户 cgroup OOM。事故现场保持只读；recovery 改为新 worktree、每后端独立 driver/前台进程、4 GiB cgroup 与4 CPU上限。事故与修复链见 `docs/00-handoffs/0026-2026-09-09-decoder-connectivity-complete-and-resource-incident.zh-CN.md`；
 - M1J runtime binding task commits：`801e4e6d8`、`7121b2c52`、`a1356ed64`；integration commits：`55f71762e`、`7cfe28133`、`0bc15d06e`；schema 精确分区3/320/48输入并包含36个 `A_log/dt_bias`，compact manifest 的 name/storage/aliases/order/dtype/shape/count/bytes 与 exact Core 三方校验，368-region packed layout 只生成 metadata；
 - M1J 首轮独立验收发现 compact manifest name/storage 可任意改名仍被接受；修复后的 r2 验收 `506 passed, 7 skipped`，bytes/bytearray/read-only mmap/writable mmap zero-copy、bounds/mutability/lifetime、artifact program digest 与篡改门禁均 `PASS`。现有 scalar/AVX2/CUDA 对 byte memoryview 均安全拒绝，不会静默错算；证据目录 `../worktrees/_meta/pypto-x/integration-w6-qwen35-bf16-runtime-binding-final-r2/`；
-- 当前 integration HEAD：`0bc15d06ee167d5b6b5c62cffec88083dabb2bdf`，工作树 clean。GPU 由 PyPTO-X 独占，`gamepc` 锁仅协调远端 heavy CPU/host-memory。
+- M1K-CPU task commits：`8707cb653`、`78b39c62d`；integration commits：`e95591b94`、`0bc662c6a`；新增 BF16/FP32/INT32/INT64 typed byte view，AVX2/AVX-512 direct pointer、scalar reference decode 与 SVE raw wire staging；
+- M1K-CPU 首轮验收发现 `ctypes.pythonapi` reload 类型冲突与 NumPy `V2` 的 memoryview `2x` 格式遗漏；修复后的 r2 验收 `516 passed, 7 skipped`，连续6次 reload/lifetime、NumPy V2、371-input/51-output/43,200-byte external-buffer Qwen graph 在 scalar/AVX2/AVX-512/QEMU SVE256 均 `PASS`。SVE 仍有19次显式 host-reference `to_values` fallback；证据目录 `../worktrees/_meta/pypto-x/integration-w6-qwen35-bf16-cpu-buffer-ingestion-final-r2/`；
+- GamePC AMD 核显探测：Windows `AMD Radeon(TM) Graphics DEV_13C0` 状态 OK，OpenCL device `gfx1036`；WSL 无 `/dev/kfd`/ROCm/HIP，最终状态 `BLOCKED_DEVICE`。目标命名冻结为 `amd-igpu-gfx1036`，不得冒充6750GRE/gfx1031；
+- 当前 integration HEAD：`0bc662c6af9bdd32f587dbe2a0e9d0aec81290da`，工作树 clean。GPU-only 工作不申请 `gamepc`；该锁仅协调远端 heavy CPU/host-memory。
 
 W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保持只读，不重跑覆盖。
 
@@ -421,7 +424,7 @@ W1/W2/W2B/W3 smoke 日志位于 `../worktrees/_meta/pypto-x/`；任务日志保�
 3. CPU/加速器优先级为 AVX2 → AVX-512 → SVE256（无 NEON）→ NVIDIA → AMD。
 4. 上游默认分支已刷新为 edge 快照，版本策略为 release family + exact SHA 双轨 lock。
 5. Tensor frontend 作为跨架构主入口，Pro 作为 Ascend expert dialect + portable subset。
-6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、CUDA C1–C2、Qwen3.5-0.8B M0–M1J 与 AVX2/AVX-512 parity 已完成。下一任务是 CPU/CUDA external byte-buffer ingestion adapter；实际权重下载/加载需要新的明确授权。5080 GPU-only 工作持续可用，host-heavy 阶段单独申请 `gamepc`。
+6. 用户已批准执行开发计划；W1/W2/W2B、完整 W3、SVE256、GPU common、CUDA C1–C2、Qwen3.5-0.8B M0–M1K-CPU 与 AVX2/AVX-512 parity 已完成。下一任务是 CUDA external byte-buffer ingestion；实际权重下载/加载需要新的明确授权。AMD 临时目标是 `amd-igpu-gfx1036`，当前只能做静态 codegen。
 
 C0 已完成：
 
@@ -430,7 +433,7 @@ C0 已完成：
 3. 接手文档已按序号和日期归档到 `docs/00-handoffs/`。
 4. stable lock 仍等待实际 CANN toolkit/NPU 环境做晋升验证，不影响目标无关 W1，但会门禁 Ascend 回归结论。
 
-GPU common 已冻结 NVIDIA/AMD 共用的 Grid/Workgroup/Thread/Subgroup、address space、GPU artifact 与 launch ABI；公共层没有 NVVM/ROCDL/WMMA/MFMA 语义。CUDA C2 已用 `ctypes + libcuda.so.1 + PTX JIT` 在 5080 完成 Qwen math/layout/indexing/composites 正确性验收；它仍不是 NVVM、Tensor Core、fusion 或性能结论。PyPTO-Gym M0、PyPTO M1A–M1J 与 AVX2/AVX-512 parity 已完成并集成；24层 decoder 与 target-independent external buffer binding 均已冻结。下一步让 CPU/CUDA backend 正确摄取 byte memoryview/mmap slice，并在取得权重/参考环境授权后进入 BF16 实际模型与 W8A8-linear。M1G/M1I 的 T>1 GDR 仍是静态 sequential SSA 展开，不是 fused WY/chunk kernel；SVE position/control 仍有 host fallback。鲲鹏 920B ECS 当前 ACTIVE，用于 native 正确性和汇编验收；实际权重下载/加载仍未授权。Ascend 当前只完成 adapter seam；stable CANN/NPU 回归继续保持 pending。
+GPU common 已冻结 NVIDIA/AMD 共用的 Grid/Workgroup/Thread/Subgroup、address space、GPU artifact 与 launch ABI；公共层没有 NVVM/ROCDL/WMMA/MFMA 语义。M1K-CPU 已使 CPU backends 正确摄取 external byte views，下一步为 CUDA host-to-device staging；AMD `gfx1036` 在 WSL 暂无 HIP runtime，只做静态目标开发。之后在取得权重/参考环境授权后进入 BF16 实际模型与 W8A8-linear。M1G/M1I 的 T>1 GDR 仍是静态 sequential SSA 展开；SVE position/control 和部分复合路径仍有 host fallback。920B 继续承担 native 功能验证；Ascend stable CANN/NPU 回归仍 pending。
 
 ## 12. 快速自检命令
 

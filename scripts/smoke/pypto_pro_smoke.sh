@@ -8,7 +8,7 @@ usage() {
     --agent-id NAME \
     --started-at ISO8601-UTC \
     --worktree ABS_PATH \
-    --target host|qemu-aarch64|nvidia-5080|amd-6750gre|kunpeng-sve256 \
+    --target host|qemu-aarch64|nvidia-5080|amd-igpu-gfx1036|amd-6750gre|kunpeng-sve256 \
     --log-dir ABS_PATH
 
 该脚本不接受模型参数，也不会下载模型。
@@ -79,7 +79,7 @@ if [[ ! "$started_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z
     exit 2
 fi
 case "$target" in
-    host|qemu-aarch64|nvidia-5080|amd-6750gre|kunpeng-sve256) ;;
+    host|qemu-aarch64|nvidia-5080|amd-igpu-gfx1036|amd-6750gre|kunpeng-sve256) ;;
     *)
         echo "错误：不支持的 target：$target" >&2
         exit 2
@@ -206,10 +206,10 @@ else
                     notes="NVIDIA 设备和 nvcc 可见；未加载模型"
                 fi
                 ;;
-            amd-6750gre)
+            amd-igpu-gfx1036|amd-6750gre)
                 if ! command -v rocminfo >/dev/null 2>&1; then
                     status="BLOCKED_DEVICE"
-                    notes="rocminfo 不可用；AMD 6750GRE 尚未接入或 ROCm 未安装"
+                    notes="rocminfo 不可用；AMD 目标未通过 ROCm/HIP 暴露"
                 elif ! run_logged rocminfo; then
                     notes="rocminfo 执行失败"
                 elif ! command -v hipcc >/dev/null 2>&1; then

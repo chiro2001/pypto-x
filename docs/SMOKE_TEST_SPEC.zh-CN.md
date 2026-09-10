@@ -16,7 +16,7 @@
 --agent-id       唯一任务名
 --started-at     ISO-8601 UTC 时间，例如 2026-09-06T08:00:00Z
 --worktree       该 subagent 的绝对 worktree 路径
---target         host | qemu-aarch64 | nvidia-5080 | amd-6750gre | kunpeng-sve256
+--target         host | qemu-aarch64 | nvidia-5080 | amd-igpu-gfx1036 | amd-6750gre | kunpeng-sve256
 --log-dir        该 subagent 独占的日志目录
 ```
 
@@ -56,11 +56,11 @@
 - 缺少 CUDA 工具链时返回 `BLOCKED_TOOLCHAIN`，不下载模型。
 - 这是 GPU-only 轻量 probe，RTX 5080 已由 PyPTO-X 独占，因此不申请 `gamepc`；若扩展为 host-heavy CUDA 编译/并行构建，则扩展阶段必须单独持有 `gamepc`。
 
-### `amd-6750gre`
+### `amd-igpu-gfx1036` / `amd-6750gre`
 
 - 运行 `rocminfo`/`rocm-smi`/`hipcc --version`；
 - 记录 gfx target 和 wavefront 信息；
-- 卡未接入时返回 `BLOCKED_DEVICE`。
+- 当前临时目标是 GamePC `gfx1036` 核显；WSL 缺少 `/dev/kfd` 或 ROCm/HIP runtime 时返回 `BLOCKED_DEVICE`。`amd-6750gre` 作为历史兼容 target 保留，但不再是当前资源。
 
 ### `kunpeng-sve256`
 

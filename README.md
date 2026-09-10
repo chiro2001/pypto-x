@@ -1,6 +1,6 @@
 # PyPTO-X：PyPTO 跨架构后端
 
-PyPTO-X（PyPTO Cross-Architecture）是本项目的工作名称，目标是在保留 PyPTO Tensor/Professional 双前端定位的前提下，抽取可移植 Core IR 与 target ABI，并逐步支持鲲鹏 CPU、x86_64 CPU、NVIDIA GPU 和 AMD GPU。当前已冻结 CPU scalar、SVE256、GPU common、Qwen3.5-0.8B M0–M1J、AVX2/AVX-512 Qwen parity，以及 RTX 5080 CUDA C2 math/layout/indexing/composites；24层无权重 decoder connectivity 与 typed external buffer/mmap binding 已独立验收通过。下一阶段是 CPU/CUDA byte-buffer ingestion adapter，再进入获授权后的 BF16 带权参考执行。各后端能力只以对应验收证据为准。
+PyPTO-X（PyPTO Cross-Architecture）是本项目的工作名称，目标是在保留 PyPTO Tensor/Professional 双前端定位的前提下，抽取可移植 Core IR 与 target ABI，并逐步支持鲲鹏 CPU、x86_64 CPU、NVIDIA GPU 和 AMD GPU。当前已冻结 Qwen3.5-0.8B M0–M1K-CPU、AVX2/AVX-512 parity、SVE256、GPU common 与 RTX 5080 CUDA C2；24层无权重 decoder、external buffer binding 和 CPU typed byte-view ingestion 已独立验收通过。下一阶段是 CUDA byte-buffer staging，再进入获授权后的 BF16 带权参考执行。AMD 临时目标为 GamePC `gfx1036` 核显，当前 WSL 仍为 `BLOCKED_DEVICE`。各后端能力只以对应验收证据为准。
 
 ## 快速入口
 
@@ -18,7 +18,7 @@ PyPTO-X（PyPTO Cross-Architecture）是本项目的工作名称，目标是在�
 - [项目文件布局](docs/PROJECT_LAYOUT.zh-CN.md)：PyPTO-X 的模块边界、源码归属和许可证分层。
 - [Worktree 与 subagent 计划](docs/WORKTREE_AGENT_PLAN.zh-CN.md)：分支拓扑、任务依赖、启动参数和一小时长等待协议。
 - [Qwen3.5-0.8B BF16/W8A8 模型 MVP](docs/20-planning/0001-2026-09-07-qwen35-08b-bf16-w8a8-mvp.zh-CN.md)：模型 revision、算子闭包、量化契约、后端顺序和验收标准。
-- [资源矩阵](docs/RESOURCE_MATRIX.zh-CN.md)：5080 WSL、AMD 6750GRE、鲲鹏 920B 和 QEMU 的使用安排。
+- [资源矩阵](docs/RESOURCE_MATRIX.zh-CN.md)：5080 WSL、AMD `gfx1036` 核显、鲲鹏 920B 和 QEMU 的使用安排。
 - [本机重任务资源锁策略](docs/LOCAL_RESOURCE_POLICY.zh-CN.md)：跨项目 `local` 锁、cgroup 限制、运行时资源监控与安全停止规则。
 - [无模型冒烟测试规范](docs/SMOKE_TEST_SPEC.zh-CN.md)：每个 subagent 只执行一次的测试契约。
 - [上游版本锁](configs/upstream_lock.yaml)：edge/stable 双轨仓库 SHA、release 锚点和晋升验证项。

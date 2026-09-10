@@ -13,9 +13,9 @@
 
 ## 当前阶段
 
-- 当前状态是 `EXECUTION_W6_QWEN35_BF16_RUNTIME_BINDING_COMPLETE_BACKEND_INGESTION_READY`。
-- Qwen3.5-0.8B M0–M1J 已完成并冻结；M1I 是24层无权重、非 identity 参数化 decoder Core SSA graph，M1J 已冻结3/320/48 runtime/parameter/state 的 typed external buffer/mmap 与 launcher binding 契约。SVE `iota/compare` 仍是 host-reference fallback，尚不是带权整网执行。
-- AVX2、AVX-512 Qwen parity、CUDA C2、M1I decoder connectivity 与 M1J runtime binding 均已独立验收通过；下一步是 CPU/CUDA external byte-buffer ingestion adapter，下载或加载模型权重仍需用户明确授权。GPU-only 工作无需 `gamepc` 锁，CUDA host-heavy 编译阶段才申请该锁；鲲鹏 920B ECS 继续承担 SVE256 验证。
+- 当前状态是 `EXECUTION_W6_QWEN35_M1K_CPU_COMPLETE_CUDA_INGESTION_READY_AMD_GFX1036_IDENTIFIED`。
+- Qwen3.5-0.8B M0–M1K-CPU 已完成并冻结；M1I 是24层无权重 decoder，M1J 是3/320/48 external buffer binding，M1K-CPU 已让 scalar、AVX2/AVX-512 与 SVE256 正确摄取 typed byte views。SVE `iota/compare` 和部分复合路径仍有 host-reference fallback，尚不是带权整网执行。
+- 下一步是 CUDA host-to-device byte-buffer ingestion。AMD 临时目标改为 GamePC 核显 `amd-igpu-gfx1036`；Windows 可见，但 WSL 缺少 `/dev/kfd` 和 ROCm/HIP runtime，当前只允许静态 target/codegen 开发并标记 `BLOCKED_DEVICE`。下载或加载模型权重仍需用户明确授权。
 
 ## Git 与目录
 
@@ -53,6 +53,6 @@
 - 本机共享重任务遵守 `/home/chiro/projects/.resource-locks/README.md`；运行前以 `resource-lock run` 实际取得锁才算获准，`status` 只供观察。
 - PyPTO-X 本机 heavy 命令统一经 `scripts/resource/run_local_heavy.sh`：默认启动至少 8 GiB `MemAvailable`、保留 4 GiB 系统余量、最多 6/12 CPU，使用动态 `MemoryHigh/MemoryMax`、`MemorySwapMax=0`、CPU quota/affinity，并持续记录内存、RSS、load 与 PSI；安全停止只作用于本任务进程组。
 - RTX 5080 主机 `192.168.101.5` 已恢复且 GPU 由 PyPTO-X 独占；GPU-only probe/执行不申请 `gamepc`，大量远端 CPU/内存阶段才持锁。SSH 默认进入 Windows `cmd`；Linux 命令必须通过 `wsl.exe -e bash -lc`。
-- AMD 6750GRE 尚未接入，不得声称 HIP 已在真机运行。
+- AMD 6750GRE 安装失败并暂缓；临时目标为 GamePC `gfx1036` 核显。Windows OpenCL/Vulkan 可见不等于 HIP 可用；在 WSL 获得 `/dev/kfd`、ROCm/HIP runtime 与真机 kernel 证据前，不得声称 HIP 已运行。
 - QEMU 只用于 AArch64/SVE 功能验证，不得用其数字作性能结论。
 - 鲲鹏 920B ECS 已完成 native SVE256 功能与汇编验证：SVE=1、VL=32、SVE2=0；它是 2 vCPU KVM guest，尚未形成性能门槛。

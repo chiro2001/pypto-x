@@ -1,14 +1,14 @@
 # PyPTO-X 可用资源与测试矩阵
 
-更新日期：2026-09-09（Asia/Shanghai）
+更新日期：2026-09-10（Asia/Shanghai）
 
 ## 资源总览
 
 | 资源 | 当前状态 | 主要用途 | 当前实测/已知信息 | 限制 |
 |---|---|---|---|---|
-| 本地开发机 | 可用；heavy 需全局 `local` 锁；AVX parity、M1I decoder 与 M1J binding PASS | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8；M1I 全量 `491 passed, 7 skipped`；M1J 全量 `506 passed, 7 skipped`，external bytes/mmap binding 与 metadata-only 1.57GB packed layout 通过 | full pytest、大 shape lowering/compile 与并行构建必须走 `scripts/resource/run_local_heavy.sh`；默认保留 4 GiB、最多 6 CPU；当前仅为正确性/汇编证据，不形成性能门槛 |
+| 本地开发机 | 可用；heavy 需全局 `local` 锁；M1K-CPU PASS | Core IR、ABI、CPU scalar/x86、PTO simulator、QEMU | x86_64，12 vCPU，Clang 22.1.8；M1K-CPU `516 passed, 7 skipped`，scalar/AVX2/AVX-512/QEMU SVE256 的24层 external-buffer graph 通过 | full pytest、大 shape lowering/compile 与并行构建必须走 `scripts/resource/run_local_heavy.sh`；默认保留 4 GiB、最多 6 CPU；当前仅为正确性/汇编证据，不形成性能门槛 |
 | RTX 5080（`192.168.101.5`） | 在线；GPU 由 PyPTO-X 独占；CUDA C2 与 M1I synthetic PASS | NVIDIA CUDA/PTX/NVVM 验证 | WSL2、RTX 5080 16,303 MiB、CC 12.0、KMD 610.62/CUDA UMD 13.3；Driver/PTX 已通过 math/layout/indexing/composites，并执行24层 synthetic decoder | GPU-only 无需 `gamepc` 锁；host-heavy 才持锁。无 `nvcc`/NVRTC/CUDART/SDK headers/PyTorch/Triton；当前是 correctness kernel，不是 fusion/性能结论 |
-| AMD 6750GRE 12G | 暂未接入 | AMD HIP/ROCDL、wave 和显存测试 | 当前机器 `lspci` 未发现该卡，`rocminfo/rocm-smi` 不可用 | 接入前不能声明 ROCm 支持或性能；具体 gfx target 以 `rocminfo` 为准 |
+| AMD GamePC 核显 `gfx1036` | Windows 可见；WSL/HIP `BLOCKED_DEVICE`；6750GRE 暂缓 | AMD HIP/ROCDL 静态 target，后续真机功能 | Ryzen 9 9900X iGPU，Windows OpenCL device `gfx1036`、Vulkan integrated GPU；WSL 仅 `/dev/dxg`，无 `/dev/kfd`/ROCm/HIP | `gfx1036` 来自 OpenCL 而非 rocminfo；wave/BF16/INT8/MFMA/WMMA unknown；不能声明 HIP 已运行或代表6750GRE性能 |
 | 鲲鹏 920B ECS（SVE256） | 按量实例运行中 | 原生 AArch64/SVE256 功能、汇编，后续受控性能探测 | openEuler 22.03、HiSilicon、2 vCPU、GCC 10.3.1、KVM；HWCAP SVE=1、SVE2=0、VL=32；M1C1–M1I 功能/contract 与24层 synthetic decoder 已通过 | ECS 是 KVM guest，不代表裸机/整机性能；`iota/compare` 是 host-reference；按量计费，状态见 `~/tools/ecs-920B/state.env` |
 | QEMU AArch64 | 可用 | AArch64/SVE/SVE2 功能和编译验证 | `qemu-aarch64` 11.0.3；已验证 `max,sve256=on` 可报告 SVE/SVE2，VL=32 bytes | 不能代表鲲鹏吞吐、缓存、内存带宽或指令时序 |
 
@@ -54,6 +54,8 @@ CUDA C2 在此基础上补齐 math、compare/iota/position、broadcast/where、l
 M1I 在 exact integration HEAD `ec60f95979a56a9646d84f163912e677e9eb08ac` 上完成24层无权重 decoder connectivity。真实 `(B=1,T=1,past=4096)` profile 的 scalar、vector-common、AVX2、AVX-512、SVE256、GPU common 与 CUDA lowering/compile 均通过且 vector iteration domain 全部 compact；缩小但拓扑等价的24层 synthetic graph 已在 scalar、AVX2、AVX-512、QEMU SVE256、920B native 和 RTX 5080 Driver/PTX 实际执行通过。证据位于 `../worktrees/_meta/pypto-x/integration-w6-qwen35-decoder-connectivity-final-r3/validation.json`；这仍不代表带权整网推理或性能结论。
 
 M1J 在 exact integration HEAD `0bc15d06ee167d5b6b5c62cffec88083dabb2bdf` 上冻结 external bytes/mmap binding contract。真实 profile 只计算3/320/48 input schema、368个 packed region 和1,574,877,952 bytes的 storage-relative layout metadata，没有创建、映射或读取权重文件；现有 scalar/AVX2/CUDA 对 byte memoryview 均为安全拒绝，backend ingestion 尚待下一阶段。证据位于 `../worktrees/_meta/pypto-x/integration-w6-qwen35-bf16-runtime-binding-final-r2/validation.json`。
+
+M1K-CPU 在 exact integration HEAD `0bc662c6af9bdd32f587dbe2a0e9d0aec81290da` 上完成 typed byte-view ingestion。24层 synthetic Qwen graph 通过371个 external descriptors和43,200-byte packed storage在 scalar、AVX2、AVX-512、QEMU SVE256实际执行；AVX直接借用pointer，SVE有363个raw-wire payload并保留19个显式host-reference fallback。证据位于 `../worktrees/_meta/pypto-x/integration-w6-qwen35-bf16-cpu-buffer-ingestion-final-r2/validation.json`。
 
 ## QEMU SVE/SVE2 验证
 
@@ -137,26 +139,24 @@ NUMA 节点、CPU affinity、内存带宽工具
 3. SVE/SVE2 多 VL 兼容性（若机器支持）；
 4. 最后才做性能和 PMU 测量。
 
-## AMD 6750GRE 接入清单
+## AMD GamePC `gfx1036` 核显接入结果
 
-卡接入系统后先记录：
+6750GRE 实测无法安装，当前以 GamePC 核显作为临时 AMD 目标。2026-09-10 轻量探测确认：
 
-```bash
-lspci -nn | rg -i 'amd|vga|3d|display'
-rocminfo
-rocm-smi
-hipcc --version
-```
+- Windows：`AMD Radeon(TM) Graphics`、`DEV_13C0`、状态 `OK`；
+- Windows OpenCL：device name `gfx1036`、preferred work-group multiple 32；
+- Windows Vulkan：integrated GPU；
+- WSL：`/dev/dxg` 存在，`/dev/kfd` 与 `/dev/dri` 不存在；
+- WSL：无 `rocminfo`、`rocm-smi`、`hipcc`、ROCm/HSA runtime 和 device library；
+- Clang 18 注册了 `amdgcn/gfx1036` 名称，但只能作为静态 target 信号。
 
-随后确认：
+因此当前目标名冻结为 `amd-igpu-gfx1036`，状态为 `BLOCKED_DEVICE`。在 WSL 真正提供 `/dev/kfd`、ROCm/HIP runtime 后，仍需重新取得：
 
-- ROCm 版本是否支持该消费级 RDNA2 GPU；
-- `gfx` target 字符串；
-- wavefront 是 32 还是 64；
-- FP16/BF16/FP32、原子和矩阵指令能力；
-- 12 GiB 显存是否足以承载测试工作集。
+- `rocminfo` 的 exact agent/gfx/wave 证据；
+- FP16/BF16/INT8、MFMA/WMMA、XNACK 和 local/global memory capability；
+- 最小 HIP enumerate/vector-add 真机结果。
 
-在这些信息确认前，AMD worktree 只做代码生成和静态检查，不做性能承诺。
+Windows OpenCL/Vulkan 设备可见不等于 Linux HIP 可用；当前只做静态 codegen，不做执行或性能承诺。证据见 `../worktrees/_meta/pypto-x/gamepc-amd-igpu-probe-20260910/validation.json`。
 
 ## 资源分配
 
@@ -167,7 +167,7 @@ hipcc --version
 | CPU scalar/x86 | 本地 | 无 | scalar golden、AVX 汇编检查 |
 | SVE256/SVE2 | 鲲鹏 920B ECS（native） | QEMU（功能） | VL/predicate/尾块；性能结论另行冻结 |
 | NVIDIA | 5080 WSL | 无 | CUDA artifact、运行结果 |
-| AMD | 6750GRE 接入后 | 无 | HIP artifact、gfx/wave 检查 |
+| AMD | GamePC `amd-igpu-gfx1036` | 静态 Clang amdgcn | 当前只做 gfx1036 target/codegen；HIP runtime `BLOCKED_DEVICE` |
 | 9B/GDR | 后期各目标 | 5080 或鲲鹏 | 先单算子，再报告模型覆盖率 |
 
 ## 资源使用原则
@@ -178,5 +178,5 @@ hipcc --version
 - Smoke 测试不加载模型、不需要模型路径、不产生大权重文件。
 - 5080 先用于 elementwise、softmax、matmul 和 GPU ABI，不直接从 9B 端到端开始。
 - SVE 已完成 QEMU 与鲲鹏 ECS native 功能验证；ECS KVM 数字暂不直接作为生产性能门槛。
-- AMD 卡接入前不能把 HIP backend 标成“可运行”；最多标成“编译路径开发中”。
+- AMD 核显在 WSL 获得 `/dev/kfd` 与 ROCm/HIP 真机证据前不能把 HIP backend 标成“可运行”；最多标成“gfx1036 静态编译路径开发中”。
 - native compiler task 使用 `../worktrees/_meta/pypto-x/<task>/` 下独占的 `TMPDIR`、build、artifact 和日志目录，避免共享 `/tmp` 的容量/配额抖动，也避免不同 agent 共享未完成生成物。
