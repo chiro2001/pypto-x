@@ -2,7 +2,7 @@
 
 状态：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED_W8C_C1_C2_VERIFIED_W8B_B5_REDUCE_BROADCAST_VERIFIED_W8B_B3A_CUDA_EVENT_TIMING_VERIFIED`
 
-最后更新：2026-09-11 01:35 CST（Asia/Shanghai）
+最后更新：2026-09-11 01:58 CST（Asia/Shanghai；§8 追加 920B 释放与 A2 暂停状态）
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -163,7 +163,14 @@ chat(T=18)  PASS（修订判据）严格 argmax 17/18（唯一 mismatch row 14�
 GamePC 192.168.101.5  WSL2 24 线程 / 30 GiB（宿主 61.4 GiB）/ RTX 5080 16 GB；CUDA Toolkit（nvcc 13.3.73+cuBLAS 13.6）
                     GPU-only 短探测不申请 gamepc；host-heavy 才持锁；Linux 命令经 wsl.exe -e bash -lc
 鲲鹏 920B ECS       2 vCPU / 2.5 GiB / SVE=1 VL=32、SVE2=0；约定串行；QEMU 只作功能验证
-昇腾 A2(910B3)      容器 256 vCPU / 2 TB / 1×910B3（64 GB HBM）/ CANN 9.0.0 / driver 25.2.0 —— 在线
+                    **2026-09-11 已按用户指示释放**（实例+系统盘+EIP 删除，计费停止）；释放前 /root 工作目录
+                    已归档 ../worktrees/_meta/pypto-x/ecs920b-release-archive-20260911/（758 文件 / 9.8 MB，条目核对一致）；
+                    需用时以 ~/tools/ecs-920B/create.sh + setup-access.sh 重建 → **重建前 920B 线任务（B2 等）不发射**
+昇腾 A2(910B3)      容器 256 vCPU / 2 TB / 1×910B3（64 GB HBM）/ CANN 9.0.0 / driver 25.2.0
+                    **2026-09-11 起暂停（用户指示）**：机时预算 100 h、已用 ~6 h，暂停不消耗机时且文件保留；
+                    待用户通知恢复 → **恢复前 A2 任务一律不发射**（E4/E5、W8H/W8I 后续范围、stable CANN 9.2.0-beta.2
+                    上卡、classic/Pro JIT/OPC/gym 验证；另 A2 上 ~8.03 GiB profiler trace 待清理）；
+                    暂停时无在途任务、卡锁已释放（.using→.done）、无残留进程
                     W8A-C 真机验收 PASS；W8H/W8I vllm-ascend 基线**独立验收 PASS**
                     **卡占用协议**：容器固定目录 /root/a2-npu-lock/（README.zh-CN.md + a2_card_lock.sh）；
                     流程 request→using→done（历史保留），180 s 轮询，TTL 6 h + PID 僵死判定；
