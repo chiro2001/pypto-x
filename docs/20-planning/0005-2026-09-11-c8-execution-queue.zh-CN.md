@@ -59,3 +59,40 @@ e5 产物归属  gold 数据进 _meta，摘要与 digest 进 lock；不进 patch
 - **C8 通过 ≠ W8A8 可生产**：它只证明"实现忠实于契约方案"；量化质量（相对 fp32 的真实损失）要靠 L6/perplexity 或独立评测。
 - **band 是参照自身的量化噪声底**，不是行业标准阈值；对外只能声称"与同方案参照一致"，不能声称"精度达标"。
 - 轴 B 的差异来源包含内核实现差异（累加顺序/epilogue 舍入/饱和策略），因此它的判据必须与轴 A 分开表述，**不得混算**。
+
+---
+
+## 9. 队列现状（2026-09-12 02:15 CST 快照；权威状态以 `configs/development_lock.yaml` 为准）
+
+| # | 任务 | 状态 | 结果 / 阻塞 |
+|---|---|---|---|
+| Q1 | `a3-c8-prep` | ✅ 完成 | 独立 conda env `~/pypto-x-a3/envs/pypto-x-c8`（transformers 5.17.0 与 x86 gold 精确同版本）；两个加载探测 LOAD_OK；并行度基线（1 case = 1 进程 × 8 线程，16–20 并发为上限；HT 负收益）；**红旗：aarch64 无 `torch+cpu` wheel → 第二参照口径**；容器 cpuset 仅 560-639 |
+| Q2 | `c8-w8a8-reference-gold` | ✅ 完成 | W8A8 参照 gold + band；**scale 交叉校验 150/150 张量、399,360 元素逐位一致（max ULP=0）**；gold 聚合 digest `22e754cf…`；两变体（`w8a8` 主参照 / `w8a8_f32ref` 诊断） |
+| Q3 | `c8-l4-avx512` | 🔄 在途（持锁） | 主判定（prefill 口径）en/zh 全 PASS（严格 argmax 9/9、12/12、8/8，near-tie 0）；**zh-default 的 decode 扩展 FAIL（decode 口径下限 0.99082，实测 0.98477）**；chat 段收尾中 |
+| Q4 | `c8-axis-b-probe` | ✅ 完成 | 决策表：x86 vLLM-CPU **可行**（checkpoint 重打包 200–300 行、无运行时胶水）；A3 容器不可行；A3 host 二进制可得/运行未证；**sm_120：cuBLASLt 的 int8（含融合 scale）不可用**；最硬证据=激活码一致时 vLLM(oneDNN) 与我们**逐位一致** |
+| Q5 | `c8-l4-sve256` | ⛔ 阻塞（已收口） | W8A8 整网在 SVE256 **lowering 即被拒**（int8 转置 150/187 个、474/717 MiB/forward）；副产品=**A3 bf16 整网普查 PASS**（native 91–93%，RSS 峰值 68–81 GiB）→ 直接暴露 SVE256 的 int8 缺口与**不释放中间值**两个问题 |
+| Q7 | `b6-verify` | ✅ 完成 | B6 独立验收 PASS_WITH_BOUNDARIES（101/101 逐位、声明=执行、fail-closed、collect +85/0 删减） |
+| Q8 | `vendor-gemm-survey` | ✅ 完成 | AOCL/LPGEMM 显式 Zen4 构建 + **位级包络**（K≤1024 精确、2048≤1、3584≤4、5099≤6、133145 回绕）+ 12 形状四路实测 + **"位级的价格" 2.5–533×** + 推荐阶梯（W8A8 默认自有 kernel，AOCL 为 opt-in 提速档） |
+| Q8b | `vendor-gemm-survey-2` | 🔄 在途 | aarch64：**KleidiAI 原生 per-token×per-channel 且 int32 精确**（含 `lhs_zero_point=1` 开关陷阱）；sm_120：**GemmEx int8→s32 可用且精确**，cuBLASLt 融合不可用；待补 oneDNN-aarch64 与 SVE256 对照 |
+| Q9 | `op-bench-framework` | ⏳ 排队 | **依赖 U1 的 `OpDefinition` registry**（两者必须共用同一个 registry）；U1 落定后派发 |
+| Q10 | `sve256-int8-layout` | 🔄 在途 | 采纳路线 **(a)**（native int8 layout，对标 B6），版本链 wire v3→4 / index v4→5 / payload 1→2 / lowering 8→9；完成后 **Q5 重跑拿 SVE256 的 L4 判定** |
+| — | `sve256-liveness-release` | 🔄 在途 | 由 Q5 的 RSS 68–81 GiB 直接派生：SVE256 runtime 从不释放 SSA 中间值；头号指标=A3 RSS 前后对比 |
+| — | `w8a8-v2-transpose-elimination` | 🔄 M1 在途 | 用户已批准立项（`docs/20-planning/0009-…`）；M1 只做设计/影响面与**重基线可执行清单**；**M4 合入必须等本批收口** |
+| — | `launch-artifact-cache` | 🔄 在途 | 由 N4.0/ERR-0006 派生：消掉每次 launch 对同一程序做两遍 lower + 全量 plan 深比较（≈9.8 s prefill） |
+
+### 9.1 Q5 重跑的排期与资源预算（前置条件满足后执行）
+
+```text
+前置：Q10（int8 layout 原生化）交付并合入  +  sve256-liveness-release 交付并合入
+方式：6 个 prompt×配置 并行（1 case = 1 进程 × 8 线程 × 8 个不重叠物理核；A3 上 ≤20 并发）
+      预fill 单 prompt 目前 242–1006 s（bf16 口径），并行后墙钟约 20–40 min 量级
+内存：修复前单进程峰值 68–81 GiB；修复后预期显著下降 —— 以 sve256-liveness-release 的实测为准
+判据：与 Q3 完全一致（主判定用 prefill 口径 band；decode 扩展用 decode 口径 band 并报参照自洽性）
+```
+
+### 9.2 已登记的过程教训（本队列产生）
+
+1. **锁要分段**：单任务长时间持锁会饿死排队者（Q3 已改为按段取锁）；
+2. **"改动小"不等于"不用跑全量"**：KF-1 就是这样漏掉的（见 ERR-0005 之后的流程补充：cherry-pick 后必须立刻跑一次全量 collect + 失败集合对比）；
+3. **残差不是归因**：B3c 的"41–49% dispatch"实为每-launch setup（ERR-0006）——**凡是"减去法"得到的量，标注时都要写明它是残差**；
+4. **"第二次实测"才能定口径**：sm_120 的 vendor int8 结论被实测收窄了两次（"不可用"→"int8+scale 融合不可用"→"cuBLASLt int8 不可用，但 GemmEx int8→s32 可用且精确"）。
