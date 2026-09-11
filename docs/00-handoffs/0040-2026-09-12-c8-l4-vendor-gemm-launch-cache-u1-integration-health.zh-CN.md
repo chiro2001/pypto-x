@@ -17,7 +17,7 @@
 ```text
 upstream base        34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad
 integration base     195ace3eb8a521950c72ffc62f0349aed6c7ac04（0039 交接点）
-integration head     TBD_AT_FREEZE（本批已知节点：健康检查受检 7e2aea514 → D-1/D-2 修复 77981213e → U1 回修 8360a9aee）
+integration head     TBD_AT_FREEZE（本批已知节点：健康检查受检 7e2aea514 → D-1/D-2 修复 77981213e → U1 回修 8360a9aee → C7 工具修复 dcb8ae7fc → Q9 op-bench 合入 140c88446 → D-3 修复后为最终 tip）
 patches              TBD_AT_FREEZE（0039 收口后为 144）
 控制仓 main          TBD_AT_FREEZE（本批本地提交，未推送）
 ```
@@ -83,10 +83,11 @@ patches              TBD_AT_FREEZE（0039 收口后为 144）
 - **SVE256 活性回收**：integration `d223ad3a0..7e2aea514`；本地三套件 127/91/67 全绿、on/off 两次 launch 逐位一致；A3 断线前观测稳态 RSS 2,335 MiB（峰值 25,170 MiB 定位在 LM-head transpose 的 Python list 边界 op 6723），**A3 侧确认待恢复**。
 - **P 线与 W8A8 v2**：M1 设计完成（`docs/20-planning/0010`），契约 v2 = region `[in,out]` + `PACKED_LAYOUT_VERSION` 2→3 + `BINDING_SCHEMA_VERSION` 2→3，四后端 kernel 零改动；重基线 4–7 h；**M4 必须等本批收口**。
 
-## 9. 集成体检与 D-1/D-2
+## 9. 集成体检与 D-1/D-2/D-3
 
 - **HEALTHY**（受检 `7e2aea514`，经 `run_local_heavy.sh` local 锁）：**1394 collected / 1387 passed / 7 skipped / 0 failed / 0 error**，rc=0，758.99 s；收集数三方 diff **+190/−3** 逐项溯源（新增全部有文件级来源；消失 3 个是 Q10 版本改名）；gold 抽检 16/16 sha256 + 聚合/index digest MATCH；证据 `worktrees/_meta/pypto-x/integration-health-check`。
-- **D-1**（C6 harness cherry-pick 顺序回退）与 **D-2**（`tools/c8_sve256_a3/pack_ours_logits.py:66` 未定义名）：已修复、已合入 `77981213e`（+ 6 条静态 AST 守卫），独立验收在跑；**规则 8 全量需在新 tip 重跑**。
+- **D-1**（C6 harness cherry-pick 顺序回退）与 **D-2**（`tools/c8_sve256_a3/pack_ours_logits.py:66` 未定义名）：已修复、已合入 `77981213e`（+ 6 条静态 AST 守卫）；独立验收 V1–V4 PASS。
+- **D-3（规则 8 抓到的真实回归，修复中）**：Q9 合入 `140c88446` 后，canonical 全量 **10 failed / 1416 passed / 7 skipped（rc=1）**。已确证根因：新增测试 `test_op_bench_framework.py::_imports()` 在 collection 期删除全部 `pypto*` 的 `sys.modules` 条目、塞入**没有 `__portable_only__` 的假 `pypto`** 且从不恢复，导致后续测试走 classic 分支访问 `pypto_impl.SymbolicScalar`（本机只有 stub）失败；其余 8 条为全量 session 特有、单文件隔离全绿（疑同源，归因中）。修复方案：导入真包（或子进程隔离）/`snapshot+finally` 恢复 + 真 `__portable_only__` + 守卫测试。**批次 tip 在修好并重跑全绿之前不得收口**——这条正是"批量合并 + 单次全量"策略存在的意义。
 - 新增流程（HANDOFF §4.9 第五条）：同一文件被"功能 + 修复"提交各自整份改写时必须按分支顺序 pick，且合入后对每个受影响文件做 `git diff <最新源提交> <tip> -- <file>` 差分复核——**全绿不等于内容对**。
 
 ## 10. 在途与排队（收口时按 lock 更新）
