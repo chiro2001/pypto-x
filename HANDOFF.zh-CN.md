@@ -164,7 +164,7 @@ chat(T=18)  PASS（修订判据）严格 argmax 17/18（唯一 mismatch row 14�
 ③ 发布动作（**需用户批准**）：控制仓 main 8 个 0039 提交未 push；收口需先重跑 `export_patches.sh`（134→?）；
    push 后跑 `scripts/remote/sync_private_backup.sh`
 ④ **性能续作（B3c 已给出靶点）**：本机热点已是 **reshape 8.34 s / slice 7.37 s / transpose 7.27 s（全 host_reference）**，
-   外加 **dispatch 开销占 wall 41–49%**（Python 逐 op 派发）；这两项直接决定 T=5/T=18 prefill 与 decode 的墙钟
+   外加 **"残差"占 wall 41–49%**（**注意：ERR-0006 已更正——该残差不是逐 op 派发，而是每 launch 的 artifact 校验/重复 lowering/ELF decode**，逐 op 胶水仅 0.003 ms/op）；这两项直接决定 T=5/T=18 prefill 与 decode 的墙钟
 ⑤ W8C 续作：C6（CUDA/AMD 静态 W8A8）、C7 layer ladder（1→6→24）、C8 正式门禁（R12–R14）——
    **C8 之前需用户裁定 L4 阈值口径**（现 W8A8 scheme 超出暂定阈值：max_abs 2.69/2.76 vs ≤0.5）
 ⑥ B4 阈值冻结：B3b 的 4 个 candidate_ratio 已就绪、B3c 已给出 dispatch 分解——**需用户批准**才写 `configs/perf_lock.yaml`
@@ -256,7 +256,7 @@ A3（用户借用共享机） 鲲鹏 920B CPU（aarch64，**SVE VL=32 原生**�
   - **N4** IR→PTO 最小桥 PASS_WITH_BOUNDARIES（0 阻断）：**Core IR → 自动生成 PTO C++ → chip7 真机逐位一致**（3 个 64×64 f32 程序）
   - **B2** SVE256 四类原生化验收 PASS：`iota/compare/broadcast/where` 全 native；**QEMU 与 A3 原生 50/50 逐输出 sha256 一致**
   - **W8A8 lm_head 556 全开**验收 PASS_WITH_BOUNDARIES：真权重可用；覆盖率 linear 1.0 / whole-net 0.9808；仍超 L4 暂定阈值（如实登记）
-  - **B3c**：**dispatch 占 wall 41–49%**；热点转为 reshape/slice/transpose（全 host_reference）
+  - **B3c**：**残差占 wall 41–49%**（ERR-0006：实为每-launch setup，非逐 op 派发）；热点转为 reshape/slice/transpose（全 host_reference）
   - **C5** SVE W8A8：4 opcode 全 native（`sunpklo`×2 + 整数 `mla`，附 HWCAP/反汇编）；连带修复既有整数存储缺陷（验收在途）
   - **N5**（E4 step2）：已按用户要求暂停（NPU 被用户量化占用）
 

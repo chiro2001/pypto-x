@@ -12,11 +12,15 @@
 
 ---
 
+> **勘误（ERR-0006）**：本文 §1.1 的 "dispatch" 是残差 `launch − Σ(op)` 的旧称。N4.0 实测（2026-09-12）表明该残差
+> **不是逐 op 派发**，而是每 launch 的 artifact 校验 / 重复 lowering / ELF decode（loop 内胶水仅 0.003 ms/op）。
+> 表格中的数字仍有效（都是实测），但**读法**应以 ERR-0006 为准。
+
 ## 1. 背景（不看会话也能读）
 
 B3c 在 AVX-512 后端、s3 场景（T=5 prefill + 1 decode step，真实 Qwen3.5-0.8B 权重）上跑了 3 轮，给出 launch / op-sum / dispatch 三分账：
 
-| 段 | launch 中位 | op sum | dispatch | dispatch 占比 |
+| 段 | launch 中位 | op sum | 残差（当时记作 dispatch） | 残差占比 |
 |---|---:|---:|---:|---:|
 | T=5 prefill（6728 ops） | 47.63 s | 28.0–29.0 s | 19.3–19.7 s | **40.3–41.3%** |
 | T=1 decode（past=5，4550 ops） | 22.47 s | 11.4–11.5 s | 10.8–11.2 s | **48.7–49.3%** |
