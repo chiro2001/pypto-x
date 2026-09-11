@@ -288,3 +288,46 @@ G1/G3 定义、既有 CPU 侧（local_kvm_no_cpufreq）与 A2/920B 相关口径�
 5. 父 agent 负责限制"每台机器上的重度并行度"，而不是限制 subagent 总数。
 
 **依据**：用户 2026-09-12 明确指示（"subagent 其实没有并发限制"）。
+
+---
+
+## ERR-0006：B3c 的"dispatch 开销 41–49% 主要来自逐 op 派发循环"结论被 N4.0 实测推翻
+
+**原结论**（0039 批次，`waves.W8.w8b_b3c_local_perf_verification` 与快照 0039 均引用）：
+`dispatch ≈ launch − Σ(op)` 占 prefill 40–49%、decode 49%，"归因 = runtime 的逐 op 派发循环
+（`runtime_per_op_dispatch_loop`）"。
+
+**N4.0 的三档分解实测**（integration `c2ec98f3c`，3 轮中位，全部 `UNGATED`）：
+
+| 段 | T=5 prefill | T=1 decode |
+|---|---|---|
+| launch | 24.460 s | 14.931 s |
+| **setup** | **19.148 s（81.1%）** | **10.757 s（72.3%）** |
+| loop | 4.458 s（18.8%） | 4.122 s（27.6%） |
+| teardown | 0.030 s（0.1%） | 0.021 s |
+| loop 内的**纯胶水**（`release_dead_values` + 循环开销） | **0.027 s** | **0.020 s** |
+| 每 op 胶水 | **0.003 ms/op** | **0.003 ms/op** |
+
+`setup` 的构成（prefill）：`lower_avx512` ×3 = 5.56 s、`_validate_primary_semantics` ×2 = 5.56 s（exclusive，含 2 次
+lower）、`_program_digest_from_metadata` ×2 = 1.26 s、`_decode_artifact` 本体 3.43 s、
+`_packed_dispatch_for` 首次 1.51 s；参数绑定与 `plan_release` 各 ~0.004 s。
+
+**为什么 B3c 会误判**：`dispatch` 从来不是被直接测量的量，而是残差 `launch − Σ(op)`；而 setup 里
+的**多次 lower / 全量 plan 序列化深比较 / 元数据重建**代价与**程序规模（op 数）相关**，摊到每 op
+就是 ~2.8 ms —— 于是被读成了"每 op 派发开销"。**N4.0 的实测把这条抹平到 0.003 ms/op。**
+
+**正确结论**：残差**不是**逐 op 派发，而是**每 launch 的 artifact 校验 / 重复 lowering / ELF decode**。
+
+**影响**：
+1. B3c 的 `attribution: runtime_per_op_dispatch_not_harness` 字段应读作"残差、未分解"，**不是**归因结论；
+2. "把图执行外包给框架"因此**不成立**：整段 loop 胶水即使全交出去也只能省 0.017/0.012 s（≈ launch 的 0.07%），
+   而 setup 是**我们自己的 fail-closed 校验与 lowering 路径**，任何外部框架都消不掉；
+3. 正确方向是**在自家做 launch/进程级 artifact→target_ir 缓存**（N4.0 建议）。
+
+**已落地的部分修复**：per-launch `_LaunchValidationMemo`（`1dc9c1261`）在同一 launch 内复用 primary 校验，
+实测 prefill 24.460 → 18.092 s（−26.0%）、decode 14.931 → 11.819 s（−20.8%）；51 个输出 buffer + artifact digest
+的 sha256 全一致，fail-closed 用例全拒。
+**仍剩余**：去重后 prefill 仍有 `_validate_primary_semantics`（2.92 s + lower 1.80 s）与 `_decode_artifact`
+本体（3.10 s + lower 2.00 s）对同一 6728-op 程序各做一次 lower + 全量 plan 深比较（≈9.8 s；decode ≈3.2 s）。
+
+**证据**：`_meta/pypto-x/n4-dispatch-residual/{brief.zh-CN.md, raw/decomposition-table.md, raw/analysis.json, raw/{base,after}_r{1,2,3}.*}`。
