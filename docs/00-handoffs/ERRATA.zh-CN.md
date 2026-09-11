@@ -268,3 +268,23 @@ G1/G3 定义、既有 CPU 侧（local_kvm_no_cpufreq）与 A2/920B 相关口径�
 **证据**：`_meta/pypto-x/verify-cuda-gemm-baseline-r2/{brief.zh-CN.md,validation.json,verify_verdict.json,raw/}`
 （8 个轮次原件全部保留，含 5 个作废轮与两个真实 harness UNGATED 聚合）；
 实现方记录 `_meta/pypto-x/cuda-gemm-baseline/d1-rerun/{brief.zh-CN.md,raw/{k5,round1..3}.json}`。
+
+---
+
+## ERR-0005：并发上限"≤3 subagent"是项目自设假设，不是平台限制
+
+**现状更正**：`AGENTS.md`、`HANDOFF.zh-CN.md` §0/§5、`docs/20-planning/0003-…` §4.1 与 §10 中写有
+"平台 4 个 agent 槽位含父 agent → 活动 subagent ≤3"。**该表述没有平台依据**：平台对 subagent 的并发
+**没有硬性上限**，这条是项目在 W8 路线图里自设的资源纪律，并被后续文档当作平台事实引用。
+
+**影响**：不影响任何已完成的验收与数字；只影响编排——此前多次因为"3 槽已满"而把可并行的任务排队等待。
+
+**更正后的纪律**（替代原表述）：
+
+1. 平台无硬性并发上限；**真正的约束是资源锁**（`local` / `gamepc` / A3 CPU 时段 / A2·A3 的 NPU）与机器负载；
+2. 重任务仍必须经 `scripts/resource/run_local_heavy.sh` 取锁，抢不到退避重试，禁止绕过；
+3. 约定：**同一把锁的等待者不超过 2 个**（避免排队噪声），同一台机器不并行跑多个 heavy（锁已保证）；
+4. 按用途铺并行度：local-heavy / 远端(GamePC) / A3 / 轻任务 / 文档与评审，互不挤占；
+5. 父 agent 负责限制"每台机器上的重度并行度"，而不是限制 subagent 总数。
+
+**依据**：用户 2026-09-12 明确指示（"subagent 其实没有并发限制"）。
