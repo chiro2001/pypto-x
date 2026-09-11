@@ -358,3 +358,35 @@ c2 不被否决，而是"当且仅当将来要求共用 storage 时启用"。
 
 **教训**：跨任务转述**布局/stride 语义**时，必须引用**原始证据的原文与行号**，并显式写出
 "哪个维度连续"——`stride(0)==1` 这种写法极容易被读反。本项目的"布局类"结论今后一律按此格式登记。
+
+---
+
+## ERR-0008：cherry-pick sequencer 未清理 + 后续 `--abort` 静默回退分支，丢掉了 Q3 的 4 个提交
+
+**现象**：`integration` 上"应该已合入"的 Q3（`c8-l4-avx512`）4 个提交实际不存在；`tools/c8_l4_compare.py` 是
+Q5 版（`TOOL_VERSION=1`、CLI `--ours-dir`），而 Q3 规范版（`TOOL_VERSION=4`、CLI `--ours-manifest`）只存在于
+`work/c7-decode-gap-localization`。**由集成健康检查任务发现**（`integration-health-check`，早期发现）。
+
+**根因（integration reflog 直接可见）**：
+
+```text
+@{19}/{18}  cherry-pick: acbf4d340 / ad28cc8a8   ← Q3 的提交确实曾落在 integration 上
+@{17}       reset: moving to acece0a92           ← 一次 cherry-pick --abort 按 sequencer 记录的起点重置了分支
+```
+
+父 agent 处理 Q3 冲突时用 `git commit -m` 手动收尾（`cherry-pick --continue` 因 `EDITOR unset` 失败），
+**但 sequencer 状态没有被清掉**；其后处理 Q8b 时又出现"拣选操作已在进行"，父 agent 执行
+`git cherry-pick --abort`，于是分支被重置到 sequencer 记录的起点 `acece0a92`，
+**静默丢弃了已提交的 Q3 4 个提交**（它们因 `work/c7-decode-gap-localization` 恰好从 `ad28cc8a8` 创建而幸存）。
+
+**修复**：重新 cherry-pick `f2e17777f^..ad28cc8a8` 到 integration → 新 tip `c8ab4c6f6`；
+校验：规范版 `TOOL_VERSION=4`、归档版文件在、两者 `py_compile` 通过。Q3 的 L4 判定证据本身**不受影响**
+（它在 `ad28cc8a8` 上产出，内容与重拣后一致）。
+
+**教训（流程级）**：
+
+1. **不要用 `git commit` 收尾 cherry-pick**：要么 `cherry-pick --continue`（先设 `GIT_EDITOR=true`），要么
+   明确 `cherry-pick --quit` 清掉 sequencer；**sequencer 挂着时任何后续 `--abort` 都会回退分支**；
+2. **"已合入"必须有独立核验**：登记 `integration_commits` 前应 `git merge-base --is-ancestor <sha> <tip>` 逐个验证
+   （本次若做一步就能当场发现）；该核验已加入本仓的惯例；
+3. 这也解释了为什么"cherry-pick 后必须立刻跑全量"这条规矩（KF-1 教训）是必要的——**分支状态也会骗人**。
