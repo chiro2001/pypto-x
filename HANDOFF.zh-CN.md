@@ -37,7 +37,7 @@
       内核性能投入（W8J 注入 4.71–14.47× 慢于 oneDNN）｜**U/P 两条新线是否立项**（用户接口 / 用户侧性能控制，提案见 lock）
    d) 下一批硬优化候选（B3c 结论）：**reshape 8.34 s / slice 7.37 s / transpose 7.27 s（全 host_reference）** +
       **dispatch 开销 41–49%**；A2 暂停、920B 已释放、A3 的 NPU 归用户——三者都需用户通知才动。
-5. 并发与资源：活动 subagent ≤3；重任务一律经 scripts/resource/run_local_heavy.sh（返回 75/69 就等待重试，
+5. 并发与资源：平台无 subagent 并发上限（旧文档的 ≤3 属自设假设，ERR-0005 已更正）；重任务一律经 scripts/resource/run_local_heavy.sh（返回 75/69 就等待重试，
    禁止绕过）；**等锁时挂后台或长 timeout，不要在前台循环空转**（会耗尽 agent 回合，S1 曾因此中断一次）；
    A2/920B/A3 都是共享资源，约定安静使用。
 6. 重任务需要用户批准才启动（AGENTS.md「Subagent 协议」第一条）。
@@ -141,7 +141,7 @@ chat(T=18)  PASS（修订判据）严格 argmax 17/18（唯一 mismatch row 14�
   `smoke_once=true`、`wait_timeout_seconds=3600`、`poll=false`、`resource_lock_root=/home/chiro/projects/.resource-locks`、
   `local_heavy_policy=locked`、`local_heavy_runner=…/scripts/resource/run_local_heavy.sh`、
   `local_min_available_mib=8192`、`local_safety_floor_mib=4096`、`local_max_cpus=6`。
-- **并发上限**：平台 4 槽含父 agent → 活动 subagent ≤3（推荐 1 local-heavy + 1 远端 + 1 轻任务）。
+- **并发**：平台无硬性上限（ERR-0005）；按资源锁与用途铺并行度，同一把锁的等待者不超过 2 个。
 - 阶段验收必须独立：从待验收 integration HEAD 建 `verify/<phase>` worktree，源码只读，只写独占 `_meta`。
 - 父 agent 不自己跑重任务；同一任务禁止同时提交两个重命令；不在锁内跑无关命令。
 - 重任务经 `run_local_heavy.sh`（75/69 等待重试，禁止绕过）；大内存任务显式登记 `memory_max_mib`。

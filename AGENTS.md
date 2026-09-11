@@ -124,7 +124,9 @@ git -C /home/chiro/projects/pypto/worktrees/pypto-x/integration log --oneline -1
   `local_min_available_mib=8192`、`local_safety_floor_mib=4096`、`local_max_cpus=6`。
 - 启动时省略 `model`/`model_name`；每个 subagent 启动后只执行一次无模型冒烟测试。
 - 父 agent 派发后做一次长等待（`wait_timeout_seconds=3600`），不周期轮询。
-- **并发上限**：平台 4 个 agent 槽位含父 agent → 活动 subagent ≤3（推荐 1 个 local-heavy + 1 个 GamePC/远端 + 1 个轻任务）。
+- **并发**：平台对 subagent **没有硬性并发上限**（旧文档里的“4 槽含父 agent → ≤3”是项目自设假设，已由 ERR-0005 更正）。
+  真正的约束是**资源锁**（local / gamepc / A3 时段 / NPU）与机器负载：重任务由锁串行化，抢不到就退避重试；
+  约定按用途铺并行度（local-heavy / 远端 / A3 / 轻任务 / 文档与评审互不挤占），但**同一把锁的等待者不超过 2 个**。
 - **阶段验收必须独立**：从待验收 integration HEAD 建 `verify/<phase>` worktree，源码只读，只写独占 `_meta` 目录；验收失败回原实现 worktree 修，不由验收 agent 改 integration。
 - 不下载、不加载 LLM 权重（用户已授权的固定 revision 除外）；不上传权重或证据到公网。
 

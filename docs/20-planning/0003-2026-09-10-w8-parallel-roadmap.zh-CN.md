@@ -349,7 +349,7 @@ A0 配置真值归一化 + 当前 runtime 任务收口（已完成）
 5. **W8H/W8I 后续范围**：是否补做 ACL graph 口径精度复跑、并发 sweep、`logprobs=-1` 全词表往返？*（未决）*
 6. **是否批准 §8 的可删清单**（安装包 / venv / build 目录；本机磁盘约 78 GB 可用）？*（未决）*
 
-已决（2026-09-10，勿再开工）：并发采用 ≤3 subagent + 父 agent 四槽；验收口径 = 相对 gold dtype 带宽 +
+已决（2026-09-10，勿再开工；**其中并发条目已由 ERR-0005 更正**：平台无 subagent 硬性上限，真正约束是资源锁）；验收口径 = 相对 gold dtype 带宽 +
 near-tie 例外；W8A-C 以"限定式关闭 blocked"记账；A2 NPU 任务走 `/root/a2-npu-lock/` 卡锁。
 若本节与 `HANDOFF.zh-CN.md` §0/§11 冲突，以 HANDOFF 为准。
 
