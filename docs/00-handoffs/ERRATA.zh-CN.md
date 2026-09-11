@@ -331,3 +331,30 @@ lower）、`_program_digest_from_metadata` ×2 = 1.26 s、`_decode_artifact` 本
 本体（3.10 s + lower 2.00 s）对同一 6728-op 程序各做一次 lower + 全量 plan 深比较（≈9.8 s；decode ≈3.2 s）。
 
 **证据**：`_meta/pypto-x/n4-dispatch-residual/{brief.zh-CN.md, raw/decomposition-table.md, raw/analysis.json, raw/{base,after}_r{1,2,3}.*}`。
+
+---
+
+## ERR-0007：aarch64 vendor int8 的布局证据被父 agent 转述反了（stride 语义）
+
+**错误**：父 agent 在把 `axis-b-a3-runtime` 的证据转给 W8A8 v2（路线 c）的 M1 设计任务时，写成
+"oneDNN+ACL 要求 `[K,N]` ⇒ **c1 落地后 aarch64 的 vendor 路径将不再需要任何转置**"。
+
+**事实**（M1 核实并提出，父 agent 复核两处原始证据后确认）：
+
+| | 需要的字节序 | 证据 |
+|---|---|---|
+| 四后端 portable kernel | `[K,N]` **行主序、N 连续**（读 `right[i*n + j]`） | `cpu_avx2.py:511/520/526`；AVX-512/SVE256/CUDA 同构 |
+| aarch64 oneDNN+ACL | `[K,N]` 且 **`stride(0)==1`** ⇒ **K 连续**，即 `[N,K]` 行主序的**转置视图** | `_meta/pypto-x/axis-b-a3-runtime/brief.zh-CN.md:188-191` |
+| c1 的打包布局 | `[K,out]` 行主序 ⇒ **N 连续** | 立项书 `0009` §3 |
+
+**结论**：**c1 与 oneDNN+ACL 要的是相反的字节序**；c1 的收益只覆盖 portable 四后端
+（kernel 0 改动、SVE256 解封、每 forward 转置归零），**不**消除 vendor 侧的布局需求。
+
+**范围决策（父 agent，2026-09-12）**：**不要求 portable 与 vendor 共用同一 int8 storage**——因为实际上存在
+**三种互不兼容**的需求（portable `[K,N]` N 连续 ／ oneDNN+ACL 的 K 连续转置视图 ／ KleidiAI 的私有 packed RHS），
+单一布局不可能通吃；强行共用只能走 c2（4 个 NT kernel + R5 重验）或双 region（+474 MiB 存储/搬运）。
+vendor 侧各腿在 **ingestion 期做一次性 repack**，并把"需要哪种布局"登记为 provider capability 的前置条件。
+c2 不被否决，而是"当且仅当将来要求共用 storage 时启用"。
+
+**教训**：跨任务转述**布局/stride 语义**时，必须引用**原始证据的原文与行号**，并显式写出
+"哪个维度连续"——`stride(0)==1` 这种写法极容易被读反。本项目的"布局类"结论今后一律按此格式登记。
