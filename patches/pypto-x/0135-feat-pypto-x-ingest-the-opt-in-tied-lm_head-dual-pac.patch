@@ -1,0 +1,1299 @@
+From 17c5c5542e72d41bbd956398b644fc878a704fe9 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 20:01:00 +0800
+Subject: [PATCH 135/141] feat(pypto-x): ingest the opt-in tied lm_head dual
+ packing (W8C 556 open)
+
+Allow one checkpoint tensor to back two logical parameters when it is the
+frozen contract 0002 section 3.4 pair (BF16 embedding + int8 lm_head packing)
+while every other duplicate claim, missing tensor, dangling scale or shape
+mismatch stays fail-closed.  The checkpoint-aware layout now models
+quant_weight/quant_scale regions and only admits an overlap when both regions
+reference the identical registered source range.  Physical checkpoint bytes are
+deduplicated with an explicit shared-source overcount so the byte
+conservation identity holds; the streaming weight quantizer keeps the tied
+lm_head (248320x1024) fp64 working set bounded and stays bit-exact with the
+C1 golden.  BF16 layout JSON/digest is byte-identical.
+---
+ python/pypto/portable/qwen35_w8a8_weight.py                 | 161 +++++++++++++-----
+ python/pypto/portable/qwen35_weight_layout.py               | 218 ++++++++++++++++++++++--
+ python/pypto/portable/qwen35_weight_map.py                  | 141 +++++++++++++++-
+ python/tests/ut/pypto_x/qwen35_weight_fixture.py            |  20 ++-
+ python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py |  58 ++++++-
+ python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py     | 285 +++++++++++++++++++++++++++++++-
+ 6 files changed, 807 insertions(+), 76 deletions(-)
+
+diff --git a/python/pypto/portable/qwen35_w8a8_weight.py b/python/pypto/portable/qwen35_w8a8_weight.py
+index 3a0965e0a..744e9e990 100644
+--- a/python/pypto/portable/qwen35_w8a8_weight.py
++++ b/python/pypto/portable/qwen35_w8a8_weight.py
+@@ -94,6 +94,38 @@ def _require_numpy() -> Any:
+     return np
+ 
+ 
++#: 流式量化的行块元素预算。4M 元素把 fp64 中间量峰值限制在 ~32 MiB/份，
++#: 与 K 无关；逐行语义与 C1 golden 完全一致（每行互相独立），因此分块不改变
++#: 任何 codes/scales 位模式。tied lm_head（248320×1024）不能再按整张量做
++#: fp64 中间量：那是 2 GiB/份的量级。
++_QUANTIZE_CHUNK_ELEMENTS = 1 << 22
++
++_SUPPORTED_SOURCE_DTYPES = ("bfloat16", "bf16", "float32", "f32", "float16", "f16")
++
++
++def _decode_row_block(
++    source_bytes: bytes, dtype: str, row_start: int, row_stop: int, columns: int
++) -> Any:
++    """把 ``[row_start, row_stop)`` 行解码成 float32 的 2-D 块。"""
++
++    np = _require_numpy()
++    count = (row_stop - row_start) * columns
++    if dtype in ("bfloat16", "bf16"):
++        raw = np.frombuffer(source_bytes, dtype=np.uint16, count=count, offset=row_start * columns * 2)
++        values = (raw.astype(np.uint32) << 16).view(np.float32)
++    elif dtype in ("float32", "f32"):
++        values = np.frombuffer(
++            source_bytes, dtype="<f4", count=count, offset=row_start * columns * 4
++        ).astype(np.float32, copy=False)
++    elif dtype in ("float16", "f16"):
++        values = np.frombuffer(
++            source_bytes, dtype="<f2", count=count, offset=row_start * columns * 2
++        ).astype(np.float32)
++    else:  # pragma: no cover - guarded by quantize_weight_per_output_channel
++        raise W8A8WeightQuantizationError("unsupported weight source dtype {!r}".format(dtype))
++    return values.reshape(row_stop - row_start, columns)
++
++
+ def _decode_values(source_bytes: bytes, dtype: str, shape: Tuple[int, int]) -> Any:
+     np = _require_numpy()
+     rows, columns = shape
+@@ -103,22 +135,15 @@ def _decode_values(source_bytes: bytes, dtype: str, shape: Tuple[int, int]) -> A
+         raise W8A8WeightQuantizationError(
+             "K={} exceeds the INT32 accumulation limit {} (Q5)".format(columns, MAX_ACCUMULATOR_K)
+         )
+-    if dtype in ("bfloat16", "bf16"):
+-        raw = np.frombuffer(source_bytes, dtype=np.uint16)
+-        if raw.size != rows * columns:
+-            raise W8A8WeightQuantizationError("BF16 source byte count does not match the shape")
+-        values = (raw.astype(np.uint32) << 16).view(np.float32)
+-    elif dtype in ("float32", "f32"):
+-        values = np.frombuffer(source_bytes, dtype="<f4")
+-        if values.size != rows * columns:
+-            raise W8A8WeightQuantizationError("FP32 source byte count does not match the shape")
+-    elif dtype in ("float16", "f16"):
+-        values = np.frombuffer(source_bytes, dtype="<f2").astype(np.float32)
+-        if values.size != rows * columns:
+-            raise W8A8WeightQuantizationError("FP16 source byte count does not match the shape")
+-    else:
++    if dtype not in _SUPPORTED_SOURCE_DTYPES:
+         raise W8A8WeightQuantizationError("unsupported weight source dtype {!r}".format(dtype))
+-    return values.reshape(rows, columns).astype(np.float32, copy=False)
++    expected = rows * columns
++    itemsize = 2 if dtype in ("bfloat16", "bf16", "float16", "f16") else 4
++    if len(source_bytes) != expected * itemsize:
++        raise W8A8WeightQuantizationError(
++            "{} source byte count does not match the shape".format(dtype)
++        )
++    return _decode_row_block(source_bytes, dtype, 0, rows, columns).reshape(rows, columns)
+ 
+ 
+ def quantize_weight_per_output_channel(
+@@ -127,8 +152,15 @@ def quantize_weight_per_output_channel(
+     dtype: str,
+     shape: Sequence[int],
+     name: str = "<weight>",
++    chunk_elements: int = _QUANTIZE_CHUNK_ELEMENTS,
+ ) -> QuantizedWeight:
+-    """Quantize one ``[out, in]`` weight with the frozen per-channel scheme."""
++    """Quantize one ``[out, in]`` weight with the frozen per-channel scheme.
++
++    Rows are processed in blocks bounded by ``chunk_elements`` so that the
++    fp64 working set stays ~32 MiB even for the 248320×1024 tied lm_head; the
++    per-row arithmetic and its order are unchanged, so the output is bit-exact
++    with the previous whole-tensor implementation and the C1 golden.
++    """
+ 
+     if not isinstance(source_bytes, (bytes, bytearray, memoryview)):
+         raise W8A8WeightQuantizationError("source_bytes must be a bytes-like object")
+@@ -136,43 +168,82 @@ def quantize_weight_per_output_channel(
+     if len(shape) != 2:
+         raise W8A8WeightQuantizationError("weight shape must be rank 2 [out, in]")
+     rows, columns = int(shape[0]), int(shape[1])
+-    np = _require_numpy()
+-    values = _decode_values(payload, str(dtype).lower(), (rows, columns))
+-    if not bool(np.isfinite(values).all()):
+-        # Q2: NaN/Inf fail closed instead of being silently clamped.
++    if rows <= 0 or columns <= 0:
++        raise W8A8WeightQuantizationError("weight shape must be non-empty")
++    if columns > MAX_ACCUMULATOR_K:
+         raise W8A8WeightQuantizationError(
+-            "{} contains NaN/Inf; quantize_per_token_s8 fails closed (Q2)".format(name)
++            "K={} exceeds the INT32 accumulation limit {} (Q5)".format(columns, MAX_ACCUMULATOR_K)
+         )
+-    absmax = np.max(np.abs(values), axis=1, keepdims=True)
+-    zero_rows = absmax[:, 0] == np.float32(0.0)
+-    # C1 golden computes ``float32_round(absmax / 127.0)`` in binary64 and then
+-    # rounds once to binary32; reproduce that exact order here.
+-    scales = (absmax.astype(np.float64) / float(QUANT_MAX)).astype(np.float32)
+-    nonzero_rows = ~zero_rows
+-    if bool(np.any((scales[:, 0] == np.float32(0.0)) & nonzero_rows)):
++    decode_dtype = str(dtype).lower()
++    if decode_dtype not in _SUPPORTED_SOURCE_DTYPES:
++        raise W8A8WeightQuantizationError("unsupported weight source dtype {!r}".format(dtype))
++    itemsize = 2 if decode_dtype in ("bfloat16", "bf16", "float16", "f16") else 4
++    if len(payload) != rows * columns * itemsize:
+         raise W8A8WeightQuantizationError(
+-            "{} has a non-zero row whose float32 scale underflows to 0".format(name)
++            "{} source byte count does not match the shape".format(decode_dtype)
+         )
+-    scales[zero_rows] = np.float32(1.0)
+-    ratios = values.astype(np.float64) / scales.astype(np.float64)
+-    rounded = np.rint(ratios)
+-    saturation = int(np.count_nonzero((rounded < QUANT_MIN) | (rounded > QUANT_MAX)))
+-    codes = np.clip(rounded, QUANT_MIN, QUANT_MAX).astype(np.int8)
+-    codes[zero_rows] = np.int8(0)
+-    scale_flat = scales.reshape(-1)
++    if isinstance(chunk_elements, bool) or not isinstance(chunk_elements, int) or chunk_elements <= 0:
++        raise W8A8WeightQuantizationError("chunk_elements must be a positive integer")
++    np = _require_numpy()
++    rows_per_chunk = max(1, int(chunk_elements) // columns)
++
++    codes = bytearray(rows * columns)
++    scale_bytes = bytearray(4 * rows)
++    max_abs = 0.0
++    scale_min: Optional[float] = None
++    scale_max: Optional[float] = None
++    saturation = 0
++    zero_rows = 0
++    for row_start in range(0, rows, rows_per_chunk):
++        row_stop = min(rows, row_start + rows_per_chunk)
++        block = _decode_row_block(payload, decode_dtype, row_start, row_stop, columns)
++        if not bool(np.isfinite(block).all()):
++            # Q2: NaN/Inf fail closed instead of being silently clamped.
++            raise W8A8WeightQuantizationError(
++                "{} contains NaN/Inf; quantize_per_token_s8 fails closed (Q2)".format(name)
++            )
++        absmax = np.max(np.abs(block), axis=1, keepdims=True)
++        block_zero = absmax[:, 0] == np.float32(0.0)
++        # C1 golden computes ``float32_round(absmax / 127.0)`` in binary64 and
++        # then rounds once to binary32; reproduce that exact order here.
++        scales = (absmax.astype(np.float64) / float(QUANT_MAX)).astype(np.float32)
++        nonzero_rows = ~block_zero
++        if bool(np.any((scales[:, 0] == np.float32(0.0)) & nonzero_rows)):
++            raise W8A8WeightQuantizationError(
++                "{} has a non-zero row whose float32 scale underflows to 0".format(name)
++            )
++        scales[block_zero] = np.float32(1.0)
++        ratios = block.astype(np.float64) / scales.astype(np.float64)
++        rounded = np.rint(ratios)
++        saturation += int(np.count_nonzero((rounded < QUANT_MIN) | (rounded > QUANT_MAX)))
++        block_codes = np.clip(rounded, QUANT_MIN, QUANT_MAX).astype(np.int8)
++        block_codes[block_zero] = np.int8(0)
++        code_flat = block_codes.reshape(-1)
++        codes[row_start * columns:row_stop * columns] = code_flat.tobytes()
++        scale_flat = scales.reshape(-1)
++        scale_bytes[row_start * 4:row_stop * 4] = scale_flat.astype("<f4").tobytes()
++        max_abs = max(max_abs, float(absmax.max()))
++        block_min = float(scale_flat.min())
++        block_max = float(scale_flat.max())
++        scale_min = block_min if scale_min is None else min(scale_min, block_min)
++        scale_max = block_max if scale_max is None else max(scale_max, block_max)
++        zero_rows += int(np.count_nonzero(block_zero))
++
++    codes_payload = bytes(codes)
++    scales_payload = bytes(scale_bytes)
+     return QuantizedWeight(
+         name=name,
+-        source_dtype=str(dtype).lower(),
++        source_dtype=decode_dtype,
+         shape=(rows, columns),
+-        codes=codes.tobytes(),
+-        scales=scale_flat.astype("<f4").tobytes(),
+-        max_abs=float(absmax.max()) if rows else 0.0,
+-        scale_min=float(scale_flat.min()) if rows else 0.0,
+-        scale_max=float(scale_flat.max()) if rows else 0.0,
++        codes=codes_payload,
++        scales=scales_payload,
++        max_abs=max_abs,
++        scale_min=float(scale_min if scale_min is not None else 0.0),
++        scale_max=float(scale_max if scale_max is not None else 0.0),
+         saturation_count=saturation,
+-        zero_row_count=int(np.count_nonzero(zero_rows)),
+-        codes_sha256=hashlib.sha256(codes.tobytes()).hexdigest(),
+-        scales_sha256=hashlib.sha256(scale_flat.astype("<f4").tobytes()).hexdigest(),
++        zero_row_count=zero_rows,
++        codes_sha256=hashlib.sha256(codes_payload).hexdigest(),
++        scales_sha256=hashlib.sha256(scales_payload).hexdigest(),
+         source_sha256=hashlib.sha256(payload).hexdigest(),
+     )
+ 
+diff --git a/python/pypto/portable/qwen35_weight_layout.py b/python/pypto/portable/qwen35_weight_layout.py
+index f0c618c84..af47c8ca7 100644
+--- a/python/pypto/portable/qwen35_weight_layout.py
++++ b/python/pypto/portable/qwen35_weight_layout.py
+@@ -42,6 +42,8 @@ from .qwen35_weight_map import (
+ )
+ from .runtime_binding import (
+     DEFAULT_PACK_ALIGNMENT,
++    QUANT_SCALE_ROLE,
++    QUANT_WEIGHT_REGION_ROLE,
+     BindingSchema,
+     PackedRegion,
+     build_binding_schema,
+@@ -56,7 +58,13 @@ class WeightLayoutError(ValueError):
+ 
+ @dataclass(frozen=True)
+ class WeightLayoutRegion:
+-    """packed region 与其官方 checkpoint 来源的合并描述。"""
++    """packed region 与其官方 checkpoint 来源的合并描述。
++
++    ``quantized`` 标记 W8A8 int8 region：其来源仍是一个浮点 checkpoint 张量，
++    但落盘字节由量化器（``qwen35_w8a8_weight``）生成，不是 RNE 字节转换。
++    ``derived_from`` 标记 fp32 per-output-channel scale region：它由对应的
++    int8 weight region 在内存中派生，没有独立的 checkpoint 来源。
++    """
+ 
+     storage_id: str
+     role: str
+@@ -73,9 +81,11 @@ class WeightLayoutRegion:
+     source_nbytes: Optional[int]
+     source_elements: Optional[int]
+     requires_dtype_conversion: bool
++    quantized: bool = False
++    derived_from: Optional[str] = None
+ 
+     def to_dict(self) -> Mapping[str, Any]:
+-        return {
++        payload: Dict[str, Any] = {
+             "storage_id": self.storage_id,
+             "role": self.role,
+             "dtype": self.dtype,
+@@ -96,6 +106,12 @@ class WeightLayoutRegion:
+                 "elements": self.source_elements,
+             },
+         }
++        # 只在 W8A8 region 上出现的新键：BF16 layout JSON 保持逐字节不变。
++        if self.quantized:
++            payload["quantized"] = True
++        if self.derived_from is not None:
++            payload["derived_from"] = self.derived_from
++        return payload
+ 
+ 
+ @dataclass(frozen=True)
+@@ -113,12 +129,20 @@ class WeightLayout:
+ 
+     @property
+     def parameter_regions(self) -> Tuple[WeightLayoutRegion, ...]:
+-        return tuple(region for region in self.regions if region.role == "parameter")
++        return tuple(
++            region
++            for region in self.regions
++            if region.role in ("parameter", QUANT_WEIGHT_REGION_ROLE)
++        )
+ 
+     @property
+     def state_regions(self) -> Tuple[WeightLayoutRegion, ...]:
+         return tuple(region for region in self.regions if region.role == "state")
+ 
++    @property
++    def quant_scale_regions(self) -> Tuple[WeightLayoutRegion, ...]:
++        return tuple(region for region in self.regions if region.role == QUANT_SCALE_ROLE)
++
+     @property
+     def padding_nbytes(self) -> int:
+         return self.total_nbytes - sum(region.nbytes for region in self.regions)
+@@ -130,7 +154,7 @@ class WeightLayout:
+         raise WeightLayoutError("weight layout has no logical name {!r}".format(logical_name))
+ 
+     def to_dict(self) -> Mapping[str, Any]:
+-        return {
++        payload: Dict[str, Any] = {
+             "layout_kind": "qwen35_text_decoder_weight_layout",
+             "layout_version": 1,
+             "schema_digest": self.schema_digest,
+@@ -150,6 +174,30 @@ class WeightLayout:
+             "state_regions_without_source": [region.storage_id for region in self.state_regions],
+             "regions": [region.to_dict() for region in self.regions],
+         }
++        quant_scale_regions = self.quant_scale_regions
++        if quant_scale_regions:
++            quantized_regions = [region for region in self.regions if region.quantized]
++            payload["quantized_region_count"] = len(quantized_regions)
++            payload["quant_scale_region_count"] = len(quant_scale_regions)
++            payload["quantized_nbytes"] = sum(region.nbytes for region in quantized_regions)
++            payload["quant_scale_nbytes"] = sum(region.nbytes for region in quant_scale_regions)
++            shared_storage: Dict[str, List[str]] = {}
++            shared_nbytes: Dict[str, int] = {}
++            for region in self.regions:
++                if region.source_name is None:
++                    continue
++                shared_storage.setdefault(region.source_name, []).append(region.storage_id)
++                shared_nbytes.setdefault(region.source_name, int(region.source_nbytes or 0))
++            payload["shared_source_tensors"] = [
++                {
++                    "tensor": name,
++                    "storage_ids": sorted(storage_ids),
++                    "nbytes": shared_nbytes[name],
++                }
++                for name, storage_ids in sorted(shared_storage.items())
++                if len(storage_ids) > 1
++            ]
++        return payload
+ 
+     def canonical_json(self) -> str:
+         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+@@ -163,6 +211,13 @@ def _align_up(value: int, alignment: int) -> int:
+     return value if not remainder else value + alignment - remainder
+ 
+ 
++def _shape_elements(shape: Sequence[int]) -> int:
++    total = 1
++    for dimension in shape:
++        total *= int(dimension)
++    return total
++
++
+ def _source_by_storage(weight_mapping: WeightMapping) -> Mapping[str, Any]:
+     table: Dict[str, Any] = {}
+     for item in weight_mapping.mappings:
+@@ -195,19 +250,57 @@ def _verify_region_chain(regions: Sequence[PackedRegion], alignment: int) -> Non
+         cursor = region.offset + region.nbytes
+ 
+ 
+-def _verify_source_disjoint(regions: Sequence[WeightLayoutRegion]) -> None:
++def _verify_source_disjoint(
++    regions: Sequence[WeightLayoutRegion],
++    shared_sources: Mapping[str, Tuple[str, ...]],
++) -> None:
++    """官方 file 区间不得重叠；唯一允许的例外是 §3.4 共享来源。
++
++    ``shared_sources`` 来自 :meth:`WeightMap.shared_source_claims`，只包含登记
++    过的 tied lm_head 双 packing；两个 region 必须引用**完全相同的** file 区间
++    才算合法共享，任何部分重叠、或以共享为名的第三个引用都会 fail-closed。
++    """
++
+     spans = sorted(
+-        (region.source_file_offset, region.source_file_offset + region.source_nbytes, region.storage_id)
++        (region.source_file_offset, region.source_file_offset + region.source_nbytes, region.storage_id, region.source_name)
+         for region in regions
+         if region.source_file_offset is not None
+     )
+     cursor = -1
+-    for begin, end, storage_id in spans:
++    previous: Optional[Tuple[int, int, str, str]] = None
++    for begin, end, storage_id, source_name in spans:
+         if begin < cursor:
++            allowed = (
++                previous is not None
++                and source_name == previous[3]
++                and begin == previous[0]
++                and end == previous[1]
++                and source_name in shared_sources
++            )
++            if not allowed:
++                raise WeightLayoutError(
++                    "checkpoint range [{}, {}) for {!r} overlaps a previous tensor".format(
++                        begin, end, storage_id
++                    )
++                )
++        else:
++            cursor = end
++        previous = (begin, end, storage_id, source_name)
++    for source_name, parameters in shared_sources.items():
++        members = [region for region in regions if region.source_name == source_name]
++        if len(members) != len(parameters):
++            raise WeightLayoutError(
++                "shared source {!r} backs {} layout regions but {} parameters claim it".format(
++                    source_name, len(members), len(parameters)
++                )
++            )
++        claimed = set()
++        for region in members:
++            claimed.update(name for name in region.logical_names if name in parameters)
++        if claimed != set(parameters):
+             raise WeightLayoutError(
+-                "checkpoint range [{}, {}) for {!r} overlaps a previous tensor".format(begin, end, storage_id)
++                "shared source {!r} regions do not expose claims {}".format(source_name, list(parameters))
+             )
+-        cursor = end
+ 
+ 
+ def build_weight_layout(
+@@ -229,23 +322,63 @@ def build_weight_layout(
+     _verify_region_chain(packed.regions, packed.alignment)
+ 
+     source_by_storage = _source_by_storage(weight_mapping)
++    scale_derivation: Dict[str, str] = {}
++    for scale_entry in schema.quant_scales:
++        weight_entries = [
++            entry
++            for entry in schema.parameters
++            if entry.quant is not None and entry.quant.get("scale_entry") == scale_entry.name
++        ]
++        if len(weight_entries) != 1:
++            raise WeightLayoutError(
++                "quant_scale region {!r} does not have exactly one owning weight".format(
++                    scale_entry.storage_id
++                )
++            )
++        scale_derivation[scale_entry.storage_id] = weight_entries[0].storage_id
+     regions: List[WeightLayoutRegion] = []
+     for region in packed.regions:
+-        if region.role == "parameter":
++        if region.role in ("parameter", QUANT_WEIGHT_REGION_ROLE):
+             item = source_by_storage.get(region.storage_id)
+             if item is None:
+                 raise WeightLayoutError(
+                     "parameter region {!r} has no checkpoint source".format(region.storage_id)
+                 )
+             source = item.source
+-            if item.dtype_conforms:
++            quantized = region.role == QUANT_WEIGHT_REGION_ROLE
++            if quantized:
++                # W8A8：来源是浮点 checkpoint 张量，落盘字节由量化器生成，不能
++                # 按“字节减半转换”处理；这里只校验契约与来源的元素数/类型前提。
++                if region.dtype != "int8" or item.manifest_dtype != "int8":
++                    raise WeightLayoutError(
++                        "quantized region {!r} must be int8 (contract {!r})".format(
++                            region.storage_id, item.manifest_dtype
++                        )
++                    )
++                if _shape_elements(region.shape) != source.elements:
++                    raise WeightLayoutError(
++                        "quantized region {!r} element count {} differs from source {}".format(
++                            region.storage_id, _shape_elements(region.shape), source.elements
++                        )
++                    )
++                if source.pypto_dtype not in ("bf16", "float16", "float32"):
++                    raise WeightLayoutError(
++                        "quantized region {!r} source dtype {!r} is not quantizable".format(
++                            region.storage_id, source.pypto_dtype
++                        )
++                    )
++                requires_conversion = False
++            elif item.dtype_conforms:
+                 if source.nbytes != region.nbytes:
+                     raise WeightLayoutError(
+                         "parameter region {!r} nbytes {} differs from conforming source {}".format(
+                             region.storage_id, region.nbytes, source.nbytes
+                         )
+                     )
+-            elif source.nbytes != region.nbytes * 2:
++                requires_conversion = False
++            elif source.nbytes == region.nbytes * 2:
++                requires_conversion = True
++            else:
+                 raise WeightLayoutError(
+                     "non-conforming region {!r} must halve source bytes ({} -> {})".format(
+                         region.storage_id, source.nbytes, region.nbytes
+@@ -267,7 +400,40 @@ def build_weight_layout(
+                     source.dtype,
+                     source.nbytes,
+                     source.elements,
+-                    not item.dtype_conforms,
++                    requires_conversion,
++                    quantized=quantized,
++                )
++            )
++        elif region.role == QUANT_SCALE_ROLE:
++            derived_from = scale_derivation.get(region.storage_id)
++            if derived_from is None:
++                raise WeightLayoutError(
++                    "quant_scale region {!r} has no owning weight".format(region.storage_id)
++                )
++            if region.dtype != "float32":
++                raise WeightLayoutError(
++                    "quant_scale region {!r} must be float32; got {!r}".format(
++                        region.storage_id, region.dtype
++                    )
++                )
++            regions.append(
++                WeightLayoutRegion(
++                    region.storage_id,
++                    region.role,
++                    region.dtype,
++                    region.shape,
++                    region.nbytes,
++                    region.offset,
++                    region.alignment,
++                    region.logical_names,
++                    None,
++                    None,
++                    None,
++                    None,
++                    None,
++                    None,
++                    False,
++                    derived_from=derived_from,
+                 )
+             )
+         elif region.role == "state":
+@@ -293,8 +459,10 @@ def build_weight_layout(
+         else:
+             raise WeightLayoutError("unexpected packed region role {!r}".format(region.role))
+ 
+-    _verify_source_disjoint(regions)
+-    parameter_regions = tuple(region for region in regions if region.role == "parameter")
++    _verify_source_disjoint(regions, weight_mapping.shared_source_claims())
++    parameter_regions = tuple(
++        region for region in regions if region.role in ("parameter", QUANT_WEIGHT_REGION_ROLE)
++    )
+     if len(parameter_regions) != weight_mapping.mapped_count:
+         raise WeightLayoutError(
+             "layout has {} parameter regions but mapping has {} parameters".format(
+@@ -305,6 +473,13 @@ def build_weight_layout(
+     missing = set(item.storage_id for item in weight_mapping.mappings) - used_storage
+     if missing:
+         raise WeightLayoutError("{} mapped storages are absent from the layout".format(len(missing)))
++    physical_source_bytes = sum(
++        {
++            region.source_name: region.source_nbytes
++            for region in parameter_regions
++            if region.source_name is not None
++        }.values()
++    )
+ 
+     return WeightLayout(
+         schema.graph_digest,
+@@ -313,7 +488,7 @@ def build_weight_layout(
+         tuple(regions),
+         packed.total_nbytes,
+         tuple(sorted(region.storage_id for region in regions if region.requires_dtype_conversion)),
+-        sum(region.source_nbytes for region in parameter_regions),
++        physical_source_bytes,
+         checkpoint.file_nbytes,
+     )
+ 
+@@ -421,6 +596,12 @@ def convert_region_bytes(reader: SafetensorsReader, region: WeightLayoutRegion)
+ 
+     if region.source_name is None:
+         raise WeightLayoutError("region {!r} has no checkpoint source".format(region.storage_id))
++    if region.quantized:
++        raise WeightLayoutError(
++            "region {!r} is W8A8 int8; use the streaming weight quantizer instead of a byte cast".format(
++                region.storage_id
++            )
++        )
+     view = reader.view(region.source_name)
+     try:
+         if not region.requires_dtype_conversion:
+@@ -460,6 +641,11 @@ def audit_precision_boundary(
+ 
+     results: List[RegionConversion] = []
+     for region in layout.parameter_regions:
++        if region.quantized:
++            raise WeightLayoutError(
++                "region {!r} is W8A8 int8; precision audit must go through the C1 "
++                "quantization golden, not the BF16 RNE conversion".format(region.storage_id)
++            )
+         if not region.requires_dtype_conversion:
+             results.append(
+                 RegionConversion(
+diff --git a/python/pypto/portable/qwen35_weight_map.py b/python/pypto/portable/qwen35_weight_map.py
+index a6d8fa023..0596e695a 100644
+--- a/python/pypto/portable/qwen35_weight_map.py
++++ b/python/pypto/portable/qwen35_weight_map.py
+@@ -16,7 +16,12 @@
+ 
+ ``tie_word_embeddings=true`` 时官方 checkpoint 没有 ``lm_head.weight``，映射显式
+ 回退到 ``model.language_model.embed_tokens.weight`` 并在结果里记录，不做静默
+-猜测。vision tower（``model.visual.*``）与 MTP 层（``mtp.*``）被显式列为排除组，
++猜测。**唯一的例外**是契约 §3.4 的 opt-in tied lm_head 双 packing：当 graph
++manifest 声明 ``lm_head_int8_weight`` 时，该 int8 逻辑参数与 BF16 embedding
++**共享同一个** checkpoint 张量（不同物理 packing）；只有冻结登记表里的精确
++pair 允许共享来源，任何其它重复认领都 fail-closed。
++
++vision tower（``model.visual.*``）与 MTP 层（``mtp.*``）被显式列为排除组，
+ 带张量数、字节数和完整名字列表，绝不进入文本图。
+ 
+ 本模块不读取权重数据，只用 header 元数据。
+@@ -29,7 +34,10 @@ from dataclasses import dataclass
+ from types import MappingProxyType
+ from typing import Any, Dict, List, Mapping, Sequence, Tuple
+ 
+-from .qwen35 import _decoder_parameter_manifest
++from .qwen35 import (
++    QWEN35_LM_HEAD_QUANTIZED_FUNCTION_PARAMETER,
++    _decoder_parameter_manifest,
++)
+ from .runtime_binding import _DTYPE_BYTES, BindingSchema, _canonical_dtype
+ from .safetensors_reader import SafetensorsReader, SafetensorsTensor
+ 
+@@ -65,6 +73,30 @@ _SHARED_FUNCTION_PARAMETERS = {
+     "final_norm.weight": "final_norm_weight",
+ }
+ 
++#: 冻结的 §3.4 tied lm_head 双 packing 登记表。
++#:
++#: 三元组 ``(primary_parameter, dual_parameter, official_tensor)``：tied
++#: checkpoint 只有一个物理张量（``model.language_model.embed_tokens.weight``），
++#: embedding 以 BF16 读它，lm_head 以 int8 codes + fp32 per-output-channel scale
++#: 的**不同物理 packing** 认领同一个张量。只有这张登记表里的精确 pair 允许
++#: 共享来源，其它任何重复认领继续 fail-closed。
++_TIED_DUAL_PACKING_CLAIMS = (
++    (
++        "embedding_lm_head_shared_weight",
++        QWEN35_LM_HEAD_QUANTIZED_FUNCTION_PARAMETER,
++        QWEN35_EMBED_TOKENS_TENSOR,
++    ),
++)
++
++
++def _dual_packing_claim_allowed(tensor_name: str, first: str, second: str) -> bool:
++    """判断 ``tensor_name`` 上的第二次认领是否属于寄存器冻结的 dual packing。"""
++
++    for primary, dual, source in _TIED_DUAL_PACKING_CLAIMS:
++        if tensor_name == source and frozenset((first, second)) == frozenset((primary, dual)):
++            return True
++    return False
++
+ 
+ class WeightMapError(ValueError):
+     """权重映射失败基类。"""
+@@ -226,6 +258,20 @@ class WeightMapping:
+     def dtype_discrepancies(self) -> Tuple[ParameterMapping, ...]:
+         return tuple(item for item in self.mappings if not item.dtype_conforms)
+ 
++    def shared_source_claims(self) -> Mapping[str, Tuple[str, ...]]:
++        """官方张量 -> 认领它的逻辑参数（仅返回被多次认领的张量）。
++
++        按构造，多认领只可能来自冻结的 §3.4 tied lm_head 双 packing；结果供
++        layout 层验证"同一张量、两种 packing"的共享来源，而不用重复实现登记表。
++        """
++
++        table: Dict[str, List[str]] = {}
++        for item in self.mappings:
++            table.setdefault(item.source.official_name, []).append(item.parameter)
++        return MappingProxyType(
++            {name: tuple(params) for name, params in sorted(table.items()) if len(params) > 1}
++        )
++
+     def to_dict(self) -> Mapping[str, Any]:
+         return {
+             "graph_digest": self.graph_digest,
+@@ -308,6 +354,10 @@ def _expand_manifest_entry(
+ 
+     if pattern in _SHARED_OFFICIAL_NAMES:
+         expanded = ((_SHARED_FUNCTION_PARAMETERS[pattern], _SHARED_OFFICIAL_NAMES[pattern], pattern),)
++    elif pattern == QWEN35_LM_HEAD_QUANTIZED_FUNCTION_PARAMETER:
++        # §3.4：quantized tied lm_head 与 embedding 共享同一个官方张量；它自己
++        # 是 int8 参数，checkpoint 侧仍读取 BF16 的 embed_tokens 权重。
++        expanded = ((pattern, QWEN35_EMBED_TOKENS_TENSOR, pattern),)
+     elif ".*." in pattern:
+         head, suffix = pattern.split("*.", 1)
+         if not head.endswith(".") or head not in _MODULE_BY_PREFIX:
+@@ -386,6 +436,9 @@ def build_weight_mapping(
+ 
+     tensor_catalog = checkpoint.tensors()
+     mapped_names = set()
++    #: official tensor name -> ordered logical parameters claiming it.  More
++    #: than one claim is only legal for the frozen §3.4 dual-packing pair.
++    claims_by_tensor: Dict[str, List[str]] = {}
+     mappings: List[ParameterMapping] = []
+     seen_parameters = set()
+ 
+@@ -447,10 +500,26 @@ def build_weight_mapping(
+                 raise WeightMapMismatchError(
+                     "checkpoint is missing tensor {!r} for parameter {!r}".format(official_name, function_parameter)
+                 )
+-            if tensor.name in mapped_names:
++            if tensor.name in mapped_names and not _dual_packing_claim_allowed(
++                tensor.name,
++                claims_by_tensor[tensor.name][0],
++                function_parameter,
++            ):
++                raise WeightMapMismatchError(
++                    "checkpoint tensor {!r} is claimed by more than one parameter".format(official_name)
++                )
++            if function_parameter in claims_by_tensor.get(tensor.name, ()):
++                raise WeightMapMismatchError(
++                    "parameter {!r} claims checkpoint tensor {!r} twice".format(
++                        function_parameter, official_name
++                    )
++                )
++            prior_claims = claims_by_tensor.setdefault(tensor.name, [])
++            if len(prior_claims) >= 2:
+                 raise WeightMapMismatchError(
+                     "checkpoint tensor {!r} is claimed by more than one parameter".format(official_name)
+                 )
++            prior_claims.append(function_parameter)
+             mapped_names.add(tensor.name)
+             if tuple(tensor.shape) != manifest_shape:
+                 raise WeightMapMismatchError(
+@@ -500,6 +569,43 @@ def build_weight_mapping(
+             )
+         )
+ 
++    # 共享来源只允许出现在登记表里，且必须成对出现（§3.4 双 packing）。
++    shared_sources: Dict[str, Tuple[str, ...]] = {
++        name: tuple(params) for name, params in claims_by_tensor.items() if len(params) > 1
++    }
++    for dual_primary, dual_parameter, dual_source in _TIED_DUAL_PACKING_CLAIMS:
++        if dual_parameter not in parameters:
++            # 非全开路径：不允许出现任何来源共享。
++            if dual_source in shared_sources:
++                raise WeightMapMismatchError(
++                    "checkpoint tensor {!r} is shared without declaring the dual-packing parameter".format(
++                        dual_source
++                    )
++                )
++            continue
++        declared = {dual_primary, dual_parameter}
++        if not declared <= set(parameters) or not declared <= seen_parameters:
++            raise WeightMapMismatchError(
++                "§3.4 dual packing requires both {!r} and {!r} to be mapped".format(
++                    dual_primary, dual_parameter
++                )
++            )
++        if frozenset(claims_by_tensor.get(dual_source, ())) != frozenset(declared):
++            raise WeightMapMismatchError(
++                "§3.4 dual packing requires {!r} and {!r} to claim the same checkpoint tensor {!r}".format(
++                    dual_primary, dual_parameter, dual_source
++                )
++            )
++    for name, params in shared_sources.items():
++        allowed = any(
++            name == dual_source and frozenset(params) == frozenset((dual_primary, dual_parameter))
++            for dual_primary, dual_parameter, dual_source in _TIED_DUAL_PACKING_CLAIMS
++        )
++        if not allowed:
++            raise WeightMapMismatchError(
++                "checkpoint tensor {!r} is claimed by more than one parameter".format(name)
++            )
++
+     # tied embedding / lm_head 显式决策
+     lm_head_present = QWEN35_LM_HEAD_TENSOR in tensor_catalog
+     if not tie_word_embeddings:
+@@ -548,9 +654,16 @@ def build_weight_mapping(
+             "checkpoint contains {} unclassified tensors: {}".format(len(unexpected), list(unexpected[:8]))
+         )
+ 
+-    text_tensors = [tensor_catalog[item.source.official_name] for item in mappings]
++    # 物理 checkpoint 字节按**唯一张量**计数；共享来源（§3.4）的第二次逻辑
++    # 认领不重复计入 checkpoint，但在契约侧各自占 region 字节。守恒式：
++    #   checkpoint_text_bytes = manifest_parameter_bytes
++    #                            + conversion_reclaim_bytes
++    #                            - shared_source_overcount_bytes
++    physical_sources: Dict[str, SafetensorsTensor] = {}
++    for item in mappings:
++        physical_sources.setdefault(item.source.official_name, tensor_catalog[item.source.official_name])
+     text_bytes_by_dtype: Dict[str, int] = {}
+-    for tensor in text_tensors:
++    for tensor in physical_sources.values():
+         text_bytes_by_dtype[tensor.dtype] = text_bytes_by_dtype.get(tensor.dtype, 0) + tensor.nbytes
+     discrepancies = tuple(item for item in mappings if not item.dtype_conforms)
+     element_total = sum(item.elements for item in mappings)
+@@ -564,9 +677,12 @@ def build_weight_mapping(
+             )
+         )
+     tensor_count_by_dtype: Dict[str, int] = {}
+-    for item in mappings:
+-        key = item.source.dtype
++    for tensor in physical_sources.values():
++        key = tensor.dtype
+         tensor_count_by_dtype[key] = tensor_count_by_dtype.get(key, 0) + 1
++    shared_source_overcount = sum(
++        (len(params) - 1) * tensor_catalog[name].nbytes for name, params in shared_sources.items()
++    )
+     discrepancy_groups: List[Mapping[str, Any]] = []
+     for pattern in sorted(set(item.manifest_pattern for item in discrepancies)):
+         members = [item for item in discrepancies if item.manifest_pattern == pattern]
+@@ -588,6 +704,7 @@ def build_weight_mapping(
+         {
+             "checkpoint_tensor_total": len(tensor_catalog),
+             "text_tensor_count": len(mappings),
++            "distinct_text_tensor_count": len(physical_sources),
+             "text_element_count": element_total,
+             "text_tensor_count_by_checkpoint_dtype": dict(sorted(tensor_count_by_dtype.items())),
+             "conforming_tensor_count": len(mappings) - len(discrepancies),
+@@ -596,6 +713,16 @@ def build_weight_mapping(
+             "checkpoint_text_bytes": sum(text_bytes_by_dtype.values()),
+             "checkpoint_text_bytes_by_dtype": dict(sorted(text_bytes_by_dtype.items())),
+             "conversion_reclaim_bytes": sum(item.source.nbytes - item.manifest_bytes for item in discrepancies),
++            "shared_source_tensor_count": len(shared_sources),
++            "shared_source_overcount_bytes": shared_source_overcount,
++            "shared_source_tensors": [
++                {
++                    "tensor": name,
++                    "parameters": list(params),
++                    "nbytes": tensor_catalog[name].nbytes,
++                }
++                for name, params in sorted(shared_sources.items())
++            ],
+             "excluded_tensor_count": sum(group.tensor_count for group in excluded),
+             "excluded_bytes": sum(group.nbytes for group in excluded),
+             "dtype_discrepancy_count": len(discrepancies),
+diff --git a/python/tests/ut/pypto_x/qwen35_weight_fixture.py b/python/tests/ut/pypto_x/qwen35_weight_fixture.py
+index 20dd9d087..d5bad1cf4 100644
+--- a/python/tests/ut/pypto_x/qwen35_weight_fixture.py
++++ b/python/tests/ut/pypto_x/qwen35_weight_fixture.py
+@@ -13,7 +13,7 @@ import json
+ import os
+ import struct
+ from pathlib import Path
+-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
++from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+ 
+ from pypto.portable.safetensors_reader import SAFETENSORS_DTYPES
+ 
+@@ -49,17 +49,33 @@ def payload_for(name: str, nbytes: int) -> bytes:
+     return (seed * (nbytes // len(seed) + 1))[:nbytes]
+ 
+ 
++def finite_payload_for(name: str, nbytes: int) -> bytes:
++    """确定性且按 BF16/FP16/F32 解码都有限的 payload。
++
++    W8A8 权重量化对 NaN/Inf fail-closed，而伪随机 payload 可能解码出 NaN；
++    这里用 ``0x3C00``（BF16/FP16 的 1.0）重复填充，对 4 字节 dtype 也得到
++    有限值，保证量化路径可测且可复现。
++    """
++
++    del name  # 填充与名字无关，保持确定性
++    unit = struct.pack("<H", 0x3C00)
++    return (unit * ((nbytes + len(unit) - 1) // len(unit)))[:nbytes]
++
++
+ def write_safetensors(
+     path: Path,
+     tensors: Sequence[Tuple[str, str, Sequence[int]]],
+     *,
+     metadata: Optional[Mapping[str, str]] = None,
++    payload_factory: Optional[Callable[[str, int], bytes]] = None,
+ ) -> Dict[str, Any]:
+     """写入一个合法的合成 safetensors 文件，返回 name -> header 条目。
+ 
+     header 与真实 safetensors 一样用空格 padding 到 8 字节对齐。
++    ``payload_factory`` 默认为 :func:`payload_for`（原有行为逐字节不变）。
+     """
+ 
++    factory = payload_factory or payload_for
+     header: Dict[str, Any] = {}
+     if metadata:
+         header["__metadata__"] = dict(metadata)
+@@ -78,7 +94,7 @@ def write_safetensors(
+             "shape": [int(dimension) for dimension in shape],
+             "data_offsets": [offset, offset + nbytes],
+         }
+-        body.extend(payload_for(name, nbytes))
++        body.extend(factory(name, nbytes))
+         offset += nbytes
+     raw_header = json.dumps(header, sort_keys=True).encode("utf-8")
+     raw_header += b" " * ((-(8 + len(raw_header))) % 8)
+diff --git a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+index 668d7c8f5..125179ecf 100644
+--- a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
++++ b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+@@ -663,7 +663,7 @@ def _fill_region(storage: bytearray, offset: int, nbytes: int, dtype: str) -> No
+ 
+ def synthetic_bindings(schema: Any, layout: Any) -> Tuple[Dict[str, BufferBinding], Dict[str, BufferBinding]]:
+     storage = bytearray(layout.total_nbytes)
+-    for entry in schema.parameters + schema.states:
++    for entry in schema.parameters + schema.quant_scales + schema.states:
+         region = layout.region_for(entry.name)
+         _fill_region(storage, region.offset, region.nbytes, entry.dtype)
+     parameters = {
+@@ -671,7 +671,7 @@ def synthetic_bindings(schema: Any, layout: Any) -> Tuple[Dict[str, BufferBindin
+             storage, layout.region_for(entry.name).storage_id, entry.dtype, entry.shape,
+             byte_offset=layout.region_for(entry.name).offset, readonly=True,
+         )
+-        for entry in schema.parameters
++        for entry in schema.parameters + schema.quant_scales
+     }
+     states = {
+         entry.name: BufferBinding.from_buffer(
+@@ -1682,11 +1682,59 @@ def stage_preflight(args: argparse.Namespace) -> Mapping[str, Any]:
+                     ),
+                 }
+             else:
++                scope = getattr(args, "quantized_linear_scope", "default")
++                quantize_lm_head = bool(getattr(args, "quantize_lm_head", False))
++                expected_region_count = {
++                    ("default", False): 518,
++                    ("all", False): 554,
++                    ("default", True): 520,
++                    ("all", True): 556,
++                }[(scope, quantize_lm_head)]
++                if len(layout.regions) != expected_region_count:
++                    raise DriverError(
++                        "packed layout has {} regions, expected {} for scope={!r} quantize_lm_head={}".format(
++                            len(layout.regions), expected_region_count, scope, quantize_lm_head
++                        )
++                    )
++                # checkpoint-aware W8A8 layout：只读 header，不读权重字节。
++                weight_layout = build_weight_layout(schema, mapping, reader, alignment=64)
++                if len(weight_layout.regions) != len(layout.regions):
++                    raise DriverError(
++                        "checkpoint-aware layout has {} regions, packed layout has {}".format(
++                            len(weight_layout.regions), len(layout.regions)
++                        )
++                    )
++                layout_payload = weight_layout.to_dict()
++                result["w8a8_weight_layout"] = {
++                    "layout_digest": weight_layout.layout_digest(),
++                    "region_count": len(weight_layout.regions),
++                    "parameter_region_count": len(weight_layout.parameter_regions),
++                    "quantized_region_count": layout_payload.get("quantized_region_count", 0),
++                    "quant_scale_region_count": layout_payload.get("quant_scale_region_count", 0),
++                    "state_region_count": len(weight_layout.state_regions),
++                    "total_nbytes": weight_layout.total_nbytes,
++                    "source_text_bytes": weight_layout.source_text_bytes,
++                    "dtype_conversion_region_count": len(weight_layout.dtype_conversion_storage_ids),
++                    "shared_source_tensors": layout_payload.get("shared_source_tensors", []),
++                    "weight_bytes_read": False,
++                }
++                result["w8a8_dual_packing"] = {
++                    "quantize_lm_head": quantize_lm_head,
++                    "quantized_lm_head_parameter": (
++                        "lm_head_int8_weight" if quantize_lm_head else None
++                    ),
++                    "shared_source_claims": {
++                        name: list(params)
++                        for name, params in mapping.shared_source_claims().items()
++                    },
++                    "weight_bytes_read": False,
++                }
+                 result["w8a8_packed_layout"] = {
+                     "layout_version": layout.layout_version,
+                     "region_count": len(layout.regions),
+                     "total_nbytes": layout.total_nbytes,
+                     "counts": schema.to_dict()["counts"],
++                    "expected_region_count": expected_region_count,
+                     "default_region_count_expected": 518,
+                     "all_linear_region_count_expected": 554,
+                     "full_open_region_count_expected": 556,
+@@ -1694,8 +1742,8 @@ def stage_preflight(args: argparse.Namespace) -> Mapping[str, Any]:
+                         "default 368-150+150*2=518; all-186 368-186+186*2=554; "
+                         "+lm_head dual packing +2 = 556 (ERR-0003)"
+                     ),
+-                    "quantized_linear_scope": getattr(args, "quantized_linear_scope", "default"),
+-                    "quantize_lm_head": bool(getattr(args, "quantize_lm_head", False)),
++                    "quantized_linear_scope": scope,
++                    "quantize_lm_head": quantize_lm_head,
+                     "weight_bytes_written_to_disk": False,
+                 }
+             if args.hash_checkpoint:
+@@ -2293,7 +2341,7 @@ def build_parser() -> argparse.ArgumentParser:
+     parser.add_argument("--quantized-linear-scope", default="default", choices=("default", "all"),
+                         help="w8a8-linear: 150 default or all 186 linear weights")
+     parser.add_argument("--quantize-lm-head", action="store_true",
+-                        help="w8a8-linear: opt-in §3.4 lm_head dual packing (not for real-weight runs)")
++                        help="w8a8-linear: opt-in §3.4 tied lm_head dual packing (+2 regions, 556 full open)")
+     parser.add_argument("--prompt", default="en_continuation", choices=PROMPTS)
+     parser.add_argument("--steps", type=int, default=None)
+     parser.add_argument("--past-length", type=int, default=0)
+diff --git a/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py b/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py
+index 47109b61e..0a4cd9916 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py
++++ b/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py
+@@ -11,8 +11,12 @@ from pathlib import Path
+ 
+ import pytest
+ 
+-from pypto.portable.qwen35 import build_qwen35_text_decoder_graph
++from pypto.portable.qwen35 import (
++    QWEN35_LM_HEAD_QUANTIZED_FUNCTION_PARAMETER,
++    build_qwen35_text_decoder_graph,
++)
+ from pypto.portable.qwen35_weight_layout import (
++    WeightLayoutError,
+     audit_precision_boundary,
+     build_weight_layout,
+     convert_f32_view_to_bf16_rne,
+@@ -28,14 +32,17 @@ from pypto.portable.qwen35_weight_map import (
+     assert_manifest_reproducible,
+     tie_word_embeddings_from_config,
+ )
++from pypto.portable.qwen35_w8a8_weight import quantize_weight_per_output_channel
+ from pypto.portable.runtime_binding import build_binding_schema, build_packed_layout
+ from pypto.portable.safetensors_reader import SafetensorsReader
+ from pypto_x.qwen35_weight_fixture import (
+     REAL_SAFETENSORS_BYTES,
++    finite_payload_for,
+     real_asset_dir,
+     synthetic_checkpoint_tensors,
+     write_safetensors,
+ )
++import pypto.portable.qwen35_weight_map as qwen35_weight_map
+ 
+ F32_PATTERNS = ("layers.linear_attention.*.A_log", "layers.linear_attention.*.norm.weight")
+ 
+@@ -318,3 +325,279 @@ def test_real_checkpoint_mapping_layout_and_precision_boundary():
+     assert sum(item.contract_nbytes for item in converted) == 5184
+     assert all(item.max_relative_error <= 2 ** -8 for item in converted)
+     assert max(item.max_relative_error for item in converted) > 0.0
++
++
++# --------------------------------------------------------------------------
++# W8A8 §3.4 tied lm_head 双 packing ingestion
++# --------------------------------------------------------------------------
++
++LM_HEAD_PARAMETER = QWEN35_LM_HEAD_QUANTIZED_FUNCTION_PARAMETER
++LM_HEAD_STORAGE_ID = "parameter:embedding_lm_head_shared_weight.lm_head.int8"
++LM_HEAD_SCALE_STORAGE_ID = "parameter:embedding_lm_head_shared_weight.lm_head.scale"
++
++
++def _w8a8_graph(scope="all", quantize_lm_head=True):
++    program = build_qwen35_text_decoder_graph(
++        1,
++        1,
++        shape_profile="synthetic_test",
++        precision="w8a8-linear",
++        quantized_linear_scope=scope,
++        quantize_lm_head=quantize_lm_head,
++    )
++    return program, build_binding_schema(program)
++
++
++def _w8a8_checkpoint(tmp_path, program, name="w8a8", extra_tensors=()):
++    path = Path(tmp_path) / "{}.safetensors".format(name)
++    write_safetensors(
++        path,
++        list(synthetic_checkpoint_tensors(program.metadata)) + list(extra_tensors),
++        payload_factory=finite_payload_for,
++    )
++    return path
++
++
++def test_w8a8_dual_packing_maps_tied_lm_head_to_shared_checkpoint_tensor(tmp_path):
++    program, schema = _w8a8_graph(scope="all", quantize_lm_head=True)
++    packed = build_packed_layout(schema)
++    assert len(packed.regions) == 556
++    path = _w8a8_checkpoint(tmp_path, program, "dual")
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        mapping = build_weight_mapping(schema, program.metadata, reader)
++        assert mapping.parameter_count == 321
++        assert mapping.mapped_count == 321
++        assert mapping.unmapped == () and mapping.unexpected_checkpoint_tensors == ()
++        by_name = {item.parameter: item for item in mapping.mappings}
++        embedding = by_name["embedding_lm_head_shared_weight"]
++        lm_head = by_name[LM_HEAD_PARAMETER]
++        # 同一 checkpoint 张量、两个逻辑参数、两种物理 packing。
++        assert lm_head.source.official_name == QWEN35_EMBED_TOKENS_TENSOR
++        assert embedding.source.official_name == QWEN35_EMBED_TOKENS_TENSOR
++        assert lm_head.storage_id == LM_HEAD_STORAGE_ID
++        assert embedding.storage_id == "embedding_lm_head_shared_weight"
++        assert embedding.manifest_dtype == "bf16" and embedding.dtype_conforms
++        assert lm_head.manifest_dtype == "int8" and not lm_head.dtype_conforms
++        assert mapping.tied.fallback_used is True and mapping.tied.lm_head_present is False
++        assert mapping.shared_source_claims() == {
++            QWEN35_EMBED_TOKENS_TENSOR: (
++                "embedding_lm_head_shared_weight",
++                LM_HEAD_PARAMETER,
++            )
++        }
++        totals = mapping.totals
++        assert totals["text_tensor_count"] == 321
++        assert totals["distinct_text_tensor_count"] == 320
++        assert totals["shared_source_tensor_count"] == 1
++        assert totals["shared_source_overcount_bytes"] == embedding.source.nbytes
++        assert totals["conversion_tensor_count"] == 187
++        # 守恒：物理 checkpoint 字节按唯一张量计数一次。
++        assert totals["checkpoint_text_bytes"] == (
++            totals["manifest_parameter_bytes"]
++            + totals["conversion_reclaim_bytes"]
++            - totals["shared_source_overcount_bytes"]
++        )
++        assert totals["shared_source_tensors"] == [
++            {
++                "tensor": QWEN35_EMBED_TOKENS_TENSOR,
++                "parameters": ["embedding_lm_head_shared_weight", LM_HEAD_PARAMETER],
++                "nbytes": embedding.source.nbytes,
++            }
++        ]
++        layout = build_weight_layout(schema, mapping, reader)
++        payload = layout.to_dict()
++        assert payload["region_count"] == 556
++        assert payload["parameter_region_count"] == 321
++        assert payload["quantized_region_count"] == 187
++        assert payload["quant_scale_region_count"] == 187
++        assert len(layout.parameter_regions) == 321
++        assert len(layout.state_regions) == 48
++        assert layout.source_text_bytes == totals["checkpoint_text_bytes"]
++        assert payload["shared_source_tensors"] == [
++            {
++                "tensor": QWEN35_EMBED_TOKENS_TENSOR,
++                "storage_ids": ["embedding_lm_head_shared_weight", LM_HEAD_STORAGE_ID],
++                "nbytes": embedding.source.nbytes,
++            }
++        ]
++        region = layout.region_for(LM_HEAD_PARAMETER)
++        assert region.role == "quant_weight" and region.quantized is True
++        assert region.dtype == "int8" and region.nbytes * 2 == region.source_nbytes
++        assert region.source_name == QWEN35_EMBED_TOKENS_TENSOR
++        assert region.requires_dtype_conversion is False
++        scale_region = layout.region_for(LM_HEAD_PARAMETER + "_scale")
++        assert scale_region.role == "quant_scale"
++        assert scale_region.derived_from == LM_HEAD_STORAGE_ID
++        assert scale_region.source_name is None
++        assert scale_region.dtype == "float32"
++        # int8 region 不能走字节 cast；精度审计必须走 C1 量化 golden。
++        with pytest.raises(WeightLayoutError, match="W8A8 int8"):
++            convert_region_bytes(reader, region)
++        with pytest.raises(WeightLayoutError, match="W8A8 int8"):
++            audit_precision_boundary(reader, layout)
++
++
++def test_w8a8_default_scope_with_lm_head_has_520_regions_and_dual_source(tmp_path):
++    program, schema = _w8a8_graph(scope="default", quantize_lm_head=True)
++    assert len(build_packed_layout(schema).regions) == 520
++    path = _w8a8_checkpoint(tmp_path, program, "dual_default")
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        mapping = build_weight_mapping(schema, program.metadata, reader)
++        assert mapping.mapped_count == 321
++        assert list(mapping.shared_source_claims()) == [QWEN35_EMBED_TOKENS_TENSOR]
++        layout = build_weight_layout(schema, mapping, reader)
++        assert len(layout.regions) == 520
++        assert len(layout.quant_scale_regions) == 151
++        assert layout.to_dict()["quantized_region_count"] == 151
++
++
++def test_w8a8_default_scope_without_lm_head_stays_518_and_has_no_shared_source(tmp_path):
++    program, schema = _w8a8_graph(scope="default", quantize_lm_head=False)
++    assert len(build_packed_layout(schema).regions) == 518
++    path = _w8a8_checkpoint(tmp_path, program, "w8a8_518")
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        mapping = build_weight_mapping(schema, program.metadata, reader)
++        assert mapping.parameter_count == 320 and mapping.mapped_count == 320
++        assert mapping.shared_source_claims() == {}
++        layout = build_weight_layout(schema, mapping, reader)
++        assert len(layout.regions) == 518
++        assert layout.to_dict().get("shared_source_tensors", []) == []
++        assert len(layout.quant_scale_regions) == 150
++
++
++def test_w8a8_dual_packing_fails_closed_on_missing_or_mismatched_shared_tensor(tmp_path):
++    program, schema = _w8a8_graph()
++    tensors = list(synthetic_checkpoint_tensors(program.metadata))
++    missing = [item for item in tensors if item[0] != QWEN35_EMBED_TOKENS_TENSOR]
++    path = Path(tmp_path) / "dual_missing.safetensors"
++    write_safetensors(path, missing)
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        with pytest.raises(WeightMapMismatchError, match="missing tensor"):
++            build_weight_mapping(schema, program.metadata, reader)
++    broken = [
++        (name, dtype, (int(shape[0]) // 2, shape[1]) if name == QWEN35_EMBED_TOKENS_TENSOR else shape)
++        for name, dtype, shape in tensors
++    ]
++    path = Path(tmp_path) / "dual_broken.safetensors"
++    write_safetensors(path, broken)
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        with pytest.raises(WeightMapMismatchError, match="shape"):
++            build_weight_mapping(schema, program.metadata, reader)
++
++
++def test_w8a8_dual_packing_rejects_unregistered_duplicate_claim(tmp_path, monkeypatch):
++    """没有登记表的重复认领必须回到原来的 fail-closed 行为。"""
++
++    program, schema = _w8a8_graph()
++    path = _w8a8_checkpoint(tmp_path, program, "dual_unregistered")
++    monkeypatch.setattr(qwen35_weight_map, "_TIED_DUAL_PACKING_CLAIMS", ())
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        with pytest.raises(WeightMapMismatchError, match="claimed by more than one parameter"):
++            build_weight_mapping(schema, program.metadata, reader)
++
++
++def test_w8a8_dual_packing_rejects_second_physical_lm_head_copy(tmp_path):
++    """tied contract 不接受 checkpoint 再带一份 lm_head.weight。"""
++
++    program, schema = _w8a8_graph()
++    path = _w8a8_checkpoint(
++        tmp_path, program, "dual_extra", extra_tensors=(("lm_head.weight", "BF16", (32, 8)),)
++    )
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        with pytest.raises(WeightMapMismatchError, match="unclassified"):
++            build_weight_mapping(schema, program.metadata, reader)
++
++
++def test_w8a8_dual_packing_rejects_manifest_without_dual_entry(tmp_path):
++    program, schema = _w8a8_graph()
++    metadata = dict(program.metadata)
++    metadata["parameter_manifest"] = [
++        entry
++        for entry in metadata["parameter_manifest"]
++        if entry["name"] != LM_HEAD_PARAMETER
++    ]
++    path = _w8a8_checkpoint(tmp_path, program, "dual_no_manifest")
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        with pytest.raises(WeightMapMismatchError, match="unmapped"):
++            build_weight_mapping(schema, metadata, reader)
++
++
++def test_w8a8_weight_quantizer_is_chunk_invariant_and_bit_exact():
++    import numpy as np
++
++    rng = np.random.default_rng(20260911)
++    shape = (37, 129)
++    values = rng.uniform(-2.0, 2.0, size=shape).astype(np.float32)
++    payload = values.tobytes()
++    whole = quantize_weight_per_output_channel(payload, dtype="float32", shape=shape, name="w")
++    for chunk_elements in (1, 17, 1024, 1 << 22):
++        part = quantize_weight_per_output_channel(
++            payload, dtype="float32", shape=shape, name="w", chunk_elements=chunk_elements
++        )
++        assert part.codes == whole.codes
++        assert part.scales == whole.scales
++        assert part.max_abs == whole.max_abs
++        assert part.scale_min == whole.scale_min and part.scale_max == whole.scale_max
++        assert part.saturation_count == whole.saturation_count
++
++
++def test_w8a8_real_parameter_ingestion_binds_int8_lm_head_and_fp32_scales(tmp_path):
++    """真实权重 ingestion 函数对 556 全开可执行：int8 codes + fp32 scale 都在内存中。"""
++
++    import hashlib
++
++    from pypto_x.qwen35_weighted_execution_driver import w8a8_real_parameters
++
++    program, schema = _w8a8_graph(scope="all", quantize_lm_head=True)
++    packed = build_packed_layout(schema)
++    path = _w8a8_checkpoint(tmp_path, program, "dual_bind")
++    with SafetensorsReader(str(path), mode="pread") as reader:
++        mapping = build_weight_mapping(schema, program.metadata, reader)
++        bindings, evidence = w8a8_real_parameters(schema, packed, mapping, reader)
++        assert len(bindings) == len(schema.parameters) + len(schema.quant_scales)
++        lm_head = bindings[LM_HEAD_PARAMETER]
++        assert lm_head.storage_id == LM_HEAD_STORAGE_ID
++        assert lm_head.dtype == "int8" and lm_head.nbytes == 32 * 8
++        scale = bindings[LM_HEAD_PARAMETER + "_scale"]
++        assert scale.storage_id == LM_HEAD_SCALE_STORAGE_ID
++        assert scale.dtype == "float32" and scale.nbytes == 32 * 4
++        assert evidence["weight_bytes_written_to_disk"] is False
++        assert evidence["quantized_parameters"] == 187
++        assert evidence["quant_scale_parameters"] == 187
++        manifest = {item["name"]: item for item in evidence["weight_scale_manifest"]}
++        view = reader.view(QWEN35_EMBED_TOKENS_TENSOR)
++        try:
++            source_bytes = view.tobytes()
++        finally:
++            view.release()
++        source_sha = hashlib.sha256(source_bytes).hexdigest()
++        # lm_head 的量化来源必须与 embedding 读到的 BF16 张量逐字节相同。
++        assert manifest[LM_HEAD_PARAMETER]["source_sha256"] == source_sha
++        expected = quantize_weight_per_output_channel(
++            source_bytes,
++            dtype="bf16",
++            shape=(32, 8),
++            name=LM_HEAD_PARAMETER,
++        )
++        assert manifest[LM_HEAD_PARAMETER]["codes_sha256"] == expected.codes_sha256
++        assert manifest[LM_HEAD_PARAMETER]["scales_sha256"] == expected.scales_sha256
++
++
++def test_w8a8_full_open_synthetic_bindings_cover_weights_and_scales():
++    """556 全开的合成绑定必须同时覆盖 int8 权重与 fp32 scale region。"""
++
++    from pypto_x.qwen35_weighted_execution_driver import synthetic_bindings
++
++    program, schema = _w8a8_graph(scope="all", quantize_lm_head=True)
++    packed = build_packed_layout(schema)
++    assert len(packed.regions) == 556
++    parameters, states = synthetic_bindings(schema, packed)
++    assert set(parameters) == set(entry.name for entry in schema.parameters) | set(
++        entry.name for entry in schema.quant_scales
++    )
++    assert set(states) == set(entry.name for entry in schema.states)
++    assert parameters[LM_HEAD_PARAMETER].dtype == "int8"
++    assert parameters[LM_HEAD_PARAMETER].storage_id == LM_HEAD_STORAGE_ID
++    assert parameters[LM_HEAD_PARAMETER + "_scale"].dtype == "float32"
++    assert parameters[LM_HEAD_PARAMETER + "_scale"].storage_id == LM_HEAD_SCALE_STORAGE_ID
++    assert len(parameters) == 321 + 187

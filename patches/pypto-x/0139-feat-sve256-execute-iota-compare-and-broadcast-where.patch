@@ -1,0 +1,2016 @@
+From 4da3ac15154c2f1923652ccbcbfa596f466b1712 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 20:43:24 +0800
+Subject: [PATCH 139/141] feat(sve256): execute iota/compare and
+ broadcast/where natively
+
+W8B B2 closes the four position/control and data-movement fallback
+classes on cpu.aarch64.sve256:
+
+- runner protocol v5 adds compact control descriptors: iota (PXIO) and
+  compare (PXCP) are executed inside the AArch64 ELF, so the Python
+  iota_values()/compare_values() host-reference boundary is gone.
+- broadcast (PXBD) and where (PXWH) send raw storage plus output-rank
+  broadcast strides; the ELF performs every source lookup.  The artifact
+  now advertises host_preexpanded_operations=[] instead of
+  ["broadcast","where"] and position_control_fallback="native".
+- SVE256_LOWERING_VERSION 6 -> 7 so v4/v5/v6 artifacts and the old
+  preexpanded wire contract fail closed instead of being reinterpreted.
+- focused QEMU differential covers non-multiple-of-8 tails, NaN/Inf,
+  empty shapes, scalar/rank-delta broadcast, all compare predicates and
+  int32/int64/uint8/uint64/bool/bf16/float32 dtypes.
+---
+ python/pypto/backends/cpu/aarch64/sve256.py             | 585 +++++++++++++++++++++++------
+ python/pypto/compiler/targets/cpu_sve256.py             | 730 +++++++++++++++++++++++++++++++++++-
+ python/pypto/lowering/cpu/aarch64/sve/lowering.py       |  10 +-
+ python/tests/ut/pypto_x/test_cpu_sve256.py              | 301 ++++++++++++++-
+ python/tests/ut/pypto_x/test_qwen35_position_control.py |  14 +-
+ 5 files changed, 1481 insertions(+), 159 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/aarch64/sve256.py b/python/pypto/backends/cpu/aarch64/sve256.py
+index a4695fa7b..70b35f380 100644
+--- a/python/pypto/backends/cpu/aarch64/sve256.py
++++ b/python/pypto/backends/cpu/aarch64/sve256.py
+@@ -23,12 +23,12 @@ from pypto.compiler.targets.cpu_sve256 import (
+ )
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation
+ from pypto.lowering.cpu import (
+-    compare_values,
++    comparison_predicate_for_operation,
+     canonical_dtype,
+     canonical_operation_name,
+     element_count,
+     flatten_values,
+-    iota_values,
++    iota_spec,
+     static_shape,
+ )
+ from pypto.lowering.cpu.aarch64.sve import (
+@@ -110,6 +110,11 @@ _WIRE_MAGIC = b"PXSV"
+ _WIRE_VERSION = 1
+ _LAYOUT_WIRE_VERSION = 3
+ _INDEXING_WIRE_VERSION = 4
++# Control wire v5 carries compact descriptor payloads for native iota/compare
++# and for native (non-preexpanded) broadcast/where.  Shared with the ELF
++# runner; see RUNNER_PROTOCOL v5 in pypto.compiler.targets.cpu_sve256.
++_CONTROL_WIRE_VERSION = 5
++_CONTROL_MAX_RANK = 64
+ _LAYOUT_DESC_VERSION = 2
+ _LAYOUT_DESC_HEADER = struct.Struct("<4s5I2Q")
+ _LAYOUT_KIND_CODES = {"logical_layout_copy": 0, "transpose": 1, "slice": 2}
+@@ -146,14 +151,49 @@ _OP_CODES = {
+     "concat": 24,
+     "gather": 25,
+     "embedding": 26,
++    "iota": 27,
++    "compare": 28,
+ }
+ _DTYPE_CODES = {"float32": 0, "bf16": 1}
+ _CAST_DTYPE_CODES = {("float32", "bf16"): 2, ("bf16", "float32"): 3}
++# Control-wire dtype codes must match PTX_DTYPE_* in cpu_sve256.py.
++_CONTROL_DTYPE_CODES = {
++    "float32": 0,
++    "bf16": 1,
++    "int32": 4,
++    "int64": 5,
++    "bool": 6,
++    "int8": 7,
++    "uint8": 8,
++    "int16": 9,
++    "uint16": 10,
++    "uint32": 11,
++    "uint64": 12,
++}
++_CONTROL_DTYPE_ITEMS = {
++    "float32": 4,
++    "bf16": 2,
++    "int32": 4,
++    "int64": 8,
++    "bool": 1,
++    "int8": 1,
++    "uint8": 1,
++    "int16": 2,
++    "uint16": 2,
++    "uint32": 4,
++    "uint64": 8,
++}
++_PREDICATE_CODES = {"eq": 0, "ne": 1, "lt": 2, "le": 3, "gt": 4, "ge": 5}
++_IOTA_DESC_HEADER = struct.Struct("<4s5IQqqQQ")
++_COMPARE_DESC_HEADER = struct.Struct("<4s7I3Q")
++_EXPAND_DESC_HEADER = struct.Struct("<4s5I2Q")
++_WHERE_DESC_HEADER = struct.Struct("<4s7I4Q")
+ _CTYPE = {
+     "float32": ctypes.c_float,
+     "bf16": ctypes.c_uint16,
+     "int32": ctypes.c_int32,
+     "int64": ctypes.c_int64,
++    "bool": ctypes.c_uint8,
+ }
+ 
+ 
+@@ -246,78 +286,199 @@ def _runner_values(value: Any, count: int, context: str) -> Any:
+     )
+ 
+ 
+-def _broadcast_values(value: Any, input_type: CoreType, output_type: CoreType, context: str) -> List[Any]:
+-    output_shape = static_shape(output_type, context + ".output")
+-    output_count = element_count(output_shape)
+-    output_dtype = canonical_dtype(output_type.dtype)
+-    if _is_scalar(input_type):
+-        if not isinstance(value, list) or len(value) != 1:
+-            raise CpuSve256ExecutionError("{} scalar input storage length mismatch".format(context))
+-        value = value[0]
+-        return [_cast_value(value, output_dtype) for _ in range(output_count)]
+-    input_shape = static_shape(input_type, context + ".input")
+-    if len(value) != element_count(input_shape):
+-        raise CpuSve256ExecutionError("{} input storage length mismatch".format(context))
++def _control_dtype_code(dtype: str, context: str) -> int:
++    code = _CONTROL_DTYPE_CODES.get(canonical_dtype(dtype))
++    if code is None:
++        raise CpuSve256ExecutionError(
++            "{} dtype {!r} is unsupported by the SVE256 control wire".format(context, dtype)
++        )
++    return code
++
++
++def _control_item_bytes(dtype: str, context: str) -> int:
++    item = _CONTROL_DTYPE_ITEMS.get(canonical_dtype(dtype))
++    if item is None:
++        raise CpuSve256ExecutionError(
++            "{} dtype {!r} is unsupported by the SVE256 control wire".format(context, dtype)
++        )
++    return item
++
++
++def _broadcast_strides(
++    input_shape: Sequence[int], output_shape: Sequence[int], context: str
++) -> Tuple[int, ...]:
++    """Return output-rank strides with zero strides on broadcast axes."""
++
+     rank_delta = len(output_shape) - len(input_shape)
+-    result = []
+-    for output_index in range(output_count):
+-        output_coords = _unravel(output_index, output_shape)
+-        input_coords = [
+-            0 if dimension == 1 else output_coords[axis + rank_delta]
+-            for axis, dimension in enumerate(input_shape)
+-        ]
+-        result.append(_cast_value(value[_ravel(input_coords, input_shape)], output_dtype))
+-    return result
++    if rank_delta < 0:
++        raise CpuSve256ExecutionError(
++            "{} input shape {} has higher rank than output {}".format(context, tuple(input_shape), tuple(output_shape))
++        )
++    contiguous = _contiguous_strides(input_shape)
++    strides = []
++    for axis, dimension in enumerate(output_shape):
++        if axis < rank_delta:
++            strides.append(0)
++            continue
++        input_axis = axis - rank_delta
++        if input_shape[input_axis] == 1:
++            strides.append(0)
++        elif input_shape[input_axis] == dimension:
++            strides.append(contiguous[input_axis])
++        else:
++            raise CpuSve256ExecutionError(
++                "{} input shape {} cannot broadcast to output shape {}".format(
++                    context, tuple(input_shape), tuple(output_shape)
++                )
++            )
++    return tuple(strides)
++
++
++def _source_layout(
++    value_type: CoreType, output_shape: Sequence[int], context: str
++) -> Tuple[Tuple[int, ...], Tuple[int, ...], int]:
++    """Return (shape, output-rank strides, element count) for one broadcast source."""
++
++    if _is_scalar(value_type):
++        return (), tuple(0 for _ in output_shape), 1
++    shape = static_shape(value_type, context)
++    return shape, _broadcast_strides(shape, output_shape, context), element_count(shape)
++
++
++def _iota_descriptor_bytes(
++    output_type: CoreType, attributes: Mapping[str, Any], context: str
++) -> bytes:
++    """Pack the native iota schedule (axis/start/step plus rank-sized strides)."""
++
++    axis, start, step = iota_spec(output_type, attributes, context)
++    shape = static_shape(output_type, context + ".output")
++    dtype = canonical_dtype(output_type.dtype)
++    inner_stride = 1
++    for dimension in shape[axis + 1:]:
++        inner_stride *= dimension
++    return _IOTA_DESC_HEADER.pack(
++        b"PXIO",
++        1,
++        axis,
++        _control_dtype_code(dtype, context),
++        0,
++        len(shape),
++        element_count(shape),
++        start,
++        step,
++        inner_stride,
++        shape[axis],
++    )
+ 
+ 
+-def _where_values(
+-    condition: Any,
+-    condition_type: CoreType,
+-    true_value: Any,
+-    true_type: CoreType,
+-    false_value: Any,
+-    false_type: CoreType,
++def _compare_descriptor_bytes(
++    inputs: Sequence[Tuple[CoreType, Any]],
+     output_type: CoreType,
++    predicate: str,
+     context: str,
+-) -> Tuple[List[Any], List[Any], List[Any]]:
++) -> Tuple[bytes, int, int, int]:
++    """Pack the native compare schedule and return (descriptor, left, right, output) counts."""
++
+     output_shape = static_shape(output_type, context + ".output") if _is_tensor(output_type) else ()
+     output_count = element_count(output_shape) if _is_tensor(output_type) else 1
+-    prepared = []
+-    for value, value_type, label in (
+-        (condition, condition_type, "condition"),
+-        (true_value, true_type, "input"),
+-        (false_value, false_type, "other"),
+-    ):
+-        if _is_scalar(value_type):
+-            if not isinstance(value, list) or len(value) != 1:
+-                raise CpuSve256ExecutionError("{} {} scalar storage length mismatch".format(context, label))
+-            value = value[0]
+-            prepared.append((value, None))
+-            continue
+-        shape = static_shape(value_type, context + "." + label)
+-        if len(value) != element_count(shape):
+-            raise CpuSve256ExecutionError("{} {} storage length mismatch".format(context, label))
+-        prepared.append((value, shape))
+-
+-    def source_at(item: Tuple[Any, Optional[Tuple[int, ...]]], coords: Tuple[int, ...]) -> Any:
+-        value, shape = item
+-        if shape is None:
+-            return value
+-        rank_delta = len(output_shape) - len(shape)
+-        source_coords = [
+-            0 if dimension == 1 else coords[axis + rank_delta]
+-            for axis, dimension in enumerate(shape)
+-        ]
+-        return value[_ravel(source_coords, shape)]
+-
+-    conditions, true_values, false_values = [], [], []
+-    for output_index in range(output_count):
+-        coords = _unravel(output_index, output_shape)
+-        predicate = source_at(prepared[0], coords)
+-        conditions.append(predicate)
+-        true_values.append(source_at(prepared[1], coords))
+-        false_values.append(source_at(prepared[2], coords))
+-    return conditions, true_values, false_values
++    left_type, right_type = inputs[0][0], inputs[1][0]
++    left_dtype = canonical_dtype(left_type.dtype)
++    right_dtype = canonical_dtype(right_type.dtype)
++    if left_dtype != right_dtype:
++        raise CpuSve256ExecutionError("{} compare requires matching input dtypes".format(context))
++    if predicate not in _PREDICATE_CODES:
++        raise CpuSve256ExecutionError("{} predicate {!r} is unsupported".format(context, predicate))
++    _left_shape, left_strides, left_elements = _source_layout(left_type, output_shape, context + ".left")
++    _right_shape, right_strides, right_elements = _source_layout(right_type, output_shape, context + ".right")
++    header = _COMPARE_DESC_HEADER.pack(
++        b"PXCP",
++        1,
++        len(output_shape),
++        _control_dtype_code(left_dtype, context),
++        _control_dtype_code(right_dtype, context),
++        _PREDICATE_CODES[predicate],
++        0,
++        0,
++        left_elements,
++        right_elements,
++        output_count,
++    )
++    descriptor = (
++        header
++        + _pack_u64_values(left_strides, context + ".left_strides")
++        + _pack_u64_values(right_strides, context + ".right_strides")
++        + _pack_u64_values(output_shape, context + ".output_shape")
++    )
++    return descriptor, left_elements, right_elements, output_count
++
++
++def _broadcast_descriptor_bytes(
++    input_type: CoreType, output_type: CoreType, context: str
++) -> Tuple[bytes, int, int]:
++    """Pack the native broadcast schedule and return (descriptor, input, output) counts."""
++
++    output_shape = static_shape(output_type, context + ".output")
++    output_count = element_count(output_shape)
++    output_dtype = canonical_dtype(output_type.dtype)
++    if canonical_dtype(input_type.dtype) != output_dtype:
++        raise CpuSve256ExecutionError("{} input and output dtypes must match".format(context))
++    _shape, strides, input_count = _source_layout(input_type, output_shape, context + ".input")
++    header = _EXPAND_DESC_HEADER.pack(
++        b"PXBD",
++        1,
++        len(output_shape),
++        _control_dtype_code(output_dtype, context),
++        0,
++        0,
++        input_count,
++        output_count,
++    )
++    descriptor = header + _pack_u64_values(strides, context + ".input_strides") + _pack_u64_values(
++        output_shape, context + ".output_shape"
++    )
++    return descriptor, input_count, output_count
++
++
++def _where_descriptor_bytes(
++    inputs: Sequence[Tuple[CoreType, Any]], output_type: CoreType, context: str
++) -> Tuple[bytes, int, int, int, int]:
++    """Pack the native where schedule; returns (descriptor, cond, true, false, output) counts."""
++
++    output_shape = static_shape(output_type, context + ".output") if _is_tensor(output_type) else ()
++    output_count = element_count(output_shape) if _is_tensor(output_type) else 1
++    condition_type, true_type, false_type = inputs[0][0], inputs[1][0], inputs[2][0]
++    if canonical_dtype(condition_type.dtype) != "bool":
++        raise CpuSve256ExecutionError("{} condition must have bool dtype".format(context))
++    value_dtype = canonical_dtype(true_type.dtype)
++    if canonical_dtype(false_type.dtype) != value_dtype or canonical_dtype(output_type.dtype) != value_dtype:
++        raise CpuSve256ExecutionError("{} selected values and output must share one dtype".format(context))
++    _cond_shape, condition_strides, condition_elements = _source_layout(
++        condition_type, output_shape, context + ".condition"
++    )
++    _true_shape, true_strides, true_elements = _source_layout(true_type, output_shape, context + ".input")
++    _false_shape, false_strides, false_elements = _source_layout(false_type, output_shape, context + ".other")
++    header = _WHERE_DESC_HEADER.pack(
++        b"PXWH",
++        1,
++        len(output_shape),
++        _control_dtype_code("bool", context),
++        _control_dtype_code(value_dtype, context),
++        _control_dtype_code(value_dtype, context),
++        0,
++        0,
++        condition_elements,
++        true_elements,
++        false_elements,
++        output_count,
++    )
++    descriptor = (
++        header
++        + _pack_u64_values(condition_strides, context + ".condition_strides")
++        + _pack_u64_values(true_strides, context + ".input_strides")
++        + _pack_u64_values(false_strides, context + ".other_strides")
++        + _pack_u64_values(output_shape, context + ".output_shape")
++    )
++    return descriptor, condition_elements, true_elements, false_elements, output_count
+ 
+ 
+ def _validate_runtime_indices(values: Sequence[Any], axis_length: int, operation: str) -> None:
+@@ -408,6 +569,8 @@ def _verify_embedded_markers(
+         b"scalar_math_lane_fallback:exp,sigmoid,silu,softplus",
+         b"ptx_sve256_indexing_fallback",
+         b"scalar_indexing_lane_fallback:bf16_reorder",
++        b"ptx_sve256_control_operations",
++        b"native_iota_compare_broadcast_where",
+     )
+     if any(marker not in native_bytes for marker in markers):
+         raise CpuSve256ArtifactError("SVE256 ELF contract marker is missing")
+@@ -451,12 +614,16 @@ def _validate_primary_artifact(artifact: Artifact) -> Mapping[str, Any]:
+         raise CpuSve256ArtifactError("SVE256 scalar math fallback metadata is invalid")
+     if metadata.get("scalar_conversion_lane_fallback") != ["cast", "bf16_math", "bf16_where"]:
+         raise CpuSve256ArtifactError("SVE256 scalar conversion fallback metadata is invalid")
+-    if metadata.get("host_preexpanded_operations") != ["broadcast", "where"]:
++    if metadata.get("host_preexpanded_operations") != []:
+         raise CpuSve256ArtifactError("SVE256 host pre-expansion metadata is invalid")
+-    if metadata.get("sve_math_operations") != ["rsqrt", "where", "broadcast", "cast", "reduce_mean"]:
++    if metadata.get("sve_math_operations") != [
++        "rsqrt", "where", "broadcast", "cast", "reduce_mean", "iota", "compare"
++    ]:
+         raise CpuSve256ArtifactError("SVE256 math operation metadata is invalid")
+-    if metadata.get("position_control_fallback", "host_reference") != "host_reference":
+-        raise CpuSve256ArtifactError("SVE256 position/control fallback metadata is invalid")
++    if metadata.get("control_descriptor_wire") != "v5:pxio-pxcp-pxbd-pxwh+fnv1a64":
++        raise CpuSve256ArtifactError("SVE256 control descriptor wire contract is invalid")
++    if metadata.get("position_control_fallback", "native") != "native":
++        raise CpuSve256ArtifactError("SVE256 position/control implementation metadata is invalid")
+     if metadata.get("layout_plan_version") != 2:
+         raise CpuSve256ArtifactError("SVE256 layout plan version is unsupported")
+     if metadata.get("layout_descriptor_wire") != "v3:pxld-v2+fnv1a64":
+@@ -885,9 +1052,22 @@ def _write_storage(descriptor: TensorDesc, dtype: str, values: Sequence[Any], co
+         raise CpuSve256ExecutionError("{} output storage is not writable".format(context)) from exc
+ 
+ 
++_PACK_CODES = {
++    "int8": "b",
++    "uint8": "B",
++    "int16": "h",
++    "uint16": "H",
++    "int32": "i",
++    "uint32": "I",
++    "int64": "q",
++    "uint64": "Q",
++}
++
++
+ def _wire_values(dtype: str, values: Sequence[Any]) -> bytes:
++    dtype = canonical_dtype(dtype)
+     if isinstance(values, TypedByteView):
+-        if canonical_dtype(values.dtype) != canonical_dtype(dtype):
++        if canonical_dtype(values.dtype) != dtype:
+             raise CpuSve256ExecutionError(
+                 "SVE256 raw byte view dtype {} does not match wire dtype {}".format(values.dtype, dtype)
+             )
+@@ -897,7 +1077,15 @@ def _wire_values(dtype: str, values: Sequence[Any]) -> bytes:
+             raise CpuSve256ExecutionError(str(exc)) from exc
+     if dtype == "float32":
+         return struct.pack("<{}f".format(len(values)), *[float(value) for value in values])
+-    return struct.pack("<{}H".format(len(values)), *[_bf16_bits(value) for value in values])
++    if dtype == "bf16":
++        return struct.pack("<{}H".format(len(values)), *[_bf16_bits(value) for value in values])
++    if dtype == "bool":
++        return bytes(1 if _cast_value(value, "bool") else 0 for value in values)
++    code = _PACK_CODES.get(dtype)
++    if code is None:
++        raise CpuSve256ExecutionError("SVE256 wire dtype {!r} is unsupported".format(dtype))
++    converted = [_cast_value(value, dtype) for value in values]
++    return struct.pack("<{}{}".format(len(converted), code), *converted)
+ 
+ 
+ def _wire_indices(dtype: str, values: Sequence[Any]) -> bytes:
+@@ -1019,16 +1207,32 @@ def _index_descriptor_bytes(indexing: Any, index_dtype: str) -> bytes:
+ 
+ 
+ def _decode_wire_values(dtype: str, payload: bytes, count: int) -> List[Any]:
++    dtype = canonical_dtype(dtype)
+     if dtype == "float32":
+         expected = count * 4
+         if len(payload) != expected:
+             raise CpuSve256ExecutionError("SVE256 runner returned {} bytes; expected {}".format(len(payload), expected))
+         return list(struct.unpack("<{}f".format(count), payload)) if count else []
+-    expected = count * 2
++    if dtype == "bf16":
++        expected = count * 2
++        if len(payload) != expected:
++            raise CpuSve256ExecutionError("SVE256 runner returned {} bytes; expected {}".format(len(payload), expected))
++        bits = struct.unpack("<{}H".format(count), payload) if count else ()
++        return [_bf16_value(value) for value in bits]
++    if dtype == "bool":
++        if len(payload) != count:
++            raise CpuSve256ExecutionError(
++                "SVE256 runner returned {} bytes; expected {}".format(len(payload), count)
++            )
++        return [bool(value) for value in payload]
++    item = _CONTROL_DTYPE_ITEMS.get(dtype)
++    code = _PACK_CODES.get(dtype)
++    if item is None or code is None:
++        raise CpuSve256ExecutionError("SVE256 result dtype {!r} is unsupported".format(dtype))
++    expected = count * item
+     if len(payload) != expected:
+         raise CpuSve256ExecutionError("SVE256 runner returned {} bytes; expected {}".format(len(payload), expected))
+-    bits = struct.unpack("<{}H".format(count), payload) if count else ()
+-    return [_bf16_value(value) for value in bits]
++    return list(struct.unpack("<{}{}".format(count, code), payload)) if count else []
+ 
+ 
+ class Sve256Runtime:
+@@ -1318,7 +1522,33 @@ class Sve256Runtime:
+             )
+         else:
+             payload_values = b"".join(_wire_values(output_dtype, value) for value in values)
+-        payload = header + payload_values
++        expected_count = m * n if operation == "matmul" else (
++            1 if operation.startswith("reduce_") else count
++        )
++        return self._invoke_runner(
++            artifact,
++            header=header,
++            payload=payload_values,
++            output_dtype=output_dtype,
++            expected_count=expected_count,
++            wire_version=(
++                _LAYOUT_WIRE_VERSION if layout_operation else
++                _INDEXING_WIRE_VERSION if indexing_operation else _WIRE_VERSION
++            ),
++        )
++
++    def _invoke_runner(
++        self,
++        artifact: Artifact,
++        *,
++        header: bytes,
++        payload: bytes,
++        output_dtype: str,
++        expected_count: int,
++        wire_version: int,
++    ) -> List[Any]:
++        """Run one supervised ELF invocation and validate its response envelope."""
++
+         if self.execution_mode == "native":
+             command = [str(artifact.path)]
+         else:
+@@ -1328,7 +1558,7 @@ class Sve256Runtime:
+             command = [qemu_path, "-L", self._sysroot, "-cpu", self._qemu_cpu, str(artifact.path)]
+         try:
+             result = subprocess.run(
+-                command, input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                command, input=header + payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                 check=False, timeout=120,
+             )
+         except (OSError, subprocess.SubprocessError) as exc:
+@@ -1344,11 +1574,7 @@ class Sve256Runtime:
+         magic, version, status, response_dtype, response_count = _WIRE_RESPONSE.unpack(
+             result.stdout[:_WIRE_RESPONSE.size]
+         )
+-        expected_wire_version = (
+-            _LAYOUT_WIRE_VERSION if layout_operation else
+-            _INDEXING_WIRE_VERSION if indexing_operation else _WIRE_VERSION
+-        )
+-        if magic != int.from_bytes(_WIRE_MAGIC, "little") or version != expected_wire_version:
++        if magic != int.from_bytes(_WIRE_MAGIC, "little") or version != wire_version:
+             raise CpuSve256ExecutionError("SVE256 runner response header is invalid")
+         if status != 0 or result.returncode != 0:
+             raise CpuSve256ExecutionError(
+@@ -1356,13 +1582,101 @@ class Sve256Runtime:
+                     status, result.returncode, result.stderr.decode("utf-8", "replace")
+                 )
+             )
+-        expected_count = m * n if operation == "matmul" else (
+-            1 if operation.startswith("reduce_") else count
++        output_dtype = canonical_dtype(output_dtype)
++        expected_dtype = (
++            _DTYPE_CODES[output_dtype]
++            if output_dtype in _DTYPE_CODES
++            else _CONTROL_DTYPE_CODES[output_dtype]
+         )
+-        if response_dtype != _DTYPE_CODES[output_dtype] or response_count != expected_count:
++        if response_dtype != expected_dtype or response_count != expected_count:
+             raise CpuSve256ExecutionError("SVE256 runner response shape is invalid")
+         return _decode_wire_values(output_dtype, result.stdout[_WIRE_RESPONSE.size:], response_count)
+ 
++    def _run_control_runner(
++        self,
++        artifact: Artifact,
++        operation: str,
++        output_dtype: str,
++        values: Sequence[Sequence[Any]],
++        input_dtypes: Sequence[str],
++        descriptor: bytes,
++        count: int,
++        m: int = 0,
++        k: int = 0,
++        predicate: Optional[str] = None,
++    ) -> List[Any]:
++        """Execute one v5 descriptor control op entirely inside the ELF.
++
++        The host only serializes raw tensor bytes plus the rank-sized
++        descriptor; no element is expanded or decoded here.
++        """
++
++        operation = canonical_operation_name(operation)
++        if operation not in _OP_CODES:
++            raise CpuSve256ExecutionError("unsupported SVE256 control operation {!r}".format(operation))
++        output_dtype = canonical_dtype(output_dtype)
++        input_dtypes = tuple(canonical_dtype(dtype) for dtype in input_dtypes)
++        descriptor_len = len(descriptor)
++        wire_hash = _layout_wire_hash(descriptor)
++        reserved = _PREDICATE_CODES[predicate] if predicate is not None else 0
++        if operation == "iota":
++            if values or input_dtypes:
++                raise CpuSve256ExecutionError("SVE256 iota runner takes no tensor inputs")
++            wire_dtype = _control_dtype_code(output_dtype, "SVE256 iota")
++            payload = descriptor
++            header_m, header_k, reserved, reserved2 = count, descriptor_len, 0, 0
++        elif operation == "compare":
++            if len(values) != 2 or len(input_dtypes) != 2:
++                raise CpuSve256ExecutionError("SVE256 compare runner requires two inputs")
++            wire_dtype = _control_dtype_code("bool", "SVE256 compare")
++            payload = (
++                descriptor
++                + _wire_values(input_dtypes[0], values[0])
++                + _wire_values(input_dtypes[1], values[1])
++            )
++            header_m, header_k, reserved2 = m, k, descriptor_len
++        elif operation == "broadcast":
++            if len(values) != 1 or len(input_dtypes) != 1:
++                raise CpuSve256ExecutionError("SVE256 broadcast runner requires one input")
++            wire_dtype = _control_dtype_code(output_dtype, "SVE256 broadcast")
++            payload = descriptor + _wire_values(input_dtypes[0], values[0])
++            header_m, header_k, reserved, reserved2 = m, descriptor_len, 0, 0
++        elif operation == "where":
++            if len(values) != 3 or len(input_dtypes) != 3:
++                raise CpuSve256ExecutionError("SVE256 where runner requires three inputs")
++            wire_dtype = _control_dtype_code(output_dtype, "SVE256 where")
++            payload = (
++                descriptor
++                + _wire_values("bool", values[0])
++                + _wire_values(output_dtype, values[1])
++                + _wire_values(output_dtype, values[2])
++            )
++            header_m, header_k, reserved, reserved2 = m, descriptor_len, 0, 0
++        else:
++            raise CpuSve256ExecutionError(
++                "SVE256 control runner does not implement operation {!r}".format(operation)
++            )
++        header = _WIRE_REQUEST.pack(
++            int.from_bytes(_WIRE_MAGIC, "little"),
++            _CONTROL_WIRE_VERSION,
++            _OP_CODES[operation],
++            wire_dtype,
++            reserved if operation == "compare" else 0,
++            reserved2,
++            count,
++            header_m,
++            header_k,
++            wire_hash,
++        )
++        return self._invoke_runner(
++            artifact,
++            header=header,
++            payload=payload,
++            output_dtype=output_dtype,
++            expected_count=count,
++            wire_version=_CONTROL_WIRE_VERSION,
++        )
++
+     def launch(self, request: LaunchRequest) -> Tuple[Any, ...]:
+         if not isinstance(request, LaunchRequest):
+             raise CpuSve256ExecutionError("SVE256 launch requires LaunchRequest")
+@@ -1472,26 +1786,45 @@ class Sve256Runtime:
+             environment[output_ref.name] = (output_ref.type, [_cast_value(value, dtype) for value in values])
+             return
+         if name == "iota":
+-            # Position/control operations are intentionally explicit host
+-            # reference fallbacks in this first SVE closure.  They still use
+-            # the SVE256 artifact/lowering contract, but do not pretend the
+-            # generic float-only runner emits integer/boolean instructions.
+-            values = iota_values(output_ref.type, operation.attributes, "SVE256 iota")
++            # Native position generation: the rank-sized descriptor carries
++            # axis/start/step and the ELF computes every integer lane.  There
++            # is no host iota_values() boundary.
++            descriptor = _iota_descriptor_bytes(output_ref.type, operation.attributes, "SVE256 iota")
++            values = self._run_control_runner(
++                artifact,
++                "iota",
++                dtype,
++                [],
++                [],
++                descriptor,
++                count=plan.element_count,
++            )
+             environment[output_ref.name] = (output_ref.type, values)
+             return
+         if name == "compare":
+-            values = compare_values(
+-                _materialize_values(inputs[0][1], "SVE256 compare.left"),
+-                inputs[0][0],
+-                _materialize_values(inputs[1][1], "SVE256 compare.right"),
+-                inputs[1][0],
+-                output_ref.type,
+-                operation.attributes,
+-                "SVE256 compare",
+-                operation_name=operation.name,
++            # Native compare: inputs stay raw; the descriptor carries the
++            # broadcast strides and the ELF emits the boolean lanes.
++            predicate = comparison_predicate_for_operation(
++                operation.name, operation.attributes, "SVE256 compare"
++            )
++            descriptor, left_elements, right_elements, output_count = _compare_descriptor_bytes(
++                inputs, output_ref.type, predicate, "SVE256 compare"
++            )
++            values = self._run_control_runner(
++                artifact,
++                "compare",
++                "bool",
++                [inputs[0][1], inputs[1][1]],
++                [
++                    canonical_dtype(inputs[0][0].dtype),
++                    canonical_dtype(inputs[1][0].dtype),
++                ],
++                descriptor,
++                count=output_count,
++                m=left_elements,
++                k=right_elements,
++                predicate=predicate,
+             )
+-            if _is_scalar(output_ref.type):
+-                values = [values]
+             environment[output_ref.name] = (output_ref.type, values)
+             return
+         if name == "identity":
+@@ -1528,31 +1861,41 @@ class Sve256Runtime:
+         elif name in ("reduce_sum", "reduce_max", "reduce_mean"):
+             values = self._execute_reduction(name, inputs[0], output_ref.type, plan, artifact)
+         elif name == "broadcast":
+-            expanded = _broadcast_values(
+-                _materialize_values(inputs[0][1], "SVE256 broadcast"),
+-                inputs[0][0],
+-                output_ref.type,
+-                "SVE256 broadcast",
++            # Native broadcast: raw storage plus output-rank strides; the ELF
++            # performs every source lookup, including scalar and rank-delta
++            # broadcast, so no host pre-expansion exists.
++            descriptor, input_elements, output_count = _broadcast_descriptor_bytes(
++                inputs[0][0], output_ref.type, "SVE256 broadcast"
++            )
++            values = self._run_control_runner(
++                artifact,
++                "broadcast",
++                dtype,
++                [inputs[0][1]],
++                [canonical_dtype(inputs[0][0].dtype)],
++                descriptor,
++                count=output_count,
++                m=input_elements,
+             )
+-            values = self._run_runner(artifact, "broadcast", dtype, [expanded], plan.element_count)
+         elif name == "where":
+-            condition, true_value, false_value = inputs
+-            condition_values, true_values, false_values = _where_values(
+-                _materialize_values(condition[1], "SVE256 where.condition"),
+-                condition[0],
+-                _materialize_values(true_value[1], "SVE256 where.true"),
+-                true_value[0],
+-                _materialize_values(false_value[1], "SVE256 where.false"),
+-                false_value[0],
+-                output_ref.type,
+-                "SVE256 where",
++            # Native where: bool condition bytes and raw selected values are
++            # sent with the broadcast strides; the ELF performs the select.
++            descriptor, condition_elements, _true_elements, _false_elements, output_count = (
++                _where_descriptor_bytes(inputs, output_ref.type, "SVE256 where")
+             )
+-            values = self._run_runner(
++            values = self._run_control_runner(
+                 artifact,
+                 "where",
+                 dtype,
+-                [[1.0 if item else 0.0 for item in condition_values], true_values, false_values],
+-                plan.element_count,
++                [inputs[0][1], inputs[1][1], inputs[2][1]],
++                [
++                    canonical_dtype(inputs[0][0].dtype),
++                    canonical_dtype(inputs[1][0].dtype),
++                    canonical_dtype(inputs[2][0].dtype),
++                ],
++                descriptor,
++                count=output_count,
++                m=condition_elements,
+             )
+         elif name == "matmul":
+             matmul = plan.matmul
+diff --git a/python/pypto/compiler/targets/cpu_sve256.py b/python/pypto/compiler/targets/cpu_sve256.py
+index 9009b6bd4..5d2f596d2 100644
+--- a/python/pypto/compiler/targets/cpu_sve256.py
++++ b/python/pypto/compiler/targets/cpu_sve256.py
+@@ -34,7 +34,7 @@ from pypto.target._utils import mapping_copy, sha256_bytes, sha256_text
+ 
+ ARTIFACT_PAYLOAD_VERSION = 1
+ DEFAULT_ARTIFACT_FORMAT = "pypto-x.cpu.sve256"
+-RUNNER_PROTOCOL = "pypto-x.cpu.sve256.runner.v4"
++RUNNER_PROTOCOL = "pypto-x.cpu.sve256.runner.v5"
+ 
+ 
+ _NATIVE_SOURCE = r'''
+@@ -51,9 +51,38 @@ _NATIVE_SOURCE = r'''
+ #define PTX_MAGIC 0x56535850U /* little-endian bytes: PXSV */
+ #define PTX_VERSION 3U
+ #define PTX_INDEX_VERSION 4U
++/* v5 carries compact descriptor payloads for native iota/compare and for
++ * native broadcast/where; v1 remains the legacy host-preexpanded broadcast
++ * and where wire contract and must not be used for iota/compare. */
++#define PTX_CONTROL_VERSION 5U
+ #define PTX_STATUS_OK 0U
+ #define PTX_STATUS_BAD_REQUEST 2U
+ #define PTX_STATUS_RUNTIME 3U
++
++/* Control-wire dtype codes.  0 and 1 keep the historical float32/bf16 wire
++ * meanings; 2/3 remain cast-only codes. */
++#define PTX_DTYPE_F32 0U
++#define PTX_DTYPE_BF16 1U
++#define PTX_DTYPE_I32 4U
++#define PTX_DTYPE_I64 5U
++#define PTX_DTYPE_BOOL 6U
++#define PTX_DTYPE_I8 7U
++#define PTX_DTYPE_U8 8U
++#define PTX_DTYPE_I16 9U
++#define PTX_DTYPE_U16 10U
++#define PTX_DTYPE_U32 11U
++#define PTX_DTYPE_U64 12U
++#define PTX_CONTROL_MAX_RANK 64U
++#define PTX_IOTA_DESCRIPTOR_BYTES 64U
++#define PTX_COMPARE_DESCRIPTOR_HEADER_BYTES 56U
++#define PTX_EXPAND_DESCRIPTOR_HEADER_BYTES 40U
++#define PTX_WHERE_DESCRIPTOR_HEADER_BYTES 64U
++#define PTX_PREDICATE_EQ 0U
++#define PTX_PREDICATE_NE 1U
++#define PTX_PREDICATE_LT 2U
++#define PTX_PREDICATE_LE 3U
++#define PTX_PREDICATE_GT 4U
++#define PTX_PREDICATE_GE 5U
+ #ifndef PTX_VARIANT
+ #define PTX_VARIANT "unknown"
+ #endif
+@@ -77,6 +106,8 @@ __attribute__((used, visibility("default"))) const char *ptx_sve256_math_fallbac
+     "scalar_math_lane_fallback:exp,sigmoid,silu,softplus";
+ __attribute__((used, visibility("default"))) const char *ptx_sve256_indexing_fallback =
+     "scalar_indexing_lane_fallback:bf16_reorder";
++__attribute__((used, visibility("default"))) const char *ptx_sve256_control_operations =
++    "native_iota_compare_broadcast_where";
+ 
+ enum { PTX_COPY = 0, PTX_NEG = 1, PTX_ADD = 2, PTX_SUB = 3,
+        PTX_MUL = 4, PTX_DIV = 5, PTX_REDUCE_SUM = 6,
+@@ -87,7 +118,7 @@ enum { PTX_COPY = 0, PTX_NEG = 1, PTX_ADD = 2, PTX_SUB = 3,
+        PTX_RESHAPE = 18, PTX_VIEW = 19, PTX_CONTIGUOUS = 20,
+        PTX_TRANSPOSE = 21, PTX_SLICE = 22,
+        PTX_SPLIT = 23, PTX_CONCAT = 24, PTX_GATHER = 25,
+-       PTX_EMBEDDING = 26 };
++       PTX_EMBEDDING = 26, PTX_IOTA = 27, PTX_COMPARE = 28 };
+ 
+ typedef struct {
+     uint32_t magic;
+@@ -221,7 +252,9 @@ static int write_all(const void *source, size_t size) {
+ static int ptx_error_response(uint32_t status, uint32_t dtype, uint32_t version) {
+     PtxResponse response;
+     response.magic = PTX_MAGIC;
+-    response.version = version == 1U ? 1U : (version == PTX_INDEX_VERSION ? PTX_INDEX_VERSION : PTX_VERSION);
++    response.version = (version == 1U || version == PTX_VERSION ||
++                        version == PTX_INDEX_VERSION || version == PTX_CONTROL_VERSION)
++        ? version : PTX_VERSION;
+     response.status = status;
+     response.dtype = dtype <= 1 ? dtype : 0;
+     response.count = 0;
+@@ -259,7 +292,7 @@ static int ptx_size_mul(size_t left, size_t right, size_t *result) {
+ }
+ 
+ static int ptx_valid_operation(uint32_t operation) {
+-    return operation <= PTX_EMBEDDING;
++    return operation <= PTX_COMPARE;
+ }
+ 
+ static int ptx_is_layout_operation(uint32_t operation) {
+@@ -270,13 +303,38 @@ static int ptx_is_indexing_operation(uint32_t operation) {
+     return operation >= PTX_SPLIT && operation <= PTX_EMBEDDING;
+ }
+ 
+-static int ptx_validate_request(const PtxRequest *request, size_t *item_size,
++static int ptx_is_position_operation(uint32_t operation) {
++    return operation == PTX_IOTA || operation == PTX_COMPARE;
++}
++
++static int ptx_is_expand_operation(uint32_t operation) {
++    return operation == PTX_BROADCAST || operation == PTX_WHERE;
++}
++
++static int ptx_validate_control_request(const PtxRequest *request, const unsigned char *payload,
++                                        size_t payload_length, size_t *item_size,
++                                        size_t *payload_size, uint64_t *output_count,
++                                        size_t *result_size);
++
++static int ptx_validate_request(const PtxRequest *request, const unsigned char *payload,
++                                size_t payload_length, size_t *item_size,
+                                 size_t *payload_size, uint64_t *output_count,
+                                 size_t *result_size) {
+     uint64_t left_count = 0, right_count = 0, output_count_u64 = 0;
+     size_t left_size, right_size, count_size, output_size;
+     int status;
+-    if (request->dtype > 3 || !ptx_valid_operation(request->operation) ||
++    if (!ptx_valid_operation(request->operation))
++        return PTX_STATUS_BAD_REQUEST;
++    if (request->version == PTX_CONTROL_VERSION) {
++        if (!ptx_is_position_operation(request->operation) &&
++            !ptx_is_expand_operation(request->operation))
++            return PTX_STATUS_BAD_REQUEST;
++        return ptx_validate_control_request(request, payload, payload_length, item_size,
++                                            payload_size, output_count, result_size);
++    }
++    if (ptx_is_position_operation(request->operation))
++        return PTX_STATUS_BAD_REQUEST;
++    if (request->dtype > 3 ||
+         (!ptx_is_indexing_operation(request->operation) && (request->reserved || request->reserved2)) ||
+         (ptx_is_indexing_operation(request->operation) && request->operation <= PTX_CONCAT && request->reserved))
+         return PTX_STATUS_BAD_REQUEST;
+@@ -440,6 +498,585 @@ static uint64_t ptx_read_u64(const unsigned char *bytes) {
+     return value;
+ }
+ 
++/* ------------------------------------------------------------------ *
++ * Native control wire v5: iota / compare / broadcast / where.
++ *
++ * The descriptors are compact, little-endian, rank-sized schedules.  The
++ * host sends raw tensor bytes plus these descriptors; every per-element
++ * read, broadcast offset, comparison, and selection happens in this ELF.
++ * iota and compare never have a host-reference path here.
++ * ------------------------------------------------------------------ */
++
++typedef struct {
++    uint32_t rank;
++    uint32_t dtype;
++    uint64_t output_elements;
++    int64_t start;
++    int64_t step;
++    uint64_t inner_stride;
++    uint64_t dimension;
++} PtxIotaDescriptor;
++
++typedef struct {
++    uint32_t rank;
++    uint32_t left_dtype;
++    uint32_t right_dtype;
++    uint32_t predicate;
++    uint64_t left_elements;
++    uint64_t right_elements;
++    uint64_t output_elements;
++    uint64_t left_strides[PTX_CONTROL_MAX_RANK];
++    uint64_t right_strides[PTX_CONTROL_MAX_RANK];
++    uint64_t output_shape[PTX_CONTROL_MAX_RANK];
++} PtxCompareDescriptor;
++
++typedef struct {
++    uint32_t rank;
++    uint32_t dtype;
++    uint64_t input_elements;
++    uint64_t output_elements;
++    uint64_t input_strides[PTX_CONTROL_MAX_RANK];
++    uint64_t output_shape[PTX_CONTROL_MAX_RANK];
++} PtxExpandDescriptor;
++
++typedef struct {
++    uint32_t rank;
++    uint32_t condition_dtype;
++    uint32_t value_dtype;
++    uint32_t output_dtype;
++    uint64_t condition_elements;
++    uint64_t true_elements;
++    uint64_t false_elements;
++    uint64_t output_elements;
++    uint64_t condition_strides[PTX_CONTROL_MAX_RANK];
++    uint64_t true_strides[PTX_CONTROL_MAX_RANK];
++    uint64_t false_strides[PTX_CONTROL_MAX_RANK];
++    uint64_t output_shape[PTX_CONTROL_MAX_RANK];
++} PtxWhereDescriptor;
++
++static uint32_t ptx_dtype_item_size(uint32_t dtype) {
++    switch (dtype) {
++    case PTX_DTYPE_F32: case PTX_DTYPE_I32: case PTX_DTYPE_U32: return 4U;
++    case PTX_DTYPE_BF16: case PTX_DTYPE_I16: case PTX_DTYPE_U16: return 2U;
++    case PTX_DTYPE_I64: case PTX_DTYPE_U64: return 8U;
++    case PTX_DTYPE_BOOL: case PTX_DTYPE_I8: case PTX_DTYPE_U8: return 1U;
++    default: return 0U;
++    }
++}
++
++static int ptx_is_float_dtype(uint32_t dtype) {
++    return dtype == PTX_DTYPE_F32 || dtype == PTX_DTYPE_BF16;
++}
++
++static int ptx_is_integer_dtype(uint32_t dtype) {
++    return dtype == PTX_DTYPE_I32 || dtype == PTX_DTYPE_I64 ||
++           dtype == PTX_DTYPE_BOOL || dtype == PTX_DTYPE_I8 ||
++           dtype == PTX_DTYPE_U8 || dtype == PTX_DTYPE_I16 ||
++           dtype == PTX_DTYPE_U16 || dtype == PTX_DTYPE_U32 ||
++           dtype == PTX_DTYPE_U64;
++}
++
++static int ptx_is_signed_integer_dtype(uint32_t dtype) {
++    return dtype == PTX_DTYPE_I32 || dtype == PTX_DTYPE_I64 ||
++           dtype == PTX_DTYPE_I8 || dtype == PTX_DTYPE_I16;
++}
++
++/* Validate that every broadcast source offset stays inside the declared
++ * source element count.  This is a rank-sized O(rank) check, never a
++ * per-element host expansion. */
++static int ptx_validate_broadcast_offsets(const uint64_t *shape, const uint64_t *strides,
++                                          uint32_t rank, uint64_t elements) {
++    uint64_t max_offset = 0;
++    uint32_t axis;
++    /* An empty output never reads the source: output_elements is zero and
++     * the source may legitimately still hold elements (e.g. (1,3)->(0,3)). */
++    for (axis = 0; axis < rank; ++axis) {
++        if (shape[axis] == 0) return PTX_STATUS_OK;
++    }
++    if (elements == 0) return PTX_STATUS_OK;
++    for (axis = 0; axis < rank; ++axis) {
++        uint64_t term;
++        if (ptx_u64_mul(shape[axis] - 1U, strides[axis], &term) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_u64_add(max_offset, term, &max_offset) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++    }
++    if (max_offset >= elements) return PTX_STATUS_BAD_REQUEST;
++    return PTX_STATUS_OK;
++}
++
++static int ptx_validate_shape_product(const uint64_t *shape, uint32_t rank,
++                                      uint64_t expected) {
++    uint64_t product = 1;
++    uint32_t axis;
++    for (axis = 0; axis < rank; ++axis) {
++        if (ptx_u64_mul(product, shape[axis], &product) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++    }
++    return product == expected ? PTX_STATUS_OK : PTX_STATUS_BAD_REQUEST;
++}
++
++static int ptx_decode_iota_descriptor(const unsigned char *bytes, size_t length,
++                                      PtxIotaDescriptor *descriptor) {
++    if (length < PTX_IOTA_DESCRIPTOR_BYTES || memcmp(bytes, "PXIO", 4) != 0 ||
++        ptx_read_u32(bytes + 4) != 1U)
++        return PTX_STATUS_BAD_REQUEST;
++    memset(descriptor, 0, sizeof(*descriptor));
++    descriptor->rank = ptx_read_u32(bytes + 20);
++    descriptor->dtype = ptx_read_u32(bytes + 12);
++    descriptor->output_elements = ptx_read_u64(bytes + 24);
++    descriptor->start = (int64_t)ptx_read_u64(bytes + 32);
++    descriptor->step = (int64_t)ptx_read_u64(bytes + 40);
++    descriptor->inner_stride = ptx_read_u64(bytes + 48);
++    descriptor->dimension = ptx_read_u64(bytes + 56);
++    if (ptx_read_u32(bytes + 16) != 0U) return PTX_STATUS_BAD_REQUEST;
++    if (descriptor->rank == 0U || descriptor->rank > PTX_CONTROL_MAX_RANK)
++        return PTX_STATUS_BAD_REQUEST;
++    if (ptx_read_u32(bytes + 8) >= descriptor->rank) return PTX_STATUS_BAD_REQUEST;
++    if (descriptor->dtype != PTX_DTYPE_I32 && descriptor->dtype != PTX_DTYPE_I64)
++        return PTX_STATUS_BAD_REQUEST;
++    if (descriptor->output_elements != 0U &&
++        (descriptor->dimension == 0U || descriptor->inner_stride == 0U ||
++         descriptor->inner_stride > descriptor->output_elements))
++        return PTX_STATUS_BAD_REQUEST;
++    return PTX_STATUS_OK;
++}
++
++static int ptx_decode_compare_descriptor(const unsigned char *bytes, size_t length,
++                                         PtxCompareDescriptor *descriptor) {
++    uint32_t rank, axis;
++    size_t expected;
++    if (length < PTX_COMPARE_DESCRIPTOR_HEADER_BYTES || memcmp(bytes, "PXCP", 4) != 0 ||
++        ptx_read_u32(bytes + 4) != 1U)
++        return PTX_STATUS_BAD_REQUEST;
++    rank = ptx_read_u32(bytes + 8);
++    if (rank > PTX_CONTROL_MAX_RANK) return PTX_STATUS_BAD_REQUEST;
++    if (ptx_size_mul(rank, sizeof(uint64_t), &expected) != PTX_STATUS_OK ||
++        ptx_size_mul(expected, 3U, &expected) != PTX_STATUS_OK ||
++        ptx_size_add(expected, PTX_COMPARE_DESCRIPTOR_HEADER_BYTES, &expected) != PTX_STATUS_OK)
++        return PTX_STATUS_BAD_REQUEST;
++    if (length < expected) return PTX_STATUS_BAD_REQUEST;
++    memset(descriptor, 0, sizeof(*descriptor));
++    descriptor->rank = rank;
++    descriptor->left_dtype = ptx_read_u32(bytes + 12);
++    descriptor->right_dtype = ptx_read_u32(bytes + 16);
++    descriptor->predicate = ptx_read_u32(bytes + 20);
++    if (ptx_read_u32(bytes + 24) != 0U || ptx_read_u32(bytes + 28) != 0U)
++        return PTX_STATUS_BAD_REQUEST;
++    descriptor->left_elements = ptx_read_u64(bytes + 32);
++    descriptor->right_elements = ptx_read_u64(bytes + 40);
++    descriptor->output_elements = ptx_read_u64(bytes + 48);
++    for (axis = 0; axis < rank; ++axis) {
++        descriptor->left_strides[axis] = ptx_read_u64(bytes + 56 + axis * 8U);
++        descriptor->right_strides[axis] = ptx_read_u64(bytes + 56 + (rank + axis) * 8U);
++        descriptor->output_shape[axis] = ptx_read_u64(bytes + 56 + (2U * rank + axis) * 8U);
++    }
++    if (descriptor->left_dtype != descriptor->right_dtype)
++        return PTX_STATUS_BAD_REQUEST;
++    if (!ptx_is_float_dtype(descriptor->left_dtype) &&
++        !ptx_is_integer_dtype(descriptor->left_dtype))
++        return PTX_STATUS_BAD_REQUEST;
++    if (descriptor->predicate > PTX_PREDICATE_GE)
++        return PTX_STATUS_BAD_REQUEST;
++    if (descriptor->left_dtype == PTX_DTYPE_BOOL &&
++        descriptor->predicate != PTX_PREDICATE_EQ &&
++        descriptor->predicate != PTX_PREDICATE_NE)
++        return PTX_STATUS_BAD_REQUEST;
++    if (ptx_validate_shape_product(descriptor->output_shape, rank,
++                                   descriptor->output_elements) != PTX_STATUS_OK)
++        return PTX_STATUS_BAD_REQUEST;
++    if (ptx_validate_broadcast_offsets(descriptor->output_shape, descriptor->left_strides,
++                                       rank, descriptor->left_elements) != PTX_STATUS_OK ||
++        ptx_validate_broadcast_offsets(descriptor->output_shape, descriptor->right_strides,
++                                       rank, descriptor->right_elements) != PTX_STATUS_OK)
++        return PTX_STATUS_BAD_REQUEST;
++    return PTX_STATUS_OK;
++}
++
++static int ptx_decode_expand_descriptor(const unsigned char *bytes, size_t length,
++                                        PtxExpandDescriptor *descriptor) {
++    uint32_t rank, axis;
++    size_t expected;
++    if (length < PTX_EXPAND_DESCRIPTOR_HEADER_BYTES || memcmp(bytes, "PXBD", 4) != 0 ||
++        ptx_read_u32(bytes + 4) != 1U)
++        return PTX_STATUS_BAD_REQUEST;
++    rank = ptx_read_u32(bytes + 8);
++    if (rank > PTX_CONTROL_MAX_RANK) return PTX_STATUS_BAD_REQUEST;
++    if (ptx_size_mul(rank, sizeof(uint64_t), &expected) != PTX_STATUS_OK ||
++        ptx_size_mul(expected, 2U, &expected) != PTX_STATUS_OK ||
++        ptx_size_add(expected, PTX_EXPAND_DESCRIPTOR_HEADER_BYTES, &expected) != PTX_STATUS_OK)
++        return PTX_STATUS_BAD_REQUEST;
++    if (length < expected) return PTX_STATUS_BAD_REQUEST;
++    memset(descriptor, 0, sizeof(*descriptor));
++    descriptor->rank = rank;
++    descriptor->dtype = ptx_read_u32(bytes + 12);
++    if (ptx_read_u32(bytes + 16) != 0U || ptx_read_u32(bytes + 20) != 0U)
++        return PTX_STATUS_BAD_REQUEST;
++    descriptor->input_elements = ptx_read_u64(bytes + 24);
++    descriptor->output_elements = ptx_read_u64(bytes + 32);
++    for (axis = 0; axis < rank; ++axis) {
++        descriptor->input_strides[axis] = ptx_read_u64(bytes + 40 + axis * 8U);
++        descriptor->output_shape[axis] = ptx_read_u64(bytes + 40 + (rank + axis) * 8U);
++    }
++    if (!ptx_is_float_dtype(descriptor->dtype)) return PTX_STATUS_BAD_REQUEST;
++    if (ptx_validate_shape_product(descriptor->output_shape, rank,
++                                   descriptor->output_elements) != PTX_STATUS_OK)
++        return PTX_STATUS_BAD_REQUEST;
++    if (ptx_validate_broadcast_offsets(descriptor->output_shape, descriptor->input_strides,
++                                       rank, descriptor->input_elements) != PTX_STATUS_OK)
++        return PTX_STATUS_BAD_REQUEST;
++    return PTX_STATUS_OK;
++}
++
++static int ptx_decode_where_descriptor(const unsigned char *bytes, size_t length,
++                                       PtxWhereDescriptor *descriptor) {
++    uint32_t rank, axis;
++    size_t expected;
++    if (length < PTX_WHERE_DESCRIPTOR_HEADER_BYTES || memcmp(bytes, "PXWH", 4) != 0 ||
++        ptx_read_u32(bytes + 4) != 1U)
++        return PTX_STATUS_BAD_REQUEST;
++    rank = ptx_read_u32(bytes + 8);
++    if (rank > PTX_CONTROL_MAX_RANK) return PTX_STATUS_BAD_REQUEST;
++    if (ptx_size_mul(rank, sizeof(uint64_t), &expected) != PTX_STATUS_OK ||
++        ptx_size_mul(expected, 4U, &expected) != PTX_STATUS_OK ||
++        ptx_size_add(expected, PTX_WHERE_DESCRIPTOR_HEADER_BYTES, &expected) != PTX_STATUS_OK)
++        return PTX_STATUS_BAD_REQUEST;
++    if (length < expected) return PTX_STATUS_BAD_REQUEST;
++    memset(descriptor, 0, sizeof(*descriptor));
++    descriptor->rank = rank;
++    descriptor->condition_dtype = ptx_read_u32(bytes + 12);
++    descriptor->value_dtype = ptx_read_u32(bytes + 16);
++    descriptor->output_dtype = ptx_read_u32(bytes + 20);
++    if (ptx_read_u32(bytes + 24) != 0U || ptx_read_u32(bytes + 28) != 0U)
++        return PTX_STATUS_BAD_REQUEST;
++    descriptor->condition_elements = ptx_read_u64(bytes + 32);
++    descriptor->true_elements = ptx_read_u64(bytes + 40);
++    descriptor->false_elements = ptx_read_u64(bytes + 48);
++    descriptor->output_elements = ptx_read_u64(bytes + 56);
++    for (axis = 0; axis < rank; ++axis) {
++        descriptor->condition_strides[axis] = ptx_read_u64(bytes + 64 + axis * 8U);
++        descriptor->true_strides[axis] = ptx_read_u64(bytes + 64 + (rank + axis) * 8U);
++        descriptor->false_strides[axis] = ptx_read_u64(bytes + 64 + (2U * rank + axis) * 8U);
++        descriptor->output_shape[axis] = ptx_read_u64(bytes + 64 + (3U * rank + axis) * 8U);
++    }
++    if (descriptor->condition_dtype != PTX_DTYPE_BOOL)
++        return PTX_STATUS_BAD_REQUEST;
++    if (!ptx_is_float_dtype(descriptor->value_dtype) ||
++        descriptor->value_dtype != descriptor->output_dtype)
++        return PTX_STATUS_BAD_REQUEST;
++    if (ptx_validate_shape_product(descriptor->output_shape, rank,
++                                   descriptor->output_elements) != PTX_STATUS_OK)
++        return PTX_STATUS_BAD_REQUEST;
++    if (ptx_validate_broadcast_offsets(descriptor->output_shape,
++                                       descriptor->condition_strides, rank,
++                                       descriptor->condition_elements) != PTX_STATUS_OK ||
++        ptx_validate_broadcast_offsets(descriptor->output_shape, descriptor->true_strides,
++                                       rank, descriptor->true_elements) != PTX_STATUS_OK ||
++        ptx_validate_broadcast_offsets(descriptor->output_shape, descriptor->false_strides,
++                                       rank, descriptor->false_elements) != PTX_STATUS_OK)
++        return PTX_STATUS_BAD_REQUEST;
++    return PTX_STATUS_OK;
++}
++
++static int ptx_validate_control_request(const PtxRequest *request, const unsigned char *payload,
++                                        size_t payload_length, size_t *item_size,
++                                        size_t *payload_size, uint64_t *output_count,
++                                        size_t *result_size) {
++    size_t descriptor_bytes, data_size, output_size;
++    if (request->operation == PTX_IOTA) {
++        PtxIotaDescriptor descriptor;
++        if (ptx_decode_iota_descriptor(payload, payload_length, &descriptor) != PTX_STATUS_OK ||
++            request->dtype != descriptor.dtype || request->reserved || request->reserved2 ||
++            request->m != descriptor.output_elements || request->count != descriptor.output_elements ||
++            request->k != PTX_IOTA_DESCRIPTOR_BYTES ||
++            ptx_wire_hash(payload, PTX_IOTA_DESCRIPTOR_BYTES) != request->n)
++            return PTX_STATUS_BAD_REQUEST;
++        *item_size = descriptor.dtype == PTX_DTYPE_I32 ? sizeof(int32_t) : sizeof(int64_t);
++        *payload_size = PTX_IOTA_DESCRIPTOR_BYTES;
++        *output_count = request->count;
++        if (payload_length != *payload_size ||
++            ptx_u64_to_size(*output_count, &output_size) != PTX_STATUS_OK ||
++            ptx_size_mul(output_size, *item_size, result_size) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        return PTX_STATUS_OK;
++    }
++    if (request->operation == PTX_COMPARE) {
++        PtxCompareDescriptor descriptor;
++        size_t left_bytes, right_bytes;
++        uint32_t left_item, right_item;
++        if (ptx_decode_compare_descriptor(payload, payload_length, &descriptor) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        descriptor_bytes = PTX_COMPARE_DESCRIPTOR_HEADER_BYTES +
++            (size_t)descriptor.rank * 3U * sizeof(uint64_t);
++        left_item = ptx_dtype_item_size(descriptor.left_dtype);
++        right_item = ptx_dtype_item_size(descriptor.right_dtype);
++        if (request->dtype != PTX_DTYPE_BOOL || request->reserved != descriptor.predicate ||
++            request->reserved2 != descriptor_bytes || !left_item || !right_item ||
++            request->m != descriptor.left_elements ||
++            request->k != descriptor.right_elements ||
++            request->count != descriptor.output_elements ||
++            ptx_wire_hash(payload, descriptor_bytes) != request->n)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_u64_to_size(descriptor.left_elements, &left_bytes) != PTX_STATUS_OK ||
++            ptx_size_mul(left_bytes, left_item, &left_bytes) != PTX_STATUS_OK ||
++            ptx_u64_to_size(descriptor.right_elements, &right_bytes) != PTX_STATUS_OK ||
++            ptx_size_mul(right_bytes, right_item, &right_bytes) != PTX_STATUS_OK ||
++            ptx_size_add(descriptor_bytes, left_bytes, &data_size) != PTX_STATUS_OK ||
++            ptx_size_add(data_size, right_bytes, payload_size) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        if (payload_length != *payload_size) return PTX_STATUS_BAD_REQUEST;
++        *item_size = 1U;
++        *output_count = request->count;
++        if (ptx_u64_to_size(*output_count, &output_size) != PTX_STATUS_OK ||
++            ptx_size_mul(output_size, *item_size, result_size) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        return PTX_STATUS_OK;
++    }
++    if (request->operation == PTX_BROADCAST) {
++        PtxExpandDescriptor descriptor;
++        size_t input_bytes;
++        uint32_t item;
++        if (ptx_decode_expand_descriptor(payload, payload_length, &descriptor) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        descriptor_bytes = PTX_EXPAND_DESCRIPTOR_HEADER_BYTES +
++            (size_t)descriptor.rank * 2U * sizeof(uint64_t);
++        item = ptx_dtype_item_size(descriptor.dtype);
++        if (request->dtype != descriptor.dtype || request->reserved || request->reserved2 ||
++            request->m != descriptor.input_elements ||
++            request->count != descriptor.output_elements ||
++            request->k != descriptor_bytes || !item ||
++            ptx_wire_hash(payload, descriptor_bytes) != request->n)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_u64_to_size(descriptor.input_elements, &input_bytes) != PTX_STATUS_OK ||
++            ptx_size_mul(input_bytes, item, &input_bytes) != PTX_STATUS_OK ||
++            ptx_size_add(descriptor_bytes, input_bytes, payload_size) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        if (payload_length != *payload_size) return PTX_STATUS_BAD_REQUEST;
++        *item_size = item;
++        *output_count = request->count;
++        if (ptx_u64_to_size(*output_count, &output_size) != PTX_STATUS_OK ||
++            ptx_size_mul(output_size, *item_size, result_size) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        return PTX_STATUS_OK;
++    }
++    if (request->operation == PTX_WHERE) {
++        PtxWhereDescriptor descriptor;
++        size_t condition_bytes, true_bytes, false_bytes;
++        uint32_t item;
++        if (ptx_decode_where_descriptor(payload, payload_length, &descriptor) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        descriptor_bytes = PTX_WHERE_DESCRIPTOR_HEADER_BYTES +
++            (size_t)descriptor.rank * 4U * sizeof(uint64_t);
++        item = ptx_dtype_item_size(descriptor.output_dtype);
++        if (request->dtype != descriptor.output_dtype || request->reserved ||
++            request->reserved2 != 0U || request->m != descriptor.condition_elements ||
++            request->count != descriptor.output_elements ||
++            request->k != descriptor_bytes || !item ||
++            ptx_wire_hash(payload, descriptor_bytes) != request->n)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_u64_to_size(descriptor.condition_elements, &condition_bytes) != PTX_STATUS_OK ||
++            ptx_u64_to_size(descriptor.true_elements, &true_bytes) != PTX_STATUS_OK ||
++            ptx_size_mul(true_bytes, item, &true_bytes) != PTX_STATUS_OK ||
++            ptx_u64_to_size(descriptor.false_elements, &false_bytes) != PTX_STATUS_OK ||
++            ptx_size_mul(false_bytes, item, &false_bytes) != PTX_STATUS_OK ||
++            ptx_size_add(descriptor_bytes, condition_bytes, &data_size) != PTX_STATUS_OK ||
++            ptx_size_add(data_size, true_bytes, &data_size) != PTX_STATUS_OK ||
++            ptx_size_add(data_size, false_bytes, payload_size) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        if (payload_length != *payload_size) return PTX_STATUS_BAD_REQUEST;
++        *item_size = item;
++        *output_count = request->count;
++        if (ptx_u64_to_size(*output_count, &output_size) != PTX_STATUS_OK ||
++            ptx_size_mul(output_size, *item_size, result_size) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        return PTX_STATUS_OK;
++    }
++    return PTX_STATUS_BAD_REQUEST;
++}
++
++static void ptx_odometer_advance(uint64_t *coordinates, const uint64_t *shape,
++                                 uint32_t rank) {
++    uint32_t axis = rank;
++    while (axis > 0) {
++        --axis;
++        coordinates[axis] += 1U;
++        if (coordinates[axis] < shape[axis]) return;
++        coordinates[axis] = 0;
++    }
++}
++
++static uint64_t ptx_linear_offset(const uint64_t *coordinates, const uint64_t *strides,
++                                  uint32_t rank) {
++    uint64_t offset = 0;
++    uint32_t axis;
++    for (axis = 0; axis < rank; ++axis)
++        offset += coordinates[axis] * strides[axis];
++    return offset;
++}
++
++static int ptx_store_integer(uint32_t dtype, unsigned char *output, uint64_t index,
++                             int64_t value) {
++    if (dtype == PTX_DTYPE_I32) {
++        int32_t narrowed = (int32_t)value;
++        memcpy(output + index * 4U, &narrowed, sizeof(narrowed));
++        return PTX_STATUS_OK;
++    }
++    if (dtype == PTX_DTYPE_I64) {
++        memcpy(output + index * 8U, &value, sizeof(value));
++        return PTX_STATUS_OK;
++    }
++    return PTX_STATUS_BAD_REQUEST;
++}
++
++static int ptx_iota_run(const PtxIotaDescriptor *descriptor, unsigned char *result,
++                        uint64_t count) {
++    uint64_t index;
++    for (index = 0; index < count; ++index) {
++        uint64_t coordinate = (index / descriptor->inner_stride) % descriptor->dimension;
++        int64_t value = descriptor->start + (int64_t)coordinate * descriptor->step;
++        if (ptx_store_integer(descriptor->dtype, result, index, value) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++    }
++    return PTX_STATUS_OK;
++}
++
++static int64_t ptx_load_signed(const unsigned char *data, uint64_t offset, uint32_t dtype) {
++    if (dtype == PTX_DTYPE_I8) {
++        int8_t value; memcpy(&value, data + offset, sizeof(value)); return (int64_t)value;
++    }
++    if (dtype == PTX_DTYPE_I16) {
++        int16_t value; memcpy(&value, data + offset, sizeof(value)); return (int64_t)value;
++    }
++    if (dtype == PTX_DTYPE_I32) {
++        int32_t value; memcpy(&value, data + offset, sizeof(value)); return (int64_t)value;
++    }
++    {
++        int64_t value; memcpy(&value, data + offset, sizeof(value)); return value;
++    }
++}
++
++static uint64_t ptx_load_unsigned(const unsigned char *data, uint64_t offset, uint32_t dtype) {
++    if (dtype == PTX_DTYPE_BOOL || dtype == PTX_DTYPE_U8) return data[offset];
++    if (dtype == PTX_DTYPE_U16) {
++        uint16_t value; memcpy(&value, data + offset, sizeof(value)); return value;
++    }
++    if (dtype == PTX_DTYPE_U32) {
++        uint32_t value; memcpy(&value, data + offset, sizeof(value)); return value;
++    }
++    {
++        uint64_t value; memcpy(&value, data + offset, sizeof(value)); return value;
++    }
++}
++
++static float ptx_load_float(const unsigned char *data, uint64_t offset, uint32_t dtype) {
++    if (dtype == PTX_DTYPE_BF16) {
++        uint16_t bits; memcpy(&bits, data + offset, sizeof(bits));
++        return ptx_bf16_to_f32(bits);
++    }
++    {
++        float value; memcpy(&value, data + offset, sizeof(value)); return value;
++    }
++}
++
++static int ptx_predicate_satisfied(uint32_t predicate, int comparison) {
++    /* comparison: -1 left<right, 0 equal, 1 left>right, 2 unordered (NaN) */
++    if (predicate == PTX_PREDICATE_EQ) return comparison == 0;
++    if (predicate == PTX_PREDICATE_NE) return comparison != 0;
++    if (comparison > 1) return 0; /* NaN fails every ordered predicate */
++    if (predicate == PTX_PREDICATE_LT) return comparison < 0;
++    if (predicate == PTX_PREDICATE_LE) return comparison <= 0;
++    if (predicate == PTX_PREDICATE_GT) return comparison > 0;
++    return comparison >= 0;
++}
++
++static int ptx_float_comparison(float left, float right) {
++    if (left < right) return -1;
++    if (left > right) return 1;
++    if (left == right) return 0;
++    return 2;
++}
++
++static int ptx_compare_run(const PtxCompareDescriptor *descriptor,
++                           const unsigned char *payload, size_t descriptor_bytes,
++                           unsigned char *result, uint64_t count) {
++    const unsigned char *left_data = payload + descriptor_bytes;
++    const unsigned char *right_data =
++        left_data + descriptor->left_elements * ptx_dtype_item_size(descriptor->left_dtype);
++    uint64_t coordinates[PTX_CONTROL_MAX_RANK];
++    uint64_t index;
++    memset(coordinates, 0, sizeof(coordinates));
++    for (index = 0; index < count; ++index) {
++        uint64_t left_offset = ptx_linear_offset(coordinates, descriptor->left_strides,
++                                                 descriptor->rank);
++        uint64_t right_offset = ptx_linear_offset(coordinates, descriptor->right_strides,
++                                                  descriptor->rank);
++        int comparison;
++        if (ptx_is_float_dtype(descriptor->left_dtype)) {
++            comparison = ptx_float_comparison(
++                ptx_load_float(left_data, left_offset * ptx_dtype_item_size(descriptor->left_dtype),
++                               descriptor->left_dtype),
++                ptx_load_float(right_data, right_offset * ptx_dtype_item_size(descriptor->right_dtype),
++                               descriptor->right_dtype));
++        } else if (ptx_is_signed_integer_dtype(descriptor->left_dtype)) {
++            int64_t left = ptx_load_signed(left_data,
++                left_offset * ptx_dtype_item_size(descriptor->left_dtype), descriptor->left_dtype);
++            int64_t right = ptx_load_signed(right_data,
++                right_offset * ptx_dtype_item_size(descriptor->right_dtype), descriptor->right_dtype);
++            comparison = left < right ? -1 : (left > right ? 1 : 0);
++        } else {
++            uint64_t left = ptx_load_unsigned(left_data,
++                left_offset * ptx_dtype_item_size(descriptor->left_dtype), descriptor->left_dtype);
++            uint64_t right = ptx_load_unsigned(right_data,
++                right_offset * ptx_dtype_item_size(descriptor->right_dtype), descriptor->right_dtype);
++            comparison = left < right ? -1 : (left > right ? 1 : 0);
++        }
++        result[index] = ptx_predicate_satisfied(descriptor->predicate, comparison) ? 1U : 0U;
++        ptx_odometer_advance(coordinates, descriptor->output_shape, descriptor->rank);
++    }
++    return PTX_STATUS_OK;
++}
++
++static int ptx_broadcast_run(const PtxExpandDescriptor *descriptor,
++                             const unsigned char *input, unsigned char *result,
++                             uint64_t count) {
++    uint64_t coordinates[PTX_CONTROL_MAX_RANK];
++    uint64_t index;
++    size_t item = ptx_dtype_item_size(descriptor->dtype);
++    memset(coordinates, 0, sizeof(coordinates));
++    for (index = 0; index < count; ++index) {
++        uint64_t offset = ptx_linear_offset(coordinates, descriptor->input_strides,
++                                            descriptor->rank);
++        memcpy(result + index * item, input + offset * item, item);
++        ptx_odometer_advance(coordinates, descriptor->output_shape, descriptor->rank);
++    }
++    return PTX_STATUS_OK;
++}
++
++static int ptx_where_run(const PtxWhereDescriptor *descriptor, const unsigned char *payload,
++                         size_t descriptor_bytes, unsigned char *result, uint64_t count) {
++    size_t item = ptx_dtype_item_size(descriptor->output_dtype);
++    const unsigned char *condition = payload + descriptor_bytes;
++    const unsigned char *true_data = condition + descriptor->condition_elements;
++    const unsigned char *false_data = true_data + descriptor->true_elements * item;
++    uint64_t coordinates[PTX_CONTROL_MAX_RANK];
++    uint64_t index;
++    memset(coordinates, 0, sizeof(coordinates));
++    for (index = 0; index < count; ++index) {
++        uint64_t condition_offset = ptx_linear_offset(coordinates,
++            descriptor->condition_strides, descriptor->rank);
++        uint64_t true_offset = ptx_linear_offset(coordinates,
++            descriptor->true_strides, descriptor->rank);
++        uint64_t false_offset = ptx_linear_offset(coordinates,
++            descriptor->false_strides, descriptor->rank);
++        const unsigned char *selected = condition[condition_offset]
++            ? true_data + true_offset * item
++            : false_data + false_offset * item;
++        memcpy(result + index * item, selected, item);
++        ptx_odometer_advance(coordinates, descriptor->output_shape, descriptor->rank);
++    }
++    return PTX_STATUS_OK;
++}
++
+ static void ptx_free_layout_descriptor(PtxLayoutDescriptor *descriptor) {
+     free(descriptor->storage);
+     memset(descriptor, 0, sizeof(*descriptor));
+@@ -1333,6 +1970,40 @@ static int ptx_run(const PtxRequest *request, const unsigned char *payload,
+                    unsigned char *result) {
+     uint64_t count = request->count;
+     size_t item_size;
++    if (request->operation == PTX_IOTA) {
++        PtxIotaDescriptor descriptor;
++        if (ptx_decode_iota_descriptor(payload, (size_t)request->k, &descriptor) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        return ptx_iota_run(&descriptor, result, count);
++    }
++    if (request->operation == PTX_COMPARE) {
++        PtxCompareDescriptor descriptor;
++        size_t descriptor_bytes;
++        if (ptx_decode_compare_descriptor(payload, (size_t)request->reserved2,
++                                          &descriptor) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        descriptor_bytes = PTX_COMPARE_DESCRIPTOR_HEADER_BYTES +
++            (size_t)descriptor.rank * 3U * sizeof(uint64_t);
++        return ptx_compare_run(&descriptor, payload, descriptor_bytes, result, count);
++    }
++    if (request->version == PTX_CONTROL_VERSION && request->operation == PTX_BROADCAST) {
++        PtxExpandDescriptor descriptor;
++        size_t descriptor_bytes;
++        if (ptx_decode_expand_descriptor(payload, (size_t)request->k, &descriptor) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        descriptor_bytes = PTX_EXPAND_DESCRIPTOR_HEADER_BYTES +
++            (size_t)descriptor.rank * 2U * sizeof(uint64_t);
++        return ptx_broadcast_run(&descriptor, payload + descriptor_bytes, result, count);
++    }
++    if (request->version == PTX_CONTROL_VERSION && request->operation == PTX_WHERE) {
++        PtxWhereDescriptor descriptor;
++        size_t descriptor_bytes;
++        if (ptx_decode_where_descriptor(payload, (size_t)request->k, &descriptor) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        descriptor_bytes = PTX_WHERE_DESCRIPTOR_HEADER_BYTES +
++            (size_t)descriptor.rank * 4U * sizeof(uint64_t);
++        return ptx_where_run(&descriptor, payload, descriptor_bytes, result, count);
++    }
+     if (request->operation == PTX_CAST) {
+         item_size = request->dtype == 2 ? sizeof(float) : sizeof(uint16_t);
+     } else {
+@@ -1750,23 +2421,37 @@ int main(int argc, char **argv) {
+         free(input); return ptx_error_response(PTX_STATUS_BAD_REQUEST, 0, 1U);
+     }
+     memcpy(&request, input, sizeof(request));
+-    if (request.magic != PTX_MAGIC ||
+-        (request.version != 1U && request.version != PTX_VERSION && request.version != PTX_INDEX_VERSION) ||
+-        (request.version == 1U && ptx_is_layout_operation(request.operation)) ||
++    if (request.magic != PTX_MAGIC || !ptx_valid_operation(request.operation) ||
++        (request.version != 1U && request.version != PTX_VERSION &&
++         request.version != PTX_INDEX_VERSION && request.version != PTX_CONTROL_VERSION) ||
++        (request.version == PTX_CONTROL_VERSION &&
++         !(ptx_is_position_operation(request.operation) ||
++           ptx_is_expand_operation(request.operation))) ||
++        (request.version != PTX_CONTROL_VERSION &&
++         ptx_is_position_operation(request.operation)) ||
++        (request.version == 1U &&
++         (ptx_is_layout_operation(request.operation) ||
++          ptx_is_indexing_operation(request.operation) ||
++          ptx_is_position_operation(request.operation))) ||
+         (request.version != PTX_INDEX_VERSION && ptx_is_indexing_operation(request.operation)) ||
+         (request.version == PTX_INDEX_VERSION && !ptx_is_indexing_operation(request.operation)) ||
+-        (!ptx_is_indexing_operation(request.operation) && (request.reserved || request.reserved2)) ||
++        (request.version != PTX_CONTROL_VERSION && !ptx_is_indexing_operation(request.operation) &&
++         (request.reserved || request.reserved2)) ||
+         (ptx_is_indexing_operation(request.operation) && request.operation <= PTX_CONCAT && request.reserved)) {
+         uint32_t dtype = request.dtype;
+         free(input); return ptx_error_response(PTX_STATUS_BAD_REQUEST, dtype, request.version);
+     }
+-    status = ptx_validate_request(&request, &item_size, &payload_size,
+-                                  &output_count, &result_size);
++    if (payload_offset > input_size) {
++        uint32_t dtype = request.dtype;
++        free(input); return ptx_error_response(PTX_STATUS_BAD_REQUEST, dtype, request.version);
++    }
++    status = ptx_validate_request(&request, input + payload_offset, input_size - payload_offset,
++                                  &item_size, &payload_size, &output_count, &result_size);
+     if (status != PTX_STATUS_OK) {
+         uint32_t dtype = request.dtype;
+         free(input); return ptx_error_response((uint32_t)status, dtype, request.version);
+     }
+-    if (payload_offset > input_size || payload_size != input_size - payload_offset) {
++    if (payload_size != input_size - payload_offset) {
+         uint32_t dtype = request.dtype;
+         free(input); return ptx_error_response(PTX_STATUS_BAD_REQUEST, dtype, request.version);
+     }
+@@ -2048,17 +2733,22 @@ class Sve256Compiler:
+             "sve2_required": False,
+             "scalar_math_lane_fallback": ["exp", "sigmoid", "silu", "softplus"],
+             "scalar_conversion_lane_fallback": ["cast", "bf16_math", "bf16_where"],
+-            "host_preexpanded_operations": ["broadcast", "where"],
+-            "sve_math_operations": ["rsqrt", "where", "broadcast", "cast", "reduce_mean"],
+-            # Integer iota and boolean compare are currently executed by the
+-            # explicit Python reference path in Sve256Runtime.  Keep this
+-            # list in the immutable artifact so a future native implementation
+-            # cannot silently change the advertised closure.
++            # W8B B2: no broadcast/where input is expanded in the Python host.
++            # Raw storage plus output-rank strides go to the native ELF.
++            "host_preexpanded_operations": [],
++            "sve_math_operations": [
++                "rsqrt", "where", "broadcast", "cast", "reduce_mean", "iota", "compare"
++            ],
++            # Integer iota and boolean compare are executed natively through
++            # the v5 descriptor wire.  Keep this list in the immutable
++            # artifact so a future regression cannot silently change the
++            # advertised closure.
+             "position_control_operations": [
+                 plan.operation for plan in target_ir.plans
+                 if plan.operation in ("iota", "compare")
+             ],
+-            "position_control_fallback": "host_reference",
++            "position_control_fallback": "native",
++            "control_descriptor_wire": "v5:pxio-pxcp-pxbd-pxwh+fnv1a64",
+             "execution_modes": ["native", "qemu"],
+             "guarded_buffer_self_test": True,
+             "layout_plan_version": 2,
+diff --git a/python/pypto/lowering/cpu/aarch64/sve/lowering.py b/python/pypto/lowering/cpu/aarch64/sve/lowering.py
+index 8eee02f44..d48f96ad7 100644
+--- a/python/pypto/lowering/cpu/aarch64/sve/lowering.py
++++ b/python/pypto/lowering/cpu/aarch64/sve/lowering.py
+@@ -21,9 +21,13 @@ from .capabilities import Sve256Capability, probe_sve256_capabilities
+ SVE256_BACKEND = "cpu.aarch64.sve256"
+ # Version 6 extends the v5 M1F batched-matmul contract with M1H
+ # compare/iota position-control plans and explicit integer/boolean domains.
+-# Every SVE plan uses compact domains; v3/v4/v5 artifacts must be rejected
+-# rather than silently reinterpreted by the new runtime.
+-SVE256_LOWERING_VERSION = 6
++# Version 7 (W8B B2) keeps the same vector plans but changes the artifact
++# runner contract: iota/compare and broadcast/where are executed by the
++# native AArch64 ELF through compact descriptor payloads, so v6 artifacts
++# must be rejected rather than silently reinterpreted under the old
++# host-reference host pre-expansion semantics.  Every SVE plan uses compact
++# domains; v3/v4/v5 artifacts were already rejected by version 6.
++SVE256_LOWERING_VERSION = 7
+ SVE256_LANE_COUNT = 8
+ SVE256_TAIL_POLICY = TailPolicy.MASKED
+ SVE256_REQUIRED_FEATURES = frozenset(("sve", "vl256"))
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256.py b/python/tests/ut/pypto_x/test_cpu_sve256.py
+index 21972a806..c34f0f19c 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256.py
+@@ -242,17 +242,17 @@ def test_lowering_uses_eight_lanes_masked_tail_and_omits_sve2():
+         lower_sve256(_elementwise(), _target("sve", "neon"))
+ 
+ 
+-def test_sve_v3_v4_v5_plan_and_artifact_are_explicitly_incompatible_after_m1h_bump(tmp_path):
++def test_sve_v3_to_v6_plan_and_artifact_are_explicitly_incompatible_after_b2_bump(tmp_path):
+     program = _elementwise(shape=(9,))
+     compiler, target_ir, artifact = _compile(program, tmp_path)
+-    assert target_ir.lowering_version == 6
+-    assert artifact.metadata["lowering_version"] == 6
++    assert target_ir.lowering_version == 7
++    assert artifact.metadata["lowering_version"] == 7
+     assert target_ir.plans[0].iteration.compact is True
+-    for old_version in (3, 4, 5):
++    for old_version in (3, 4, 5, 6):
+         with pytest.raises(Sve256ValidationError, match="unsupported SVE256 lowering version"):
+             Sve256Program(target_ir.vector_program, lowering_version=old_version)
+ 
+-    for old_version in (3, 4, 5):
++    for old_version in (3, 4, 5, 6):
+         old_metadata = dict(artifact.metadata)
+         old_metadata["lowering_version"] = old_version
+         old_artifact = Artifact(
+@@ -295,7 +295,7 @@ def test_sve_v4_compact_iteration_invariant_covers_nested_domains():
+     )
+     for program in programs:
+         valid = lower_sve256(program, _target("sve", "sve2"))
+-        Sve256Program(valid.vector_program, lowering_version=6).validate()
++        Sve256Program(valid.vector_program, lowering_version=7).validate()
+ 
+         legacy = lower_cpu_vector(
+             program,
+@@ -306,7 +306,7 @@ def test_sve_v4_compact_iteration_invariant_covers_nested_domains():
+             specialization={},
+         )
+         with pytest.raises(Sve256ValidationError, match="requires compact iteration"):
+-            Sve256Program(legacy, lowering_version=6)
++            Sve256Program(legacy, lowering_version=7)
+ 
+     for program, nested_name in (
+         (_reduction("float32", (2, 3), (2,), "reduce_sum", {"axis": 1}), "reduction.output_iteration"),
+@@ -333,7 +333,7 @@ def test_sve_v4_compact_iteration_invariant_covers_nested_domains():
+             ),
+         )
+         with pytest.raises(Sve256ValidationError, match=nested_name):
+-            Sve256Program(legacy, lowering_version=6)
++            Sve256Program(legacy, lowering_version=7)
+ 
+ 
+ def test_sve_target_is_fixed_little_endian_linux_protocol():
+@@ -602,7 +602,9 @@ def test_sve_m1c1_scalar_rank_broadcast_and_same_dtype_cast(tmp_path):
+     broadcast_output = HostTensor.zeros("float32", (2, 3))
+     _run(broadcast_artifact, [], broadcast_output, scalars={"scalar": 2.5})
+     assert broadcast_output.tolist() == [[2.5, 2.5, 2.5], [2.5, 2.5, 2.5]]
+-    assert tuple(broadcast_artifact.metadata["host_preexpanded_operations"]) == ("broadcast", "where")
++    assert tuple(broadcast_artifact.metadata["host_preexpanded_operations"]) == ()
++    assert broadcast_artifact.metadata["position_control_fallback"] == "native"
++    assert broadcast_artifact.metadata["control_descriptor_wire"] == "v5:pxio-pxcp-pxbd-pxwh+fnv1a64"
+     assert tuple(broadcast_artifact.metadata["scalar_conversion_lane_fallback"]) == (
+         "cast", "bf16_math", "bf16_where"
+     )
+@@ -1280,3 +1282,284 @@ def test_sve_portable_only_import_and_native_mode_gate():
+     if platform.machine().lower() not in ("aarch64", "arm64"):
+         runtime = Sve256Runtime(execution_mode="native")
+         assert not runtime.is_available()
++
++
++# ---------------------------------------------------------------------------
++# W8B B2: native iota/compare/broadcast/where closure (control wire v5).
++# ---------------------------------------------------------------------------
++
++
++def _iota_program(dtype, shape, attributes):
++    output = ValueRef("output", CoreType.tensor(dtype, shape))
++    return _program("iota", (), (output,), (Operation("iota", (), (output,), attributes),))
++
++
++def _compare_program(name, left_type, right_type, output_type, attributes=None):
++    left = ValueRef("left", left_type)
++    right = ValueRef("right", right_type)
++    output = ValueRef("output", output_type)
++    operation = Operation(name, (left, right), (output,), attributes or {})
++    return _program(name, (left, right), (output,), (operation,))
++
++
++def _broadcast_program(input_type, output_type, shape):
++    source = ValueRef("source", input_type)
++    output = ValueRef("output", output_type)
++    operation = Operation("broadcast", (source,), (output,), {"shape": list(shape)})
++    return _program("broadcast", (source,), (output,), (operation,))
++
++
++def _scalar_run_with_scalars(program, inputs, output, scalars):
++    compiler = CpuScalarCompiler()
++    artifact = compiler.compile(compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu")))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[value.descriptor(readonly=True) for value in inputs],
++            outputs=[output.descriptor()],
++            scalars=scalars,
++        )
++    )
++
++
++def _flat_values_equal_with_nan(actual, expected):
++    assert len(actual) == len(expected)
++    for left, right in zip(actual, expected):
++        if isinstance(left, float) and isinstance(right, float):
++            if math.isnan(left) and math.isnan(right):
++                continue
++        assert left == right, (left, right)
++
++
++@pytest.mark.parametrize(
++    "dtype,shape,attributes",
++    (
++        ("int32", (19,), {"axis": 0, "start": -7, "step": 2}),
++        ("int32", (3, 5, 7), {"axis": 1, "start": -3, "step": -2}),
++        ("int64", (2, 19), {"axis": 1, "start": 1 << 40, "step": -3}),
++        ("int64", (0, 3), {"axis": 1, "start": 5, "step": 1}),
++    ),
++)
++def test_sve_b2_native_iota_matches_scalar_signed_steps_and_tails(
++    dtype, shape, attributes, tmp_path
++):
++    program = _iota_program(dtype, shape, attributes)
++    _, target_ir, artifact = _compile(program, tmp_path / "iota")
++    assert [plan.operation for plan in target_ir.plans] == ["iota"]
++    assert artifact.metadata["position_control_fallback"] == "native"
++    assert tuple(artifact.metadata["host_preexpanded_operations"]) == ()
++    actual = HostTensor.zeros(dtype, shape)
++    expected = HostTensor.zeros(dtype, shape)
++    _run(artifact, [], actual)
++    _scalar_run(program, [], expected)
++    assert actual.flat() == expected.flat()
++
++
++@pytest.mark.parametrize(
++    "name,dtype,left_shape,right_shape",
++    (
++        ("lt", "float32", (19,), (1,)),
++        ("le", "float32", (2, 1), (1, 3)),
++        ("ge", "int64", (19,), (1,)),
++        ("eq", "int32", (3, 4), (3, 1)),
++        ("ne", "bool", (19,), (1,)),
++        ("lt", "uint8", (19,), (1,)),
++        ("gt", "bf16", (2, 1), (1, 3)),
++        ("ge", "uint64", (0, 3), (1, 3)),
++    ),
++)
++def test_sve_b2_native_compare_predicates_broadcast_and_tail(
++    name, dtype, left_shape, right_shape, tmp_path
++):
++    output_shape = tuple(
++        left if left != 1 else right for left, right in zip(left_shape, right_shape)
++    )
++    program = _compare_program(
++        name,
++        CoreType.tensor(dtype, left_shape),
++        CoreType.tensor(dtype, right_shape),
++        CoreType.tensor("bool", output_shape),
++    )
++    _, target_ir, artifact = _compile(program, tmp_path / "compare")
++    assert [plan.operation for plan in target_ir.plans] == ["compare"]
++    assert artifact.metadata["position_control_fallback"] == "native"
++
++    def values(count):
++        if dtype == "float32":
++            pattern = [
++                float("nan"), float("inf"), float("-inf"), -0.0, 0.0,
++                1.5, -2.5, 3.25, -1e30, 1e-30,
++            ]
++            return [pattern[index % len(pattern)] for index in range(count)]
++        if dtype == "bf16":
++            pattern = [0.5, -1.5, float("inf"), float("-inf"), -0.0, 0.0]
++            return [pattern[index % len(pattern)] for index in range(count)]
++        if dtype == "bool":
++            return [index % 3 == 0 for index in range(count)]
++        if dtype == "uint8":
++            return [(index * 7) % 256 for index in range(count)]
++        if dtype == "uint64":
++            return [(1 << 63) + index for index in range(count)]
++        return [index - 9 for index in range(count)]
++
++    left = HostTensor(dtype, left_shape, values(math.prod(left_shape)))
++    right = HostTensor(dtype, right_shape, values(math.prod(right_shape)))
++    actual = HostTensor.zeros("bool", output_shape)
++    expected = HostTensor.zeros("bool", output_shape)
++    _run(artifact, [left, right], actual)
++    _scalar_run(program, [left, right], expected)
++    assert actual.flat() == expected.flat()
++
++
++@pytest.mark.parametrize(
++    "dtype,input_shape,output_shape,values",
++    (
++        ("float32", (19,), (19,), [float("nan"), float("inf"), float("-inf")] + [float(i) for i in range(16)]),
++        ("float32", (2, 1), (2, 3), [2.0, 5.0]),
++        ("float32", (1, 3), (2, 4, 3), [1.0, -2.0, 3.0]),
++        ("float32", (0, 3), (2, 0, 3), []),
++        ("bf16", (1, 19), (2, 19), [0.5, -1.5, float("nan"), float("inf"), -0.0] + [float(i) for i in range(14)]),
++    ),
++)
++def test_sve_b2_native_broadcast_rank_delta_tail_and_nonfinite(
++    dtype, input_shape, output_shape, values, tmp_path
++):
++    program = _broadcast_program(
++        CoreType.tensor(dtype, input_shape),
++        CoreType.tensor(dtype, output_shape),
++        output_shape,
++    )
++    _, target_ir, artifact = _compile(program, tmp_path / "broadcast")
++    assert [plan.operation for plan in target_ir.plans] == ["broadcast"]
++    assert tuple(artifact.metadata["host_preexpanded_operations"]) == ()
++    source = HostTensor(dtype, input_shape, values)
++    actual = HostTensor.zeros(dtype, output_shape)
++    expected = HostTensor.zeros(dtype, output_shape)
++    _run(artifact, [source], actual)
++    _scalar_run(program, [source], expected)
++    _flat_values_equal_with_nan(actual.flat(), expected.flat())
++
++
++def test_sve_b2_native_broadcast_scalar_and_where_scalar_inputs(tmp_path):
++    scalar_type = CoreType.scalar("float32")
++    broadcast_type = CoreType.tensor("float32", (2, 3))
++    scalar = ValueRef("scalar", scalar_type)
++    broadcast = ValueRef("broadcast", broadcast_type)
++    program = _program(
++        "scalar_broadcast",
++        (scalar,),
++        (broadcast,),
++        (Operation("broadcast", (scalar,), (broadcast,), {"shape": [2, 3]}),),
++    )
++    _, _, artifact = _compile(program, tmp_path / "scalar-broadcast")
++    actual = HostTensor.zeros("float32", (2, 3))
++    expected = HostTensor.zeros("float32", (2, 3))
++    _run(artifact, [], actual, scalars={"scalar": 2.5})
++    _scalar_run_with_scalars(program, [], expected, {"scalar": 2.5})
++    assert actual.flat() == expected.flat()
++
++    condition_type = CoreType.scalar("bool")
++    true_type = CoreType.tensor("float32", (2, 1))
++    false_type = CoreType.tensor("float32", (1, 3))
++    selected_type = CoreType.tensor("float32", (2, 3))
++    condition = ValueRef("condition", condition_type)
++    true_value = ValueRef("true_value", true_type)
++    false_value = ValueRef("false_value", false_type)
++    selected = ValueRef("selected", selected_type)
++    where_program = _program(
++        "scalar_condition_where",
++        (condition, true_value, false_value),
++        (selected,),
++        (Operation("where", (condition, true_value, false_value), (selected,)),),
++    )
++    _, _, where_artifact = _compile(where_program, tmp_path / "where")
++    true_tensor = HostTensor("float32", (2, 1), [[float("nan")], [2.0]])
++    false_tensor = HostTensor("float32", (1, 3), [[float("-inf"), 3.0, -0.0]])
++    where_actual = HostTensor.zeros("float32", (2, 3))
++    where_expected = HostTensor.zeros("float32", (2, 3))
++    where_scalars = {"condition": False}
++    _run(where_artifact, [true_tensor, false_tensor], where_actual, scalars=where_scalars)
++    _scalar_run_with_scalars(where_program, [true_tensor, false_tensor], where_expected, where_scalars)
++    _flat_values_equal_with_nan(where_actual.flat(), where_expected.flat())
++
++
++def test_sve_b2_integrated_native_control_pipeline_and_metadata(tmp_path, monkeypatch):
++    import pypto.backends.cpu.aarch64.sve256 as sve256_module
++
++    position = ValueRef("position", CoreType.tensor("int32", (19,)))
++    limit = ValueRef("limit", CoreType.tensor("int32", (1,)))
++    mask = ValueRef("mask", CoreType.tensor("bool", (19,)))
++    source = ValueRef("source", CoreType.tensor("float32", (1, 19)))
++    broadcast_out = ValueRef("broadcast_out", CoreType.tensor("float32", (2, 19)))
++    condition = ValueRef("condition", CoreType.tensor("bool", (2, 1)))
++    true_value = ValueRef("true_value", CoreType.tensor("float32", (1, 19)))
++    false_value = ValueRef("false_value", CoreType.tensor("float32", (2, 19)))
++    selected = ValueRef("selected", CoreType.tensor("float32", (2, 19)))
++    operations = (
++        Operation("iota", (), (position,), {"axis": 0, "start": 3, "step": 2}),
++        Operation("ge", (position, limit), (mask,)),
++        Operation("broadcast", (source,), (broadcast_out,), {"shape": [2, 19]}),
++        Operation("where", (condition, true_value, false_value), (selected,)),
++    )
++    program = CoreProgram(
++        functions=(
++            CoreFunction(
++                "control_pipeline",
++                (limit, source, condition, true_value, false_value),
++                (mask, broadcast_out, selected),
++                Region(operations),
++            ),
++        )
++    )
++    _, target_ir, artifact = _compile(program, tmp_path / "control-pipeline")
++    assert [plan.operation for plan in target_ir.plans] == ["iota", "compare", "broadcast", "where"]
++    assert artifact.metadata["position_control_fallback"] == "native"
++    assert artifact.metadata["control_descriptor_wire"] == "v5:pxio-pxcp-pxbd-pxwh+fnv1a64"
++    assert tuple(artifact.metadata["host_preexpanded_operations"]) == ()
++    assert artifact.metadata["runner_protocol"].endswith(".v5")
++    native_bytes = Path(artifact.path).read_bytes()
++    assert b"native_iota_compare_broadcast_where" in native_bytes
++
++    def forbidden_host_reference(value, context):
++        raise AssertionError("SVE256 host-reference boundary was used for {}".format(context))
++
++    monkeypatch.setattr(sve256_module, "_materialize_values", forbidden_host_reference)
++    inputs = [
++        HostTensor("int32", (1,), [11]),
++        HostTensor("float32", (1, 19), [float(i) - 9.0 for i in range(19)]),
++        HostTensor("bool", (2, 1), [[True], [False]]),
++        HostTensor("float32", (1, 19), [float("nan")] + [float(i) for i in range(18)]),
++        HostTensor("float32", (2, 19), [float(i) for i in range(38)]),
++    ]
++    actual = [
++        HostTensor.zeros("bool", (19,)),
++        HostTensor.zeros("float32", (2, 19)),
++        HostTensor.zeros("float32", (2, 19)),
++    ]
++    expected = [
++        HostTensor.zeros("bool", (19,)),
++        HostTensor.zeros("float32", (2, 19)),
++        HostTensor.zeros("float32", (2, 19)),
++    ]
++    Sve256Runtime(execution_mode="qemu").launch(
++        LaunchRequest(
++            artifact,
++            inputs=[value.descriptor(readonly=True) for value in inputs],
++            outputs=[value.descriptor() for value in actual],
++        )
++    )
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            _scalar_artifact(program),
++            inputs=[value.descriptor(readonly=True) for value in inputs],
++            outputs=[value.descriptor() for value in expected],
++        )
++    )
++    assert actual[0].flat() == expected[0].flat()
++    _flat_values_equal_with_nan(actual[1].flat(), expected[1].flat())
++    _flat_values_equal_with_nan(actual[2].flat(), expected[2].flat())
++
++
++def _scalar_artifact(program):
++    compiler = CpuScalarCompiler()
++    return compiler.compile(compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu")))
+diff --git a/python/tests/ut/pypto_x/test_qwen35_position_control.py b/python/tests/ut/pypto_x/test_qwen35_position_control.py
+index 8c6435a40..527fd5dd1 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_position_control.py
++++ b/python/tests/ut/pypto_x/test_qwen35_position_control.py
+@@ -139,12 +139,14 @@ def test_sve_qemu_position_control_differential_and_metadata(tmp_path):
+     program = build_qwen35_position_control(1, 2, past_length=3, index_dtype="int64")
+     target_ir, artifact = _compile_sve(program, tmp_path)
+     assert target_ir.vector_program.plan_version == 3
+-    assert target_ir.lowering_version == 6
++    assert target_ir.lowering_version == 7
+     assert artifact.metadata["plan_version"] == 3
+-    assert artifact.metadata["lowering_version"] == 6
++    assert artifact.metadata["lowering_version"] == 7
+     assert [plan.operation for plan in target_ir.plans] == ["iota", "iota", "iota", "compare"]
+     assert tuple(artifact.metadata["position_control_operations"]) == ("iota", "iota", "iota", "compare")
+-    assert artifact.metadata["position_control_fallback"] == "host_reference"
++    assert artifact.metadata["position_control_fallback"] == "native"
++    assert tuple(artifact.metadata["host_preexpanded_operations"]) == ()
++    assert artifact.metadata["control_descriptor_wire"] == "v5:pxio-pxcp-pxbd-pxwh+fnv1a64"
+     assert "index_map" not in json.dumps(target_ir.to_dict(), sort_keys=True)
+     scalar_outputs = [HostTensor("int64", (1, 2)), HostTensor("bool", (1, 8, 2, 5))]
+     sve_outputs = [HostTensor("int64", (1, 2)), HostTensor("bool", (1, 8, 2, 5))]
+@@ -154,11 +156,11 @@ def test_sve_qemu_position_control_differential_and_metadata(tmp_path):
+     assert sve_outputs[1].flat() == scalar_outputs[1].flat()
+ 
+ 
+-def test_sve_position_control_fallback_metadata_tamper_is_fail_closed(tmp_path):
++def test_sve_position_control_native_metadata_tamper_is_fail_closed(tmp_path):
+     program = build_qwen35_position_control(1, 1, past_length=1)
+     _target_ir, artifact = _compile_sve(program, tmp_path)
+     metadata = dict(artifact.metadata)
+-    metadata["position_control_fallback"] = "native"
++    metadata["position_control_fallback"] = "host_reference"
+     tampered = Artifact(
+         format=artifact.format,
+         entrypoint=artifact.entrypoint,
+@@ -167,7 +169,7 @@ def test_sve_position_control_fallback_metadata_tamper_is_fail_closed(tmp_path):
+         path=artifact.path,
+         metadata=metadata,
+     )
+-    with pytest.raises(CpuSve256ArtifactError, match="fallback metadata"):
++    with pytest.raises(CpuSve256ArtifactError, match="implementation metadata"):
+         Sve256Runtime(execution_mode="qemu").load(tampered)
+ 
+ 

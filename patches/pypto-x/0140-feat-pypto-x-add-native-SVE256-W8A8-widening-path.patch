@@ -1,0 +1,3279 @@
+From e8041fd97c087bfa09b6c446935a62e525c45565 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 22:20:06 +0800
+Subject: [PATCH 140/141] feat(pypto-x): add native SVE256 W8A8 widening path
+
+Implement contract 0002 C5 / R6 for the SVE256 backend:
+
+- qmatmul_s8s8_s32 executes inside the AArch64 ELF with the native
+  widening fallback: int8 lanes are sign-extended in two sunpklo steps
+  (s8 -> s16 -> s32) and accumulated with integer mla.  No SDOT (SVE2)
+  and no I8MM/SMMLA instruction is emitted; the real HWCAP2 probe
+  records svei8mm/sve2 so "unavailable" and "available but unused"
+  stay distinguishable.
+- the three primitives dequantize_s8, dequantize_epilogue_bf16 and
+  quantize_per_token_s8 are native v6 runner operations and
+  probe-gated target entry points, bit-exact with the C1 scalar
+  goldens (Q1-Q6; reserved -128, NaN/Inf, scale underflow and
+  binary32 overflow fail closed).
+- runner protocol v5 -> v6 and SVE256 lowering version 7 -> 8 so old
+  artifacts/plans fail closed; the v5 control wire for
+  iota/compare/broadcast/where is unchanged.  Batched qmatmul is an
+  explicitly registered host dispatch loop over the native rank-2
+  request, never a silent fallback.
+- CapabilitySet declares s8s8_s32_sve_widening_sunpklo; the real
+  getauxval/prctl gate cannot be forged by injected capabilities and
+  cannot be disabled on a machine that passes the probe.
+- 39 new focused tests cover rank2/3/4 goldens, tails, K=133144,
+  +-127, -128, all-zero rows, int32 extremes, capability and metadata
+  tampering, v6 wire locking, objdump widening evidence, and the
+  native vs host-decode boundary.
+- connected fix: _write_storage integer raw-address outputs forced
+  every non-bf16 value through float(value), so an int32/int64 raw
+  address raised TypeError (pre-existing known limit
+  sve256_write_storage_integer_raw_address_output_preexisting_typeerror);
+  the fix makes integer storage scalar-aware and extends _CTYPE plus
+  the NumPy integer typestr/itemsize mapping.  This is a connected fix
+  of a pre-existing defect, not a C5 regression.
+---
+ python/pypto/backends/cpu/aarch64/sve256.py             | 819 +++++++++++++++++++++++++++++-
+ python/pypto/compiler/targets/cpu_sve256.py             | 642 ++++++++++++++++++++++-
+ python/pypto/lowering/cpu/aarch64/sve/__init__.py       |   8 +
+ python/pypto/lowering/cpu/aarch64/sve/capabilities.py   | 148 +++++-
+ python/pypto/lowering/cpu/aarch64/sve/lowering.py       |  75 ++-
+ python/tests/ut/pypto_x/test_cpu_sve256.py              |  18 +-
+ python/tests/ut/pypto_x/test_qwen35_position_control.py |   4 +-
+ python/tests/ut/pypto_x/test_w8a8_sve256.py             | 984 ++++++++++++++++++++++++++++++++++++
+ 8 files changed, 2652 insertions(+), 46 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/aarch64/sve256.py b/python/pypto/backends/cpu/aarch64/sve256.py
+index 70b35f380..c4b82c5c1 100644
+--- a/python/pypto/backends/cpu/aarch64/sve256.py
++++ b/python/pypto/backends/cpu/aarch64/sve256.py
+@@ -20,6 +20,18 @@ from pypto.compiler.artifact import ABI_VERSION, Artifact
+ from pypto.compiler.targets.cpu_sve256 import (
+     DEFAULT_ARTIFACT_FORMAT,
+     RUNNER_PROTOCOL,
++    W8A8_COMPENSATION,
++    W8A8_DEQUANTIZE_S8_KERNEL,
++    W8A8_EPILOGUE_KERNEL,
++    W8A8_I8MM_USED,
++    W8A8_KERNEL_VERSION,
++    W8A8_QMATMUL_KERNEL,
++    W8A8_QMATMUL_MODE,
++    W8A8_QUANTIZE_KERNEL,
++    W8A8_RUNNER_WIRE,
++    W8A8_SDOT_USED,
++    _w8a8_execution_metadata,
++    w8a8_kernel_contract,
+ )
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation
+ from pypto.lowering.cpu import (
+@@ -30,14 +42,23 @@ from pypto.lowering.cpu import (
+     flatten_values,
+     iota_spec,
+     static_shape,
++    W8A8_DEQUANTIZE_OPCODE,
++    W8A8_EPILOGUE_OPCODE,
++    W8A8_MAX_ACCUMULATOR_K,
++    W8A8_QMATMUL_OPCODE,
++    W8A8_QUANTIZE_OPCODE,
+ )
+ from pypto.lowering.cpu.aarch64.sve import (
+     SVE256_BACKEND,
+     SVE256_LANE_COUNT,
+     SVE256_LOWERING_VERSION,
++    SVE256_W8A8_CAPABILITY,
++    SVE256_W8A8_FORBIDDEN_MATRIX_CAPABILITIES,
++    SVE256_W8A8_MATRIX_CAPABILITY,
+     Sve256Capability,
+     Sve256Program,
+     lower_sve256,
++    sve256_w8a8_capabilities,
+ )
+ from pypto.lowering.cpu.aarch64.sve.lowering import _is_little_linux_aarch64
+ from pypto.lowering.cpu.aarch64.sve import capabilities as _capabilities
+@@ -54,6 +75,16 @@ from ..tensor import FlatBuffer, HostTensor, _cast_value
+ from ..byte_view import CpuByteViewError, TypedByteView, try_typed_byte_view
+ 
+ 
++W8A8_RUNTIME_OPERATIONS = frozenset(
++    (
++        W8A8_QMATMUL_OPCODE,
++        W8A8_QUANTIZE_OPCODE,
++        W8A8_DEQUANTIZE_OPCODE,
++        W8A8_EPILOGUE_OPCODE,
++    )
++)
++
++
+ class CpuSve256RuntimeError(RuntimeError):
+     """Base class for SVE256 runtime failures."""
+ 
+@@ -112,8 +143,12 @@ _LAYOUT_WIRE_VERSION = 3
+ _INDEXING_WIRE_VERSION = 4
+ # Control wire v5 carries compact descriptor payloads for native iota/compare
+ # and for native (non-preexpanded) broadcast/where.  Shared with the ELF
+-# runner; see RUNNER_PROTOCOL v5 in pypto.compiler.targets.cpu_sve256.
++# runner; see RUNNER_PROTOCOL v6 in pypto.compiler.targets.cpu_sve256.
+ _CONTROL_WIRE_VERSION = 5
++# W8A8 wire v6 carries native widening qmatmul plus the three
++# quantize/dequantize primitives.  It is admitted only for those four
++# operations and leaves the v5 control wire untouched.
++_W8A8_WIRE_VERSION = 6
+ _CONTROL_MAX_RANK = 64
+ _LAYOUT_DESC_VERSION = 2
+ _LAYOUT_DESC_HEADER = struct.Struct("<4s5I2Q")
+@@ -153,6 +188,10 @@ _OP_CODES = {
+     "embedding": 26,
+     "iota": 27,
+     "compare": 28,
++    W8A8_QMATMUL_OPCODE: 29,
++    W8A8_QUANTIZE_OPCODE: 30,
++    W8A8_DEQUANTIZE_OPCODE: 31,
++    W8A8_EPILOGUE_OPCODE: 32,
+ }
+ _DTYPE_CODES = {"float32": 0, "bf16": 1}
+ _CAST_DTYPE_CODES = {("float32", "bf16"): 2, ("bf16", "float32"): 3}
+@@ -191,12 +230,58 @@ _WHERE_DESC_HEADER = struct.Struct("<4s7I4Q")
+ _CTYPE = {
+     "float32": ctypes.c_float,
+     "bf16": ctypes.c_uint16,
++    "bool": ctypes.c_uint8,
++    "int8": ctypes.c_int8,
++    "uint8": ctypes.c_uint8,
++    "int16": ctypes.c_int16,
++    "uint16": ctypes.c_uint16,
+     "int32": ctypes.c_int32,
++    "uint32": ctypes.c_uint32,
+     "int64": ctypes.c_int64,
+-    "bool": ctypes.c_uint8,
++    "uint64": ctypes.c_uint64,
++}
++#: NumPy array-interface typestr groups accepted for raw buffer handles.
++_NUMPY_TYPESTRS = {
++    "float32": ("<f4", "=f4"),
++    "bf16": ("<u2", "=u2", "<V2", "=V2", "|V2"),
++    "int8": ("|i1", "<i1", "=i1"),
++    "uint8": ("|u1", "<u1", "=u1"),
++    "int16": ("<i2", "=i2"),
++    "uint16": ("<u2", "=u2"),
++    "int32": ("<i4", "=i4"),
++    "uint32": ("<u4", "=u4"),
++    "int64": ("<i8", "=i8"),
++    "uint64": ("<u8", "=u8"),
++    "bool": ("|b1", "<b1", "=b1", "|u1", "<u1", "=u1"),
++}
++_NUMPY_ITEMSIZE = {
++    "float32": 4, "bf16": 2, "int8": 1, "uint8": 1, "bool": 1,
++    "int16": 2, "uint16": 2, "int32": 4, "uint32": 4, "int64": 8, "uint64": 8,
+ }
+ 
+ 
++def _storage_scalar_value(dtype: str, value: Any) -> Any:
++    """Convert one host value to the native scalar used by a storage handle.
++
++    This is the write-side mirror of :func:`_cast_value`: BF16 is stored as
++    raw bits, float32 as a C float, and every integer dtype as a Python int
++    (never ``float(value)``, which ctypes rejects for integer arrays).  The
++    historical raw-address integer output path crashed with a TypeError
++    because it forced every non-BF16 value through ``float``.
++    """
++
++    dtype = canonical_dtype(dtype)
++    if dtype == "bf16":
++        return _bf16_bits(value)
++    if dtype == "float32":
++        return float(value)
++    if dtype == "bool":
++        return 1 if _cast_value(value, "bool") else 0
++    if dtype in _PACK_CODES:
++        return _cast_value(value, dtype)
++    return value
++
++
+ def _bf16_bits(value: Any) -> int:
+     number = float(value)
+     bits = struct.unpack("<I", struct.pack("<f", number))[0]
+@@ -209,6 +294,92 @@ def _bf16_value(bits: int) -> float:
+     return struct.unpack("<f", struct.pack("<I", (int(bits) & 0xFFFF) << 16))[0]
+ 
+ 
++@dataclass(frozen=True)
++class Sve256QuantizePerTokenResult:
++    """Native SVE256 ``quantize_per_token_s8`` result (codes + scales + count)."""
++
++    codes: Tuple[int, ...]
++    scales: Tuple[float, ...]
++    saturation_count: int
++    rows: int
++    k: int
++
++
++def _w8a8_flatten(values: Any, context: str) -> Tuple[Tuple[Any, ...], Tuple[int, ...]]:
++    """Flatten a regular nested sequence and infer its row-major shape."""
++
++    if isinstance(values, (list, tuple)):
++        if not values:
++            return (), (0,)
++        flat: List[Any] = []
++        child_shape: Optional[Tuple[int, ...]] = None
++        for index, item in enumerate(values):
++            item_flat, item_shape = _w8a8_flatten(item, "{}[{}]".format(context, index))
++            if child_shape is None:
++                child_shape = item_shape
++            elif item_shape != child_shape:
++                raise CpuSve256ExecutionError(
++                    "{} is ragged: {} != {}".format(context, item_shape, child_shape)
++                )
++            flat.extend(item_flat)
++        assert child_shape is not None
++        return tuple(flat), (len(values),) + child_shape
++    return (values,), ()
++
++
++def _w8a8_declared_shape(
++    values: Any,
++    shape: Optional[Sequence[int]],
++    context: str,
++) -> Tuple[Tuple[Any, ...], Tuple[int, ...]]:
++    flat, inferred = _w8a8_flatten(values, context)
++    if shape is None:
++        return flat, inferred
++    try:
++        declared = tuple(int(dimension) for dimension in shape)
++    except (TypeError, ValueError) as exc:
++        raise CpuSve256ExecutionError(
++            "{} shape must be a sequence of integers".format(context)
++        ) from exc
++    for index, dimension in enumerate(declared):
++        if isinstance(dimension, bool) or dimension < 0:
++            raise CpuSve256ExecutionError(
++                "{} shape[{}] must be a non-negative integer".format(context, index)
++            )
++    product = 1
++    for dimension in declared:
++        product *= dimension
++    if product != len(flat):
++        raise CpuSve256ExecutionError(
++            "{} shape {} does not match {} flattened elements".format(context, declared, len(flat))
++        )
++    return flat, declared
++
++
++def _w8a8_int_codes(flat: Sequence[Any], context: str) -> Tuple[int, ...]:
++    """Validate the frozen symmetric [-127, 127] code domain (no -128)."""
++
++    codes = []
++    for index, code in enumerate(flat):
++        if isinstance(code, bool) or not isinstance(code, int):
++            raise CpuSve256ExecutionError(
++                "{}[{}] must be an integer code".format(context, index)
++            )
++        if code < -127 or code > 127:
++            raise CpuSve256ExecutionError(
++                "{}[{}]={} outside [-127, 127]".format(context, index, code)
++            )
++        codes.append(code)
++    return tuple(codes)
++
++
++def _w8a8_row_count(shape: Sequence[int]) -> int:
++    rows = 1
++    for dimension in shape[:-1]:
++        rows *= dimension
++    return rows
++
++
+ def _is_tensor(value_type: CoreType) -> bool:
+     return value_type.kind in ("tensor", "view", "tile")
+ 
+@@ -571,6 +742,10 @@ def _verify_embedded_markers(
+         b"scalar_indexing_lane_fallback:bf16_reorder",
+         b"ptx_sve256_control_operations",
+         b"native_iota_compare_broadcast_where",
++        b"ptx_sve256_w8a8_plane",
++        b"sve_widening:no_sdot:no_i8mm",
++        b"ptx_sve256_w8a8_operations",
++        b"native_qmatmul_s8s8_s32+dequantize_s8+quantize_per_token_s8+dequantize_epilogue_bf16",
+     )
+     if any(marker not in native_bytes for marker in markers):
+         raise CpuSve256ArtifactError("SVE256 ELF contract marker is missing")
+@@ -622,6 +797,43 @@ def _validate_primary_artifact(artifact: Artifact) -> Mapping[str, Any]:
+         raise CpuSve256ArtifactError("SVE256 math operation metadata is invalid")
+     if metadata.get("control_descriptor_wire") != "v5:pxio-pxcp-pxbd-pxwh+fnv1a64":
+         raise CpuSve256ArtifactError("SVE256 control descriptor wire contract is invalid")
++    if metadata.get("w8a8_runner_wire") != W8A8_RUNNER_WIRE:
++        raise CpuSve256ArtifactError("SVE256 W8A8 runner wire contract is invalid")
++    if metadata.get("w8a8_kernel_version") != W8A8_KERNEL_VERSION:
++        raise CpuSve256ArtifactError("SVE256 W8A8 kernel version is invalid")
++    if metadata.get("w8a8_sdot_used") is not False or metadata.get("w8a8_i8mm_used") is not False:
++        raise CpuSve256ArtifactError("SVE256 W8A8 ISA declaration must exclude SDOT/I8MM")
++    if metadata.get("w8a8_batched_qmatmul_dispatch") != "host_batch_loop_rank2_native_kernel":
++        raise CpuSve256ArtifactError("SVE256 W8A8 batched qmatmul dispatch metadata is invalid")
++    if tuple(metadata.get("w8a8_target_entry_points", ())) != (
++        W8A8_DEQUANTIZE_OPCODE,
++        W8A8_QUANTIZE_OPCODE,
++        W8A8_EPILOGUE_OPCODE,
++    ):
++        raise CpuSve256ArtifactError("SVE256 W8A8 target entry point metadata is invalid")
++    declaration = metadata.get("w8a8_capability")
++    if not isinstance(declaration, Mapping):
++        raise CpuSve256ArtifactError("SVE256 artifact has no W8A8 capability declaration")
++    if declaration.get("digest") != SVE256_W8A8_CAPABILITY.fingerprint:
++        raise CpuSve256ArtifactError("SVE256 artifact W8A8 capability digest mismatch")
++    if tuple(declaration.get("dtypes", ())) != tuple(SVE256_W8A8_CAPABILITY.dtypes):
++        raise CpuSve256ArtifactError("SVE256 artifact W8A8 dtype declaration mismatch")
++    if tuple(declaration.get("matrix_capabilities", ())) != tuple(
++        SVE256_W8A8_CAPABILITY.matrix_capabilities
++    ):
++        raise CpuSve256ArtifactError("SVE256 artifact W8A8 matrix capability declaration mismatch")
++    if declaration.get("matrix_kind") != SVE256_W8A8_MATRIX_CAPABILITY:
++        raise CpuSve256ArtifactError("SVE256 artifact W8A8 matrix kind mismatch")
++    if declaration.get("isa") != "sve_widening_sunpklo":
++        raise CpuSve256ArtifactError("SVE256 artifact W8A8 ISA declaration is invalid")
++    if declaration.get("compensation") != W8A8_COMPENSATION:
++        raise CpuSve256ArtifactError("SVE256 artifact W8A8 compensation declaration is invalid")
++    if declaration.get("sdot_used") is not False or declaration.get("i8mm_used") is not False:
++        raise CpuSve256ArtifactError("SVE256 artifact W8A8 capability must exclude SDOT/I8MM")
++    if tuple(declaration.get("forbidden_matrix_capabilities", ())) != tuple(
++        SVE256_W8A8_FORBIDDEN_MATRIX_CAPABILITIES
++    ):
++        raise CpuSve256ArtifactError("SVE256 artifact W8A8 forbidden matrix list is invalid")
+     if metadata.get("position_control_fallback", "native") != "native":
+         raise CpuSve256ArtifactError("SVE256 position/control implementation metadata is invalid")
+     if metadata.get("layout_plan_version") != 2:
+@@ -753,6 +965,26 @@ def _decode_artifact(artifact: Artifact, available: CpuFeatureSet) -> LoadedSve2
+     ]
+     if metadata.get("batched_matmul_operations") != expected_batched_matmul:
+         raise CpuSve256ArtifactError("SVE256 batched matmul metadata mismatch")
++    expected_w8a8_names, expected_w8a8 = _w8a8_execution_metadata(target_ir)
++    if list(metadata.get("w8a8_kernel_operations", ())) != expected_w8a8_names:
++        raise CpuSve256ArtifactError("SVE256 W8A8 kernel operation metadata mismatch")
++    if list(metadata.get("w8a8_operations", ())) != expected_w8a8:
++        raise CpuSve256ArtifactError("SVE256 W8A8 operation metadata mismatch")
++    expected_w8a8_batched = [
++        {
++            "operation": plan.operation,
++            "batch_shape": list(plan.matmul.batch_shape),
++            "m": plan.matmul.m,
++            "k": plan.matmul.k,
++            "n": plan.matmul.n,
++        }
++        for plan in target_ir.plans
++        if plan.operation == W8A8_QMATMUL_OPCODE
++        and plan.matmul is not None
++        and plan.matmul.batch_shape
++    ]
++    if list(metadata.get("w8a8_batched_qmatmul_operations", ())) != expected_w8a8_batched:
++        raise CpuSve256ArtifactError("SVE256 W8A8 batched qmatmul metadata mismatch")
+     expected_position_control = [
+         plan.operation for plan in target_ir.plans
+         if plan.operation in ("iota", "compare")
+@@ -893,15 +1125,10 @@ def _storage_values(descriptor: TensorDesc, dtype: str, context: str) -> Any:
+         if interface.get("shape") is None or tuple(interface["shape"]) != expected_shape:
+             raise CpuSve256ExecutionError("{} array shape does not match descriptor".format(context))
+         typestr = interface.get("typestr")
+-        expected_types = (
+-            ("<f4", "=f4") if dtype == "float32" else
+-            ("<u2", "=u2", "<V2", "=V2", "|V2") if dtype == "bf16" else
+-            ("<i4", "=i4") if dtype == "int32" else
+-            ("<i8", "=i8") if dtype == "int64" else ()
+-        )
++        expected_types = _NUMPY_TYPESTRS.get(dtype, ())
+         if typestr not in expected_types:
+             raise CpuSve256ExecutionError("{} array dtype {} does not match {}".format(context, typestr, dtype))
+-        itemsize = 4 if dtype in ("float32", "int32") else 2 if dtype == "bf16" else 8
++        itemsize = _NUMPY_ITEMSIZE[dtype]
+         expected_strides = []
+         running = itemsize
+         for dimension in reversed(expected_shape):
+@@ -986,7 +1213,7 @@ def _write_storage(descriptor: TensorDesc, dtype: str, values: Sequence[Any], co
+         if ctype is not expected_ctype or len(storage) != descriptor.element_count:
+             raise CpuSve256ExecutionError("{} ctypes output buffer is incompatible".format(context))
+         for index, value in enumerate(values):
+-            storage[index] = _bf16_bits(value) if dtype == "bf16" else float(value)
++            storage[index] = _storage_scalar_value(dtype, value)
+         return
+     if isinstance(storage, int) and not isinstance(storage, bool):
+         if descriptor.element_count and storage == 0:
+@@ -994,19 +1221,17 @@ def _write_storage(descriptor: TensorDesc, dtype: str, values: Sequence[Any], co
+         ctype = _CTYPE[dtype]
+         array = (ctype * len(values)).from_address(storage)
+         for index, value in enumerate(values):
+-            array[index] = _bf16_bits(value) if dtype == "bf16" else float(value)
++            array[index] = _storage_scalar_value(dtype, value)
+         return
+     if hasattr(storage, "__array_interface__"):
+         interface = storage.__array_interface__
+         if interface.get("shape") is None or tuple(interface["shape"]) != descriptor.shape:
+             raise CpuSve256ExecutionError("{} output array shape does not match descriptor".format(context))
+         typestr = interface.get("typestr")
+-        expected_types = ("<f4", "=f4") if dtype == "float32" else (
+-            "<u2", "=u2", "<V2", "=V2", "|V2"
+-        )
++        expected_types = _NUMPY_TYPESTRS.get(dtype, ())
+         if typestr not in expected_types:
+             raise CpuSve256ExecutionError("{} output array dtype does not match {}".format(context, dtype))
+-        itemsize = 4 if dtype == "float32" else 2
++        itemsize = _NUMPY_ITEMSIZE[dtype]
+         expected_strides = []
+         running = itemsize
+         for dimension in reversed(descriptor.shape):
+@@ -1027,10 +1252,8 @@ def _write_storage(descriptor: TensorDesc, dtype: str, values: Sequence[Any], co
+             for index, value in enumerate(values):
+                 if dtype == "bf16" and typestr.endswith("V2"):
+                     flat[index] = struct.pack("<H", _bf16_bits(value))
+-                elif dtype == "bf16":
+-                    flat[index] = _bf16_bits(value)
+                 else:
+-                    flat[index] = value
++                    flat[index] = _storage_scalar_value(dtype, value)
+             return
+         except (AttributeError, TypeError, ValueError) as exc:
+             raise CpuSve256ExecutionError("{} output array is not writable".format(context)) from exc
+@@ -1537,17 +1760,22 @@ class Sve256Runtime:
+             ),
+         )
+ 
+-    def _invoke_runner(
++    def _invoke_runner_raw(
+         self,
+         artifact: Artifact,
+         *,
+         header: bytes,
+         payload: bytes,
+-        output_dtype: str,
++        expected_dtype: int,
+         expected_count: int,
+         wire_version: int,
+-    ) -> List[Any]:
+-        """Run one supervised ELF invocation and validate its response envelope."""
++    ) -> bytes:
++        """Run one supervised ELF invocation and validate its response envelope.
++
++        The raw response payload is returned undecoded; callers that need a
++        specific bit pattern (BF16 epilogue) can read it without a lossy
++        float round trip.
++        """
+ 
+         if self.execution_mode == "native":
+             command = [str(artifact.path)]
+@@ -1582,15 +1810,406 @@ class Sve256Runtime:
+                     status, result.returncode, result.stderr.decode("utf-8", "replace")
+                 )
+             )
++        if response_dtype != expected_dtype or response_count != expected_count:
++            raise CpuSve256ExecutionError("SVE256 runner response shape is invalid")
++        return result.stdout[_WIRE_RESPONSE.size:]
++
++    def _invoke_runner(
++        self,
++        artifact: Artifact,
++        *,
++        header: bytes,
++        payload: bytes,
++        output_dtype: str,
++        expected_count: int,
++        wire_version: int,
++    ) -> List[Any]:
++        """Run one supervised ELF invocation and decode its response."""
++
+         output_dtype = canonical_dtype(output_dtype)
+         expected_dtype = (
+             _DTYPE_CODES[output_dtype]
+             if output_dtype in _DTYPE_CODES
+             else _CONTROL_DTYPE_CODES[output_dtype]
+         )
+-        if response_dtype != expected_dtype or response_count != expected_count:
+-            raise CpuSve256ExecutionError("SVE256 runner response shape is invalid")
+-        return _decode_wire_values(output_dtype, result.stdout[_WIRE_RESPONSE.size:], response_count)
++        raw = self._invoke_runner_raw(
++            artifact,
++            header=header,
++            payload=payload,
++            expected_dtype=expected_dtype,
++            expected_count=expected_count,
++            wire_version=wire_version,
++        )
++        return _decode_wire_values(output_dtype, raw, expected_count)
++
++    # ------------------------------------------------------------------
++    # W8A8 native plane (runner wire v6, contract 0002 C5 / R6).
++    # ------------------------------------------------------------------
++
++    def _w8a8_header(
++        self,
++        operation: str,
++        wire_dtype: int,
++        count: int,
++        m: int = 0,
++        k: int = 0,
++        n: int = 0,
++    ) -> bytes:
++        return _WIRE_REQUEST.pack(
++            int.from_bytes(_WIRE_MAGIC, "little"),
++            _W8A8_WIRE_VERSION,
++            _OP_CODES[operation],
++            wire_dtype,
++            0,
++            0,
++            count,
++            m,
++            k,
++            n,
++        )
++
++    def _require_w8a8_declaration(self, artifact: Artifact, declared: Any) -> Any:
++        metadata = mapping_copy(artifact.metadata)
++        declaration = metadata.get("w8a8_capability")
++        if not isinstance(declaration, Mapping):
++            raise CpuSve256ArtifactError("SVE256 artifact has no W8A8 capability declaration")
++        if metadata.get("w8a8_runner_wire") != W8A8_RUNNER_WIRE:
++            raise CpuSve256ArtifactError("SVE256 artifact has no W8A8 v6 runner wire")
++        if declaration.get("digest") != declared.fingerprint:
++            raise CpuSve256ArtifactError("SVE256 artifact W8A8 capability digest mismatch")
++        if tuple(declaration.get("dtypes", ())) != tuple(declared.dtypes):
++            raise CpuSve256ArtifactError("SVE256 artifact W8A8 dtype declaration mismatch")
++        if tuple(declaration.get("matrix_capabilities", ())) != tuple(
++            declared.matrix_capabilities
++        ):
++            raise CpuSve256ArtifactError(
++                "SVE256 artifact W8A8 matrix capability declaration mismatch"
++            )
++        if declaration.get("sdot_used") is not False or declaration.get("i8mm_used") is not False:
++            raise CpuSve256ArtifactError("SVE256 W8A8 entry points require a non-SDOT/non-I8MM artifact")
++        return declared
++
++    def _load_w8a8(self, artifact: Artifact) -> Tuple[Any, LoadedSve256Artifact]:
++        # The real probe decides W8A8 availability, never an injected
++        # capability: an injected "available" cannot forge the native gate,
++        # and an injected low capability cannot disable a real machine that
++        # passes the probe (same fail-closed rule as C3/C4).
++        capability = self._require_real_capability()
++        declared = sve256_w8a8_capabilities(capability, target=self.name)
++        loaded = self._decode_for_execution(artifact, capability)
++        self._require_w8a8_declaration(loaded.artifact, declared)
++        return declared, loaded
++
++    def w8a8_capability(self, artifact: Artifact) -> Any:
++        """Return the probe-gated W8A8 :class:`CapabilitySet` for an artifact."""
++
++        declared, _ = self._load_w8a8(artifact)
++        return declared
++
++    def _run_w8a8_qmatmul_runner(
++        self,
++        artifact: Artifact,
++        left_codes: Sequence[int],
++        right_codes: Sequence[int],
++        m: int,
++        k: int,
++        n: int,
++    ) -> List[int]:
++        payload = _wire_values("int8", left_codes) + _wire_values("int8", right_codes)
++        header = self._w8a8_header(
++            W8A8_QMATMUL_OPCODE,
++            _CONTROL_DTYPE_CODES["int32"],
++            m * n,
++            m=m,
++            k=k,
++            n=n,
++        )
++        return self._invoke_runner(
++            artifact,
++            header=header,
++            payload=payload,
++            output_dtype="int32",
++            expected_count=m * n,
++            wire_version=_W8A8_WIRE_VERSION,
++        )
++
++    def run_w8a8_qmatmul(
++        self,
++        artifact: Artifact,
++        left: Any,
++        right: Any,
++        *,
++        left_shape: Optional[Sequence[int]] = None,
++        right_shape: Optional[Sequence[int]] = None,
++    ) -> Tuple[int, ...]:
++        """Run the native SVE256 widening s8 x s8 -> s32 kernel."""
++
++        _, loaded = self._load_w8a8(artifact)
++        left_flat, left_declared = _w8a8_declared_shape(left, left_shape, "qmatmul.left")
++        right_flat, right_declared = _w8a8_declared_shape(right, right_shape, "qmatmul.right")
++        if len(left_declared) != len(right_declared) or len(left_declared) not in (2, 3, 4):
++            raise CpuSve256ExecutionError(
++                "SVE256 {} operands must have equal rank 2, 3, or 4".format(W8A8_QMATMUL_OPCODE)
++            )
++        if left_declared[:-2] != right_declared[:-2]:
++            raise CpuSve256ExecutionError(
++                "SVE256 {} operands must have identical batch prefixes".format(W8A8_QMATMUL_OPCODE)
++            )
++        if left_declared[-1] != right_declared[-2]:
++            raise CpuSve256ExecutionError(
++                "SVE256 {} reduction dimensions do not match".format(W8A8_QMATMUL_OPCODE)
++            )
++        k = left_declared[-1]
++        if k > W8A8_MAX_ACCUMULATOR_K:
++            raise CpuSve256ExecutionError(
++                "SVE256 {} K={} exceeds the INT32 accumulation limit {}".format(
++                    W8A8_QMATMUL_OPCODE, k, W8A8_MAX_ACCUMULATOR_K
++                )
++            )
++        left_codes = _w8a8_int_codes(left_flat, "qmatmul.left")
++        right_codes = _w8a8_int_codes(right_flat, "qmatmul.right")
++        m = left_declared[-2]
++        n = right_declared[-1]
++        batch_shape = left_declared[:-2]
++        batch_count = 1
++        for dimension in batch_shape:
++            batch_count *= dimension
++        if len(left_codes) != batch_count * m * k or len(right_codes) != batch_count * k * n:
++            raise CpuSve256ExecutionError(
++                "SVE256 {} operand sizes do not match the declared shapes".format(
++                    W8A8_QMATMUL_OPCODE
++                )
++            )
++        left_elements = m * k
++        right_elements = k * n
++        values: List[int] = []
++        for batch_index in range(batch_count):
++            values.extend(
++                self._run_w8a8_qmatmul_runner(
++                    loaded.artifact,
++                    left_codes[batch_index * left_elements:(batch_index + 1) * left_elements],
++                    right_codes[batch_index * right_elements:(batch_index + 1) * right_elements],
++                    m,
++                    k,
++                    n,
++                )
++            )
++        return tuple(values)
++
++    def run_w8a8_dequantize_s8(
++        self,
++        artifact: Artifact,
++        codes: Any,
++        scales: Sequence[float],
++        *,
++        shape: Optional[Sequence[int]] = None,
++    ) -> Tuple[float, ...]:
++        """Run the native SVE256 ``dequantize_s8`` diagnostic primitive."""
++
++        _, loaded = self._load_w8a8(artifact)
++        flat, declared_shape = _w8a8_declared_shape(codes, shape, "dequantize_s8.codes")
++        if len(declared_shape) < 1:
++            raise CpuSve256ExecutionError("SVE256 dequantize_s8 requires at least a 1-D input")
++        k = declared_shape[-1]
++        rows = _w8a8_row_count(declared_shape)
++        if k == 0 or rows == 0:
++            raise CpuSve256ExecutionError("SVE256 dequantize_s8 requires non-empty [rows, K]")
++        if len(scales) != rows:
++            raise CpuSve256ExecutionError(
++                "SVE256 dequantize_s8 expects {} per-row scales, got {}".format(rows, len(scales))
++            )
++        code_values = _w8a8_int_codes(flat, "dequantize_s8.codes")
++        try:
++            scale_values = tuple(float(scale) for scale in scales)
++        except (TypeError, ValueError) as exc:
++            raise CpuSve256ExecutionError(
++                "SVE256 dequantize_s8 scales must be real numbers"
++            ) from exc
++        payload = _wire_values("int8", code_values) + _wire_values("float32", scale_values)
++        header = self._w8a8_header(
++            W8A8_DEQUANTIZE_OPCODE, _DTYPE_CODES["float32"], rows * k, m=rows, k=k
++        )
++        return tuple(
++            self._invoke_runner(
++                loaded.artifact,
++                header=header,
++                payload=payload,
++                output_dtype="float32",
++                expected_count=rows * k,
++                wire_version=_W8A8_WIRE_VERSION,
++            )
++        )
++
++    def run_w8a8_quantize_per_token_s8(
++        self,
++        artifact: Artifact,
++        values: Any,
++        *,
++        shape: Optional[Sequence[int]] = None,
++        dtype: str = "float32",
++    ) -> Sve256QuantizePerTokenResult:
++        """Run the native SVE256 dynamic per-token absmax quantizer (Q1-Q6).
++
++        ``dtype`` selects the logical input dtype: ``float32`` passes the
++        values through and ``bf16`` first rounds them to bfloat16 (the ELF
++        always consumes binary32, exactly like the graph's ``bf16 -> fp32``
++        view before quantization).
++        """
++
++        _, loaded = self._load_w8a8(artifact)
++        normalized_dtype = canonical_dtype(dtype)
++        if normalized_dtype not in ("float32", "bf16"):
++            raise CpuSve256ExecutionError(
++                "SVE256 quantize_per_token_s8 requires float32 or bf16 input, got {!r}".format(
++                    dtype
++                )
++            )
++        flat, declared_shape = _w8a8_declared_shape(values, shape, "quantize_per_token_s8.values")
++        if len(declared_shape) == 0:
++            raise CpuSve256ExecutionError(
++                "SVE256 quantize_per_token_s8 requires at least a 1-D input"
++            )
++        k = declared_shape[-1]
++        rows = _w8a8_row_count(declared_shape)
++        if k == 0 or rows == 0:
++            raise CpuSve256ExecutionError(
++                "SVE256 quantize_per_token_s8 requires non-empty [rows, K]"
++            )
++        if k > W8A8_MAX_ACCUMULATOR_K:
++            raise CpuSve256ExecutionError(
++                "SVE256 quantize_per_token_s8 K={} exceeds the INT32 accumulation limit {}".format(
++                    k, W8A8_MAX_ACCUMULATOR_K
++                )
++            )
++        numbers = []
++        for index, value in enumerate(flat):
++            if isinstance(value, bool) or not isinstance(value, (int, float)):
++                raise CpuSve256ExecutionError(
++                    "SVE256 quantize_per_token_s8.values[{}] must be a real number".format(index)
++                )
++            number = float(value)
++            if math.isnan(number) or math.isinf(number):
++                raise CpuSve256ExecutionError(
++                    "SVE256 quantize_per_token_s8.values[{}] is NaN/Inf; refusing to quantize (Q2)".format(
++                        index
++                    )
++                )
++            # The opcode is defined on a typed tensor: round the input to its
++            # declared dtype first, then quantize the exact stored value.
++            rounded = float(_cast_value(number, normalized_dtype))
++            if math.isnan(rounded) or math.isinf(rounded):
++                raise CpuSve256ExecutionError(
++                    "SVE256 quantize_per_token_s8.values[{}] overflows {!r}; refusing to quantize".format(
++                        index, normalized_dtype
++                    )
++                )
++            numbers.append(rounded)
++        payload = _wire_values("float32", numbers)
++        header = self._w8a8_header(
++            W8A8_QUANTIZE_OPCODE,
++            _CONTROL_DTYPE_CODES["int8"],
++            rows * k,
++            m=rows,
++            k=k,
++        )
++        raw = self._invoke_runner_raw(
++            loaded.artifact,
++            header=header,
++            payload=payload,
++            expected_dtype=_CONTROL_DTYPE_CODES["int8"],
++            expected_count=rows * k,
++            wire_version=_W8A8_WIRE_VERSION,
++        )
++        expected_bytes = rows * k + rows * 4 + 8
++        if len(raw) != expected_bytes:
++            raise CpuSve256ExecutionError(
++                "SVE256 quantize_per_token_s8 runner returned {} bytes; expected {}".format(
++                    len(raw), expected_bytes
++                )
++            )
++        codes = tuple(_decode_wire_values("int8", raw[: rows * k], rows * k))
++        scales = struct.unpack("<{}f".format(rows), raw[rows * k : rows * k + rows * 4])
++        saturation_count = struct.unpack("<Q", raw[rows * k + rows * 4 :])[0]
++        return Sve256QuantizePerTokenResult(codes, scales, saturation_count, rows, k)
++
++    def run_w8a8_dequantize_epilogue_bf16(
++        self,
++        artifact: Artifact,
++        accumulator: Any,
++        row_scales: Sequence[float],
++        column_scales: Sequence[float],
++        *,
++        shape: Optional[Sequence[int]] = None,
++    ) -> Tuple[int, ...]:
++        """Run the native SVE256 single-rounding BF16 epilogue, returning bits."""
++
++        _, loaded = self._load_w8a8(artifact)
++        flat, declared_shape = _w8a8_declared_shape(
++            accumulator, shape, "dequantize_epilogue_bf16.accumulator"
++        )
++        if len(declared_shape) != 2:
++            raise CpuSve256ExecutionError(
++                "SVE256 dequantize_epilogue_bf16 requires a rank-2 int32 accumulator"
++            )
++        rows, columns = declared_shape
++        if rows == 0 or columns == 0:
++            raise CpuSve256ExecutionError(
++                "SVE256 dequantize_epilogue_bf16 requires non-empty [m, n]"
++            )
++        if len(row_scales) != rows or len(column_scales) != columns:
++            raise CpuSve256ExecutionError(
++                "SVE256 dequantize_epilogue_bf16 scale counts do not match the accumulator shape"
++            )
++        values = []
++        for index, value in enumerate(flat):
++            if isinstance(value, bool) or not isinstance(value, int):
++                raise CpuSve256ExecutionError(
++                    "SVE256 dequantize_epilogue_bf16 accumulator[{}] must be an integer".format(
++                        index
++                    )
++                )
++            if value < -(2**31) or value > 2**31 - 1:
++                raise CpuSve256ExecutionError(
++                    "SVE256 dequantize_epilogue_bf16 accumulator[{}] outside INT32 range".format(
++                        index
++                    )
++                )
++            values.append(value)
++        try:
++            row_values = tuple(float(scale) for scale in row_scales)
++            column_values = tuple(float(scale) for scale in column_scales)
++        except (TypeError, ValueError) as exc:
++            raise CpuSve256ExecutionError(
++                "SVE256 dequantize_epilogue_bf16 scales must be real numbers"
++            ) from exc
++        payload = (
++            _wire_values("int32", values)
++            + _wire_values("float32", row_values)
++            + _wire_values("float32", column_values)
++        )
++        header = self._w8a8_header(
++            W8A8_EPILOGUE_OPCODE,
++            _DTYPE_CODES["bf16"],
++            rows * columns,
++            m=rows,
++            n=columns,
++        )
++        raw = self._invoke_runner_raw(
++            loaded.artifact,
++            header=header,
++            payload=payload,
++            expected_dtype=_DTYPE_CODES["bf16"],
++            expected_count=rows * columns,
++            wire_version=_W8A8_WIRE_VERSION,
++        )
++        if len(raw) != rows * columns * 2:
++            raise CpuSve256ExecutionError(
++                "SVE256 dequantize_epilogue_bf16 runner returned {} bytes; expected {}".format(
++                    len(raw), rows * columns * 2
++                )
++            )
++        return tuple(struct.unpack("<{}H".format(rows * columns), raw))
++
+ 
+     def _run_control_runner(
+         self,
+@@ -1750,6 +2369,152 @@ class Sve256Runtime:
+                 results.append(values[0] if values else None)
+         return tuple(results)
+ 
++    def _execute_w8a8_operation(
++        self,
++        operation: Operation,
++        plan: Any,
++        inputs: Sequence[Tuple[CoreType, List[Any]]],
++        environment: Dict[str, Tuple[CoreType, List[Any]]],
++        artifact: Artifact,
++    ) -> None:
++        """Execute one native v6 W8A8 operation for a Core IR program.
++
++        The same predicate that produced the artifact metadata decides this
++        dispatch, so an artifact can never advertise the native kernel and
++        then execute a host reference (contract 0002 section 6).
++        """
++
++        contract = w8a8_kernel_contract(operation, plan)
++        if contract is None:
++            raise CpuSve256ArtifactError(
++                "SVE256 W8A8 operation {!r} has no native kernel contract".format(plan.operation)
++            )
++        _, loaded = self._load_w8a8(artifact)
++        name = plan.operation
++        if name == W8A8_QMATMUL_OPCODE:
++            matmul = plan.matmul
++            if matmul is None:
++                raise CpuSve256ArtifactError("SVE256 W8A8 qmatmul plan is missing")
++            if matmul.k > W8A8_MAX_ACCUMULATOR_K:
++                raise CpuSve256ExecutionError(
++                    "SVE256 {} K={} exceeds the INT32 accumulation limit {}".format(
++                        W8A8_QMATMUL_OPCODE, matmul.k, W8A8_MAX_ACCUMULATOR_K
++                    )
++                )
++            batch_count = 1
++            for dimension in matmul.batch_shape:
++                batch_count *= dimension
++            left_elements = matmul.m * matmul.k
++            right_elements = matmul.k * matmul.n
++            if batch_count == 1:
++                # Rank-2 qmatmul keeps raw byte views raw: the ELF receives
++                # storage bytes and computes every product (R6).  No host
++                # element decode or arithmetic happens on this path.
++                left_values = _runner_values(
++                    inputs[0][1], left_elements, "SVE256 W8A8 qmatmul.left"
++                )
++                right_values = _runner_values(
++                    inputs[1][1], right_elements, "SVE256 W8A8 qmatmul.right"
++                )
++                values = list(
++                    self._run_w8a8_qmatmul_runner(
++                        loaded.artifact,
++                        left_values,
++                        right_values,
++                        matmul.m,
++                        matmul.k,
++                        matmul.n,
++                    )
++                )
++            else:
++                # Batched plans are an auditable host dispatch loop over the
++                # native rank-2 request; the metadata records that explicitly.
++                left_values = _materialize_values(
++                    inputs[0][1], "SVE256 W8A8 batched qmatmul.left"
++                )
++                right_values = _materialize_values(
++                    inputs[1][1], "SVE256 W8A8 batched qmatmul.right"
++                )
++                if (
++                    len(left_values) != batch_count * left_elements
++                    or len(right_values) != batch_count * right_elements
++                ):
++                    raise CpuSve256ExecutionError(
++                        "SVE256 W8A8 qmatmul operand length mismatch"
++                    )
++                values: List[int] = []
++                for batch_index in range(batch_count):
++                    values.extend(
++                        self._run_w8a8_qmatmul_runner(
++                            loaded.artifact,
++                            left_values[
++                                batch_index * left_elements:(batch_index + 1) * left_elements
++                            ],
++                            right_values[
++                                batch_index * right_elements:(batch_index + 1) * right_elements
++                            ],
++                            matmul.m,
++                            matmul.k,
++                            matmul.n,
++                        )
++                    )
++            output_ref = operation.outputs[0]
++            environment[output_ref.name] = (output_ref.type, values)
++            return
++        if name == W8A8_QUANTIZE_OPCODE:
++            input_dtype = canonical_dtype(inputs[0][0].dtype)
++            input_shape = tuple(int(value) for value in inputs[0][0].shape)
++            # A raw BF16/FP32 byte view is a dtype view, not a computation
++            # boundary: decode it so the runner's declared-dtype rounding
++            # sees the exact stored values (identical to the golden).  The
++            # explicit CoreType shape keeps a flat byte view from being
++            # reinterpreted as a 1-D row.
++            quantize_input = _materialize_values(
++                inputs[0][1], "SVE256 W8A8 quantize input"
++            )
++            result = self.run_w8a8_quantize_per_token_s8(
++                loaded.artifact, quantize_input, shape=input_shape, dtype=input_dtype
++            )
++            codes_ref, scales_ref = operation.outputs
++            environment[codes_ref.name] = (codes_ref.type, list(result.codes))
++            environment[scales_ref.name] = (scales_ref.type, list(result.scales))
++            return
++        if name == W8A8_DEQUANTIZE_OPCODE:
++            code_shape = tuple(int(value) for value in inputs[0][0].shape)
++            code_values = _materialize_values(inputs[0][1], "SVE256 W8A8 dequantize codes")
++            scale_values = _materialize_values(inputs[1][1], "SVE256 W8A8 dequantize scales")
++            values = self.run_w8a8_dequantize_s8(
++                loaded.artifact, code_values, scale_values, shape=code_shape
++            )
++            output_ref = operation.outputs[0]
++            environment[output_ref.name] = (output_ref.type, list(values))
++            return
++        if name == W8A8_EPILOGUE_OPCODE:
++            accumulator_shape = tuple(int(value) for value in inputs[0][0].shape)
++            accumulator = _materialize_values(
++                inputs[0][1], "SVE256 W8A8 epilogue accumulator"
++            )
++            row_scales = _materialize_values(inputs[1][1], "SVE256 W8A8 epilogue row scales")
++            column_scales = _materialize_values(
++                inputs[2][1], "SVE256 W8A8 epilogue column scales"
++            )
++            bits = self.run_w8a8_dequantize_epilogue_bf16(
++                loaded.artifact,
++                accumulator,
++                row_scales,
++                column_scales,
++                shape=accumulator_shape,
++            )
++            output_ref = operation.outputs[0]
++            environment[output_ref.name] = (
++                output_ref.type,
++                [_bf16_value(value) for value in bits],
++            )
++            return
++        raise CpuSve256ArtifactError(
++            "SVE256 unsupported W8A8 operation {!r}".format(name)
++        )
++
+     def _execute_operation(
+         self,
+         operation: Operation,
+@@ -1765,6 +2530,9 @@ class Sve256Runtime:
+             if ref.name not in environment:
+                 raise CpuSve256ExecutionError("SVE256 input {!r} is unavailable".format(ref.name))
+             inputs.append(environment[ref.name])
++        if name in W8A8_RUNTIME_OPERATIONS:
++            self._execute_w8a8_operation(operation, plan, inputs, environment, artifact)
++            return
+         if name == "split":
+             split = plan.split_plan
+             if split is None or len(operation.outputs) != len(split.output_shapes):
+@@ -2046,6 +2814,7 @@ __all__ = [
+     "CpuSVE256Runtime",
+     "LoadedSve256Artifact",
+     "SVE256Runtime",
++    "Sve256QuantizePerTokenResult",
+     "Sve256Runtime",
+     "launch_sve256",
+ ]
+diff --git a/python/pypto/compiler/targets/cpu_sve256.py b/python/pypto/compiler/targets/cpu_sve256.py
+index 5d2f596d2..e116305aa 100644
+--- a/python/pypto/compiler/targets/cpu_sve256.py
++++ b/python/pypto/compiler/targets/cpu_sve256.py
+@@ -22,19 +22,53 @@ from typing import Any, Mapping, Optional
+ from pypto.compiler.api import CompileOptions
+ from pypto.compiler.artifact import ABI_VERSION, Artifact
+ from pypto.core_ir import CoreProgram
++from pypto.lowering.cpu import (
++    W8A8_DEQUANTIZE_OPCODE,
++    W8A8_EPILOGUE_OPCODE,
++    W8A8_MAX_ACCUMULATOR_K,
++    W8A8_QMATMUL_OPCODE,
++    W8A8_QUANTIZE_OPCODE,
++    canonical_dtype,
++    canonical_operation_name,
++)
+ from pypto.lowering.cpu.aarch64.sve import (
+     SVE256_BACKEND,
+     SVE256_LOWERING_VERSION,
+     Sve256Program,
+     lower_sve256,
+ )
++from pypto.lowering.cpu.aarch64.sve.capabilities import (
++    SVE256_W8A8_CAPABILITY,
++    SVE256_W8A8_FORBIDDEN_MATRIX_CAPABILITIES,
++    SVE256_W8A8_MATRIX_CAPABILITY,
++)
+ from pypto.target import TargetSpec
+ from pypto.target._utils import mapping_copy, sha256_bytes, sha256_text
+ 
+ 
+ ARTIFACT_PAYLOAD_VERSION = 1
+ DEFAULT_ARTIFACT_FORMAT = "pypto-x.cpu.sve256"
+-RUNNER_PROTOCOL = "pypto-x.cpu.sve256.runner.v5"
++# Version 6 adds the W8A8 operation plane (native widening qmatmul plus the
++# three dequantize/quantize primitives).  The v5 control wire is unchanged
++# and stays the only wire for iota/compare/broadcast/where; v6 requests are
++# admitted only for the four W8A8 operations.
++RUNNER_PROTOCOL = "pypto-x.cpu.sve256.runner.v6"
++#: W8A8 native kernel plane.  Version 1 covers the public
++#: ``qmatmul_s8s8_s32`` Core IR opcode (R6); the three primitives stay
++#: target entry points until the C7/C8 graph integration.
++W8A8_KERNEL_VERSION = 1
++W8A8_QMATMUL_MODE = "native_sve256_w8a8_qmatmul"
++W8A8_QMATMUL_KERNEL = "ptx_sve256_qmatmul_s8s8_s32"
++W8A8_DEQUANTIZE_S8_KERNEL = "ptx_sve256_dequantize_s8_f32"
++W8A8_EPILOGUE_KERNEL = "ptx_sve256_dequantize_epilogue_bf16"
++W8A8_QUANTIZE_KERNEL = "ptx_sve256_quantize_per_token_s8_f32"
++#: C5 emits only base-SVE ``sunpklo`` widening and integer mul/mla.  There
++#: is no signed-compensation term (unlike VNNI u8 x s8) and no SDOT/I8MM.
++W8A8_COMPENSATION = "none_widening_sunpklo_no_sign_compensation"
++W8A8_RUNNER_WIRE = "v6:pxqm-pxqs-pxqd-pxqe"
++W8A8_SDOT_USED = False
++W8A8_I8MM_USED = False
++
+ 
+ 
+ _NATIVE_SOURCE = r'''
+@@ -55,6 +89,12 @@ _NATIVE_SOURCE = r'''
+  * native broadcast/where; v1 remains the legacy host-preexpanded broadcast
+  * and where wire contract and must not be used for iota/compare. */
+ #define PTX_CONTROL_VERSION 5U
++/* v6 carries the W8A8 operation plane: native widening qmatmul plus the
++ * dequantize/quantize primitives.  It is admitted only for those four
++ * operations; the v5 control wire is untouched. */
++#define PTX_W8A8_VERSION 6U
++/* floor((2^31 - 1) / (127 * 127)) == 133144 (contract 0002 section 1.4 Q5). */
++#define PTX_W8A8_MAX_K 133144ULL
+ #define PTX_STATUS_OK 0U
+ #define PTX_STATUS_BAD_REQUEST 2U
+ #define PTX_STATUS_RUNTIME 3U
+@@ -108,6 +148,10 @@ __attribute__((used, visibility("default"))) const char *ptx_sve256_indexing_fal
+     "scalar_indexing_lane_fallback:bf16_reorder";
+ __attribute__((used, visibility("default"))) const char *ptx_sve256_control_operations =
+     "native_iota_compare_broadcast_where";
++__attribute__((used, visibility("default"))) const char *ptx_sve256_w8a8_plane =
++    "sve_widening:no_sdot:no_i8mm";
++__attribute__((used, visibility("default"))) const char *ptx_sve256_w8a8_operations =
++    "native_qmatmul_s8s8_s32+dequantize_s8+quantize_per_token_s8+dequantize_epilogue_bf16";
+ 
+ enum { PTX_COPY = 0, PTX_NEG = 1, PTX_ADD = 2, PTX_SUB = 3,
+        PTX_MUL = 4, PTX_DIV = 5, PTX_REDUCE_SUM = 6,
+@@ -118,7 +162,9 @@ enum { PTX_COPY = 0, PTX_NEG = 1, PTX_ADD = 2, PTX_SUB = 3,
+        PTX_RESHAPE = 18, PTX_VIEW = 19, PTX_CONTIGUOUS = 20,
+        PTX_TRANSPOSE = 21, PTX_SLICE = 22,
+        PTX_SPLIT = 23, PTX_CONCAT = 24, PTX_GATHER = 25,
+-       PTX_EMBEDDING = 26, PTX_IOTA = 27, PTX_COMPARE = 28 };
++       PTX_EMBEDDING = 26, PTX_IOTA = 27, PTX_COMPARE = 28,
++       PTX_QMATMUL_S8S8_S32 = 29, PTX_QUANTIZE_PER_TOKEN_S8 = 30,
++       PTX_DEQUANTIZE_S8 = 31, PTX_DEQUANTIZE_EPILOGUE_BF16 = 32 };
+ 
+ typedef struct {
+     uint32_t magic;
+@@ -253,7 +299,8 @@ static int ptx_error_response(uint32_t status, uint32_t dtype, uint32_t version)
+     PtxResponse response;
+     response.magic = PTX_MAGIC;
+     response.version = (version == 1U || version == PTX_VERSION ||
+-                        version == PTX_INDEX_VERSION || version == PTX_CONTROL_VERSION)
++                        version == PTX_INDEX_VERSION || version == PTX_CONTROL_VERSION ||
++                        version == PTX_W8A8_VERSION)
+         ? version : PTX_VERSION;
+     response.status = status;
+     response.dtype = dtype <= 1 ? dtype : 0;
+@@ -292,7 +339,7 @@ static int ptx_size_mul(size_t left, size_t right, size_t *result) {
+ }
+ 
+ static int ptx_valid_operation(uint32_t operation) {
+-    return operation <= PTX_COMPARE;
++    return operation <= PTX_DEQUANTIZE_EPILOGUE_BF16;
+ }
+ 
+ static int ptx_is_layout_operation(uint32_t operation) {
+@@ -311,11 +358,20 @@ static int ptx_is_expand_operation(uint32_t operation) {
+     return operation == PTX_BROADCAST || operation == PTX_WHERE;
+ }
+ 
++static int ptx_is_w8a8_operation(uint32_t operation) {
++    return operation >= PTX_QMATMUL_S8S8_S32 && operation <= PTX_DEQUANTIZE_EPILOGUE_BF16;
++}
++
+ static int ptx_validate_control_request(const PtxRequest *request, const unsigned char *payload,
+                                         size_t payload_length, size_t *item_size,
+                                         size_t *payload_size, uint64_t *output_count,
+                                         size_t *result_size);
+ 
++static int ptx_validate_w8a8_request(const PtxRequest *request, const unsigned char *payload,
++                                     size_t payload_length, size_t *item_size,
++                                     size_t *payload_size, uint64_t *output_count,
++                                     size_t *result_size);
++
+ static int ptx_validate_request(const PtxRequest *request, const unsigned char *payload,
+                                 size_t payload_length, size_t *item_size,
+                                 size_t *payload_size, uint64_t *output_count,
+@@ -325,6 +381,14 @@ static int ptx_validate_request(const PtxRequest *request, const unsigned char *
+     int status;
+     if (!ptx_valid_operation(request->operation))
+         return PTX_STATUS_BAD_REQUEST;
++    if (request->version == PTX_W8A8_VERSION) {
++        if (!ptx_is_w8a8_operation(request->operation))
++            return PTX_STATUS_BAD_REQUEST;
++        return ptx_validate_w8a8_request(request, payload, payload_length, item_size,
++                                         payload_size, output_count, result_size);
++    }
++    if (ptx_is_w8a8_operation(request->operation))
++        return PTX_STATUS_BAD_REQUEST;
+     if (request->version == PTX_CONTROL_VERSION) {
+         if (!ptx_is_position_operation(request->operation) &&
+             !ptx_is_expand_operation(request->operation))
+@@ -440,6 +504,130 @@ static int ptx_validate_request(const PtxRequest *request, const unsigned char *
+     return PTX_STATUS_OK;
+ }
+ 
++/* Native W8A8 operation plane (runner protocol v6).
++ *
++ *   qmatmul_s8s8_s32        int8[m,k] x int8[k,n]  -> int32[m,n]
++ *   quantize_per_token_s8   float32[rows,k]        -> int8 codes + float32 scales
++ *                                                     + uint64 saturation count
++ *   dequantize_s8           int8[rows,k] + float32[rows]      -> float32
++ *   dequantize_epilogue_bf16 int32[m,n] + float32[m] + float32[n] -> bf16
++ *
++ * The ELF owns every integer product; the host only serializes storage and
++ * validates lengths.  K is bounded by the frozen contract Q5 so the int32
++ * accumulator cannot overflow.
++ */
++static int ptx_validate_w8a8_request(const PtxRequest *request, const unsigned char *payload,
++                                     size_t payload_length, size_t *item_size,
++                                     size_t *payload_size, uint64_t *output_count,
++                                     size_t *result_size) {
++    size_t primary, scales, result;
++    uint64_t elements;
++    (void)payload;
++    if (request->reserved != 0 || request->reserved2 != 0)
++        return PTX_STATUS_BAD_REQUEST;
++    if (request->operation == PTX_QMATMUL_S8S8_S32) {
++        size_t left_count, right_count, result_bytes;
++        if (request->dtype != PTX_DTYPE_I32)
++            return PTX_STATUS_BAD_REQUEST;
++        if (request->k > PTX_W8A8_MAX_K)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_u64_mul(request->m, request->k, &elements) != PTX_STATUS_OK ||
++            ptx_u64_to_size(elements, &left_count) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_u64_mul(request->k, request->n, &elements) != PTX_STATUS_OK ||
++            ptx_u64_to_size(elements, &right_count) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_u64_mul(request->m, request->n, &elements) != PTX_STATUS_OK ||
++            elements != request->count ||
++            ptx_u64_to_size(elements, &primary) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        /* int8 operands travel as one byte each. */
++        if (ptx_size_add(left_count, right_count, payload_size) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_size_mul(primary, sizeof(int32_t), &result_bytes) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        *item_size = sizeof(int32_t);
++        *output_count = request->count;
++        *result_size = result_bytes;
++        return PTX_STATUS_OK;
++    }
++    if (request->operation == PTX_QUANTIZE_PER_TOKEN_S8) {
++        size_t values_bytes, codes_bytes, scale_bytes;
++        if (request->dtype != PTX_DTYPE_I8 || request->m == 0 || request->k == 0 ||
++            request->n != 0 || request->m > (uint64_t)SIZE_MAX || request->k > (uint64_t)SIZE_MAX)
++            return PTX_STATUS_BAD_REQUEST;
++        if (request->k > PTX_W8A8_MAX_K)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_u64_mul(request->m, request->k, &elements) != PTX_STATUS_OK ||
++            elements != request->count ||
++            ptx_u64_to_size(elements, &primary) != PTX_STATUS_OK ||
++            ptx_u64_to_size(request->m, &scales) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_size_mul(primary, sizeof(float), &values_bytes) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        codes_bytes = primary;
++        if (ptx_size_mul(scales, sizeof(float), &scale_bytes) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_size_add(codes_bytes, scale_bytes, result_size) != PTX_STATUS_OK ||
++            ptx_size_add(*result_size, sizeof(uint64_t), result_size) != PTX_STATUS_OK ||
++            payload_length != values_bytes)
++            return PTX_STATUS_BAD_REQUEST;
++        *item_size = 1U;
++        *output_count = request->count;
++        *payload_size = payload_length;
++        return PTX_STATUS_OK;
++    }
++    if (request->operation == PTX_DEQUANTIZE_S8) {
++        size_t codes_bytes, scale_bytes, values_bytes;
++        if (request->dtype != PTX_DTYPE_F32 || request->m == 0 || request->k == 0 ||
++            request->n != 0 || request->m > (uint64_t)SIZE_MAX || request->k > (uint64_t)SIZE_MAX)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_u64_mul(request->m, request->k, &elements) != PTX_STATUS_OK ||
++            elements != request->count ||
++            ptx_u64_to_size(elements, &primary) != PTX_STATUS_OK ||
++            ptx_u64_to_size(request->m, &scales) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        codes_bytes = primary;
++        if (ptx_size_mul(scales, sizeof(float), &scale_bytes) != PTX_STATUS_OK ||
++            ptx_size_add(codes_bytes, scale_bytes, payload_size) != PTX_STATUS_OK ||
++            payload_length != *payload_size)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_size_mul(primary, sizeof(float), &values_bytes) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        *item_size = sizeof(float);
++        *output_count = request->count;
++        *result_size = values_bytes;
++        return PTX_STATUS_OK;
++    }
++    if (request->operation == PTX_DEQUANTIZE_EPILOGUE_BF16) {
++        size_t accumulator_bytes, row_bytes, column_bytes, output_bytes;
++        if (request->dtype != PTX_DTYPE_BF16 || request->m == 0 || request->n == 0 ||
++            request->k != 0 || request->m > (uint64_t)SIZE_MAX || request->n > (uint64_t)SIZE_MAX)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_u64_mul(request->m, request->n, &elements) != PTX_STATUS_OK ||
++            elements != request->count ||
++            ptx_u64_to_size(elements, &primary) != PTX_STATUS_OK ||
++            ptx_u64_to_size(request->m, &scales) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_size_mul(primary, sizeof(int32_t), &accumulator_bytes) != PTX_STATUS_OK ||
++            ptx_size_mul(scales, sizeof(float), &row_bytes) != PTX_STATUS_OK ||
++            ptx_u64_to_size(request->n, &scales) != PTX_STATUS_OK ||
++            ptx_size_mul(scales, sizeof(float), &column_bytes) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_size_add(accumulator_bytes, row_bytes, &result) != PTX_STATUS_OK ||
++            ptx_size_add(result, column_bytes, payload_size) != PTX_STATUS_OK ||
++            payload_length != *payload_size)
++            return PTX_STATUS_BAD_REQUEST;
++        if (ptx_size_mul(primary, sizeof(uint16_t), &output_bytes) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        *item_size = sizeof(uint16_t);
++        *output_count = request->count;
++        *result_size = output_bytes;
++        return PTX_STATUS_OK;
++    }
++    return PTX_STATUS_BAD_REQUEST;
++}
++
+ static inline uint16_t ptx_f32_to_bf16(float value) {
+     union { uint32_t bits; float value; } converted;
+     uint32_t rounding;
+@@ -1966,10 +2154,252 @@ static void ptx_matmul_f32(const float *left, const float *right,
+     }
+ }
+ 
++/* ------------------------------------------------------------------ *
++ * Native W8A8 widening kernels (runner protocol v6, contract 0002 C5/R6).
++ *
++ * qmatmul: int8 lanes are sign-widened in two ``sunpklo`` steps
++ * (s8 -> s16 -> s32) and accumulated with integer mul/add (``mla``).  This
++ * is the SVE analogue of the AVX2 vpmovsxbw/vpmaddwd path.  SDOT (SVE2) and
++ * SMMLA/I8MM are deliberately *not* emitted; the real probe records whether
++ * the machine exposes them so the evidence can distinguish "unavailable"
++ * from "available but unused".
++ *
++ * The frozen scheme admits only codes in [-127, 127]; INT8_MIN is rejected
++ * before any arithmetic rather than silently wrapped.  K is bounded by Q5
++ * so the int32 accumulator cannot overflow.
++ * ------------------------------------------------------------------ */
++
++static int ptx_w8a8_has_reserved(const int8_t *values, uint64_t count) {
++    uint64_t index;
++    for (index = 0; index < count; ++index)
++        if (values[index] == INT8_MIN) return 1;
++    return 0;
++}
++
++__attribute__((noinline, used, visibility("default"))) void ptx_sve256_qmatmul_s8s8_s32(const int8_t *left, const int8_t *right,
++                                      int32_t *output, uint64_t m, uint64_t k, uint64_t n) {
++    uint64_t row;
++    for (row = 0; row < m; ++row) {
++        const int8_t *left_row = left + row * k;
++        int32_t *output_row = output + row * n;
++        uint64_t column = 0;
++        while (column < n) {
++            uint64_t inner;
++            svbool_t store_pg = svwhilelt_b32(column, n);
++            svbool_t load_pg = svwhilelt_b8((uint64_t)0, n - column);
++            svint32_t accumulator = svdup_n_s32(0);
++            for (inner = 0; inner < k; ++inner) {
++                svint8_t a8 = svdup_n_s8(left_row[inner]);
++                svint8_t b8 = svld1_s8(load_pg, right + inner * n + column);
++                svint16_t a16 = svunpklo_s16(a8);
++                svint16_t b16 = svunpklo_s16(b8);
++                svint32_t a32 = svunpklo_s32(a16);
++                svint32_t b32 = svunpklo_s32(b16);
++                accumulator = svmla_m(store_pg, accumulator, a32, b32);
++            }
++            svst1_s32(store_pg, output_row + column, accumulator);
++            column += svcntw();
++        }
++    }
++}
++
++__attribute__((noinline, used, visibility("default"))) int ptx_sve256_dequantize_s8_f32(const int8_t *codes, const float *scales,
++                                       float *output, uint64_t rows, uint64_t k) {
++    uint64_t row;
++    for (row = 0; row < rows; ++row) {
++        float scale = scales[row];
++        const int8_t *code_row = codes + row * k;
++        float *output_row = output + row * k;
++        uint64_t column = 0;
++        while (column < k) {
++            svbool_t load_pg = svwhilelt_b8((uint64_t)0, k - column);
++            svbool_t store_pg = svwhilelt_b32(column, k);
++            svint8_t b8 = svld1_s8(load_pg, code_row + column);
++            svint16_t b16 = svunpklo_s16(b8);
++            svint32_t b32 = svunpklo_s32(b16);
++            svfloat32_t values = svcvt_f32_s32_x(store_pg, b32);
++            svfloat32_t scaled = svmul_f32_x(store_pg, values, svdup_n_f32(scale));
++            svst1_f32(store_pg, output_row + column, scaled);
++            column += svcntw();
++        }
++        if (isfinite(scale)) {
++            /* The Python golden raises on binary32 overflow; never return a
++             * silently saturated inf for a finite scale. */
++            for (column = 0; column < k; ++column)
++                if (isinf(output_row[column])) return -3;
++        }
++    }
++    return 0;
++}
++
++static inline int ptx_w8a8_rne_double(double value) {
++    double floor_value = floor(value);
++    double fraction = value - floor_value;
++    int64_t base = (int64_t)floor_value;
++    if (fraction > 0.5) base += 1;
++    else if (fraction == 0.5 && (base & 1)) base += 1;
++    return (int)base;
++}
++
++static float ptx_w8a8_row_absmax(const float *values, uint64_t k) {
++    uint64_t column = 0;
++    svfloat32_t maximum = svdup_n_f32(0.0f);
++    while (column < k) {
++        svbool_t pg = svwhilelt_b32(column, k);
++        svfloat32_t value = svld1(pg, values + column);
++        svfloat32_t magnitude = svabs_f32_x(pg, value);
++        maximum = svmax_m(pg, maximum, magnitude);
++        column += svcntw();
++    }
++    return svmaxv_f32(svptrue_b32(), maximum);
++}
++
++__attribute__((noinline, used, visibility("default"))) int ptx_sve256_quantize_per_token_s8_f32(const float *values,
++                                              int8_t *codes, float *scales,
++                                              uint64_t *saturation,
++                                              uint64_t rows, uint64_t k) {
++    uint64_t row, column, element, total_saturation = 0;
++    for (element = 0; element < rows * k; ++element)
++        if (!isfinite(values[element])) return -1;
++    for (row = 0; row < rows; ++row) {
++        const float *row_values = values + row * k;
++        int8_t *row_codes = codes + row * k;
++        float absmax = ptx_w8a8_row_absmax(row_values, k);
++        if (absmax == 0.0f) {
++            /* Q1: an all-zero row gets s=1.0 and q=0, never NaN/Inf. */
++            scales[row] = 1.0f;
++            for (column = 0; column < k; ++column) row_codes[column] = 0;
++            continue;
++        }
++        {
++            float scale = (float)((double)absmax / 127.0);
++            if (scale == 0.0f) return -2;
++            scales[row] = scale;
++            for (column = 0; column < k; ++column) {
++                /* Q4: exact FP64 quotient with ties-to-even RNE, matching
++                 * the C1 scalar golden bit for bit. */
++                int code = ptx_w8a8_rne_double((double)row_values[column] / (double)scale);
++                if (code < -127) {
++                    code = -127;
++                    ++total_saturation;
++                } else if (code > 127) {
++                    code = 127;
++                    ++total_saturation;
++                }
++                row_codes[column] = (int8_t)code;
++            }
++        }
++    }
++    *saturation = total_saturation;
++    return 0;
++}
++
++__attribute__((noinline, used, visibility("default"))) int ptx_sve256_dequantize_epilogue_bf16(const int32_t *accumulator,
++                                             const float *row_scales,
++                                             const float *column_scales,
++                                             uint16_t *output,
++                                             uint64_t rows, uint64_t columns) {
++    uint64_t row;
++    for (row = 0; row < rows; ++row) {
++        float row_scale = row_scales[row];
++        uint64_t column = 0;
++        while (column < columns) {
++            float scaled_lanes[32];
++            float product_lanes[32];
++            uint64_t lane, lanes;
++            svbool_t pg = svwhilelt_b32(column, columns);
++            svfloat32_t column_values = svld1(pg, column_scales + column);
++            svfloat32_t scaled = svmul_m(pg, column_values, svdup_n_f32(row_scale));
++            svint32_t accumulator_values = svld1_s32(pg, accumulator + row * columns + column);
++            svfloat32_t converted = svcvt_f32_s32_x(pg, accumulator_values);
++            svfloat32_t products = svmul_m(pg, converted, scaled);
++            svst1_f32(pg, scaled_lanes, scaled);
++            svst1_f32(pg, product_lanes, products);
++            lanes = columns - column;
++            if (lanes > svcntw()) lanes = svcntw();
++            for (lane = 0; lane < lanes; ++lane) {
++                if (isfinite(row_scale) && isfinite(column_scales[column + lane]) &&
++                    (isinf(scaled_lanes[lane]) || isinf(product_lanes[lane])))
++                    return -3;  /* binary32 overflow: the golden raises here */
++                output[row * columns + column + lane] =
++                    ptx_f32_to_bf16(product_lanes[lane]);
++            }
++            column += svcntw();
++        }
++    }
++    return 0;
++}
++
+ static int ptx_run(const PtxRequest *request, const unsigned char *payload,
+                    unsigned char *result) {
+     uint64_t count = request->count;
+     size_t item_size;
++    if (ptx_is_w8a8_operation(request->operation)) {
++        uint64_t left_count, right_count, primary, scales_count;
++        size_t left_bytes, right_bytes, primary_bytes, scale_bytes;
++        if (request->operation == PTX_QMATMUL_S8S8_S32) {
++            left_count = request->m * request->k;
++            right_count = request->k * request->n;
++            if (ptx_u64_to_size(left_count, &left_bytes) != PTX_STATUS_OK ||
++                ptx_u64_to_size(right_count, &right_bytes) != PTX_STATUS_OK ||
++                ptx_w8a8_has_reserved((const int8_t *)payload, left_count) ||
++                ptx_w8a8_has_reserved((const int8_t *)(payload + left_bytes), right_count))
++                return PTX_STATUS_RUNTIME;
++            ptx_sve256_qmatmul_s8s8_s32((const int8_t *)payload,
++                                      (const int8_t *)(payload + left_bytes),
++                                      (int32_t *)result, request->m, request->k, request->n);
++            return PTX_STATUS_OK;
++        }
++        if (request->operation == PTX_QUANTIZE_PER_TOKEN_S8) {
++            int8_t *codes = (int8_t *)result;
++            float *scales;
++            uint64_t *saturation;
++            if (ptx_u64_mul(request->m, request->k, &primary) != PTX_STATUS_OK ||
++                ptx_u64_to_size(primary, &primary_bytes) != PTX_STATUS_OK ||
++                ptx_u64_to_size(request->m, &scales_count) != PTX_STATUS_OK ||
++                ptx_size_mul(scales_count, sizeof(float), &scale_bytes) != PTX_STATUS_OK)
++                return PTX_STATUS_RUNTIME;
++            scales = (float *)(result + primary_bytes);
++            saturation = (uint64_t *)(result + primary_bytes + scale_bytes);
++            if (ptx_sve256_quantize_per_token_s8_f32((const float *)payload, codes, scales,
++                                                   saturation, request->m, request->k) != 0)
++                return PTX_STATUS_RUNTIME;
++            return PTX_STATUS_OK;
++        }
++        if (request->operation == PTX_DEQUANTIZE_S8) {
++            if (ptx_u64_mul(request->m, request->k, &primary) != PTX_STATUS_OK ||
++                ptx_u64_to_size(primary, &primary_bytes) != PTX_STATUS_OK ||
++                ptx_u64_to_size(request->m, &scales_count) != PTX_STATUS_OK ||
++                ptx_size_mul(scales_count, sizeof(float), &scale_bytes) != PTX_STATUS_OK ||
++                ptx_w8a8_has_reserved((const int8_t *)payload, primary))
++                return PTX_STATUS_RUNTIME;
++            if (ptx_sve256_dequantize_s8_f32((const int8_t *)payload,
++                                           (const float *)(payload + primary_bytes),
++                                           (float *)result, request->m, request->k) != 0)
++                return PTX_STATUS_RUNTIME;
++            return PTX_STATUS_OK;
++        }
++        if (ptx_u64_mul(request->m, request->n, &primary) != PTX_STATUS_OK ||
++            ptx_u64_to_size(primary, &primary_bytes) != PTX_STATUS_OK ||
++            ptx_size_mul(primary_bytes, sizeof(int32_t), &primary_bytes) != PTX_STATUS_OK ||
++            ptx_u64_to_size(request->m, &scales_count) != PTX_STATUS_OK ||
++            ptx_size_mul(scales_count, sizeof(float), &scale_bytes) != PTX_STATUS_OK ||
++            ptx_u64_to_size(request->n, &scales_count) != PTX_STATUS_OK)
++            return PTX_STATUS_RUNTIME;
++        {
++            /* scale_bytes currently holds the row-scale byte count. */
++            size_t row_bytes = scale_bytes;
++            if (ptx_size_mul(scales_count, sizeof(float), &scale_bytes) != PTX_STATUS_OK)
++                return PTX_STATUS_RUNTIME;
++            if (ptx_sve256_dequantize_epilogue_bf16(
++                    (const int32_t *)payload,
++                    (const float *)(payload + primary_bytes),
++                    (const float *)(payload + primary_bytes + row_bytes),
++                    (uint16_t *)result, request->m, request->n) != 0)
++                return PTX_STATUS_RUNTIME;
++        }
++        return PTX_STATUS_OK;
++    }
+     if (request->operation == PTX_IOTA) {
+         PtxIotaDescriptor descriptor;
+         if (ptx_decode_iota_descriptor(payload, (size_t)request->k, &descriptor) != PTX_STATUS_OK)
+@@ -2423,7 +2853,12 @@ int main(int argc, char **argv) {
+     memcpy(&request, input, sizeof(request));
+     if (request.magic != PTX_MAGIC || !ptx_valid_operation(request.operation) ||
+         (request.version != 1U && request.version != PTX_VERSION &&
+-         request.version != PTX_INDEX_VERSION && request.version != PTX_CONTROL_VERSION) ||
++         request.version != PTX_INDEX_VERSION && request.version != PTX_CONTROL_VERSION &&
++         request.version != PTX_W8A8_VERSION) ||
++        (request.version == PTX_W8A8_VERSION &&
++         !ptx_is_w8a8_operation(request.operation)) ||
++        (request.version != PTX_W8A8_VERSION &&
++         ptx_is_w8a8_operation(request.operation)) ||
+         (request.version == PTX_CONTROL_VERSION &&
+          !(ptx_is_position_operation(request.operation) ||
+            ptx_is_expand_operation(request.operation))) ||
+@@ -2474,6 +2909,158 @@ int main(int argc, char **argv) {
+ }
+ '''
+ 
++_W8A8_OPCODES = frozenset(
++    (
++        W8A8_QMATMUL_OPCODE,
++        W8A8_QUANTIZE_OPCODE,
++        W8A8_DEQUANTIZE_OPCODE,
++        W8A8_EPILOGUE_OPCODE,
++    )
++)
++
++
++def w8a8_kernel_contract(operation: Any, plan: Any) -> Optional[dict]:
++    """Describe the native SVE W8A8 kernel for one operation, or ``None``.
++
++    Only ``qmatmul_s8s8_s32`` is a public Core IR operation in C5; the
++    dequantize/quantize primitives are exercised through the runtime's
++    target-specific entry points.  ``None`` means the operation is not a
++    native W8A8 kernel and must not be advertised as one in artifact
++    metadata.
++    """
++
++    if operation is None or plan is None:
++        return None
++    name = canonical_operation_name(operation.name)
++    if name != plan.operation or name not in _W8A8_OPCODES:
++        return None
++    input_dtypes = tuple(canonical_dtype(ref.type.dtype) for ref in operation.inputs)
++    output_dtypes = tuple(canonical_dtype(ref.type.dtype) for ref in operation.outputs)
++    contract = {
++        "operation": name,
++        "compensation": W8A8_COMPENSATION,
++        "sdot_used": W8A8_SDOT_USED,
++        "i8mm_used": W8A8_I8MM_USED,
++        "geometry": {},
++    }
++    if name == W8A8_QMATMUL_OPCODE:
++        if plan.plan_kind != "matmul" or plan.matmul is None:
++            return None
++        if input_dtypes != ("int8", "int8") or output_dtypes != ("int32",):
++            return None
++        matmul = plan.matmul
++        if matmul.k > W8A8_MAX_ACCUMULATOR_K:
++            return None
++        contract.update(
++            {
++                "mode": W8A8_QMATMUL_MODE,
++                "kernel": W8A8_QMATMUL_KERNEL,
++                "geometry": {
++                    "m": int(matmul.m),
++                    "k": int(matmul.k),
++                    "n": int(matmul.n),
++                    "batch_shape": [int(value) for value in matmul.batch_shape],
++                },
++            }
++        )
++        return contract
++    if name == W8A8_QUANTIZE_OPCODE:
++        if input_dtypes not in (("float32",), ("bf16",)) or output_dtypes != ("int8", "float32"):
++            return None
++        shape = tuple(int(value) for value in operation.inputs[0].type.shape)
++        if len(shape) != 2 or shape[0] <= 0 or shape[1] <= 0:
++            return None
++        contract.update(
++            {
++                "mode": "native_sve256_w8a8_quantize_per_token_s8",
++                "kernel": W8A8_QUANTIZE_KERNEL,
++                "geometry": {"rows": shape[0], "k": shape[1]},
++            }
++        )
++        return contract
++    if name == W8A8_DEQUANTIZE_OPCODE:
++        if input_dtypes != ("int8", "float32") or output_dtypes != ("float32",):
++            return None
++        shape = tuple(int(value) for value in operation.inputs[0].type.shape)
++        if not shape or any(value <= 0 for value in shape):
++            return None
++        rows = 1
++        for value in shape[:-1]:
++            rows *= value
++        contract.update(
++            {
++                "mode": "native_sve256_w8a8_dequantize_s8",
++                "kernel": W8A8_DEQUANTIZE_S8_KERNEL,
++                "geometry": {"rows": rows, "k": shape[-1]},
++            }
++        )
++        return contract
++    if name == W8A8_EPILOGUE_OPCODE:
++        if input_dtypes != ("int32", "float32", "float32") or output_dtypes != ("bf16",):
++            return None
++        shape = plan.shape
++        if len(shape) != 2:
++            return None
++        contract.update(
++            {
++                "mode": "native_sve256_w8a8_dequantize_epilogue_bf16",
++                "kernel": W8A8_EPILOGUE_KERNEL,
++                "geometry": {"rows": int(shape[0]), "columns": int(shape[1])},
++            }
++        )
++        return contract
++    return None
++
++
++def _w8a8_capability_metadata() -> dict:
++    return {
++        "dtypes": list(SVE256_W8A8_CAPABILITY.dtypes),
++        "matrix_capabilities": list(SVE256_W8A8_CAPABILITY.matrix_capabilities),
++        "digest": SVE256_W8A8_CAPABILITY.fingerprint,
++        "matrix_kind": SVE256_W8A8_MATRIX_CAPABILITY,
++        "isa": "sve_widening_sunpklo",
++        "compensation": W8A8_COMPENSATION,
++        "sdot_used": W8A8_SDOT_USED,
++        "i8mm_used": W8A8_I8MM_USED,
++        "kernel_version": W8A8_KERNEL_VERSION,
++        "forbidden_matrix_capabilities": list(SVE256_W8A8_FORBIDDEN_MATRIX_CAPABILITIES),
++    }
++
++
++def _w8a8_execution_metadata(target_ir: Sve256Program) -> tuple:
++    """Return (names, entries) for the native W8A8 plane."""
++
++    function = next(
++        function for function in target_ir.program.functions
++        if function.name == target_ir.entrypoint
++    )
++    core_operations = list(function.body.operations)
++    names = []
++    entries = []
++    for plan in target_ir.plans:
++        operation = (
++            core_operations[plan.operation_index]
++            if 0 <= plan.operation_index < len(core_operations)
++            else None
++        )
++        contract = w8a8_kernel_contract(operation, plan)
++        if contract is None:
++            continue
++        if contract["operation"] not in names:
++            names.append(contract["operation"])
++        entry = {
++            "operation_index": plan.operation_index,
++            "operation": contract["operation"],
++            "mode": contract["mode"],
++            "kernel": contract["kernel"],
++            "compensation": contract["compensation"],
++            "sdot_used": contract["sdot_used"],
++            "i8mm_used": contract["i8mm_used"],
++        }
++        entry.update(contract["geometry"])
++        entries.append(entry)
++    return names, entries
++
+ 
+ class Sve256CompileError(RuntimeError):
+     """The AArch64 compiler could not produce an SVE256 ELF."""
+@@ -2703,6 +3290,7 @@ class Sve256Compiler:
+         program_data = json.loads(program_json)
+         program_digest = hashlib.sha256(program_json.encode("utf-8")).hexdigest()
+         plan_data = _plain_mapping(target_ir.vector_program.to_dict())
++        w8a8_names, w8a8_entries = _w8a8_execution_metadata(target_ir)
+         metadata = {
+             "backend": SVE256_BACKEND,
+             "artifact_payload_version": ARTIFACT_PAYLOAD_VERSION,
+@@ -2749,6 +3337,39 @@ class Sve256Compiler:
+             ],
+             "position_control_fallback": "native",
+             "control_descriptor_wire": "v5:pxio-pxcp-pxbd-pxwh+fnv1a64",
++            # W8C C5: the W8A8 plane is a separate v6 runner wire.  Keep the
++            # declared kernels in the immutable artifact so a regression
++            # cannot silently change the native/host boundary.
++            "w8a8_runner_wire": W8A8_RUNNER_WIRE,
++            "w8a8_kernel_version": W8A8_KERNEL_VERSION,
++            "w8a8_kernel_operations": w8a8_names,
++            "w8a8_operations": w8a8_entries,
++            "w8a8_capability": _w8a8_capability_metadata(),
++            "w8a8_target_entry_points": [
++                W8A8_DEQUANTIZE_OPCODE,
++                W8A8_QUANTIZE_OPCODE,
++                W8A8_EPILOGUE_OPCODE,
++            ],
++            # The native v6 wire remains rank-2.  Batched qmatmul plans run
++            # one native rank-2 request per equal batch-prefix slice on the
++            # host; this is an auditable dispatch loop, never a claim of a
++            # fused native batched kernel.
++            "w8a8_batched_qmatmul_dispatch": "host_batch_loop_rank2_native_kernel",
++            "w8a8_batched_qmatmul_operations": [
++                {
++                    "operation": plan.operation,
++                    "batch_shape": list(plan.matmul.batch_shape),
++                    "m": plan.matmul.m,
++                    "k": plan.matmul.k,
++                    "n": plan.matmul.n,
++                }
++                for plan in target_ir.plans
++                if plan.operation == W8A8_QMATMUL_OPCODE
++                and plan.matmul is not None
++                and plan.matmul.batch_shape
++            ],
++            "w8a8_sdot_used": W8A8_SDOT_USED,
++            "w8a8_i8mm_used": W8A8_I8MM_USED,
+             "execution_modes": ["native", "qemu"],
+             "guarded_buffer_self_test": True,
+             "layout_plan_version": 2,
+@@ -2903,5 +3524,16 @@ __all__ = [
+     "Sve256CompileError",
+     "Sve256Compiler",
+     "SVE256Compiler",
++    "W8A8_COMPENSATION",
++    "W8A8_DEQUANTIZE_S8_KERNEL",
++    "W8A8_EPILOGUE_KERNEL",
++    "W8A8_I8MM_USED",
++    "W8A8_KERNEL_VERSION",
++    "W8A8_QMATMUL_KERNEL",
++    "W8A8_QMATMUL_MODE",
++    "W8A8_QUANTIZE_KERNEL",
++    "W8A8_RUNNER_WIRE",
++    "W8A8_SDOT_USED",
+     "compile_cpu_sve256",
++    "w8a8_kernel_contract",
+ ]
+diff --git a/python/pypto/lowering/cpu/aarch64/sve/__init__.py b/python/pypto/lowering/cpu/aarch64/sve/__init__.py
+index 3691d7f13..f0199802d 100644
+--- a/python/pypto/lowering/cpu/aarch64/sve/__init__.py
++++ b/python/pypto/lowering/cpu/aarch64/sve/__init__.py
+@@ -2,11 +2,15 @@
+ 
+ from .capabilities import (
+     SVE256Capability,
++    SVE256_W8A8_CAPABILITY,
++    SVE256_W8A8_FORBIDDEN_MATRIX_CAPABILITIES,
++    SVE256_W8A8_MATRIX_CAPABILITY,
+     Sve256Capability,
+     Sve256ProbeError,
+     probe_sve256,
+     probe_sve256_capabilities,
+     probe_sve_capabilities,
++    sve256_w8a8_capabilities,
+ )
+ from .lowering import (
+     SVE_BACKEND,
+@@ -29,6 +33,9 @@ __all__ = [
+     "SVE256_LANE_COUNT",
+     "SVE256_LOWERING_VERSION",
+     "SVE256_TAIL_POLICY",
++    "SVE256_W8A8_CAPABILITY",
++    "SVE256_W8A8_FORBIDDEN_MATRIX_CAPABILITIES",
++    "SVE256_W8A8_MATRIX_CAPABILITY",
+     "SVE_BACKEND",
+     "SVE_LANE_COUNT",
+     "SVE_LOWERING_VERSION",
+@@ -44,4 +51,5 @@ __all__ = [
+     "probe_sve256",
+     "probe_sve256_capabilities",
+     "probe_sve_capabilities",
++    "sve256_w8a8_capabilities",
+ ]
+diff --git a/python/pypto/lowering/cpu/aarch64/sve/capabilities.py b/python/pypto/lowering/cpu/aarch64/sve/capabilities.py
+index 0236ed1cb..a110069bc 100644
+--- a/python/pypto/lowering/cpu/aarch64/sve/capabilities.py
++++ b/python/pypto/lowering/cpu/aarch64/sve/capabilities.py
+@@ -18,10 +18,78 @@ import subprocess
+ import tempfile
+ from typing import Any, Mapping, Optional, Tuple
+ 
++from pypto.target import CapabilitySet as _CapabilitySet
++from pypto.target import UnsupportedCapabilityError as _UnsupportedCapabilityError
++
+ 
+ SVE256_VL_BYTES = 32
+ SVE_HWCAP_BIT = 1 << 22
+ SVE2_HWCAP2_BIT = 1 << 1
++# Optional SVE2-era HWCAP2 extension bits (Linux uapi/asm/hwcap.h).  The
++# native SVE256 widening path does not emit any of these instructions; they
++# are probed and reported so the evidence can distinguish "not available"
++# from "available but deliberately unused" (contract 0002 D10 / section 6).
++SVE_I8MM_HWCAP2_BIT = 1 << 9
++SVE_F32MM_HWCAP2_BIT = 1 << 10
++SVE_F64MM_HWCAP2_BIT = 1 << 11
++SVE_BF16_HWCAP2_BIT = 1 << 12
++I8MM_HWCAP2_BIT = 1 << 13
++BF16_HWCAP2_BIT = 1 << 14
++
++
++#: W8A8 capability declaration for the SVE256 target.  The matrix kind names
++#: the actual mechanism emitted by this path: two-stage SVE ``sunpklo``
++#: widening (s8->s16->s32) plus ``mul``/``mla`` accumulation.  It is a
++#: different capability from AVX2 widening (``s8s8_s32_widening``) and from
++#: VNNI ``vpdpbusd``, and no dot-product / matrix-multiply extension is
++#: implied.
++SVE256_W8A8_MATRIX_CAPABILITY = "s8s8_s32_sve_widening_sunpklo"
++SVE256_W8A8_CAPABILITY = _CapabilitySet(
++    dtypes=("int8", "int32", "float32", "bf16"),
++    matrix_capabilities=(SVE256_W8A8_MATRIX_CAPABILITY,),
++)
++#: Matrix kinds that must stay absent from this declaration.  C5 does not
++#: emit SDOT (SVE2 dot product), I8MM/SMMLA or any AVX VNNI mechanism.
++SVE256_W8A8_FORBIDDEN_MATRIX_CAPABILITIES = (
++    "s8s8_s32_widening",
++    "s8s8_s32_vnni_dpbusd",
++    "int8_dot_product",
++    "smmla",
++    "sdot",
++)
++
++
++def sve256_w8a8_capabilities(
++    capability: Optional["Sve256Capability"] = None,
++    *,
++    target: Any = None,
++) -> _CapabilitySet:
++    """Return the probe-gated SVE256 W8A8 declaration.
++
++    The gate is the same real ``getauxval``/``prctl`` probe the runtime uses:
++    SVE must be present and the actual vector length must be 32 bytes.  The
++    widening path needs no SVE2/I8MM/SDOT extension, so those bits are
++    reported but deliberately not required.  An unavailable probe raises
++    :class:`UnsupportedCapabilityError` naming the missing matrix kind; no
++    BF16 fallback exists inside the W8A8 path (contract 0002 section 6).
++    """
++
++    if capability is None:
++        capability = probe_sve256_capabilities()
++    if not isinstance(capability, Sve256Capability) or not capability.available:
++        raise _UnsupportedCapabilityError(
++            "matrix_capability", SVE256_W8A8_MATRIX_CAPABILITY, target or "cpu.aarch64.sve256"
++        )
++    if capability.vl_bytes != SVE256_VL_BYTES:
++        raise _UnsupportedCapabilityError(
++            "matrix_capability", SVE256_W8A8_MATRIX_CAPABILITY, target or "cpu.aarch64.sve256"
++        )
++    SVE256_W8A8_CAPABILITY.require(
++        "matrix", SVE256_W8A8_MATRIX_CAPABILITY, target or "cpu.aarch64.sve256"
++    )
++    for dtype in ("int8", "int32", "float32", "bf16"):
++        SVE256_W8A8_CAPABILITY.require("dtype", dtype, target or "cpu.aarch64.sve256")
++    return SVE256_W8A8_CAPABILITY
+ 
+ 
+ _PROBE_SOURCE = r'''
+@@ -36,6 +104,24 @@ _PROBE_SOURCE = r'''
+ #ifndef HWCAP2_SVE2
+ #define HWCAP2_SVE2 (1UL << 1)
+ #endif
++#ifndef HWCAP2_SVEI8MM
++#define HWCAP2_SVEI8MM (1UL << 9)
++#endif
++#ifndef HWCAP2_SVEF32MM
++#define HWCAP2_SVEF32MM (1UL << 10)
++#endif
++#ifndef HWCAP2_SVEF64MM
++#define HWCAP2_SVEF64MM (1UL << 11)
++#endif
++#ifndef HWCAP2_SVEBF16
++#define HWCAP2_SVEBF16 (1UL << 12)
++#endif
++#ifndef HWCAP2_I8MM
++#define HWCAP2_I8MM (1UL << 13)
++#endif
++#ifndef HWCAP2_BF16
++#define HWCAP2_BF16 (1UL << 14)
++#endif
+ #ifndef PR_SVE_GET_VL
+ #define PR_SVE_GET_VL 51
+ #endif
+@@ -48,9 +134,14 @@ int main(void) {
+     unsigned long hwcap2 = getauxval(AT_HWCAP2);
+     int raw_vl = prctl(PR_SVE_GET_VL);
+     int vl = raw_vl < 0 ? -1 : (raw_vl & PR_SVE_VL_LEN_MASK);
+-    printf("{\"hwcap\":%lu,\"hwcap2\":%lu,\"sve\":%d,\"sve2\":%d,\"vl_bytes\":%d}\n",
++    printf("{\"hwcap\":%lu,\"hwcap2\":%lu,\"sve\":%d,\"sve2\":%d,"
++           "\"sve_i8mm\":%d,\"sve_bf16\":%d,\"sve_f32mm\":%d,\"sve_f64mm\":%d,"
++           "\"i8mm\":%d,\"bf16\":%d,\"vl_bytes\":%d}\n",
+            hwcap, hwcap2, (hwcap & HWCAP_SVE) != 0,
+-           (hwcap2 & HWCAP2_SVE2) != 0, vl);
++           (hwcap2 & HWCAP2_SVE2) != 0,
++           (hwcap2 & HWCAP2_SVEI8MM) != 0, (hwcap2 & HWCAP2_SVEBF16) != 0,
++           (hwcap2 & HWCAP2_SVEF32MM) != 0, (hwcap2 & HWCAP2_SVEF64MM) != 0,
++           (hwcap2 & HWCAP2_I8MM) != 0, (hwcap2 & HWCAP2_BF16) != 0, vl);
+     return 0;
+ }
+ '''
+@@ -95,6 +186,16 @@ class Sve256Capability:
+     emulated: bool = False
+     execution_mode: str = "native"
+     injected: bool = False
++    # Optional SVE2-era extensions.  They are observations only: the C5
++    # widening kernel requires neither SDOT nor I8MM, but the real probe
++    # records them so "unavailable" and "available but unused" stay
++    # distinguishable in the evidence.
++    sve_i8mm: bool = False
++    sve_bf16: bool = False
++    sve_f32mm: bool = False
++    sve_f64mm: bool = False
++    i8mm: bool = False
++    bf16: bool = False
+ 
+     @property
+     def vector_length_bytes(self) -> int:
+@@ -125,6 +226,12 @@ class Sve256Capability:
+         sve2: Optional[bool] = None,
+         emulated: bool = False,
+         source: str = "injected",
++        sve_i8mm: bool = False,
++        sve_bf16: bool = False,
++        sve_f32mm: bool = False,
++        sve_f64mm: bool = False,
++        i8mm: bool = False,
++        bf16: bool = False,
+     ) -> "Sve256Capability":
+         names = set(_normalise_features(features))
+         sve = "sve" in names or "sve256" in names
+@@ -136,6 +243,13 @@ class Sve256Capability:
+         if has_sve2:
+             names.add("sve2")
+         available = bool(sve and vl_bytes == SVE256_VL_BYTES)
++        hwcap2 = (SVE2_HWCAP2_BIT if has_sve2 else 0) | (
++            SVE_I8MM_HWCAP2_BIT if sve_i8mm else 0
++        ) | (SVE_BF16_HWCAP2_BIT if sve_bf16 else 0) | (
++            SVE_F32MM_HWCAP2_BIT if sve_f32mm else 0
++        ) | (SVE_F64MM_HWCAP2_BIT if sve_f64mm else 0) | (
++            I8MM_HWCAP2_BIT if i8mm else 0
++        ) | (BF16_HWCAP2_BIT if bf16 else 0)
+         return cls(
+             available,
+             tuple(sorted(names)),
+@@ -148,13 +262,19 @@ class Sve256Capability:
+             "injected",
+             "aarch64-linux-gnu",
+             SVE_HWCAP_BIT if sve else 0,
+-            SVE2_HWCAP2_BIT if has_sve2 else 0,
++            hwcap2,
+             int(vl_bytes),
+             sve,
+             has_sve2,
+             bool(emulated),
+             "qemu" if emulated else "native",
+             True,
++            bool(sve_i8mm),
++            bool(sve_bf16),
++            bool(sve_f32mm),
++            bool(sve_f64mm),
++            bool(i8mm),
++            bool(bf16),
+         )
+ 
+     def to_dict(self) -> Mapping[str, Any]:
+@@ -175,6 +295,12 @@ class Sve256Capability:
+             "emulated": self.emulated,
+             "execution_mode": self.execution_mode,
+             "injected": self.injected,
++            "sve_i8mm": self.sve_i8mm,
++            "sve_bf16": self.sve_bf16,
++            "sve_f32mm": self.sve_f32mm,
++            "sve_f64mm": self.sve_f64mm,
++            "i8mm": self.i8mm,
++            "bf16": self.bf16,
+         }
+ 
+ 
+@@ -260,6 +386,12 @@ def _run_probe(
+     hwcap2 = int(values.get("hwcap2", 0))
+     sve = bool(values.get("sve", bool(hwcap & SVE_HWCAP_BIT)))
+     sve2 = bool(values.get("sve2", bool(hwcap2 & SVE2_HWCAP2_BIT)))
++    sve_i8mm = bool(values.get("sve_i8mm", bool(hwcap2 & SVE_I8MM_HWCAP2_BIT)))
++    sve_bf16 = bool(values.get("sve_bf16", bool(hwcap2 & SVE_BF16_HWCAP2_BIT)))
++    sve_f32mm = bool(values.get("sve_f32mm", bool(hwcap2 & SVE_F32MM_HWCAP2_BIT)))
++    sve_f64mm = bool(values.get("sve_f64mm", bool(hwcap2 & SVE_F64MM_HWCAP2_BIT)))
++    i8mm = bool(values.get("i8mm", bool(hwcap2 & I8MM_HWCAP2_BIT)))
++    bf16 = bool(values.get("bf16", bool(hwcap2 & BF16_HWCAP2_BIT)))
+     vl_bytes = int(values.get("vl_bytes", -1))
+     features = set()
+     if sve:
+@@ -294,6 +426,12 @@ def _run_probe(
+         execution_mode == "qemu",
+         execution_mode,
+         False,
++        sve_i8mm,
++        sve_bf16,
++        sve_f32mm,
++        sve_f64mm,
++        i8mm,
++        bf16,
+     )
+ 
+ 
+@@ -329,10 +467,14 @@ SVE256Capability = Sve256Capability
+ 
+ __all__ = [
+     "SVE256_VL_BYTES",
++    "SVE256_W8A8_CAPABILITY",
++    "SVE256_W8A8_FORBIDDEN_MATRIX_CAPABILITIES",
++    "SVE256_W8A8_MATRIX_CAPABILITY",
+     "Sve256Capability",
+     "SVE256Capability",
+     "Sve256ProbeError",
+     "probe_sve256",
+     "probe_sve256_capabilities",
+     "probe_sve_capabilities",
++    "sve256_w8a8_capabilities",
+ ]
+diff --git a/python/pypto/lowering/cpu/aarch64/sve/lowering.py b/python/pypto/lowering/cpu/aarch64/sve/lowering.py
+index d48f96ad7..134283fe6 100644
+--- a/python/pypto/lowering/cpu/aarch64/sve/lowering.py
++++ b/python/pypto/lowering/cpu/aarch64/sve/lowering.py
+@@ -6,7 +6,13 @@ from dataclasses import dataclass
+ from typing import Any, Mapping, Optional
+ 
+ from pypto.core_ir import CoreProgram
+-from pypto.lowering.cpu import canonical_dtype
++from pypto.lowering.cpu import (
++    W8A8_DEQUANTIZE_OPCODE,
++    W8A8_EPILOGUE_OPCODE,
++    W8A8_QMATMUL_OPCODE,
++    W8A8_QUANTIZE_OPCODE,
++    canonical_dtype,
++)
+ from pypto.lowering.cpu.vector import (
+     CpuFeatureSet,
+     CpuVectorProgram,
+@@ -27,10 +33,23 @@ SVE256_BACKEND = "cpu.aarch64.sve256"
+ # must be rejected rather than silently reinterpreted under the old
+ # host-reference host pre-expansion semantics.  Every SVE plan uses compact
+ # domains; v3/v4/v5 artifacts were already rejected by version 6.
+-SVE256_LOWERING_VERSION = 7
++# Version 8 (W8C C5) admits the W8A8-linear integer plans (qmatmul s8xs8->s32
++# plus the quantize/dequantize/epilogue primitives) and changes the runner
++# protocol to v6 for the new operations, so v7 artifacts and the v5 runner
++# wire must fail closed rather than be reinterpreted under the float-only
++# operation set.
++SVE256_LOWERING_VERSION = 8
+ SVE256_LANE_COUNT = 8
+ SVE256_TAIL_POLICY = TailPolicy.MASKED
+ SVE256_REQUIRED_FEATURES = frozenset(("sve", "vl256"))
++W8A8_SVE256_OPERATIONS = frozenset(
++    (
++        W8A8_QMATMUL_OPCODE,
++        W8A8_QUANTIZE_OPCODE,
++        W8A8_DEQUANTIZE_OPCODE,
++        W8A8_EPILOGUE_OPCODE,
++    )
++)
+ SVE_BACKEND = SVE256_BACKEND
+ SVE_LANE_COUNT = SVE256_LANE_COUNT
+ SVE_LOWERING_VERSION = SVE256_LOWERING_VERSION
+@@ -163,6 +182,52 @@ def _required_features(required: Any) -> CpuFeatureSet:
+     return CpuFeatureSet(tuple(sorted(explicit)), source=source)
+ 
+ 
++def _w8a8_plan_error(operation: Any, plan: Any) -> Optional[str]:
++    """Return a fail-closed error string for a malformed W8A8 SVE plan.
++
++    The shared CPU vector planner already validates shapes and the C1 scalar
++    opcode contract; this extra check pins the exact dtype signature each
++    W8A8 plan must have before the SVE runner protocol can describe it
++    (contract 0002 section 3.3 / R6).
++    """
++
++    name = plan.operation
++    plan_dtype = canonical_dtype(plan.dtype)
++    inputs = tuple(canonical_dtype(ref.type.dtype) for ref in operation.inputs)
++    outputs = tuple(canonical_dtype(ref.type.dtype) for ref in operation.outputs)
++    if name == W8A8_QMATMUL_OPCODE:
++        if plan_dtype != "int32" or inputs != ("int8", "int8") or outputs != ("int32",):
++            return "SVE256 {} requires int8 x int8 -> int32, got {!r}/{!r}".format(
++                name, inputs, outputs
++            )
++        if plan.matmul is None:
++            return "SVE256 {} requires a matmul plan".format(name)
++        return None
++    if name == W8A8_QUANTIZE_OPCODE:
++        if plan_dtype != "int8" or inputs not in (("float32",), ("bf16",)):
++            return "SVE256 {} requires a single float32/bf16 input and int8 codes, got {!r}/{!r}".format(
++                name, inputs, plan_dtype
++            )
++        if outputs != ("int8", "float32"):
++            return "SVE256 {} requires int8 codes and float32 scales, got {!r}".format(
++                name, outputs
++            )
++        return None
++    if name == W8A8_DEQUANTIZE_OPCODE:
++        if plan_dtype != "float32" or inputs != ("int8", "float32") or outputs != ("float32",):
++            return "SVE256 {} requires int8+float32 -> float32, got {!r}/{!r}".format(
++                name, inputs, outputs
++            )
++        return None
++    if name == W8A8_EPILOGUE_OPCODE:
++        if plan_dtype != "bf16" or inputs != ("int32", "float32", "float32") or outputs != ("bf16",):
++            return "SVE256 {} requires int32+float32+float32 -> bf16, got {!r}/{!r}".format(
++                name, inputs, outputs
++            )
++        return None
++    return "SVE256 received unknown W8A8 operation {!r}".format(name)
++
++
+ @dataclass(frozen=True)
+ class Sve256Program:
+     """Validated SVE256 target IR and shared vector-common plan."""
+@@ -228,6 +293,11 @@ class Sve256Program:
+         )
+         for operation, plan in zip(function.body.operations, self.vector_program.plans):
+             plan_dtype = canonical_dtype(plan.dtype)
++            if plan.operation in W8A8_SVE256_OPERATIONS:
++                error = _w8a8_plan_error(operation, plan)
++                if error is not None:
++                    raise Sve256UnsupportedError(error)
++                continue
+             allowed_plan_dtype = plan_dtype in ("float32", "bf16") or (
+                 plan.operation == "iota" and plan_dtype in ("int32", "int64")
+             ) or (plan.operation == "compare" and plan_dtype == "bool")
+@@ -390,6 +460,7 @@ __all__ = [
+     "Sve256Program",
+     "Sve256UnsupportedError",
+     "Sve256ValidationError",
++    "W8A8_SVE256_OPERATIONS",
+     "lower",
+     "lower_sve256",
+     "probe_sve256_capabilities",
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256.py b/python/tests/ut/pypto_x/test_cpu_sve256.py
+index c34f0f19c..ad9880947 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256.py
+@@ -242,17 +242,17 @@ def test_lowering_uses_eight_lanes_masked_tail_and_omits_sve2():
+         lower_sve256(_elementwise(), _target("sve", "neon"))
+ 
+ 
+-def test_sve_v3_to_v6_plan_and_artifact_are_explicitly_incompatible_after_b2_bump(tmp_path):
++def test_sve_v3_to_v7_plan_and_artifact_are_explicitly_incompatible_after_c5_bump(tmp_path):
+     program = _elementwise(shape=(9,))
+     compiler, target_ir, artifact = _compile(program, tmp_path)
+-    assert target_ir.lowering_version == 7
+-    assert artifact.metadata["lowering_version"] == 7
++    assert target_ir.lowering_version == 8
++    assert artifact.metadata["lowering_version"] == 8
+     assert target_ir.plans[0].iteration.compact is True
+-    for old_version in (3, 4, 5, 6):
++    for old_version in (3, 4, 5, 6, 7):
+         with pytest.raises(Sve256ValidationError, match="unsupported SVE256 lowering version"):
+             Sve256Program(target_ir.vector_program, lowering_version=old_version)
+ 
+-    for old_version in (3, 4, 5, 6):
++    for old_version in (3, 4, 5, 6, 7):
+         old_metadata = dict(artifact.metadata)
+         old_metadata["lowering_version"] = old_version
+         old_artifact = Artifact(
+@@ -295,7 +295,7 @@ def test_sve_v4_compact_iteration_invariant_covers_nested_domains():
+     )
+     for program in programs:
+         valid = lower_sve256(program, _target("sve", "sve2"))
+-        Sve256Program(valid.vector_program, lowering_version=7).validate()
++        Sve256Program(valid.vector_program, lowering_version=8).validate()
+ 
+         legacy = lower_cpu_vector(
+             program,
+@@ -306,7 +306,7 @@ def test_sve_v4_compact_iteration_invariant_covers_nested_domains():
+             specialization={},
+         )
+         with pytest.raises(Sve256ValidationError, match="requires compact iteration"):
+-            Sve256Program(legacy, lowering_version=7)
++            Sve256Program(legacy, lowering_version=8)
+ 
+     for program, nested_name in (
+         (_reduction("float32", (2, 3), (2,), "reduce_sum", {"axis": 1}), "reduction.output_iteration"),
+@@ -333,7 +333,7 @@ def test_sve_v4_compact_iteration_invariant_covers_nested_domains():
+             ),
+         )
+         with pytest.raises(Sve256ValidationError, match=nested_name):
+-            Sve256Program(legacy, lowering_version=7)
++            Sve256Program(legacy, lowering_version=8)
+ 
+ 
+ def test_sve_target_is_fixed_little_endian_linux_protocol():
+@@ -1516,7 +1516,7 @@ def test_sve_b2_integrated_native_control_pipeline_and_metadata(tmp_path, monkey
+     assert artifact.metadata["position_control_fallback"] == "native"
+     assert artifact.metadata["control_descriptor_wire"] == "v5:pxio-pxcp-pxbd-pxwh+fnv1a64"
+     assert tuple(artifact.metadata["host_preexpanded_operations"]) == ()
+-    assert artifact.metadata["runner_protocol"].endswith(".v5")
++    assert artifact.metadata["runner_protocol"].endswith(".v6")
+     native_bytes = Path(artifact.path).read_bytes()
+     assert b"native_iota_compare_broadcast_where" in native_bytes
+ 
+diff --git a/python/tests/ut/pypto_x/test_qwen35_position_control.py b/python/tests/ut/pypto_x/test_qwen35_position_control.py
+index 527fd5dd1..07d529f7a 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_position_control.py
++++ b/python/tests/ut/pypto_x/test_qwen35_position_control.py
+@@ -139,9 +139,9 @@ def test_sve_qemu_position_control_differential_and_metadata(tmp_path):
+     program = build_qwen35_position_control(1, 2, past_length=3, index_dtype="int64")
+     target_ir, artifact = _compile_sve(program, tmp_path)
+     assert target_ir.vector_program.plan_version == 3
+-    assert target_ir.lowering_version == 7
++    assert target_ir.lowering_version == 8
+     assert artifact.metadata["plan_version"] == 3
+-    assert artifact.metadata["lowering_version"] == 7
++    assert artifact.metadata["lowering_version"] == 8
+     assert [plan.operation for plan in target_ir.plans] == ["iota", "iota", "iota", "compare"]
+     assert tuple(artifact.metadata["position_control_operations"]) == ("iota", "iota", "iota", "compare")
+     assert artifact.metadata["position_control_fallback"] == "native"
+diff --git a/python/tests/ut/pypto_x/test_w8a8_sve256.py b/python/tests/ut/pypto_x/test_w8a8_sve256.py
+new file mode 100644
+index 000000000..7540ca1eb
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_w8a8_sve256.py
+@@ -0,0 +1,984 @@
++"""SVE256 W8A8 widening path: contract 0002 C5 / R6 evidence.
++
++Scope of this module:
++
++* the native ``qmatmul_s8s8_s32`` Core IR path is bit-exact with the C1
++  scalar integer golden, including rank-3/rank-4 batch prefixes,
++  non-multiple-of-8 M/N/K tails, the K upper bound, the reserved ``-128``
++  code point and integer extremes;
++* the SVE256 capability declaration travels through ``CapabilitySet`` and is
++  gated by the real ``getauxval``/``prctl`` probe; injected capabilities can
++  neither forge nor disable the real gate (fail-closed);
++* the three dequantize/quantize primitives are bit-exact with the C1
++  goldens through the probe-gated target entry points;
++* the emitted widening code is proven by disassembly: two-stage ``sunpklo``
++  (s8 -> s16 -> s32) plus integer ``mla``, and no SDOT/I8MM instruction is
++  emitted even when the machine exposes those HWCAP2 bits;
++* runner wire v6 and lowering v7 artifacts fail closed instead of being
++  reinterpreted under the float-only operation set.
++
++This file also pins the connected fix for the pre-existing
++``sve256_write_storage`` integer raw-address output TypeError (registered as
++known limit ``sve256_write_storage_integer_raw_address_output_preexisting_typeerror``);
++the fix is not a C5-new defect but was required for an int32 W8A8 output
++handle.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import math
++import os
++from pathlib import Path
++import platform
++import random
++import re
++import shutil
++import struct
++import subprocess
++
++import pytest
++
++from pypto.abi import LaunchRequest, TensorDesc
++from pypto.backends.cpu import HostTensor
++from pypto.backends.cpu.aarch64 import (
++    CpuSve256ArtifactError,
++    CpuSve256ExecutionError,
++    CpuSve256UnavailableError,
++    Sve256Runtime,
++)
++from pypto.backends.cpu.tensor import _cast_value
++from pypto.compiler import Artifact, CompileOptions
++from pypto.compiler.targets.cpu_sve256 import (
++    RUNNER_PROTOCOL,
++    W8A8_COMPENSATION,
++    W8A8_DEQUANTIZE_S8_KERNEL,
++    W8A8_EPILOGUE_KERNEL,
++    W8A8_KERNEL_VERSION,
++    W8A8_QMATMUL_KERNEL,
++    W8A8_QMATMUL_MODE,
++    W8A8_QUANTIZE_KERNEL,
++    W8A8_RUNNER_WIRE,
++    Sve256Compiler,
++    w8a8_kernel_contract,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu import (
++    CpuScalarUnsupportedError,
++    W8A8_DEQUANTIZE_OPCODE,
++    W8A8_EPILOGUE_OPCODE,
++    W8A8_MAX_ACCUMULATOR_K,
++    W8A8_QMATMUL_OPCODE,
++    W8A8_QUANTIZE_OPCODE,
++    flatten_values,
++)
++from pypto.lowering.cpu.aarch64.sve import (
++    SVE256_LOWERING_VERSION,
++    SVE256_W8A8_CAPABILITY,
++    SVE256_W8A8_FORBIDDEN_MATRIX_CAPABILITIES,
++    SVE256_W8A8_MATRIX_CAPABILITY,
++    Sve256Capability,
++    probe_sve256_capabilities,
++    sve256_w8a8_capabilities,
++)
++from pypto.lowering.cpu.aarch64.sve import capabilities as capabilities_module
++from pypto.lowering.cpu.vector import CpuVectorUnsupportedError
++from pypto.portable.qwen35_w8a8_scheme import (
++    OPCODE_DEQUANTIZE_EPILOGUE_BF16,
++    OPCODE_DEQUANTIZE_S8,
++    OPCODE_QMATMUL_S8S8_S32,
++    OPCODE_QUANTIZE_PER_TOKEN_S8,
++    W8A8QuantizationError,
++    W8A8SchemeError,
++    dequantize_epilogue_bf16,
++    dequantize_s8,
++    qmatmul_s8s8_s32,
++    quantize_per_token_s8,
++)
++from pypto.target import TargetSpec, UnsupportedCapabilityError
++
++
++_QEMU_CPU = "max,sve256=on"
++# The same focused suite runs natively on A3 (SVE VL=32) by exporting
++# PYPTO_X_SVE_TEST_MODE=native; the default local leg is the explicit QEMU
++# differential.  No test ever silently crosses between the two modes.
++_EXECUTION_MODE = os.environ.get("PYPTO_X_SVE_TEST_MODE", "qemu").strip().lower()
++if _EXECUTION_MODE not in ("native", "qemu"):
++    raise RuntimeError("PYPTO_X_SVE_TEST_MODE must be 'native' or 'qemu'")
++
++
++@pytest.fixture(scope="session")
++def build_root(tmp_path_factory):
++    return tmp_path_factory.mktemp("pypto-x-sve256-w8a8")
++_TARGET = TargetSpec(
++    "cpu",
++    "aarch64-linux-gnu",
++    features=("sve", "sve2", "vl256"),
++    attributes={"vl_bytes": 32},
++)
++_COMPILED = {}
++
++
++def _require_sve_execution() -> None:
++    if _EXECUTION_MODE == "qemu":
++        if shutil.which("qemu-aarch64") is None:
++            pytest.skip("qemu-aarch64 is unavailable")
++    elif platform.machine().lower() not in ("aarch64", "arm64"):
++        pytest.skip("native SVE256 execution requires an AArch64 host")
++
++
++def _runtime(**kwargs) -> Sve256Runtime:
++    return Sve256Runtime(execution_mode=_EXECUTION_MODE, qemu_cpu=_QEMU_CPU, **kwargs)
++
++
++def _program(name, inputs, outputs, attributes=None):
++    return CoreProgram(
++        functions=(
++            CoreFunction(
++                "main",
++                tuple(inputs),
++                tuple(outputs),
++                Region((Operation(name, tuple(inputs), tuple(outputs), attributes or {}),)),
++            ),
++        )
++    )
++
++
++def _qmatmul_program(left_shape, right_shape):
++    left = ValueRef("left", CoreType.tensor("int8", left_shape))
++    right = ValueRef("right", CoreType.tensor("int8", right_shape))
++    output_shape = left_shape[:-2] + (left_shape[-2], right_shape[-1])
++    output = ValueRef("output", CoreType.tensor("int32", output_shape))
++    return _program(W8A8_QMATMUL_OPCODE, (left, right), (output,)), output_shape
++
++
++def _quantize_program(shape):
++    source = ValueRef("values", CoreType.tensor("float32", shape))
++    codes = ValueRef("codes", CoreType.tensor("int8", shape))
++    scales = ValueRef("scales", CoreType.tensor("float32", (shape[0],)))
++    return _program(W8A8_QUANTIZE_OPCODE, (source,), (codes, scales))
++
++
++def _dequantize_program(shape):
++    codes = ValueRef("codes", CoreType.tensor("int8", shape))
++    rows = math.prod(shape[:-1]) if len(shape) > 1 else 1
++    scales = ValueRef("scales", CoreType.tensor("float32", (rows,)))
++    output = ValueRef("output", CoreType.tensor("float32", shape))
++    return _program(W8A8_DEQUANTIZE_OPCODE, (codes, scales), (output,))
++
++
++def _epilogue_program(rows, columns):
++    accumulator = ValueRef("accumulator", CoreType.tensor("int32", (rows, columns)))
++    row_scales = ValueRef("row_scales", CoreType.tensor("float32", (rows,)))
++    column_scales = ValueRef("column_scales", CoreType.tensor("float32", (columns,)))
++    output = ValueRef("output", CoreType.tensor("bf16", (rows, columns)))
++    return _program(
++        W8A8_EPILOGUE_OPCODE,
++        (accumulator, row_scales, column_scales),
++        (output,),
++    )
++
++
++def _elementwise_program(shape=(4,)):
++    source = ValueRef("source", CoreType.tensor("float32", shape))
++    output = ValueRef("output", CoreType.tensor("float32", shape))
++    return _program("neg", (source,), (output,))
++
++
++def _compile(program, build_root, key):
++    if key not in _COMPILED:
++        compiler = Sve256Compiler()
++        target_ir = compiler.lower(program, _TARGET)
++        artifact = compiler.compile(
++            target_ir,
++            CompileOptions(
++                artifact_format="pypto-x.cpu.sve256",
++                extra={"build_dir": str(Path(build_root) / key)},
++            ),
++        )
++        _COMPILED[key] = (target_ir, artifact)
++    return _COMPILED[key]
++
++
++def _launch(artifact, inputs, outputs, runtime=None):
++    (_runtime() if runtime is None else runtime).launch(
++        LaunchRequest(
++            artifact,
++            inputs=[value.descriptor(readonly=True) for value in inputs],
++            outputs=[value.descriptor() for value in outputs],
++        )
++    )
++
++
++def _flat_values(output):
++    return tuple(flatten_values(output.data))
++
++
++def _rand_codes(rng, count, low=-127, high=127):
++    return [rng.randint(low, high) for _ in range(count)]
++
++
++def _qmatmul_golden(left, right, left_shape, right_shape):
++    return qmatmul_s8s8_s32(left, right, left_shape=left_shape, right_shape=right_shape).values
++
++
++def _float_bits(values):
++    return tuple(struct.pack("<f", value) for value in values)
++
++
++def _f32_nan(value: float) -> bool:
++    bits = struct.unpack("<I", struct.pack("<f", value))[0]
++    return (bits & 0x7F800000) == 0x7F800000 and bool(bits & 0x007FFFFF)
++
++
++def _f32_equal(left: float, right: float) -> bool:
++    if struct.pack("<f", left) == struct.pack("<f", right):
++        return True
++    return _f32_nan(left) and _f32_nan(right)
++
++
++def _bf16_nan(bits: int) -> bool:
++    return (bits & 0x7F80) == 0x7F80 and bool(bits & 0x007F)
++
++
++def _bf16_bits_equal(left: int, right: int) -> bool:
++    if left == right:
++        return True
++    return _bf16_nan(left) and _bf16_nan(right)
++
++
++def _f32_sequence_equal(left, right) -> bool:
++    return len(left) == len(right) and all(
++        _f32_equal(a, b) for a, b in zip(left, right)
++    )
++
++
++# ---------------------------------------------------------------------------
++# a) qmatmul_s8s8_s32 native Core IR, bit-exact with the scalar golden
++# ---------------------------------------------------------------------------
++
++QMATMUL_SHAPES = (
++    ((1, 1), (1, 1)),
++    ((2, 3), (3, 4)),
++    ((17, 13), (13, 19)),
++    ((2, 3, 5), (2, 5, 7)),
++    ((2, 1, 4, 3), (2, 1, 3, 5)),
++    ((3, 5, 7, 11), (3, 5, 11, 13)),
++    ((5, 7, 19), (5, 19, 3)),
++    ((1, 8, 9), (1, 9, 1)),
++)
++
++
++@pytest.mark.parametrize("left_shape,right_shape", QMATMUL_SHAPES)
++def test_sve_w8a8_qmatmul_core_ir_matches_integer_golden(left_shape, right_shape, build_root):
++    _require_sve_execution()
++    program, output_shape = _qmatmul_program(left_shape, right_shape)
++    key = "qm_{}_{}".format(left_shape, right_shape).replace(" ", "")
++    target_ir, artifact = _compile(program, build_root, key)
++    assert [plan.operation for plan in target_ir.plans] == [W8A8_QMATMUL_OPCODE]
++    assert tuple(artifact.metadata["w8a8_kernel_operations"]) == (W8A8_QMATMUL_OPCODE,)
++    rng = random.Random(17)
++    left = _rand_codes(rng, math.prod(left_shape))
++    right = _rand_codes(rng, math.prod(right_shape))
++    expected = _qmatmul_golden(left, right, left_shape, right_shape)
++    left_tensor = HostTensor("int8", left_shape, left)
++    right_tensor = HostTensor("int8", right_shape, right)
++    output = HostTensor("int32", output_shape, [0] * math.prod(output_shape))
++    _launch(artifact, [left_tensor, right_tensor], [output])
++    assert _flat_values(output) == tuple(expected)
++
++
++def test_sve_w8a8_qmatmul_extremes_and_zero_rows(build_root):
++    _require_sve_execution()
++    left_shape, right_shape = (3, 9), (9, 11)
++    program, output_shape = _qmatmul_program(left_shape, right_shape)
++    _, artifact = _compile(program, build_root, "qm_extremes")
++    cases = (
++        ([127] * 27, [127] * 99),
++        ([-127] * 27, [127] * 99),
++        ([127] * 27, [-127] * 99),
++        ([0] * 27, [5] * 99),
++        ([0] * 27, [0] * 99),
++        ([1, -1] * 13 + [0], [-3, 4] * 49 + [0]),
++    )
++    for left, right in cases:
++        expected = _qmatmul_golden(left, right, left_shape, right_shape)
++        left_tensor = HostTensor("int8", left_shape, left)
++        right_tensor = HostTensor("int8", right_shape, right)
++        output = HostTensor("int32", output_shape, [0] * math.prod(output_shape))
++        _launch(artifact, [left_tensor, right_tensor], [output])
++        assert _flat_values(output) == tuple(expected)
++
++
++@pytest.mark.parametrize("value", (127, -127))
++def test_sve_w8a8_qmatmul_k_upper_bound_is_exact(value, build_root):
++    _require_sve_execution()
++    k = W8A8_MAX_ACCUMULATOR_K
++    left_shape, right_shape = (1, k), (k, 1)
++    program, output_shape = _qmatmul_program(left_shape, right_shape)
++    _, artifact = _compile(program, build_root, "qm_kbound")
++    expected_value = value * 127 * k
++    assert abs(expected_value) == 2147479576 <= (2**31 - 1)
++    left = [value] * k
++    right = [127] * k
++    output = HostTensor("int32", output_shape, [0])
++    _launch(
++        artifact,
++        [HostTensor("int8", left_shape, left), HostTensor("int8", right_shape, right)],
++        [output],
++    )
++    assert _flat_values(output) == (expected_value,)
++
++
++def test_sve_w8a8_qmatmul_k_over_limit_fails_closed_in_lowering(build_root):
++    k = W8A8_MAX_ACCUMULATOR_K + 1
++    program, _ = _qmatmul_program((1, k), (k, 1))
++    with pytest.raises((CpuVectorUnsupportedError, CpuScalarUnsupportedError), match="exceeds"):
++        Sve256Compiler().lower(program, _TARGET)
++
++
++def test_sve_w8a8_qmatmul_rejects_reserved_minus_128(build_root):
++    _require_sve_execution()
++    program, output_shape = _qmatmul_program((1, 2), (2, 1))
++    _, artifact = _compile(program, build_root, "qm_reserved")
++    runtime = _runtime()
++    # Target entry point: fail-closed before any native launch.
++    with pytest.raises(CpuSve256ExecutionError, match="-127"):
++        runtime.run_w8a8_qmatmul(
++            artifact, [-128, 1], [1, 1], left_shape=(1, 2), right_shape=(2, 1)
++        )
++    # Core IR: the native ELF also guards the reserved code point.
++    output = HostTensor("int32", output_shape, [0])
++    with pytest.raises(CpuSve256ExecutionError, match="status"):
++        _launch(
++            artifact,
++            [
++                HostTensor("int8", (1, 2), [-128, 1]),
++                HostTensor("int8", (2, 1), [1, 1]),
++            ],
++            [output],
++            runtime=runtime,
++        )
++
++
++def test_sve_w8a8_qmatmul_entry_point_matches_golden(build_root):
++    _require_sve_execution()
++    runtime = _runtime()
++    for left_shape, right_shape in (((2, 3), (3, 4)), ((2, 3, 5), (2, 5, 7))):
++        program, _ = _qmatmul_program(left_shape, right_shape)
++        key = "qm_ep_{}".format(left_shape).replace(" ", "")
++        _, artifact = _compile(program, build_root, key)
++        rng = random.Random(23)
++        left = _rand_codes(rng, math.prod(left_shape))
++        right = _rand_codes(rng, math.prod(right_shape))
++        expected = _qmatmul_golden(left, right, left_shape, right_shape)
++        assert runtime.run_w8a8_qmatmul(
++            artifact, left, right, left_shape=left_shape, right_shape=right_shape
++        ) == tuple(expected)
++    with pytest.raises(CpuSve256ExecutionError, match="rank 2, 3, or 4"):
++        runtime.run_w8a8_qmatmul(artifact, [1], [1], left_shape=(1,), right_shape=(1,))
++
++
++def test_sve_w8a8_qmatmul_raw_address_int_output(build_root):
++    _require_sve_execution()
++    left_shape, right_shape = (1, 2), (2, 2)
++    program, output_shape = _qmatmul_program(left_shape, right_shape)
++    _, artifact = _compile(program, build_root, "qm_raw")
++    left = (ctypes.c_int8 * 2)(1, 2)
++    right = (ctypes.c_int8 * 4)(1, 2, 3, 4)
++    output = (ctypes.c_int32 * 2)(0, 0)
++    _runtime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[
++                TensorDesc("int8", left_shape, address=ctypes.addressof(left), readonly=True),
++                TensorDesc("int8", right_shape, address=ctypes.addressof(right), readonly=True),
++            ],
++            outputs=[
++                TensorDesc(
++                    "int32",
++                    output_shape,
++                    address=ctypes.addressof(output),
++                )
++            ],
++        )
++    )
++    assert [output[index] for index in range(2)] == [7, 10]
++
++
++# ---------------------------------------------------------------------------
++# a) Connected fix: integer raw-address outputs (pre-existing known limit)
++# ---------------------------------------------------------------------------
++
++
++def test_sve_write_storage_integer_raw_address_preexisting_fix(build_root):
++    """Pin the connected fix for the pre-existing raw-address TypeError.
++
++    Before the fix, ``_write_storage`` forced every non-BF16 value through
++    ``float(value)``, so a raw int32/int64 output address raised
++    ``TypeError: 'float' object cannot be interpreted as an integer``.  C5's
++    int32 qmatmul output exposed the defect; the fix is general, not
++    W8A8-specific.
++    """
++
++    _require_sve_execution()
++    runtime = _runtime()
++
++    # int64 raw output via a native iota program (non-W8A8, proves generality).
++    index = ValueRef("index", CoreType.tensor("int64", (5,)))
++    iota = _program("iota", (), (index,), {"axis": 0, "start": 2, "step": 3})
++    _, iota_artifact = _compile(iota, build_root, "iota_i64")
++    buffer64 = (ctypes.c_int64 * 5)(0, 0, 0, 0, 0)
++    runtime.launch(
++        LaunchRequest(
++            iota_artifact,
++            inputs=[],
++            outputs=[TensorDesc("int64", (5,), address=ctypes.addressof(buffer64))],
++        )
++    )
++    assert [buffer64[index] for index in range(5)] == [2, 5, 8, 11, 14]
++
++    # int8 + float32 raw outputs via the W8A8 quantizer.
++    program = _quantize_program((2, 4))
++    _, artifact = _compile(program, build_root, "quant_raw")
++    values = HostTensor("float32", (2, 4), [1.0, -2.0, 3.0, -4.0, 0.0, 0.0, 0.0, 0.0])
++    codes = (ctypes.c_int8 * 8)()
++    scales = (ctypes.c_float * 2)()
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[values.descriptor(readonly=True)],
++            outputs=[
++                TensorDesc("int8", (2, 4), address=ctypes.addressof(codes)),
++                TensorDesc("float32", (2,), address=ctypes.addressof(scales)),
++            ],
++        )
++    )
++    assert list(codes) == [32, -64, 95, -127, 0, 0, 0, 0]
++    assert list(scales) == [0.031496062874794006, 1.0]
++
++    # NumPy integer arrays are raw handles too.
++    np = pytest.importorskip("numpy")
++    qprogram, qshape = _qmatmul_program((1, 2), (2, 2))
++    _, qartifact = _compile(qprogram, build_root, "qm_numpy")
++    output = np.zeros(qshape, dtype="<i4")
++    runtime.launch(
++        LaunchRequest(
++            qartifact,
++            inputs=[
++                HostTensor("int8", (1, 2), [1, 2]).descriptor(readonly=True),
++                HostTensor("int8", (2, 2), [1, 2, 3, 4]).descriptor(readonly=True),
++            ],
++            outputs=[TensorDesc("int32", qshape, handle=output)],
++        )
++    )
++    assert output.tolist() == [[7, 10]]
++
++
++# ---------------------------------------------------------------------------
++# a) dequantize_s8 / quantize_per_token_s8 / dequantize_epilogue_bf16
++# ---------------------------------------------------------------------------
++
++
++def test_sve_w8a8_dequantize_matches_golden(build_root):
++    _require_sve_execution()
++    runtime = _runtime()
++    rng = random.Random(31)
++    cases = (
++        ((1, 1), [5], [0.25]),
++        ((3, 5), _rand_codes(rng, 15), [0.5, -1.25, 3.0]),
++        ((2, 3, 4), _rand_codes(rng, 24), [1.0, -0.5, 0.25, 2.0, -1.5, 0.75]),
++        ((1, 7), _rand_codes(rng, 7), [2.0]),
++        ((2, 8), _rand_codes(rng, 16), [0.0, -0.0]),
++    )
++    for shape, codes, scales in cases:
++        program = _dequantize_program(shape)
++        key = "dq_{}_{}".format(shape, len(codes)).replace(" ", "")
++        _, artifact = _compile(program, build_root, key)
++        expected = dequantize_s8(codes, scales, shape=shape)
++        actual = runtime.run_w8a8_dequantize_s8(artifact, codes, scales, shape=shape)
++        assert _f32_sequence_equal(actual, expected)
++
++
++def test_sve_w8a8_dequantize_special_scales_and_fail_closed(build_root):
++    _require_sve_execution()
++    runtime = _runtime()
++    program = _dequantize_program((1, 4))
++    _, artifact = _compile(program, build_root, "dq_special")
++    codes = [127, -127, 1, 0]
++    scales = [float("inf")]
++    expected = dequantize_s8(codes, scales, shape=(1, 4))
++    actual = runtime.run_w8a8_dequantize_s8(artifact, codes, scales, shape=(1, 4))
++    assert _f32_sequence_equal(actual, expected)
++    nan_scales = [float("nan")]
++    expected_nan = dequantize_s8(codes, nan_scales, shape=(1, 4))
++    actual_nan = runtime.run_w8a8_dequantize_s8(artifact, codes, nan_scales, shape=(1, 4))
++    assert _f32_sequence_equal(actual_nan, expected_nan)
++    with pytest.raises(CpuSve256ExecutionError, match="-127"):
++        runtime.run_w8a8_dequantize_s8(artifact, [-128, 0, 0, 0], [1.0], shape=(1, 4))
++    with pytest.raises(CpuSve256ExecutionError, match="status"):
++        runtime.run_w8a8_dequantize_s8(artifact, [127, 0, 0, 0], [3.0e38], shape=(1, 4))
++    with pytest.raises(W8A8SchemeError):
++        dequantize_s8([127, 0, 0, 0], [3.0e38], shape=(1, 4))
++
++
++def test_sve_w8a8_quantize_core_ir_matches_golden(build_root):
++    _require_sve_execution()
++    rng = random.Random(41)
++    cases = (
++        ((1, 1), [1.0]),
++        ((2, 5), [rng.uniform(-4.0, 4.0) for _ in range(10)]),
++        ((3, 7), [rng.uniform(-100.0, 100.0) for _ in range(21)]),
++        ((2, 8), [0.0] * 8 + [1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0]),
++    )
++    for shape, values in cases:
++        program = _quantize_program(shape)
++        key = "q_{}_{}".format(shape, len(values)).replace(" ", "")
++        _, artifact = _compile(program, build_root, key)
++        stored = [float(_cast_value(value, "float32")) for value in values]
++        expected = quantize_per_token_s8(stored, shape=shape)
++        values_tensor = HostTensor("float32", shape, stored)
++        codes = HostTensor("int8", shape, [0] * math.prod(shape))
++        scales = HostTensor("float32", (shape[0],), [0.0] * shape[0])
++        _launch(artifact, [values_tensor], [codes, scales])
++        assert _flat_values(codes) == tuple(expected.codes)
++        assert _flat_values(scales) == tuple(expected.scales)
++
++
++def test_sve_w8a8_quantize_entry_point_rank3_and_rank4(build_root):
++    _require_sve_execution()
++    runtime = _runtime()
++    # The entry point accepts any rank and flattens to [rows, K]; the Core IR
++    # builder currently pins the graph-facing quantizer to rank 2.
++    program = _quantize_program((2, 5))
++    _, artifact = _compile(program, build_root, "q_entry_ranks")
++    rng = random.Random(43)
++    for shape in ((2, 3, 4), (2, 2, 3, 2)):
++        values = [rng.uniform(-3.0, 3.0) for _ in range(math.prod(shape))]
++        stored = [float(_cast_value(value, "float32")) for value in values]
++        expected = quantize_per_token_s8(stored, shape=shape)
++        actual = runtime.run_w8a8_quantize_per_token_s8(artifact, values, shape=shape)
++        assert actual.codes == tuple(expected.codes)
++        assert actual.scales == tuple(expected.scales)
++        assert (actual.rows, actual.k) == (expected.rows, expected.k)
++
++
++def test_sve_w8a8_quantize_bf16_input_rounds_before_quantizing(build_root):
++    _require_sve_execution()
++    runtime = _runtime()
++    shape = (2, 6)
++    values = [0.03125 * index - 0.1 for index in range(12)]
++    program = _quantize_program(shape)
++    _, artifact = _compile(program, build_root, "q_bf16")
++    stored = [float(_cast_value(value, "bf16")) for value in values]
++    expected = quantize_per_token_s8(stored, shape=shape)
++    actual = runtime.run_w8a8_quantize_per_token_s8(artifact, values, shape=shape, dtype="bf16")
++    assert actual.codes == tuple(expected.codes)
++    assert actual.scales == tuple(expected.scales)
++
++
++def test_sve_w8a8_quantize_fails_closed_on_nan_inf_underflow_and_k(build_root):
++    _require_sve_execution()
++    runtime = _runtime()
++    program = _quantize_program((1, 4))
++    _, artifact = _compile(program, build_root, "q_failclosed")
++    for bad in (float("nan"), float("inf"), float("-inf")):
++        with pytest.raises(CpuSve256ExecutionError, match="NaN/Inf"):
++            runtime.run_w8a8_quantize_per_token_s8(
++                artifact, [bad, 0.0, 0.0, 0.0], shape=(1, 4)
++            )
++    # A non-zero row whose float32 scale underflows to zero must fail closed.
++    underflow = [2.0e-44, -2.0e-44, 0.0, 0.0]
++    scale = _cast_value(2.0e-44, "float32") / 127.0
++    assert _cast_value(scale, "float32") == 0.0
++    with pytest.raises(W8A8QuantizationError):
++        quantize_per_token_s8(underflow, shape=(1, 4))
++    with pytest.raises(CpuSve256ExecutionError, match="status"):
++        runtime.run_w8a8_quantize_per_token_s8(artifact, underflow, shape=(1, 4))
++    with pytest.raises(CpuSve256ExecutionError, match="exceeds"):
++        runtime.run_w8a8_quantize_per_token_s8(
++            artifact, [1.0] * (W8A8_MAX_ACCUMULATOR_K + 1), shape=(1, W8A8_MAX_ACCUMULATOR_K + 1)
++        )
++
++
++EPILOGUE_CASES = (
++    (1, 1),
++    (2, 3),
++    (5, 17),
++    (4, 33),
++)
++
++
++@pytest.mark.parametrize("rows,columns", EPILOGUE_CASES)
++def test_sve_w8a8_epilogue_matches_golden(rows, columns, build_root):
++    _require_sve_execution()
++    runtime = _runtime()
++    program = _epilogue_program(rows, columns)
++    _, artifact = _compile(program, build_root, "ep_{}x{}".format(rows, columns))
++    rng = random.Random(rows * 100 + columns)
++    accumulator = [rng.randint(-(2**31), 2**31 - 1) for _ in range(rows * columns)]
++    row_scales = [rng.uniform(1e-4, 1e-2) for _ in range(rows)]
++    column_scales = [rng.uniform(0.1, 2.0) for _ in range(columns)]
++    expected = dequantize_epilogue_bf16(
++        accumulator, row_scales, column_scales, shape=(rows, columns)
++    )
++    actual = runtime.run_w8a8_dequantize_epilogue_bf16(
++        artifact, accumulator, row_scales, column_scales, shape=(rows, columns)
++    )
++    assert len(actual) == len(expected.bf16_bits)
++    assert all(
++        _bf16_bits_equal(a, b) for a, b in zip(actual, expected.bf16_bits)
++    )
++
++
++def test_sve_w8a8_epilogue_int32_extremes_and_special_scales(build_root):
++    _require_sve_execution()
++    runtime = _runtime()
++    rows, columns = 3, 4
++    program = _epilogue_program(rows, columns)
++    _, artifact = _compile(program, build_root, "ep_extremes")
++    accumulator = [-(2**31), 2**31 - 1, 0, 1, -1, 123456789, -(2**31), 2**31 - 1, 7, -7, 0, 0]
++    row_scales = [float("inf"), 1e-3, float("nan")]
++    column_scales = [0.5, 1.5, 2.5, 3.5]
++    expected = dequantize_epilogue_bf16(
++        accumulator, row_scales, column_scales, shape=(rows, columns)
++    )
++    actual = runtime.run_w8a8_dequantize_epilogue_bf16(
++        artifact, accumulator, row_scales, column_scales, shape=(rows, columns)
++    )
++    assert len(actual) == len(expected.bf16_bits)
++    assert all(
++        _bf16_bits_equal(a, b) for a, b in zip(actual, expected.bf16_bits)
++    )
++    # Finite binary32 overflow fails closed, exactly like the golden.
++    with pytest.raises(W8A8SchemeError):
++        dequantize_epilogue_bf16(
++            [2**31 - 1] * 4, [3.0e38], [3.0e38] * 4, shape=(1, 4)
++        )
++    with pytest.raises(CpuSve256ExecutionError, match="status"):
++        runtime.run_w8a8_dequantize_epilogue_bf16(
++            artifact, [2**31 - 1] * 4, [3.0e38], [3.0e38] * 4, shape=(1, 4)
++        )
++
++
++# ---------------------------------------------------------------------------
++# b) capability probe and fail-closed gating
++# ---------------------------------------------------------------------------
++
++
++def test_sve256_w8a8_probe_reports_real_extensions():
++    _require_sve_execution()
++    capability = probe_sve256_capabilities(execution_mode=_EXECUTION_MODE, qemu_cpu=_QEMU_CPU)
++    assert capability.available is True
++    assert capability.vl_bytes == 32
++    assert capability.sve is True
++    assert capability.emulated is (_EXECUTION_MODE == "qemu")
++    assert capability.source.startswith("getauxval+prctl")
++    assert capability.hwcap & (1 << 22)
++    assert capability.sve2 == bool(capability.hwcap2 & (1 << 1))
++    assert capability.sve_i8mm == bool(capability.hwcap2 & (1 << 9))
++    assert capability.sve_bf16 == bool(capability.hwcap2 & (1 << 12))
++    assert capability.sve_f32mm == bool(capability.hwcap2 & (1 << 10))
++    assert capability.sve_f64mm == bool(capability.hwcap2 & (1 << 11))
++    assert capability.i8mm == bool(capability.hwcap2 & (1 << 13))
++    assert capability.bf16 == bool(capability.hwcap2 & (1 << 14))
++    declared = sve256_w8a8_capabilities(capability)
++    assert declared.dtypes == SVE256_W8A8_CAPABILITY.dtypes
++    assert set(declared.dtypes) == {"int8", "int32", "float32", "bf16"}
++    assert declared.matrix_capabilities == (SVE256_W8A8_MATRIX_CAPABILITY,)
++    for forbidden in SVE256_W8A8_FORBIDDEN_MATRIX_CAPABILITIES:
++        assert forbidden not in declared.matrix_capabilities
++
++
++def test_sve256_w8a8_capability_gate_rejects_unavailable_and_wrong_vl():
++    without_sve = Sve256Capability.injected_capability(("vl256",))
++    assert without_sve.available is False
++    with pytest.raises(UnsupportedCapabilityError):
++        sve256_w8a8_capabilities(without_sve)
++    wrong_vl = Sve256Capability.injected_capability(("sve",), vl_bytes=16)
++    assert wrong_vl.available is False
++    with pytest.raises(UnsupportedCapabilityError):
++        sve256_w8a8_capabilities(wrong_vl)
++
++
++def test_sve256_w8a8_injected_capability_cannot_forge_the_real_gate(
++    build_root, monkeypatch
++):
++    _require_sve_execution()
++    program, _ = _qmatmul_program((1, 2), (2, 1))
++    _, artifact = _compile(program, build_root, "qm_forge")
++    forged = Sve256Capability.injected_capability(("sve", "vl256"))
++    runtime = _runtime(capability=forged)
++    unavailable = Sve256Capability.injected_capability(())
++    monkeypatch.setattr(
++        capabilities_module, "probe_sve256_capabilities", lambda **kwargs: unavailable
++    )
++    with pytest.raises(CpuSve256UnavailableError):
++        runtime.run_w8a8_qmatmul(
++            artifact, [1, 2], [1, 1], left_shape=(1, 2), right_shape=(2, 1)
++        )
++
++
++def test_sve256_w8a8_injected_low_capability_cannot_disable_real_probe(build_root):
++    _require_sve_execution()
++    program, _ = _qmatmul_program((1, 2), (2, 1))
++    _, artifact = _compile(program, build_root, "qm_injected_low")
++    runtime = _runtime(capability=Sve256Capability.injected_capability(()))
++    assert runtime.is_available() is False
++    assert runtime.run_w8a8_qmatmul(
++        artifact, [1, 2], [1, 1], left_shape=(1, 2), right_shape=(2, 1)
++    ) == (3,)
++
++
++def test_sve256_w8a8_artifact_metadata_tamper_fails_closed(build_root):
++    _require_sve_execution()
++    program, _ = _qmatmul_program((1, 2), (2, 1))
++    _, artifact = _compile(program, build_root, "qm_tamper")
++    runtime = _runtime()
++
++    def tampered(**updates):
++        metadata = dict(artifact.metadata)
++        for key, value in updates.items():
++            metadata[key] = value
++        return Artifact(
++            format=artifact.format,
++            entrypoint=artifact.entrypoint,
++            target=artifact.target,
++            abi_version=artifact.abi_version,
++            path=artifact.path,
++            metadata=metadata,
++        )
++
++    capability = dict(artifact.metadata["w8a8_capability"])
++    capability["digest"] = "0" * 64
++    cases = (
++        {"runner_protocol": "pypto-x.cpu.sve256.runner.v5"},
++        {"lowering_version": 7},
++        {"w8a8_runner_wire": "v5:pxqm"},
++        {"w8a8_kernel_version": 0},
++        {"w8a8_sdot_used": True},
++        {"w8a8_i8mm_used": True},
++        {"w8a8_capability": capability},
++    )
++    for update in cases:
++        with pytest.raises(CpuSve256ArtifactError):
++            runtime.load(tampered(**update))
++    bad_dtypes = dict(artifact.metadata["w8a8_capability"])
++    bad_dtypes["dtypes"] = ["int8", "int32"]
++    with pytest.raises(CpuSve256ArtifactError):
++        runtime.load(tampered(w8a8_capability=bad_dtypes))
++    bad_matrix = dict(artifact.metadata["w8a8_capability"])
++    bad_matrix["matrix_capabilities"] = ["s8s8_s32_widening"]
++    with pytest.raises(CpuSve256ArtifactError):
++        runtime.load(tampered(w8a8_capability=bad_matrix))
++    bad_entry = dict(artifact.metadata["w8a8_capability"])
++    bad_entry["sdot_used"] = True
++    with pytest.raises(CpuSve256ArtifactError):
++        runtime.load(tampered(w8a8_capability=bad_entry))
++
++
++def test_sve256_w8a8_elf_wire_is_version_locked(build_root):
++    _require_sve_execution()
++    program, _ = _qmatmul_program((1, 2), (2, 1))
++    _, artifact = _compile(program, build_root, "qm_wire")
++    request = struct.Struct("<6I4Q")
++
++    def run(version, operation):
++        header = request.pack(0x56535850, version, operation, 4, 0, 0, 1, 1, 2, 1)
++        payload = struct.pack("<2b", 1, 2) + struct.pack("<2b", 1, 1)
++        if _EXECUTION_MODE == "qemu":
++            command = [
++                "qemu-aarch64", "-L", "/usr/aarch64-linux-gnu", "-cpu", _QEMU_CPU,
++                artifact.path,
++            ]
++        else:
++            command = [artifact.path]
++        return subprocess.run(
++            command,
++            input=header + payload,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            check=False,
++        )
++
++    good = run(6, 29)
++    assert good.returncode == 0
++    magic, version, status, dtype, count = struct.unpack("<4IQ", good.stdout[:24])
++    assert (magic, version, status, dtype, count) == (0x56535850, 6, 0, 4, 1)
++    # v5 must not be reinterpreted as the W8A8 wire, and v6 must not carry a
++    # non-W8A8 operation.
++    for version, operation in ((5, 29), (6, 1)):
++        result = run(version, operation)
++        assert result.returncode != 0
++        _, response_version, status, _, _ = struct.unpack("<4IQ", result.stdout[:24])
++        assert response_version == version
++        assert status != 0
++
++
++# ---------------------------------------------------------------------------
++# c) disassembly evidence: real widening, no SDOT/I8MM
++# ---------------------------------------------------------------------------
++
++
++def test_sve256_w8a8_disassembly_emits_widening_not_dot_or_i8mm(build_root):
++    _require_sve_execution()
++    objdump = shutil.which("aarch64-linux-gnu-objdump") or shutil.which("objdump")
++    if objdump is None:
++        pytest.skip("AArch64 objdump is unavailable")
++    program, _ = _qmatmul_program((2, 3), (3, 4))
++    _, artifact = _compile(program, build_root, "qm_objdump")
++    flags = tuple(artifact.metadata["native_flags"])
++    assert "-march=armv8.2-a+sve" in flags
++    assert "-msve-vector-bits=scalable" in flags
++    assert not any("sve2" in flag or "i8mm" in flag for flag in flags)
++    listing = subprocess.run(
++        [objdump, "-d", artifact.path],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        universal_newlines=True,
++        check=True,
++    ).stdout
++    symbol = listing.split("<{}>:".format(W8A8_QMATMUL_KERNEL), 1)
++    assert len(symbol) == 2, "native qmatmul symbol is missing from the ELF"
++    body = symbol[1].split("\n\n", 1)[0].lower()
++    assert len(re.findall(r"\bsunpklo\b", body)) >= 2, body
++    assert re.search(r"\b(mla|mul)\b", body)
++    assert re.search(r"\bst1w\b", body)
++    whole = listing.lower()
++    for forbidden in ("sdot", "udot", "smmla", "ummla", "usmmla", "bfdot", "bfmmla"):
++        assert not re.search(r"\b{}\b".format(forbidden), whole)
++    for kernel in (
++        W8A8_QMATMUL_KERNEL,
++        W8A8_DEQUANTIZE_S8_KERNEL,
++        W8A8_QUANTIZE_KERNEL,
++        W8A8_EPILOGUE_KERNEL,
++    ):
++        assert "<{}>:".format(kernel) in listing
++
++
++def test_sve256_w8a8_no_cross_isa_or_neon_lowering(build_root):
++    program, _ = _qmatmul_program((1, 2), (2, 1))
++    _, artifact = _compile(program, build_root, "qm_no_neon")
++    assert artifact.metadata["native_isa"] == "sve"
++    assert tuple(artifact.metadata["emitting_features"]) == ("sve",)
++    assert artifact.metadata["sve2_required"] is False
++    command = " ".join(str(item) for item in artifact.metadata["compile_command"]).lower()
++    assert "neon" not in command
++    assert not any("sve2" in str(flag) for flag in artifact.metadata["native_flags"])
++
++
++# ---------------------------------------------------------------------------
++# d) metadata / version contract
++# ---------------------------------------------------------------------------
++
++
++def test_sve256_w8a8_metadata_describes_native_contract(build_root):
++    program, _ = _qmatmul_program((2, 3, 5), (2, 5, 7))
++    target_ir, artifact = _compile(program, build_root, "qm_meta")
++    assert target_ir.lowering_version == SVE256_LOWERING_VERSION == 8
++    assert RUNNER_PROTOCOL == "pypto-x.cpu.sve256.runner.v6"
++    assert artifact.metadata["runner_protocol"] == RUNNER_PROTOCOL
++    assert artifact.metadata["w8a8_runner_wire"] == W8A8_RUNNER_WIRE
++    assert artifact.metadata["w8a8_kernel_version"] == W8A8_KERNEL_VERSION
++    assert tuple(artifact.metadata["w8a8_kernel_operations"]) == (W8A8_QMATMUL_OPCODE,)
++    assert artifact.metadata["w8a8_capability"]["digest"] == SVE256_W8A8_CAPABILITY.fingerprint
++    assert artifact.metadata["w8a8_sdot_used"] is False
++    assert artifact.metadata["w8a8_i8mm_used"] is False
++    entry = artifact.metadata["w8a8_operations"][0]
++    assert entry["mode"] == W8A8_QMATMUL_MODE
++    assert entry["kernel"] == W8A8_QMATMUL_KERNEL
++    assert entry["compensation"] == W8A8_COMPENSATION
++    assert tuple(entry["batch_shape"]) == (2,)
++    assert (entry["m"], entry["k"], entry["n"]) == (3, 5, 7)
++    assert artifact.metadata["w8a8_batched_qmatmul_dispatch"] == (
++        "host_batch_loop_rank2_native_kernel"
++    )
++    batched = list(artifact.metadata["w8a8_batched_qmatmul_operations"])
++    assert len(batched) == 1
++    assert batched[0]["operation"] == W8A8_QMATMUL_OPCODE
++    assert tuple(batched[0]["batch_shape"]) == (2,)
++    assert (batched[0]["m"], batched[0]["k"], batched[0]["n"]) == (3, 5, 7)
++    contract = w8a8_kernel_contract(
++        target_ir.program.functions[0].body.operations[0], target_ir.plans[0]
++    )
++    assert contract is not None
++    assert contract["kernel"] == W8A8_QMATMUL_KERNEL
++    assert contract["sdot_used"] is False and contract["i8mm_used"] is False
++
++
++def test_sve256_w8a8_primitive_metadata_and_target_entry_points(build_root):
++    quantize = _quantize_program((3, 4))
++    _, quantize_artifact = _compile(quantize, build_root, "meta_q")
++    assert tuple(quantize_artifact.metadata["w8a8_kernel_operations"]) == (W8A8_QUANTIZE_OPCODE,)
++    quantize_entry = quantize_artifact.metadata["w8a8_operations"][0]
++    assert quantize_entry["mode"] == "native_sve256_w8a8_quantize_per_token_s8"
++    assert quantize_entry["kernel"] == W8A8_QUANTIZE_KERNEL
++    assert (quantize_entry["rows"], quantize_entry["k"]) == (3, 4)
++    dequantize = _dequantize_program((3, 4))
++    _, dequantize_artifact = _compile(dequantize, build_root, "meta_dq")
++    assert tuple(dequantize_artifact.metadata["w8a8_kernel_operations"]) == (W8A8_DEQUANTIZE_OPCODE,)
++    assert dequantize_artifact.metadata["w8a8_operations"][0]["kernel"] == (
++        W8A8_DEQUANTIZE_S8_KERNEL
++    )
++    epilogue = _epilogue_program(2, 3)
++    _, epilogue_artifact = _compile(epilogue, build_root, "meta_ep")
++    assert tuple(epilogue_artifact.metadata["w8a8_kernel_operations"]) == (W8A8_EPILOGUE_OPCODE,)
++    assert epilogue_artifact.metadata["w8a8_operations"][0]["kernel"] == W8A8_EPILOGUE_KERNEL
++    assert tuple(epilogue_artifact.metadata["w8a8_target_entry_points"]) == (
++        W8A8_DEQUANTIZE_OPCODE,
++        W8A8_QUANTIZE_OPCODE,
++        W8A8_EPILOGUE_OPCODE,
++    )
++
++
++def test_sve256_w8a8_opcode_names_match_the_contract():
++    assert (
++        W8A8_QMATMUL_OPCODE,
++        W8A8_QUANTIZE_OPCODE,
++        W8A8_DEQUANTIZE_OPCODE,
++        W8A8_EPILOGUE_OPCODE,
++    ) == (
++        OPCODE_QMATMUL_S8S8_S32,
++        OPCODE_QUANTIZE_PER_TOKEN_S8,
++        OPCODE_DEQUANTIZE_S8,
++        OPCODE_DEQUANTIZE_EPILOGUE_BF16,
++    )
++
++
++# ---------------------------------------------------------------------------
++# e) native/host boundary
++# ---------------------------------------------------------------------------
++
++
++def test_sve256_w8a8_qmatmul_never_decodes_storage_on_the_host(build_root, monkeypatch):
++    """The rank-2 qmatmul path sends raw storage bytes to the AArch64 ELF."""
++
++    _require_sve_execution()
++    import pypto.backends.cpu.aarch64.sve256 as sve256_module
++
++    program, output_shape = _qmatmul_program((2, 3), (3, 4))
++    _, artifact = _compile(program, build_root, "qm_host_boundary")
++
++    def forbidden(value, context):
++        raise AssertionError("host decoded qmatmul storage: {}".format(context))
++
++    monkeypatch.setattr(sve256_module, "_materialize_values", forbidden)
++    runtime = _runtime()
++    left = HostTensor("int8", (2, 3), [1, -2, 3, -4, 5, -6])
++    right = HostTensor("int8", (3, 4), [7, 8, 9, 10, -11, -12, -13, -14, 15, 16, 17, 18])
++    output = HostTensor("int32", output_shape, [0] * 8)
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[left.descriptor(readonly=True), right.descriptor(readonly=True)],
++            outputs=[output.descriptor()],
++        )
++    )
++    assert _flat_values(output) == tuple(
++        _qmatmul_golden(
++            [1, -2, 3, -4, 5, -6],
++            [7, 8, 9, 10, -11, -12, -13, -14, 15, 16, 17, 18],
++            (2, 3),
++            (3, 4),
++        )
++    )

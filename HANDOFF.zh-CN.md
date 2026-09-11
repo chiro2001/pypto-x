@@ -1,8 +1,10 @@
 # PyPTO-X 接手文档
 
-状态：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED_W8C_C1_C2_VERIFIED_W8B_B5_REDUCE_BROADCAST_VERIFIED_W8B_B3A_CUDA_EVENT_TIMING_VERIFIED_W8B_B1_AVX2_PACKED_VERIFIED_W8B_AVX512_BLOCKED_GEMM_VERIFIED_W8B_B3B_R3_PASS_W8C_C3_C4_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_ERR_0004`
+状态：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED_W8C_C1_C2_VERIFIED_W8B_B5_REDUCE_BROADCAST_VERIFIED_W8B_B3A_CUDA_EVENT_TIMING_VERIFIED_W8B_B1_AVX2_PACKED_VERIFIED_W8B_AVX512_BLOCKED_GEMM_VERIFIED_W8B_B3B_R3_PASS_W8C_C3_C4_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_ERR_0004_A3_ONBOARDED_ASCEND_N1_N4_PASS_W8B_B2_SVE_VERIFIED_W8C_LMHEAD_556_VERIFIED_C5_B3C_VERIFY_IN_FLIGHT_C6_IN_FLIGHT_N5_PAUSED`
 
-最后更新：2026-09-11 11:20 CST（Asia/Shanghai；0038 波次收口：AVX2 packed / blocked GEMM / W8A8 图路径 / J1–J2 / ERR-0003 / ERR-0004）
+最后更新：2026-09-11 22:50 CST（Asia/Shanghai；0039 批次：A3 接入 + Ascend N1–N4 + B2 SVE 四类 + lm_head 556；C5/B3c 验收与 C6 在途；U/P 两线提案待决）
+
+> **零记忆恢复（上下文压缩后）**：按顺序读 本文件 §0 → `docs/00-handoffs/ERRATA.zh-CN.md` → `docs/00-handoffs/0039-2026-09-11-a3-onboarding-ascend-bridge-sve-w8a8.zh-CN.md` → `configs/development_lock.yaml` 的 `waves.W8.in_flight_2026_09_11_batch2` 与 `pending_user_decisions_2026_09_11`。
 
 项目根目录：`/home/chiro/projects/pypto/pypto_x`
 
@@ -23,27 +25,29 @@
    不把静态 lowering 说成真机 PASS；不把 A2 的限定式关闭说成"PyPTO Ascend 后端已通"；
    不推公开仓/不改历史/不发权重证据，除非用户当次明确指示。
 4. 用户说"继续"时的默认动作（按优先级）：
-   a) 0038 波次已收口（2026-09-11 夜间）：W8B B1 avx2-packed、avx512-blocked-gemm（prefill matmul 12.4×、
-      整网位级零漂移）、B3b CUDA GEMM 基线（r3 PASS，B4 输入就绪）；W8C C3/C4（AVX2/AVX-512 VNNI widening）、
-      **W8A8-linear 图路径（真权重端到端跑通）**；W8J J1/J1.1/J2（torch 桥 + vLLM 插件，注入因性能门禁默认关闭）；
-      累积 BF16 回归零漂移；ERR-0003（契约 556）、ERR-0004（性能协议 MAD 门加 floor）均落地。
-      详见 `docs/00-handoffs/0038-2026-09-11-w8b-w8c-w8j-wave-results.zh-CN.md`。
-   b) 下一批候选（0038 §7）：批次发布（push + sync_private_backup，**需用户批准**）；B4 阈值冻结（需用户批准）；
-      W8A8 L4 阈值口径裁决 → C8（R12–R14）；`quantize_lm_head` 真权重 ingestion；C7 阶梯；B3c 本机性能；
-      内核性能专线（让 J2 注入真正启用）。
-   c) 待用户裁决：W8A8 误差预算是否接受 / Framework Adapter 后续（J3）、W8D/E、W8H/W8I 后续范围。
-   d) A2 NPU 任务必须遵守卡锁协议 /root/a2-npu-lock/（只保护 NPU 执行）；**A2 当前暂停、920B 已释放**，
-      两者都需用户通知才恢复。
+   a) 0039 批次（2026-09-11 下半场）：**A3 共享机接入**（原生 SVE256 + 昇腾 910C；chip7 独占、node7 CPU、只写 home）；
+      Ascend 线 **N1 自检 / N2 PTO-ISA bring-up（tassign on chip7）/ N3 vllm-ascend Qwen3.5-0.8B 基线（token 链与 gold 一致）
+      / N4 IR→PTO 最小桥（Core IR→PTO C++ 真机逐位一致）**；**B2 SVE 四类原生化**（QEMU/原生 50/50 sha 一致）；
+      **W8A8 lm_head 双 packing（556 全开可用）**；B3c（dispatch 占 41–49%）；C5（SVE W8A8）与 C6（CUDA W8A8）在途。
+      详见 `docs/00-handoffs/0039-2026-09-11-a3-onboarding-ascend-bridge-sve-w8a8.zh-CN.md`。
+   b) **在途任务与恢复**（见 lock `waves.W8.in_flight_2026_09_11_batch2`）：
+      C5 验收（verify-qwen35-w8a8-sve256）｜B3c 验收（verify-local-perf-l0-l1）｜C6 实现（qwen35-w8a8-gpu-kernels）
+      ｜**N5 已按用户要求暂停**（NPU 被用户量化占用；A3 残留 `~/pypto-x-a3/e4s2/`，恢复时注意改用 `/home` 路径 + 修 `CMAKE_PREFIX_PATH`）
+   c) **待用户裁决（4 项）**：B4 阈值冻结（需批准）｜C8 的 L4 阈值口径（决定 C7/C8 能否启动）｜
+      内核性能投入（W8J 注入 4.71–14.47× 慢于 oneDNN）｜**U/P 两条新线是否立项**（用户接口 / 用户侧性能控制，提案见 lock）
+   d) 下一批硬优化候选（B3c 结论）：**reshape 8.34 s / slice 7.37 s / transpose 7.27 s（全 host_reference）** +
+      **dispatch 开销 41–49%**；A2 暂停、920B 已释放、A3 的 NPU 归用户——三者都需用户通知才动。
 5. 并发与资源：活动 subagent ≤3；重任务一律经 scripts/resource/run_local_heavy.sh（返回 75/69 就等待重试，
-   禁止绕过）；A2 与 920B 都是租用共享资源，约定串行；A2 只锁 NPU 执行（下载/编译/环境准备可并行）。
+   禁止绕过）；**等锁时挂后台或长 timeout，不要在前台循环空转**（会耗尽 agent 回合，S1 曾因此中断一次）；
+   A2/920B/A3 都是共享资源，约定安静使用。
 6. 重任务需要用户批准才启动（AGENTS.md「Subagent 协议」第一条）。
 7. 提交纪律：公开主仓 = 本目录（origin）；改完实现 → cherry-pick 到 integration → 独立 verify → 更新
    development_lock/快照/ERRATA → scripts/remote/export_patches.sh → git push origin main → scripts/remote/sync_private_backup.sh。
-   （0036/0037 收口 commits 均只在本地 main，尚未 push；push 前需用户当次明确批准。）
+   （0038 收口已 push 到 7a064ab；**0039 批次 8 个控制仓提交仍在本地 main，未 push**；push 前需用户当次明确批准。）
 ```
 
 找不到答案时，先查 `_meta` 证据目录（`../worktrees/_meta/pypto-x/<task>/`）与 `docs/00-handoffs/` 的历史快照，
-再问用户；**不要凭记忆编造数字**——所有阶段性数字都应以 `configs/development_lock.yaml` 与 0038 快照为准。
+再问用户；**不要凭记忆编造数字**——所有阶段性数字都应以 `configs/development_lock.yaml` 与 0039 快照为准。
 
 ## 1. 接手摘要
 
@@ -114,10 +118,10 @@ chat(T=18)  PASS（修订判据）严格 argmax 17/18（唯一 mismatch row 14�
 ```text
 控制仓/公开主仓   /home/chiro/projects/pypto/pypto_x   origin = chiro2001/pypto-x（公开）
 私有备份          ../pypto_x_private_bkp（archive 分支含第三方离线副本；main 跟随公开）
-现有 HEAD         origin/main = 543e6b7；本地 main 领先多个 0038 收口提交，**均未 push**
+现有 HEAD         origin/main = 7a064ab（0038 已 push）；本地 main 另有 **8 个 0039 批次提交未 push**
 实现主仓          upstream/pypto @ 34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad（只读）
-集成分支          port/pypto-x-integration @ 227506c86（含 A1/C3/C4/J1/J1fix/J1.1/J2/GEMM/W8A8 图路径/B3b 修复）
-补丁集            patches/pypto-x/ 134 个（base 34475e0d8，HEAD 227506c86）
+集成分支          port/pypto-x-integration @ bef73643b（含 B1/C3/C4/J1/J1fix/J1.1/J2/GEMM/W8A8 图路径/B3b/B2/lm_head 556/C5/B3c）
+补丁集            patches/pypto-x/ 134 个（base 34475e0d8；**0039 新增提交尚未重新导出**，收口时跑 export_patches.sh）
 任务 worktree     ../worktrees/pypto-x/<task>；证据 ../worktrees/_meta/pypto-x/<task>/
 ```
 
@@ -147,19 +151,21 @@ chat(T=18)  PASS（修订判据）严格 argmax 17/18（唯一 mismatch row 14�
 ## 7. 建议的下一步波次（W8 及以后）
 
 ```text
-① 0038 波次已完成（2026-09-11 夜间）：W8B B1/B3b、avx512-blocked-gemm、W8C C3/C4、W8A8 图路径、
-   W8J J0–J2 全部实现并通过独立验收；累积 BF16 回归零漂移（详见 0038 快照）
-② 发布动作（**需用户批准**）：控制仓 main 多个 0038 收口提交未 push；patches 已刷新为 134；
-   push 后跑 scripts/remote/sync_private_backup.sh
-③ 性能收口：B4 阈值冻结（**需用户批准**；B3b 的 4 个 candidate_ratio 已就绪，缺 B3c 本机 L0/L1）；
-   T=18 剩余热点 reshape 27.8s / slice 27.3s / transpose 20.7s（CPU host 路径）
-④ W8C 续作：C5 SVE256（随 920B 封存）、C6 CUDA/AMD 静态、C7 layer ladder（1→6→24）、
-   C8 正式门禁（R12–R14）——**C8 之前需用户裁定 L4 阈值口径**（现 scheme 超出暂定阈值）
-⑤ W8J 续作：J3 需先解决内核性能（当前 4.71–14.47× 慢于 oneDNN 6T，注入默认关闭）；
-   可选 `quantize_lm_head` 真权重 ingestion（556 全开）
-⑥ 平台注记：GamePC WSL2 的 cuEvent rate offset（wsl2_cuevent_rate_offset）与 ERR-0004 的
+① 0039 批次（A3 接入 + Ascend N1–N4 + B2 SVE + lm_head 556）已收口；C5/B3c 验收与 C6 在途（详见 0039 快照）
+② **在途恢复**：C5 验收 / B3c 验收 / C6 实现（若上下文压缩期间中断，按 lock 的 `in_flight_2026_09_11_batch2` 重新派发或验收）；
+   **N5 等用户 NPU 用完再恢复**（先跑上游 TADD 冒烟；A3 残留目录与路径坑见 0039 快照 §3）
+③ 发布动作（**需用户批准**）：控制仓 main 8 个 0039 提交未 push；收口需先重跑 `export_patches.sh`（134→?）；
+   push 后跑 `scripts/remote/sync_private_backup.sh`
+④ **性能续作（B3c 已给出靶点）**：本机热点已是 **reshape 8.34 s / slice 7.37 s / transpose 7.27 s（全 host_reference）**，
+   外加 **dispatch 开销占 wall 41–49%**（Python 逐 op 派发）；这两项直接决定 T=5/T=18 prefill 与 decode 的墙钟
+⑤ W8C 续作：C6（CUDA/AMD 静态 W8A8）、C7 layer ladder（1→6→24）、C8 正式门禁（R12–R14）——
+   **C8 之前需用户裁定 L4 阈值口径**（现 W8A8 scheme 超出暂定阈值：max_abs 2.69/2.76 vs ≤0.5）
+⑥ B4 阈值冻结：B3b 的 4 个 candidate_ratio 已就绪、B3c 已给出 dispatch 分解——**需用户批准**才写 `configs/perf_lock.yaml`
+⑦ W8J 续作：J3 需先解决内核性能（4.71–14.47× 慢于 oneDNN 6T，注入默认关闭）
+⑧ **U/P 两条新线待立项**（用户接口 / 用户侧性能控制；提案见 0039 快照 §7 与 lock 的 `up_lines_proposal_2026_09_11`）
+⑨ 平台注记：GamePC WSL2 的 cuEvent rate offset（wsl2_cuevent_rate_offset）与 ERR-0004 的
    outlier floor 规则必须遵守；CUDA 计时必须 raw + corrected + platform_flags 同报
-⑦ 可选：若用户要求 chat 严格 18/18，评估任务分支 327b17158（--debug-f32-residual，未合入、未采纳）
+⑩ 可选：若用户要求 chat 严格 18/18，评估任务分支 327b17158（--debug-f32-residual，未合入、未采纳）
 ```
 
 ## 8. 可用资源实况
@@ -235,6 +241,17 @@ A3（用户借用共享机） 鲲鹏 920B CPU（aarch64，**SVE VL=32 原生**�
   **性能门禁 0/12 → 注入默认关闭**（4.71–14.47× 慢于 oneDNN 6T，性能边界非机制缺陷）。
 - **累积 BF16 回归零漂移**：4 次 artifact 版本升级后 en T=5 380/380 sha256 与冻结基线逐一相同。
 - **ERR-0003**（契约 §3.1 555→556）与 **ERR-0004**（性能协议 MAD 门加 floor，用户批准）均已落地。
+- **0039 批次（A3 接入 + Ascend）**：
+  - **A3**：鲲鹏 920B（SVE VL=32 原生）+ 昇腾 910C（CANN 9.1.0）接入；自建容器、chip7 独占、node7 CPU；原生 SVE256 首光通过
+  - **N1** Ascend 自检 PASS（torch/acl/aclnn/bisheng/mspti + vllm-ascend 插件）
+  - **N2** PTO-ISA bring-up PASS（**单用例限定**）：`tassign` chip7 exit 0 / 5/5 PASSED
+  - **N3** vllm-ascend 基线 PASS：**Qwen3.5-0.8B 三 prompt 前 4 token 与冻结 gold 全一致**（新机新版本基线，与 A2 不可比）
+  - **N4** IR→PTO 最小桥 PASS_WITH_BOUNDARIES（0 阻断）：**Core IR → 自动生成 PTO C++ → chip7 真机逐位一致**（3 个 64×64 f32 程序）
+  - **B2** SVE256 四类原生化验收 PASS：`iota/compare/broadcast/where` 全 native；**QEMU 与 A3 原生 50/50 逐输出 sha256 一致**
+  - **W8A8 lm_head 556 全开**验收 PASS_WITH_BOUNDARIES：真权重可用；覆盖率 linear 1.0 / whole-net 0.9808；仍超 L4 暂定阈值（如实登记）
+  - **B3c**：**dispatch 占 wall 41–49%**；热点转为 reshape/slice/transpose（全 host_reference）
+  - **C5** SVE W8A8：4 opcode 全 native（`sunpklo`×2 + 整数 `mla`，附 HWCAP/反汇编）；连带修复既有整数存储缺陷（验收在途）
+  - **N5**（E4 step2）：已按用户要求暂停（NPU 被用户量化占用）
 
 ## 10. 许可证状态
 
@@ -265,7 +282,7 @@ scripts/worktree/status.sh
 bash -n scripts/worktree/*.sh scripts/smoke/*.sh scripts/resource/*.sh scripts/remote/*.sh
 python3 -c "import yaml;[yaml.safe_load(open(p)) for p in ['configs/development_lock.yaml','configs/agent_tasks.yaml','configs/upstream_lock.yaml']];print('yaml ok')"
 /home/chiro/projects/.resource-locks/resource-lock status     # 只观察；取得锁必须用 run
-ls patches/pypto-x/*.patch | wc -l                            # 应为 134（0038 冻结点）
+ls patches/pypto-x/*.patch | wc -l                            # 0038 冻结点为 134；0039 收口后重新导出再更新此数
 ```
 
 除非用户明确要求，接手自检**不重跑** smoke、不下载依赖、不加载权重。

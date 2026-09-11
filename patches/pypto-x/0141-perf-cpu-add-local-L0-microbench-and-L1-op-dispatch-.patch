@@ -1,0 +1,1277 @@
+From bef73643b79a75719ca7099dc6e5480504987193 Mon Sep 17 00:00:00 2001
+From: PyPTO-X Agent <agent@pypto-x.local>
+Date: Fri, 11 Sep 2026 22:44:41 +0800
+Subject: [PATCH 141/141] perf(cpu): add local L0 microbench and L1 op-dispatch
+ decomposition (W8B B3c)
+
+---
+ python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py |   33 +-
+ scripts/perf/aggregate_driver_progress.py                   |  144 +++++
+ scripts/perf/local_l0_microbench.py                         | 1028 +++++++++++++++++++++++++++++++
+ 3 files changed, 1195 insertions(+), 10 deletions(-)
+
+diff --git a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+index 125179ecf..aa3c8d741 100644
+--- a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
++++ b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+@@ -1017,6 +1017,8 @@ def compile_program(backend: Mapping[str, Any], program: Any, build_dir: Path) -
+ def make_runtime(backend: Mapping[str, Any], recorder: Optional[OpRecorder]) -> Any:
+     name = backend["runtime"]
+     if name == "avx512":
++        if recorder is None:
++            return Avx512Runtime()
+         return InstrumentedAvx512Runtime(recorder=recorder)
+     if name == "avx2":
+         return Avx2Runtime()
+@@ -1899,8 +1901,8 @@ def stage_s1(args: argparse.Namespace) -> Mapping[str, Any]:
+         error = "{}: {}".format(type(exc).__name__, exc)
+     result["launch_seconds"] = round(time.perf_counter() - started, 3)
+     result["launch_error"] = error
+-    result["budget_watchdog_stop"] = recorder.stopped_reason
+-    result["op_summary"] = summarise_ops(recorder)
++    result["budget_watchdog_stop"] = recorder.stopped_reason if recorder is not None else None
++    result["op_summary"] = summarise_ops(recorder) if recorder is not None else None
+     result["rss_peak_mib"] = _maxrss_mib()
+     result["cgroup_memory_peak_mib"] = _cgroup_mib("/memory.peak")
+     result["output_canary_intact"] = all(
+@@ -1974,9 +1976,15 @@ def _run_once(
+     outputs, output_storage = output_bindings(schema)
+     runtime_inputs = runtime_input_bindings(schema, input_ids, cos_bits, sin_bits)
+     request = build_request(schema, artifact, runtime_inputs, parameters, states, outputs, backend["device"])
+-    recorder = OpRecorder(
+-        args.progress_obj, _cgroup_mib("/memory.max"), not args.no_watchdog, args.abort_op_mib
+-    )
++    if getattr(args, "no_op_recorder", False):
++        # 计时对照专用：完全跳过程序化 instrumentation（K 分类 + 逐 op 计时/进度），
++        # 只保留 runtime 自身的 launch。用于把"框架/派发开销"与
++        # "driver 见证开销（plan_execution + progress 逐行 flush）"分开。
++        recorder = None
++    else:
++        recorder = OpRecorder(
++            args.progress_obj, _cgroup_mib("/memory.max"), not args.no_watchdog, args.abort_op_mib
++        )
+     runtime = make_runtime(backend, recorder)
+     started = time.perf_counter()
+     error: Optional[str] = None
+@@ -2015,8 +2023,8 @@ def _run_once(
+         "binding": binding_evidence,
+         "launch_seconds": round(launch_seconds, 3),
+         "launch_error": error,
+-        "budget_watchdog_stop": recorder.stopped_reason,
+-        "op_summary": summarise_ops(recorder),
++        "budget_watchdog_stop": recorder.stopped_reason if recorder is not None else None,
++        "op_summary": summarise_ops(recorder) if recorder is not None else None,
+         "rss_peak_mib": _maxrss_mib(),
+         "cgroup_memory_peak_mib": _cgroup_mib("/memory.peak"),
+         "cgroup_memory_max_mib": _cgroup_mib("/memory.max"),
+@@ -2297,11 +2305,11 @@ def stage_s4(args: argparse.Namespace) -> Mapping[str, Any]:
+         "run_status": record["status"],
+         "launch_error": record.get("launch_error"),
+         "budget_watchdog_stop": record.get("budget_watchdog_stop"),
+-        "executed_operations": record.get("op_summary", {}).get("executed_operations"),
++        "executed_operations": (record.get("op_summary") or {}).get("executed_operations"),
+         "operation_total": record.get("operation_total"),
+         "last_executed_operation": (
+-            record.get("op_summary", {}).get("by_operation", {}) and
+-            list(record["op_summary"]["by_operation"])[:1]
++            (record.get("op_summary") or {}).get("by_operation", {}) and
++            list((record.get("op_summary") or {})["by_operation"])[:1]
+         ),
+         "rope_source": rope_source,
+         "gold_layer_count": int(layers.shape[0]),
+@@ -2355,6 +2363,11 @@ def build_parser() -> argparse.ArgumentParser:
+     parser.add_argument("--build-dir", default=None)
+     parser.add_argument("--hash-checkpoint", action="store_true")
+     parser.add_argument("--no-watchdog", action="store_true")
++    parser.add_argument(
++        "--no-op-recorder",
++        action="store_true",
++        help="B3c 计时对照：完全关闭逐 op 计时/进度 instrumentation（launch 时间仍照测）",
++    )
+     parser.add_argument("--abort-op-mib", type=int, default=None,
+                         help="host_reference 单算子预估物化超过该值时确定性中止")
+     parser.add_argument("--micro-benchmark-elements", type=int, default=0,
+diff --git a/scripts/perf/aggregate_driver_progress.py b/scripts/perf/aggregate_driver_progress.py
+new file mode 100755
+index 000000000..716444255
+--- /dev/null
++++ b/scripts/perf/aggregate_driver_progress.py
+@@ -0,0 +1,144 @@
++#!/usr/bin/env python3
++"""Aggregate ``qwen35_weighted_execution_driver --progress`` op records.
++
++B5 的 per-op 统计路径（``qwen35-native-reduce-broadcast/aggregate_progress.py``）
++的通用化版本：``stage-start`` 或 op-index 回绕开启一个新的 run；按 run 序号或
++"最长/最短 run" 选择要聚合的那一次 launch。
++
++用法：
++    python3 scripts/perf/aggregate_driver_progress.py <progress.log> <out.json> \
++        --run longest|shortest|first|last|<index> [--label prefill]
++"""
++
++from __future__ import annotations
++
++import argparse
++import collections
++import json
++import sys
++from pathlib import Path
++
++
++def load_runs(path: Path):
++    runs = []
++    current = None
++    previous_index = None
++    stage_starts = []
++    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
++        line = line.strip()
++        if not line:
++            continue
++        try:
++            record = json.loads(line)
++        except ValueError:
++            continue
++        kind = record.get("kind")
++        if kind == "stage-start":
++            stage_starts.append({"line": line_number, **record})
++            current = None
++            previous_index = None
++            continue
++        if kind != "op":
++            continue
++        index = record.get("index")
++        if current is None or (index is not None and previous_index is not None and index <= previous_index):
++            current = []
++            runs.append(current)
++        current.append(record)
++        previous_index = index
++    return runs, stage_starts
++
++
++def aggregate(records):
++    by_operation = {}
++    total_seconds = 0.0
++    for record in records:
++        operation = str(record.get("operation", "?"))
++        entry = by_operation.setdefault(
++            operation,
++            {"calls": 0, "total_seconds": 0.0, "max_ms": 0.0, "modes": collections.Counter(),
++             "seconds": []},
++        )
++        seconds = float(record.get("seconds", 0.0))
++        entry["calls"] += 1
++        entry["total_seconds"] += seconds
++        entry["seconds"].append(seconds)
++        entry["max_ms"] = max(entry["max_ms"], seconds * 1000.0)
++        entry["modes"][str(record.get("mode", "?"))] += 1
++        total_seconds += seconds
++    result = {}
++    for operation, entry in sorted(by_operation.items()):
++        samples = sorted(entry["seconds"])
++        median = samples[len(samples) // 2] if len(samples) % 2 else (
++            0.5 * (samples[len(samples) // 2 - 1] + samples[len(samples) // 2])
++        )
++        p95 = samples[max(0, -(-95 * len(samples) // 100) - 1)]
++        result[operation] = {
++            "calls": entry["calls"],
++            "total_seconds": round(entry["total_seconds"], 4),
++            "ms_per_call": round(entry["total_seconds"] * 1000.0 / entry["calls"], 4),
++            "median_ms": round(median * 1000.0, 4),
++            "p95_ms": round(p95 * 1000.0, 4),
++            "max_ms": round(entry["max_ms"], 4),
++            "modes": dict(sorted(entry["modes"].items())),
++        }
++    return {
++        "operation_total": len(records),
++        "op_seconds_total": round(total_seconds, 4),
++        "by_operation": result,
++    }
++
++
++def select_run(runs, selector: str):
++    if not runs:
++        raise SystemExit("no op runs found")
++    if selector == "longest":
++        return max(range(len(runs)), key=lambda index: len(runs[index]))
++    if selector == "shortest":
++        return min(range(len(runs)), key=lambda index: len(runs[index]))
++    if selector == "first":
++        return 0
++    if selector == "last":
++        return len(runs) - 1
++    try:
++        index = int(selector)
++    except ValueError:
++        raise SystemExit("--run must be longest|shortest|first|last|<index>")
++    if index < 0 or index >= len(runs):
++        raise SystemExit("run index {} out of range ({} runs)".format(index, len(runs)))
++    return index
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("progress")
++    parser.add_argument("output")
++    parser.add_argument("--run", default="longest")
++    parser.add_argument("--label", default=None)
++    args = parser.parse_args(argv)
++    path = Path(args.progress)
++    runs, stage_starts = load_runs(path)
++    chosen = select_run(runs, args.run)
++    records = runs[chosen]
++    report = {
++        "path": str(path.resolve()),
++        "label": args.label,
++        "selector": args.run,
++        "runs": len(runs),
++        "run_operation_counts": [len(run) for run in runs],
++        "chosen_run": chosen,
++        "stage_starts": stage_starts,
++    }
++    report.update(aggregate(records))
++    Path(args.output).write_text(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=1) + "\n")
++    print(
++        "label={} selector={} run={}/{} ops={} seconds={}".format(
++            args.label, args.run, chosen, len(runs), report["operation_total"],
++            report["op_seconds_total"],
++        )
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/scripts/perf/local_l0_microbench.py b/scripts/perf/local_l0_microbench.py
+new file mode 100755
+index 000000000..6ae844a10
+--- /dev/null
++++ b/scripts/perf/local_l0_microbench.py
+@@ -0,0 +1,1028 @@
++#!/usr/bin/env python3
++"""W8B B3c · L0 算子级 microbench（本机 AVX-512 / scalar）。
++
++任务：``local-perf-l0-l1``。协议：``docs/PERF_MEASUREMENT_PROTOCOL.zh-CN.md``。
++
++本驱动**直接构造 Core IR 程序 + Artifact + LaunchRequest 调用 backend runtime**
++（协议 §2 L0 的强制要求：不得通过 ``build_qwen35_text_decoder_graph`` 走图遍历）。
++每个 case 同时测两侧：
++
++* ``kernel`` 侧：单次 launch 内放 ``R_ops`` 个同类算子，整次 launch 计时 / ``R_ops``
++  （协议 §2 的 ``kernel_seconds``）；
++* ``dispatch`` 侧：``R`` 次独立 launch，每次只有 1 个同类算子，整次 launch 计时；
++* ``dispatch_seconds = median(1-op launch) - median(N-op launch)/N``
++  （协议 §2 差值法；纯派发/装载开销，kernel 工作在两侧抵消）。
++
++统计口径（协议 §3.3/§3.4 + ERR-0004）：
++``min/median/p95(nearest-rank)/max/stdev/cv``，outlier 规则
++``|x - median| > max(3*1.4826*MAD, max(1us, 0.02*median))``，``outlier_ratio > 0.10 -> UNSTABLE``；
++本机方差门：``cv <= 0.05``、``p95/median <= 1.25``。本机是 KVM guest 且无 cpufreq，
++因此所有绝对数字**永久 UNGATED**（T2/T3），本驱动不写任何阈值。
++
++用法（重任务必须经 ``scripts/resource/run_local_heavy.sh``）：
++    python3 scripts/perf/local_l0_microbench.py --round 1 --output <json> \
++        --work-dir <dir> [--backends avx512,scalar] [--cases name1,name2] \
++        [--probe]
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import math
++import os
++import platform
++import struct
++import subprocess
++import sys
++import time
++from pathlib import Path
++from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
++
++# ---------------------------------------------------------------------------
++# 常量与口径
++# ---------------------------------------------------------------------------
++
++TASK = "local-perf-l0-l1"
++EVIDENCE_KIND = "pypto-x.perf-evidence.local-l0"
++
++# 协议 §3.4 本机（KVM guest）方差上限。
++VARIANCE_LIMITS_LOCAL = {"cv": 0.05, "p95_over_median": 1.25}
++# 协议 §3.3 第 6 步 + ERR-0004 floor。
++OUTLIER_RATIO_MAX = 0.10
++OUTLIER_FLOOR_MIN_SECONDS = 1.0e-6
++OUTLIER_FLOOR_MEDIAN_FRACTION = 0.02
++WARMUP_ACCEPTANCE = 0.05
++WARMUP_ATTEMPTS = 3
++
++# 环境噪声门（协议 §4.1）：max(load1) < online_cpus，max(cpu_psi_avg10) < 25。
++HOST_LOAD_MAX_RATIO = 1.0
++HOST_PSI_MAX_AVG10 = 25.0
++
++AVX512_FORMAT = "pypto-x.cpu.avx512"
++
++
++# ---------------------------------------------------------------------------
++# case 定义
++#
++# 对称 case（两个后端同 shape，可做同 host 的 T2 时间比）：
++#   elementwise add/mul N=65536（协议 shape 集 {4096, 65536, 1M, 4M} 的中间值）；
++#   reduction reduce_sum / reduce_max (32,64) axis=1（scalar 的 _reduce_value 是
++#   O(N_in*N_out)，更大 shape 在纯 Python 下不可行：实测 (64,64) 就要 ~143 ms/op，
++#   (1,4096,256) last-axis 约 10^9 量级 Python 迭代）；
++#   matmul f32 64x64x64（scalar 是纯 Python 三重循环）。
++# AVX-512-only 参考 case（scalar 在这些真实 Qwen shape 上不可执行，见 brief）：
++#   add N=1048576；reduce_sum (1,4096,256) axis=2；matmul (1,1024)x(1024,3584)。
++#
++# 单 launch 内 op 数 N 与 measured 样本数 R：AVX-512 一律 N=21/R=21；
++# scalar 的高成本 case 用协议允许的最小 R=11（N=11），否则 3 轮会超出锁预算。
++# 这是"每轮独立进程 × 3"的 G2 形状，但本机绝对数字仍永久 UNGATED。
++# ---------------------------------------------------------------------------
++
++CASES: Tuple[Mapping[str, Any], ...] = (
++    {
++        "name": "elementwise_add_f32_n65536",
++        "group": "elementwise",
++        "op": "add",
++        "dtype": "float32",
++        "shape": (65536,),
++        "attributes": {},
++        "backends": ("avx512", "scalar"),
++        "ops_per_launch": 21,
++        "repeats": 21,
++        "ops_per_launch_scalar": 11,
++        "repeats_scalar": 11,
++        "launches_per_sample_avx512": 5,
++        "launches_per_sample_scalar": 2,
++    },
++    {
++        "name": "elementwise_add_f32_n4096",
++        "group": "elementwise",
++        "op": "add",
++        "dtype": "float32",
++        "shape": (4096,),
++        "attributes": {},
++        "backends": ("avx512", "scalar"),
++        "ops_per_launch": 21,
++        "repeats": 21,
++        "ops_per_launch_scalar": 11,
++        "repeats_scalar": 11,
++        "launches_per_sample_avx512": 5,
++        "launches_per_sample_scalar": 2,
++    },
++    {
++        "name": "elementwise_mul_f32_n65536",
++        "group": "elementwise",
++        "op": "mul",
++        "dtype": "float32",
++        "shape": (65536,),
++        "attributes": {},
++        "backends": ("avx512", "scalar"),
++        "ops_per_launch": 21,
++        "repeats": 21,
++        "ops_per_launch_scalar": 11,
++        "repeats_scalar": 11,
++        "launches_per_sample_avx512": 5,
++        "launches_per_sample_scalar": 2,
++    },
++    {
++        "name": "reduction_sum_f32_32x64_axis1",
++        "group": "reduction",
++        "op": "reduce_sum",
++        "dtype": "float32",
++        "shape": (32, 64),
++        "output_shape": (32,),
++        "attributes": {"axis": 1},
++        "backends": ("avx512", "scalar"),
++        "ops_per_launch": 21,
++        "repeats": 21,
++        "ops_per_launch_scalar": 11,
++        "repeats_scalar": 11,
++        "launches_per_sample_avx512": 5,
++        "launches_per_sample_scalar": 2,
++    },
++    {
++        "name": "reduction_max_f32_32x64_axis1",
++        "group": "reduction",
++        "op": "reduce_max",
++        "dtype": "float32",
++        "shape": (32, 64),
++        "output_shape": (32,),
++        "attributes": {"axis": 1},
++        "backends": ("avx512", "scalar"),
++        "ops_per_launch": 21,
++        "repeats": 21,
++        "ops_per_launch_scalar": 11,
++        "repeats_scalar": 11,
++        "launches_per_sample_avx512": 5,
++        "launches_per_sample_scalar": 2,
++    },
++    {
++        "name": "matmul_f32_64x64x64",
++        "group": "matmul",
++        "op": "matmul",
++        "dtype": "float32",
++        "left_shape": (64, 64),
++        "right_shape": (64, 64),
++        "output_shape": (64, 64),
++        "attributes": {},
++        "backends": ("avx512", "scalar"),
++        "ops_per_launch": 21,
++        "repeats": 21,
++        "ops_per_launch_scalar": 11,
++        "repeats_scalar": 11,
++        "launches_per_sample_avx512": 5,
++        "launches_per_sample_scalar": 1,
++    },
++    {
++        "name": "elementwise_add_f32_n1048576_avx512_ref",
++        "group": "elementwise",
++        "op": "add",
++        "dtype": "float32",
++        "shape": (1048576,),
++        "attributes": {},
++        "backends": ("avx512",),
++        "ops_per_launch": 11,
++        "repeats": 21,
++        "reference_only": True,
++        "launches_per_sample_avx512": 2,
++    },
++    {
++        "name": "reduction_sum_f32_1x4096x256_axis2_avx512_ref",
++        "group": "reduction",
++        "op": "reduce_sum",
++        "dtype": "float32",
++        "shape": (1, 4096, 256),
++        "output_shape": (1, 4096),
++        "attributes": {"axis": 2},
++        "backends": ("avx512",),
++        "ops_per_launch": 11,
++        "repeats": 21,
++        "reference_only": True,
++        "launches_per_sample_avx512": 2,
++    },
++    {
++        "name": "matmul_f32_1x1024x3584_avx512_ref",
++        "group": "matmul",
++        "op": "matmul",
++        "dtype": "float32",
++        "left_shape": (1, 1024),
++        "right_shape": (1024, 3584),
++        "output_shape": (1, 3584),
++        "attributes": {},
++        "backends": ("avx512",),
++        "ops_per_launch": 11,
++        "repeats": 21,
++        "reference_only": True,
++        "launches_per_sample_avx512": 2,
++    },
++)
++
++
++def case_by_name(name: str) -> Mapping[str, Any]:
++    for case in CASES:
++        if case["name"] == name:
++            return case
++    raise SystemExit("unknown case {!r}; known: {}".format(name, ", ".join(c["name"] for c in CASES)))
++
++
++# ---------------------------------------------------------------------------
++# Core IR 程序
++# ---------------------------------------------------------------------------
++
++
++def build_program(case: Mapping[str, Any], ops: int):
++    """构造 ``ops`` 个同类算子的 CoreProgram（参数与输出按 case 而定）。"""
++
++    from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++
++    dtype = case["dtype"]
++    name = case["op"]
++    attributes = dict(case.get("attributes") or {})
++    operations = []
++    returns = []
++    if case["group"] == "elementwise":
++        value_type = CoreType.tensor(dtype, case["shape"])
++        left = ValueRef("left", value_type)
++        right = ValueRef("right", value_type)
++        parameters = (left, right)
++        for index in range(ops):
++            output = ValueRef("out{}".format(index), value_type)
++            operations.append(Operation(name, (left, right), (output,), dict(attributes)))
++            returns.append(output)
++    elif case["group"] == "reduction":
++        input_type = CoreType.tensor(dtype, case["shape"])
++        output_type = CoreType.tensor(dtype, case["output_shape"])
++        source = ValueRef("source", input_type)
++        parameters = (source,)
++        for index in range(ops):
++            output = ValueRef("out{}".format(index), output_type)
++            operations.append(Operation(name, (source,), (output,), dict(attributes)))
++            returns.append(output)
++    elif case["group"] == "matmul":
++        left_type = CoreType.tensor(dtype, case["left_shape"])
++        right_type = CoreType.tensor(dtype, case["right_shape"])
++        output_type = CoreType.tensor(dtype, case["output_shape"])
++        left = ValueRef("left", left_type)
++        right = ValueRef("right", right_type)
++        parameters = (left, right)
++        for index in range(ops):
++            output = ValueRef("out{}".format(index), output_type)
++            operations.append(Operation(name, (left, right), (output,), dict(attributes)))
++            returns.append(output)
++    else:
++        raise SystemExit("unknown case group {!r}".format(case["group"]))
++    function = CoreFunction(case["name"], parameters, tuple(returns), Region(tuple(operations)))
++    return CoreProgram(functions=(function,))
++
++
++def program_flops(case: Mapping[str, Any], ops: int) -> int:
++    """协议 §3.2 的 FLOP 口径，逐 case 写死。"""
++
++    if case["group"] == "elementwise":
++        return ops * int(case["shape"][-1]) if case["op"] in ("add", "mul", "sub", "div") else 0
++    if case["group"] == "reduction":
++        element_count = 1
++        for dimension in case["shape"]:
++            element_count *= int(dimension)
++        output_count = 1
++        for dimension in case["output_shape"]:
++            output_count *= int(dimension)
++        factor = max(0, element_count // max(1, output_count) - 1)
++        return ops * factor * output_count if case["op"] in ("reduce_sum", "reduce_mean") else 0
++    if case["group"] == "matmul":
++        m = int(case["left_shape"][-2])
++        k = int(case["left_shape"][-1])
++        n = int(case["right_shape"][-1])
++        batch = 1
++        for dimension in case["left_shape"][:-2]:
++            batch *= int(dimension)
++        return ops * 2 * batch * m * n * k
++    return 0
++
++
++# ---------------------------------------------------------------------------
++# 绑定 / 编译 / 执行
++# ---------------------------------------------------------------------------
++
++
++def f32_payload(count: int, seed: float = 0.5) -> bytes:
++    """确定性输入：4 字节浮点，幅值 ~1，避免 NaN/Inf。"""
++
++    values = [(((index * 37) % 101) - 50) * 0.0025 + seed for index in range(count)]
++    return struct.pack("<{}f".format(count), *values)
++
++
++def _dtype_bytes(dtype: str) -> int:
++    return {"float32": 4, "float64": 8, "bf16": 2, "float16": 2, "int8": 1, "int32": 4, "int64": 8}[dtype]
++
++
++def make_backend(name: str) -> Mapping[str, Any]:
++    from pypto.compiler.targets.cpu import CpuScalarCompiler
++    from pypto.compiler.targets.cpu_avx512 import Avx512Compiler
++    from pypto.target import TargetSpec
++
++    if name == "avx512":
++        return {
++            "name": "avx512",
++            "compiler": Avx512Compiler(),
++            "target": TargetSpec(
++                "cpu", "x86_64-linux-gnu", features=("avx512f",), attributes={"lane_count": 16}
++            ),
++            "format": AVX512_FORMAT,
++        }
++    if name == "scalar":
++        return {
++            "name": "scalar",
++            "compiler": CpuScalarCompiler(),
++            "target": TargetSpec("cpu", "x86_64-linux-gnu"),
++            "format": None,
++        }
++    raise SystemExit("unsupported backend {!r}".format(name))
++
++
++def make_runtime(name: str):
++    from pypto.backends.cpu import CpuScalarRuntime
++    from pypto.backends.cpu.x86 import Avx512Runtime
++
++    if name == "avx512":
++        return Avx512Runtime()
++    if name == "scalar":
++        return CpuScalarRuntime()
++    raise SystemExit("unsupported backend {!r}".format(name))
++
++
++def build_bindings(program, case: Mapping[str, Any], payloads: Mapping[str, bytes]):
++    from pypto.portable.runtime_binding import BufferBinding, build_binding_schema
++
++    schema = build_binding_schema(program)
++    parameter_bindings: Dict[str, Any] = {}
++    output_bindings: Dict[str, Any] = {}
++    output_arrays: Dict[str, bytearray] = {}
++    for entry in schema.parameters:
++        payload = payloads[entry.name]
++        if len(payload) != entry.nbytes:
++            raise SystemExit(
++                "payload for {} is {} bytes, expected {}".format(entry.name, len(payload), entry.nbytes)
++            )
++        parameter_bindings[entry.name] = BufferBinding.from_buffer(
++            bytearray(payload), entry.storage_id, entry.dtype, entry.shape, readonly=True
++        )
++    for entry in schema.outputs:
++        buffer = bytearray(entry.nbytes or 0)
++        output_arrays[entry.name] = buffer
++        output_bindings[entry.name] = BufferBinding.from_buffer(
++            buffer, entry.storage_id, entry.dtype, entry.shape, readonly=False
++        )
++    return schema, parameter_bindings, output_bindings, output_arrays
++
++
++def compile_artifact(backend: Mapping[str, Any], program, build_dir: Path):
++    from pypto.compiler import CompileOptions
++
++    started = time.perf_counter()
++    target_ir = backend["compiler"].lower(program, backend["target"])
++    lowered = time.perf_counter()
++    if backend["format"] is not None:
++        options = CompileOptions(artifact_format=backend["format"], extra={"build_dir": str(build_dir)})
++        artifact = backend["compiler"].compile(target_ir, options)
++    else:
++        artifact = backend["compiler"].compile(target_ir)
++    compiled = time.perf_counter()
++    return artifact, {
++        "lower_seconds": round(lowered - started, 6),
++        "compile_seconds": round(compiled - lowered, 6),
++        "artifact_format": getattr(artifact, "format", None),
++        "artifact_path": getattr(artifact, "path", None),
++        "plans": len(getattr(target_ir, "plans", ()) or ()),
++        "native_operations": (getattr(artifact, "metadata", {}) or {}).get("native_operations"),
++        "host_reference_operations": (getattr(artifact, "metadata", {}) or {}).get(
++            "host_reference_operations"
++        ),
++    }
++
++
++def assemble_request(schema, artifact, parameter_bindings, output_bindings):
++    from pypto.portable.runtime_binding import assemble_launch_request
++
++    return assemble_launch_request(schema, artifact, {}, parameter_bindings, {}, output_bindings, {})
++
++
++# ---------------------------------------------------------------------------
++# oracle（纯 Python，不参与计时；避免引入 numpy/BLAS 线程噪声）
++# ---------------------------------------------------------------------------
++
++
++def oracle(case: Mapping[str, Any], payloads: Mapping[str, bytes]) -> List[float]:
++    if case["group"] == "elementwise":
++        left = list(struct.unpack("<{}f".format(len(payloads["left"]) // 4), payloads["left"]))
++        right = list(struct.unpack("<{}f".format(len(payloads["right"]) // 4), payloads["right"]))
++        if case["op"] == "add":
++            return [a + b for a, b in zip(left, right)]
++        if case["op"] == "mul":
++            return [a * b for a, b in zip(left, right)]
++        raise SystemExit("no oracle for {}".format(case["op"]))
++    if case["group"] == "reduction":
++        shape = tuple(case["shape"])
++        axis = int((case["attributes"] or {}).get("axis", 0))
++        source = list(struct.unpack("<{}f".format(len(payloads["source"]) // 4), payloads["source"]))
++        rows = shape[0] if len(shape) > 1 else 1
++        columns = shape[-1]
++        result = []
++        for row in range(rows):
++            chunk = source[row * columns : (row + 1) * columns]
++            if axis == len(shape) - 1:
++                if case["op"] == "reduce_sum":
++                    result.append(math.fsum(chunk))
++                else:
++                    result.append(max(chunk))
++            else:
++                raise SystemExit("oracle only supports trailing-axis reduction")
++        return result
++    if case["group"] == "matmul":
++        m = int(case["left_shape"][-2])
++        k = int(case["left_shape"][-1])
++        n = int(case["right_shape"][-1])
++        left = list(struct.unpack("<{}f".format(len(payloads["left"]) // 4), payloads["left"]))
++        right = list(struct.unpack("<{}f".format(len(payloads["right"]) // 4), payloads["right"]))
++        result = []
++        for row in range(m):
++            left_row = left[row * k : (row + 1) * k]
++            for column in range(n):
++                aggregate = 0.0
++                for inner in range(k):
++                    aggregate += left_row[inner] * right[inner * n + column]
++                result.append(aggregate)
++        return result
++    raise SystemExit("no oracle for group {}".format(case["group"]))
++
++
++def check_output(case: Mapping[str, Any], payloads: Mapping[str, bytes], raw: bytes) -> Mapping[str, Any]:
++    expected = oracle(case, payloads)
++    count = len(expected)
++    observed = struct.unpack("<{}f".format(count), raw[: count * 4])
++    max_abs = 0.0
++    first_mismatch = None
++    for index, (want, got) in enumerate(zip(expected, observed)):
++        error = abs(want - got)
++        if error > max_abs:
++            max_abs = error
++        if error > 1.0e-4 and first_mismatch is None:
++            first_mismatch = {"index": index, "expected": want, "observed": got}
++    scale = max(1.0, max(abs(value) for value in expected)) if expected else 1.0
++    return {
++        "elements": count,
++        "max_abs_error": max_abs,
++        "relative_to_max": max_abs / scale,
++        "tolerance": 1.0e-4,
++        "passed": max_abs <= 1.0e-4 * max(1.0, scale),
++        "first_mismatch": first_mismatch,
++    }
++
++
++# ---------------------------------------------------------------------------
++# 统计（协议 §3.3 + ERR-0004）
++# ---------------------------------------------------------------------------
++
++
++def percentile_nearest_rank(values: Sequence[float], fraction: float) -> float:
++    ordered = sorted(values)
++    index = max(0, math.ceil(fraction * len(ordered)) - 1)
++    return ordered[index]
++
++
++def dispersion(values: Sequence[float]) -> Mapping[str, Any]:
++    import statistics
++
++    if not values:
++        return {"n": 0}
++    ordered = sorted(values)
++    median = statistics.median(ordered)
++    stdev = statistics.stdev(ordered) if len(ordered) > 1 else 0.0
++    p95 = percentile_nearest_rank(ordered, 0.95)
++    mad = statistics.median([abs(value - median) for value in ordered]) if len(ordered) > 1 else 0.0
++    floor = max(OUTLIER_FLOOR_MIN_SECONDS, OUTLIER_FLOOR_MEDIAN_FRACTION * median)
++    mad_component = 3.0 * 1.4826 * mad
++    threshold = max(mad_component, floor)
++    outliers = sum(1 for value in ordered if abs(value - median) > threshold)
++    return {
++        "n": len(ordered),
++        "min": ordered[0],
++        "median": median,
++        "p95": p95,
++        "p95_method": "nearest_rank",
++        "max": ordered[-1],
++        "mean": statistics.fmean(ordered),
++        "stdev": stdev,
++        "stdev_method": "sample_n_minus_1",
++        "cv": (stdev / median) if median else 0.0,
++        "p95_over_median": (p95 / median) if median else 0.0,
++        "mad": mad,
++        "outlier_rule": (
++            "|x - median| > max(3 * 1.4826 * MAD, floor); floor = max(1 us, 0.02 * median)"
++        ),
++        "outlier_threshold": threshold,
++        "outlier_threshold_mad_component": mad_component,
++        "outlier_floor": floor,
++        "outliers_marked": outliers,
++        "outlier_ratio": outliers / len(ordered),
++    }
++
++
++def variance_verdict(stats: Mapping[str, Any]) -> str:
++    if stats.get("n", 0) < 11:
++        return "INSUFFICIENT_SAMPLES"
++    if stats.get("outlier_ratio", 0.0) > OUTLIER_RATIO_MAX:
++        return "UNSTABLE"
++    if stats["cv"] > VARIANCE_LIMITS_LOCAL["cv"] or stats["p95_over_median"] > (
++        VARIANCE_LIMITS_LOCAL["p95_over_median"]
++    ):
++        return "INVALID_VARIANCE"
++    return "VALID"
++
++
++# ---------------------------------------------------------------------------
++# 环境指纹 / 噪声
++# ---------------------------------------------------------------------------
++
++
++def cpu_model() -> str:
++    try:
++        with open("/proc/cpuinfo", encoding="utf-8") as stream:
++            for line in stream:
++                if line.startswith("model name"):
++                    return line.split(":", 1)[1].strip()
++    except OSError:
++        pass
++    return platform.processor() or "unknown"
++
++
++def meminfo(field: str) -> int:
++    try:
++        with open("/proc/meminfo", encoding="utf-8") as stream:
++            for line in stream:
++                if line.startswith(field + ":"):
++                    return int(line.split()[1])
++    except OSError:
++        pass
++    return -1
++
++
++def psi_avg10(path: str) -> Optional[float]:
++    try:
++        with open(path, encoding="utf-8") as stream:
++            for line in stream:
++                if line.startswith("some"):
++                    for token in line.split():
++                        if token.startswith("avg10="):
++                            return float(token.split("=", 1)[1])
++    except OSError:
++        pass
++    return None
++
++
++def noise_sample() -> Mapping[str, Any]:
++    load1 = None
++    try:
++        load1 = os.getloadavg()[0]
++    except OSError:
++        pass
++    return {
++        "t": round(time.time(), 3),
++        "load1": load1,
++        "cpu_psi_avg10": psi_avg10("/proc/pressure/cpu"),
++        "memory_psi_avg10": psi_avg10("/proc/pressure/memory"),
++        "mem_available_mib": round(meminfo("MemAvailable") / 1024.0, 1),
++    }
++
++
++def host_fingerprint(payload: Mapping[str, Any]) -> str:
++    material = "|".join(
++        str(payload.get(key)) for key in (
++            "cpu_model", "nproc_online", "cpu_affinity", "virtualization",
++            "cpufreq_available", "mem_total_mib",
++        )
++    )
++    return hashlib.sha256(material.encode("utf-8")).hexdigest()
++
++
++def host_environment() -> Mapping[str, Any]:
++    affinity = sorted(os.sched_getaffinity(0))
++    virtualization = "unknown"
++    try:
++        virtualization = subprocess.run(
++            ["systemd-detect-virt"], capture_output=True, text=True, timeout=5
++        ).stdout.strip() or "none"
++    except (OSError, subprocess.SubprocessError):
++        pass
++    payload = {
++        "cpu_model": cpu_model(),
++        "nproc_online": os.cpu_count(),
++        "cpu_affinity": affinity,
++        "virtualization": virtualization,
++        "cpufreq_available": Path("/sys/devices/system/cpu/cpu0/cpufreq").exists(),
++        "governor": None,
++        "frequency_control": "unavailable_kvm_guest",
++        "mem_total_mib": round(meminfo("MemTotal") / 1024.0, 1),
++        "uname": platform.uname()._asdict(),
++        "python": sys.version.split()[0],
++        "pid": os.getpid(),
++    }
++    payload["fingerprint"] = host_fingerprint(payload)
++    return payload
++
++
++def resource_context() -> Mapping[str, Any]:
++    return {
++        "cgroup_memory_max_mib": _cgroup_mib("/memory.max"),
++        "cgroup_memory_current_mib": _cgroup_mib("/memory.current"),
++        "env": {
++            key: os.environ.get(key)
++            for key in (
++                "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
++                "PYPTO_X_PORTABLE_ONLY", "CPUQuota",
++            )
++        },
++    }
++
++
++def _cgroup_mib(path: str) -> Optional[float]:
++    try:
++        value = Path(path).read_text(encoding="utf-8").strip()
++    except OSError:
++        return None
++    if value in ("max", ""):
++        return None
++    try:
++        return round(int(value) / (1024.0 * 1024.0), 1)
++    except ValueError:
++        return None
++
++
++def peak_rss_mib() -> float:
++    import resource as resource_module
++
++    return round(resource_module.getrusage(resource_module.RUSAGE_SELF).ru_maxrss / 1024.0, 1)
++
++
++# ---------------------------------------------------------------------------
++# 单 case 测量
++# ---------------------------------------------------------------------------
++
++
++def measure_backend(case: Mapping[str, Any], backend_name: str, build_dir: Path, config: Mapping[str, Any],
++                    log: Callable[[str], None]) -> Mapping[str, Any]:
++    repeats = int(config["repeats"])
++    warmup = int(config["warmup"])
++    ops_per_launch = int(config["ops_per_launch"])
++    launches_per_sample = max(1, int(config.get("launches_per_sample") or 1))
++    backend = make_backend(backend_name)
++    payloads = payloads_for(case)
++    result: Dict[str, Any] = {"case": case["name"], "backend": backend_name, "group": case["group"],
++                              "op": case["op"], "dtype": case["dtype"]}
++    reference_only = bool(case.get("reference_only"))
++    result["reference_only"] = reference_only
++
++    # ---- payload / oracle 用的原始 1-op 程序 ----
++    program_one = build_program(case, 1)
++    schema_one, params_one, outputs_one, arrays_one = build_bindings(program_one, case, payloads)
++    artifact_one, compile_one = compile_artifact(backend, program_one, build_dir / "one")
++    request_one = assemble_request(schema_one, artifact_one, params_one, outputs_one)
++    result["compile_one_op"] = compile_one
++
++    # ---- N-op 程序 ----
++    program_n = build_program(case, ops_per_launch)
++    schema_n, params_n, outputs_n, arrays_n = build_bindings(program_n, case, payloads)
++    artifact_n, compile_n = compile_artifact(backend, program_n, build_dir / "many")
++    request_n = assemble_request(schema_n, artifact_n, params_n, outputs_n)
++    result["compile_n_ops"] = compile_n
++    result["ops_per_launch"] = ops_per_launch
++    result["repeats"] = repeats
++    result["launches_per_sample"] = launches_per_sample
++
++    runtime = make_runtime(backend_name)
++
++    # ---- 正确性：1-op 与 N-op 各跑一次，与纯 Python oracle 比 ----
++    launch_once = time.perf_counter()
++    runtime.launch(request_one)
++    correctness_one = check_output(case, payloads, bytes(arrays_one["out0"]))
++    runtime.launch(request_n)
++    correctness_n = check_output(
++        case, payloads, bytes(arrays_n["out{}".format(ops_per_launch - 1)])
++    )
++    result["cold_launch_seconds"] = round(time.perf_counter() - launch_once, 6)
++    result["correctness"] = {"one_op": correctness_one, "n_ops_last_output": correctness_n}
++    result["flops_per_op"] = program_flops(case, 1)
++
++    def timed_launch(request):
++        started = time.perf_counter()
++        runtime.launch(request)
++        return time.perf_counter() - started
++
++    def sample(request, ops: int):
++        """一次统计样本：``launches_per_sample`` 次独立 launch 的均值（除以 ops）。
++
++        B3b 在 WSL2 上验证过同一做法：短 launch 的微秒级抖动（GC/中断）会让
++        单次样本击穿 cv 门，而"多次 launch 的均值"才是派发开销的可复现估计；
++        每次 launch 的原始时间仍然全部保留在 ``samples_raw_seconds`` 里。
++        """
++
++        raw = [timed_launch(request) for _ in range(launches_per_sample)]
++        return sum(raw) / (launches_per_sample * ops), raw
++
++    attempts: List[Mapping[str, Any]] = []
++    launch_samples: List[float] = []
++    op_samples: List[float] = []
++    launch_raw: List[List[float]] = []
++    op_raw: List[List[float]] = []
++    for attempt in range(WARMUP_ATTEMPTS):
++        warmup_last = None
++        for _ in range(warmup):
++            warmup_last, _ = sample(request_one, 1)
++        launch_samples = []
++        op_samples = []
++        launch_raw = []
++        op_raw = []
++        for _ in range(repeats):
++            value, raw = sample(request_one, 1)
++            launch_samples.append(value)
++            launch_raw.append(raw)
++            value, raw = sample(request_n, ops_per_launch)
++            op_samples.append(value)
++            op_raw.append(raw)
++        smallest = min(launch_samples[:5]) if launch_samples else None
++        acceptance = (
++            abs(warmup_last - smallest) / smallest if (smallest and warmup_last is not None) else None
++        )
++        accepted = acceptance is not None and acceptance < WARMUP_ACCEPTANCE
++        attempts.append(
++            {
++                "attempt": attempt + 1,
++                "warmup_samples": warmup,
++                "last_warmup_launch_seconds": warmup_last,
++                "min_first_five_launch_seconds": smallest,
++                "relative_gap": acceptance,
++                "accepted": accepted,
++            }
++        )
++        if accepted:
++            break
++
++    stats_launch = dispersion(launch_samples)
++    stats_op = dispersion(op_samples)
++    op_median = stats_op["median"]
++    dispatch_median = stats_launch["median"] - op_median
++    result["warmup"] = {
++        "iterations": warmup,
++        "acceptance_rule": "|last_warmup - min(first 5 measured)| / min(...) < 0.05",
++        "attempts": attempts,
++        "verdict": "PASS" if attempts[-1]["accepted"] else "INVALID_WARMUP",
++    }
++    result["statistics"] = {
++        "one_op_launch_seconds": stats_launch,
++        "per_op_seconds": stats_op,
++        "one_op_launch_verdict": variance_verdict(stats_launch),
++        "per_op_verdict": variance_verdict(stats_op),
++    }
++    result["metrics"] = {
++        "op_seconds_median": op_median,
++        "dispatch_seconds_median": dispatch_median,
++        "dispatch_fraction_of_one_op_launch": (
++            dispatch_median / stats_launch["median"] if stats_launch["median"] else None
++        ),
++        "dispatch_over_op": (dispatch_median / op_median) if op_median else None,
++        "fixed_launch_overhead_estimate": (
++            dispatch_median / (1.0 - 1.0 / ops_per_launch) if ops_per_launch > 1 else None
++        ),
++        "launches_per_sample": launches_per_sample,
++        "one_op_launch_seconds_median": stats_launch["median"],
++        "one_op_launch_seconds_mean": stats_launch["mean"],
++        "per_op_seconds_mean": stats_op["mean"],
++        "dispatch_seconds_mean_difference": stats_launch["mean"] - stats_op["mean"],
++        "gflops_end_to_end": (
++            (program_flops(case, 1) / stats_launch["median"] / 1.0e9)
++            if stats_launch["median"] and program_flops(case, 1)
++            else None
++        ),
++        "gflops_scope": "end_to_end",
++        "flop_accounting": (
++            "2*B*M*N*K (matmul)" if case["group"] == "matmul"
++            else ("1*N_out (elementwise binary)" if case["group"] == "elementwise"
++                  else "(N_in/N_out - 1) * N_out (reduce_sum); reduce_max=0")
++        ),
++    }
++    result["samples_seconds"] = {
++        "one_op_launch": launch_samples,
++        "per_op": op_samples,
++    }
++    result["samples_raw_seconds"] = {
++        "one_op_launch": launch_raw,
++        "per_op": op_raw,
++    }
++    result["peak_rss_mib"] = peak_rss_mib()
++    result["status"] = (
++        "PASS"
++        if attempts[-1]["accepted"]
++        and result["statistics"]["one_op_launch_verdict"] == "VALID"
++        and result["statistics"]["per_op_verdict"] == "VALID"
++        else "REVIEW"
++    )
++    log(
++        "[{}/{}] median_1op={:.6f}s per_op={:.6f}s dispatch={:.6f}s cv={:.4f}/{:.4f} verdict={}/{}".format(
++            case["name"], backend_name, stats_launch["median"], op_median, dispatch_median,
++            stats_launch["cv"], stats_op["cv"],
++            result["statistics"]["one_op_launch_verdict"], result["statistics"]["per_op_verdict"],
++        )
++    )
++    return result
++
++
++def payloads_for(case: Mapping[str, Any]) -> Mapping[str, bytes]:
++    if case["group"] == "elementwise":
++        count = 1
++        for dimension in case["shape"]:
++            count *= int(dimension)
++        return {"left": f32_payload(count), "right": f32_payload(count, seed=0.25)}
++    if case["group"] == "reduction":
++        count = 1
++        for dimension in case["shape"]:
++            count *= int(dimension)
++        return {"source": f32_payload(count, seed=0.0)}
++    if case["group"] == "matmul":
++        left_count = 1
++        for dimension in case["left_shape"]:
++            left_count *= int(dimension)
++        right_count = 1
++        for dimension in case["right_shape"]:
++            right_count *= int(dimension)
++        return {"left": f32_payload(left_count), "right": f32_payload(right_count, seed=0.25)}
++    raise SystemExit("no payload for group {}".format(case["group"]))
++
++
++# ---------------------------------------------------------------------------
++# CLI
++# ---------------------------------------------------------------------------
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(description="W8B B3c L0 microbench（AVX-512 / scalar）")
++    parser.add_argument("--round", type=int, default=1)
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--work-dir", required=True)
++    parser.add_argument("--backends", default="avx512,scalar")
++    parser.add_argument("--cases", default="")
++    parser.add_argument("--repeats", type=int, default=0, help="覆盖 measured 样本数（默认按 case）")
++    parser.add_argument("--ops-per-launch", type=int, default=0, help="覆盖单 launch 内 op 数（默认按 case）")
++    parser.add_argument("--warmup", type=int, default=5)
++    parser.add_argument("--launches-per-sample", type=int, default=0,
++                        help="每个统计样本内含的独立 launch 次数（默认按 case/backend）")
++    parser.add_argument("--probe", action="store_true", help="只跑少量 launch 打印量级，不产出正式样本")
++    parser.add_argument("--resource-log", default=None)
++    parser.add_argument("--started-at", default=None)
++    return parser
++
++
++def main(argv: Optional[Sequence[str]] = None) -> int:
++    args = build_parser().parse_args(argv)
++    work_dir = Path(args.work_dir)
++    work_dir.mkdir(parents=True, exist_ok=True)
++    started_at = args.started_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++    backends = [item.strip() for item in args.backends.split(",") if item.strip()]
++    selected = (
++        [case_by_name(name) for name in (item.strip() for item in args.cases.split(",")) if name]
++        if args.cases
++        else list(CASES)
++    )
++
++    log_path = work_dir / "microbench-round{}.log".format(args.round)
++    log_stream = open(log_path, "a", encoding="utf-8", buffering=1)
++
++    def log(message: str) -> None:
++        line = "[{}] {}".format(time.strftime("%H:%M:%S"), message)
++        print(line, flush=True)
++        log_stream.write(line + "\n")
++
++    if args.probe:
++        return run_probe(selected, backends, work_dir, log)
++
++    evidence: Dict[str, Any] = {
++        "schema_version": 1,
++        "artifact_kind": EVIDENCE_KIND,
++        "task": TASK,
++        "round": args.round,
++        "started_at_utc": started_at,
++        "finished_at_utc": None,
++        "host": host_environment(),
++        "resource": resource_context(),
++        "resource_log": args.resource_log,
++        "config": {
++            "repeats": args.repeats,
++            "ops_per_launch": args.ops_per_launch,
++            "warmup": args.warmup,
++            "backends": backends,
++            "cases": [case["name"] for case in selected],
++            "variance_limits": VARIANCE_LIMITS_LOCAL,
++            "outlier_ratio_max": OUTLIER_RATIO_MAX,
++            "levels": "L0_op",
++            "gate": {"relative": "UNGATED", "absolute": "UNGATED", "eligible_for_threshold": False},
++        },
++        "noise_before": noise_sample(),
++        "cases": [],
++    }
++    git_head, branch, dirty = git_state()
++    evidence["git"] = {"head": git_head, "branch": branch, "dirty": dirty}
++
++    for case in selected:
++        for backend_name in backends:
++            if backend_name not in case["backends"]:
++                continue
++            config = {
++                "repeats": args.repeats
++                or case.get("repeats_{}".format(backend_name))
++                or case["repeats"],
++                "ops_per_launch": args.ops_per_launch
++                or case.get("ops_per_launch_{}".format(backend_name))
++                or case["ops_per_launch"],
++                "launches_per_sample": args.launches_per_sample
++                or case.get("launches_per_sample_{}".format(backend_name))
++                or case.get("launches_per_sample")
++                or 1,
++                "warmup": args.warmup,
++            }
++            build_dir = work_dir / "build" / case["name"] / backend_name
++            build_dir.mkdir(parents=True, exist_ok=True)
++            log("start {} / {} (R={} N={} K={})".format(
++                case["name"], backend_name, config["repeats"], config["ops_per_launch"],
++                config["launches_per_sample"],
++            ))
++            try:
++                result = measure_backend(case, backend_name, build_dir, config, log)
++            except Exception as exc:  # noqa: BLE001
++                result = {
++                    "case": case["name"], "backend": backend_name, "status": "ERROR",
++                    "error": "{}: {}".format(type(exc).__name__, exc),
++                }
++                log("ERROR {} / {}: {}".format(case["name"], backend_name, exc))
++            evidence["cases"].append(result)
++
++    evidence["noise_after"] = noise_sample()
++    evidence["peak_rss_mib"] = peak_rss_mib()
++    evidence["finished_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++    Path(args.output).write_text(
++        json.dumps(evidence, ensure_ascii=False, sort_keys=True, indent=1) + "\n", encoding="utf-8"
++    )
++    log("wrote {}".format(args.output))
++    log_stream.close()
++    return 0
++
++
++def run_probe(cases, backends, work_dir, log) -> int:
++    """少量 launch 的量级探针：用于确定 R/N 与 shape 是否可行。"""
++
++    import statistics
++
++    print("case,backend,1op_med_s,Nop_med_s,per_op_s,dispatch_s")
++    for case in cases:
++        for backend_name in backends:
++            if backend_name not in case["backends"]:
++                continue
++            config = {
++                "repeats": 3,
++                "ops_per_launch": min(
++                    21, case.get("ops_per_launch_{}".format(backend_name), case["ops_per_launch"])
++                ),
++                "warmup": 1,
++            }
++            build_dir = work_dir / "probe" / case["name"] / backend_name
++            build_dir.mkdir(parents=True, exist_ok=True)
++            try:
++                result = measure_backend(case, backend_name, build_dir, config, log)
++            except Exception as exc:  # noqa: BLE001
++                print("{},{},ERROR,{}".format(case["name"], backend_name, exc))
++                continue
++            one = statistics.median(result["samples_seconds"]["one_op_launch"])
++            per_op = statistics.median(result["samples_seconds"]["per_op"])
++            correctness = result.get("correctness", {})
++            passed = all(item.get("passed") for item in correctness.values())
++            print("{},{},{:.6f},{:.6f},{:.6f},{:.6f},correct={}".format(
++                case["name"], backend_name, one, per_op * config["ops_per_launch"], per_op, one - per_op,
++                passed))
++    return 0
++
++
++def git_state() -> Tuple[str, str, bool]:
++    try:
++        head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True,
++                              timeout=10, check=True).stdout.strip()
++        branch = subprocess.run(["git", "branch", "--show-current"], capture_output=True, text=True,
++                                timeout=10, check=True).stdout.strip()
++        dirty = bool(subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True,
++                                    timeout=10, check=True).stdout.strip())
++        return head, branch, dirty
++    except (OSError, subprocess.SubprocessError):
++        return "unknown", "unknown", True
++
++
++if __name__ == "__main__":
++    sys.exit(main())
