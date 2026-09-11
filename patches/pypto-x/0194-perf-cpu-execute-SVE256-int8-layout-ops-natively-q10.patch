@@ -1,0 +1,2771 @@
+From e5cb967190fee212f8da910d37dfe1f604769eb8 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 02:42:10 +0800
+Subject: [PATCH 194/217] perf(cpu): execute SVE256 int8 layout ops natively
+ (q10-sve256-int8-layout)
+
+Admit int8 reshape/view/contiguous/transpose/slice/split/concat on the
+SVE256 native descriptor plane: new ptx_layout_i8/ptx_split_i8/ptx_concat_i8
+kernels plus the layout v4 / indexing v5 wires, so the W8A8 weight
+transpose that blocked Q5 lowers and executes natively instead of
+fail-closed. The native contract predicate is shared by artifact metadata
+and runtime dispatch (declaration==execution); unsupported dtypes stay
+fail-closed. f32/bf16 layout lanes now reproduce the host reference's
+CPython-float round trip (including signaling-NaN quieting) bit-for-bit.
+TypedByteView gains int8 so int8 payloads stay raw bytes across the wire.
+Bump lowering 8->9, artifact payload 1->2, runner protocol v6->v7, layout
+wire 3->4, indexing wire 4->5; pre-Q10 artifacts fail closed.
+---
+ python/pypto/backends/cpu/aarch64/sve256.py                 | 122 +++++-
+ python/pypto/backends/cpu/byte_view.py                      |  12 +-
+ python/pypto/compiler/targets/cpu_sve256.py                 | 492 +++++++++++++++++++++---
+ python/pypto/lowering/cpu/aarch64/sve/lowering.py           |  18 +-
+ python/tests/ut/pypto_x/qwen35_gdr_t128_920b_driver.py      |   6 +-
+ python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py |  30 +-
+ python/tests/ut/pypto_x/test_cpu_sve256.py                  |  18 +-
+ python/tests/ut/pypto_x/test_cpu_sve256_indexing.py         |  10 +-
+ python/tests/ut/pypto_x/test_cpu_sve256_int8_layout.py      | 637 ++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_cpu_sve256_layout.py           |  12 +-
+ python/tests/ut/pypto_x/test_qwen35_position_control.py     |   4 +-
+ python/tests/ut/pypto_x/test_w8a8_sve256.py                 |   4 +-
+ tools/c8_sve256_a3/run_a3_int8_layout.sh                    |  89 +++++
+ tools/c8_sve256_a3/sync_int8_layout_to_a3.sh                |  43 +++
+ tools/c8_sve256_w8a8_gap_probe.py                           |  38 +-
+ tools/sve256_int8_layout_matrix.py                          | 371 +++++++++++++++++++
+ tools/sve256_old_artifact_rejection.py                      | 159 ++++++++
+ 17 files changed, 1957 insertions(+), 108 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/aarch64/sve256.py b/python/pypto/backends/cpu/aarch64/sve256.py
+index c4b82c5c1..6b08092d2 100644
+--- a/python/pypto/backends/cpu/aarch64/sve256.py
++++ b/python/pypto/backends/cpu/aarch64/sve256.py
+@@ -18,7 +18,10 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+ from pypto.abi import Availability, LaunchRequest, TensorDesc
+ from pypto.compiler.artifact import ABI_VERSION, Artifact
+ from pypto.compiler.targets.cpu_sve256 import (
++    ARTIFACT_PAYLOAD_VERSION,
+     DEFAULT_ARTIFACT_FORMAT,
++    LAYOUT_NATIVE_DTYPES,
++    LAYOUT_NATIVE_KERNEL_VERSION,
+     RUNNER_PROTOCOL,
+     W8A8_COMPENSATION,
+     W8A8_DEQUANTIZE_S8_KERNEL,
+@@ -30,7 +33,11 @@ from pypto.compiler.targets.cpu_sve256 import (
+     W8A8_QUANTIZE_KERNEL,
+     W8A8_RUNNER_WIRE,
+     W8A8_SDOT_USED,
++    _layout_execution_metadata,
+     _w8a8_execution_metadata,
++    layout_native_contract,
++    layout_native_fallback_reason,
++    layout_native_kernel,
+     w8a8_kernel_contract,
+ )
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation
+@@ -139,11 +146,15 @@ _WIRE_REQUEST = struct.Struct("<6I4Q")
+ _WIRE_RESPONSE = struct.Struct("<4IQ")
+ _WIRE_MAGIC = b"PXSV"
+ _WIRE_VERSION = 1
+-_LAYOUT_WIRE_VERSION = 3
+-_INDEXING_WIRE_VERSION = 4
++# Layout wire v4 adds the int8 raw-byte dtype code (2) for the native
++# layout plane; v3 requests stay valid only for float32/bf16.
++_LAYOUT_WIRE_VERSION = 4
++# Indexing wire v5 adds the int8 raw-byte dtype code (2) for split/concat;
++# int8 gather/embedding remain unsupported.
++_INDEXING_WIRE_VERSION = 5
+ # Control wire v5 carries compact descriptor payloads for native iota/compare
+ # and for native (non-preexpanded) broadcast/where.  Shared with the ELF
+-# runner; see RUNNER_PROTOCOL v6 in pypto.compiler.targets.cpu_sve256.
++# runner; see RUNNER_PROTOCOL v7 in pypto.compiler.targets.cpu_sve256.
+ _CONTROL_WIRE_VERSION = 5
+ # W8A8 wire v6 carries native widening qmatmul plus the three
+ # quantize/dequantize primitives.  It is admitted only for those four
+@@ -194,6 +205,10 @@ _OP_CODES = {
+     W8A8_EPILOGUE_OPCODE: 32,
+ }
+ _DTYPE_CODES = {"float32": 0, "bf16": 1}
++# Layout/indexing wire v4/v5 dtype codes (int8 is a raw-byte payload, distinct
++# from the control wire's PTX_DTYPE_I8=7; must match PTX_LAYOUT_DTYPE_I8 in
++# cpu_sve256.py).
++_LAYOUT_DTYPE_CODES = {"float32": 0, "bf16": 1, "int8": 2}
+ _CAST_DTYPE_CODES = {("float32", "bf16"): 2, ("bf16", "float32"): 3}
+ # Control-wire dtype codes must match PTX_DTYPE_* in cpu_sve256.py.
+ _CONTROL_DTYPE_CODES = {
+@@ -746,6 +761,14 @@ def _verify_embedded_markers(
+         b"sve_widening:no_sdot:no_i8mm",
+         b"ptx_sve256_w8a8_operations",
+         b"native_qmatmul_s8s8_s32+dequantize_s8+quantize_per_token_s8+dequantize_epilogue_bf16",
++        b"ptx_sve256_layout_plane",
++        b"native_layout_dtypes:float32,bf16,int8",
++        b"ptx_sve256_layout_wire",
++        b"v4:pxld-v2",
++        b"ptx_sve256_index_wire",
++        b"v5:pxsp-pxct-pxix",
++        b"ptx_sve256_int8_layout_lane",
++        b"native_int8_layout_lane:transpose,slice,split,concat",
+     )
+     if any(marker not in native_bytes for marker in markers):
+         raise CpuSve256ArtifactError("SVE256 ELF contract marker is missing")
+@@ -838,14 +861,22 @@ def _validate_primary_artifact(artifact: Artifact) -> Mapping[str, Any]:
+         raise CpuSve256ArtifactError("SVE256 position/control implementation metadata is invalid")
+     if metadata.get("layout_plan_version") != 2:
+         raise CpuSve256ArtifactError("SVE256 layout plan version is unsupported")
+-    if metadata.get("layout_descriptor_wire") != "v3:pxld-v2+fnv1a64":
++    if metadata.get("layout_descriptor_wire") != "v4:pxld-v2+fnv1a64":
+         raise CpuSve256ArtifactError("SVE256 layout descriptor wire contract is invalid")
+-    if metadata.get("layout_scalar_lane_fallback") != ["bf16_reorder"]:
+-        raise CpuSve256ArtifactError("SVE256 layout BF16 conversion metadata is invalid")
+-    if metadata.get("indexing_descriptor_wire") != "v4:pxsp-pxct-pxix+fnv1a64":
++    if metadata.get("layout_scalar_lane_fallback") != ["bf16_reorder", "int8_reorder"]:
++        raise CpuSve256ArtifactError("SVE256 layout conversion lane metadata is invalid")
++    if metadata.get("indexing_descriptor_wire") != "v5:pxsp-pxct-pxix+fnv1a64":
+         raise CpuSve256ArtifactError("SVE256 indexing descriptor wire contract is invalid")
+     if metadata.get("indexing_scalar_lane_fallback") != ["bf16_reorder"]:
+         raise CpuSve256ArtifactError("SVE256 indexing BF16 conversion metadata is invalid")
++    if metadata.get("layout_native_kernel_version") != LAYOUT_NATIVE_KERNEL_VERSION:
++        raise CpuSve256ArtifactError("SVE256 layout native kernel version is invalid")
++    if metadata.get("layout_native_dtypes") != list(LAYOUT_NATIVE_DTYPES):
++        raise CpuSve256ArtifactError("SVE256 layout native dtype declaration is invalid")
++    if metadata.get("layout_native_int8_lane") != (
++        "native_int8_layout_lane:transpose,slice,split,concat"
++    ):
++        raise CpuSve256ArtifactError("SVE256 layout int8 lane declaration is invalid")
+     required = set(_string_sequence(metadata.get("required_features"), "required_features"))
+     if required != {"sve", "vl256"}:
+         raise CpuSve256ArtifactError("SVE256 required_features must contain only sve and vl256")
+@@ -884,7 +915,7 @@ def _decode_artifact(artifact: Artifact, available: CpuFeatureSet) -> LoadedSve2
+         )
+     if metadata.get("entrypoint") != artifact.entrypoint:
+         raise CpuSve256ArtifactError("SVE256 artifact entrypoint mismatch")
+-    if metadata.get("artifact_payload_version") != 1:
++    if metadata.get("artifact_payload_version") != ARTIFACT_PAYLOAD_VERSION:
+         raise CpuSve256ArtifactError("unsupported SVE256 artifact payload version")
+     if metadata.get("lowering_version") != SVE256_LOWERING_VERSION:
+         raise CpuSve256ArtifactError("unsupported SVE256 lowering version")
+@@ -949,6 +980,20 @@ def _decode_artifact(artifact: Artifact, available: CpuFeatureSet) -> LoadedSve2
+         raise CpuSve256ArtifactError("SVE256 logical-layout-copy metadata mismatch")
+     if metadata.get("native_layout_reorder_operations") != expected_reorder:
+         raise CpuSve256ArtifactError("SVE256 native layout reorder metadata mismatch")
++    # The declared native layout/split/concat kernels are re-derived from the
++    # same shared predicate the runtime dispatches with, so an artifact cannot
++    # declare a native kernel that would not be executed (declaration==execution).
++    expected_native_layout, expected_layout_fallbacks = _layout_execution_metadata(target_ir)
++    declared_native_layout = metadata.get("layout_native_operations")
++    if not isinstance(declared_native_layout, (list, tuple)) or (
++        list(declared_native_layout) != expected_native_layout
++    ):
++        raise CpuSve256ArtifactError("SVE256 native layout operation metadata mismatch")
++    declared_layout_fallbacks = metadata.get("layout_native_fallbacks")
++    if not isinstance(declared_layout_fallbacks, (list, tuple)) or (
++        list(declared_layout_fallbacks) != expected_layout_fallbacks
++    ):
++        raise CpuSve256ArtifactError("SVE256 layout fallback metadata mismatch")
+     if metadata.get("batched_matmul_fallback") != "host_batch_loop_rank2_runner":
+         raise CpuSve256ArtifactError("SVE256 batched matmul fallback metadata is missing")
+     expected_batched_matmul = [
+@@ -1655,11 +1700,26 @@ class Sve256Runtime:
+             raise CpuSve256ExecutionError("unsupported SVE256 runner operation {!r}".format(operation))
+         dtype = canonical_dtype(dtype)
+         output_dtype = canonical_dtype(output_dtype or dtype)
+-        if output_dtype not in _DTYPE_CODES:
+-            raise CpuSve256ExecutionError("SVE256 runner supports float32 and bf16 only")
+         input_dtype = canonical_dtype(input_dtype or dtype)
+         layout_operation = operation in ("reshape", "view", "contiguous", "transpose", "slice")
+         indexing_operation = operation in ("split", "concat", "gather", "embedding")
++        if (layout_operation or operation in ("split", "concat")) and (
++            layout_native_kernel(operation, output_dtype) is None
++        ):
++            raise CpuSve256ExecutionError(
++                "SVE256 {} with dtype {} is not a native layout kernel".format(
++                    operation, output_dtype
++                )
++            )
++        if layout_operation or indexing_operation:
++            if output_dtype not in _LAYOUT_DTYPE_CODES:
++                raise CpuSve256ExecutionError(
++                    "SVE256 layout/indexing runner supports float32/bf16/int8, got {!r}".format(
++                        output_dtype
++                    )
++                )
++        elif output_dtype not in _DTYPE_CODES:
++            raise CpuSve256ExecutionError("SVE256 runner supports float32 and bf16 only")
+         if indexing_operation and indexing_descriptor is None:
+             raise CpuSve256ExecutionError("SVE256 indexing runner requires a compact descriptor")
+         if layout_operation:
+@@ -1690,6 +1750,12 @@ class Sve256Runtime:
+             else:
+                 if len(values) != 2:
+                     raise CpuSve256ExecutionError("SVE256 indexing runner requires source and indices")
++                if output_dtype not in _DTYPE_CODES:
++                    raise CpuSve256ExecutionError(
++                        "SVE256 gather/embedding supports float32/bf16 source, got {!r}".format(
++                            output_dtype
++                        )
++                    )
+                 index_dtype = canonical_dtype(index_dtype or "int64")
+                 if index_dtype not in _INDEX_DTYPE_CODES:
+                     raise CpuSve256ExecutionError("SVE256 indexing requires int32 or int64 indices")
+@@ -1714,6 +1780,8 @@ class Sve256Runtime:
+             raise CpuSve256ExecutionError("SVE256 runner input lengths do not match operation")
+         if operation == "cast":
+             wire_dtype = _CAST_DTYPE_CODES[(input_dtype, output_dtype)]
++        elif layout_operation or indexing_operation:
++            wire_dtype = _LAYOUT_DTYPE_CODES[output_dtype]
+         else:
+             wire_dtype = _DTYPE_CODES[output_dtype]
+         reserved = _INDEX_DTYPE_CODES.get(canonical_dtype(index_dtype)) if operation in ("gather", "embedding") else 0
+@@ -1753,6 +1821,10 @@ class Sve256Runtime:
+             header=header,
+             payload=payload_values,
+             output_dtype=output_dtype,
++            # Cast requests use the cast-pair code on the wire while the
++            # response carries the output dtype code, so only the
++            # layout/indexing plane overrides the inferred response dtype.
++            expected_dtype=wire_dtype if (layout_operation or indexing_operation) else None,
+             expected_count=expected_count,
+             wire_version=(
+                 _LAYOUT_WIRE_VERSION if layout_operation else
+@@ -1823,15 +1895,17 @@ class Sve256Runtime:
+         output_dtype: str,
+         expected_count: int,
+         wire_version: int,
++        expected_dtype: Optional[int] = None,
+     ) -> List[Any]:
+         """Run one supervised ELF invocation and decode its response."""
+ 
+         output_dtype = canonical_dtype(output_dtype)
+-        expected_dtype = (
+-            _DTYPE_CODES[output_dtype]
+-            if output_dtype in _DTYPE_CODES
+-            else _CONTROL_DTYPE_CODES[output_dtype]
+-        )
++        if expected_dtype is None:
++            expected_dtype = (
++                _DTYPE_CODES[output_dtype]
++                if output_dtype in _DTYPE_CODES
++                else _CONTROL_DTYPE_CODES[output_dtype]
++            )
+         raw = self._invoke_runner_raw(
+             artifact,
+             header=header,
+@@ -2537,6 +2611,12 @@ class Sve256Runtime:
+             split = plan.split_plan
+             if split is None or len(operation.outputs) != len(split.output_shapes):
+                 raise CpuSve256ArtifactError("SVE256 split plan is missing or mismatched")
++            if layout_native_contract(operation, plan) is None:
++                raise CpuSve256ArtifactError(
++                    "SVE256 split is not a native layout operation: {}".format(
++                        layout_native_fallback_reason(operation, plan) or "unsupported dtype"
++                    )
++                )
+             for output_index, output_ref in enumerate(operation.outputs):
+                 output_count = element_count(split.output_shapes[output_index])
+                 descriptor = _split_descriptor_bytes(split, output_index)
+@@ -2711,6 +2791,12 @@ class Sve256Runtime:
+             layout = plan.layout_plan
+             if layout is None or layout.operation != name:
+                 raise CpuSve256ArtifactError("SVE256 layout plan is missing or mismatched")
++            if layout_native_contract(operation, plan) is None:
++                raise CpuSve256ArtifactError(
++                    "SVE256 {} is not a native layout operation: {}".format(
++                        name, layout_native_fallback_reason(operation, plan) or "unsupported dtype"
++                    )
++                )
+             if len(inputs[0][1]) != layout.source_elements:
+                 raise CpuSve256ExecutionError("SVE256 layout source length does not match plan")
+             # The host supplies only static schedule metadata.  Input data is
+@@ -2728,6 +2814,12 @@ class Sve256Runtime:
+             concat = plan.concat_plan
+             if concat is None or len(inputs) != len(concat.input_shapes):
+                 raise CpuSve256ArtifactError("SVE256 concat plan is missing or mismatched")
++            if layout_native_contract(operation, plan) is None:
++                raise CpuSve256ArtifactError(
++                    "SVE256 concat is not a native layout operation: {}".format(
++                        layout_native_fallback_reason(operation, plan) or "unsupported dtype"
++                    )
++                )
+             values = self._run_runner(
+                 artifact, "concat", dtype, [item[1] for item in inputs], concat.output_elements,
+                 indexing_descriptor=_concat_descriptor_bytes(concat),
+diff --git a/python/pypto/backends/cpu/byte_view.py b/python/pypto/backends/cpu/byte_view.py
+index 264f5d41a..2db93af17 100644
+--- a/python/pypto/backends/cpu/byte_view.py
++++ b/python/pypto/backends/cpu/byte_view.py
+@@ -8,7 +8,7 @@ Python element sequence.  A scalar/reference backend may explicitly call
+ ``to_values`` for a small tensor; native backends keep the view and pointer.
+ 
+ Only the dtypes used by the current CPU ingestion contract are accepted here:
+-BF16, FP32, INT32 and INT64.  BF16 is always a little-endian raw uint16
++BF16, FP32, INT8, INT32 and INT64.  BF16 is always a little-endian raw uint16
+ stream.  The utility intentionally does not infer a dtype from a byte buffer.
+ """
+ 
+@@ -32,6 +32,7 @@ _DTYPE_INFO = {
+     "bf16": (2, "H"),
+     "bfloat16": (2, "H"),
+     "float32": (4, "f"),
++    "int8": (1, "b"),
+     "int32": (4, "i"),
+     "int64": (8, "q"),
+ }
+@@ -41,6 +42,7 @@ _NATIVE_FORMATS = {
+     # numeric format, and is accepted only with the exact BF16 itemsize.
+     "bf16": ("H", "2x"),
+     "float32": ("f",),
++    "int8": ("b",),
+     "int32": ("i",),
+     # NumPy exposes np.int64 as ``l`` on LP64 hosts, while ctypes/array use
+     # ``q``.  Both are signed 64-bit native-little-endian exporters.
+@@ -53,7 +55,7 @@ def _canonical_dtype(dtype: Any) -> str:
+     value = str(value).strip().lower()
+     if value == "bfloat16":
+         return "bf16"
+-    if value not in ("bf16", "float32", "int32", "int64"):
++    if value not in ("bf16", "float32", "int8", "int32", "int64"):
+         raise CpuByteViewError("typed byte view does not support dtype {!r}".format(dtype))
+     return value
+ 
+@@ -302,6 +304,8 @@ class TypedByteView:
+             return [_bf16_value(value) for value in bits]
+         if self.dtype == "float32":
+             return list(struct.unpack("<{}f".format(self.count), payload)) if self.count else []
++        if self.dtype == "int8":
++            return list(struct.unpack("<{}b".format(self.count), payload)) if self.count else []
+         if self.dtype == "int32":
+             return list(struct.unpack("<{}i".format(self.count), payload)) if self.count else []
+         if self.dtype == "int64":
+@@ -314,6 +318,8 @@ class TypedByteView:
+         payload = self.to_bytes()
+         if self.dtype == "bf16":
+             return list(struct.unpack("<{}H".format(self.count), payload)) if self.count else []
++        if self.dtype == "int8":
++            return list(struct.unpack("<{}b".format(self.count), payload)) if self.count else []
+         if self.dtype == "int32":
+             return list(struct.unpack("<{}i".format(self.count), payload)) if self.count else []
+         if self.dtype == "int64":
+@@ -341,6 +347,8 @@ class TypedByteView:
+                 payload = struct.pack("<{}H".format(self.count), *[_bf16_bits(value) for value in values])
+             elif self.dtype == "float32":
+                 payload = struct.pack("<{}f".format(self.count), *[float(value) for value in values])
++            elif self.dtype == "int8":
++                payload = struct.pack("<{}b".format(self.count), *[int(value) for value in values])
+             elif self.dtype == "int32":
+                 payload = struct.pack("<{}i".format(self.count), *[int(value) for value in values])
+             elif self.dtype == "int64":
+diff --git a/python/pypto/compiler/targets/cpu_sve256.py b/python/pypto/compiler/targets/cpu_sve256.py
+index e116305aa..f98df7804 100644
+--- a/python/pypto/compiler/targets/cpu_sve256.py
++++ b/python/pypto/compiler/targets/cpu_sve256.py
+@@ -46,13 +46,17 @@ from pypto.target import TargetSpec
+ from pypto.target._utils import mapping_copy, sha256_bytes, sha256_text
+ 
+ 
+-ARTIFACT_PAYLOAD_VERSION = 1
++ARTIFACT_PAYLOAD_VERSION = 2
+ DEFAULT_ARTIFACT_FORMAT = "pypto-x.cpu.sve256"
+ # Version 6 adds the W8A8 operation plane (native widening qmatmul plus the
+ # three dequantize/quantize primitives).  The v5 control wire is unchanged
+ # and stays the only wire for iota/compare/broadcast/where; v6 requests are
+ # admitted only for the four W8A8 operations.
+-RUNNER_PROTOCOL = "pypto-x.cpu.sve256.runner.v6"
++# Version 7 (W8C Q10) adds the native int8 layout/split/concat plane: the
++# layout wire moves to v4 and the indexing wire to v5.  Payload 1 artifacts
++# declared int8 layout operations as unsupported, so they must fail closed
++# rather than be silently reinterpreted under the float-only dtype set.
++RUNNER_PROTOCOL = "pypto-x.cpu.sve256.runner.v7"
+ #: W8A8 native kernel plane.  Version 1 covers the public
+ #: ``qmatmul_s8s8_s32`` Core IR opcode (R6); the three primitives stay
+ #: target entry points until the C7/C8 graph integration.
+@@ -69,6 +73,28 @@ W8A8_RUNNER_WIRE = "v6:pxqm-pxqs-pxqd-pxqe"
+ W8A8_SDOT_USED = False
+ W8A8_I8MM_USED = False
+ 
++#: Native layout/split/concat plane (artifact payload version 2).
++#:
++#: ``LayoutPlan`` / ``SplitPlan`` / ``ConcatPlan`` already carry the complete
++#: rank-sized descriptor; this plane executes those descriptors in the
++#: compiled SVE256 ELF instead of walking a Python list.  The predicate below
++#: is shared by the artifact metadata and the runtime, so an artifact cannot
++#: declare a native layout kernel that the runtime would not execute.
++LAYOUT_NATIVE_KERNEL_VERSION = 1
++LAYOUT_NATIVE_MODE = "native_sve256_layout"
++LAYOUT_SPLIT_MODE = "native_sve256_split"
++LAYOUT_CONCAT_MODE = "native_sve256_concat"
++#: int8 is required for the W8A8 weight path; any other dtype stays on the
++#: explicit host_reference boundary with a reason instead of silently
++#: materializing a Python list.
++LAYOUT_NATIVE_DTYPES = ("float32", "bf16", "int8")
++LAYOUT_NATIVE_OPERATIONS = frozenset(
++    ("reshape", "view", "contiguous", "transpose", "slice")
++)
++LAYOUT_INDEXING_OPERATIONS = frozenset(("split", "concat"))
++LAYOUT_NATIVE_KERNEL_SUFFIX = {"float32": "f32", "bf16": "bf16", "int8": "i8"}
++_LAYOUT_TENSOR_KINDS = frozenset(("tensor", "view", "tile"))
++
+ 
+ 
+ _NATIVE_SOURCE = r'''
+@@ -83,8 +109,12 @@ _NATIVE_SOURCE = r'''
+ #include <unistd.h>
+ 
+ #define PTX_MAGIC 0x56535850U /* little-endian bytes: PXSV */
+-#define PTX_VERSION 3U
+-#define PTX_INDEX_VERSION 4U
++/* v4 carries the layout plane with the int8 dtype code (2).  The old v3
++ * layout wire is rejected fail-closed; callers must move to v4. */
++#define PTX_VERSION 4U
++/* v5 carries the indexing plane with the int8 dtype code (2) for
++ * split/concat; int8 gather/embedding remain unsupported. */
++#define PTX_INDEX_VERSION 5U
+ /* v5 carries compact descriptor payloads for native iota/compare and for
+  * native broadcast/where; v1 remains the legacy host-preexpanded broadcast
+  * and where wire contract and must not be used for iota/compare. */
+@@ -100,7 +130,8 @@ _NATIVE_SOURCE = r'''
+ #define PTX_STATUS_RUNTIME 3U
+ 
+ /* Control-wire dtype codes.  0 and 1 keep the historical float32/bf16 wire
+- * meanings; 2/3 remain cast-only codes. */
++ * meanings; 2/3 remain cast-only codes.  The layout/indexing wires reuse code
++ * 2 for int8 on v4/v5 requests (see PTX_LAYOUT_DTYPE_I8). */
+ #define PTX_DTYPE_F32 0U
+ #define PTX_DTYPE_BF16 1U
+ #define PTX_DTYPE_I32 4U
+@@ -112,6 +143,9 @@ _NATIVE_SOURCE = r'''
+ #define PTX_DTYPE_U16 10U
+ #define PTX_DTYPE_U32 11U
+ #define PTX_DTYPE_U64 12U
++/* Layout/indexing wire v4/v5 int8 dtype code (raw byte payloads, no value
++ * conversion; distinct from the control wire's PTX_DTYPE_I8 code). */
++#define PTX_LAYOUT_DTYPE_I8 2U
+ #define PTX_CONTROL_MAX_RANK 64U
+ #define PTX_IOTA_DESCRIPTOR_BYTES 64U
+ #define PTX_COMPARE_DESCRIPTOR_HEADER_BYTES 56U
+@@ -152,6 +186,12 @@ __attribute__((used, visibility("default"))) const char *ptx_sve256_w8a8_plane =
+     "sve_widening:no_sdot:no_i8mm";
+ __attribute__((used, visibility("default"))) const char *ptx_sve256_w8a8_operations =
+     "native_qmatmul_s8s8_s32+dequantize_s8+quantize_per_token_s8+dequantize_epilogue_bf16";
++__attribute__((used, visibility("default"))) const char *ptx_sve256_layout_plane =
++    "native_layout_dtypes:float32,bf16,int8";
++__attribute__((used, visibility("default"))) const char *ptx_sve256_layout_wire = "v4:pxld-v2";
++__attribute__((used, visibility("default"))) const char *ptx_sve256_index_wire = "v5:pxsp-pxct-pxix";
++__attribute__((used, visibility("default"))) const char *ptx_sve256_int8_layout_lane =
++    "native_int8_layout_lane:transpose,slice,split,concat";
+ 
+ enum { PTX_COPY = 0, PTX_NEG = 1, PTX_ADD = 2, PTX_SUB = 3,
+        PTX_MUL = 4, PTX_DIV = 5, PTX_REDUCE_SUM = 6,
+@@ -358,6 +398,15 @@ static int ptx_is_expand_operation(uint32_t operation) {
+     return operation == PTX_BROADCAST || operation == PTX_WHERE;
+ }
+ 
++/* Item size for the layout/indexing wire dtype codes (0/1 historical, 2 is
++ * the v4/v5 int8 raw-byte code).  Returns 0 for every other code. */
++static size_t ptx_layout_wire_item_size(uint32_t dtype) {
++    if (dtype == PTX_DTYPE_F32) return sizeof(float);
++    if (dtype == PTX_DTYPE_BF16) return sizeof(uint16_t);
++    if (dtype == PTX_LAYOUT_DTYPE_I8) return sizeof(int8_t);
++    return 0;
++}
++
+ static int ptx_is_w8a8_operation(uint32_t operation) {
+     return operation >= PTX_QMATMUL_S8S8_S32 && operation <= PTX_DEQUANTIZE_EPILOGUE_BF16;
+ }
+@@ -389,15 +438,20 @@ static int ptx_validate_request(const PtxRequest *request, const unsigned char *
+     }
+     if (ptx_is_w8a8_operation(request->operation))
+         return PTX_STATUS_BAD_REQUEST;
+-    if (request->version == PTX_CONTROL_VERSION) {
+-        if (!ptx_is_position_operation(request->operation) &&
+-            !ptx_is_expand_operation(request->operation))
++    if (ptx_is_position_operation(request->operation)) {
++        if (request->version != PTX_CONTROL_VERSION)
+             return PTX_STATUS_BAD_REQUEST;
+         return ptx_validate_control_request(request, payload, payload_length, item_size,
+                                             payload_size, output_count, result_size);
+     }
+-    if (ptx_is_position_operation(request->operation))
+-        return PTX_STATUS_BAD_REQUEST;
++    /* Version 5 is shared with the indexing wire; only the descriptor-carrying
++     * broadcast/where form enters the control plane.  Legacy v1 broadcast/where
++     * fall through to the generic pre-expanded path. */
++    if (request->version == PTX_CONTROL_VERSION &&
++        ptx_is_expand_operation(request->operation)) {
++        return ptx_validate_control_request(request, payload, payload_length, item_size,
++                                            payload_size, output_count, result_size);
++    }
+     if (request->dtype > 3 ||
+         (!ptx_is_indexing_operation(request->operation) && (request->reserved || request->reserved2)) ||
+         (ptx_is_indexing_operation(request->operation) && request->operation <= PTX_CONCAT && request->reserved))
+@@ -405,6 +459,18 @@ static int ptx_validate_request(const PtxRequest *request, const unsigned char *
+     if (request->operation == PTX_CAST) {
+         if (request->dtype < 2) return PTX_STATUS_BAD_REQUEST;
+         *item_size = request->dtype == 2 ? sizeof(float) : sizeof(uint16_t);
++    } else if (request->dtype == PTX_LAYOUT_DTYPE_I8 &&
++               (ptx_is_layout_operation(request->operation) ||
++                request->operation == PTX_SPLIT || request->operation == PTX_CONCAT)) {
++        /* int8 is admitted only on the v4 layout / v5 indexing wire and only
++         * for the raw-byte layout/split/concat kernels; v3 is rejected
++         * outright and the gather/embedding plane stays float32/bf16. */
++        int layout_int8 = ptx_is_layout_operation(request->operation) &&
++                          request->version == PTX_VERSION;
++        int indexing_int8 = (request->operation == PTX_SPLIT || request->operation == PTX_CONCAT) &&
++                            request->version == PTX_INDEX_VERSION;
++        if (!layout_int8 && !indexing_int8) return PTX_STATUS_BAD_REQUEST;
++        *item_size = sizeof(int8_t);
+     } else {
+         if (request->dtype > 1) return PTX_STATUS_BAD_REQUEST;
+         *item_size = request->dtype == 0 ? sizeof(float) : sizeof(uint16_t);
+@@ -1450,12 +1516,67 @@ static void ptx_copy_bf16(const uint16_t *input, uint16_t *output, uint64_t coun
+     }
+ }
+ 
++/* The Python host reference decodes every float lane through a CPython float
++ * (IEEE-754 default conversion), which quiets a signaling NaN while preserving
++ * the payload.  Quiet NaN, Inf and finite patterns are unchanged.  The layout
++ * plane reproduces that conversion bit-for-bit, so a native reorder is
++ * byte-identical to the host_reference output. */
++static inline float ptx_quiet_nan_f32(float value) {
++    union { uint32_t bits; float value; } converted;
++    converted.value = value;
++    if ((converted.bits & 0x7F800000U) == 0x7F800000U &&
++        (converted.bits & 0x007FFFFFU) != 0U)
++        converted.bits |= 0x00400000U;
++    return converted.value;
++}
++
++static inline uint16_t ptx_quiet_nan_bf16(uint16_t value) {
++    if ((value & 0x7F80U) == 0x7F80U && (value & 0x007FU) != 0U)
++        value |= 0x0040U;
++    return value;
++}
++
++static inline svfloat32_t ptx_quiet_nan_f32_vector(svbool_t pg, svfloat32_t values) {
++    svuint32_t bits = svreinterpret_u32_f32(values);
++    svuint32_t exponent = svand_n_u32_x(pg, bits, 0x7F800000U);
++    svuint32_t mantissa = svand_n_u32_x(pg, bits, 0x007FFFFFU);
++    svbool_t is_nan = svand_b_z(pg, svcmpeq_n_u32(pg, exponent, 0x7F800000U),
++                                svcmpne_n_u32(pg, mantissa, 0U));
++    return svreinterpret_f32_u32(svorr_n_u32_m(is_nan, bits, 0x00400000U));
++}
++
++static void ptx_layout_copy_f32(const float *input, float *output, uint64_t count) {
++    uint64_t index = 0;
++    while (index < count) {
++        svbool_t pg = svwhilelt_b32(index, count);
++        svfloat32_t value = svld1(pg, input + index);
++        svst1(pg, output + index, ptx_quiet_nan_f32_vector(pg, value));
++        index += svcntw();
++    }
++}
++
++static void ptx_layout_copy_bf16(const uint16_t *input, uint16_t *output, uint64_t count) {
++    uint64_t index;
++    for (index = 0; index < count; ++index)
++        output[index] = ptx_quiet_nan_bf16(input[index]);
++}
++
++static void ptx_copy_i8(const int8_t *input, int8_t *output, uint64_t count) {
++    uint64_t index = 0;
++    while (index < count) {
++        svbool_t pg = svwhilelt_b8(index, count);
++        svint8_t value = svld1_s8(pg, input + index);
++        svst1_s8(pg, output + index, value);
++        index += svcntb();
++    }
++}
++
+ __attribute__((noinline))
+ static int ptx_layout_f32(uint32_t operation, const float *input, float *output,
+                           const PtxLayoutDescriptor *descriptor, uint64_t count) {
+     uint64_t index = 0;
+     if (operation == PTX_RESHAPE || operation == PTX_VIEW || operation == PTX_CONTIGUOUS) {
+-        ptx_copy_f32(input, output, count);
++        ptx_layout_copy_f32(input, output, count);
+         return PTX_STATUS_OK;
+     }
+     /* The descriptor is evaluated in the native runner.  Only the final
+@@ -1474,7 +1595,7 @@ static int ptx_layout_f32(uint32_t operation, const float *input, float *output,
+         }
+         svuint32_t indices = svld1_u32(pg32, index_values);
+         svfloat32_t values = svld1_gather_u32index_f32(pg32, input, indices);
+-        svst1(pg32, output + index, values);
++        svst1(pg32, output + index, ptx_quiet_nan_f32_vector(pg32, values));
+         index = end;
+     }
+     return PTX_STATUS_OK;
+@@ -1485,11 +1606,31 @@ static int ptx_layout_bf16(uint32_t operation, const uint16_t *input, uint16_t *
+                            const PtxLayoutDescriptor *descriptor, uint64_t count) {
+     uint64_t index = 0;
+     if (operation == PTX_RESHAPE || operation == PTX_VIEW || operation == PTX_CONTIGUOUS) {
+-        ptx_copy_bf16(input, output, count);
++        ptx_layout_copy_bf16(input, output, count);
+         return PTX_STATUS_OK;
+     }
+     /* GCC's SVE1 ACLE has no predicated u16 indexed gather.  The descriptor
+      * is still evaluated natively; only the BF16 element load is scalar. */
++    for (index = 0; index < count; ++index) {
++        uint64_t source_index;
++        if (ptx_layout_source_index(descriptor, index, &source_index) != PTX_STATUS_OK)
++            return PTX_STATUS_BAD_REQUEST;
++        output[index] = ptx_quiet_nan_bf16(input[source_index]);
++    }
++    return PTX_STATUS_OK;
++}
++
++__attribute__((noinline))
++static int ptx_layout_i8(uint32_t operation, const int8_t *input, int8_t *output,
++                         const PtxLayoutDescriptor *descriptor, uint64_t count) {
++    uint64_t index = 0;
++    if (operation == PTX_RESHAPE || operation == PTX_VIEW || operation == PTX_CONTIGUOUS) {
++        ptx_copy_i8(input, output, count);
++        return PTX_STATUS_OK;
++    }
++    /* SVE1 has no u8 indexed gather.  The descriptor is still evaluated and
++     * every byte lane is written by this ELF; int8 values are raw bytes, so
++     * no conversion is applied. */
+     for (index = 0; index < count; ++index) {
+         uint64_t source_index;
+         if (ptx_layout_source_index(descriptor, index, &source_index) != PTX_STATUS_OK)
+@@ -1635,6 +1776,21 @@ static int ptx_split_bf16(const uint16_t *input, uint16_t *output,
+     return PTX_STATUS_OK;
+ }
+ 
++static int ptx_split_i8(const int8_t *input, int8_t *output,
++                        const PtxSplitDescriptor *descriptor) {
++    uint64_t outer = ptx_split_outer(descriptor), inner = ptx_split_inner(descriptor);
++    uint64_t axis_size = descriptor->sizes[descriptor->output_index];
++    uint64_t row = axis_size * inner;
++    uint64_t source_axis = descriptor->input_shape[descriptor->axis];
++    uint64_t offset = ptx_split_offset(descriptor), index;
++    if (descriptor->output_elements == 0) return PTX_STATUS_OK;
++    for (index = 0; index < outer; ++index) {
++        uint64_t source_offset = index * source_axis * inner + offset * inner;
++        ptx_copy_i8(input + source_offset, output + index * row, row);
++    }
++    return PTX_STATUS_OK;
++}
++
+ static int ptx_decode_concat_descriptor(const unsigned char *bytes, size_t length,
+                                         PtxConcatDescriptor *descriptor) {
+     uint32_t rank, input_count;
+@@ -1748,6 +1904,28 @@ static int ptx_concat_bf16(const uint16_t *input, uint16_t *output,
+     return PTX_STATUS_OK;
+ }
+ 
++static int ptx_concat_i8(const int8_t *input, int8_t *output,
++                         const PtxConcatDescriptor *descriptor) {
++    uint64_t inner = 1, outer = 1, axis;
++    uint32_t dimension, input_index;
++    if (descriptor->output_elements == 0) return PTX_STATUS_OK;
++    for (dimension = descriptor->axis + 1; dimension < descriptor->rank; ++dimension) inner *= descriptor->output_shape[dimension];
++    for (dimension = 0; dimension < descriptor->axis; ++dimension) outer *= descriptor->output_shape[dimension];
++    for (axis = 0; axis < outer; ++axis) {
++        uint64_t output_offset = axis * descriptor->output_shape[descriptor->axis] * inner;
++        uint64_t local_offset = 0, input_base = 0;
++        for (input_index = 0; input_index < descriptor->input_count; ++input_index) {
++            uint64_t row = descriptor->sizes[input_index] * inner;
++            uint64_t source_offset = input_base + axis * row;
++            ptx_copy_i8(input + source_offset, output + output_offset + local_offset, row);
++            if (outer > 0 && row > UINT64_MAX / outer) return PTX_STATUS_BAD_REQUEST;
++            input_base += outer * row;
++            local_offset += row;
++        }
++    }
++    return PTX_STATUS_OK;
++}
++
+ static int ptx_decode_index_descriptor(const unsigned char *bytes, size_t length,
+                                        PtxIndexDescriptor *descriptor) {
+     uint32_t source_rank, index_rank, output_rank;
+@@ -2437,8 +2615,8 @@ static int ptx_run(const PtxRequest *request, const unsigned char *payload,
+     if (request->operation == PTX_CAST) {
+         item_size = request->dtype == 2 ? sizeof(float) : sizeof(uint16_t);
+     } else {
+-        if (request->dtype > 1) return PTX_STATUS_BAD_REQUEST;
+-        item_size = request->dtype == 0 ? sizeof(float) : sizeof(uint16_t);
++        item_size = ptx_layout_wire_item_size(request->dtype);
++        if (item_size == 0) return PTX_STATUS_BAD_REQUEST;
+     }
+     if (ptx_is_layout_operation(request->operation)) {
+         size_t source_elements, source_bytes, descriptor_bytes;
+@@ -2462,11 +2640,16 @@ static int ptx_run(const PtxRequest *request, const unsigned char *payload,
+         layout_status = ptx_validate_layout_descriptor(
+             &descriptor, request->operation, request->m, request->count
+         );
+-        if (layout_status == PTX_STATUS_OK && request->dtype == 0)
++        if (layout_status == PTX_STATUS_OK && request->dtype == PTX_DTYPE_F32)
+             layout_status = ptx_layout_f32(
+                 request->operation, (const float *)payload, (float *)result,
+                 &descriptor, count
+             );
++        else if (layout_status == PTX_STATUS_OK && request->dtype == PTX_LAYOUT_DTYPE_I8)
++            layout_status = ptx_layout_i8(
++                request->operation, (const int8_t *)payload, (int8_t *)result,
++                &descriptor, count
++            );
+         else if (layout_status == PTX_STATUS_OK)
+             layout_status = ptx_layout_bf16(
+                 request->operation, (const uint16_t *)payload,
+@@ -2493,8 +2676,10 @@ static int ptx_run(const PtxRequest *request, const unsigned char *payload,
+                 indexing_status = ptx_decode_split_descriptor(descriptor_payload, descriptor_bytes, &descriptor);
+                 if (indexing_status == PTX_STATUS_OK)
+                     indexing_status = ptx_validate_split_descriptor(&descriptor, request->m, request->count);
+-                if (indexing_status == PTX_STATUS_OK && request->dtype == 0)
++                if (indexing_status == PTX_STATUS_OK && request->dtype == PTX_DTYPE_F32)
+                     indexing_status = ptx_split_f32((const float *)payload, (float *)result, &descriptor);
++                else if (indexing_status == PTX_STATUS_OK && request->dtype == PTX_LAYOUT_DTYPE_I8)
++                    indexing_status = ptx_split_i8((const int8_t *)payload, (int8_t *)result, &descriptor);
+                 else if (indexing_status == PTX_STATUS_OK)
+                     indexing_status = ptx_split_bf16((const uint16_t *)payload, (uint16_t *)result, &descriptor);
+                 ptx_free_split_descriptor(&descriptor);
+@@ -2505,8 +2690,10 @@ static int ptx_run(const PtxRequest *request, const unsigned char *payload,
+                 indexing_status = ptx_decode_concat_descriptor(descriptor_payload, descriptor_bytes, &descriptor);
+                 if (indexing_status == PTX_STATUS_OK)
+                     indexing_status = ptx_validate_concat_descriptor(&descriptor, request->m, request->count);
+-                if (indexing_status == PTX_STATUS_OK && request->dtype == 0)
++                if (indexing_status == PTX_STATUS_OK && request->dtype == PTX_DTYPE_F32)
+                     indexing_status = ptx_concat_f32((const float *)payload, (float *)result, &descriptor);
++                else if (indexing_status == PTX_STATUS_OK && request->dtype == PTX_LAYOUT_DTYPE_I8)
++                    indexing_status = ptx_concat_i8((const int8_t *)payload, (int8_t *)result, &descriptor);
+                 else if (indexing_status == PTX_STATUS_OK)
+                     indexing_status = ptx_concat_bf16((const uint16_t *)payload, (uint16_t *)result, &descriptor);
+                 ptx_free_concat_descriptor(&descriptor);
+@@ -2820,6 +3007,38 @@ static int ptx_guarded_self_test(void) {
+             if (value != (float)((index % 3) * 3 + index / 3)) return 4;
+         }
+     }
++    {
++        enum { layout_count = 15, layout_rank = 2 };
++        unsigned char layout_input_raw[layout_count + 2];
++        unsigned char layout_output_raw[layout_count + 2];
++        uint64_t layout_input_shape[layout_rank] = {3, 5};
++        uint64_t layout_output_shape[layout_rank] = {5, 3};
++        uint64_t layout_strides[layout_rank] = {5, 1};
++        uint64_t layout_permutation[layout_rank] = {1, 0};
++        uint64_t layout_starts[layout_rank] = {0, 0};
++        uint64_t layout_steps[layout_rank] = {1, 1};
++        PtxLayoutDescriptor layout_descriptor = {
++            PTX_LAYOUT_KIND_TRANSPOSE, layout_rank, layout_rank,
++            layout_count, layout_count, layout_input_shape, layout_output_shape,
++            layout_strides, layout_permutation, layout_starts, layout_steps, NULL
++        };
++        const int8_t *layout_input = (const int8_t *)(layout_input_raw + 1);
++        int8_t *layout_output = (int8_t *)(layout_output_raw + 1);
++        layout_input_raw[0] = 0xa5; layout_input_raw[sizeof(layout_input_raw) - 1] = 0x5a;
++        layout_output_raw[0] = 0xa5; layout_output_raw[sizeof(layout_output_raw) - 1] = 0x5a;
++        for (index = 0; index < layout_count; ++index)
++            layout_input_raw[1 + index] = (unsigned char)(int8_t)(index - 7);
++        if (ptx_layout_i8(PTX_TRANSPOSE, layout_input, layout_output,
++                          &layout_descriptor, layout_count) != PTX_STATUS_OK)
++            return 5;
++        if (layout_input_raw[0] != 0xa5 || layout_input_raw[sizeof(layout_input_raw) - 1] != 0x5a ||
++            layout_output_raw[0] != 0xa5 || layout_output_raw[sizeof(layout_output_raw) - 1] != 0x5a)
++            return 5;
++        for (index = 0; index < layout_count; ++index) {
++            int8_t expected = (int8_t)(((index % 3) * 5 + index / 3) - 7);
++            if (layout_output_raw[1 + index] != (unsigned char)expected) return 6;
++        }
++    }
+     return 0;
+ }
+ 
+@@ -2851,30 +3070,43 @@ int main(int argc, char **argv) {
+         free(input); return ptx_error_response(PTX_STATUS_BAD_REQUEST, 0, 1U);
+     }
+     memcpy(&request, input, sizeof(request));
+-    if (request.magic != PTX_MAGIC || !ptx_valid_operation(request.operation) ||
+-        (request.version != 1U && request.version != PTX_VERSION &&
+-         request.version != PTX_INDEX_VERSION && request.version != PTX_CONTROL_VERSION &&
+-         request.version != PTX_W8A8_VERSION) ||
+-        (request.version == PTX_W8A8_VERSION &&
+-         !ptx_is_w8a8_operation(request.operation)) ||
+-        (request.version != PTX_W8A8_VERSION &&
+-         ptx_is_w8a8_operation(request.operation)) ||
+-        (request.version == PTX_CONTROL_VERSION &&
+-         !(ptx_is_position_operation(request.operation) ||
+-           ptx_is_expand_operation(request.operation))) ||
+-        (request.version != PTX_CONTROL_VERSION &&
+-         ptx_is_position_operation(request.operation)) ||
+-        (request.version == 1U &&
+-         (ptx_is_layout_operation(request.operation) ||
+-          ptx_is_indexing_operation(request.operation) ||
+-          ptx_is_position_operation(request.operation))) ||
+-        (request.version != PTX_INDEX_VERSION && ptx_is_indexing_operation(request.operation)) ||
+-        (request.version == PTX_INDEX_VERSION && !ptx_is_indexing_operation(request.operation)) ||
+-        (request.version != PTX_CONTROL_VERSION && !ptx_is_indexing_operation(request.operation) &&
+-         (request.reserved || request.reserved2)) ||
+-        (ptx_is_indexing_operation(request.operation) && request.operation <= PTX_CONCAT && request.reserved)) {
+-        uint32_t dtype = request.dtype;
+-        free(input); return ptx_error_response(PTX_STATUS_BAD_REQUEST, dtype, request.version);
++    {
++        int is_w8a8 = ptx_is_w8a8_operation(request.operation);
++        int is_position = ptx_is_position_operation(request.operation);
++        int is_expand = ptx_is_expand_operation(request.operation);
++        int is_indexing = ptx_is_indexing_operation(request.operation);
++        int is_layout = ptx_is_layout_operation(request.operation);
++        int expand_v5 = is_expand && request.version == PTX_CONTROL_VERSION;
++        int generic_plane = !is_w8a8 && !is_position && !is_indexing && !expand_v5;
++        /* Version 5 is shared by the control plane (iota/compare/broadcast/
++         * where) and the v5 indexing plane (split/concat/gather/embedding);
++         * the operation selects the plane.  Legacy v1 broadcast/where stay on
++         * the generic pre-expanded path.  Layout ops require the v4 layout
++         * wire (v3 is rejected fail-closed), generic ops stay on v1/v4, and
++         * W8A8 ops require v6. */
++        int version_ok =
++            request.version == 1U || request.version == PTX_VERSION ||
++            request.version == PTX_INDEX_VERSION || request.version == PTX_CONTROL_VERSION ||
++            request.version == PTX_W8A8_VERSION;
++        int plane_ok =
++            (is_w8a8 && request.version == PTX_W8A8_VERSION) ||
++            (is_position && request.version == PTX_CONTROL_VERSION) ||
++            expand_v5 ||
++            (is_indexing && request.version == PTX_INDEX_VERSION) ||
++            (generic_plane &&
++             (is_layout ? request.version == PTX_VERSION :
++              (request.version == 1U || request.version == PTX_VERSION)));
++        int reserved_ok = 1;
++        if (is_indexing) {
++            if (request.operation <= PTX_CONCAT && request.reserved) reserved_ok = 0;
++        } else if (!is_position && !expand_v5) {
++            if (request.reserved || request.reserved2) reserved_ok = 0;
++        }
++        if (request.magic != PTX_MAGIC || !ptx_valid_operation(request.operation) ||
++            !version_ok || !plane_ok || !reserved_ok) {
++            uint32_t dtype = request.dtype;
++            free(input); return ptx_error_response(PTX_STATUS_BAD_REQUEST, dtype, request.version);
++        }
+     }
+     if (payload_offset > input_size) {
+         uint32_t dtype = request.dtype;
+@@ -3027,6 +3259,170 @@ def _w8a8_capability_metadata() -> dict:
+     }
+ 
+ 
++def _layout_operand_dtype(operation: Any) -> Optional[str]:
++    """Return the single common tensor dtype of one plan's operands, or None."""
++
++    dtypes = []
++    for ref in tuple(operation.inputs) + tuple(operation.outputs):
++        if ref.type.kind not in _LAYOUT_TENSOR_KINDS:
++            return None
++        dtypes.append(canonical_dtype(ref.type.dtype))
++    if not dtypes or any(dtype != dtypes[0] for dtype in dtypes):
++        return None
++    return dtypes[0]
++
++
++def layout_native_kernel(operation: str, dtype: str) -> Optional[str]:
++    """Return the native ELF kernel symbol for a layout-plane operation or None.
++
++    This is the single shared name mapping used by both the artifact metadata
++    and the runtime dispatch, so a declared kernel is the executed kernel.
++    """
++
++    suffix = LAYOUT_NATIVE_KERNEL_SUFFIX.get(canonical_dtype(dtype))
++    if suffix is None:
++        return None
++    if operation in LAYOUT_NATIVE_OPERATIONS:
++        return "layout_{}".format(suffix)
++    if operation in LAYOUT_INDEXING_OPERATIONS:
++        return "{}_{}".format(operation, suffix)
++    return None
++
++
++def layout_native_contract(operation: Any, plan: Any) -> Optional[dict]:
++    """Describe the native layout/split/concat kernel for one operation, or None.
++
++    ``None`` means the operation is not covered by this plane; callers that
++    still need an explicit boundary record use
++    :func:`layout_native_fallback_reason`.
++    """
++
++    if operation is None or plan is None:
++        return None
++    name = canonical_operation_name(operation.name)
++    if name != plan.operation:
++        return None
++    if name in LAYOUT_NATIVE_OPERATIONS:
++        layout = plan.layout_plan
++        if layout is None or layout.operation != name:
++            return None
++        dtype = _layout_operand_dtype(operation)
++        kernel = layout_native_kernel(name, dtype) if dtype is not None else None
++        if kernel is None:
++            return None
++        return {
++            "mode": LAYOUT_NATIVE_MODE,
++            "kernel": kernel,
++            "dtype": dtype,
++            "kind": layout.kind,
++            "descriptor_digest": layout.descriptor_digest,
++        }
++    if name == "split":
++        split = plan.split_plan
++        if split is None or len(operation.inputs) != 1:
++            return None
++        if len(operation.outputs) != len(split.sizes):
++            return None
++        dtype = _layout_operand_dtype(operation)
++        kernel = layout_native_kernel(name, dtype) if dtype is not None else None
++        if kernel is None:
++            return None
++        return {
++            "mode": LAYOUT_SPLIT_MODE,
++            "kernel": kernel,
++            "dtype": dtype,
++            "kind": "split",
++            "output_count": len(split.sizes),
++            "descriptor_digest": split.descriptor_digest,
++        }
++    if name == "concat":
++        concat = plan.concat_plan
++        if concat is None or len(operation.inputs) != len(concat.input_shapes):
++            return None
++        dtype = _layout_operand_dtype(operation)
++        kernel = layout_native_kernel(name, dtype) if dtype is not None else None
++        if kernel is None:
++            return None
++        return {
++            "mode": LAYOUT_CONCAT_MODE,
++            "kernel": kernel,
++            "dtype": dtype,
++            "kind": "concat",
++            "input_count": len(concat.input_shapes),
++            "descriptor_digest": concat.descriptor_digest,
++        }
++    return None
++
++
++def layout_native_fallback_reason(operation: Any, plan: Any) -> Optional[str]:
++    """Return why a layout/split/concat operation is not native, or None."""
++
++    if operation is None or plan is None:
++        return None
++    name = canonical_operation_name(operation.name)
++    if name != plan.operation:
++        return None
++    if name not in LAYOUT_NATIVE_OPERATIONS and name not in LAYOUT_INDEXING_OPERATIONS:
++        return None
++    if layout_native_contract(operation, plan) is not None:
++        return None
++    if name in LAYOUT_NATIVE_OPERATIONS:
++        layout = plan.layout_plan
++        if layout is None or layout.operation != name:
++            return "layout descriptor is missing or does not match the operation"
++    elif name == "split" and plan.split_plan is None:
++        return "split descriptor is missing"
++    elif name == "concat" and plan.concat_plan is None:
++        return "concat descriptor is missing"
++    dtype = _layout_operand_dtype(operation)
++    if dtype is None:
++        return "operand dtypes are missing, non-tensor, or inconsistent"
++    if dtype not in LAYOUT_NATIVE_DTYPES:
++        return "dtype {} is not in the native SVE256 layout dtype set (bf16/float32/int8)".format(dtype)
++    return "operation is not covered by the native SVE256 layout plane"
++
++
++def _layout_execution_metadata(target_ir: Sve256Program) -> tuple:
++    """Return (native entries, fallback entries) for the layout plane."""
++
++    function = next(
++        function for function in target_ir.program.functions
++        if function.name == target_ir.entrypoint
++    )
++    core_operations = list(function.body.operations)
++    native_entries = []
++    fallback_entries = []
++    for plan in target_ir.plans:
++        operation = (
++            core_operations[plan.operation_index]
++            if 0 <= plan.operation_index < len(core_operations)
++            else None
++        )
++        contract = layout_native_contract(operation, plan)
++        if contract is not None:
++            entry = {
++                "operation_index": plan.operation_index,
++                "operation": plan.operation,
++                "mode": contract["mode"],
++                "kernel": contract["kernel"],
++                "dtype": contract["dtype"],
++                "kind": contract["kind"],
++                "descriptor_digest": contract["descriptor_digest"],
++            }
++            native_entries.append(entry)
++            continue
++        reason = layout_native_fallback_reason(operation, plan)
++        if reason is not None:
++            fallback_entries.append(
++                {
++                    "operation_index": plan.operation_index,
++                    "operation": plan.operation,
++                    "reason": reason,
++                }
++            )
++    return native_entries, fallback_entries
++
++
+ def _w8a8_execution_metadata(target_ir: Sve256Program) -> tuple:
+     """Return (names, entries) for the native W8A8 plane."""
+ 
+@@ -3291,6 +3687,7 @@ class Sve256Compiler:
+         program_digest = hashlib.sha256(program_json.encode("utf-8")).hexdigest()
+         plan_data = _plain_mapping(target_ir.vector_program.to_dict())
+         w8a8_names, w8a8_entries = _w8a8_execution_metadata(target_ir)
++        layout_native_entries, layout_native_fallbacks = _layout_execution_metadata(target_ir)
+         metadata = {
+             "backend": SVE256_BACKEND,
+             "artifact_payload_version": ARTIFACT_PAYLOAD_VERSION,
+@@ -3390,10 +3787,15 @@ class Sve256Compiler:
+                 for plan in target_ir.plans
+                 if plan.layout_plan is not None
+             ],
+-            "layout_descriptor_wire": "v3:pxld-v2+fnv1a64",
+-            "layout_scalar_lane_fallback": ["bf16_reorder"],
+-            "indexing_descriptor_wire": "v4:pxsp-pxct-pxix+fnv1a64",
++            "layout_descriptor_wire": "v4:pxld-v2+fnv1a64",
++            "layout_scalar_lane_fallback": ["bf16_reorder", "int8_reorder"],
++            "indexing_descriptor_wire": "v5:pxsp-pxct-pxix+fnv1a64",
+             "indexing_scalar_lane_fallback": ["bf16_reorder"],
++            "layout_native_kernel_version": LAYOUT_NATIVE_KERNEL_VERSION,
++            "layout_native_dtypes": list(LAYOUT_NATIVE_DTYPES),
++            "layout_native_int8_lane": "native_int8_layout_lane:transpose,slice,split,concat",
++            "layout_native_operations": layout_native_entries,
++            "layout_native_fallbacks": layout_native_fallbacks,
+             "indexing_operations": [
+                 {
+                     "operation": plan.operation,
+diff --git a/python/pypto/lowering/cpu/aarch64/sve/lowering.py b/python/pypto/lowering/cpu/aarch64/sve/lowering.py
+index 134283fe6..63c3ab346 100644
+--- a/python/pypto/lowering/cpu/aarch64/sve/lowering.py
++++ b/python/pypto/lowering/cpu/aarch64/sve/lowering.py
+@@ -38,10 +38,17 @@ SVE256_BACKEND = "cpu.aarch64.sve256"
+ # protocol to v6 for the new operations, so v7 artifacts and the v5 runner
+ # wire must fail closed rather than be reinterpreted under the float-only
+ # operation set.
+-SVE256_LOWERING_VERSION = 8
++# Version 9 (W8C Q10) admits int8 layout/indexing plans (reshape/view/
++# contiguous/transpose/slice/split/concat) on the native v4/v5 descriptor
++# wire, so v8 artifacts must fail closed rather than be interpreted as if the
++# int8 layout plane did not exist.
++SVE256_LOWERING_VERSION = 9
+ SVE256_LANE_COUNT = 8
+ SVE256_TAIL_POLICY = TailPolicy.MASKED
+ SVE256_REQUIRED_FEATURES = frozenset(("sve", "vl256"))
++SVE256_LAYOUT_OPERATIONS = frozenset(
++    ("reshape", "view", "contiguous", "transpose", "slice", "split", "concat")
++)
+ W8A8_SVE256_OPERATIONS = frozenset(
+     (
+         W8A8_QMATMUL_OPCODE,
+@@ -299,17 +306,20 @@ class Sve256Program:
+                     raise Sve256UnsupportedError(error)
+                 continue
+             allowed_plan_dtype = plan_dtype in ("float32", "bf16") or (
++                plan_dtype == "int8" and plan.operation in SVE256_LAYOUT_OPERATIONS
++            ) or (
+                 plan.operation == "iota" and plan_dtype in ("int32", "int64")
+             ) or (plan.operation == "compare" and plan_dtype == "bool")
+             if not allowed_plan_dtype:
+                 raise Sve256UnsupportedError(
+-                    "SVE256 supports float32/bf16 plans plus iota int32/int64 and compare bool, got {!r}".format(
+-                        plan.dtype
+-                    )
++                    "SVE256 supports float32/bf16 plans, int8 layout/indexing plans, "
++                    "iota int32/int64 and compare bool, got {!r}".format(plan.dtype)
+                 )
+             for input_index, input_ref in enumerate(operation.inputs):
+                 input_dtype = canonical_dtype(input_ref.type.dtype)
+                 if input_dtype not in ("float32", "bf16") and not (
++                    input_dtype == "int8" and plan.operation in SVE256_LAYOUT_OPERATIONS
++                ) and not (
+                     plan.operation == "where" and input_index == 0 and input_dtype == "bool"
+                 ) and not (
+                     plan.operation in ("gather", "embedding") and input_index == 1
+diff --git a/python/tests/ut/pypto_x/qwen35_gdr_t128_920b_driver.py b/python/tests/ut/pypto_x/qwen35_gdr_t128_920b_driver.py
+index 3de17648c..2980dad67 100644
+--- a/python/tests/ut/pypto_x/qwen35_gdr_t128_920b_driver.py
++++ b/python/tests/ut/pypto_x/qwen35_gdr_t128_920b_driver.py
+@@ -172,7 +172,9 @@ def guarded_self_test(artifact):
+ 
+ def run_matmul(artifact, dtype, left, right, m, k, n, timeout=120):
+     count_value = m * n
+-    header = REQUEST.pack(MAGIC, 3, MATMUL, DTYPES[dtype], 0, 0, count_value, m, k, n)
++    # Wire version 4 is the current native-wire version (Q10 bumped it from 3);
++    # the ELF admits matmul on the legacy/current wire versions only.
++    header = REQUEST.pack(MAGIC, 4, MATMUL, DTYPES[dtype], 0, 0, count_value, m, k, n)
+     completed = subprocess.run(
+         [artifact],
+         input=header + pack_values(dtype, left) + pack_values(dtype, right),
+@@ -188,7 +190,7 @@ def run_matmul(artifact, dtype, left, right, m, k, n, timeout=120):
+     magic, version, status, response_dtype, response_count = RESPONSE.unpack(completed.stdout[: RESPONSE.size])
+     if (magic, version, status, response_dtype, response_count) != (
+         MAGIC,
+-        3,
++        4,
+         0,
+         DTYPES[dtype],
+         count_value,
+diff --git a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+index db1b76069..0383cea0b 100644
+--- a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
++++ b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+@@ -1057,6 +1057,14 @@ SVE256_SCALAR_CONVERSION_LANE = frozenset(("cast",))
+ #: bf16 element load is a scalar lane loop (see ``ptx_layout_bf16`` /
+ #: ``ptx_index_bf16`` in compiler/targets/cpu_sve256.py).
+ SVE256_BF16_REORDER_LANE = frozenset(("transpose", "slice", "gather", "embedding"))
++#: artifact metadata ``layout_scalar_lane_fallback`` (``int8_reorder``): the
++#: descriptor is still evaluated natively, but the int8 element lane is a
++#: scalar byte loop (SVE1 has no u8 indexed gather; see ``ptx_layout_i8`` /
++#: ``ptx_split_i8`` / ``ptx_concat_i8`` in compiler/targets/cpu_sve256.py).
++#: reshape/view/contiguous use the native SVE byte copy kernel.
++SVE256_INT8_REORDER_LANE = frozenset(
++    ("reshape", "view", "contiguous", "transpose", "slice", "split", "concat")
++)
+ #: Python host group loop around per-group native runner calls
+ #: (``Sve256Runtime._execute_reduction``).
+ SVE256_HOST_GROUP_LOOP = frozenset(("reduce_sum", "reduce_max", "reduce_mean"))
+@@ -1135,12 +1143,26 @@ def sve256_execution_decision(name: str, plan: Any) -> Mapping[str, Any]:
+             "B2 control runner: descriptor wire native, ELF descriptor loop is scalar; host_preexpanded_operations=[]",
+         )
+     if dtype not in ("float32", "bf16"):
+-        # Defensive: the SVE256 runner wire only carries float32/bf16 payloads
+-        # (the W8A8 plane above is the only integer exception), so an int8
+-        # layout op is not executable by this runtime even if it lowered.
++        if dtype == "int8" and name in SVE256_INT8_REORDER_LANE:
++            if name in ("reshape", "view", "contiguous"):
++                return decision(
++                    "native_sve256_vector", "native",
++                    "artifact metadata layout_native_dtypes includes int8; ptx_layout_i8 raw-byte SVE copy",
++                )
++            return decision(
++                "native_sve256_scalar_lane", "native",
++                "artifact metadata layout_scalar_lane_fallback=int8_reorder; "
++                "ptx_layout_i8 / ptx_split_i8 / ptx_concat_i8 raw-byte lanes",
++            )
++        # Defensive: the SVE256 runner wire carries float32/bf16 plus the
++        # int8 layout/split/concat plane; other integer operations (the W8A8
++        # plane above) are the only other executable exception, so an
++        # uncovered int8 op is not executable by this runtime even if it
++        # lowered.
+         return decision(
+             "unsupported_by_sve256_runtime", "unsupported",
+-            "Sve256Runtime._run_runner accepts float32/bf16 only; no int8 layout wire",
++            "Sve256Runtime layout/indexing runner accepts float32/bf16/int8 for "
++            "layout/split/concat; no native kernel for this operation",
+         )
+     if name in SVE256_SCALAR_MATH_LANE:
+         return decision(
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256.py b/python/tests/ut/pypto_x/test_cpu_sve256.py
+index ad9880947..19ecd8630 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256.py
+@@ -242,17 +242,17 @@ def test_lowering_uses_eight_lanes_masked_tail_and_omits_sve2():
+         lower_sve256(_elementwise(), _target("sve", "neon"))
+ 
+ 
+-def test_sve_v3_to_v7_plan_and_artifact_are_explicitly_incompatible_after_c5_bump(tmp_path):
++def test_sve_v3_to_v8_plan_and_artifact_are_explicitly_incompatible_after_q10_bump(tmp_path):
+     program = _elementwise(shape=(9,))
+     compiler, target_ir, artifact = _compile(program, tmp_path)
+-    assert target_ir.lowering_version == 8
+-    assert artifact.metadata["lowering_version"] == 8
++    assert target_ir.lowering_version == 9
++    assert artifact.metadata["lowering_version"] == 9
+     assert target_ir.plans[0].iteration.compact is True
+-    for old_version in (3, 4, 5, 6, 7):
++    for old_version in (3, 4, 5, 6, 7, 8):
+         with pytest.raises(Sve256ValidationError, match="unsupported SVE256 lowering version"):
+             Sve256Program(target_ir.vector_program, lowering_version=old_version)
+ 
+-    for old_version in (3, 4, 5, 6, 7):
++    for old_version in (3, 4, 5, 6, 7, 8):
+         old_metadata = dict(artifact.metadata)
+         old_metadata["lowering_version"] = old_version
+         old_artifact = Artifact(
+@@ -295,7 +295,7 @@ def test_sve_v4_compact_iteration_invariant_covers_nested_domains():
+     )
+     for program in programs:
+         valid = lower_sve256(program, _target("sve", "sve2"))
+-        Sve256Program(valid.vector_program, lowering_version=8).validate()
++        Sve256Program(valid.vector_program, lowering_version=9).validate()
+ 
+         legacy = lower_cpu_vector(
+             program,
+@@ -306,7 +306,7 @@ def test_sve_v4_compact_iteration_invariant_covers_nested_domains():
+             specialization={},
+         )
+         with pytest.raises(Sve256ValidationError, match="requires compact iteration"):
+-            Sve256Program(legacy, lowering_version=8)
++            Sve256Program(legacy, lowering_version=9)
+ 
+     for program, nested_name in (
+         (_reduction("float32", (2, 3), (2,), "reduce_sum", {"axis": 1}), "reduction.output_iteration"),
+@@ -333,7 +333,7 @@ def test_sve_v4_compact_iteration_invariant_covers_nested_domains():
+             ),
+         )
+         with pytest.raises(Sve256ValidationError, match=nested_name):
+-            Sve256Program(legacy, lowering_version=8)
++            Sve256Program(legacy, lowering_version=9)
+ 
+ 
+ def test_sve_target_is_fixed_little_endian_linux_protocol():
+@@ -1516,7 +1516,7 @@ def test_sve_b2_integrated_native_control_pipeline_and_metadata(tmp_path, monkey
+     assert artifact.metadata["position_control_fallback"] == "native"
+     assert artifact.metadata["control_descriptor_wire"] == "v5:pxio-pxcp-pxbd-pxwh+fnv1a64"
+     assert tuple(artifact.metadata["host_preexpanded_operations"]) == ()
+-    assert artifact.metadata["runner_protocol"].endswith(".v6")
++    assert artifact.metadata["runner_protocol"].endswith(".v7")
+     native_bytes = Path(artifact.path).read_bytes()
+     assert b"native_iota_compare_broadcast_where" in native_bytes
+ 
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py b/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py
+index 999eb5b5b..b8a3d050c 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py
+@@ -231,11 +231,11 @@ def test_sve256_indexing_rejects_bad_indices_and_wire_versions(tmp_path):
+     assert result.returncode != 0 and result.returncode != -11
+     assert len(result.stdout) >= 24
+     magic, version, status, _dtype, _count = struct.unpack("<4IQ", result.stdout[:24])
+-    assert magic == 0x56535850 and version == 3 and status != 0
++    assert magic == 0x56535850 and version == 4 and status != 0
+ 
+ 
+ @pytest.mark.parametrize("index_dtype", ("int32", "int64"))
+-def test_sve256_native_v4_index_wire_rejects_negative_oob_and_stale_hash(index_dtype, tmp_path):
++def test_sve256_native_v5_index_wire_rejects_negative_oob_and_stale_hash(index_dtype, tmp_path):
+     qemu = shutil.which("qemu-aarch64")
+     if qemu is None:
+         pytest.skip("qemu-aarch64 is unavailable")
+@@ -251,7 +251,7 @@ def test_sve256_native_v4_index_wire_rejects_negative_oob_and_stale_hash(index_d
+     def invoke(index_values, checksum=None):
+         index_bytes = struct.pack(index_format, *index_values)
+         header = struct.pack(
+-            "<6I4Q", 0x56535850, 4, 25, 0, index_code, len(descriptor),
++            "<6I4Q", 0x56535850, 5, 25, 0, index_code, len(descriptor),
+             16, 24, 2, _layout_wire_hash(descriptor) if checksum is None else checksum,
+         )
+         return subprocess.run(
+@@ -267,13 +267,13 @@ def test_sve256_native_v4_index_wire_rejects_negative_oob_and_stale_hash(index_d
+         assert result.returncode != 0 and result.returncode != -11
+         assert len(result.stdout) >= 24
+         magic, version, status, _dtype, _count = struct.unpack("<4IQ", result.stdout[:24])
+-        assert magic == 0x56535850 and version == 4 and status != 0
++        assert magic == 0x56535850 and version == 5 and status != 0
+ 
+     stale = invoke((0, 1), checksum=(_layout_wire_hash(descriptor) ^ 1))
+     assert stale.returncode != 0 and stale.returncode != -11
+     assert len(stale.stdout) >= 24
+     magic, version, status, _dtype, _count = struct.unpack("<4IQ", stale.stdout[:24])
+-    assert magic == 0x56535850 and version == 4 and status != 0
++    assert magic == 0x56535850 and version == 5 and status != 0
+ 
+ 
+ def test_sve256_indexing_metadata_is_rank_and_output_count_bounded(tmp_path):
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256_int8_layout.py b/python/tests/ut/pypto_x/test_cpu_sve256_int8_layout.py
+new file mode 100644
+index 000000000..7acc9205d
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cpu_sve256_int8_layout.py
+@@ -0,0 +1,637 @@
++"""W8C Q10: native SVE256 int8 layout / split / concat execution plane.
++
++Every native execution is compared *bitwise* (full output buffer sha256) against
++the same program on the CPU scalar host reference, using raw ctypes buffers so
++NaN payloads are compared too.  The declaration/execution invariant is checked
++through artifact metadata plus a wire recorder: the mode and kernel a program
++declares are derived from the same shared predicate the runtime dispatches
++with, and int8 wire requests carry the v4/v5 dtype code the kernel expects.
++
++QEMU mode is the default local leg (``PYPTO_X_SVE_QEMU_CPU``); the same file
++runs unchanged with ``PYPTO_X_SVE_TEST_MODE=native`` on an AArch64 host.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import functools
++import hashlib
++import os
++import struct
++
++import numpy as np
++import pytest
++
++from pypto.abi import LaunchRequest, TensorDesc
++from pypto.backends.cpu import CpuScalarRuntime
++from pypto.backends.cpu.aarch64 import CpuSve256ArtifactError, CpuSve256ExecutionError, Sve256Runtime
++from pypto.backends.cpu.aarch64.sve256 import (
++    _INDEXING_WIRE_VERSION,
++    _LAYOUT_WIRE_VERSION,
++    _layout_descriptor_bytes,
++)
++from pypto.compiler import Artifact, CompileOptions
++from pypto.compiler.targets.cpu import CpuScalarCompiler
++from pypto.compiler.targets.cpu_sve256 import (
++    ARTIFACT_PAYLOAD_VERSION,
++    LAYOUT_CONCAT_MODE,
++    LAYOUT_NATIVE_DTYPES,
++    LAYOUT_NATIVE_KERNEL_VERSION,
++    LAYOUT_NATIVE_MODE,
++    LAYOUT_SPLIT_MODE,
++    RUNNER_PROTOCOL,
++    Sve256Compiler,
++    layout_native_contract,
++    layout_native_fallback_reason,
++    layout_native_kernel,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu import element_count
++from pypto.lowering.cpu.aarch64.sve import Sve256UnsupportedError
++from pypto.target import TargetSpec
++
++
++SVE256_TARGET = TargetSpec(
++    "cpu", "aarch64-linux-gnu", features=("sve", "sve2"), attributes={"vl_bytes": 32}
++)
++_EXECUTION_MODE = os.environ.get("PYPTO_X_SVE_TEST_MODE", "qemu").strip().lower()
++if _EXECUTION_MODE not in ("native", "qemu"):
++    raise RuntimeError("PYPTO_X_SVE_TEST_MODE must be 'native' or 'qemu'")
++_CTYPES = {"float32": ctypes.c_float, "bf16": ctypes.c_uint16, "int8": ctypes.c_int8}
++_F32_SPECIAL = (
++    0x7F800001,  # signaling NaN, positive payload 1
++    0xFF800001,  # signaling NaN, negative payload 1
++    0x7F812345,
++    0xFF812345,
++    0x7FC00001,  # quiet NaN with payload
++    0xFFC12345,
++    0x7F800000,  # +inf
++    0xFF800000,  # -inf
++    0x00000001,  # subnormal
++    0x80000001,
++    0x7F7FFFFF,  # max finite
++    0x3F800000,
++    0xBF800000,
++    0x41200000,
++    0x00000000,
++)
++_BF16_SPECIAL = (
++    0x7F81,  # signaling NaN
++    0xFF81,
++    0x7FA1,
++    0xFFA1,
++    0x7FC1,  # quiet NaN
++    0xFFC1,
++    0x7F80,  # +inf
++    0xFF80,
++    0x0001,  # subnormal
++    0x8001,
++    0x7F7F,
++    0x3F80,
++    0xBF80,
++    0x4120,
++    0x0000,
++)
++
++
++@functools.lru_cache(maxsize=None)
++def _runtime():
++    runtime = Sve256Runtime(execution_mode=_EXECUTION_MODE)
++    if not runtime.is_available():
++        pytest.skip("SVE256 unavailable: {}".format(runtime.availability().to_dict()))
++    return runtime
++
++
++def _raw_array(dtype, bits):
++    array = (_CTYPES[dtype] * len(bits))()
++    if dtype == "float32":
++        for index, value in enumerate(bits):
++            ctypes.memmove(
++                ctypes.addressof(array) + 4 * index, struct.pack("<I", int(value) & 0xFFFFFFFF), 4
++            )
++    elif dtype == "bf16":
++        for index, value in enumerate(bits):
++            ctypes.memmove(
++                ctypes.addressof(array) + 2 * index, struct.pack("<H", int(value) & 0xFFFF), 2
++            )
++    else:
++        for index, value in enumerate(bits):
++            ctypes.memmove(
++                ctypes.addressof(array) + index, struct.pack("<b", int(value)), 1
++            )
++    return array
++
++
++def _buffer_sha256(array):
++    return hashlib.sha256(
++        ctypes.string_at(ctypes.addressof(array), ctypes.sizeof(array))
++    ).hexdigest()
++
++
++def _descriptor(dtype, shape, array, readonly=False):
++    return TensorDesc(dtype, shape, handle=array, readonly=readonly)
++
++
++def _launch(runtime, artifact, inputs, outputs):
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[_descriptor(dtype, shape, array, True) for dtype, shape, array in inputs],
++            outputs=[_descriptor(dtype, shape, array) for dtype, shape, array in outputs],
++        )
++    )
++
++
++def _compile_sve(program, tmp_path, name):
++    compiler = Sve256Compiler()
++    target_ir = compiler.lower(program, SVE256_TARGET)
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format="pypto-x.cpu.sve256",
++            extra={"build_dir": str(tmp_path / name)},
++        ),
++    )
++    return target_ir, artifact
++
++
++def _compile_reference(program):
++    compiler = CpuScalarCompiler()
++    return compiler.compile(compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu")))
++
++
++def _assert_native_matches_reference(program, artifact, inputs, output_shapes, dtypes, tmp_path):
++    native = [_raw_array(dtype, [0] * element_count(shape)) for dtype, shape in zip(dtypes, output_shapes)]
++    reference = [
++        _raw_array(dtype, [0] * element_count(shape)) for dtype, shape in zip(dtypes, output_shapes)
++    ]
++    _launch(
++        _runtime(),
++        artifact,
++        inputs,
++        [(dtype, shape, array) for dtype, shape, array in zip(dtypes, output_shapes, native)],
++    )
++    _launch(
++        CpuScalarRuntime(),
++        _compile_reference(program),
++        inputs,
++        [(dtype, shape, array) for dtype, shape, array in zip(dtypes, output_shapes, reference)],
++    )
++    for left, right in zip(native, reference):
++        assert _buffer_sha256(left) == _buffer_sha256(right)
++
++
++def _pattern_bits(dtype, count, seed=1):
++    if dtype == "float32":
++        special = _F32_SPECIAL
++        return [
++            special[index] if index < len(special)
++            else ((seed * 2654435761 + index * 2246822519) & 0xFFFFFFFF)
++            for index in range(count)
++        ]
++    if dtype == "bf16":
++        special = _BF16_SPECIAL
++        return [
++            special[index] if index < len(special)
++            else ((seed * 40503 + index * 16411) & 0xFFFF)
++            for index in range(count)
++        ]
++    return [((seed * 37 + index * 91) % 255) - 127 for index in range(count)]
++
++
++# --------------------------------------------------------------------------
++# layout
++# --------------------------------------------------------------------------
++
++
++def _layout_program(name, input_shape, output_shape, attributes, dtype):
++    source = ValueRef("source", CoreType.tensor(dtype, input_shape))
++    output = ValueRef("output", CoreType.tensor(dtype, output_shape))
++    operation = Operation(name, (source,), (output,), dict(attributes))
++    return CoreProgram(
++        functions=(CoreFunction(name, (source,), (output,), Region((operation,))),)
++    )
++
++
++def _layout_cases():
++    """One entry per independent native-layout case: dtype/name/shapes/attrs."""
++
++    cases = []
++    for dtype in ("float32", "bf16", "int8"):
++        cases.append((dtype, "reshape", (3, 5), (5, 3), {"shape": [5, 3]}))
++        cases.append((dtype, "view", (2, 3, 4), (4, 6), {"shape": [4, 6]}))
++        cases.append((dtype, "contiguous", (2, 3), (2, 3), {}))
++        # Empty axes and odd (non 8/16-multiple) sizes.
++        cases.append((dtype, "reshape", (2, 0, 3), (0, 6), {"shape": [0, 6]}))
++        cases.append((dtype, "reshape", (7,), (7,), {"shape": [7]}))
++        # A batch prefix larger than one lane.
++        cases.append((dtype, "contiguous", (3, 5, 7), (3, 5, 7), {}))
++        # Rank-2 / rank-3 / rank-4 transposes with non-trivial permutations.
++        cases.append((dtype, "transpose", (5, 7), (7, 5), {"permutation": [1, 0]}))
++        cases.append((dtype, "transpose", (2, 3, 5), (5, 2, 3), {"permutation": [2, 0, 1]}))
++        cases.append((dtype, "transpose", (2, 3, 5), (3, 2, 5), {"permutation": [1, 0, 2]}))
++        cases.append((dtype, "transpose", (2, 3, 4, 5), (4, 5, 2, 3), {"permutation": [2, 3, 0, 1]}))
++        cases.append((dtype, "transpose", (1, 3, 2, 5), (5, 2, 3, 1), {"permutation": [3, 2, 1, 0]}))
++        # Unit and non-unit step slices, negative bounds, an empty slice.
++        cases.append((dtype, "slice", (4, 7), (2, 7), {"starts": [1, 0], "stops": [4, 7], "steps": [2, 1]}))
++        cases.append((dtype, "slice", (5, 7), (3, 2), {"starts": [0, 1], "stops": [5, 7], "steps": [2, 3]}))
++        cases.append(
++            (
++                dtype,
++                "slice",
++                (2, 4, 6),
++                (2, 2, 3),
++                {"starts": [0, 1, 0], "stops": [2, 4, 6], "steps": [1, 2, 2], "axes": [0, 1, 2]},
++            )
++        )
++        cases.append((dtype, "slice", (2, 5), (2, 2), {"starts": [-4], "stops": [-1], "axes": [-1], "steps": [2]}))
++        cases.append((dtype, "slice", (3, 5), (0, 5), {"starts": [2], "stops": [2], "steps": [1], "axes": [0]}))
++    return cases
++
++
++def test_layout_native_metadata_declares_the_executed_kernel(tmp_path):
++    program = _layout_program("reshape", (2, 6), (3, 4), {"shape": [3, 4]}, "float32")
++    target_ir, artifact = _compile_sve(program, tmp_path, "declared")
++    metadata = artifact.metadata
++    assert metadata["layout_native_kernel_version"] == LAYOUT_NATIVE_KERNEL_VERSION == 1
++    assert list(metadata["layout_native_dtypes"]) == list(LAYOUT_NATIVE_DTYPES) == [
++        "float32", "bf16", "int8"
++    ]
++    assert metadata["layout_descriptor_wire"] == "v4:pxld-v2+fnv1a64"
++    assert metadata["indexing_descriptor_wire"] == "v5:pxsp-pxct-pxix+fnv1a64"
++    assert _LAYOUT_WIRE_VERSION == 4 and _INDEXING_WIRE_VERSION == 5
++    assert metadata["artifact_payload_version"] == ARTIFACT_PAYLOAD_VERSION == 2
++    assert metadata["runner_protocol"] == RUNNER_PROTOCOL == "pypto-x.cpu.sve256.runner.v7"
++    assert list(metadata["layout_native_fallbacks"]) == []
++    entry = dict(metadata["layout_native_operations"][0])
++    assert entry["mode"] == LAYOUT_NATIVE_MODE
++    assert entry["kernel"] == "layout_f32"
++    assert entry["kind"] == "logical_layout_copy"
++    assert entry["dtype"] == "float32"
++    contract = layout_native_contract(
++        program.functions[0].body.operations[0], target_ir.plans[0]
++    )
++    assert contract is not None
++    assert contract["mode"] == entry["mode"]
++    assert contract["kernel"] == entry["kernel"]
++    assert contract["dtype"] == entry["dtype"]
++    assert contract["descriptor_digest"] == entry["descriptor_digest"]
++    assert layout_native_fallback_reason(
++        program.functions[0].body.operations[0], target_ir.plans[0]
++    ) is None
++
++
++@pytest.mark.parametrize(
++    "dtype,name,input_shape,output_shape,attributes",
++    _layout_cases(),
++    ids=lambda value: str(value) if not isinstance(value, (tuple, dict)) else "",
++)
++def test_layout_native_matches_host_reference_bitwise(
++    dtype, name, input_shape, output_shape, attributes, tmp_path
++):
++    program = _layout_program(name, input_shape, output_shape, attributes, dtype)
++    target_ir, artifact = _compile_sve(program, tmp_path, "{}-{}".format(dtype, name))
++    entry = dict(artifact.metadata["layout_native_operations"][0])
++    assert entry["mode"] == LAYOUT_NATIVE_MODE
++    assert entry["kernel"] == "layout_{}".format({"float32": "f32", "bf16": "bf16", "int8": "i8"}[dtype])
++    source = _raw_array(dtype, _pattern_bits(dtype, element_count(input_shape), seed=3))
++    _assert_native_matches_reference(
++        program, artifact, [(dtype, input_shape, source)], [output_shape], [dtype], tmp_path
++    )
++
++
++@pytest.mark.parametrize("dtype", ("float32", "bf16"))
++def test_layout_special_nan_payloads_are_bit_identical(dtype, tmp_path):
++    specials = _F32_SPECIAL if dtype == "float32" else _BF16_SPECIAL
++    bits = [specials[index % len(specials)] for index in range(30)]
++    cases = (
++        ("reshape", (30,), (5, 6), {"shape": [5, 6]}),
++        ("transpose", (2, 3, 5), (5, 3, 2), {"permutation": [2, 1, 0]}),
++        ("slice", (5, 6), (4, 3), {"starts": [1, 0], "stops": [5, 6], "steps": [1, 2]}),
++    )
++    for index, (name, input_shape, output_shape, attributes) in enumerate(cases):
++        program = _layout_program(name, input_shape, output_shape, attributes, dtype)
++        _target_ir, artifact = _compile_sve(program, tmp_path, "{}-{}".format(dtype, index))
++        source = _raw_array(dtype, bits)
++        _assert_native_matches_reference(
++            program, artifact, [(dtype, input_shape, source)], [output_shape], [dtype], tmp_path
++        )
++
++
++def test_w8a8_shaped_int8_transpose_is_native_and_correct(tmp_path):
++    """The Q5 gap shape: an int8 [6144,1024] weight transpose."""
++
++    input_shape, output_shape = (6144, 1024), (1024, 6144)
++    program = _layout_program("transpose", input_shape, output_shape, {"permutation": [-1, 0]}, "int8")
++    # Lowering admits the plan and the metadata declares the int8 kernel.
++    compiler = Sve256Compiler()
++    target_ir = compiler.lower(program, SVE256_TARGET)
++    plan = target_ir.plans[0]
++    entry = layout_native_contract(program.functions[0].body.operations[0], plan)
++    assert entry is not None
++    assert entry["mode"] == LAYOUT_NATIVE_MODE and entry["kernel"] == "layout_i8"
++    _target_ir, artifact = _compile_sve(program, tmp_path, "w8a8-shape")
++    declared = dict(artifact.metadata["layout_native_operations"][0])
++    assert declared["kernel"] == "layout_i8" and declared["dtype"] == "int8"
++    assert declared["descriptor_digest"] == entry["descriptor_digest"]
++
++    source_array = np.arange(
++        element_count(input_shape), dtype=np.int32
++    ).astype(np.int8).reshape(input_shape)
++    source = _raw_array("int8", source_array.reshape(-1).tolist())
++    output = _raw_array("int8", [0] * element_count(output_shape))
++    _launch(_runtime(), artifact, [("int8", input_shape, source)], [("int8", output_shape, output)])
++    assert _buffer_sha256(output) == hashlib.sha256(source_array.T.tobytes()).hexdigest()
++    assert ctypes.string_at(ctypes.addressof(output), ctypes.sizeof(output)) == source_array.T.tobytes()
++
++
++# --------------------------------------------------------------------------
++# split / concat
++# --------------------------------------------------------------------------
++
++
++def _split_program(input_shape, axis, sizes, dtype):
++    source = ValueRef("source", CoreType.tensor(dtype, input_shape))
++    outputs = []
++    for index, size in enumerate(sizes):
++        shape = list(input_shape)
++        shape[axis] = size
++        outputs.append(ValueRef("out{}".format(index), CoreType.tensor(dtype, tuple(shape))))
++    operation = Operation("split", (source,), tuple(outputs), {"axis": axis, "sizes": list(sizes)})
++    return CoreProgram(
++        functions=(CoreFunction("split", (source,), tuple(outputs), Region((operation,))),)
++    )
++
++
++def _split_cases():
++    cases = []
++    for dtype in ("float32", "bf16", "int8"):
++        cases.append((dtype, (6,), 0, [1, 2, 3]))
++        cases.append((dtype, (2, 5, 3), 1, [2, 3, 0]))
++        cases.append((dtype, (3, 4), 0, [1, 2]))
++        cases.append((dtype, (2, 4, 6), 2, [1, 3, 2]))
++        cases.append((dtype, (2, 7), 1, [7]))
++        cases.append((dtype, (3, 5), 0, [0, 3]))
++    return cases
++
++
++@pytest.mark.parametrize(
++    "dtype,input_shape,axis,sizes", _split_cases(), ids=lambda value: str(value)
++)
++def test_split_native_matches_host_reference_bitwise(dtype, input_shape, axis, sizes, tmp_path):
++    program = _split_program(input_shape, axis, sizes, dtype)
++    _target_ir, artifact = _compile_sve(program, tmp_path, "split-{}-{}".format(dtype, axis))
++    entries = [dict(entry) for entry in artifact.metadata["layout_native_operations"]]
++    assert len(entries) == 1
++    assert entries[0]["mode"] == LAYOUT_SPLIT_MODE
++    assert entries[0]["kind"] == "split"
++    assert entries[0]["kernel"] == "split_{}".format(
++        {"float32": "f32", "bf16": "bf16", "int8": "i8"}[dtype]
++    )
++    output_shapes = []
++    for size in sizes:
++        shape = list(input_shape)
++        shape[axis] = size
++        output_shapes.append(tuple(shape))
++    source = _raw_array(dtype, _pattern_bits(dtype, element_count(input_shape), seed=5))
++    _assert_native_matches_reference(
++        program, artifact, [(dtype, input_shape, source)], output_shapes, [dtype] * len(sizes), tmp_path
++    )
++
++
++def _concat_program(input_shapes, axis, dtype):
++    references = [
++        ValueRef("in{}".format(index), CoreType.tensor(dtype, shape))
++        for index, shape in enumerate(input_shapes)
++    ]
++    output_shape = list(input_shapes[0])
++    output_shape[axis] = sum(shape[axis] for shape in input_shapes)
++    output = ValueRef("output", CoreType.tensor(dtype, tuple(output_shape)))
++    operation = Operation("concat", tuple(references), (output,), {"axis": axis})
++    return CoreProgram(
++        functions=(
++            CoreFunction("concat", tuple(references), (output,), Region((operation,))),
++        )
++    )
++
++
++def _concat_cases():
++    cases = []
++    for dtype in ("float32", "bf16", "int8"):
++        cases.append((dtype, [(6,)], 0))
++        cases.append((dtype, [(2, 2, 3), (2, 3, 3)], 1))
++        cases.append((dtype, [(2, 4), (3, 4)], 0))
++        cases.append((dtype, [(2, 3, 2), (2, 3, 4)], 2))
++        cases.append((dtype, [(0, 4), (2, 4)], 0))
++    return cases
++
++
++@pytest.mark.parametrize("dtype,input_shapes,axis", _concat_cases(), ids=lambda value: str(value))
++def test_concat_native_matches_host_reference_bitwise(dtype, input_shapes, axis, tmp_path):
++    program = _concat_program(input_shapes, axis, dtype)
++    _target_ir, artifact = _compile_sve(program, tmp_path, "concat-{}-{}".format(dtype, axis))
++    entry = dict(artifact.metadata["layout_native_operations"][0])
++    assert entry["mode"] == LAYOUT_CONCAT_MODE
++    assert entry["kernel"] == "concat_{}".format(
++        {"float32": "f32", "bf16": "bf16", "int8": "i8"}[dtype]
++    )
++    inputs = []
++    for index, shape in enumerate(input_shapes):
++        bits = _pattern_bits(dtype, element_count(shape), seed=7 + index)
++        inputs.append((dtype, shape, _raw_array(dtype, bits)))
++    output_shape = list(input_shapes[0])
++    output_shape[axis] = sum(shape[axis] for shape in input_shapes)
++    _assert_native_matches_reference(
++        program, artifact, inputs, [tuple(output_shape)], [dtype], tmp_path
++    )
++
++
++# --------------------------------------------------------------------------
++# declaration == execution
++# --------------------------------------------------------------------------
++
++
++class _WireRecordingRuntime(Sve256Runtime):
++    """Record every runner request header, then execute normally."""
++
++    def __init__(self, **kwargs):
++        super().__init__(**kwargs)
++        self.requests = []
++
++    def _invoke_runner_raw(self, artifact, *, header, payload, expected_dtype, expected_count, wire_version):
++        magic, version, operation, dtype, reserved, reserved2, count, m, k, n = struct.unpack(
++            "<6I4Q", header
++        )
++        self.requests.append(
++            {
++                "magic": magic,
++                "wire_version": version,
++                "operation": operation,
++                "dtype": dtype,
++                "reserved": reserved,
++                "reserved2": reserved2,
++                "count": count,
++                "m": m,
++                "k": k,
++                "n": n,
++                "expected_dtype": expected_dtype,
++            }
++        )
++        return super()._invoke_runner_raw(
++            artifact,
++            header=header,
++            payload=payload,
++            expected_dtype=expected_dtype,
++            expected_count=expected_count,
++            wire_version=wire_version,
++        )
++
++
++def test_declared_layout_kernel_is_the_executed_wire_request(tmp_path):
++    program = _layout_program("transpose", (3, 5), (5, 3), {"permutation": [-1, 0]}, "int8")
++    _target_ir, artifact = _compile_sve(program, tmp_path, "declared-executed")
++    runtime = _WireRecordingRuntime(execution_mode=_EXECUTION_MODE)
++    if not runtime.is_available():
++        pytest.skip("SVE256 unavailable")
++    source = _raw_array("int8", _pattern_bits("int8", 15, seed=9))
++    output = _raw_array("int8", [0] * 15)
++    _launch(runtime, artifact, [("int8", (3, 5), source)], [("int8", (5, 3), output)])
++    assert runtime.requests[-1]["operation"] == 21  # transpose
++    assert runtime.requests[-1]["wire_version"] == _LAYOUT_WIRE_VERSION == 4
++    assert runtime.requests[-1]["dtype"] == 2  # layout-wire int8
++    assert runtime.requests[-1]["expected_dtype"] == 2
++    declared = dict(artifact.metadata["layout_native_operations"][0])
++    assert declared["kernel"] == "layout_i8"
++    assert declared["kernel"] == layout_native_kernel("transpose", "int8")
++
++    split_program = _split_program((2, 5, 3), 1, [2, 3, 0], "int8")
++    _target_ir, split_artifact = _compile_sve(split_program, tmp_path, "declared-split")
++    split_runtime = _WireRecordingRuntime(execution_mode=_EXECUTION_MODE)
++    split_input = _raw_array("int8", _pattern_bits("int8", 30, seed=11))
++    split_outputs = [
++        ("int8", (2, 2, 3), _raw_array("int8", [0] * 12)),
++        ("int8", (2, 3, 3), _raw_array("int8", [0] * 18)),
++        ("int8", (2, 0, 3), _raw_array("int8", [0] * 0)),
++    ]
++    _launch(split_runtime, split_artifact, [("int8", (2, 5, 3), split_input)], split_outputs)
++    assert {request["operation"] for request in split_runtime.requests} == {23}  # split
++    assert {request["wire_version"] for request in split_runtime.requests} == {_INDEXING_WIRE_VERSION}
++    assert {request["dtype"] for request in split_runtime.requests} == {2}
++    declared_kernels = {dict(entry)["kernel"] for entry in split_artifact.metadata["layout_native_operations"]}
++    assert declared_kernels == {layout_native_kernel("split", "int8")} == {"split_i8"}
++
++
++# --------------------------------------------------------------------------
++# fail-closed boundaries
++# --------------------------------------------------------------------------
++
++
++def _tampered(artifact, **updates):
++    metadata = dict(artifact.metadata)
++    metadata.update(updates)
++    return Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        path=artifact.path,
++        metadata=metadata,
++    )
++
++
++@pytest.mark.parametrize(
++    "updates,match",
++    (
++        ({"layout_native_dtypes": ["float32", "bf16"]}, "layout native dtype declaration"),
++        ({"layout_native_kernel_version": 2}, "layout native kernel version"),
++        ({"layout_descriptor_wire": "v3:pxld-v2+fnv1a64"}, "layout descriptor wire"),
++        ({"indexing_descriptor_wire": "v4:pxsp-pxct-pxix+fnv1a64"}, "indexing descriptor wire"),
++        ({"artifact_payload_version": 1}, "unsupported SVE256 artifact payload version"),
++        ({"lowering_version": 8}, "unsupported SVE256 lowering version"),
++        ({"runner_protocol": "pypto-x.cpu.sve256.runner.v6"}, "runner protocol is unsupported"),
++        ({"native_digest": "0" * 64}, "ELF content digest mismatch"),
++        ({"native_source_digest": "0" * 64}, "native source marker mismatch"),
++    ),
++)
++def test_artifact_metadata_tamper_fails_closed(tmp_path, updates, match):
++    program = _layout_program("transpose", (3, 5), (5, 3), {"permutation": [-1, 0]}, "int8")
++    _target_ir, artifact = _compile_sve(program, tmp_path, "tamper")
++    with pytest.raises(CpuSve256ArtifactError, match=match):
++        Sve256Runtime(execution_mode=_EXECUTION_MODE).load(_tampered(artifact, **updates))
++
++
++def test_declared_native_kernel_and_dtype_tamper_fails_closed(tmp_path):
++    program = _layout_program("transpose", (3, 5), (5, 3), {"permutation": [-1, 0]}, "int8")
++    _target_ir, artifact = _compile_sve(program, tmp_path, "kernel-tamper")
++    entries = [dict(artifact.metadata["layout_native_operations"][0])]
++    for update in ({"kernel": "layout_f32"}, {"dtype": "bf16"}, {"descriptor_digest": "f" * 64},
++                   {"mode": "host_reference"}):
++        tampered = _tampered(artifact, layout_native_operations=[dict(entries[0], **update)])
++        with pytest.raises(CpuSve256ArtifactError, match="native layout operation metadata"):
++            Sve256Runtime(execution_mode=_EXECUTION_MODE).load(tampered)
++    fallback_tamper = _tampered(
++        artifact, layout_native_fallbacks=[{"operation_index": 0, "operation": "transpose",
++                                            "reason": "forced"}]
++    )
++    with pytest.raises(CpuSve256ArtifactError, match="layout fallback metadata"):
++        Sve256Runtime(execution_mode=_EXECUTION_MODE).load(fallback_tamper)
++    layout_tamper = _tampered(
++        artifact,
++        layout_operations=[dict(artifact.metadata["layout_operations"][0], descriptor_digest="0" * 64)],
++    )
++    with pytest.raises(CpuSve256ArtifactError, match="layout operation metadata"):
++        Sve256Runtime(execution_mode=_EXECUTION_MODE).load(layout_tamper)
++
++
++def test_corrupted_int8_descriptor_is_rejected_before_memory_access(tmp_path):
++    program = _layout_program("transpose", (3, 5), (5, 3), {"permutation": [-1, 0]}, "int8")
++    target_ir, artifact = _compile_sve(program, tmp_path, "corrupt")
++    descriptor = bytearray(_layout_descriptor_bytes(target_ir.plans[0].layout_plan))
++    descriptor[-8] = 0xFF
++    runtime = _runtime()
++    with pytest.raises(CpuSve256ExecutionError, match="runner returned status"):
++        runtime._run_runner(
++            artifact, "transpose", "int8", [[1] * 15], 15, layout_descriptor=bytes(descriptor)
++        )
++
++
++def test_unsupported_dtypes_stay_fail_closed_at_lowering(tmp_path):
++    for dtype, name, input_shape, output_shape, attributes in (
++        ("int32", "transpose", (3, 5), (5, 3), {"permutation": [-1, 0]}),
++        ("int32", "reshape", (3, 5), (5, 3), {"shape": [5, 3]}),
++        ("uint8", "slice", (3, 5), (3, 2), {"starts": [0], "stops": [2], "axes": [1]}),
++    ):
++        program = _layout_program(name, input_shape, output_shape, attributes, dtype)
++        with pytest.raises(Sve256UnsupportedError):
++            Sve256Compiler().lower(program, SVE256_TARGET)
++
++
++def test_int8_gather_embedding_are_not_admitted(tmp_path):
++    source = ValueRef("source", CoreType.tensor("int8", (4, 6)))
++    indices = ValueRef("indices", CoreType.tensor("int32", (2,)))
++    output = ValueRef("output", CoreType.tensor("int8", (2, 6)))
++    operation = Operation("gather", (source, indices), (output,), {"axis": 0})
++    gather_program = CoreProgram(
++        functions=(CoreFunction("gather", (source, indices), (output,), Region((operation,))),)
++    )
++    with pytest.raises(Sve256UnsupportedError):
++        Sve256Compiler().lower(gather_program, SVE256_TARGET)
++
++    embedding_source = ValueRef("source", CoreType.tensor("int8", (4, 2)))
++    embedding_indices = ValueRef("indices", CoreType.tensor("int32", (2,)))
++    embedding_output = ValueRef("output", CoreType.tensor("int8", (2, 2)))
++    embedding_operation = Operation(
++        "embedding", (embedding_source, embedding_indices), (embedding_output,), {}
++    )
++    embedding_program = CoreProgram(
++        functions=(
++            CoreFunction(
++                "embedding",
++                (embedding_source, embedding_indices),
++                (embedding_output,),
++                Region((embedding_operation,)),
++            ),
++        )
++    )
++    with pytest.raises(Sve256UnsupportedError):
++        Sve256Compiler().lower(embedding_program, SVE256_TARGET)
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256_layout.py b/python/tests/ut/pypto_x/test_cpu_sve256_layout.py
+index a4a9434c0..9a54ffd5c 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256_layout.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256_layout.py
+@@ -95,7 +95,7 @@ def test_layout_plan_is_serializable_and_distinguishes_copy_from_reorder(tmp_pat
+     assert "index_map" not in transpose_plan.to_dict()
+     assert copy_artifact.metadata["logical_layout_copy_operations"] == ("reshape",)
+     assert transpose_artifact.metadata["native_layout_reorder_operations"] == ("transpose",)
+-    assert copy_artifact.metadata["layout_descriptor_wire"] == "v3:pxld-v2+fnv1a64"
++    assert copy_artifact.metadata["layout_descriptor_wire"] == "v4:pxld-v2+fnv1a64"
+     assert len(_layout_descriptor_bytes(copy_plan)) < 256
+     assert copy_plan.descriptor_digest == sha256_text(
+         {key: value for key, value in copy_plan.to_dict().items() if key != "descriptor_digest"}
+@@ -219,7 +219,7 @@ def test_layout_runner_rejects_bad_descriptor_and_wire_tamper_before_memory_acce
+         _program("transpose", (3, 5), (5, 3), {"permutation": [1, 0]}), tmp_path / "wire"
+     )[0].plans[0].layout_plan)
+     header = struct.pack(
+-        "<6I4Q", 0x56535850, 3, 21, 0, 0, 0, 15, 15, len(descriptor), 0
++        "<6I4Q", 0x56535850, 4, 21, 0, 0, 0, 15, 15, len(descriptor), 0
+     )
+     # Wrong descriptor checksum must produce a structured error, never an
+     # out-of-bounds access or a signal.
+@@ -231,7 +231,7 @@ def test_layout_runner_rejects_bad_descriptor_and_wire_tamper_before_memory_acce
+     assert result.returncode != 0 and result.returncode != -11
+     assert len(result.stdout) >= 24
+     magic, version, status, _dtype, _count = struct.unpack("<4IQ", result.stdout[:24])
+-    assert magic == 0x56535850 and version == 3 and status != 0
++    assert magic == 0x56535850 and version == 4 and status != 0
+ 
+ 
+ def test_layout_wire_v1_compatibility_and_v1_layout_rejection(tmp_path):
+@@ -263,11 +263,11 @@ def test_layout_wire_v1_compatibility_and_v1_layout_rejection(tmp_path):
+ 
+     legacy_v2 = invoke(2, descriptor, len(descriptor), 0)
+     _magic, version, status, _dtype, _count = struct.unpack("<4IQ", legacy_v2.stdout[:24])
+-    assert legacy_v2.returncode != 0 and version == 3 and status != 0
++    assert legacy_v2.returncode != 0 and version == 4 and status != 0
+ 
+-    truncated = invoke(3, descriptor[:-1], len(descriptor), 0)
++    truncated = invoke(4, descriptor[:-1], len(descriptor), 0)
+     _magic, version, status, _dtype, _count = struct.unpack("<4IQ", truncated.stdout[:24])
+-    assert truncated.returncode != 0 and version == 3 and status != 0
++    assert truncated.returncode != 0 and version == 4 and status != 0
+ 
+ 
+ def test_layout_descriptor_metadata_is_rank_bounded_for_qwen_sized_shapes(tmp_path):
+diff --git a/python/tests/ut/pypto_x/test_qwen35_position_control.py b/python/tests/ut/pypto_x/test_qwen35_position_control.py
+index 07d529f7a..4c58607e4 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_position_control.py
++++ b/python/tests/ut/pypto_x/test_qwen35_position_control.py
+@@ -139,9 +139,9 @@ def test_sve_qemu_position_control_differential_and_metadata(tmp_path):
+     program = build_qwen35_position_control(1, 2, past_length=3, index_dtype="int64")
+     target_ir, artifact = _compile_sve(program, tmp_path)
+     assert target_ir.vector_program.plan_version == 3
+-    assert target_ir.lowering_version == 8
++    assert target_ir.lowering_version == 9
+     assert artifact.metadata["plan_version"] == 3
+-    assert artifact.metadata["lowering_version"] == 8
++    assert artifact.metadata["lowering_version"] == 9
+     assert [plan.operation for plan in target_ir.plans] == ["iota", "iota", "iota", "compare"]
+     assert tuple(artifact.metadata["position_control_operations"]) == ("iota", "iota", "iota", "compare")
+     assert artifact.metadata["position_control_fallback"] == "native"
+diff --git a/python/tests/ut/pypto_x/test_w8a8_sve256.py b/python/tests/ut/pypto_x/test_w8a8_sve256.py
+index 7540ca1eb..456b089a0 100644
+--- a/python/tests/ut/pypto_x/test_w8a8_sve256.py
++++ b/python/tests/ut/pypto_x/test_w8a8_sve256.py
+@@ -875,8 +875,8 @@ def test_sve256_w8a8_no_cross_isa_or_neon_lowering(build_root):
+ def test_sve256_w8a8_metadata_describes_native_contract(build_root):
+     program, _ = _qmatmul_program((2, 3, 5), (2, 5, 7))
+     target_ir, artifact = _compile(program, build_root, "qm_meta")
+-    assert target_ir.lowering_version == SVE256_LOWERING_VERSION == 8
+-    assert RUNNER_PROTOCOL == "pypto-x.cpu.sve256.runner.v6"
++    assert target_ir.lowering_version == SVE256_LOWERING_VERSION == 9
++    assert RUNNER_PROTOCOL == "pypto-x.cpu.sve256.runner.v7"
+     assert artifact.metadata["runner_protocol"] == RUNNER_PROTOCOL
+     assert artifact.metadata["w8a8_runner_wire"] == W8A8_RUNNER_WIRE
+     assert artifact.metadata["w8a8_kernel_version"] == W8A8_KERNEL_VERSION
+diff --git a/tools/c8_sve256_a3/run_a3_int8_layout.sh b/tools/c8_sve256_a3/run_a3_int8_layout.sh
+new file mode 100644
+index 000000000..d623c5b33
+--- /dev/null
++++ b/tools/c8_sve256_a3/run_a3_int8_layout.sh
+@@ -0,0 +1,89 @@
++#!/usr/bin/env bash
++# W8C Q10 A3-side native window (runs ON a3-21 as l00886679, NOT in the
++# container: the host side owns cpus 320-639 per a3_cpu_grant_2026_09_11).
++#
++# Scope: run the SVE256 int8/bf16/float32 layout matrix *natively* on the A3
++# host and re-run the W8A8 gap probe, both from the synced worktree bundle.
++# This is the native leg of the QEMU+A3 dual run; it makes no L4/performance
++# claim and never touches chip7/NPU.
++#
++# Discipline: only writes under ~/pypto-x-a3/sve256-int8-layout, only taskset
++# cpus 320-639 (here 8 physical cores 320..334), no machine config changes,
++# no model weights, no residue.
++set -u
++
++ROOT="${HOME}/pypto-x-a3/sve256-int8-layout"
++PY="${HOME}/pypto-x-a3/envs/pypto-x-c8/bin/python"
++RAW="${ROOT}/raw"
++LOGS="${ROOT}/logs"
++WORK="${ROOT}/work"
++TMP="${ROOT}/tmp"
++mkdir -p "${RAW}" "${LOGS}" "${WORK}" "${TMP}"
++
++export PYTHONPATH="${ROOT}/src/python"
++export PYPTO_X_PORTABLE_ONLY=1
++export TMPDIR="${TMP}"
++export OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 MKL_NUM_THREADS=8
++export OMP_PROC_BIND=close OMP_PLACES=cores
++export PYPTO_X_SVE_TEST_MODE=native
++
++# 8 non-overlapping physical cores: core c -> cpu 320 + (c/40)*80 + (c%40)*2.
++CPUS="320,322,324,326,328,330,332,334"
++
++{
++  echo "== a3_q10_window =="
++  date -u '+started_utc=%Y-%m-%dT%H:%M:%SZ'
++  date '+started_local=%Y-%m-%dT%H:%M:%S%z'
++  echo "hostname=$(hostname) user=$(whoami) home=${HOME}"
++  echo "cpuset_self=$(awk '/Cpus_allowed_list/{print $2}' /proc/self/status)"
++  echo "nproc=$(nproc) mem_available_kib=$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
++  echo "uname=$(uname -m) kernel=$(uname -r)"
++  echo "python=$(${PY} --version 2>&1) cc=$(cc --version | head -1)"
++  echo "env_numpy=$(${PY} -c 'import numpy; print(numpy.__version__)' 2>&1)"
++  ${PY} - <<'PY'
++from pypto.lowering.cpu.aarch64.sve import probe_sve256_capabilities
++import json
++print("sve256_capability=" + json.dumps(probe_sve256_capabilities(execution_mode="native").to_dict(), sort_keys=True))
++PY
++} > "${LOGS}/env_evidence.log" 2>&1
++
++echo "[run] native layout matrix"
++STARTS=$(date +%s)
++setsid --wait timeout 10800 taskset -c "${CPUS}" "${PY}" \
++  "${ROOT}/tools/sve256_int8_layout_matrix.py" \
++  --execution-mode native \
++  --output "${RAW}/layout_matrix_native.json" \
++  --work-dir "${WORK}/layout_matrix" \
++  --w8a8-shape > "${LOGS}/layout_matrix_native.log" 2>&1
++MATRIX_STATUS=$?
++echo "[run] layout matrix exit=${MATRIX_STATUS} elapsed_s=$(( $(date +%s) - STARTS ))"
++
++echo "[run] W8A8 gap probe (lowering only, no weights)"
++STARTS=$(date +%s)
++setsid --wait timeout 1800 taskset -c "${CPUS}" "${PY}" \
++  "${ROOT}/tools/c8_sve256_w8a8_gap_probe.py" \
++  --output "${RAW}/gap_probe_a3.json" > "${LOGS}/gap_probe_a3.log" 2>&1
++PROBE_STATUS=$?
++echo "[run] gap probe exit=${PROBE_STATUS} elapsed_s=$(( $(date +%s) - STARTS ))"
++
++# --- discipline self-check --------------------------------------------------
++{
++  echo "cpuset_self=$(awk '/Cpus_allowed_list/{print $2}' /proc/self/status)"
++  echo "written_root=${ROOT}"
++  echo "matrix_exit=${MATRIX_STATUS} probe_exit=${PROBE_STATUS}"
++  echo "residue_processes=$(pgrep -u "$(whoami)" -f 'sve256_int8_layout_matrix|c8_sve256_w8a8_gap_probe' | wc -l)"
++  echo "npu_calls=none"
++  date -u '+finished_utc=%Y-%m-%dT%H:%M:%SZ'
++} > "${LOGS}/discipline_check.txt" 2>&1
++
++{
++  echo "{"
++  echo "  \"window\": \"a3_sve256_int8_layout\","
++  echo "  \"matrix_exit\": ${MATRIX_STATUS},"
++  echo "  \"gap_probe_exit\": ${PROBE_STATUS},"
++  echo "  \"a3_utc\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\""
++  echo "}"
++} > "${RAW}/matrix_status.json"
++
++echo "[done] matrix=${MATRIX_STATUS} probe=${PROBE_STATUS}"
++exit $(( MATRIX_STATUS != 0 || PROBE_STATUS != 0 ))
+diff --git a/tools/c8_sve256_a3/sync_int8_layout_to_a3.sh b/tools/c8_sve256_a3/sync_int8_layout_to_a3.sh
+new file mode 100644
+index 000000000..198c06c33
+--- /dev/null
++++ b/tools/c8_sve256_a3/sync_int8_layout_to_a3.sh
+@@ -0,0 +1,43 @@
++#!/usr/bin/env bash
++# W8C Q10: ship the int8-layout worktree bundle to A3 (a3-21) and verify it by
++# sha256 manifest.  Runs on the LOCAL machine after the worktree commit.
++set -euo pipefail
++
++WT=/home/chiro/projects/pypto/worktrees/pypto-x/sve256-int8-layout
++EV=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/sve256-int8-layout
++A3=a3-21
++A3_HOME=/home/l00886679
++A3_ROOT=pypto-x-a3/sve256-int8-layout
++BUNDLE="${EV}/a3_bundle"
++
++[[ -d "${WT}/python/pypto" ]] || { echo "missing worktree python/pypto" >&2; exit 2; }
++
++rm -rf "${BUNDLE}"
++mkdir -p "${BUNDLE}/src/python/tests/ut/pypto_x" "${BUNDLE}/tools/c8_sve256_a3"
++
++tar -C "${WT}" -cf - --exclude='__pycache__' --exclude='*.pyc' python/pypto \
++    | tar -C "${BUNDLE}/src" -xf -
++cp -f "${WT}/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py" \
++      "${BUNDLE}/src/python/tests/ut/pypto_x/"
++cp -f "${WT}/tools/sve256_int8_layout_matrix.py" \
++      "${WT}/tools/c8_sve256_w8a8_gap_probe.py" \
++      "${BUNDLE}/tools/"
++cp -f "${WT}/tools/c8_sve256_a3/run_a3_int8_layout.sh" \
++      "${BUNDLE}/tools/c8_sve256_a3/"
++
++(
++  cd "${BUNDLE}"
++  find . -type f ! -name 'MANIFEST.sha256' -print0 | sort -z | xargs -0 sha256sum > MANIFEST.sha256
++)
++BUNDLE_BYTES=$(du -sb "${BUNDLE}" | cut -f1)
++TAR="${EV}/a3_bundle.tar"
++tar -C "${EV}" -cf "${TAR}" a3_bundle
++sha256sum "${TAR}" | tee "${EV}/a3_bundle.tar.sha256"
++echo "[bundle] dir=${BUNDLE} bytes=${BUNDLE_BYTES} tar_bytes=$(stat -c %s "${TAR}")"
++
++echo "[sync] target=${A3}:${A3_HOME}/${A3_ROOT}"
++ssh -o BatchMode=yes "${A3}" "mkdir -p ${A3_HOME}/${A3_ROOT} && rm -rf ${A3_HOME}/${A3_ROOT}/src ${A3_HOME}/${A3_ROOT}/tools"
++scp -q -o BatchMode=yes "${TAR}" "${A3}:${A3_HOME}/${A3_ROOT}/a3_bundle.tar"
++ssh -o BatchMode=yes "${A3}" "cd ${A3_HOME}/${A3_ROOT} && tar -xf a3_bundle.tar && rm -rf src tools && mv a3_bundle/src . && mv a3_bundle/tools . && mv a3_bundle/MANIFEST.sha256 . && rm -rf a3_bundle && sha256sum -c MANIFEST.sha256 >/dev/null && echo '[sync] remote manifest OK'"
++ssh -o BatchMode=yes "${A3}" "du -sh ${A3_HOME}/${A3_ROOT}; date -u '+[sync] a3_utc=%Y-%m-%dT%H:%M:%SZ'"
++date -u '+[sync] local_utc=%Y-%m-%dT%H:%M:%SZ'
+diff --git a/tools/c8_sve256_w8a8_gap_probe.py b/tools/c8_sve256_w8a8_gap_probe.py
+index 7dfe65e5e..f70bc4c7f 100755
+--- a/tools/c8_sve256_w8a8_gap_probe.py
++++ b/tools/c8_sve256_w8a8_gap_probe.py
+@@ -67,6 +67,11 @@ TARGET = TargetSpec(
+ #: ``Sve256Program.validate`` (integration c2ec98f3c).
+ VALIDATOR_SOURCE = "python/pypto/lowering/cpu/aarch64/sve/lowering.py::Sve256Program.validate"
+ 
++#: Layout/indexing operation set admitted for int8 plans (W8C Q10).
++_LAYOUT_OPERATIONS = frozenset(
++    ("reshape", "view", "contiguous", "transpose", "slice", "split", "concat")
++)
++
+ _DRIVER_DECISION = None
+ 
+ 
+@@ -115,6 +120,8 @@ def _plan_violations(operation, plan) -> List[Mapping[str, Any]]:
+             violations.append({"kind": "w8a8_plan_error", "detail": error})
+         return violations
+     allowed_plan_dtype = plan_dtype in ("float32", "bf16") or (
++        plan_dtype == "int8" and plan.operation in _LAYOUT_OPERATIONS
++    ) or (
+         plan.operation == "iota" and plan_dtype in ("int32", "int64")
+     ) or (plan.operation == "compare" and plan_dtype == "bool")
+     if not allowed_plan_dtype:
+@@ -122,14 +129,16 @@ def _plan_violations(operation, plan) -> List[Mapping[str, Any]]:
+             {
+                 "kind": "output_dtype_not_allowed",
+                 "detail": (
+-                    "SVE256 supports float32/bf16 plans plus iota int32/int64 "
+-                    "and compare bool, got {!r}".format(plan.dtype)
++                    "SVE256 supports float32/bf16 plans, int8 layout/indexing "
++                    "plans, iota int32/int64 and compare bool, got {!r}".format(plan.dtype)
+                 ),
+             }
+         )
+     for input_index, input_ref in enumerate(operation.inputs):
+         input_dtype = canonical_dtype(input_ref.type.dtype)
+         if input_dtype not in ("float32", "bf16") and not (
++            input_dtype == "int8" and plan.operation in _LAYOUT_OPERATIONS
++        ) and not (
+             plan.operation == "where" and input_index == 0 and input_dtype == "bool"
+         ) and not (
+             plan.operation in ("gather", "embedding")
+@@ -235,9 +244,9 @@ def _audit_w8a8(prompt: str, steps: int, scope: str, quantize_lm_head: bool) ->
+         value["count"] for value in violations_by_op.values()
+     )
+     record["first_violation_index"] = first_violation_index
+-    if first_violation_index is not None:
+-        first_op = operations[first_violation_index]
+-        record["first_violation_operation"] = first_op.name
++    record["first_violation_operation"] = (
++        operations[first_violation_index].name if first_violation_index is not None else None
++    )
+ 
+     consumers: Dict[str, int] = collections.Counter()
+     for operation in operations:
+@@ -289,10 +298,9 @@ def _audit_w8a8(prompt: str, steps: int, scope: str, quantize_lm_head: bool) ->
+             quantized_linear_ops += 1
+     record["plan_census"] = {
+         "note": (
+-            "static census from lowering plans (executed census is impossible: "
+-            "Sve256Program.validate rejects this graph before compile/run); "
+-            "mode/boundary labels come from the same classifier the runtime "
+-            "instrumentation uses"
++            "static census from lowering plans; mode/boundary labels come from "
++            "the same classifier the runtime instrumentation uses.  When "
++            "lower_sve256 is OK this census is the predicted execution census"
+         ),
+         "by_operation": {
+             name: {
+@@ -466,10 +474,10 @@ def main() -> int:
+     # Facts a follow-up implementation task needs; values are read from the
+     # integration tree instead of being retyped into the brief.
+     from pypto.backends.cpu.aarch64.sve256 import (
+-        _DTYPE_CODES, _INDEXING_WIRE_VERSION, _LAYOUT_WIRE_VERSION,
++        _DTYPE_CODES, _INDEXING_WIRE_VERSION, _LAYOUT_DTYPE_CODES, _LAYOUT_WIRE_VERSION,
+     )
+     from pypto.compiler.targets.cpu_sve256 import (
+-        ARTIFACT_PAYLOAD_VERSION, RUNNER_PROTOCOL, W8A8_RUNNER_WIRE,
++        ARTIFACT_PAYLOAD_VERSION, LAYOUT_NATIVE_DTYPES, RUNNER_PROTOCOL, W8A8_RUNNER_WIRE,
+     )
+     from pypto.lowering.cpu.aarch64.sve.lowering import SVE256_LOWERING_VERSION
+ 
+@@ -481,9 +489,15 @@ def main() -> int:
+         "layout_wire_version": _LAYOUT_WIRE_VERSION,
+         "indexing_wire_version": _INDEXING_WIRE_VERSION,
+         "runtime_dtype_codes": dict(sorted(_DTYPE_CODES.items())),
++        "runtime_layout_dtype_codes": dict(sorted(_LAYOUT_DTYPE_CODES.items())),
++        "layout_native_dtypes": list(LAYOUT_NATIVE_DTYPES),
+         "validator_source": VALIDATOR_SOURCE,
+         "runtime_source": "python/pypto/backends/cpu/aarch64/sve256.py::Sve256Runtime._run_runner",
+-        "native_c_source": "python/pypto/compiler/targets/cpu_sve256.py (ptx_layout_f32/ptx_layout_bf16 only)",
++        "native_c_source": (
++            "python/pypto/compiler/targets/cpu_sve256.py "
++            "(ptx_layout_f32/ptx_layout_bf16/ptx_layout_i8, "
++            "ptx_split_i8/ptx_concat_i8)"
++        ),
+         "avx2_host_reference_precedent": (
+             "python/pypto/backends/cpu/x86/avx2.py::_reference_operation delegates "
+             "layout/indexing/control to python/pypto/backends/cpu/vector/runtime.py::_execute_operation "
+diff --git a/tools/sve256_int8_layout_matrix.py b/tools/sve256_int8_layout_matrix.py
+new file mode 100644
+index 000000000..1ddb64149
+--- /dev/null
++++ b/tools/sve256_int8_layout_matrix.py
+@@ -0,0 +1,371 @@
++#!/usr/bin/env python3
++"""W8C Q10 SVE256 int8 layout/split/concat native matrix (QEMU or A3-native).
++
++This tool is the dual-run companion of
++``python/tests/ut/pypto_x/test_cpu_sve256_int8_layout.py``.  It does not need
++pytest, so it can run on the A3 host with the Q1 conda environment (which only
++has numpy) as well as locally under QEMU.
++
++For every case it:
++
++1. lowers and compiles a native SVE256 artifact,
++2. launches it in the requested execution mode and records the wire requests
++   (version/dtype/operation) the runtime actually sent,
++3. runs the same program on the CPU scalar host reference,
++4. compares the full output buffer sha256 (raw bytes, NaN payloads included),
++5. checks that the artifact metadata declares exactly the kernel the shared
++   ``layout_native_contract`` predicate derives.
++
++It writes a single JSON file and never touches model weights or the NPU.
++"""
++
++from __future__ import annotations
++
++import argparse
++import ctypes
++import hashlib
++import json
++import platform
++import struct
++import sys
++import time
++from pathlib import Path
++from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
++
++import numpy as np
++
++from pypto.abi import LaunchRequest, TensorDesc
++from pypto.backends.cpu import CpuScalarRuntime
++from pypto.backends.cpu.aarch64 import Sve256Runtime
++from pypto.compiler import CompileOptions
++from pypto.compiler.targets.cpu import CpuScalarCompiler
++from pypto.compiler.targets.cpu_sve256 import (
++    ARTIFACT_PAYLOAD_VERSION,
++    LAYOUT_NATIVE_DTYPES,
++    RUNNER_PROTOCOL,
++    Sve256Compiler,
++    layout_native_contract,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu import element_count
++from pypto.lowering.cpu.aarch64.sve import SVE256_LOWERING_VERSION
++from pypto.target import TargetSpec
++
++TOOL = "sve256_int8_layout_matrix"
++
++SVE256_TARGET = TargetSpec(
++    "cpu", "aarch64-linux-gnu", features=("sve", "sve2"), attributes={"vl_bytes": 32}
++)
++_CTYPES = {"float32": ctypes.c_float, "bf16": ctypes.c_uint16, "int8": ctypes.c_int8}
++_F32_SPECIAL = (
++    0x7F800001, 0xFF800001, 0x7F812345, 0xFF812345, 0x7FC00001, 0xFFC12345,
++    0x7F800000, 0xFF800000, 0x00000001, 0x80000001, 0x7F7FFFFF, 0x3F800000,
++    0xBF800000, 0x41200000, 0x00000000,
++)
++_BF16_SPECIAL = (
++    0x7F81, 0xFF81, 0x7FA1, 0xFFA1, 0x7FC1, 0xFFC1, 0x7F80, 0xFF80,
++    0x0001, 0x8001, 0x7F7F, 0x3F80, 0xBF80, 0x4120, 0x0000,
++)
++
++
++def _raw_array(dtype: str, bits: Sequence[int]):
++    array = (_CTYPES[dtype] * len(bits))()
++    for index, value in enumerate(bits):
++        if dtype == "float32":
++            ctypes.memmove(ctypes.addressof(array) + 4 * index, struct.pack("<I", int(value) & 0xFFFFFFFF), 4)
++        elif dtype == "bf16":
++            ctypes.memmove(ctypes.addressof(array) + 2 * index, struct.pack("<H", int(value) & 0xFFFF), 2)
++        else:
++            ctypes.memmove(ctypes.addressof(array) + index, struct.pack("<b", int(value)), 1)
++    return array
++
++
++def _buffer_sha256(array) -> str:
++    return hashlib.sha256(ctypes.string_at(ctypes.addressof(array), ctypes.sizeof(array))).hexdigest()
++
++
++def _pattern_bits(dtype: str, count: int, seed: int = 1) -> List[int]:
++    if dtype == "float32":
++        return [
++            _F32_SPECIAL[index] if index < len(_F32_SPECIAL)
++            else ((seed * 2654435761 + index * 2246822519) & 0xFFFFFFFF)
++            for index in range(count)
++        ]
++    if dtype == "bf16":
++        return [
++            _BF16_SPECIAL[index] if index < len(_BF16_SPECIAL)
++            else ((seed * 40503 + index * 16411) & 0xFFFF)
++            for index in range(count)
++        ]
++    return [((seed * 37 + index * 91) % 255) - 127 for index in range(count)]
++
++
++def _descriptor(dtype, shape, array, readonly=False):
++    return TensorDesc(dtype, shape, handle=array, readonly=readonly)
++
++
++class _RecordingRuntime(Sve256Runtime):
++    def __init__(self, **kwargs):
++        super().__init__(**kwargs)
++        self.requests: List[Dict[str, int]] = []
++
++    def _invoke_runner_raw(self, artifact, *, header, payload, expected_dtype, expected_count, wire_version):
++        magic, version, operation, dtype, reserved, reserved2, count, m, k, n = struct.unpack("<6I4Q", header)
++        self.requests.append(
++            {
++                "wire_version": version, "operation": operation, "dtype": dtype,
++                "reserved": reserved, "reserved2": reserved2,
++                "count": count, "m": m, "k": k, "n": n, "expected_dtype": expected_dtype,
++            }
++        )
++        return super()._invoke_runner_raw(
++            artifact, header=header, payload=payload, expected_dtype=expected_dtype,
++            expected_count=expected_count, wire_version=wire_version,
++        )
++
++
++def _layout_program(name, input_shape, output_shape, attributes, dtype):
++    source = ValueRef("source", CoreType.tensor(dtype, input_shape))
++    output = ValueRef("output", CoreType.tensor(dtype, output_shape))
++    operation = Operation(name, (source,), (output,), dict(attributes))
++    return CoreProgram(functions=(CoreFunction(name, (source,), (output,), Region((operation,))),))
++
++
++def _split_program(input_shape, axis, sizes, dtype):
++    source = ValueRef("source", CoreType.tensor(dtype, input_shape))
++    outputs = []
++    for index, size in enumerate(sizes):
++        shape = list(input_shape)
++        shape[axis] = size
++        outputs.append(ValueRef("out{}".format(index), CoreType.tensor(dtype, tuple(shape))))
++    operation = Operation("split", (source,), tuple(outputs), {"axis": axis, "sizes": list(sizes)})
++    return CoreProgram(functions=(CoreFunction("split", (source,), tuple(outputs), Region((operation,))),))
++
++
++def _concat_program(input_shapes, axis, dtype):
++    references = [
++        ValueRef("in{}".format(index), CoreType.tensor(dtype, shape))
++        for index, shape in enumerate(input_shapes)
++    ]
++    output_shape = list(input_shapes[0])
++    output_shape[axis] = sum(shape[axis] for shape in input_shapes)
++    output = ValueRef("output", CoreType.tensor(dtype, tuple(output_shape)))
++    operation = Operation("concat", tuple(references), (output,), {"axis": axis})
++    return CoreProgram(
++        functions=(CoreFunction("concat", tuple(references), (output,), Region((operation,))),)
++    )
++
++
++def _cases() -> List[Mapping[str, Any]]:
++    cases = []
++    for dtype in ("float32", "bf16", "int8"):
++        cases.append({"name": "reshape", "dtype": dtype, "program": _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, dtype)})
++        cases.append({"name": "view", "dtype": dtype, "program": _layout_program("view", (2, 3, 4), (4, 6), {"shape": [4, 6]}, dtype)})
++        cases.append({"name": "contiguous", "dtype": dtype, "program": _layout_program("contiguous", (3, 5, 7), (3, 5, 7), {}, dtype)})
++        cases.append({"name": "reshape_empty_axis", "dtype": dtype, "program": _layout_program("reshape", (2, 0, 3), (0, 6), {"shape": [0, 6]}, dtype)})
++        cases.append({"name": "transpose_rank2", "dtype": dtype, "program": _layout_program("transpose", (5, 7), (7, 5), {"permutation": [1, 0]}, dtype)})
++        cases.append({"name": "transpose_rank3", "dtype": dtype, "program": _layout_program("transpose", (2, 3, 5), (5, 2, 3), {"permutation": [2, 0, 1]}, dtype)})
++        cases.append({"name": "transpose_rank4", "dtype": dtype, "program": _layout_program("transpose", (2, 3, 4, 5), (4, 5, 2, 3), {"permutation": [2, 3, 0, 1]}, dtype)})
++        cases.append({"name": "slice_step", "dtype": dtype, "program": _layout_program("slice", (5, 7), (3, 2), {"starts": [0, 1], "stops": [5, 7], "steps": [2, 3]}, dtype)})
++        cases.append({"name": "slice_empty", "dtype": dtype, "program": _layout_program("slice", (3, 5), (0, 5), {"starts": [2], "stops": [2], "steps": [1], "axes": [0]}, dtype)})
++        cases.append({"name": "split", "dtype": dtype, "program": _split_program((2, 5, 3), 1, [2, 3, 0], dtype)})
++        cases.append({"name": "split_empty", "dtype": dtype, "program": _split_program((3, 5), 0, [0, 3], dtype)})
++        cases.append({"name": "concat", "dtype": dtype, "program": _concat_program([(2, 2, 3), (2, 3, 3)], 1, dtype)})
++        cases.append({"name": "concat_empty_input", "dtype": dtype, "program": _concat_program([(0, 4), (2, 4)], 0, dtype)})
++    for dtype in ("float32", "bf16"):
++        cases.append({"name": "special_nan_transpose", "dtype": dtype, "program": _layout_program("transpose", (2, 3, 5), (5, 3, 2), {"permutation": [2, 1, 0]}, dtype)})
++        cases.append({"name": "special_nan_slice", "dtype": dtype, "program": _layout_program("slice", (5, 6), (4, 3), {"starts": [1, 0], "stops": [5, 6], "steps": [1, 2]}, dtype)})
++    return cases
++
++
++def _run_case(case: Mapping[str, Any], recording: "_RecordingRuntime", work: Path, seed: int) -> Mapping[str, Any]:
++    dtype = case["dtype"]
++    name = case["name"]
++    program = case["program"]
++    operation = program.functions[0].body.operations[0]
++    compiler = Sve256Compiler()
++    target_ir = compiler.lower(program, SVE256_TARGET)
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format="pypto-x.cpu.sve256",
++            extra={"build_dir": str(work / "{}-{}".format(dtype, name))},
++        ),
++    )
++    declared = [dict(entry) for entry in artifact.metadata["layout_native_operations"]]
++    contracts = [
++        layout_native_contract(operation, plan) for plan in target_ir.plans
++    ]
++    declared_matches_predicate = []
++    for plan, contract in zip(target_ir.plans, contracts):
++        entry = next(
++            (item for item in declared if item["operation_index"] == plan.operation_index), None
++        )
++        declared_matches_predicate.append(
++            contract is not None and entry is not None and entry["kernel"] == contract["kernel"]
++            and entry["dtype"] == contract["dtype"] and entry["mode"] == contract["mode"]
++            and entry["descriptor_digest"] == contract["descriptor_digest"]
++        )
++
++    if operation.name == "split":
++        input_shapes = [tuple(program.functions[0].parameters[0].type.shape)]
++    elif operation.name == "concat":
++        input_shapes = [tuple(ref.type.shape) for ref in operation.inputs]
++    else:
++        input_shapes = [tuple(operation.inputs[0].type.shape)]
++    output_shapes = [tuple(ref.type.shape) for ref in operation.outputs]
++
++    inputs = []
++    for index, shape in enumerate(input_shapes):
++        inputs.append((dtype, shape, _raw_array(dtype, _pattern_bits(dtype, element_count(shape), seed + index))))
++    native_outputs = [
++        (dtype, shape, _raw_array(dtype, [0] * element_count(shape))) for shape in output_shapes
++    ]
++    recording.requests = []
++    recording.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[_descriptor(d, s, a, True) for d, s, a in inputs],
++            outputs=[_descriptor(d, s, a) for d, s, a in native_outputs],
++        )
++    )
++
++    reference_outputs = [
++        (dtype, shape, _raw_array(dtype, [0] * element_count(shape))) for shape in output_shapes
++    ]
++    reference = CpuScalarCompiler().compile(
++        CpuScalarCompiler().lower(program, TargetSpec("cpu", "x86_64-linux-gnu"))
++    )
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            reference,
++            inputs=[_descriptor(d, s, a, True) for d, s, a in inputs],
++            outputs=[_descriptor(d, s, a) for d, s, a in reference_outputs],
++        )
++    )
++    native_hashes = [_buffer_sha256(array) for _dtype, _shape, array in native_outputs]
++    reference_hashes = [_buffer_sha256(array) for _dtype, _shape, array in reference_outputs]
++    return {
++        "case": "{}-{}".format(dtype, name),
++        "operation": operation.name,
++        "dtypes": sorted({entry["dtype"] for entry in declared}),
++        "plan_count": len(target_ir.plans),
++        "declared_kernels": [entry["kernel"] for entry in declared],
++        "declared_modes": [entry["mode"] for entry in declared],
++        "declared_matches_predicate": all(declared_matches_predicate),
++        "wire_requests": recording.requests,
++        "native_sha256": native_hashes,
++        "reference_sha256": reference_hashes,
++        "match": native_hashes == reference_hashes,
++    }
++
++
++def _w8a8_shape_case(recording: "_RecordingRuntime", work: Path) -> Mapping[str, Any]:
++    input_shape, output_shape = (6144, 1024), (1024, 6144)
++    program = _layout_program("transpose", input_shape, output_shape, {"permutation": [-1, 0]}, "int8")
++    compiler = Sve256Compiler()
++    target_ir = compiler.lower(program, SVE256_TARGET)
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format="pypto-x.cpu.sve256",
++            extra={"build_dir": str(work / "w8a8-shape")},
++        ),
++    )
++    source = np.arange(element_count(input_shape), dtype=np.int32).astype(np.int8).reshape(input_shape)
++    source_array = _raw_array("int8", source.reshape(-1).tolist())
++    output = _raw_array("int8", [0] * element_count(output_shape))
++    started = time.time()
++    recording.requests = []
++    recording.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[_descriptor("int8", input_shape, source_array, True)],
++            outputs=[_descriptor("int8", output_shape, output)],
++        )
++    )
++    elapsed = time.time() - started
++    expected = hashlib.sha256(source.T.tobytes()).hexdigest()
++    actual = _buffer_sha256(output)
++    contract = layout_native_contract(program.functions[0].body.operations[0], target_ir.plans[0])
++    return {
++        "case": "int8-w8a8-shape-transpose",
++        "input_shape": list(input_shape),
++        "output_shape": list(output_shape),
++        "declared_kernel": contract["kernel"] if contract else None,
++        "declared_mode": contract["mode"] if contract else None,
++        "sha256_native": actual,
++        "sha256_expected": expected,
++        "match": actual == expected,
++        "wall_seconds": round(elapsed, 3),
++    }
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--execution-mode", choices=("qemu", "native"), default="qemu")
++    parser.add_argument("--output", required=True, help="JSON evidence path")
++    parser.add_argument("--work-dir", required=True, help="native build directory")
++    parser.add_argument("--w8a8-shape", action="store_true", help="also run the 6144x1024 int8 transpose")
++    args = parser.parse_args()
++
++    runtime = Sve256Runtime(execution_mode=args.execution_mode)
++    if not runtime.is_available():
++        raise SystemExit("SVE256 unavailable: {}".format(runtime.availability().to_dict()))
++    recording = _RecordingRuntime(execution_mode=args.execution_mode)
++    work = Path(args.work_dir)
++    work.mkdir(parents=True, exist_ok=True)
++
++    report: Dict[str, Any] = {
++        "tool": TOOL,
++        "execution_mode": args.execution_mode,
++        "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++        "versions": {
++            "sve256_lowering_version": SVE256_LOWERING_VERSION,
++            "artifact_payload_version": ARTIFACT_PAYLOAD_VERSION,
++            "runner_protocol": RUNNER_PROTOCOL,
++            "layout_native_dtypes": list(LAYOUT_NATIVE_DTYPES),
++        },
++        "environment": {
++            "hostname": platform.node(),
++            "machine": platform.machine(),
++            "python": sys.version.split()[0],
++            "numpy": np.__version__,
++            "capability": runtime.availability().to_dict(),
++        },
++        "cases": [],
++    }
++    failures = 0
++    started = time.time()
++    for index, case in enumerate(_cases()):
++        record = _run_case(case, recording, work, seed=3 + index)
++        report["cases"].append(record)
++        if not record["match"] or not record["declared_matches_predicate"]:
++            failures += 1
++        print(
++            "[case] {:<32} match={} declared={} kernels={}".format(
++                record["case"], record["match"], record["declared_matches_predicate"],
++                ",".join(record["declared_kernels"]),
++            ),
++            flush=True,
++        )
++    if args.w8a8_shape:
++        record = _w8a8_shape_case(recording, work)
++        report["w8a8_shape"] = record
++        if not record["match"]:
++            failures += 1
++        print("[case] {:<32} match={}".format(record["case"], record["match"]), flush=True)
++    report["summary"] = {
++        "cases": len(report["cases"]),
++        "failures": failures,
++        "wall_seconds": round(time.time() - started, 3),
++    }
++    report["finished_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
++    Path(args.output).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    print("[matrix] cases={} failures={} output={}".format(len(report["cases"]), failures, args.output))
++    return 1 if failures else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/sve256_old_artifact_rejection.py b/tools/sve256_old_artifact_rejection.py
+new file mode 100644
+index 000000000..0003dac5f
+--- /dev/null
++++ b/tools/sve256_old_artifact_rejection.py
+@@ -0,0 +1,159 @@
++#!/usr/bin/env python3
++"""Prove a *real* pre-Q10 SVE256 artifact is rejected fail-closed by Q10.
++
++The Q10 version chain (lowering 8->9, payload 1->2, runner v6->v7, layout wire
++v3->v4, indexing wire v4->v5) means every artifact compiled before this change
++must be rejected rather than silently reinterpreted.  This tool compiles one
++artifact from the frozen base revision (``82d0272a``), then feeds it to the
++current runtime and records the rejection.  It is read-only outside its
++temporary build directory and removes the temporary git worktree afterwards.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++import tempfile
++from pathlib import Path
++
++BASE_REVISION = "82d0272aecdf8ad412f51e3698d9ea45830fc3f8"
++WORKTREE = Path(__file__).resolve().parents[1]
++
++_OLD_COMPILE = r'''
++import json
++from pypto.compiler import CompileOptions
++from pypto.compiler.targets.cpu_sve256 import Sve256Compiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.target import TargetSpec
++
++source = ValueRef("source", CoreType.tensor("float32", (3, 5)))
++output = ValueRef("output", CoreType.tensor("float32", (5, 3)))
++operation = Operation("transpose", (source,), (output,), {"permutation": [-1, 0]})
++program = CoreProgram(functions=(CoreFunction("transpose", (source,), (output,), Region((operation,))),))
++target = TargetSpec("cpu", "aarch64-linux-gnu", features=("sve", "sve2"), attributes={"vl_bytes": 32})
++compiler = Sve256Compiler()
++artifact = compiler.compile(
++    compiler.lower(program, target),
++    CompileOptions(
++        artifact_format="pypto-x.cpu.sve256",
++        extra={"build_dir": __import__("os").environ["Q10_OLD_BUILD_DIR"]},
++    ),
++)
++metadata = dict(artifact.metadata)
++
++
++def plain(value):
++    if hasattr(value, "items"):
++        return {str(key): plain(item) for key, item in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [plain(item) for item in value]
++    return value
++
++
++import os
++from pathlib import Path
++
++Path(os.environ["Q10_OLD_METADATA_JSON"]).write_text(
++    json.dumps(plain(metadata), sort_keys=True), encoding="utf-8"
++)
++print(json.dumps({
++    "artifact_path": artifact.path,
++    "entrypoint": artifact.entrypoint,
++    "artifact_format": artifact.format,
++    "abi_version": artifact.abi_version,
++    "lowering_version": metadata.get("lowering_version"),
++    "artifact_payload_version": metadata.get("artifact_payload_version"),
++    "runner_protocol": metadata.get("runner_protocol"),
++    "layout_descriptor_wire": metadata.get("layout_descriptor_wire"),
++    "indexing_descriptor_wire": metadata.get("indexing_descriptor_wire"),
++}))
++'''
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--output", required=True, help="JSON evidence path")
++    args = parser.parse_args()
++
++    sys.path.insert(0, str(WORKTREE / "python"))
++    from pypto.backends.cpu.aarch64 import CpuSve256ArtifactError, Sve256Runtime
++    from pypto.compiler import Artifact
++    from pypto.target import TargetSpec
++
++    report = {
++        "tool": "sve256_old_artifact_rejection",
++        "base_revision": BASE_REVISION,
++        "worktree": str(WORKTREE),
++    }
++    temporary = Path(tempfile.mkdtemp(prefix="q10-old-artifact-"))
++    old_tree = temporary / "old"
++    build_dir = temporary / "build"
++    build_dir.mkdir(parents=True, exist_ok=True)
++    try:
++        subprocess.run(
++            ["git", "-C", str(WORKTREE), "worktree", "add", "--detach", str(old_tree), BASE_REVISION],
++            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        )
++        environment = dict(os.environ)
++        environment["PYTHONPATH"] = str(old_tree / "python")
++        environment["PYPTO_X_PORTABLE_ONLY"] = "1"
++        environment["Q10_OLD_BUILD_DIR"] = str(build_dir)
++        metadata_path = temporary / "old_artifact_metadata.json"
++        environment["Q10_OLD_METADATA_JSON"] = str(metadata_path)
++        completed = subprocess.run(
++            [sys.executable, "-c", _OLD_COMPILE],
++            cwd=str(old_tree), env=environment, stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE, universal_newlines=True, check=False,
++        )
++        if completed.returncode != 0:
++            raise SystemExit(
++                "base-revision compile failed (exit {}):\n{}".format(
++                    completed.returncode, completed.stderr[-2000:]
++                )
++            )
++        old = json.loads(completed.stdout.strip().splitlines()[-1])
++        report["old_artifact"] = {
++            key: old[key]
++            for key in (
++                "artifact_format", "abi_version", "lowering_version",
++                "artifact_payload_version", "runner_protocol",
++                "layout_descriptor_wire", "indexing_descriptor_wire",
++            )
++        }
++        artifact = Artifact(
++            format=old["artifact_format"],
++            entrypoint=old["entrypoint"],
++            target=TargetSpec(
++                "cpu", "aarch64-linux-gnu", features=("sve", "sve2"), attributes={"vl_bytes": 32}
++            ),
++            abi_version=old["abi_version"],
++            path=old["artifact_path"],
++            metadata=json.loads(metadata_path.read_text(encoding="utf-8")),
++        )
++        runtime = Sve256Runtime(execution_mode="qemu")
++        try:
++            runtime.load(artifact)
++        except CpuSve256ArtifactError as exc:
++            report["rejected"] = True
++            report["rejection_error"] = "{}: {}".format(type(exc).__name__, exc)
++        else:
++            report["rejected"] = False
++            report["rejection_error"] = None
++    finally:
++        subprocess.run(
++            ["git", "-C", str(WORKTREE), "worktree", "remove", "--force", str(old_tree)],
++            check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++        )
++        subprocess.run(["rm", "-rf", str(temporary)], check=False)
++
++    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
++    Path(args.output).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    print(json.dumps({key: report[key] for key in ("rejected", "rejection_error", "old_artifact")}, sort_keys=True))
++    return 0 if report.get("rejected") else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())

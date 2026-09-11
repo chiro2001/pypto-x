@@ -1,0 +1,1944 @@
+From 60b9f9b86bf663508ddc5b6df3b0a964a58413ce Mon Sep 17 00:00:00 2001
+From: PyPTO-X Agent <agent@pypto-x.local>
+Date: Sat, 12 Sep 2026 03:03:51 +0800
+Subject: [PATCH 187/217] perf(timing): fix C6 dispatch-overhead proxy and add
+ GPU preflight sampling
+
+- dispatch_overhead now receives the TimingProxy explicitly (r1 recorded
+  AttributeError: 'CudaRuntime' object has no attribute 'collect').
+- five-sample nvidia-smi preflight window check with an optional
+  --preflight-max-utilization-pct abort, so a busy shared GamePC does not
+  silently produce a round that is later voided.
+- measured kernel ordering fix is already in the first commit (one real
+  launch before the closed-form correctness read).
+---
+ scripts/perf/c6_timing_harness.py | 1921 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 1921 insertions(+)
+
+diff --git a/scripts/perf/c6_timing_harness.py b/scripts/perf/c6_timing_harness.py
+new file mode 100644
+index 000000000..a95a59cfc
+--- /dev/null
++++ b/scripts/perf/c6_timing_harness.py
+@@ -0,0 +1,1921 @@
++#!/usr/bin/env python3
++"""C6 W8A8 CUDA cuEvent timing harness (measurement only, protocol-shaped).
++
++Measures the four frozen C6 CUDA W8A8 opcodes on the 12 W8J GEMM shapes:
++
++    qmatmul_s8s8_s32            m x k  @  k x n   (int8 -> int32 device kernel)
++    quantize_per_token_s8       m x k             (f32 -> int8 per-row)
++    dequantize_s8               m x n             (int8 codes x per-row scale -> f32)
++    dequantize_epilogue_bf16    m x n             (int32 acc x row x col scale -> bf16)
++
++Shape set = ``vendor_gemm_matrix.SHAPES`` x ``M_VALUES`` (the W8J 12-shape gate):
++    (k,n) in {(1024,32),(1024,5120),(1024,7168),(1024,8192),(2048,1024),(3584,1024)}
++    m      in {1, 5}
++so every opcode is measured on 12 shapes (48 cases total).  The per-opcode
++shape mapping keeps the W8J (m, k, n) row intact: qmatmul uses (m,k)x(k,n),
++quantize (m,k), dequantize and epilogue (m,n).
++
++Method (docs/PERF_MEASUREMENT_PROTOCOL.zh-CN.md + ERR-0004 + B3a):
++
++  * cuEvent timing only (never host wall as the headline);
++  * warmup W=5 per case, then R measured rounds per case (default 21);
++  * median / min / p95(nearest-rank) / max / sample stdev / cv /
++    p95_over_median, and the ERR-0004 outlier rule
++    ``|x - median| > max(3*1.4826*MAD, max(1us, 0.02*median))`` with
++    ``outlier_ratio > 0.10 -> UNSTABLE``;
++  * in-window cuEvent rate calibration (two host ``sleep`` gaps inside event
++    pairs, plus a long-batch corrected-vs-host-wall agreement check); raw and
++    corrected numbers are both reported;
++  * >= 2.0 s clock warmup payload with ``clocks.sm`` sampling under load;
++  * nvidia-smi fingerprint before/after and GPU-wide utilization samples
++    during the run (a foreign/user workload on the shared GamePC is recorded
++    rather than hidden).
++
++The measured kernel time is the cuEvent span around exactly the launch the
++runtime's ``_w8a8_launch`` performs (same ``module``/``function`` handle, same
++``(grid, block, shared)`` geometry, same parameter order).  The public
++``run_w8a8_*`` entry points are exercised separately for host-side dispatch
++overhead on one representative shape per opcode, because their pure-Python
++input marshalling is O(elements) and would dominate a per-round loop.
++
++Everything is UNGATED: WSL2 guest, no cpufreq control, shared non-quiet
++window.  No number produced here is a cross-platform speedup claim.
++
++Usage (GamePC WSL2):
++
++    PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=<tree>/python python3 \
++        scripts/perf/c6_timing_harness.py --output /tmp/c6-raw.json
++
++Local pre-flight (no GPU, compiles the 48 artifacts only):
++
++    PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=python python3 \
++        scripts/perf/c6_timing_harness.py --build-only --output /tmp/c6-build.json
++"""
++
++from __future__ import annotations
++
++import argparse
++import ctypes
++import ctypes.util
++import json
++import math
++import os
++import platform
++import random
++import statistics
++import struct
++import subprocess
++import sys
++import threading
++import time
++from pathlib import Path
++
++# --------------------------------------------------------------------------
++# shape set (identical to scripts/perf/vendor_gemm_matrix.py SHAPES x M_VALUES)
++# --------------------------------------------------------------------------
++
++W8J_ROWS = (
++    (1024, 32, "gdn_in_proj_ba"),
++    (1024, 5120, "attn_qkv_proj"),
++    (1024, 7168, "mlp_gate_up_proj"),
++    (1024, 8192, "gdn_in_proj_qkvz"),
++    (2048, 1024, "gdn_out_proj/attn_o_proj"),
++    (3584, 1024, "mlp_down_proj"),
++)
++M_VALUES = (1, 5)
++
++OPCODES = (
++    "qmatmul_s8s8_s32",
++    "quantize_per_token_s8",
++    "dequantize_s8",
++    "dequantize_epilogue_bf16",
++)
++
++# CUDA enum values read from the installed CUDA 13.3 headers on GamePC
++# (/usr/local/cuda/include/{library_types.h,cublas_api.h}); kept here so the
++# harness never guesses.
++CUDA_R_32F = 0
++CUDA_R_8I = 3
++CUDA_R_32I = 10
++CUDA_R_16BF = 14
++CUBLAS_COMPUTE_32F = 68
++CUBLAS_COMPUTE_32I = 72
++CUBLAS_OP_N = 0
++CUBLAS_GEMM_DEFAULT = -1
++CUBLAS_STATUS_SUCCESS = 0
++
++DEFAULT_ROUNDS = 21
++DEFAULT_WARMUP = 5
++DEFAULT_BATCH_REPEATS = 64
++DEFAULT_RATE_GAP = 0.5
++DEFAULT_RATE_ROUNDS = 3
++DEFAULT_CLOCK_WARMUP = 2.0
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++
++
++# --------------------------------------------------------------------------
++# small statistics helpers (protocol 3.3 / ERR-0004)
++# --------------------------------------------------------------------------
++
++
++def percentile_nearest_rank(values, fraction):
++    ordered = sorted(values)
++    if not ordered:
++        return None
++    rank = max(1, int(math.ceil(fraction * len(ordered))))
++    return ordered[min(rank, len(ordered)) - 1]
++
++
++def mad(values):
++    if not values:
++        return None
++    centre = statistics.median(values)
++    return statistics.median([abs(value - centre) for value in values])
++
++
++def round_sig(value, digits=9):
++    if value is None:
++        return None
++    return round(float(value), digits)
++
++
++def stats_block(values):
++    """Descriptive statistics + ERR-0004 outlier marking for one sample list."""
++
++    samples = [float(value) for value in values]
++    median = statistics.median(samples)
++    dispersion = statistics.stdev(samples) if len(samples) > 1 else 0.0
++    median_mad = mad(samples)
++    floor = max(1e-6, 0.02 * median)  # protocol floor: max(1 us, 2% x median)
++    threshold = max(3.0 * 1.4826 * median_mad, floor)
++    outliers = [index for index, value in enumerate(samples) if abs(value - median) > threshold]
++    outlier_ratio = len(outliers) / len(samples) if samples else None
++    return {
++        "n": len(samples),
++        "min": round_sig(min(samples)),
++        "median": round_sig(median),
++        "p95_nearest_rank": round_sig(percentile_nearest_rank(samples, 0.95)),
++        "max": round_sig(max(samples)),
++        "stdev": round_sig(dispersion),
++        "cv": round_sig(dispersion / median if median else None),
++        "p95_over_median": round_sig(
++            percentile_nearest_rank(samples, 0.95) / median if median else None
++        ),
++        "mad": round_sig(median_mad),
++        "outlier_floor_seconds": round_sig(floor, 12),
++        "outlier_threshold_seconds": round_sig(threshold, 12),
++        "outlier_indices": outliers,
++        "outlier_ratio": round_sig(outlier_ratio),
++        "samples": [round_sig(value, 12) for value in samples],
++    }
++
++
++# --------------------------------------------------------------------------
++# W8A8 Core IR program builders (byte-for-byte the device-validation builders)
++# --------------------------------------------------------------------------
++
++
++def _program(parameters, returns, operations, name="main"):
++    from pypto.core_ir import CoreFunction, CoreProgram, Region
++
++    return CoreProgram(
++        functions=(CoreFunction(name, tuple(parameters), tuple(returns), Region(tuple(operations))),)
++    )
++
++
++def _tensor(name, dtype, shape):
++    from pypto.core_ir import CoreType, ValueRef
++
++    return ValueRef(name, CoreType.tensor(dtype, shape))
++
++
++def _qmatmul_program(left_shape, right_shape):
++    from pypto.core_ir import Operation
++
++    left = _tensor("left", "int8", left_shape)
++    right = _tensor("right", "int8", right_shape)
++    output = _tensor("output", "int32", left_shape[:-2] + (left_shape[-2], right_shape[-1]))
++    return _program((left, right), (output,), (Operation("qmatmul_s8s8_s32", (left, right), (output,)),))
++
++
++def _dequantize_program(shape, rows):
++    from pypto.core_ir import Operation
++
++    codes = _tensor("codes", "int8", shape)
++    scales = _tensor("scales", "float32", (rows,))
++    output = _tensor("output", "float32", shape)
++    return _program((codes, scales), (output,), (Operation("dequantize_s8", (codes, scales), (output,)),))
++
++
++def _epilogue_program(shape):
++    from pypto.core_ir import Operation
++
++    rows, columns = shape
++    accumulator = _tensor("accumulator", "int32", shape)
++    row_scales = _tensor("row_scales", "float32", (rows,))
++    column_scales = _tensor("column_scales", "float32", (columns,))
++    output = _tensor("output", "bf16", shape)
++    return _program(
++        (accumulator, row_scales, column_scales),
++        (output,),
++        (Operation("dequantize_epilogue_bf16", (accumulator, row_scales, column_scales), (output,)),),
++    )
++
++
++def _quantize_program(shape, dtype="float32"):
++    from pypto.core_ir import Operation
++
++    values = _tensor("values", dtype, shape)
++    codes = _tensor("codes", "int8", shape)
++    scales = _tensor("scales", "float32", (shape[0],))
++    return _program((values,), (codes, scales), (Operation("quantize_per_token_s8", (values,), (codes, scales)),))
++
++
++TARGET_SPEC = ("gpu", "gpu-neutral")
++
++
++def _target():
++    from pypto.target import TargetSpec
++
++    return TargetSpec(*TARGET_SPEC)
++
++
++# --------------------------------------------------------------------------
++# GPU environment helpers
++# --------------------------------------------------------------------------
++
++
++def _run(command, timeout=30):
++    try:
++        completed = subprocess.run(
++            command, shell=True, capture_output=True, text=True, timeout=timeout
++        )
++        return {
++            "command": command,
++            "returncode": completed.returncode,
++            "stdout": completed.stdout.strip(),
++            "stderr": completed.stderr.strip(),
++        }
++    except Exception as exc:  # pragma: no cover - environment specific
++        return {"command": command, "error": "{}: {}".format(type(exc).__name__, exc)}
++
++
++def _nvidia_smi(query):
++    return _run("nvidia-smi --query-gpu={} --format=csv,noheader,nounits".format(query))
++
++
++def _gpu_fact(query):
++    result = _nvidia_smi(query)
++    if result.get("returncode") != 0:
++        return None
++    lines = [line.strip() for line in result.get("stdout", "").splitlines() if line.strip()]
++    return lines
++
++
++def _parse_first_float(lines):
++    if not lines:
++        return None
++    token = lines[0].split(",")[0].strip()
++    try:
++        return float(token)
++    except ValueError:
++        return None
++
++
++class ClockSampler(threading.Thread):
++    """Sample nvidia-smi clocks/utilization while the GPU is under load."""
++
++    def __init__(self, interval=0.4):
++        super().__init__(daemon=True)
++        self.interval = interval
++        self._stopped = threading.Event()
++        self.samples = []
++
++    def run(self):
++        while not self._stopped.is_set():
++            lines = _gpu_fact(
++                "clocks.current.sm,clocks.max.sm,utilization.gpu,memory.used,power.draw"
++            )
++            if lines:
++                parts = [part.strip() for part in lines[0].split(",")]
++                if len(parts) >= 5:
++                    try:
++                        self.samples.append(
++                            {
++                                "clocks_sm_mhz": float(parts[0]),
++                                "clocks_max_sm_mhz": float(parts[1]),
++                                "utilization_gpu_pct": float(parts[2]),
++                                "memory_used_mib": float(parts[3]),
++                                "power_draw_w": float(parts[4]),
++                                "t": round(time.time() - self._t0, 3) if hasattr(self, "_t0") else None,
++                            }
++                        )
++                    except ValueError:
++                        pass
++            self._stopped.wait(self.interval)
++
++    def stop(self):
++        self._stopped.set()
++
++
++def _fingerprint():
++    return {
++        "name_compute_cap": _gpu_fact("name,compute_cap,driver_version"),
++        "clocks": _gpu_fact("clocks.current.sm,clocks.max.sm,clocks.current.memory,clocks.max.memory,pstate"),
++        "memory": _gpu_fact("memory.used,memory.total"),
++        "utilization": _gpu_fact("utilization.gpu,utilization.memory,power.draw,power.limit,temperature.gpu"),
++        "compute_apps": _run(
++            "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader"
++        ),
++        "cuda_version": _run("nvidia-smi --query-gpu=driver_version --format=csv,noheader"),
++        "nvcc": _run("nvcc --version | tail -2") if _which("nvcc") else {"error": "nvcc not found"},
++        "cublas_version": _run(
++            "grep -h -a CUBLAS_VERSION_MAJOR /usr/local/cuda/include/cublas_api.h | head -1; "
++            "ls /usr/local/cuda/lib64/libcublas.so.* 2>/dev/null | head -1"
++        ),
++    }
++
++
++def _which(name):
++    from shutil import which
++
++    return which(name)
++
++
++# --------------------------------------------------------------------------
++# cuEvent rate calibration (B3a design, reused verbatim in spirit)
++# --------------------------------------------------------------------------
++
++
++def _new_event_pair(driver):
++    return driver.event_create(), driver.event_create()
++
++
++def _rate_calibration(driver, gap_seconds, rounds):
++    rates = []
++    spans = []
++    for _ in range(max(1, rounds)):
++        start, stop = _new_event_pair(driver)
++        try:
++            start.record(None)
++            host_started = time.perf_counter()
++            time.sleep(max(0.0, gap_seconds))
++            stop.record(None)
++            host_seconds = time.perf_counter() - host_started
++            driver.event_synchronize(stop)
++            event_seconds = start.elapsed_time_seconds(stop)
++        finally:
++            for event in (start, stop):
++                try:
++                    event.close()
++                except Exception:
++                    pass
++        rate = (host_seconds / event_seconds) if event_seconds else None
++        if rate is not None:
++            rates.append(rate)
++        spans.append(
++            {
++                "gap_seconds": gap_seconds,
++                "host_seconds": round_sig(host_seconds, 12),
++                "event_seconds": round_sig(event_seconds, 12),
++                "rate": round_sig(rate, 12),
++            }
++        )
++    median_rate = statistics.median(rates) if rates else None
++    spread_pct = (
++        (max(rates) - min(rates)) / median_rate * 100.0
++        if len(rates) > 1 and median_rate
++        else 0.0
++    )
++    return {
++        "gap_seconds": gap_seconds,
++        "rounds": max(1, rounds),
++        "rates": [round_sig(rate, 12) for rate in rates],
++        "median_rate": round_sig(median_rate, 12),
++        "rate_offset_pct": round_sig((median_rate - 1.0) * 100.0 if median_rate else None),
++        "spread_pct": round_sig(spread_pct),
++        "spans": spans,
++    }
++
++
++# --------------------------------------------------------------------------
++# ctypes cuBLAS binding (classic API only: cublasGemmEx int8->s32 / bf16)
++# --------------------------------------------------------------------------
++
++
++class Cublas:
++    """Classic cuBLAS GEMM access for the vendor comparison leg.
++
++    Preferred path: ``libc6vendor.so`` (built from ``c6_vendor_shim.c``), which
++    makes the ``cublasGemmEx`` call from C with the installed headers.  A direct
++    ctypes call with the same 19 documented arguments was rejected on the
++    GamePC CUDA 13.3 stack (``status=7``, "GEMM_EX parameter number 12 had an
++    illegal value") even though the identical C call returns 0, so the shim is
++    the supported measurement path; the direct binding is kept only as an
++    explicit fallback and records which path was used.
++    """
++
++    def __init__(self, path=None):
++        self.lib = None
++        self.handle = None
++        self.mode = None
++        self.lib_path = None
++        shim = self._load_shim(path)
++        if shim is not None:
++            self.mode = "shim"
++            self.lib = shim
++            self.lib.c6_shim_init.argtypes = []
++            self.lib.c6_shim_init.restype = ctypes.c_int
++            self.lib.c6_shim_shutdown.argtypes = []
++            self.lib.c6_shim_shutdown.restype = ctypes.c_int
++            self.lib.c6_shim_version.argtypes = []
++            self.lib.c6_shim_version.restype = ctypes.c_int
++            for name in ("c6_shim_gemm_int8_s32", "c6_shim_gemm_bf16"):
++                getattr(self.lib, name).argtypes = [
++                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
++                    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
++                ]
++                getattr(self.lib, name).restype = ctypes.c_int
++            self.lib.c6_shim_status_string.argtypes = [ctypes.c_int]
++            self.lib.c6_shim_status_string.restype = ctypes.c_char_p
++            status = self.lib.c6_shim_init()
++            if status != CUBLAS_STATUS_SUCCESS:
++                raise RuntimeError("c6_shim_init failed with status {}".format(status))
++            self.version = self.lib.c6_shim_version()
++            return
++
++        candidates = []
++        if path:
++            candidates.append(path)
++        candidates.extend(
++            [
++                "/usr/local/cuda/lib64/libcublas.so",
++                "/usr/local/cuda/lib64/libcublas.so.13",
++                "libcublas.so.13",
++                "libcublas.so",
++            ]
++        )
++        resolved = None
++        errors = []
++        for candidate in candidates:
++            try:
++                self.lib = ctypes.CDLL(candidate)
++                resolved = candidate
++                break
++            except OSError as exc:
++                errors.append("{}: {}".format(candidate, exc))
++        if resolved is None:
++            raise RuntimeError("libcublas not loadable: {}".format("; ".join(errors)))
++
++        self.lib.cublasCreate_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
++        self.lib.cublasCreate_v2.restype = ctypes.c_int
++        self.lib.cublasDestroy_v2.argtypes = [ctypes.c_void_p]
++        self.lib.cublasDestroy_v2.restype = ctypes.c_int
++        self.lib.cublasGetVersion_v2.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
++        self.lib.cublasGetVersion_v2.restype = ctypes.c_int
++        self.lib.cublasGemmEx.argtypes = [
++            ctypes.c_void_p,
++            ctypes.c_int,  # transa
++            ctypes.c_int,  # transb
++            ctypes.c_int,  # m
++            ctypes.c_int,  # n
++            ctypes.c_int,  # k
++            ctypes.c_void_p,  # alpha
++            ctypes.c_void_p,  # A
++            ctypes.c_int,  # Atype
++            ctypes.c_int,  # lda
++            ctypes.c_void_p,  # B
++            ctypes.c_int,  # Btype
++            ctypes.c_int,  # ldb
++            ctypes.c_void_p,  # beta
++            ctypes.c_void_p,  # C
++            ctypes.c_int,  # Ctype
++            ctypes.c_int,  # ldc
++            ctypes.c_int,  # computeType
++            ctypes.c_int,  # algo
++        ]
++        self.lib.cublasGemmEx.restype = ctypes.c_int
++
++        self.handle = ctypes.c_void_p()
++        status = self.lib.cublasCreate_v2(ctypes.byref(self.handle))
++        if status != CUBLAS_STATUS_SUCCESS:
++            raise RuntimeError("cublasCreate_v2 failed with status {}".format(status))
++        self.mode = "direct_ctypes"
++        self.lib_path = resolved
++        version = ctypes.c_int()
++        self.lib.cublasGetVersion_v2(self.handle, ctypes.byref(version))
++        self.version = version.value
++
++    @staticmethod
++    def _load_shim(path=None):
++        candidates = []
++        if path:
++            candidates.append(path)
++        import os as _os
++
++        env = _os.environ.get("C6_VENDOR_SHIM")
++        if env:
++            candidates.append(env)
++        here = Path(__file__).resolve().parent
++        candidates.extend(
++            [
++                str(here / "libc6vendor.so"),
++                str(here / ".." / ".." / "out" / "libc6vendor.so"),
++                _os.path.join(_os.path.expanduser("~"), "c6-timing", "out", "libc6vendor.so"),
++                "libc6vendor.so",
++            ]
++        )
++        for candidate in candidates:
++            if not _os.path.exists(candidate) and "libc6vendor.so" not in candidate:
++                continue
++            try:
++                lib = ctypes.CDLL(candidate)
++            except OSError:
++                continue
++            if hasattr(lib, "c6_shim_gemm_int8_s32"):
++                lib.__c6_shim_path__ = candidate
++                return lib
++        return None
++
++    def status_string(self, status):
++        try:
++            if self.mode == "shim":
++                return self.lib.c6_shim_status_string(status).decode("utf-8", "replace")
++            return "status {}".format(status)
++        except Exception:
++            return "status {}".format(status)
++
++    def gemm_int8_s32(self, m, k, n, a_ptr, b_ptr, c_ptr):
++        if self.mode == "shim":
++            return self.lib.c6_shim_gemm_int8_s32(m, k, n, a_ptr, b_ptr, c_ptr)
++        alpha = ctypes.c_int(1)
++        beta = ctypes.c_int(0)
++        return self.lib.cublasGemmEx(
++            self.handle,
++            CUBLAS_OP_N,
++            CUBLAS_OP_N,
++            n,
++            m,
++            k,
++            ctypes.byref(alpha),
++            a_ptr,
++            CUDA_R_8I,
++            k,
++            b_ptr,
++            CUDA_R_8I,
++            n,
++            ctypes.byref(beta),
++            c_ptr,
++            CUDA_R_32I,
++            n,
++            CUBLAS_COMPUTE_32I,
++            CUBLAS_GEMM_DEFAULT,
++        )
++
++    def gemm_bf16(self, m, k, n, a_ptr, b_ptr, c_ptr):
++        if self.mode == "shim":
++            return self.lib.c6_shim_gemm_bf16(m, k, n, a_ptr, b_ptr, c_ptr)
++        alpha = ctypes.c_float(1.0)
++        beta = ctypes.c_float(0.0)
++        return self.lib.cublasGemmEx(
++            self.handle,
++            CUBLAS_OP_N,
++            CUBLAS_OP_N,
++            n,
++            m,
++            k,
++            ctypes.byref(alpha),
++            a_ptr,
++            CUDA_R_16BF,
++            k,
++            b_ptr,
++            CUDA_R_16BF,
++            n,
++            ctypes.byref(beta),
++            c_ptr,
++            CUDA_R_16BF,
++            n,
++            CUBLAS_COMPUTE_32F,
++            CUBLAS_GEMM_DEFAULT,
++        )
++
++    def close(self):
++        if self.mode == "shim":
++            try:
++                self.lib.c6_shim_shutdown()
++            except Exception:
++                pass
++            self.lib = None
++            return
++        if getattr(self, "handle", None):
++            try:
++                self.lib.cublasDestroy_v2(self.handle)
++            finally:
++                self.handle = None
++
++
++# --------------------------------------------------------------------------
++# case construction
++# --------------------------------------------------------------------------
++
++
++def case_id(opcode, m, k, n):
++    return "{}/m{}_k{}_n{}".format(opcode, m, k, n)
++
++
++def build_cases(m_values=M_VALUES, opcodes=OPCODES, rows=W8J_ROWS):
++    cases = []
++    for k, n, name in rows:
++        for m in m_values:
++            for opcode in opcodes:
++                cases.append(
++                    {
++                        "case_id": case_id(opcode, m, k, n),
++                        "opcode": opcode,
++                        "m": m,
++                        "k": k,
++                        "n": n,
++                        "w8j_row_name": name,
++                    }
++                )
++    return cases
++
++
++def compile_case(compiler, case):
++    """Compile one case and return (artifact, plan, program)."""
++
++    opcode = case["opcode"]
++    m, k, n = case["m"], case["k"], case["n"]
++    if opcode == "qmatmul_s8s8_s32":
++        program = _qmatmul_program((m, k), (k, n))
++    elif opcode == "quantize_per_token_s8":
++        program = _quantize_program((m, k))
++    elif opcode == "dequantize_s8":
++        program = _dequantize_program((m, n), m)
++    elif opcode == "dequantize_epilogue_bf16":
++        program = _epilogue_program((m, n))
++    else:  # pragma: no cover - guarded by argparse choices
++        raise ValueError("unknown opcode {!r}".format(opcode))
++    target_ir = compiler.lower(program, _target())
++    artifact = compiler.compile(target_ir)
++    plan = target_ir.operation_by_opcode(opcode)
++    return artifact, plan, target_ir
++
++
++# --------------------------------------------------------------------------
++# device buffers + launch parameter assembly (mirrors run_w8a8_* exactly)
++# --------------------------------------------------------------------------
++
++
++class DeviceBuffers:
++    def __init__(self, driver):
++        self.driver = driver
++        self.pointers = []
++        self.sizes = []
++
++    def add(self, size):
++        size = max(1, int(size))
++        pointer = self.driver.mem_alloc(size)
++        self.pointers.append(pointer)
++        self.sizes.append(size)
++        return pointer
++
++    def free(self):
++        for pointer in reversed(self.pointers):
++            try:
++                self.driver.mem_free(pointer)
++            except Exception:
++                pass
++        self.pointers = []
++        self.sizes = []
++
++
++def _ones_int8(count):
++    return b"\x01" * count
++
++
++def _ones_float32(count):
++    return struct.pack("<f", 1.0) * count
++
++
++def _constant_int32(count, value):
++    return struct.pack("<i", value) * count
++
++
++def _constant_float32(count, value):
++    return struct.pack("<f", value) * count
++
++
++def _bf16_one():
++    return struct.pack("<H", 0x3F80)
++
++
++def _codes_and_scales_for_case(case):
++    """Return (int8 primary bytes, extra buffers) for the case."""
++
++    opcode = case["opcode"]
++    m, k, n = case["m"], case["k"], case["n"]
++    if opcode == "qmatmul_s8s8_s32":
++        return {"left": _ones_int8(m * k), "right": _ones_int8(k * n)}
++    if opcode == "quantize_per_token_s8":
++        return {"values": _ones_float32(m * k)}
++    if opcode == "dequantize_s8":
++        return {"codes": _ones_int8(m * n), "scales": _ones_float32(m)}
++    if opcode == "dequantize_epilogue_bf16":
++        return {
++            "accumulator": _constant_int32(m * n, 1000),
++            "row_scales": _constant_float32(m, 0.5),
++            "column_scales": _constant_float32(n, 0.25),
++        }
++    raise ValueError("unknown opcode {!r}".format(opcode))
++
++
++def launch_plan_for_case(runtime, plan, case, buffers):
++    """Return (kernel_name, grid, block, parameters, count, status_ptr)."""
++
++    from pypto.compiler.targets.cuda_w8a8 import CUDA_W8A8_BLOCK
++
++    opcode = case["opcode"]
++    m, k, n = case["m"], case["k"], case["n"]
++    if opcode == "qmatmul_s8s8_s32":
++        count = m * n
++        parameters = [buffers["left"], buffers["right"], buffers["output"]]
++    elif opcode == "dequantize_s8":
++        count = m * n
++        parameters = [buffers["codes"], buffers["scales"], buffers["output"]]
++    elif opcode == "quantize_per_token_s8":
++        count = m
++        parameters = [
++            buffers["values"],
++            buffers["codes"],
++            buffers["scales"],
++            buffers["saturation"],
++            buffers["status"],
++        ]
++    elif opcode == "dequantize_epilogue_bf16":
++        count = m * n
++        parameters = [
++            buffers["accumulator"],
++            buffers["row_scales"],
++            buffers["column_scales"],
++            buffers["output"],
++            buffers["status"],
++        ]
++    else:  # pragma: no cover
++        raise ValueError(opcode)
++    block = int(CUDA_W8A8_BLOCK)
++    grid = ((count + block - 1) // block, 1, 1)
++    return plan.kernel, grid, (block, 1, 1), parameters, count
++
++
++def allocate_case_buffers(driver, runtime, plan, case):
++    """Allocate every device buffer one case needs and upload its inputs."""
++
++    buffers = DeviceBuffers(driver)
++    data = _codes_and_scales_for_case(case)
++    opcode = case["opcode"]
++    m, k, n = case["m"], case["k"], case["n"]
++    pointers = {}
++    if opcode == "qmatmul_s8s8_s32":
++        pointers["left"] = buffers.add(len(data["left"]))
++        pointers["right"] = buffers.add(len(data["right"]))
++        pointers["output"] = buffers.add(m * n * 4)
++        driver.memcpy_htod(pointers["left"], data["left"])
++        driver.memcpy_htod(pointers["right"], data["right"])
++    elif opcode == "quantize_per_token_s8":
++        pointers["values"] = buffers.add(len(data["values"]))
++        pointers["codes"] = buffers.add(m * k)
++        pointers["scales"] = buffers.add(m * 4)
++        pointers["saturation"] = buffers.add(m * 4)
++        pointers["status"] = buffers.add(m * 4)
++        driver.memcpy_htod(pointers["values"], data["values"])
++        driver.memcpy_htod(pointers["status"], b"\0" * (m * 4))
++    elif opcode == "dequantize_s8":
++        pointers["codes"] = buffers.add(len(data["codes"]))
++        pointers["scales"] = buffers.add(m * 4)
++        pointers["output"] = buffers.add(m * n * 4)
++        driver.memcpy_htod(pointers["codes"], data["codes"])
++        driver.memcpy_htod(pointers["scales"], data["scales"])
++    elif opcode == "dequantize_epilogue_bf16":
++        pointers["accumulator"] = buffers.add(m * n * 4)
++        pointers["row_scales"] = buffers.add(m * 4)
++        pointers["column_scales"] = buffers.add(n * 4)
++        pointers["output"] = buffers.add(m * n * 2)
++        pointers["status"] = buffers.add(4)
++        driver.memcpy_htod(pointers["accumulator"], data["accumulator"])
++        driver.memcpy_htod(pointers["row_scales"], data["row_scales"])
++        driver.memcpy_htod(pointers["column_scales"], data["column_scales"])
++        driver.memcpy_htod(pointers["status"], b"\0\0\0\0")
++    else:  # pragma: no cover
++        raise ValueError(opcode)
++    return buffers, pointers
++
++
++# --------------------------------------------------------------------------
++# correctness sanity checks (cheap, closed-form inputs)
++# --------------------------------------------------------------------------
++
++
++def correctness_check(runtime, driver, plan, case, pointers, buffers):
++    opcode = case["opcode"]
++    m, k, n = case["m"], case["k"], case["n"]
++    if opcode == "qmatmul_s8s8_s32":
++        raw = driver.memcpy_dtoh(pointers["output"], m * n * 4)
++        values = struct.unpack("<{}i".format(m * n), raw)
++        ok = all(value == k for value in values)
++        return {
++            "method": "all_ones_inputs_expect_k",
++            "status": "PASS" if ok else "FAIL",
++            "expected": k,
++            "observed_min": min(values),
++            "observed_max": max(values),
++            "values": m * n,
++        }
++    if opcode == "dequantize_s8":
++        raw = driver.memcpy_dtoh(pointers["output"], m * n * 4)
++        values = struct.unpack("<{}f".format(m * n), raw)
++        ok = all(value == 1.0 for value in values)
++        return {
++            "method": "ones_codes_ones_scale_expect_1.0",
++            "status": "PASS" if ok else "FAIL",
++            "observed_min": min(values),
++            "observed_max": max(values),
++            "values": m * n,
++        }
++    if opcode == "quantize_per_token_s8":
++        codes = driver.memcpy_dtoh(pointers["codes"], m * k)
++        scales = struct.unpack("<{}f".format(m), driver.memcpy_dtoh(pointers["scales"], m * 4))
++        status = struct.unpack("<{}i".format(m), driver.memcpy_dtoh(pointers["status"], m * 4))
++        ok = (
++            all(code == 127 for code in codes)
++            and all(abs(scale - 1.0 / 127.0) < 1e-9 for scale in scales)
++            and all(value == 0 for value in status)
++        )
++        return {
++            "method": "ones_input_expect_codes_127_scale_1_over_127_status0",
++            "status": "PASS" if ok else "FAIL",
++            "codes_min": min(codes),
++            "codes_max": max(codes),
++            "scales": [round_sig(value, 12) for value in scales],
++            "status_values": list(status),
++        }
++    if opcode == "dequantize_epilogue_bf16":
++        raw = driver.memcpy_dtoh(pointers["output"], m * n * 2)
++        bits = struct.unpack("<{}H".format(m * n), raw)
++        expected = 0x42FA  # bf16(1000 * 0.5 * 0.25) = bf16(125.0)
++        status = struct.unpack("<i", driver.memcpy_dtoh(pointers["status"], 4))[0]
++        ok = all(value == expected for value in bits) and status == 0
++        return {
++            "method": "accumulator_1000_row_0.5_col_0.25_expect_bf16_125.0",
++            "status": "PASS" if ok else "FAIL",
++            "expected_bits": expected,
++            "observed_bits_min": min(bits),
++            "observed_bits_max": max(bits),
++            "status_value": status,
++        }
++    raise ValueError(opcode)
++
++
++# --------------------------------------------------------------------------
++# public entry point dispatch measurement (one representative shape/opcode)
++# --------------------------------------------------------------------------
++
++
++class TimingProxy:
++    """Delegate to a CudaDriver but capture cuEvent kernel times per launch.
++
++    ``launch_kernel`` is wrapped with a start/stop event pair on the same
++    stream; the elapsed time is read by the caller after the entry point has
++    synchronized.  This keeps the measured region exactly the device kernel
++    (module JIT and host copies stay outside the event pair), with no change to
++    the runtime code under test.
++    """
++
++    def __init__(self, driver):
++        self._driver = driver
++        self.pending = []
++        self.launch_count = 0
++        self.launch_args = None
++
++    def __getattr__(self, name):
++        return getattr(self._driver, name)
++
++    def launch_kernel(self, function, grid, block, parameters, stream, shared_memory):
++        start = self._driver.event_create()
++        stop = self._driver.event_create()
++        self._driver.event_record(start, stream)
++        try:
++            self._driver.launch_kernel(function, grid, block, parameters, stream, shared_memory)
++        except Exception:
++            start.close()
++            stop.close()
++            raise
++        self._driver.event_record(stop, stream)
++        self.launch_count += 1
++        self.launch_args = (function, grid, block, list(parameters), stream, shared_memory)
++        self.pending.append((start, stop))
++        return None
++
++    def collect(self):
++        """Read + close every pending event pair, returning seconds."""
++
++        values = []
++        for start, stop in self.pending:
++            try:
++                self._driver.event_synchronize(stop)
++                values.append(self._driver.event_elapsed_time_ms(start, stop) / 1000.0)
++            finally:
++                for event in (start, stop):
++                    try:
++                        event.close()
++                    except Exception:
++                        pass
++        self.pending = []
++        return values
++
++
++def dispatch_overhead(runtime_proxy, proxy_driver, artifact, case, rounds):
++    """Wall time of the public entry point vs its cuEvent kernel time."""
++
++    opcode = case["opcode"]
++    m, k, n = case["m"], case["k"], case["n"]
++    entry_wall = []
++    kernel = []
++    for _ in range(rounds):
++        started = time.perf_counter()
++        if opcode == "qmatmul_s8s8_s32":
++            runtime_proxy.run_w8a8_qmatmul(
++                artifact, [1] * (m * k), [1] * (k * n), left_shape=(m, k), right_shape=(k, n)
++            )
++        elif opcode == "quantize_per_token_s8":
++            runtime_proxy.run_w8a8_quantize_per_token_s8(artifact, [1.0] * (m * k), shape=(m, k))
++        elif opcode == "dequantize_s8":
++            runtime_proxy.run_w8a8_dequantize_s8(
++                artifact, [1] * (m * n), [1.0] * m, shape=(m, n)
++            )
++        elif opcode == "dequantize_epilogue_bf16":
++            runtime_proxy.run_w8a8_dequantize_epilogue_bf16(
++                artifact, [1000] * (m * n), [0.5] * m, [0.25] * n, shape=(m, n)
++            )
++        entry_wall.append(time.perf_counter() - started)
++        kernel.extend(proxy_driver.collect())
++    return {
++        "shape": {"m": m, "k": k, "n": n, "case_id": case["case_id"]},
++        "rounds": rounds,
++        "entry_wall_seconds": [round_sig(value, 12) for value in entry_wall],
++        "kernel_seconds": [round_sig(value, 12) for value in kernel],
++        "entry_wall_median_seconds": round_sig(statistics.median(entry_wall)),
++        "kernel_median_seconds": round_sig(statistics.median(kernel)) if kernel else None,
++        "dispatch_median_seconds": (
++            round_sig(statistics.median(entry_wall) - statistics.median(kernel))
++            if kernel
++            else None
++        ),
++        "note": (
++            "representative smallest W8J row; the public entry marshals pure-Python "
++            "sequences per call so this is an upper-bound host overhead, not the "
++            "measurement path for the 48-case table"
++        ),
++    }
++
++
++# --------------------------------------------------------------------------
++# vendor two-pass (cublasGemmEx int8->s32 + our C6 epilogue) + bf16 baseline
++# --------------------------------------------------------------------------
++
++
++def _device_ptr(driver, size, payload=None):
++    pointer = driver.mem_alloc(max(1, size))
++    if payload is not None:
++        driver.memcpy_htod(pointer, payload)
++    return pointer
++
++
++def _pattern_int8(m, k, n):
++    """Structured int8 inputs whose result is asymmetric in i and j.
++
++    A[i][l] = 1 except A[0][0] = 5 and A[1][k-1] = 7; B[l][j] = 1 except
++    B[0][0] = 2, B[0][1] = 3 and B[k-1][0] = 5.  A transposed/mis-indexed GEMM
++    cannot reproduce the same int32 matrix, while the expected magnitudes stay
++    far inside int32 and inside the C6 [-127, 127] code range.
++    """
++
++    left = bytearray(b"\x01" * (m * k))
++    left[0] = 5
++    if m > 1:
++        left[k + (k - 1)] = 7
++    right = bytearray(b"\x01" * (k * n))
++    right[0] = 2
++    if n > 1:
++        right[1] = 3
++    right[(k - 1) * n] = 5
++    return bytes(left), bytes(right)
++
++
++def run_vendor_comparison(driver, runtime, compiler, cases, rounds, warmup):
++    """Measure vendor int8/bf16 GEMM and the two-pass composition per shape.
++
++    The two-pass row is ``cublasGemmEx int8->s32`` followed by *our* C6
++    ``dequantize_epilogue_bf16`` kernel on the int32 output.  The fused row is
++    our own C6 ``qmatmul_s8s8_s32`` kernel followed by the same epilogue.  Both
++    use the same device buffers layout, so the comparison isolates the GEMM
++    kernel; the shared epilogue is measured once per shape.
++    """
++
++    report = {"status": "SKIPPED", "shapes": [], "notes": []}
++    try:
++        cublas = Cublas()
++    except Exception as exc:
++        report["status"] = "UNAVAILABLE"
++        report["error"] = "{}: {}".format(type(exc).__name__, exc)
++        return report
++
++    from pypto.compiler.targets.cuda_w8a8 import CUDA_W8A8_BLOCK
++
++    report["lib_path"] = cublas.lib_path
++    report["mode"] = cublas.mode
++    report["version"] = cublas.version
++    report["status"] = "OK"
++
++    epilogue_artifacts = {}
++    qmatmul_artifacts = {}
++    for case in cases:
++        key = (case["m"], case["k"], case["n"])
++        if case["opcode"] == "dequantize_epilogue_bf16":
++            epilogue_artifacts[key] = case["artifact"]
++        elif case["opcode"] == "qmatmul_s8s8_s32":
++            qmatmul_artifacts[key] = case["artifact"]
++
++    for k, n, name in W8J_ROWS:
++        for m in M_VALUES:
++            key = (m, k, n)
++            if key not in epilogue_artifacts or key not in qmatmul_artifacts:
++                continue
++            entry = {"m": m, "k": k, "n": n, "w8j_row_name": name}
++            buffers = DeviceBuffers(driver)
++            module = None
++            try:
++                a_bytes, b_bytes = _pattern_int8(m, k, n)
++                a_ptr = _device_ptr(driver, m * k, a_bytes)
++                b_ptr = _device_ptr(driver, k * n, b_bytes)
++                c_vendor = _device_ptr(driver, m * n * 4)
++                c_ours = _device_ptr(driver, m * n * 4)
++                epi_two_pass = _device_ptr(driver, m * n * 2)
++                epi_ours = _device_ptr(driver, m * n * 2)
++                a_bf16 = _device_ptr(driver, m * k * 2, _bf16_one() * (m * k))
++                b_bf16 = _device_ptr(driver, k * n * 2, _bf16_one() * (k * n))
++                c_bf16 = _device_ptr(driver, m * n * 2)
++                row_scales = _device_ptr(driver, m * 4, _constant_float32(m, 0.5))
++                col_scales = _device_ptr(driver, n * 4, _constant_float32(n, 0.25))
++                status_two_pass = _device_ptr(driver, 4, b"\0\0\0\0")
++                status_ours = _device_ptr(driver, 4, b"\0\0\0\0")
++                for pointer in (
++                    a_ptr, b_ptr, c_vendor, c_ours, epi_two_pass, epi_ours,
++                    a_bf16, b_bf16, c_bf16, row_scales, col_scales,
++                    status_two_pass, status_ours,
++                ):
++                    buffers.pointers.append(pointer)
++
++                # -- our C6 fused-path qmatmul kernel (direct launch) ------
++                loaded_q = runtime._load_w8a8(qmatmul_artifacts[key])
++                plan_q = runtime._w8a8_plan(loaded_q, "qmatmul_s8s8_s32")
++                module_q = driver.module_load_data(loaded_q.ptx)
++                function_q = module_q.get_function(plan_q.kernel)
++                count_q = m * n
++                grid_q = ((count_q + CUDA_W8A8_BLOCK - 1) // CUDA_W8A8_BLOCK, 1, 1)
++                params_q = [a_ptr, b_ptr, c_ours]
++
++                def ours_qmatmul_call():
++                    driver.launch_kernel(
++                        function_q, grid_q, (CUDA_W8A8_BLOCK, 1, 1), params_q, None, 0
++                    )
++
++                # -- our C6 epilogue kernel --------------------------------
++                loaded_e = runtime._load_w8a8(epilogue_artifacts[key])
++                plan_e = runtime._w8a8_plan(loaded_e, "dequantize_epilogue_bf16")
++                module = driver.module_load_data(loaded_e.ptx)
++                function_e = module.get_function(plan_e.kernel)
++                grid_e = ((m * n + CUDA_W8A8_BLOCK - 1) // CUDA_W8A8_BLOCK, 1, 1)
++
++                def epilogue_two_pass_call():
++                    driver.launch_kernel(
++                        function_e,
++                        grid_e,
++                        (CUDA_W8A8_BLOCK, 1, 1),
++                        [c_vendor, row_scales, col_scales, epi_two_pass, status_two_pass],
++                        None,
++                        0,
++                    )
++
++                def epilogue_ours_call():
++                    driver.launch_kernel(
++                        function_e,
++                        grid_e,
++                        (CUDA_W8A8_BLOCK, 1, 1),
++                        [c_ours, row_scales, col_scales, epi_ours, status_ours],
++                        None,
++                        0,
++                    )
++
++                def gemm_call():
++                    return cublas.gemm_int8_s32(m, k, n, a_ptr, b_ptr, c_vendor)
++
++                def bf16_call():
++                    return cublas.gemm_bf16(m, k, n, a_bf16, b_bf16, c_bf16)
++
++                # -- correctness: vendor int32 == our C6 int32 -------------
++                entry["gemm_status"] = gemm_call()
++                entry["bf16_status"] = bf16_call()
++                entry["gemm_host_call_seconds"] = _sample_host_call(gemm_call, warmup, rounds)
++                if entry["gemm_status"] != CUBLAS_STATUS_SUCCESS:
++                    entry["error"] = (
++                        "cublasGemmEx int8->s32 returned status {}; vendor two-pass "
++                        "not measured for this shape".format(entry["gemm_status"])
++                    )
++                    if entry["bf16_status"] == CUBLAS_STATUS_SUCCESS:
++                        entry["bf16_gemm"] = _sample_events(driver, bf16_call, warmup, rounds)
++                    ours_qmatmul_call()
++                    driver.context_synchronize()
++                    report["shapes"].append(entry)
++                    continue
++                ours_qmatmul_call()
++                driver.context_synchronize()
++                vendor_values = struct.unpack("<{}i".format(m * n), driver.memcpy_dtoh(c_vendor, m * n * 4))
++                ours_values = struct.unpack("<{}i".format(m * n), driver.memcpy_dtoh(c_ours, m * n * 4))
++                entry["int32_mismatches_vs_c6"] = sum(
++                    1 for i, value in enumerate(vendor_values) if value != ours_values[i]
++                )
++                entry["int32_method"] = (
++                    "structured_pattern_A00=5,A1k=7,B00=2,B01=3,Bk0=5; "
++                    "vendor int32 vs our C6 int32 full-matrix equality"
++                )
++                entry["int32_vendor_min"] = min(vendor_values)
++                entry["int32_vendor_max"] = max(vendor_values)
++                entry["int32_ours_min"] = min(ours_values)
++                entry["int32_ours_max"] = max(ours_values)
++
++                # -- two-pass vs fused bf16 output equivalence -------------
++                epilogue_two_pass_call()
++                epilogue_ours_call()
++                driver.context_synchronize()
++                two_pass_bits = struct.unpack(
++                    "<{}H".format(m * n), driver.memcpy_dtoh(epi_two_pass, m * n * 2)
++                )
++                fused_bits = struct.unpack("<{}H".format(m * n), driver.memcpy_dtoh(epi_ours, m * n * 2))
++                entry["two_pass_bf16_mismatches_vs_fused"] = sum(
++                    1 for i, value in enumerate(two_pass_bits) if value != fused_bits[i]
++                )
++                entry["bf16_two_pass_min"] = min(two_pass_bits)
++                entry["bf16_two_pass_max"] = max(two_pass_bits)
++
++                # -- bf16 platform baseline ---------------------------------
++
++                # -- timing ------------------------------------------------
++                entry["gemm_vendor_int8"] = _sample_events(driver, gemm_call, warmup, rounds)
++                entry["gemm_ours_dp4a"] = _sample_events(driver, ours_qmatmul_call, warmup, rounds)
++                entry["epilogue_ours"] = _sample_events(driver, epilogue_ours_call, warmup, rounds)
++                entry["two_pass_combined"] = _sample_events(
++                    driver, lambda: (gemm_call(), epilogue_two_pass_call()), warmup, rounds
++                )
++                entry["fused_path_combined"] = _sample_events(
++                    driver, lambda: (ours_qmatmul_call(), epilogue_ours_call()), warmup, rounds
++                )
++                if entry["bf16_status"] == CUBLAS_STATUS_SUCCESS:
++                    entry["bf16_gemm"] = _sample_events(driver, bf16_call, warmup, rounds)
++                    entry["bf16_host_call_seconds"] = _sample_host_call(bf16_call, warmup, rounds)
++                    entry["paired_bf16_vs_ours_gemm"] = _sample_pair_events(
++                        driver, bf16_call, ours_qmatmul_call, warmup, rounds,
++                        name_a="bf16_gemm", name_b="ours_dp4a",
++                    )
++                # interleaved paired comparison: drift-robust ratios
++                entry["paired_vendor_vs_ours_gemm"] = _sample_pair_events(
++                    driver, gemm_call, ours_qmatmul_call, warmup, rounds,
++                    name_a="vendor_int8", name_b="ours_dp4a",
++                )
++                entry["paired_two_pass_vs_fused"] = _sample_pair_events(
++                    driver,
++                    lambda: (gemm_call(), epilogue_two_pass_call()),
++                    lambda: (ours_qmatmul_call(), epilogue_ours_call()),
++                    warmup,
++                    rounds,
++                    name_a="two_pass",
++                    name_b="fused_path",
++                )
++                entry["epilogue_kernel_name"] = plan_e.kernel
++                entry["qmatmul_kernel_name"] = plan_q.kernel
++                module_q.close()
++            except Exception as exc:
++                entry["error"] = "{}: {}".format(type(exc).__name__, exc)
++            finally:
++                if module is not None:
++                    try:
++                        module.close()
++                    except Exception:
++                        pass
++                buffers.free()
++            report["shapes"].append(entry)
++
++    cublas.close()
++    return report
++
++
++def _sample_pair_events(driver, call_a, call_b, warmup, rounds, name_a="a", name_b="b"):
++    """Interleaved cuEvent sampling of two calls + per-round paired ratios.
++
++    Alternating the call order cancels slow drift in the shared window, so the
++    ratio of two kernels measured this way is more robust than comparing two
++    separately measured medians.
++    """
++
++    for _ in range(max(1, warmup)):
++        call_a()
++        call_b()
++        driver.context_synchronize()
++    samples_a = []
++    samples_b = []
++    for index in range(rounds):
++        pair = []
++        calls = (call_a, call_b) if index % 2 == 0 else (call_b, call_a)
++        for call in calls:
++            start, stop = _new_event_pair(driver)
++            try:
++                start.record(None)
++                call()
++                stop.record(None)
++                driver.event_synchronize(stop)
++                pair.append(start.elapsed_time_seconds(stop))
++            finally:
++                for event in (start, stop):
++                    try:
++                        event.close()
++                    except Exception:
++                        pass
++        if index % 2 == 0:
++            samples_a.append(pair[0])
++            samples_b.append(pair[1])
++        else:
++            samples_a.append(pair[1])
++            samples_b.append(pair[0])
++    ratios = [
++        a / b if b else None for a, b in zip(samples_a, samples_b)
++    ]
++    return {
++        name_a: {
++            "rounds": rounds,
++            "kernel_seconds": [round_sig(value, 12) for value in samples_a],
++            "median_seconds": round_sig(statistics.median(samples_a)),
++        },
++        name_b: {
++            "rounds": rounds,
++            "kernel_seconds": [round_sig(value, 12) for value in samples_b],
++            "median_seconds": round_sig(statistics.median(samples_b)),
++        },
++        "paired_ratio_{}_over_{}".format(name_a, name_b): {
++            "definition": "median(a_i / b_i) over interleaved rounds; a={} b={}".format(name_a, name_b),
++            "median_ratio": round_sig(statistics.median([value for value in ratios if value])),
++            "ratios": [round_sig(value, 12) for value in ratios],
++        },
++        "interleaved": True,
++        "rounds": rounds,
++    }
++
++
++def _sample_events(driver, call, warmup, rounds):
++    """Time ``call()`` with cuEvent pairs; returns raw sample lists."""
++
++    samples = []
++    host_samples = []
++    for _ in range(warmup):
++        call()
++        driver.context_synchronize()
++    for _ in range(rounds):
++        start, stop = _new_event_pair(driver)
++        try:
++            start.record(None)
++            host_started = time.perf_counter()
++            call()
++            stop.record(None)
++            driver.event_synchronize(stop)
++            host_seconds = time.perf_counter() - host_started
++            event_seconds = start.elapsed_time_seconds(stop)
++        finally:
++            for event in (start, stop):
++                try:
++                    event.close()
++                except Exception:
++                    pass
++        samples.append(event_seconds)
++        host_samples.append(host_seconds)
++    return {
++        "rounds": rounds,
++        "kernel_seconds": [round_sig(value, 12) for value in samples],
++        "median_seconds": round_sig(statistics.median(samples)),
++        "min_seconds": round_sig(min(samples)),
++        "host_wall_seconds": [round_sig(value, 12) for value in host_samples],
++        "host_wall_median_seconds": round_sig(statistics.median(host_samples)),
++    }
++
++
++def _sample_host_call(call, warmup, rounds):
++    for _ in range(warmup):
++        call()
++    samples = []
++    for _ in range(rounds):
++        started = time.perf_counter()
++        call()
++        samples.append(time.perf_counter() - started)
++    return {
++        "rounds": rounds,
++        "samples": [round_sig(value, 12) for value in samples],
++        "median_seconds": round_sig(statistics.median(samples)),
++    }
++
++
++# --------------------------------------------------------------------------
++# main measurement loop
++# --------------------------------------------------------------------------
++
++
++def _wall_agreement(driver, launch_once, repeats_list=(128, 256)):
++    """Batch device time vs host wall for a workload-bearing span (B3a #2/#3).
++
++    Both batches run back-to-back launches of the largest qmatmul kernel inside
++    one cuEvent pair; the host wall brackets the same interval including the
++    drain sync.  The per-launch event time must agree between the half and full
++    batch (linearity ≤ 3%) and, after the in-window rate correction, the full
++    batch event span must agree with the host wall (≤ 5%).
++    """
++
++    batches = []
++    for repeats in repeats_list:
++        start, stop = _new_event_pair(driver)
++        try:
++            start.record(None)
++            host_started = time.perf_counter()
++            for _ in range(repeats):
++                launch_once()
++            stop.record(None)
++            driver.event_synchronize(stop)
++            host_seconds = time.perf_counter() - host_started
++            event_seconds = start.elapsed_time_seconds(stop)
++        finally:
++            for event in (start, stop):
++                try:
++                    event.close()
++                except Exception:
++                    pass
++        batches.append(
++            {
++                "repeats": repeats,
++                "event_seconds": round_sig(event_seconds, 12),
++                "host_wall_seconds": round_sig(host_seconds, 12),
++                "event_per_launch_seconds": round_sig(event_seconds / repeats, 12),
++                "host_per_launch_seconds": round_sig(host_seconds / repeats, 12),
++                "raw_wall_agreement_pct": round_sig(
++                    abs(event_seconds - host_seconds) / host_seconds * 100.0 if host_seconds else None
++                ),
++            }
++        )
++    linearity = None
++    if len(batches) >= 2 and batches[0]["event_per_launch_seconds"]:
++        half = batches[0]["event_per_launch_seconds"]
++        full = batches[-1]["event_per_launch_seconds"]
++        linearity = abs(full - half) / half * 100.0
++    return {
++        "batches": batches,
++        "linearity_pct": round_sig(linearity),
++        "note": "rate correction is applied by the analyzer/analysis step",
++    }
++
++
++def run_case_measurement(runtime, driver, plan, case, buffers, pointers, rounds, warmup, batch_repeats):
++    opcode = case["opcode"]
++    kernel, grid, block, parameters, count = launch_plan_for_case(
++        runtime, plan, case, pointers
++    )
++    loaded = runtime._load_w8a8(case["artifact"])
++    module = driver.module_load_data(loaded.ptx)
++    function = module.get_function(kernel)
++    try:
++        def launch_once():
++            driver.launch_kernel(function, grid, block, parameters, None, 0)
++
++        # one real launch before the closed-form correctness read
++        launch_once()
++        driver.context_synchronize()
++        correctness = correctness_check(runtime, driver, plan, case, pointers, buffers)
++
++        warmup_kernel = []
++        warmup_entry = []
++        for _ in range(warmup):
++            start, stop = _new_event_pair(driver)
++            try:
++                started = time.perf_counter()
++                start.record(None)
++                launch_once()
++                stop.record(None)
++                driver.event_synchronize(stop)
++                warmup_entry.append(time.perf_counter() - started)
++                warmup_kernel.append(start.elapsed_time_seconds(stop))
++            finally:
++                for event in (start, stop):
++                    try:
++                        event.close()
++                    except Exception:
++                        pass
++
++        measured_kernel = []
++        measured_entry = []
++        for _ in range(rounds):
++            start, stop = _new_event_pair(driver)
++            try:
++                started = time.perf_counter()
++                start.record(None)
++                launch_once()
++                stop.record(None)
++                driver.event_synchronize(stop)
++                measured_entry.append(time.perf_counter() - started)
++                measured_kernel.append(start.elapsed_time_seconds(stop))
++            finally:
++                for event in (start, stop):
++                    try:
++                        event.close()
++                    except Exception:
++                        pass
++
++        # back-to-back batch: the same launch arguments, one event pair.
++        batch = None
++        if batch_repeats and batch_repeats > 1:
++            start, stop = _new_event_pair(driver)
++            try:
++                start.record(None)
++                host_started = time.perf_counter()
++                for _ in range(batch_repeats):
++                    launch_once()
++                stop.record(None)
++                driver.event_synchronize(stop)
++                host_seconds = time.perf_counter() - host_started
++                span = start.elapsed_time_seconds(stop)
++            finally:
++                for event in (start, stop):
++                    try:
++                        event.close()
++                    except Exception:
++                        pass
++            batch = {
++                "repeats": batch_repeats,
++                "span_seconds": round_sig(span, 12),
++                "per_launch_seconds": round_sig(span / batch_repeats, 12),
++                "host_wall_seconds": round_sig(host_seconds, 12),
++                "host_wall_per_launch_seconds": round_sig(host_seconds / batch_repeats, 12),
++                "raw_wall_agreement_pct": round_sig(
++                    abs(host_seconds - span) / host_seconds * 100.0 if host_seconds else None
++                ),
++            }
++
++        flops = 2.0 * case["m"] * case["k"] * case["n"] if opcode == "qmatmul_s8s8_s32" else None
++        return {
++            "correctness": correctness,
++            "kernel_name": kernel,
++            "grid": list(grid),
++            "block": list(block),
++            "launch_count": 1,
++            "warmup_kernel_seconds": [round_sig(v, 12) for v in warmup_kernel],
++            "warmup_entry_wall_seconds": [round_sig(v, 12) for v in warmup_entry],
++            "measured_kernel_seconds": [round_sig(v, 12) for v in measured_kernel],
++            "measured_entry_wall_seconds": [round_sig(v, 12) for v in measured_entry],
++            "batch": batch,
++            "gop_per_s": (
++                round_sig(flops / statistics.median(measured_kernel) / 1e9)
++                if flops and statistics.median(measured_kernel) > 0
++                else None
++            ),
++            "flop_accounting": (
++                {"formula": "2*m*n*k", "flops": flops} if flops is not None else None
++            ),
++        }
++    finally:
++        try:
++            module.close()
++        except Exception:
++            pass
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("--output", required=True, help="raw evidence JSON path")
++    parser.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS)
++    parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
++    parser.add_argument("--batch-repeats", type=int, default=DEFAULT_BATCH_REPEATS)
++    parser.add_argument("--rate-gap", type=float, default=DEFAULT_RATE_GAP)
++    parser.add_argument("--rate-rounds", type=int, default=DEFAULT_RATE_ROUNDS)
++    parser.add_argument("--clock-warmup-seconds", type=float, default=DEFAULT_CLOCK_WARMUP)
++    parser.add_argument(
++        "--preflight-max-utilization-pct",
++        type=float,
++        default=None,
++        help="abort (exit 3) before measuring when the 5-sample preflight median exceeds this",
++    )
++    parser.add_argument("--gpu-index", type=int, default=0)
++    parser.add_argument("--opcodes", default=",".join(OPCODES))
++    parser.add_argument("--m-values", default=",".join(str(m) for m in M_VALUES))
++    parser.add_argument("--build-only", action="store_true", help="compile the 48 artifacts, no GPU")
++    parser.add_argument("--skip-vendor", action="store_true")
++    parser.add_argument("--skip-preflight", action="store_true", help="no preflight sampling")
++    parser.add_argument("--skip-dispatch", action="store_true")
++    parser.add_argument("--dispatch-rounds", type=int, default=7)
++    parser.add_argument("--seed", type=int, default=20260912)
++    args = parser.parse_args(argv)
++
++    random.seed(args.seed)
++    if str(REPO_ROOT / "python") not in sys.path:
++        sys.path.insert(0, str(REPO_ROOT / "python"))
++    opcodes = tuple(part.strip() for part in args.opcodes.split(",") if part.strip())
++    m_values = tuple(int(part) for part in args.m_values.split(",") if part.strip())
++    cases = build_cases(m_values, opcodes)
++
++    report = {
++        "artifact_kind": "pypto-x.c6-w8a8-timing-raw",
++        "schema_version": 1,
++        "task": "c6-timing-evidence",
++        "started_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++        "git": os.environ.get("C6_GIT_HEAD")
++        or _run("git -C {} rev-parse HEAD".format(REPO_ROOT)).get("stdout"),
++        "git_branch": os.environ.get("C6_GIT_BRANCH")
++        or _run("git -C {} rev-parse --abbrev-ref HEAD".format(REPO_ROOT)).get("stdout"),
++        "worktree": os.environ.get("C6_WORKTREE", str(REPO_ROOT)),
++        "argv": sys.argv,
++        "python": sys.version,
++        "platform": platform.platform(),
++        "protocol": {
++            "name": "docs/PERF_MEASUREMENT_PROTOCOL.zh-CN.md + ERR-0004 + B3a",
++            "gated": False,
++            "ungated_reason": "WSL2 guest, no cpufreq control, shared non-quiet window",
++            "warmup": args.warmup,
++            "rounds": args.rounds,
++            "outlier_rule": "ERR-0004 |x-median| > max(3*1.4826*MAD, max(1us, 0.02*median)); outlier_ratio>0.10 -> UNSTABLE",
++            "variance_limits_rtx5080_clock_unlocked": {"cv": 0.05, "p95_over_median": 1.25},
++            "variance_limits_rtx5080_clock_asserted": {"cv": 0.03, "p95_over_median": 1.15},
++            "rate_calibration": "in-window",
++        },
++        "shape_set": {
++            "source": "scripts/perf/vendor_gemm_matrix.py SHAPES x M_VALUES (W8J J2 gate)",
++            "rows": [{"k": k, "n": n, "name": name} for k, n, name in W8J_ROWS],
++            "m_values": list(m_values),
++            "opcode_shape_mapping": {
++                "qmatmul_s8s8_s32": "(m,k) x (k,n)",
++                "quantize_per_token_s8": "(m,k)",
++                "dequantize_s8": "(m,n)",
++                "dequantize_epilogue_bf16": "(m,n)",
++            },
++        },
++        "config": vars(args),
++    }
++
++    if args.build_only:
++        from pypto.compiler.targets.cuda_w8a8 import CudaW8A8Compiler
++        from pypto.lowering.gpu.cuda_w8a8 import CudaW8A8Device
++
++        compiler = CudaW8A8Compiler(
++            device=CudaW8A8Device(index=0, name="preflight", major=12, minor=0, total_memory=0)
++        )
++        built = []
++        for case in cases:
++            artifact, plan, _target_ir = compile_case(compiler, case)
++            built.append(
++                {
++                    "case_id": case["case_id"],
++                    "ptx_bytes": len(artifact.payload) if hasattr(artifact, "payload") else None,
++                    "kernel": plan.kernel,
++                    "plan": plan.to_dict(),
++                }
++            )
++        report["build_only"] = {"status": "OK", "cases": built, "count": len(built)}
++        report["status"] = "BUILD_ONLY"
++        _write(report, args.output)
++        print("build-only: {} artifacts compiled".format(len(built)))
++        return 0
++
++    if str(REPO_ROOT / "python") not in sys.path:
++        sys.path.insert(0, str(REPO_ROOT / "python"))
++
++    from pypto.backends.cuda import CudaDriver, CudaRuntime
++    from pypto.compiler.targets.cuda_w8a8 import CudaW8A8Compiler
++
++    driver = CudaDriver()
++    device_info = driver.device_info(args.gpu_index)
++    runtime = CudaRuntime(driver=driver, device_index=args.gpu_index)
++    runtime._ensure_context()
++    probe = runtime.probe_w8a8_device()
++    compiler = CudaW8A8Compiler(driver=driver, device_index=args.gpu_index)
++    report["device"] = device_info.to_dict() if hasattr(device_info, "to_dict") else str(device_info)
++    report["w8a8_probe"] = probe.to_dict() if hasattr(probe, "to_dict") else str(probe)
++    report["gpu_fingerprint_before"] = _fingerprint()
++
++    # preflight window check: five GPU-wide utilization samples over ~5 s
++    preflight = []
++    if not args.skip_preflight:
++        for _ in range(5):
++            lines = _gpu_fact("utilization.gpu,memory.used,clocks.current.sm")
++            if lines:
++                parts = [part.strip() for part in lines[0].split(",")]
++                try:
++                    preflight.append(
++                        {
++                            "utilization_gpu_pct": float(parts[0]),
++                            "memory_used_mib": float(parts[1]),
++                            "clocks_sm_mhz": float(parts[2]),
++                        }
++                    )
++                except (ValueError, IndexError):
++                    pass
++            time.sleep(1.0)
++    preflight_utils = [sample["utilization_gpu_pct"] for sample in preflight]
++    preflight_median = statistics.median(preflight_utils) if preflight_utils else None
++    report["gpu_preflight"] = {
++        "samples": preflight,
++        "utilization_gpu_pct_median": round_sig(preflight_median),
++        "utilization_gpu_pct_max": max(preflight_utils) if preflight_utils else None,
++    }
++    if (
++        args.preflight_max_utilization_pct is not None
++        and preflight_median is not None
++        and preflight_median > args.preflight_max_utilization_pct
++    ):
++        report["status"] = "PREFLIGHT_NOISY"
++        report["finished_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++        _write(report, args.output)
++        print(
++            "preflight: median GPU utilization {:.1f}% > {:.1f}%; not measuring".format(
++                preflight_median, args.preflight_max_utilization_pct
++            )
++        )
++        return 3
++
++    # clock warmup payload: repeat the largest qmatmul case for >= 2 s
++    started = time.time()
++    warmup_case = None
++    largest_flops = -1.0
++    for case in cases:
++        if case["opcode"] != "qmatmul_s8s8_s32":
++            continue
++        flops = 2.0 * case["m"] * case["k"] * case["n"]
++        if flops > largest_flops:
++            largest_flops = flops
++            warmup_case = case
++    report["clock_warmup"] = {"requested_seconds": args.clock_warmup_seconds}
++    if warmup_case is not None:
++        artifact, plan, _target_ir = compile_case(compiler, warmup_case)
++        warmup_case["artifact"] = artifact
++        buffers, pointers = allocate_case_buffers(driver, runtime, plan, warmup_case)
++        try:
++            kernel, grid, block, parameters, _count = launch_plan_for_case(
++                runtime, plan, warmup_case, pointers
++            )
++            loaded = runtime._load_w8a8(artifact)
++            module = driver.module_load_data(loaded.ptx)
++            function = module.get_function(kernel)
++            sampler = ClockSampler(interval=0.4)
++            sampler._t0 = time.time()
++            sampler.start()
++            launches = 0
++            payload_started = time.time()
++            while time.time() - payload_started < max(0.0, args.clock_warmup_seconds):
++                driver.launch_kernel(function, grid, block, parameters, None, 0)
++                launches += 1
++                if launches % 32 == 0:
++                    driver.context_synchronize()
++            driver.context_synchronize()
++            payload_seconds = time.time() - payload_started
++            sampler.stop()
++            sampler.join(timeout=5)
++
++            # wall-clock agreement on a workload-bearing span large enough that
++            # enqueue cost is negligible against device time (B3a proof #3).
++            wall_agreement = _wall_agreement(
++                driver,
++                lambda: driver.launch_kernel(function, grid, block, parameters, None, 0),
++                repeats_list=(128, 256),
++            )
++            module.close()
++            clock_values = [s["clocks_sm_mhz"] for s in sampler.samples if s.get("clocks_sm_mhz")]
++            max_values = [s["clocks_max_sm_mhz"] for s in sampler.samples if s.get("clocks_max_sm_mhz")]
++            clock_max = max(max_values) if max_values else None
++            clock_median = statistics.median(clock_values) if clock_values else None
++            clock_ratio = (clock_median / clock_max) if clock_median and clock_max else None
++            report["clock_warmup"].update(
++                {
++                    "seconds_actual": round_sig(payload_seconds),
++                    "launches": launches,
++                    "clocks_sm_mhz_samples": clock_values,
++                    "clocks_sm_mhz_median": round_sig(clock_median),
++                    "clocks_max_sm_mhz": clock_max,
++                    "clock_ratio_median": round_sig(clock_ratio),
++                    "clock_verdict": "VALID"
++                    if clock_ratio is not None and clock_ratio >= 0.9
++                    else "INVALID_CLOCK",
++                    "gpu_samples": sampler.samples,
++                    "warmup_case": warmup_case["case_id"],
++                    "warmup_flops": largest_flops,
++                }
++            )
++            report["wall_agreement"] = wall_agreement
++        finally:
++            buffers.free()
++    report["gpu_fingerprint_during"] = _fingerprint()
++
++    # in-window rate calibration: two different known gaps per window give both
++    # the platform rate and a linearity check (B3a gate: spread <= 3%,
++    # linearity <= 3%, corrected-vs-host-wall <= 5%).
++    calibration_start = {
++        "gap_a": _rate_calibration(driver, args.rate_gap, args.rate_rounds),
++        "gap_b": _rate_calibration(driver, args.rate_gap * 2.0, args.rate_rounds),
++    }
++    report["rate_calibration_start"] = calibration_start
++
++    # GPU-wide utilization/memory sampler covering the whole measurement window
++    run_sampler = ClockSampler(interval=1.0)
++    run_sampler._t0 = time.time()
++    run_sampler.start()
++
++    # compile + measure every case
++    measured_cases = []
++    for index, case in enumerate(cases, 1):
++        artifact, plan, _target_ir = compile_case(compiler, case)
++        case["artifact"] = artifact
++        buffers, pointers = allocate_case_buffers(driver, runtime, plan, case)
++        started_case = time.time()
++        try:
++            record = run_case_measurement(
++                runtime,
++                driver,
++                plan,
++                case,
++                buffers,
++                pointers,
++                args.rounds,
++                args.warmup,
++                args.batch_repeats,
++            )
++            record.update(
++                {
++                    "case_id": case["case_id"],
++                    "opcode": case["opcode"],
++                    "m": case["m"],
++                    "k": case["k"],
++                    "n": case["n"],
++                    "w8j_row_name": case["w8j_row_name"],
++                    "seconds": round_sig(time.time() - started_case),
++                }
++            )
++            measured_cases.append(record)
++            median = statistics.median(record["measured_kernel_seconds"])
++            print(
++                "[{:2d}/{:2d}] {} median={:.6g} s".format(
++                    index, len(cases), case["case_id"], median
++                ),
++                file=sys.stderr,
++            )
++        finally:
++            buffers.free()
++
++    report["cases"] = measured_cases
++
++    # representative dispatch overhead (public entry points)
++    if not args.skip_dispatch:
++        proxy = TimingProxy(driver)
++        proxy_runtime = CudaRuntime(driver=proxy, device_index=args.gpu_index)
++        # reuse the context the direct measurement already created; a second
++        # cuCtxCreate would add a context for no measurement value.
++        proxy_runtime._context = runtime._context
++        dispatch = []
++        for opcode in opcodes:
++            candidate = None
++            for item in cases:
++                if (
++                    item["opcode"] == opcode
++                    and item["m"] == 1
++                    and item["k"] == 1024
++                    and item["n"] == 32
++                ):
++                    candidate = item
++                    break
++            if candidate is None or not candidate.get("artifact"):
++                dispatch.append(
++                    {"opcode": opcode, "skipped": "representative shape not in the selected case set"}
++                )
++                continue
++            try:
++                dispatch.append(
++                    dispatch_overhead(
++                        proxy_runtime, proxy, candidate["artifact"], candidate, args.dispatch_rounds
++                    )
++                )
++            except Exception as exc:
++                dispatch.append(
++                    {
++                        "opcode": opcode,
++                        "case_id": candidate["case_id"],
++                        "error": "{}: {}".format(type(exc).__name__, exc),
++                    }
++                )
++        report["dispatch_overhead"] = dispatch
++
++    # vendor two-pass + bf16 baseline
++    if not args.skip_vendor:
++        report["vendor_two_pass"] = run_vendor_comparison(
++            driver, runtime, compiler, cases, args.rounds, args.warmup
++        )
++
++    # end-window rate calibration + long-batch wall agreement
++    calibration_end = {
++        "gap_a": _rate_calibration(driver, args.rate_gap, args.rate_rounds),
++        "gap_b": _rate_calibration(driver, args.rate_gap * 2.0, args.rate_rounds),
++    }
++    run_sampler.stop()
++    run_sampler.join(timeout=10)
++    report["gpu_samples_during_measurement"] = run_sampler.samples
++    utilizations = [
++        sample["utilization_gpu_pct"]
++        for sample in run_sampler.samples
++        if sample.get("utilization_gpu_pct") is not None
++    ]
++    memories = [
++        sample["memory_used_mib"]
++        for sample in run_sampler.samples
++        if sample.get("memory_used_mib") is not None
++    ]
++    report["window_contamination"] = {
++        "utilization_gpu_pct_samples": utilizations,
++        "utilization_gpu_pct_median": round_sig(statistics.median(utilizations))
++        if utilizations
++        else None,
++        "utilization_gpu_pct_max": max(utilizations) if utilizations else None,
++        "memory_used_mib_samples": memories,
++        "memory_used_mib_min": min(memories) if memories else None,
++        "memory_used_mib_max": max(memories) if memories else None,
++        "shared_window": bool(utilizations and statistics.median(utilizations) > 20.0),
++        "note": (
++            "GPU-wide nvidia-smi samples from inside WSL; on this shared GamePC they include "
++            "the owner's Windows graphics/VR workload, which is not attributed to a compute app"
++        ),
++    }
++    report["rate_calibration_end"] = calibration_end
++    report["gpu_fingerprint_after"] = _fingerprint()
++    report["finished_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++    report["status"] = "OK"
++    report["load_seconds"] = round_sig(time.time() - started)
++
++    blocks = [
++        window[key]
++        for window in (calibration_start, calibration_end)
++        for key in ("gap_a", "gap_b")
++    ]
++    rates = [block["median_rate"] for block in blocks if block.get("median_rate")]
++    if rates:
++        window_rate = statistics.median(rates)
++        gaps_a = [window["gap_a"]["median_rate"] for window in (calibration_start, calibration_end)]
++        gaps_b = [window["gap_b"]["median_rate"] for window in (calibration_start, calibration_end)]
++        linearity_pct = (
++            abs(statistics.median(gaps_a) - statistics.median(gaps_b)) / window_rate * 100.0
++        )
++        batch_agreements = []
++        for case in measured_cases:
++            batch = case.get("batch") or {}
++            if batch.get("span_seconds") and batch.get("host_wall_seconds"):
++                corrected = batch["span_seconds"] * window_rate
++                batch_agreements.append(
++                    abs(corrected - batch["host_wall_seconds"]) / batch["host_wall_seconds"] * 100.0
++                )
++        report["rate_calibration_window"] = {
++            "window_rate_median": round_sig(window_rate),
++            "rate_offset_pct": round_sig((window_rate - 1.0) * 100.0),
++            "rate_spread_pct": round_sig(
++                (max(rates) - min(rates)) / window_rate * 100.0 if len(rates) > 1 else 0.0
++            ),
++            "linearity_pct": round_sig(linearity_pct),
++            "corrected_wall_agreement_pct": round_sig(
++                statistics.median(batch_agreements) if batch_agreements else None
++            ),
++            "corrected_wall_agreement_pct_max": round_sig(
++                max(batch_agreements) if batch_agreements else None
++            ),
++            "batch_agreement_samples_pct": [round_sig(value) for value in batch_agreements],
++            "note": "corrected kernel_seconds = raw x window_rate_median",
++        }
++
++    _write(report, args.output)
++    print("wrote {}".format(args.output))
++    return 0
++
++
++def _write(report, path):
++    output = Path(path)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    with output.open("w", encoding="utf-8") as handle:
++        json.dump(report, handle, indent=2, sort_keys=False, ensure_ascii=False)
++
++
++if __name__ == "__main__":
++    sys.exit(main())

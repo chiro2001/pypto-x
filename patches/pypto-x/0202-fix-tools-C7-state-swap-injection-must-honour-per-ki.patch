@@ -1,0 +1,364 @@
+From 35b44bfe0cd5982f3210034e894f1b8882c8f80a Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 03:50:12 +0800
+Subject: [PATCH 202/217] fix(tools): C7 state-swap injection must honour
+ per-kind HF cache dtype
+
+HF w8a8 cache stores conv_state/key_cache/value_cache as bf16 but
+recurrent_state as float32. The first self-check cast every state to the
+model param dtype (bf16), truncating the fp32 recurrent state and making
+the injected-state forward differ from the sequential one. inject() now
+uses the per-kind dtype recorded in the gold dump manifest; add
+analyze_state_compare.py and the state comparison summary.
+---
+ tools/diag_c7/analyze_state_compare.py    | 173 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ tools/diag_c7/state_swap_experiment.py    |  61 ++++++++++++++----
+ tools/diag_c7/wait_and_run_gold_states.sh |   6 +-
+ 3 files changed, 224 insertions(+), 16 deletions(-)
+
+diff --git a/tools/diag_c7/analyze_state_compare.py b/tools/diag_c7/analyze_state_compare.py
+new file mode 100644
+index 000000000..ea943b1cd
+--- /dev/null
++++ b/tools/diag_c7/analyze_state_compare.py
+@@ -0,0 +1,173 @@
++#!/usr/bin/env python3
++"""C7 诊断：汇总 compare_states.json（state 对比）成可引用的小 JSON。
++
++输入：compare_states.json（ours state vs gold HF state 的逐层/逐步对比）
++       decode_gap_analysis.json（logits 缺口，用来对齐 state 输入误差 → logits 误差）
++输出：state_compare_summary.json
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import statistics
++from pathlib import Path
++
++CONFIGS = ("default", "full")
++PROMPTS = ("en_continuation", "zh_continuation", "chat_zh_user")
++KINDS = ("conv_state", "recurrent_state", "key_cache", "value_cache")
++TAGS = ("after_prefill", "step_0", "step_1", "step_2", "step_3", "step_4")
++
++
++def collect(prompt_data, kind, tag):
++    values = []
++    for layer, entry in prompt_data.get("layers", {}).items():
++        step = entry.get(kind, {}).get("steps", {}).get(tag)
++        if step and step.get("status") == "ok":
++            values.append((layer, step))
++    return values
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--compare", required=True)
++    parser.add_argument("--analysis", required=True)
++    parser.add_argument("--output", required=True)
++    args = parser.parse_args()
++    compare = json.loads(Path(args.compare).read_text(encoding="utf-8"))
++    analysis = json.loads(Path(args.analysis).read_text(encoding="utf-8"))
++    out = {"tool": "analyze_state_compare",
++           "source": {"compare": args.compare, "analysis": args.analysis},
++           "prompts": {}, "correlations": {}, "status_counts": {}}
++
++    status_counts = {}
++    for config in CONFIGS:
++        for prompt in PROMPTS:
++            prompt_data = compare.get("configs", {}).get(config, {}).get("prompts", {}).get(prompt, {})
++            if "layers" not in prompt_data:
++                out["prompts"]["{}|{}".format(config, prompt)] = {"status": prompt_data.get("status", "unknown")}
++                continue
++            entry = {"by_kind_tag": {}, "layers_prefill_range": {}, "logits_series": []}
++            for kind in KINDS:
++                for tag in TAGS:
++                    items = collect(prompt_data, kind, tag)
++                    if not items:
++                        continue
++                    rels = [item[1]["rel_l2"] for item in items]
++                    cosines = [item[1]["cosine"] for item in items]
++                    finite = all(item[1].get("finite_ours") and item[1].get("finite_gold") for item in items)
++                    bitwise = sum(1 for item in items if item[1].get("bitwise_equal_float32_cast"))
++                    key = "{}|{}".format(kind, tag)
++                    entry["by_kind_tag"][key] = {
++                        "layers": len(items),
++                        "rel_l2_median": statistics.median(rels),
++                        "rel_l2_min": min(rels),
++                        "rel_l2_max": max(rels),
++                        "cosine_median": statistics.median(cosines),
++                        "all_finite": finite,
++                        "bitwise_equal_count": bitwise,
++                    }
++                    status_counts["ok"] = status_counts.get("ok", 0) + len(items)
++                    if not finite:
++                        status_counts["nonfinite"] = status_counts.get("nonfinite", 0) + 1
++            # 最差输入步的逐层 top / bottom
++            for kind in KINDS:
++                items = collect(prompt_data, kind, "step_2")
++                if items:
++                    items.sort(key=lambda item: -item[1]["rel_l2"])
++                    entry.setdefault("step_2_top_layers", {})[kind] = [
++                        {"layer": item[0], "rel_l2": item[1]["rel_l2"],
++                         "cosine": item[1]["cosine"], "max_abs": item[1]["max_abs"]}
++                        for item in items[:5]]
++                    entry.setdefault("step_2_bottom_layers", {})[kind] = [
++                        {"layer": item[0], "rel_l2": item[1]["rel_l2"]} for item in items[-3:]]
++            # logits 序列
++            rows = analysis.get("configs", {}).get(config, {}).get("prompts", {}).get(prompt, {}).get("rows", [])
++            for row in rows:
++                if "ours" in row:
++                    entry["logits_series"].append({
++                        "row": row["row"],
++                        # ours-vs-gold 相对 L2（同空间），不是 band 比
++                        "rel_l2": (row["ours"]["delta_norm"] / row["ours"]["gold_norm"]
++                                   if row["ours"]["gold_norm"] else None),
++                        "band_norm_ratio": (row["ours"]["delta_norm"] / row["gold_vs_fp32"]["delta_norm"]
++                                            if row["gold_vs_fp32"]["delta_norm"] else None),
++                        "cosine": row["ours"]["cosine"],
++                    })
++            out["prompts"]["{}|{}".format(config, prompt)] = entry
++
++    # 相关性：state 输入误差（各 kind 中位） vs 同一步 logits rel_l2
++    points = []
++    for config in CONFIGS:
++        for prompt in PROMPTS:
++            key = "{}|{}".format(config, prompt)
++            if key not in out["prompts"]:
++                continue
++            entry = out["prompts"][key]
++            series = {item["row"]: item for item in entry.get("logits_series", [])}
++            for step_index, tag in enumerate(TAGS):
++                if step_index == 0:
++                    tag = "after_prefill"
++                else:
++                    tag = "step_{}".format(step_index - 1)
++                if tag not in ("after_prefill", "step_0", "step_1", "step_2", "step_3"):
++                    continue
++                logits = series.get(step_index)
++                if not logits or logits.get("rel_l2") is None:
++                    continue
++                state_medians = []
++                for kind in KINDS:
++                    item = entry["by_kind_tag"].get("{}|{}".format(kind, tag))
++                    if item:
++                        state_medians.append(item["rel_l2_median"])
++                if state_medians:
++                    x = statistics.median(state_medians)
++                    points.append({"config": config, "prompt": prompt, "step": step_index,
++                                   "state_input_median_rel_l2": x,
++                                   "logits_rel_l2": logits["rel_l2"]})
++    if len(points) >= 3:
++        xs = [p["state_input_median_rel_l2"] for p in points]
++        ys = [p["logits_rel_l2"] for p in points]
++        mx, my = statistics.mean(xs), statistics.mean(ys)
++        cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
++        sx = math.sqrt(sum((x - mx) ** 2 for x in xs))
++        sy = math.sqrt(sum((y - my) ** 2 for y in ys))
++        pearson = cov / (sx * sy) if sx and sy else None
++        out["correlations"] = {
++            "n_points": len(points),
++            "pearson_state_input_vs_logits": pearson,
++            "amplification_logits_over_state_median": statistics.median(
++                [p["logits_rel_l2"] / p["state_input_median_rel_l2"] for p in points]),
++            "points": points,
++        }
++    out["status_counts"] = status_counts
++    # row0（prefill_next）单独统计：state 输入 tag=after_prefill
++    out["prefill_state_vs_row0"] = []
++    for config in CONFIGS:
++        for prompt in PROMPTS:
++            key = "{}|{}".format(config, prompt)
++            entry = out["prompts"].get(key)
++            if not entry or "by_kind_tag" not in entry:
++                continue
++            state = [entry["by_kind_tag"].get("{}|after_prefill".format(kind)) for kind in KINDS]
++            state = [item for item in state if item]
++            logits = next((item for item in entry["logits_series"] if item["row"] == 0), None)
++            out["prefill_state_vs_row0"].append({
++                "config": config, "prompt": prompt,
++                "state_prefill_median_rel_l2": statistics.median([item["rel_l2_median"] for item in state]),
++                "row0_logits_rel_l2": logits["rel_l2"] if logits else None,
++            })
++    output = Path(args.output)
++    output.write_text(json.dumps(out, indent=1), encoding="utf-8")
++    print("[analyze_state_compare] wrote {}".format(output))
++    print("[analyze_state_compare] status_counts={}".format(status_counts))
++    if out["correlations"]:
++        print("[analyze_state_compare] pearson(state_input, logits)={:.3f} n={} median amplification={:.2f}".format(
++            out["correlations"]["pearson_state_input_vs_logits"] or float("nan"),
++            out["correlations"]["n_points"],
++            out["correlations"]["amplification_logits_over_state_median"]))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/diag_c7/state_swap_experiment.py b/tools/diag_c7/state_swap_experiment.py
+index d20ba9d44..eb3ddb578 100644
+--- a/tools/diag_c7/state_swap_experiment.py
++++ b/tools/diag_c7/state_swap_experiment.py
+@@ -104,34 +104,66 @@ def gold_snapshot(npz, tag, layer):
+     return out
+ 
+ 
++def gold_dtype_map(gold_dir):
++    """从 gold dump manifest 读 per-key 原始 dtype；按 kind 归并（要求同 kind 一致）。"""
++    import torch
++    manifest_path = Path(gold_dir) / "gold_states_manifest.json"
++    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
++    mapping = {}
++    name_map = {"conv_state": "conv", "recurrent_state": "recurrent",
++                "key_cache": "k", "value_cache": "v"}
++    for run in manifest.get("runs", []):
++        for key, dtype_name in run.get("state_dtypes", {}).items():
++            kind = name_map[key.split("__")[-1]]
++            dtype = getattr(torch, dtype_name.replace("torch.", ""))
++            if kind in mapping and mapping[kind] != dtype:
++                raise SystemExit("gold dtype 不一致: {} {} vs {}".format(kind, mapping[kind], dtype))
++            mapping[kind] = dtype
++    if not mapping:
++        raise SystemExit("gold manifest 无 state_dtypes: {}".format(manifest_path))
++    return mapping
++
++
+ def make_cache(model):
+     from transformers import DynamicCache
+     return DynamicCache(config=model.model.language_model.config)
+ 
+ 
+-def inject(cache, snapshots, dtype):
++def inject(cache, snapshots, dtype_by_kind):
++    """把 {layer: {conv/recurrent/k/v}} 注入 HF cache。
++
++    注意：HF cache 的 state dtype 并不统一——实测 w8a8 gold：
++      conv_state=bf16, key/value_cache=bf16, recurrent_state=**float32**。
++    因此必须按 kind 使用各自的目标 dtype（dtype_by_kind），不能统一 cast 到模型的
++    参数 dtype（bf16），否则会把 fp32 的 recurrent state 截断成 bf16。
++    """
+     import torch
++    kind_slot = {"conv": "conv_states", "recurrent": "recurrent_states",
++                 "k": "keys", "v": "values"}
+     for index, cache_layer in enumerate(cache.layers):
+         snap = snapshots.get(index, {})
+         if hasattr(cache_layer, "conv_states"):
+             if "conv" in snap:
+-                tensor = torch.as_tensor(np.ascontiguousarray(snap["conv"]), dtype=dtype)
++                tensor = torch.as_tensor(np.ascontiguousarray(snap["conv"]),
++                                         dtype=dtype_by_kind["conv"])
+                 cache_layer.conv_states[0] = tensor
+                 cache_layer.is_conv_states_initialized[0] = True
+                 cache_layer.conv_kernel_size[0] = int(tensor.shape[-1])
+             if "recurrent" in snap:
+                 cache_layer.recurrent_states[0] = torch.as_tensor(
+-                    np.ascontiguousarray(snap["recurrent"]), dtype=dtype)
++                    np.ascontiguousarray(snap["recurrent"]), dtype=dtype_by_kind["recurrent"])
+                 cache_layer.is_recurrent_states_initialized[0] = True
+                 cache_layer.has_previous_state[0] = True
+-            cache_layer.dtype = dtype
++            cache_layer.dtype = dtype_by_kind.get("conv", dtype_by_kind.get("recurrent"))
+             cache_layer.device = torch.device("cpu")
+         else:
+             if "k" in snap and "v" in snap:
+-                cache_layer.keys = torch.as_tensor(np.ascontiguousarray(snap["k"]), dtype=dtype)
+-                cache_layer.values = torch.as_tensor(np.ascontiguousarray(snap["v"]), dtype=dtype)
++                cache_layer.keys = torch.as_tensor(np.ascontiguousarray(snap["k"]),
++                                                   dtype=dtype_by_kind["k"])
++                cache_layer.values = torch.as_tensor(np.ascontiguousarray(snap["v"]),
++                                                     dtype=dtype_by_kind["v"])
+                 cache_layer.is_initialized = True
+-                cache_layer.dtype = dtype
++                cache_layer.dtype = dtype_by_kind["k"]
+                 cache_layer.device = torch.device("cpu")
+ 
+ 
+@@ -190,7 +222,7 @@ def snapshot_inline(past):
+     return out
+ 
+ 
+-def self_check(model, item, param_dtype, steps=3):
++def self_check(model, item, dtype_by_kind, steps=3):
+     """注入现场捕获的 gold state，验证 A_j 与顺序前向 logits 逐位一致。"""
+     import torch
+     with torch.no_grad():
+@@ -212,7 +244,7 @@ def self_check(model, item, param_dtype, steps=3):
+     checks = []
+     for j in range(steps):
+         cache = make_cache(model)
+-        inject(cache, snaps[j], param_dtype)
++        inject(cache, snaps[j], dtype_by_kind)
+         measured = measure(model, cache, chain[j])
+         checks.append({
+             "step": j,
+@@ -266,11 +298,14 @@ def main():
+     print("[swap] variant={} param_dtype={} quantized={}".format(
+         args.variants, param_dtype, audit["scope"]["quantized_module_count"]), flush=True)
+ 
++    dtype_by_kind = gold_dtype_map(args.gold_states_dir)
++    print("[swap] state dtypes (from gold manifest): {}".format(dtype_by_kind), flush=True)
+     if args.self_check:
+         report = {"tool": "state_swap_experiment.self_check",
+                   "param_dtype": str(param_dtype),
++                  "state_dtypes": {key: str(value) for key, value in dtype_by_kind.items()},
+                   "variant": args.variants,
+-                  "prompts": [self_check(model, prompt, param_dtype, steps=min(3, args.steps))
++                  "prompts": [self_check(model, prompt, dtype_by_kind, steps=min(3, args.steps))
+                               for prompt in prompts]}
+         out_path = Path(args.out)
+         out_path.parent.mkdir(parents=True, exist_ok=True)
+@@ -373,14 +408,14 @@ def main():
+                 }
+                 # A_j: gold states
+                 cache = make_cache(model)
+-                inject(cache, gold_snap, param_dtype)
++                inject(cache, gold_snap, dtype_by_kind)
+                 baseline = measure(model, cache, token)
+                 baseline_vs_seq = compare(baseline, logits_seq[j + 1])
+                 baseline_vs_seq["bitwise_equal"] = bool(np.array_equal(
+                     baseline, logits_seq[j + 1]))
+                 # B_j: ours states
+                 cache = make_cache(model)
+-                inject(cache, ours_snap, param_dtype)
++                inject(cache, ours_snap, dtype_by_kind)
+                 ours_swap = measure(model, cache, token)
+                 # C_j: ours dump logits（j 步的 dump = 消耗 token j 之后）
+                 ours_dump = np.asarray(
+@@ -400,7 +435,7 @@ def main():
+                     fixed_snap = dict(ours_snap)
+                     fixed_snap[layer] = gold_snap[layer]
+                     cache = make_cache(model)
+-                    inject(cache, fixed_snap, param_dtype)
++                    inject(cache, fixed_snap, dtype_by_kind)
+                     fixed = measure(model, cache, token)
+                     metric = compare(fixed, baseline)
+                     gain = None
+diff --git a/tools/diag_c7/wait_and_run_gold_states.sh b/tools/diag_c7/wait_and_run_gold_states.sh
+index 7dd4b12a3..1a31767d8 100755
+--- a/tools/diag_c7/wait_and_run_gold_states.sh
++++ b/tools/diag_c7/wait_and_run_gold_states.sh
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env bash
+-# C7 诊断：以 300s 节奏重试获取 local 锁，锁内 dump gold states。
++# C7 诊断：以 120s 节奏重试获取 local 锁，锁内 dump gold states。
+ # 背景运行：nohup tools/diag_c7/wait_and_run_gold_states.sh <evidence-dir> &
+ set -uo pipefail
+ 
+@@ -10,7 +10,7 @@ mkdir -p "${EV}/logs"
+ OUT="${EV}/logs/heavy_gold_states.out"
+ echo "[c7-waiter] start $(date -u +%Y-%m-%dT%H:%M:%SZ) pid=$$" | tee -a "${OUT}"
+ 
+-for attempt in $(seq 1 40); do
++for attempt in $(seq 1 120); do
+   echo "[c7-waiter] attempt ${attempt} $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${OUT}"
+   "${RUNNER}" \
+     --task c7-gold-states --agent c7-decode-gap-localization \
+@@ -28,7 +28,7 @@ for attempt in $(seq 1 40); do
+     echo "[c7-waiter] non-retryable rc=${rc}" | tee -a "${OUT}"
+     exit ${rc}
+   fi
+-  sleep 300
++  sleep 120
+ done
+ echo "[c7-waiter] gave up after attempts" | tee -a "${OUT}"
+ exit 1

@@ -2,7 +2,7 @@
 
 状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q7_Q8_Q8B_N4_C6TIMING_DONE_LAUNCH_CACHE_DONE_CUDA_QUANTIZE_DONE_C8_Q5_BLOCKED_ON_SVE_INT8_Q10_MERGED_VERIFYING_SVE_LIVENESS_MERGED_A3_LEG_PENDING_Q9_IN_FLIGHT_U1_REFIX_MERGED_AS_8360A9AEE_REVERIFYING_INTEGRATION_HEALTHY_D1_D2_VERIFIED_D3_FIXED_FINAL_RULE8_RUN_PENDING_Q9_OPBENCH_MERGED_C7_DECODE_DIAGNOSED_U1_REVERIFIED_PASS_WITH_BOUNDARIES_Q10_VERIFIED_PASS_WITH_BOUNDARIES_W8A8_V2_M1_DONE_A3_OUTAGE_OPEN`
 
-最后更新：2026-09-12 05:45 CST（Asia/Shanghai；**0040 波次进行中**：D-1/D-2 验收 V1–V4 PASS；规则 8 全量抓到 **D-3**（Q9 新测试文件 session 污染 10 failed）→ 已修合并（tip `c63558e9e`）→ 最终全量在跑；U1 第二轮 **PASS_WITH_BOUNDARIES**；Q10 **PASS_WITH_BOUNDARIES**（A3 leg pending）；C7 decode 缺口定位闭环 + 下钻得"分布式、无支配算子"；**integration 体检判 HEALTHY**（受检 `7e2aea514`，1394/1387/7/0/0，rc=0，759 s，+190/−3 收集差全部溯源），并查出 **D-1**（C6 harness 被 cherry-pick 顺序回退）与 **D-2**（`pack_ours_logits.py` 未定义名）——两者已修复并合入（tip `77981213e`，含新增 6 条静态守卫测试），独立验收在跑、规则 8 全量需在新 tip 重跑｜**U1 首切片验收判 FAIL**（3 条阻断：target fail-open / `policy_from_dict` 吞 `schema_version` / `output` 别名覆盖输入），回修中｜Q10（SVE256 int8 layout）与 liveness 均已合入：Q10 A3 原生 43/43（断线前）、liveness 本地三套件全绿、A3 侧确认待恢复｜C6 计时与 launch-artifact-cache 收口（quantize 重写后位级 58/58、中位 24×；prefill −38.2%、decode −32.1%）｜**A3 自 ~19:12Z 起不可达（20:33Z 复核仍 BLOCKED）**｜控制仓最近一次 push 仍为 7857ae6、补丁 144）
+最后更新：2026-09-12 06:25 CST（Asia/Shanghai；**0040 批次已收口待推送**：最终 tip `c63558e9e` 全量 **1438/1431/7/0/0 rc=0**（规则 8 PASS）；补丁 217；D-1/D-2 验收 V1–V4 PASS；规则 8 全量抓到 **D-3**（Q9 新测试文件 session 污染 10 failed）→ 已修合并（tip `c63558e9e`）→ 最终全量在跑；U1 第二轮 **PASS_WITH_BOUNDARIES**；Q10 **PASS_WITH_BOUNDARIES**（A3 leg pending）；C7 decode 缺口定位闭环 + 下钻得"分布式、无支配算子"；**integration 体检判 HEALTHY**（受检 `7e2aea514`，1394/1387/7/0/0，rc=0，759 s，+190/−3 收集差全部溯源），并查出 **D-1**（C6 harness 被 cherry-pick 顺序回退）与 **D-2**（`pack_ours_logits.py` 未定义名）——两者已修复并合入（tip `77981213e`，含新增 6 条静态守卫测试），独立验收在跑、规则 8 全量需在新 tip 重跑｜**U1 首切片验收判 FAIL**（3 条阻断：target fail-open / `policy_from_dict` 吞 `schema_version` / `output` 别名覆盖输入），回修中｜Q10（SVE256 int8 layout）与 liveness 均已合入：Q10 A3 原生 43/43（断线前）、liveness 本地三套件全绿、A3 侧确认待恢复｜C6 计时与 launch-artifact-cache 收口（quantize 重写后位级 58/58、中位 24×；prefill −38.2%、decode −32.1%）｜**A3 自 ~19:12Z 起不可达（20:33Z 复核仍 BLOCKED）**｜控制仓最近一次 push 仍为 7857ae6、补丁 144）
 
 > **零记忆恢复（上下文压缩后）**：按顺序读 本文件 §0 → `docs/00-handoffs/ERRATA.zh-CN.md` → `docs/00-handoffs/0039-2026-09-11-a3-onboarding-ascend-bridge-sve-w8a8.zh-CN.md` → `configs/development_lock.yaml` 的 `waves.W8.in_flight_2026_09_11_batch2` 与 `pending_user_decisions_2026_09_11`。
 
@@ -75,7 +75,7 @@
 6. 重任务需要用户批准才启动（AGENTS.md「Subagent 协议」第一条）。
 7. 提交纪律：公开主仓 = 本目录（origin）；改完实现 → cherry-pick 到 integration → 独立 verify → 更新
    development_lock/快照/ERRATA → scripts/remote/export_patches.sh → git push origin main → scripts/remote/sync_private_backup.sh。
-   （0038 收口已 push 到 7a064ab；**0039 批次及之后已 push 到 7857ae6，补丁 144**；push 前需用户当次明确批准。）
+   （0038 收口已 push 到 7a064ab；**0039 批次及之后已 push 到 7857ae6，补丁 144**；**0040 批次已本地收口：integration `c63558e9e`、补丁 217（am 复算 tree 一致），控制仓本地提交，未推送——push 需用户当次明确批准。**）
 8. **cherry-pick 后必须立刻跑一次全量 collect + pass/fail 对比**（KF-1 教训，2026-09-12）：任何改动合入 integration
    之后，即使看起来只碰工具目录或文档，也要跑一次全量 pytest 并对比收集数与失败集合；"改动小"不构成跳过理由。
    触发过的事故：C8/Q2 的 cherry-pick 引入 `tools/qwen35_reference/run_reference.py` 的导入回退，导致一条

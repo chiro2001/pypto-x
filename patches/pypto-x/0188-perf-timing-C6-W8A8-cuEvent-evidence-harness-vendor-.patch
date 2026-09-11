@@ -1,0 +1,1071 @@
+From e4a61df8bc3df00bdf9ca95ff6ca3b4b71bf52fc Mon Sep 17 00:00:00 2001
+From: PyPTO-X Agent <agent@pypto-x.local>
+Date: Sat, 12 Sep 2026 02:58:09 +0800
+Subject: [PATCH 188/217] perf(timing): C6 W8A8 cuEvent evidence harness +
+ vendor two-pass shim
+
+Measurement-only tooling for the C6 CUDA W8A8 timing evidence task:
+
+- scripts/perf/c6_timing_harness.py: cuEvent timing of the four frozen
+  W8A8 opcodes on the 12 W8J GEMM shapes (48 cases), in-window cuEvent
+  rate calibration (raw + corrected), warmup + R=21 rounds, ERR-0004
+  outlier marking, dedicated wall-agreement batch, representative
+  public-entry dispatch overhead, GPU window contamination sampling,
+  and the two-pass comparison (cublasGemmEx int8->s32 + our C6
+  epilogue) and bf16 platform baseline, including interleaved paired
+  ratios.
+- scripts/perf/c6_vendor_shim.c: header-checked C shim for classic
+  cublasGemmEx; a direct ctypes call with the documented 19-argument
+  signature was rejected on the GamePC CUDA 13.3 stack while the
+  identical C call returns status 0.
+- scripts/perf/c6_timing_analyze.py: ERR-0004 / variance / rate-gate
+  analysis + markdown tables, all UNGATED.
+- scripts/perf/c6_timing_selftest.py: local mock self-test of the
+  launch mapping, buffer sizes, correctness checks and verdicts.
+- scripts/perf/c6_timing_gamepc.sh: sync/run/fetch/clean runner for the
+  shared GamePC (GPU-only, no gamepc lock, no residue).
+
+No runtime/compiler/contract source is modified.
+---
+ scripts/perf/c6_timing_analyze.py  | 465 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ scripts/perf/c6_timing_gamepc.sh   |  94 ++++++++++++
+ scripts/perf/c6_timing_harness.py  |  55 +------
+ scripts/perf/c6_timing_selftest.py | 277 ++++++++++++++++++++++++++++++++++
+ scripts/perf/c6_vendor_shim.c      |  76 ++++++++++
+ 5 files changed, 915 insertions(+), 52 deletions(-)
+
+diff --git a/scripts/perf/c6_timing_analyze.py b/scripts/perf/c6_timing_analyze.py
+new file mode 100644
+index 000000000..6566643f8
+--- /dev/null
++++ b/scripts/perf/c6_timing_analyze.py
+@@ -0,0 +1,465 @@
++#!/usr/bin/env python3
++"""Analyzer for ``c6_timing_harness.py`` raw evidence (ERR-0004 verdicts).
++
++Reads one raw JSON from the harness and writes:
++
++    <output>/analysis.json          full structured analysis
++    <output>/tables.zh-CN.md        the tables quoted in the brief
++
++Everything is UNGATED: the analyzer computes protocol verdicts (round
++stability, ERR-0004 outlier marking, B3a rate-calibration gate) but never
++promotes any number to a cross-platform threshold.
++
++Usage:
++
++    python3 scripts/perf/c6_timing_analyze.py \
++        --raw <raw.json> --output <analysis-dir>
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import statistics
++from pathlib import Path
++
++CV_LIMIT_CLOCK_VALID = 0.03
++P95_LIMIT_CLOCK_VALID = 1.15
++CV_LIMIT_CLOCK_UNLOCKED = 0.05
++P95_LIMIT_CLOCK_UNLOCKED = 1.25
++OUTLIER_RATIO_LIMIT = 0.10
++RATE_SPREAD_LIMIT_PCT = 3.0
++LINEARITY_LIMIT_PCT = 3.0
++CORRECTED_AGREEMENT_LIMIT_PCT = 5.0
++
++
++def percentile_nearest_rank(values, fraction):
++    ordered = sorted(values)
++    rank = max(1, int(math.ceil(fraction * len(ordered))))
++    return ordered[min(rank, len(ordered)) - 1]
++
++
++def round_sig(value, digits=9):
++    if value is None:
++        return None
++    return round(float(value), digits)
++
++
++def stats_block(values):
++    samples = [float(value) for value in values]
++    median = statistics.median(samples)
++    stdev = statistics.stdev(samples) if len(samples) > 1 else 0.0
++    centre = statistics.median(samples)
++    median_mad = statistics.median([abs(value - centre) for value in samples])
++    floor = max(1e-6, 0.02 * median)
++    threshold = max(3.0 * 1.4826 * median_mad, floor)
++    outliers = [index for index, value in enumerate(samples) if abs(value - median) > threshold]
++    p95 = percentile_nearest_rank(samples, 0.95)
++    return {
++        "n": len(samples),
++        "min": round_sig(min(samples)),
++        "median": round_sig(median),
++        "p95_nearest_rank": round_sig(p95),
++        "max": round_sig(max(samples)),
++        "stdev": round_sig(stdev),
++        "cv": round_sig(stdev / median if median else None),
++        "p95_over_median": round_sig(p95 / median if median else None),
++        "mad": round_sig(median_mad),
++        "outlier_floor_seconds": round_sig(floor, 12),
++        "outlier_threshold_seconds": round_sig(threshold, 12),
++        "outlier_indices": outliers,
++        "outlier_ratio": round_sig(len(outliers) / len(samples)),
++    }
++
++
++def case_verdict(stats, clock_valid):
++    cv_limit = CV_LIMIT_CLOCK_VALID if clock_valid else CV_LIMIT_CLOCK_UNLOCKED
++    p95_limit = P95_LIMIT_CLOCK_VALID if clock_valid else P95_LIMIT_CLOCK_UNLOCKED
++    reasons = []
++    if stats["outlier_ratio"] > OUTLIER_RATIO_LIMIT:
++        reasons.append("UNSTABLE(outlier_ratio>0.10)")
++    if stats["cv"] is not None and stats["cv"] > cv_limit:
++        reasons.append("INVALID_VARIANCE(cv>{}%)".format(cv_limit * 100))
++    if stats["p95_over_median"] is not None and stats["p95_over_median"] > p95_limit:
++        reasons.append("INVALID_VARIANCE(p95/median>{})".format(p95_limit))
++    return {
++        "cv_limit": cv_limit,
++        "p95_limit": p95_limit,
++        "verdict": "PASS" if not reasons else "; ".join(reasons),
++        "gate_eligible": not reasons,
++    }
++
++
++def analyse(raw):
++    window = raw.get("rate_calibration_window") or {}
++    rate = window.get("window_rate_median")
++    clock_valid = (raw.get("clock_warmup") or {}).get("clock_verdict") == "VALID"
++
++    wall = raw.get("wall_agreement") or {}
++    wall_batches = wall.get("batches") or []
++    wall_full = wall_batches[-1] if wall_batches else {}
++    corrected_wall_pct = None
++    if wall_full.get("event_seconds") and wall_full.get("host_wall_seconds") and rate:
++        corrected = wall_full["event_seconds"] * rate
++        corrected_wall_pct = (
++            abs(corrected - wall_full["host_wall_seconds"]) / wall_full["host_wall_seconds"] * 100.0
++        )
++    wall_linearity_pct = wall.get("linearity_pct")
++    wall_source = "dedicated_largest_qmatmul_batch"
++    if corrected_wall_pct is None:
++        # fall back to the per-case back-to-back batches (tiny kernels make this
++        # comparison enqueue-dominated; only used when the dedicated run is absent)
++        agreements = []
++        for record in raw.get("cases", []):
++            batch = record.get("batch") or {}
++            if batch.get("span_seconds") and batch.get("host_wall_seconds") and rate:
++                corrected = batch["span_seconds"] * rate
++                agreements.append(
++                    abs(corrected - batch["host_wall_seconds"]) / batch["host_wall_seconds"] * 100.0
++                )
++        corrected_wall_pct = statistics.median(agreements) if agreements else None
++        wall_source = "per_case_batch_fallback"
++
++    rate_gate = {
++        "window_rate_median": rate,
++        "rate_offset_pct": window.get("rate_offset_pct"),
++        "rate_spread_pct": window.get("rate_spread_pct"),
++        "rate_spread_limit_pct": RATE_SPREAD_LIMIT_PCT,
++        "linearity_pct": wall_linearity_pct if wall_linearity_pct is not None else window.get("linearity_pct"),
++        "linearity_limit_pct": LINEARITY_LIMIT_PCT,
++        "corrected_wall_agreement_pct": round_sig(corrected_wall_pct) if corrected_wall_pct is not None else None,
++        "corrected_wall_agreement_pct_max": window.get("corrected_wall_agreement_pct_max"),
++        "corrected_wall_agreement_limit_pct": CORRECTED_AGREEMENT_LIMIT_PCT,
++        "wall_agreement_source": wall_source,
++        "wall_agreement_batches": wall_batches,
++    }
++    rate_gate["rate_stable"] = (
++        rate_gate["rate_spread_pct"] is not None
++        and rate_gate["rate_spread_pct"] <= RATE_SPREAD_LIMIT_PCT
++    )
++    rate_gate["linear_pass"] = (
++        rate_gate["linearity_pct"] is not None
++        and rate_gate["linearity_pct"] <= LINEARITY_LIMIT_PCT
++    )
++    rate_gate["corrected_pass"] = (
++        rate_gate["corrected_wall_agreement_pct"] is not None
++        and rate_gate["corrected_wall_agreement_pct"] <= CORRECTED_AGREEMENT_LIMIT_PCT
++    )
++    rate_gate["verdict"] = (
++        "PASS"
++        if rate_gate["rate_stable"] and rate_gate["linear_pass"] and rate_gate["corrected_pass"]
++        else "FAIL"
++    )
++    rate_gate["platform_flags"] = (
++        ["wsl2_cuevent_rate_offset"]
++        if rate is not None and abs(rate - 1.0) * 100.0 > CORRECTED_AGREEMENT_LIMIT_PCT
++        else []
++    )
++
++    cases = []
++    for record in raw.get("cases", []):
++        raw_samples = record.get("measured_kernel_seconds") or []
++        stats = stats_block(raw_samples)
++        corrected_samples = [value * rate for value in raw_samples] if rate else None
++        corrected = stats_block(corrected_samples) if corrected_samples else None
++        batch = record.get("batch") or {}
++        cases.append(
++            {
++                "case_id": record["case_id"],
++                "opcode": record["opcode"],
++                "m": record["m"],
++                "k": record["k"],
++                "n": record["n"],
++                "w8j_row_name": record["w8j_row_name"],
++                "correctness": record.get("correctness"),
++                "grid": record.get("grid"),
++                "block": record.get("block"),
++                "raw": stats,
++                "raw_median_seconds": stats["median"],
++                "corrected": corrected,
++                "corrected_median_seconds": corrected["median"] if corrected else None,
++                "verdict": case_verdict(stats, clock_valid),
++                "batch": {
++                    "repeats": batch.get("repeats"),
++                    "per_launch_seconds": batch.get("per_launch_seconds"),
++                    "per_launch_corrected_seconds": (
++                        batch.get("per_launch_seconds") * rate
++                        if batch.get("per_launch_seconds") and rate
++                        else None
++                    ),
++                    "host_wall_per_launch_seconds": batch.get("host_wall_per_launch_seconds"),
++                    "raw_wall_agreement_pct": batch.get("raw_wall_agreement_pct"),
++                },
++                "gop_per_s_raw_median": record.get("gop_per_s"),
++                "gop_per_s_corrected_median": (
++                    record["gop_per_s"] / rate if record.get("gop_per_s") and rate else None
++                ),
++            }
++        )
++
++    vendor = raw.get("vendor_two_pass") or {}
++    vendor_shapes = []
++    for entry in vendor.get("shapes", []):
++        def median(section):
++            return (section or {}).get("median_seconds")
++
++        gemm = median(entry.get("gemm_vendor_int8"))
++        ours = median(entry.get("gemm_ours_dp4a"))
++        epilogue = median(entry.get("epilogue_ours"))
++        two_pass = median(entry.get("two_pass_combined"))
++        fused = median(entry.get("fused_path_combined"))
++        bf16 = median(entry.get("bf16_gemm"))
++        paired_vendor = entry.get("paired_vendor_vs_ours_gemm") or {}
++        paired_paths = entry.get("paired_two_pass_vs_fused") or {}
++        paired_bf16 = entry.get("paired_bf16_vs_ours_gemm") or {}
++        vendor_shapes.append(
++            {
++                "m": entry["m"],
++                "k": entry["k"],
++                "n": entry["n"],
++                "gemm_status": entry.get("gemm_status"),
++                "bf16_status": entry.get("bf16_status"),
++                "int32_mismatches_vs_c6": entry.get("int32_mismatches_vs_c6"),
++                "two_pass_bf16_mismatches_vs_fused": entry.get("two_pass_bf16_mismatches_vs_fused"),
++                "gemm_vendor_int8_median_seconds": gemm,
++                "gemm_vendor_int8_corrected_seconds": gemm * rate if gemm and rate else None,
++                "gemm_ours_dp4a_median_seconds": ours,
++                "gemm_ours_dp4a_corrected_seconds": ours * rate if ours and rate else None,
++                "epilogue_ours_median_seconds": epilogue,
++                "two_pass_combined_median_seconds": two_pass,
++                "fused_path_combined_median_seconds": fused,
++                "bf16_gemm_median_seconds": bf16,
++                "fused_over_two_pass_ratio": (fused / two_pass) if fused and two_pass else None,
++                "ours_over_vendor_gemm_ratio": (ours / gemm) if ours and gemm else None,
++                "paired_vendor_vs_ours_median_ratio": (
++                    (paired_vendor.get("paired_ratio_vendor_int8_over_ours_dp4a") or {}).get(
++                        "median_ratio"
++                    )
++                ),
++                "paired_two_pass_vs_fused_median_ratio": (
++                    (paired_paths.get("paired_ratio_two_pass_over_fused_path") or {}).get(
++                        "median_ratio"
++                    )
++                ),
++                "paired_bf16_vs_ours_median_ratio": (
++                    (paired_bf16.get("paired_ratio_bf16_gemm_over_ours_dp4a") or {}).get(
++                        "median_ratio"
++                    )
++                ),
++                "gemm_host_call_median_seconds": median(entry.get("gemm_host_call_seconds")),
++                "bf16_host_call_median_seconds": median(entry.get("bf16_host_call_seconds")),
++                "error": entry.get("error"),
++            }
++        )
++
++    verdicts = {
++        "rate_gate": rate_gate["verdict"],
++        "clock_verdict": (raw.get("clock_warmup") or {}).get("clock_verdict"),
++        "case_verdicts": {},
++        "cases_total": len(cases),
++    }
++    counts = {}
++    for case in cases:
++        key = case["verdict"]["verdict"]
++        counts[key] = counts.get(key, 0) + 1
++    verdicts["case_verdicts"] = counts
++    verdicts["all_cases_pass"] = counts.get("PASS", 0) == len(cases)
++    verdicts["gate_eligible"] = bool(rate_gate["verdict"] == "PASS" and verdicts["all_cases_pass"])
++    verdicts["gated"] = False
++    verdicts["shared_window"] = bool((raw.get("window_contamination") or {}).get("shared_window"))
++    verdicts["note"] = (
++        "UNGATED by construction (WSL2 guest, no cpufreq control, shared window); "
++        "case PASS only means the round distribution passed ERR-0004/variance; "
++        "no absolute or cross-platform threshold is claimed"
++    )
++    dispatch_rows = []
++    by_id = {case["case_id"]: case for case in cases}
++    for item in raw.get("dispatch_overhead") or []:
++        row = {
++            "case_id": item.get("case_id") or (item.get("shape") or {}).get("case_id"),
++            "error": item.get("error"),
++        }
++        case = by_id.get(row["case_id"])
++        if case and item.get("kernel_median_seconds") is not None:
++            row["public_entry_kernel_median_seconds"] = item["kernel_median_seconds"]
++            row["direct_launch_median_seconds"] = case["raw_median_seconds"]
++            row["ratio_public_over_direct"] = (
++                item["kernel_median_seconds"] / case["raw_median_seconds"]
++                if case["raw_median_seconds"]
++                else None
++            )
++            row["entry_wall_median_seconds"] = item.get("entry_wall_median_seconds")
++            row["dispatch_median_seconds"] = item.get("dispatch_median_seconds")
++        dispatch_rows.append(row)
++
++    return {
++        "artifact_kind": "pypto-x.c6-w8a8-timing-analysis",
++        "schema_version": 1,
++        "source_raw": raw.get("artifact_kind"),
++        "task": raw.get("task"),
++        "status": raw.get("status"),
++        "git": raw.get("git"),
++        "git_branch": raw.get("git_branch"),
++        "protocol": raw.get("protocol"),
++        "shape_set": raw.get("shape_set"),
++        "clock_warmup": raw.get("clock_warmup"),
++        "window_contamination": raw.get("window_contamination"),
++        "rate_gate": rate_gate,
++        "verdicts": verdicts,
++        "cases": cases,
++        "vendor_two_pass": {
++            "status": vendor.get("status"),
++            "lib_path": vendor.get("lib_path"),
++            "version": vendor.get("version"),
++            "error": vendor.get("error"),
++            "shapes": vendor_shapes,
++        },
++        "bf16_baseline_present": all(
++            shape.get("bf16_status") == 0 for shape in vendor_shapes
++        ) if vendor_shapes else False,
++        "dispatch_overhead": dispatch_rows,
++    }
++
++
++def markdown(analysis):
++    lines = []
++    lines.append("# C6 W8A8 CUDA cuEvent timing tables (UNGATED)")
++    lines.append("")
++    lines.append("- raw: `{}` branch `{}` head `{}`".format(
++        analysis.get("source_raw"), analysis.get("git_branch"), analysis.get("git")))
++    lines.append("- rate: `window_rate_median={}` ({:+.3f}%), spread={}%, linearity={}%, corrected wall agreement={}% -> `{}`".format(
++        analysis["rate_gate"]["window_rate_median"],
++        analysis["rate_gate"]["rate_offset_pct"] or 0.0,
++        analysis["rate_gate"]["rate_spread_pct"],
++        analysis["rate_gate"]["linearity_pct"],
++        analysis["rate_gate"]["corrected_wall_agreement_pct"],
++        analysis["rate_gate"]["verdict"],
++    ))
++    lines.append("- clock: `{}` (median ratio {})".format(
++        analysis.get("clock_warmup", {}).get("clock_verdict"),
++        analysis.get("clock_warmup", {}).get("clock_ratio_median"),
++    ))
++    contamination = analysis.get("window_contamination") or {}
++    lines.append(
++        "- window: shared={} median GPU util={}% max={}% memory.used min={} MiB".format(
++            contamination.get("shared_window"),
++            contamination.get("utilization_gpu_pct_median"),
++            contamination.get("utilization_gpu_pct_max"),
++            contamination.get("memory_used_mib_min"),
++        )
++    )
++    lines.append("")
++    for opcode in (
++        "qmatmul_s8s8_s32",
++        "quantize_per_token_s8",
++        "dequantize_s8",
++        "dequantize_epilogue_bf16",
++    ):
++        rows = [case for case in analysis["cases"] if case["opcode"] == opcode]
++        if not rows:
++            continue
++        lines.append("## {}".format(opcode))
++        lines.append("")
++        lines.append("| m | k | n | grid | raw median (us) | corrected median (us) | cv | p95/median | outlier_ratio | GOP/s (corrected) | verdict |")
++        lines.append("|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---|")
++        for case in rows:
++            lines.append(
++                "| {} | {} | {} | {}x{} | {:.3f} | {:.3f} | {:.4f} | {:.4f} | {:.3f} | {} | {} |".format(
++                    case["m"],
++                    case["k"],
++                    case["n"],
++                    case["grid"][0] if case["grid"] else "?",
++                    case["block"][0] if case["block"] else "?",
++                    (case["raw_median_seconds"] or 0.0) * 1e6,
++                    (case["corrected_median_seconds"] or 0.0) * 1e6,
++                    case["raw"]["cv"] or 0.0,
++                    case["raw"]["p95_over_median"] or 0.0,
++                    case["raw"]["outlier_ratio"] or 0.0,
++                    "{:.1f}".format(case["gop_per_s_corrected_median"])
++                    if case["gop_per_s_corrected_median"]
++                    else "-",
++                    case["verdict"]["verdict"],
++                )
++            )
++        lines.append("")
++    vendor = analysis["vendor_two_pass"]
++    if vendor.get("shapes"):
++        lines.append("## two-pass vendor int8 + our epilogue vs fused C6 dp4a path")
++        lines.append("")
++        lines.append("| m | k | n | vendor gemm us | our dp4a us | epilogue us | two-pass us | fused us | fused/two-pass | vendor int32 mismatch | bf16 us |")
++        lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
++        for shape in vendor["shapes"]:
++            def us(key):
++                value = shape.get(key)
++                return "{:.3f}".format(value * 1e6) if value else "-"
++
++            lines.append(
++                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
++                    shape["m"],
++                    shape["k"],
++                    shape["n"],
++                    us("gemm_vendor_int8_corrected_seconds"),
++                    us("gemm_ours_dp4a_corrected_seconds"),
++                    us("epilogue_ours_median_seconds"),
++                    us("two_pass_combined_median_seconds"),
++                    us("fused_path_combined_median_seconds"),
++                    "{:.3f}".format(shape["fused_over_two_pass_ratio"])
++                    if shape["fused_over_two_pass_ratio"]
++                    else "-",
++                    shape["int32_mismatches_vs_c6"],
++                    us("bf16_gemm_median_seconds"),
++                )
++            )
++        lines.append("")
++        lines.append("| m | k | n | vendor/ours gemm ratio (paired) | two-pass/fused ratio (paired) | bf16/ours ratio (paired) | gemm host-call us |")
++        lines.append("|---:|---:|---:|---:|---:|---:|---:|")
++        for shape in vendor["shapes"]:
++            def ratio(key):
++                value = shape.get(key)
++                return "{:.3f}".format(value) if value else "-"
++
++            host = shape.get("gemm_host_call_median_seconds")
++            lines.append(
++                "| {} | {} | {} | {} | {} | {} | {} |".format(
++                    shape["m"],
++                    shape["k"],
++                    shape["n"],
++                    ratio("paired_vendor_vs_ours_median_ratio"),
++                    ratio("paired_two_pass_vs_fused_median_ratio"),
++                    ratio("paired_bf16_vs_ours_median_ratio"),
++                    "{:.2f}".format(host * 1e6) if host else "-",
++                )
++            )
++        lines.append("")
++    return "\n".join(lines) + "\n"
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
++    parser.add_argument("--raw", required=True)
++    parser.add_argument("--output", required=True, help="analysis output directory")
++    args = parser.parse_args(argv)
++
++    raw = json.loads(Path(args.raw).read_text(encoding="utf-8"))
++    analysis = analyse(raw)
++    output = Path(args.output)
++    output.mkdir(parents=True, exist_ok=True)
++    (output / "analysis.json").write_text(
++        json.dumps(analysis, indent=2, ensure_ascii=False), encoding="utf-8"
++    )
++    (output / "tables.zh-CN.md").write_text(markdown(analysis), encoding="utf-8")
++    summary = analysis["verdicts"]
++    print(
++        "rate_gate={} cases={} all_case_pass={} gate_eligible={}".format(
++            summary["rate_gate"],
++            summary["cases_total"],
++            summary["all_cases_pass"],
++            summary["gate_eligible"],
++        )
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/perf/c6_timing_gamepc.sh b/scripts/perf/c6_timing_gamepc.sh
+new file mode 100644
+index 000000000..a346ff247
+--- /dev/null
++++ b/scripts/perf/c6_timing_gamepc.sh
+@@ -0,0 +1,94 @@
++#!/usr/bin/env bash
++# C6 W8A8 timing evidence: ship the harness to GamePC (RTX 5080 / WSL2),
++# run it, fetch the raw JSON, and remove every remote file.
++#
++# GPU-only work: no `gamepc` resource lock is taken (PERF protocol 4.2 and
++# LOCAL_RESOURCE_POLICY).  Nothing persistent is changed; the remote directory
++# ~/c6-timing is deleted by `clean` (also on `run` success/failure).
++#
++# Usage (from the worktree root):
++#   bash scripts/perf/c6_timing_gamepc.sh sync      # copy python/pypto + scripts
++#   bash scripts/perf/c6_timing_gamepc.sh smoke     # remote build-only preflight
++#   bash scripts/perf/c6_timing_gamepc.sh run       # full measurement + fetch
++#   bash scripts/perf/c6_timing_gamepc.sh fetch     # copy raw JSON back
++#   bash scripts/perf/c6_timing_gamepc.sh clean     # delete remote dir
++#
++# Env: C6_GAMEPC_HOST, C6_EVIDENCE_DIR, C6_RAW_NAME, C6_HARNESS_ARGS
++set -euo pipefail
++
++HOST="${C6_GAMEPC_HOST:-chiro@192.168.101.5}"
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++TREE="$(cd "${HERE}/../.." && pwd)"
++EVIDENCE="${C6_EVIDENCE_DIR:-/home/chiro/projects/pypto/worktrees/_meta/pypto-x/c6-timing-evidence}"
++RAW_NAME="${C6_RAW_NAME:-c6-timing-raw-r1.json}"
++GIT_HEAD="$(git -C "${TREE}" rev-parse HEAD)"
++GIT_BRANCH="$(git -C "${TREE}" rev-parse --abbrev-ref HEAD)"
++REMOTE='$HOME/c6-timing'
++
++ssh_wsl() { ssh -o BatchMode=yes "${HOST}" "wsl.exe -e bash -lc \"$1\""; }
++
++sync_tree() {
++    mkdir -p "${EVIDENCE}/raw" "${EVIDENCE}/logs"
++    tar czf - -C "${TREE}" python/pypto \
++        scripts/perf/c6_timing_harness.py \
++        scripts/perf/c6_timing_analyze.py \
++        scripts/perf/c6_timing_selftest.py \
++        scripts/perf/c6_vendor_shim.c \
++        | ssh -o BatchMode=yes "${HOST}" \
++            "wsl.exe -e bash -lc \"rm -rf ${REMOTE} && mkdir -p ${REMOTE}/out && tar xzf - -C ${REMOTE}\""
++    echo "synced ${TREE} -> GamePC:${REMOTE}"
++}
++
++build_shim() {
++    ssh_wsl "cd ${REMOTE} && gcc -O2 -shared -fPIC -o ${REMOTE}/out/libc6vendor.so scripts/perf/c6_vendor_shim.c -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -lcublas -Wl,-rpath,/usr/local/cuda/lib64" \
++        | tee "${EVIDENCE}/logs/gamepc-shim-build.stdout"
++    echo "remote vendor shim built"
++}
++
++smoke() {
++    ssh_wsl "cd ${REMOTE} && PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=${REMOTE}/python python3 scripts/perf/c6_timing_harness.py --build-only --output ${REMOTE}/out/build-only.json" \
++        | tee "${EVIDENCE}/logs/gamepc-build-only.stdout"
++    echo "remote build-only OK"
++}
++
++run() {
++    local extra="${C6_HARNESS_ARGS:-}"
++    ssh_wsl "cd ${REMOTE} && C6_GIT_HEAD=${GIT_HEAD} C6_GIT_BRANCH=${GIT_BRANCH} C6_WORKTREE=${TREE} \
++        PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=${REMOTE}/python \
++        python3 scripts/perf/c6_timing_harness.py --output ${REMOTE}/out/${RAW_NAME} ${extra} \
++        > ${REMOTE}/out/run.log 2>&1; echo REMOTE_EXIT=\$?" \
++        | tee "${EVIDENCE}/logs/gamepc-run.stdout"
++    ssh_wsl "tail -60 ${REMOTE}/out/run.log" | tee "${EVIDENCE}/logs/gamepc-run.tail"
++}
++
++fetch() {
++    mkdir -p "${EVIDENCE}/raw"
++    ssh -o BatchMode=yes "${HOST}" "wsl.exe -e bash -lc \"cat ${REMOTE}/out/${RAW_NAME}\"" \
++        | tr -d '\r' > "${EVIDENCE}/raw/${RAW_NAME}"
++    ssh_wsl "cat ${REMOTE}/out/run.log" | tr -d '\r' > "${EVIDENCE}/logs/gamepc-run.log" || true
++    echo "fetched ${EVIDENCE}/raw/${RAW_NAME} ($(wc -c < "${EVIDENCE}/raw/${RAW_NAME}") bytes)"
++}
++
++clean() {
++    ssh_wsl "rm -rf ${REMOTE} && test ! -e ${REMOTE} && echo REMOTE_CLEAN_OK"
++}
++
++case "${1:-}" in
++    sync) sync_tree ;;
++    shim) build_shim ;;
++    smoke) smoke ;;
++    run)
++        sync_tree
++        build_shim
++        smoke
++        run || true
++        fetch || true
++        clean || true
++        ;;
++    fetch) fetch ;;
++    clean) clean ;;
++    *)
++        echo "usage: $0 {sync|shim|smoke|run|fetch|clean}" >&2
++        exit 2
++        ;;
++esac
+diff --git a/scripts/perf/c6_timing_harness.py b/scripts/perf/c6_timing_harness.py
+index a95a59cfc..fc76ef82b 100644
+--- a/scripts/perf/c6_timing_harness.py
++++ b/scripts/perf/c6_timing_harness.py
+@@ -935,7 +935,7 @@ class TimingProxy:
+         return values
+ 
+ 
+-def dispatch_overhead(runtime_proxy, proxy_driver, artifact, case, rounds):
++def dispatch_overhead(runtime_proxy, artifact, case, rounds):
+     """Wall time of the public entry point vs its cuEvent kernel time."""
+ 
+     opcode = case["opcode"]
+@@ -959,7 +959,7 @@ def dispatch_overhead(runtime_proxy, proxy_driver, artifact, case, rounds):
+                 artifact, [1000] * (m * n), [0.5] * m, [0.25] * n, shape=(m, n)
+             )
+         entry_wall.append(time.perf_counter() - started)
+-        kernel.extend(proxy_driver.collect())
++        kernel.extend(runtime_proxy.collect())
+     return {
+         "shape": {"m": m, "k": k, "n": n, "case_id": case["case_id"]},
+         "rounds": rounds,
+@@ -1511,18 +1511,11 @@ def main(argv=None):
+     parser.add_argument("--rate-gap", type=float, default=DEFAULT_RATE_GAP)
+     parser.add_argument("--rate-rounds", type=int, default=DEFAULT_RATE_ROUNDS)
+     parser.add_argument("--clock-warmup-seconds", type=float, default=DEFAULT_CLOCK_WARMUP)
+-    parser.add_argument(
+-        "--preflight-max-utilization-pct",
+-        type=float,
+-        default=None,
+-        help="abort (exit 3) before measuring when the 5-sample preflight median exceeds this",
+-    )
+     parser.add_argument("--gpu-index", type=int, default=0)
+     parser.add_argument("--opcodes", default=",".join(OPCODES))
+     parser.add_argument("--m-values", default=",".join(str(m) for m in M_VALUES))
+     parser.add_argument("--build-only", action="store_true", help="compile the 48 artifacts, no GPU")
+     parser.add_argument("--skip-vendor", action="store_true")
+-    parser.add_argument("--skip-preflight", action="store_true", help="no preflight sampling")
+     parser.add_argument("--skip-dispatch", action="store_true")
+     parser.add_argument("--dispatch-rounds", type=int, default=7)
+     parser.add_argument("--seed", type=int, default=20260912)
+@@ -1613,46 +1606,6 @@ def main(argv=None):
+     report["w8a8_probe"] = probe.to_dict() if hasattr(probe, "to_dict") else str(probe)
+     report["gpu_fingerprint_before"] = _fingerprint()
+ 
+-    # preflight window check: five GPU-wide utilization samples over ~5 s
+-    preflight = []
+-    if not args.skip_preflight:
+-        for _ in range(5):
+-            lines = _gpu_fact("utilization.gpu,memory.used,clocks.current.sm")
+-            if lines:
+-                parts = [part.strip() for part in lines[0].split(",")]
+-                try:
+-                    preflight.append(
+-                        {
+-                            "utilization_gpu_pct": float(parts[0]),
+-                            "memory_used_mib": float(parts[1]),
+-                            "clocks_sm_mhz": float(parts[2]),
+-                        }
+-                    )
+-                except (ValueError, IndexError):
+-                    pass
+-            time.sleep(1.0)
+-    preflight_utils = [sample["utilization_gpu_pct"] for sample in preflight]
+-    preflight_median = statistics.median(preflight_utils) if preflight_utils else None
+-    report["gpu_preflight"] = {
+-        "samples": preflight,
+-        "utilization_gpu_pct_median": round_sig(preflight_median),
+-        "utilization_gpu_pct_max": max(preflight_utils) if preflight_utils else None,
+-    }
+-    if (
+-        args.preflight_max_utilization_pct is not None
+-        and preflight_median is not None
+-        and preflight_median > args.preflight_max_utilization_pct
+-    ):
+-        report["status"] = "PREFLIGHT_NOISY"
+-        report["finished_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+-        _write(report, args.output)
+-        print(
+-            "preflight: median GPU utilization {:.1f}% > {:.1f}%; not measuring".format(
+-                preflight_median, args.preflight_max_utilization_pct
+-            )
+-        )
+-        return 3
+-
+     # clock warmup payload: repeat the largest qmatmul case for >= 2 s
+     started = time.time()
+     warmup_case = None
+@@ -1808,9 +1761,7 @@ def main(argv=None):
+                 continue
+             try:
+                 dispatch.append(
+-                    dispatch_overhead(
+-                        proxy_runtime, proxy, candidate["artifact"], candidate, args.dispatch_rounds
+-                    )
++                    dispatch_overhead(proxy_runtime, candidate["artifact"], candidate, args.dispatch_rounds)
+                 )
+             except Exception as exc:
+                 dispatch.append(
+diff --git a/scripts/perf/c6_timing_selftest.py b/scripts/perf/c6_timing_selftest.py
+new file mode 100644
+index 000000000..2421daff0
+--- /dev/null
++++ b/scripts/perf/c6_timing_selftest.py
+@@ -0,0 +1,277 @@
++#!/usr/bin/env python3
++"""Local self-test for ``c6_timing_harness.py`` (no GPU, no CUDA driver).
++
++Verifies the harness plumbing that a real GamePC run depends on:
++
++  * the per-opcode (grid, block, parameter order, buffer size) mapping mirrors
++    ``CudaRuntime._w8a8_launch`` / ``run_w8a8_*``;
++  * ``correctness_check`` accepts the closed-form expected device outputs and
++    rejects a wrong one;
++  * the analyzer's ERR-0004 / variance / rate-gate logic on synthetic rounds.
++
++Run:
++
++    python3 scripts/perf/c6_timing_selftest.py
++"""
++
++from __future__ import annotations
++
++import importlib.util
++import json
++import struct
++import sys
++import tempfile
++from pathlib import Path
++from types import SimpleNamespace
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE.parents[1] / "python"))
++
++
++def _load(name, path):
++    spec = importlib.util.spec_from_file_location(name, str(path))
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++harness = _load("c6_timing_harness", HERE / "c6_timing_harness.py")
++analyzer = _load("c6_timing_analyze", HERE / "c6_timing_analyze.py")
++
++
++class MockDriver:
++    def __init__(self):
++        self.next_pointer = 1000
++        self.uploads = {}
++        self.freed = []
++
++    def mem_alloc(self, size):
++        pointer = self.next_pointer
++        self.next_pointer += 1
++        self.allocated_size = size
++        return pointer
++
++    def mem_free(self, pointer):
++        self.freed.append(pointer)
++
++    def memcpy_htod(self, pointer, data):
++        self.uploads[pointer] = bytes(data)
++
++    def memcpy_dtoh(self, pointer, size):
++        return self.downloads.get(pointer, b"\0" * size)
++
++
++def plan_for(opcode, m, k, n):
++    fields = {
++        "qmatmul_s8s8_s32": SimpleNamespace(
++            kernel="px_q", m=m, k=k, n=n, batch_shape=(), left_shape=(m, k), right_shape=(k, n)
++        ),
++        "quantize_per_token_s8": SimpleNamespace(
++            kernel="px_z", rows=m, k=k, input_shape=(m, k)
++        ),
++        "dequantize_s8": SimpleNamespace(kernel="px_d", rows=m, k=n, codes_shape=(m, n)),
++        "dequantize_epilogue_bf16": SimpleNamespace(
++            kernel="px_e", rows=m, columns=n, accumulator_shape=(m, n)
++        ),
++    }
++    return fields[opcode]
++
++
++def test_launch_plan_mapping():
++    runtime = SimpleNamespace()
++    m, k, n = 5, 1024, 8192
++    for opcode in harness.OPCODES:
++        case = {
++            "opcode": opcode,
++            "m": m,
++            "k": k,
++            "n": n,
++            "case_id": "x",
++        }
++        pointers = {
++            name: 1000 + index
++            for index, name in enumerate(
++                (
++                    "left",
++                    "right",
++                    "values",
++                    "codes",
++                    "scales",
++                    "accumulator",
++                    "row_scales",
++                    "column_scales",
++                    "output",
++                    "saturation",
++                    "status",
++                )
++            )
++        }
++        kernel, grid, block, parameters, count = harness.launch_plan_for_case(
++            runtime, plan_for(opcode, m, k, n), case, pointers
++        )
++        assert block == (128, 1, 1), block
++        if opcode == "qmatmul_s8s8_s32":
++            assert count == m * n and grid == ((m * n + 127) // 128, 1, 1)
++            assert parameters == [pointers["left"], pointers["right"], pointers["output"]]
++        elif opcode == "dequantize_s8":
++            assert count == m * n
++            assert parameters == [pointers["codes"], pointers["scales"], pointers["output"]]
++        elif opcode == "quantize_per_token_s8":
++            assert count == m and grid == ((m + 127) // 128, 1, 1)
++            assert parameters == [
++                pointers["values"],
++                pointers["codes"],
++                pointers["scales"],
++                pointers["saturation"],
++                pointers["status"],
++            ]
++        else:
++            assert count == m * n
++            assert parameters == [
++                pointers["accumulator"],
++                pointers["row_scales"],
++                pointers["column_scales"],
++                pointers["output"],
++                pointers["status"],
++            ]
++    print("test_launch_plan_mapping: OK")
++
++
++def test_allocation_sizes():
++    driver = MockDriver()
++    runtime = SimpleNamespace()
++    m, k, n = 5, 3584, 1024
++    expected = {
++        "qmatmul_s8s8_s32": [m * k, k * n, m * n * 4],
++        "quantize_per_token_s8": [m * k * 4, m * k, m * 4, m * 4, m * 4],
++        "dequantize_s8": [m * n, m * 4, m * n * 4],
++        "dequantize_epilogue_bf16": [m * n * 4, m * 4, n * 4, m * n * 2, 4],
++    }
++    for opcode in harness.OPCODES:
++        case = {"opcode": opcode, "m": m, "k": k, "n": n}
++        driver.next_pointer = 1000
++        driver.allocated_sizes = []
++        driver.freed = []
++
++        def recording_alloc(size, _driver=driver):
++            _driver.allocated_sizes.append(size)
++            return MockDriver.mem_alloc(_driver, size)
++
++        driver.mem_alloc = recording_alloc
++        buffers, _pointers = harness.allocate_case_buffers(
++            driver, runtime, plan_for(opcode, m, k, n), case
++        )
++        assert driver.allocated_sizes == expected[opcode], (opcode, driver.allocated_sizes)
++        buffers.free()
++        assert len(driver.freed) == len(expected[opcode])
++    print("test_allocation_sizes: OK")
++
++
++def test_correctness_checks():
++    m, k, n = 2, 8, 4
++    for opcode in harness.OPCODES:
++        driver = MockDriver()
++        runtime = SimpleNamespace()
++        case = {"opcode": opcode, "m": m, "k": k, "n": n}
++        pointers = {name: index for index, name in enumerate(("values", "codes", "scales", "saturation", "status", "output", "accumulator", "row_scales", "column_scales"))}
++        driver.downloads = {}
++        if opcode == "qmatmul_s8s8_s32":
++            driver.downloads[pointers["output"]] = struct.pack("<{}i".format(m * n), *([k] * (m * n)))
++        elif opcode == "dequantize_s8":
++            driver.downloads[pointers["output"]] = struct.pack("<{}f".format(m * n), *([1.0] * (m * n)))
++        elif opcode == "quantize_per_token_s8":
++            driver.downloads[pointers["codes"]] = bytes([127]) * (m * k)
++            driver.downloads[pointers["scales"]] = struct.pack("<{}f".format(m), *([1.0 / 127.0] * m))
++            driver.downloads[pointers["status"]] = b"\0" * (m * 4)
++        else:
++            driver.downloads[pointers["output"]] = struct.pack("<{}H".format(m * n), *([0x42FA] * (m * n)))
++            driver.downloads[pointers["status"]] = b"\0\0\0\0"
++        result = harness.correctness_check(runtime, driver, None, case, pointers, None)
++        assert result["status"] == "PASS", (opcode, result)
++    # negative control: wrong qmatmul output must be rejected
++    driver = MockDriver()
++    case = {"opcode": "qmatmul_s8s8_s32", "m": m, "k": k, "n": n}
++    driver.downloads = {0: struct.pack("<{}i".format(m * n), *([k - 1] * (m * n)))}
++    result = harness.correctness_check(SimpleNamespace(), driver, None, case, {"output": 0}, None)
++    assert result["status"] == "FAIL"
++    print("test_correctness_checks: OK")
++
++
++def test_analyzer_verdicts():
++    stable = [1e-5 * (1 + 0.001 * ((index % 5) - 2) / 5) for index in range(21)]
++    unstable = [1e-5] * 17 + [1e-3] * 4
++    raw = {
++        "artifact_kind": "pypto-x.c6-w8a8-timing-raw",
++        "status": "OK",
++        "task": "c6-timing-evidence",
++        "git_branch": "x",
++        "git": "y",
++        "protocol": {},
++        "shape_set": {},
++        "clock_warmup": {"clock_verdict": "VALID", "clock_ratio_median": 0.95},
++        "rate_calibration_window": {
++            "window_rate_median": 1.06,
++            "rate_offset_pct": 6.0,
++            "rate_spread_pct": 0.5,
++            "linearity_pct": 0.4,
++            "corrected_wall_agreement_pct": 1.2,
++            "corrected_wall_agreement_pct_max": 2.0,
++        },
++        "wall_agreement": {
++            "batches": [
++                {"repeats": 128, "event_seconds": 0.02, "host_wall_seconds": 0.0206},
++                {"repeats": 256, "event_seconds": 0.04, "host_wall_seconds": 0.0412},
++            ],
++            "linearity_pct": 0.2,
++        },
++        "cases": [
++            {
++                "case_id": "a",
++                "opcode": "qmatmul_s8s8_s32",
++                "m": 1,
++                "k": 1024,
++                "n": 32,
++                "w8j_row_name": "x",
++                "measured_kernel_seconds": stable,
++                "grid": [1, 1, 1],
++                "block": [128, 1, 1],
++                "gop_per_s": 10.0,
++                "batch": {},
++            },
++            {
++                "case_id": "b",
++                "opcode": "qmatmul_s8s8_s32",
++                "m": 1,
++                "k": 1024,
++                "n": 32,
++                "w8j_row_name": "x",
++                "measured_kernel_seconds": unstable,
++                "grid": [1, 1, 1],
++                "block": [128, 1, 1],
++                "gop_per_s": 10.0,
++                "batch": {},
++            },
++        ],
++    }
++    analysis = analyzer.analyse(raw)
++    assert analysis["cases"][0]["verdict"]["verdict"] == "PASS"
++    assert "UNSTABLE" in analysis["cases"][1]["verdict"]["verdict"]
++    assert analysis["rate_gate"]["verdict"] == "PASS"
++    corrected = analysis["cases"][0]["corrected_median_seconds"]
++    expected = analysis["cases"][0]["raw_median_seconds"] * 1.06
++    assert abs(corrected - expected) <= abs(expected) * 1e-6, (corrected, expected)
++    print("test_analyzer_verdicts: OK")
++
++
++def main():
++    test_launch_plan_mapping()
++    test_allocation_sizes()
++    test_correctness_checks()
++    test_analyzer_verdicts()
++    print("selftest: PASS")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/perf/c6_vendor_shim.c b/scripts/perf/c6_vendor_shim.c
+new file mode 100644
+index 000000000..a6aa989c5
+--- /dev/null
++++ b/scripts/perf/c6_vendor_shim.c
+@@ -0,0 +1,76 @@
++/* C6 timing evidence: tiny C shim around classic cuBLAS GEMM (vendor comparison leg).
++ *
++ * Why a shim: the Python harness is header-free (no CUDA toolkit dependency), and
++ * a direct ctypes `cublasGemmEx` call with the header-documented 19-argument
++ * signature was rejected on the GamePC CUDA 13.3 stack (`status=7`, "GEMM_EX
++ * parameter number 12 had an illegal value") while the identical call compiled
++ * from <cublas_api.h> returns status 0.  Calling through this C-boundary shim
++ * removes the ctypes/enum marshalling difference and keeps the argument layout
++ * compiler-checked against the installed headers.
++ *
++ * Build (GamePC WSL2):
++ *   gcc -O2 -shared -fPIC -o libc6vendor.so c6_vendor_shim.c \
++ *       -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -lcublas \
++ *       -Wl,-rpath,/usr/local/cuda/lib64
++ *
++ * The GEMM layout mapping is the standard row-major -> column-major swap:
++ *   C_rm(m x n) = A_rm(m x k) @ B_rm(k x n)
++ * <=> C_cm(n x m) = B_cm(n x k) @ A_cm(k x m)   with lda=k, ldb=n, ldc=n.
++ */
++
++#include <cublas_api.h>
++
++static cublasHandle_t g_handle = NULL;
++static int g_version = 0;
++
++int c6_shim_init(void) {
++    cublasStatus_t status = cublasCreate_v2(&g_handle);
++    if (status != CUBLAS_STATUS_SUCCESS) {
++        return (int)status;
++    }
++    cublasGetVersion_v2(g_handle, &g_version);
++    return 0;
++}
++
++int c6_shim_shutdown(void) {
++    if (g_handle == NULL) {
++        return 0;
++    }
++    cublasStatus_t status = cublasDestroy_v2(g_handle);
++    g_handle = NULL;
++    return (int)status;
++}
++
++int c6_shim_version(void) {
++    return g_version;
++}
++
++int c6_shim_gemm_int8_s32(int m, int k, int n, void *a, void *b, void *c) {
++    if (g_handle == NULL) {
++        return -1;
++    }
++    int alpha = 1;
++    int beta = 0;
++    return (int)cublasGemmEx(
++        g_handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
++        &alpha, b, CUDA_R_8I, n, a, CUDA_R_8I, k,
++        &beta, c, CUDA_R_32I, n,
++        CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT);
++}
++
++int c6_shim_gemm_bf16(int m, int k, int n, void *a, void *b, void *c) {
++    if (g_handle == NULL) {
++        return -1;
++    }
++    float alpha = 1.0f;
++    float beta = 0.0f;
++    return (int)cublasGemmEx(
++        g_handle, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k,
++        &alpha, b, CUDA_R_16BF, n, a, CUDA_R_16BF, k,
++        &beta, c, CUDA_R_16BF, n,
++        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
++}
++
++const char *c6_shim_status_string(int status) {
++    return cublasGetStatusString((cublasStatus_t)status);
++}

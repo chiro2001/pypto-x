@@ -1,0 +1,1370 @@
+From db1d4ed6036a2fc07f51c1965151bcd190fe86a9 Mon Sep 17 00:00:00 2001
+From: launch-artifact-cache <agent@pypto-x.local>
+Date: Sat, 12 Sep 2026 02:41:23 +0800
+Subject: [PATCH 191/217] perf(cpu): add process-level AVX-512 artifact
+ semantics cache (launch-artifact-cache)
+
+N4.0 removed the duplicate validation entry points inside one launch, but
+_validate_primary_semantics and the body of _decode_artifact still each
+reconstructed the same CoreProgram -> Avx512Program lowering and deep-compared
+the full vector plan.  On the 6728-op prefill artifact that second pass is
+~2 s of lowering + ~0.6 s of plan serialization + comparison.
+
+Add a bounded process-level cache (N4.1) keyed by the immutable artifact
+identity: content digest, format/ABI/entrypoint, target digest and the hash of
+the deeply-frozen metadata mapping.  A hit additionally requires the exact
+frozen metadata object (held strongly) to still be attached to the artifact,
+so replacing metadata can never alias an entry, and the verified program
+digest / plan digest are pinned in the entry because both are expensive to
+recompute (CpuVectorProgram.plan_digest re-serializes every plan per access).
+
+Fail-closed is unchanged and per launch: artifact.validate() + native byte
+digest, version triple, declared program/plan/target digests, compile flags,
+native safety markers and the host feature contract are all re-checked outside
+the cache; a metadata/version/digest/capability mismatch changes the key or
+fails one of those checks and is still rejected on every launch.  The per
+launch memo now shares its thawed metadata copy, and `_packed_dispatch_for`
+accepts the already verified plan digest, so neither rebuilds that work.
+
+Measured on the s3 bracket probe (T=5, 6728 ops, no weights): validate + decode
+13.5-15.1 s (lower called twice) -> 5.3 s cold / 0.57 s repeated launch (lower
+called once / zero times).  Focused pytest: 96 passed (N4.0 memo 10 cases
+included).  The locked interleaved A/B, bit-level and fail-closed evidence
+lives in worktrees/_meta/pypto-x/launch-artifact-cache/.
+---
+ python/pypto/backends/cpu/x86/avx512.py                         | 416 +++++++++++++++++++++++++---
+ .../ut/pypto_x/test_cpu_avx512_artifact_semantics_cache.py      | 382 +++++++++++++++++++++++++
+ scripts/perf/lac_analyze.py                                     | 200 +++++++++++++
+ scripts/perf/lac_validation_probe.py                            | 177 ++++++++++++
+ 4 files changed, 1133 insertions(+), 42 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/x86/avx512.py b/python/pypto/backends/cpu/x86/avx512.py
+index 6d8ddcb36..dd4d16851 100644
+--- a/python/pypto/backends/cpu/x86/avx512.py
++++ b/python/pypto/backends/cpu/x86/avx512.py
+@@ -7,6 +7,7 @@ shape, layout and Core operation validation remains the common path.
+ 
+ from __future__ import annotations
+ 
++from collections import OrderedDict
+ import ctypes
+ from dataclasses import dataclass
+ import hashlib
+@@ -501,15 +502,21 @@ def _resolve_weight_cache(override: Optional[bool]) -> bool:
+     )
+ 
+ 
+-def _packed_dispatch_for(target_ir: Any, program_digest: str) -> Dict[int, dict]:
++def _packed_dispatch_for(
++    target_ir: Any, program_digest: str, plan_digest: Optional[str] = None
++) -> Dict[int, dict]:
+     """Cache the immutable packed-plan dispatch per (program, plan) digest.
+ 
+     The vector plan digest alone does not include SSA parameter names, so the
+     program digest is part of the key; otherwise two programs with identical
+-    shapes but different parameter names would share a stale dispatch.
++    shapes but different parameter names would share a stale dispatch.  An
++    already verified plan digest may be supplied to avoid recomputing the
++    ``CpuVectorProgram.plan_digest`` property.
+     """
+ 
+-    digest = "{}:{}".format(program_digest, getattr(target_ir, "plan_digest", ""))
++    if plan_digest is None:
++        plan_digest = str(getattr(target_ir, "plan_digest", ""))
++    digest = "{}:{}".format(program_digest, plan_digest)
+     with _PACKED_DISPATCH_LOCK:
+         cached = _PACKED_DISPATCH_CACHE.get(digest)
+         if cached is not None:
+@@ -1129,10 +1136,14 @@ class _LaunchValidationMemo:
+     is still rejected by every launch.
+ 
+     Entries are keyed by ``id(artifact)`` and hold a strong reference to the
+-    immutable ``artifact.metadata`` mapping that was validated.  A cached
+-    entry is only reused while that exact mapping object is still attached to
+-    the artifact (identity check), so replacing the mapping (for example via
+-    ``object.__setattr__``) forces a full re-validation.
++    immutable ``artifact.metadata`` mapping that was validated together with
++    the thawed copy the caller received.  A cached entry is only reused while
++    that exact mapping object is still attached to the artifact (identity
++    check), so replacing the mapping (for example via
++    ``object.__setattr__``) forces a full re-validation.  Sharing the thawed
++    copy keeps the first call's ``mapping_copy`` the only one per launch; the
++    returned mapping is read-only by all in-module callers and is dropped with
++    the memo when the launch returns.
+ 
+     Digest entries additionally re-check the declared ``program_digest`` on
+     every hit; a tampered digest string misses the memo and is recomputed,
+@@ -1147,8 +1158,260 @@ class _LaunchValidationMemo:
+     def __init__(self) -> None:
+         #: id(artifact) -> (artifact.metadata, verified digest)
+         self.digests: Dict[int, Tuple[Any, str]] = {}
+-        #: id(artifact) -> artifact.metadata (validated this launch)
+-        self.primary: Dict[int, Any] = {}
++        #: id(artifact) -> (artifact.metadata, thawed metadata copy)
++        self.primary: Dict[int, Tuple[Any, Any]] = {}
++
++    def thawed_metadata(self, artifact: Artifact) -> Optional[Any]:
++        """Return the thawed metadata validated this launch, if still current."""
++
++        cached = self.primary.get(id(artifact))
++        if cached is not None and cached[0] is artifact.metadata:
++            return cached[1]
++        return None
++
++
++class _ArtifactSemanticsEntry:
++    """One verified CoreProgram -> AVX-512 target IR lowering (N4.1).
++
++    ``program_digest`` is the digest that ``_program_digest_from_metadata``
++    verified against the program metadata; ``target_ir`` is the result of
++    ``lower_avx512`` for that same program, together with the required-feature
++    contract and target digest the artifact declared.  A digest-only entry
++    (``target_ir is None``) records that the declared program digest was
++    checked while the semantic comparison is still pending.
++
++    The entry deliberately does not copy the bulky ``_execution_metadata``
++    tables: what makes them reusable is the frozen-metadata identity check at
++    lookup time, not a per-field replay.
++    """
++
++    __slots__ = (
++        "metadata",
++        "program_digest",
++        "plan_digest",
++        "target_ir",
++        "required_features",
++        "required_feature_source",
++        "target_digest",
++    )
++
++    def __init__(
++        self,
++        metadata: Any,
++        program_digest: str,
++        plan_digest: Optional[str] = None,
++        target_ir: Any = None,
++        required_features: Tuple[str, ...] = (),
++        required_feature_source: Optional[str] = None,
++        target_digest: Optional[str] = None,
++    ) -> None:
++        self.metadata = metadata
++        self.program_digest = program_digest
++        #: ``CpuVectorProgram.plan_digest`` is a property that re-serializes
++        #: every plan on access; the verified value is pinned here so a cache
++        #: hit never recomputes it.
++        self.plan_digest = plan_digest
++        self.target_ir = target_ir
++        self.required_features = required_features
++        self.required_feature_source = required_feature_source
++        self.target_digest = target_digest
++
++
++#: Bounded process-level reuse of one verified lowering per immutable artifact.
++#: ``launch()`` lowers the program in ``_validate_primary_semantics`` and then
++#: lowers it again inside ``_decode_artifact``; the N4.0 per-launch memo only
++#: dedups the validation entry points, not that second lowering + full plan
++#: deep comparison.  Entries are keyed by the artifact content digest, the
++#: artifact ABI identity and the fingerprint of the deeply-frozen metadata
++#: mapping, and a hit additionally requires the *exact* frozen metadata object
++#: (held strongly) to still be attached to the artifact.  Replacing metadata
++#: therefore yields a different key/identity and re-runs the full validation;
++#: version, declared digest, native byte, safety-marker and host capability
++#: checks stay per launch and are never served from this cache.
++_ARTIFACT_SEMANTICS_CACHE_MAX = 8
++_ARTIFACT_SEMANTICS_CACHE_LOCK = threading.RLock()
++_ARTIFACT_SEMANTICS_CACHE: "OrderedDict[Tuple[Any, ...], _ArtifactSemanticsEntry]" = OrderedDict()
++_ARTIFACT_SEMANTICS_STATS: Dict[str, int] = {
++    "hits": 0,
++    "misses": 0,
++    "stores": 0,
++    "evictions": 0,
++    "disabled": 0,
++}
++
++
++def _artifact_semantics_key(artifact: Artifact) -> Optional[Tuple[Any, ...]]:
++    """Return the immutable identity key, or ``None`` when it cannot be built.
++
++    The metadata mapping is a ``FrozenMapping``: a deeply immutable value whose
++    ``hash`` is a content fingerprint stable for the lifetime of the process.
++    A plain mutable mapping (which cannot be hashed) disables the process
++    cache for that artifact, so the caller falls back to per-launch work.
++    """
++
++    try:
++        metadata_fingerprint = hash(artifact.metadata)
++    except TypeError:
++        return None
++    try:
++        target_digest = sha256_text(artifact.target.to_dict())
++    except Exception:
++        return None
++    return (
++        artifact.content_digest,
++        artifact.format,
++        artifact.format_version,
++        artifact.entrypoint,
++        artifact.abi_version,
++        target_digest,
++        metadata_fingerprint,
++    )
++
++
++def _artifact_semantics_get(
++    artifact: Artifact,
++) -> Tuple[Optional[Tuple[Any, ...]], Optional[_ArtifactSemanticsEntry]]:
++    """Look up one entry; a hit requires the exact frozen metadata object."""
++
++    key = _artifact_semantics_key(artifact)
++    if key is None:
++        with _ARTIFACT_SEMANTICS_CACHE_LOCK:
++            _ARTIFACT_SEMANTICS_STATS["disabled"] += 1
++        return None, None
++    with _ARTIFACT_SEMANTICS_CACHE_LOCK:
++        entry = _ARTIFACT_SEMANTICS_CACHE.get(key)
++        if entry is not None and entry.metadata is artifact.metadata:
++            _ARTIFACT_SEMANTICS_CACHE.move_to_end(key)
++            _ARTIFACT_SEMANTICS_STATS["hits"] += 1
++        else:
++            entry = None
++            _ARTIFACT_SEMANTICS_STATS["misses"] += 1
++    return key, entry
++
++
++def _artifact_semantics_put(key: Tuple[Any, ...], entry: _ArtifactSemanticsEntry) -> None:
++    with _ARTIFACT_SEMANTICS_CACHE_LOCK:
++        if key not in _ARTIFACT_SEMANTICS_CACHE and len(_ARTIFACT_SEMANTICS_CACHE) >= _ARTIFACT_SEMANTICS_CACHE_MAX:
++            _ARTIFACT_SEMANTICS_CACHE.popitem(last=False)
++            _ARTIFACT_SEMANTICS_STATS["evictions"] += 1
++        _ARTIFACT_SEMANTICS_CACHE[key] = entry
++        _ARTIFACT_SEMANTICS_CACHE.move_to_end(key)
++        _ARTIFACT_SEMANTICS_STATS["stores"] += 1
++
++
++def _artifact_semantics_note_digest(key: Tuple[Any, ...], artifact: Artifact, digest: str) -> None:
++    """Record a verified program digest before the plan comparison runs."""
++
++    with _ARTIFACT_SEMANTICS_CACHE_LOCK:
++        entry = _ARTIFACT_SEMANTICS_CACHE.get(key)
++        if entry is not None and entry.metadata is artifact.metadata:
++            entry.program_digest = digest
++            return
++        if entry is None and len(_ARTIFACT_SEMANTICS_CACHE) >= _ARTIFACT_SEMANTICS_CACHE_MAX:
++            _ARTIFACT_SEMANTICS_CACHE.popitem(last=False)
++            _ARTIFACT_SEMANTICS_STATS["evictions"] += 1
++        if entry is None:
++            _ARTIFACT_SEMANTICS_CACHE[key] = _ArtifactSemanticsEntry(artifact.metadata, digest)
++            _ARTIFACT_SEMANTICS_STATS["stores"] += 1
++
++
++def _artifact_semantics_store(
++    key: Tuple[Any, ...],
++    artifact: Artifact,
++    program_digest: str,
++    plan_digest: str,
++    target_ir: Any,
++    required: CpuFeatureSet,
++    target_digest: Optional[str],
++) -> None:
++    entry = _ArtifactSemanticsEntry(
++        artifact.metadata,
++        program_digest,
++        plan_digest=plan_digest,
++        target_ir=target_ir,
++        required_features=tuple(required.features),
++        required_feature_source=required.source,
++        target_digest=target_digest,
++    )
++    _artifact_semantics_put(key, entry)
++
++
++def _semantics_entry_matches_metadata(
++    artifact: Artifact, metadata: Mapping[str, Any], entry: _ArtifactSemanticsEntry
++) -> bool:
++    """Re-check every cheap fail-closed fact before reusing a lowering.
++
++    The expensive proof (program digest, full plan deep comparison, execution
++    metadata) is inherited from the entry, but the declared digests, versions,
++    variants and required-feature boundary are compared again on every launch.
++    A failure means the metadata changed underneath the key (or the entry is
++    incomplete), so the caller falls through to the full validation, which
++    rejects it.
++    """
++
++    target_ir = entry.target_ir
++    if target_ir is None or entry.metadata is not artifact.metadata:
++        return False
++    if entry.plan_digest is None:
++        return False
++    if metadata.get("program_digest") != entry.program_digest:
++        return False
++    if metadata.get("plan_digest") != entry.plan_digest:
++        return False
++    if metadata.get("entrypoint") != artifact.entrypoint or target_ir.entrypoint != artifact.entrypoint:
++        return False
++    if metadata.get("native_variant") != target_ir.native_variant:
++        return False
++    if metadata.get("target_digest") != entry.target_digest:
++        return False
++    plan_data = metadata.get("vector_plan")
++    if not isinstance(plan_data, Mapping) or plan_data.get("plan_version") != VECTOR_PLAN_VERSION:
++        return False
++    if tuple(metadata.get("required_features", ())) != entry.required_features:
++        return False
++    if metadata.get("required_feature_source") != entry.required_feature_source:
++        return False
++    return True
++
++
++def _semantics_target_ir_matches_metadata(
++    metadata: Mapping[str, Any], entry: _ArtifactSemanticsEntry
++) -> bool:
++    """Decode-side cross-check for a cached lowering (cheaper than re-lowering)."""
++
++    target_ir = entry.target_ir
++    if target_ir is None or entry.plan_digest is None:
++        return False
++    if metadata.get("program_digest") != entry.program_digest:
++        return False
++    if metadata.get("plan_digest") != entry.plan_digest:
++        return False
++    if metadata.get("entrypoint") != target_ir.entrypoint:
++        return False
++    if metadata.get("native_variant") != target_ir.native_variant:
++        return False
++    plan_data = metadata.get("vector_plan")
++    if not isinstance(plan_data, Mapping) or plan_data.get("plan_version") != VECTOR_PLAN_VERSION:
++        return False
++    if tuple(metadata.get("required_features", ())) != entry.required_features:
++        return False
++    if metadata.get("required_feature_source") != entry.required_feature_source:
++        return False
++    return True
++
++
++def artifact_semantics_cache_stats() -> Mapping[str, int]:
++    with _ARTIFACT_SEMANTICS_CACHE_LOCK:
++        stats = dict(_ARTIFACT_SEMANTICS_STATS)
++        stats["entries"] = len(_ARTIFACT_SEMANTICS_CACHE)
++        return stats
++
++
++def clear_artifact_semantics_cache() -> int:
++    with _ARTIFACT_SEMANTICS_CACHE_LOCK:
++        count = len(_ARTIFACT_SEMANTICS_CACHE)
++        _ARTIFACT_SEMANTICS_CACHE.clear()
++        return count
+ 
+ 
+ def _program_digest_from_metadata(
+@@ -1166,6 +1429,16 @@ def _program_digest_from_metadata(
+         cached_metadata, cached_digest = cached
+         if cached_metadata is artifact.metadata and digest == cached_digest:
+             return cached_digest
++    cache_key: Optional[Tuple[Any, ...]] = None
++    if artifact is not None:
++        cache_key, entry = _artifact_semantics_get(artifact)
++        if entry is not None and entry.program_digest == digest:
++            # The exact frozen metadata object was already digested; a changed
++            # declared digest misses here and is recomputed below, which
++            # restores the fail-closed rejection.
++            if memo is not None:
++                memo.digests[id(artifact)] = (artifact.metadata, digest)
++            return digest
+     try:
+         program = CoreProgram.from_dict(program_data)
+     except Exception as exc:
+@@ -1175,6 +1448,8 @@ def _program_digest_from_metadata(
+         raise CpuAvx512ArtifactError("{} CoreProgram digest is inconsistent".format(context))
+     if memo is not None and artifact is not None:
+         memo.digests[id(artifact)] = (artifact.metadata, actual)
++    if artifact is not None and cache_key is not None:
++        _artifact_semantics_note_digest(cache_key, artifact, actual)
+     return digest
+ 
+ 
+@@ -1193,6 +1468,12 @@ def _validate_primary_semantics(artifact: Artifact, metadata: Mapping[str, Any])
+     plan.  This check deliberately does not probe the host or load the ELF;
+     it only reconstructs the target IR and compares every semantic digest and
+     execution-boundary field.
++
++    A process-level entry can satisfy the expensive reconstruction when the
++    exact frozen metadata object was already lowered and compared.  The hit
++    path still re-checks the declared digests, variant and required-feature
++    boundary, and any mismatch falls through to the full validation below,
++    which rejects the artifact.
+     """
+ 
+     if metadata.get("artifact_payload_version") != ARTIFACT_PAYLOAD_VERSION:
+@@ -1201,6 +1482,11 @@ def _validate_primary_semantics(artifact: Artifact, metadata: Mapping[str, Any])
+         raise CpuAvx512ArtifactError("unsupported AVX-512 lowering version")
+     if metadata.get("plan_version") != VECTOR_PLAN_VERSION:
+         raise CpuAvx512ArtifactError("unsupported CPU vector plan version")
++    cache_key, cached_entry = _artifact_semantics_get(artifact)
++    if cached_entry is not None and _semantics_entry_matches_metadata(
++        artifact, metadata, cached_entry
++    ):
++        return
+     program_data = metadata.get("program")
+     plan_data = metadata.get("vector_plan")
+     if not isinstance(program_data, Mapping) or not isinstance(plan_data, Mapping):
+@@ -1243,10 +1529,19 @@ def _validate_primary_semantics(artifact: Artifact, metadata: Mapping[str, Any])
+             raise CpuAvx512ArtifactError("primary AVX-512 {} metadata mismatch".format(key))
+     if metadata.get("entrypoint") != artifact.entrypoint or target_ir.entrypoint != artifact.entrypoint:
+         raise CpuAvx512ArtifactError("primary artifact entrypoint is inconsistent")
+-    program_digest = hashlib.sha256(program.canonical_json().encode("utf-8")).hexdigest()
++    # A digest already verified for the same frozen metadata object (the
++    # primary-validation path runs _program_digest_from_metadata first) is
++    # reused; the declared digest is still compared on every launch.
++    if cached_entry is not None and cached_entry.program_digest:
++        program_digest = cached_entry.program_digest
++    else:
++        program_digest = hashlib.sha256(program.canonical_json().encode("utf-8")).hexdigest()
+     if metadata.get("program_digest") != program_digest:
+         raise CpuAvx512ArtifactError("primary artifact program digest mismatch")
+-    if metadata.get("plan_digest") != target_ir.plan_digest:
++    # ``plan_digest`` re-serializes the whole plan on every property access;
++    # compute it once here and pin it in the cache entry.
++    plan_digest = target_ir.plan_digest
++    if metadata.get("plan_digest") != plan_digest:
+         raise CpuAvx512ArtifactError("primary artifact plan digest mismatch")
+     if metadata.get("target_digest") != sha256_text(artifact.target.to_dict()):
+         raise CpuAvx512ArtifactError("primary artifact target digest mismatch")
+@@ -1256,6 +1551,16 @@ def _validate_primary_semantics(artifact: Artifact, metadata: Mapping[str, Any])
+         raise CpuAvx512ArtifactError("primary artifact required feature metadata mismatch")
+     if metadata.get("required_feature_source") != required.source:
+         raise CpuAvx512ArtifactError("primary artifact required feature source mismatch")
++    if cache_key is not None:
++        _artifact_semantics_store(
++            cache_key,
++            artifact,
++            program_digest,
++            plan_digest,
++            target_ir,
++            required,
++            metadata.get("target_digest"),
++        )
+ 
+ 
+ def _validate_primary_artifact(
+@@ -1278,6 +1583,12 @@ def _validate_primary_artifact(
+         raise CpuAvx512ArtifactError("primary artifact ABI is unsupported")
+     if artifact.target.kind != "cpu" or not artifact.target.triple.startswith(("x86_64", "amd64")):
+         raise CpuAvx512ArtifactError("primary artifact target must be x86_64 CPU")
++    # The memo is checked before the metadata thaw: within one launch this
++    # exact frozen metadata object already passed the metadata checks below,
++    # so the thawed copy can be shared instead of rebuilt.
++    cached_metadata = memo.thawed_metadata(artifact) if memo is not None else None
++    if cached_metadata is not None:
++        return cached_metadata
+     metadata = mapping_copy(artifact.metadata)
+     if metadata.get("backend") != AVX512_BACKEND:
+         raise CpuAvx512ArtifactError("primary artifact backend metadata is invalid")
+@@ -1295,14 +1606,10 @@ def _validate_primary_artifact(
+     _string_sequence(metadata.get("required_features"), "primary artifact required_features")
+     if not {"avx", "avx512f", "osxsave", "ymm", "opmask", "zmm"}.issubset(required):
+         raise CpuAvx512ArtifactError("primary artifact required_features omit AVX/ZMM safety fields")
+-    if memo is not None:
+-        cached = memo.primary.get(id(artifact))
+-        if cached is not None and cached is artifact.metadata:
+-            return metadata
+     _program_digest_from_metadata(metadata, "primary artifact", memo=memo, artifact=artifact)
+     _validate_primary_semantics(artifact, metadata)
+     if memo is not None:
+-        memo.primary[id(artifact)] = artifact.metadata
++        memo.primary[id(artifact)] = (artifact.metadata, metadata)
+     return metadata
+ 
+ 
+@@ -1384,7 +1691,7 @@ def _decode_artifact(
+     capability: Avx512Capability,
+     memo: Optional["_LaunchValidationMemo"] = None,
+ ) -> LoadedAvx512Artifact:
+-    _validate_primary_artifact(artifact, memo=memo)
++    metadata = _validate_primary_artifact(artifact, memo=memo)
+     if not isinstance(artifact, Artifact):
+         raise CpuAvx512ArtifactError("AVX-512 runtime requires Artifact")
+     try:
+@@ -1399,7 +1706,6 @@ def _decode_artifact(
+         raise CpuAvx512ArtifactError("unsupported AVX-512 artifact ABI {!r}".format(artifact.abi_version))
+     if artifact.target.kind != "cpu" or not artifact.target.triple.startswith(("x86_64", "amd64")):
+         raise CpuAvx512ArtifactError("AVX-512 artifact target must be x86_64 CPU")
+-    metadata = mapping_copy(artifact.metadata)
+     if metadata.get("backend") != AVX512_BACKEND:
+         raise CpuAvx512ArtifactError("artifact backend metadata is not cpu.avx512")
+     if metadata.get("native_isa") != "avx512" or metadata.get("native_format") != "elf-shared-object":
+@@ -1448,30 +1754,41 @@ def _decode_artifact(
+         raise CpuAvx512ArtifactError(
+             "AVX-512 DQ/BW/VL artifact has no emitting lowering"
+         )
+-    try:
+-        program = CoreProgram.from_dict(program_data)
+-        target_ir = lower_avx512(
+-            program,
+-            artifact.target,
+-            plan_data.get("entrypoint"),
+-            lane_count=plan_data.get("lane_count"),
+-            tail_policy=plan_data.get("tail_policy"),
+-            required_features=required,
+-            specialization=plan_data.get("specialization", {}),
+-            **flags
+-        )
+-    except Exception as exc:
+-        raise CpuAvx512ArtifactError("AVX-512 CoreProgram/plan is invalid: {}".format(exc)) from exc
+-    if target_ir.vector_program.to_dict() != dict(plan_data):
+-        raise CpuAvx512ArtifactError("AVX-512 vector plan metadata mismatch")
+-    expected_execution = _execution_metadata(target_ir)
+-    for key, expected in expected_execution.items():
+-        if metadata.get(key) != expected:
+-            raise CpuAvx512ArtifactError("AVX-512 {} metadata mismatch".format(key))
++    # The primary validation above already lowered and deep-compared this exact
++    # frozen metadata through the process-level cache.  Reuse that lowering;
++    # every cheap fail-closed check (declared digests, native safety markers,
++    # compile flags, host feature contract) still runs on every launch below.
++    _, semantics_entry = _artifact_semantics_get(artifact)
++    target_ir = None
++    plan_digest: Optional[str] = None
++    if semantics_entry is not None and _semantics_target_ir_matches_metadata(metadata, semantics_entry):
++        target_ir = semantics_entry.target_ir
++        plan_digest = semantics_entry.plan_digest
++    if target_ir is None:
++        try:
++            program = CoreProgram.from_dict(program_data)
++            target_ir = lower_avx512(
++                program,
++                artifact.target,
++                plan_data.get("entrypoint"),
++                lane_count=plan_data.get("lane_count"),
++                tail_policy=plan_data.get("tail_policy"),
++                required_features=required,
++                specialization=plan_data.get("specialization", {}),
++                **flags
++            )
++        except Exception as exc:
++            raise CpuAvx512ArtifactError("AVX-512 CoreProgram/plan is invalid: {}".format(exc)) from exc
++        if target_ir.vector_program.to_dict() != dict(plan_data):
++            raise CpuAvx512ArtifactError("AVX-512 vector plan metadata mismatch")
++        for key, expected in _execution_metadata(target_ir).items():
++            if metadata.get(key) != expected:
++                raise CpuAvx512ArtifactError("AVX-512 {} metadata mismatch".format(key))
++        plan_digest = target_ir.plan_digest
+     if target_ir.native_variant != metadata.get("native_variant"):
+         raise CpuAvx512ArtifactError("AVX-512 native variant metadata is inconsistent")
+     _program_digest_from_metadata(metadata, "AVX-512 artifact", memo=memo, artifact=artifact)
+-    if metadata.get("plan_digest") != target_ir.plan_digest:
++    if metadata.get("plan_digest") != plan_digest:
+         raise CpuAvx512ArtifactError("AVX-512 plan digest mismatch")
+     if metadata.get("target_digest") != sha256_text(artifact.target.to_dict()):
+         raise CpuAvx512ArtifactError("AVX-512 target digest mismatch")
+@@ -1739,7 +2056,9 @@ class Avx512Runtime:
+         # AVX-512 object.
+         real_capability = self._probe_real_capability()
+         available = CpuFeatureSet(real_capability.features, source=real_capability.source)
+-        metadata = mapping_copy(request.artifact.metadata)
++        metadata = memo.thawed_metadata(request.artifact)
++        if metadata is None:
++            metadata = mapping_copy(request.artifact.metadata)
+         required = set(metadata.get("required_features", ()))
+         if not real_capability.available or not required.issubset(set(available.features)):
+             if not fallback_artifacts:
+@@ -1843,8 +2162,21 @@ class Avx512Runtime:
+         # with the same predicate that wrote the artifact metadata; a declared
+         # packed plan therefore cannot silently execute the legacy kernel.
+         program_digest = str(metadata.get("program_digest", ""))
+-        self._packed_plan_digest = "{}:{}".format(program_digest, loaded.target_ir.plan_digest)
+-        self._packed_matmul_state = _packed_dispatch_for(loaded.target_ir, program_digest)
++        # Reuse the verified plan digest pinned by the semantics cache; the
++        # ``plan_digest`` property re-serializes every plan on each access.
++        _, semantics_entry = _artifact_semantics_get(request.artifact)
++        if (
++            semantics_entry is not None
++            and semantics_entry.target_ir is loaded.target_ir
++            and semantics_entry.plan_digest is not None
++        ):
++            plan_digest = semantics_entry.plan_digest
++        else:
++            plan_digest = loaded.target_ir.plan_digest
++        self._packed_plan_digest = "{}:{}".format(program_digest, plan_digest)
++        self._packed_matmul_state = _packed_dispatch_for(
++            loaded.target_ir, program_digest, plan_digest=plan_digest
++        )
+         if self._packed_matmul_state:
+             self._packed_weight_cache_enabled = _resolve_weight_cache(self._weight_cache_override)
+             self._gemm_threads = _resolve_gemm_threads(self._gemm_threads_override)
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx512_artifact_semantics_cache.py b/python/tests/ut/pypto_x/test_cpu_avx512_artifact_semantics_cache.py
+new file mode 100644
+index 000000000..ecbe192f2
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cpu_avx512_artifact_semantics_cache.py
+@@ -0,0 +1,382 @@
++"""N4.1: process-level AVX-512 artifact -> target_ir cache must stay fail-closed.
++
++``launch()`` lowers the CoreProgram in ``_validate_primary_semantics`` and then
++lowers it again inside ``_decode_artifact``.  N4.1 reuses the verified lowering
++through a process-level cache keyed by the immutable artifact identity
++(content digest + frozen metadata fingerprint + ABI/entrypoint/target).
++
++These tests pin the properties the cache must not weaken:
++
++* one launch performs a single ``lower_avx512`` (the second one is reused);
++* a repeated launch of the same frozen artifact reuses digest + lowering but
++  still runs the cheap validation and the output stays bit-identical;
++* every metadata tamper (program/digest/version/plan/required features/
++  variant/target digest) is rejected on two consecutive launches, including
++  after a successful launch has warmed the cache;
++* replacing ``artifact.metadata`` after a successful launch is rejected;
++* a lost host capability is rejected on every launch even with a warm cache;
++* the fallback-artifact path still validates the fallback itself;
++* native bytes changed on disk are rejected even when metadata is cached;
++* artifacts with different targets/flags never share an entry.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import struct
++
++import pytest
++
++from pypto.abi import LaunchRequest
++from pypto.backends.cpu import HostTensor
++from pypto.backends.cpu.x86 import (
++    Avx2Runtime,
++    Avx512Runtime,
++    CpuAvx512ArtifactError,
++    CpuAvx512FeatureMismatchError,
++    CpuAvx512UnavailableError,
++)
++from pypto.backends.cpu.x86 import avx512 as runtime_module
++from pypto.compiler import Artifact, CompileOptions
++from pypto.compiler.targets.cpu_avx2 import Avx2Compiler
++from pypto.compiler.targets.cpu_avx512 import Avx512Compiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu.x86.avx512 import Avx512Capability
++from pypto.lowering.cpu.x86.avx512 import capabilities as capabilities_module
++from pypto.target import TargetSpec
++from pypto.target._utils import frozen_mapping, mapping_copy
++
++
++AVX512_TARGET = TargetSpec(
++    "cpu", "x86_64-linux-gnu", features=("avx512f",), attributes={"lane_count": 16}
++)
++AVX2_TARGET = TargetSpec(
++    "cpu", "x86_64-linux-gnu", features=("avx2",), attributes={"lane_count": 8}
++)
++SHAPE = (17,)
++
++
++@pytest.fixture(autouse=True)
++def _fresh_process_cache():
++    runtime_module.clear_artifact_semantics_cache()
++    yield
++    runtime_module.clear_artifact_semantics_cache()
++
++
++def _program(operation="add", shape=SHAPE):
++    value_type = CoreType.tensor("float32", shape)
++    left = ValueRef("left", value_type)
++    right = ValueRef("right", value_type)
++    output = ValueRef("output", value_type)
++    inputs = (left,) if operation == "neg" else (left, right)
++    return CoreProgram(
++        functions=(
++            CoreFunction(
++                operation,
++                inputs,
++                (output,),
++                Region((Operation(operation, inputs, (output,)),)),
++            ),
++        )
++    )
++
++
++def _compile_avx512(program, tmp_path, name="native", features=("avx512f",)):
++    target = TargetSpec(
++        "cpu", "x86_64-linux-gnu", features=features, attributes={"lane_count": 16}
++    )
++    compiler = Avx512Compiler()
++    target_ir = compiler.lower(program, target)
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format="pypto-x.cpu.avx512", extra={"build_dir": str(tmp_path / name)}
++        ),
++    )
++    return target_ir, artifact
++
++
++def _compile_avx2(program, tmp_path, name="fallback-avx2"):
++    compiler = Avx2Compiler()
++    return compiler.compile(
++        compiler.lower(program, AVX2_TARGET),
++        CompileOptions(
++            artifact_format="pypto-x.cpu.avx2", extra={"build_dir": str(tmp_path / name)}
++        ),
++    )
++
++
++def _runtime():
++    runtime = Avx512Runtime()
++    if not runtime.is_available():
++        pytest.skip("host lacks AVX-512/ZMM capability: {}".format(runtime.availability().to_dict()))
++    return runtime
++
++
++def _left(shape=SHAPE):
++    return HostTensor("float32", shape, [float(index) for index in range(shape[0])])
++
++
++def _launch(runtime, artifact, shape=SHAPE, fallback=None):
++    output = HostTensor.zeros("float32", shape)
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[_left(shape).descriptor(readonly=True), _left(shape).descriptor(readonly=True)],
++            outputs=[output.descriptor()],
++        ),
++        fallback_artifact=fallback,
++    )
++    return output
++
++
++def _output_bytes(tensor):
++    return struct.pack("<%df" % len(tensor.data), *tensor.data)
++
++
++def _rebuilt_artifact(artifact, mutate):
++    metadata = mapping_copy(artifact.metadata)
++    mutate(metadata)
++    return Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        path=artifact.path,
++        metadata=metadata,
++    )
++
++
++@pytest.fixture
++def lower_calls(monkeypatch):
++    calls = []
++    original = runtime_module.lower_avx512
++
++    def counting(*args, **kwargs):
++        calls.append(args)
++        return original(*args, **kwargs)
++
++    monkeypatch.setattr(runtime_module, "lower_avx512", counting)
++    return calls
++
++
++@pytest.fixture
++def core_program_builds(monkeypatch):
++    calls = {"count": 0}
++    original = runtime_module.CoreProgram
++
++    class CountingCoreProgram:
++        @staticmethod
++        def from_dict(payload):
++            calls["count"] += 1
++            return original.from_dict(payload)
++
++    monkeypatch.setattr(runtime_module, "CoreProgram", CountingCoreProgram)
++    return calls
++
++
++def test_second_lowering_within_one_launch_is_reused(tmp_path, lower_calls):
++    _, artifact = _compile_avx512(_program(), tmp_path)
++    runtime = _runtime()
++    output = _launch(runtime, artifact)
++    assert _output_bytes(output)
++    assert len(lower_calls) == 1, "one launch must lower the program exactly once"
++    assert runtime_module.artifact_semantics_cache_stats()["entries"] == 1
++
++
++def test_repeated_launch_reuses_cache_and_stays_bit_identical(tmp_path, lower_calls, core_program_builds):
++    _, artifact = _compile_avx512(_program(), tmp_path)
++    runtime = _runtime()
++    first = _output_bytes(_launch(runtime, artifact))
++    lowered_once = len(lower_calls)
++    rebuilt_once = core_program_builds["count"]
++    assert lowered_once == 1
++    assert rebuilt_once == 2  # digest + semantics; the decode body is reused
++
++    for _ in range(3):
++        assert _output_bytes(_launch(runtime, artifact)) == first
++    assert len(lower_calls) == lowered_once, "cached lowering must not be recomputed"
++    assert core_program_builds["count"] == rebuilt_once, "cached digest + semantics must not rebuild"
++    stats = runtime_module.artifact_semantics_cache_stats()
++    assert stats["hits"] >= 6 and stats["entries"] == 1
++
++
++def test_metadata_replacement_after_successful_launch_is_rejected(tmp_path):
++    _, artifact = _compile_avx512(_program(), tmp_path)
++    runtime = _runtime()
++    assert _output_bytes(_launch(runtime, artifact))
++
++    metadata = mapping_copy(artifact.metadata)
++    metadata["plan_version"] = 2
++    object.__setattr__(artifact, "metadata", frozen_mapping(metadata))
++    for _ in range(2):
++        with pytest.raises(CpuAvx512ArtifactError, match="unsupported CPU vector plan version"):
++            _launch(runtime, artifact)
++
++
++def test_plain_mutable_metadata_replacement_is_rejected(tmp_path):
++    _, artifact = _compile_avx512(_program(), tmp_path)
++    runtime = _runtime()
++    assert _output_bytes(_launch(runtime, artifact))
++
++    metadata = mapping_copy(artifact.metadata)
++    metadata["plan_version"] = 2
++    object.__setattr__(artifact, "metadata", metadata)
++    for _ in range(2):
++        with pytest.raises(CpuAvx512ArtifactError, match="unsupported CPU vector plan version"):
++            _launch(runtime, artifact)
++
++
++def _tamper_program(metadata, tmp_path):
++    _, other = _compile_avx512(_program(operation="neg"), tmp_path, name="other-program")
++    metadata["program"] = mapping_copy(other.metadata)["program"]
++
++
++def _tamper_required_features(metadata):
++    plan_data = dict(metadata["vector_plan"])
++    required = dict(plan_data["required_features"])
++    required["features"] = tuple(
++        feature for feature in required["features"] if feature != "avx512f"
++    )
++    plan_data["required_features"] = required
++    metadata["vector_plan"] = plan_data
++    metadata["required_features"] = required["features"]
++
++
++@pytest.mark.parametrize(
++    "tamper, message",
++    [
++        ("program_digest", "CoreProgram digest is inconsistent"),
++        ("program", "CoreProgram digest is inconsistent"),
++        ("lowering_version", "unsupported AVX-512 lowering version"),
++        ("artifact_payload_version", "unsupported AVX-512 artifact payload version"),
++        ("plan_version", "unsupported CPU vector plan version"),
++        ("required_features", "required_features omit AVX/ZMM safety fields"),
++        ("native_variant", "primary artifact native variant metadata is inconsistent"),
++        ("target_digest", "primary artifact target digest mismatch"),
++    ],
++)
++def test_tampered_metadata_is_rejected_on_every_launch_after_warm_cache(
++    tmp_path, tamper, message
++):
++    _, artifact = _compile_avx512(_program(), tmp_path)
++    runtime = _runtime()
++    assert _output_bytes(_launch(runtime, artifact))
++
++    def mutate(metadata):
++        if tamper == "program_digest":
++            metadata["program_digest"] = "f" * 64
++        elif tamper == "program":
++            _tamper_program(metadata, tmp_path)
++        elif tamper == "required_features":
++            _tamper_required_features(metadata)
++        elif tamper == "native_variant":
++            metadata["native_variant"] = "avx512-tampered"
++        elif tamper == "target_digest":
++            metadata["target_digest"] = "0" * 64
++        else:
++            metadata[tamper] = int(metadata[tamper]) + 1
++
++    tampered = _rebuilt_artifact(artifact, mutate)
++    for _ in range(2):
++        with pytest.raises(CpuAvx512ArtifactError, match=message):
++            _launch(runtime, tampered)
++
++
++def test_lost_capability_is_rejected_every_launch_with_warm_cache(tmp_path, monkeypatch):
++    _, artifact = _compile_avx512(_program(), tmp_path)
++    runtime = _runtime()
++    assert _output_bytes(_launch(runtime, artifact))
++
++    missing = Avx512Capability.injected_capability(("avx", "osxsave", "ymm"))
++    monkeypatch.setattr(
++        capabilities_module, "probe_avx512_capabilities", lambda **kwargs: missing
++    )
++    # load() re-checks the host feature contract without the launch-level probe.
++    for _ in range(2):
++        with pytest.raises(CpuAvx512FeatureMismatchError):
++            runtime.load(artifact, available_features=("avx", "osxsave", "ymm"))
++    # launch() re-probes the real capability of a freshly built runtime.
++    for _ in range(2):
++        with pytest.raises(CpuAvx512UnavailableError):
++            _launch(Avx512Runtime(), artifact)
++
++
++def test_avx2_fallback_path_still_validates_the_fallback(tmp_path, monkeypatch):
++    if not Avx2Runtime().is_available():
++        pytest.skip("host lacks AVX2 capability for real fallback execution")
++    _, primary = _compile_avx512(_program(), tmp_path)
++    fallback = _compile_avx2(_program(), tmp_path)
++    wrong_program_fallback = _compile_avx2(
++        _program(shape=(19,)), tmp_path, name="other-shape-avx2"
++    )
++
++    missing = Avx512Capability.injected_capability(())
++    monkeypatch.setattr(
++        capabilities_module, "probe_avx512_capabilities", lambda **kwargs: missing
++    )
++    runtime = Avx512Runtime(capability=missing)
++    outputs = set()
++    for _ in range(2):
++        outputs.add(_output_bytes(_launch(runtime, primary, fallback=fallback)))
++    assert len(outputs) == 1
++    assert runtime_module.artifact_semantics_cache_stats()["entries"] >= 1
++
++    for _ in range(2):
++        with pytest.raises(
++            CpuAvx512ArtifactError,
++            match="fallback CoreProgram digest does not match primary artifact",
++        ):
++            _launch(runtime, primary, fallback=wrong_program_fallback)
++
++
++def test_different_target_variants_do_not_share_an_entry(tmp_path, lower_calls):
++    _, base = _compile_avx512(_program(), tmp_path, name="base")
++    _, fma = _compile_avx512(_program(), tmp_path, name="fma", features=("avx512f", "fma"))
++    runtime = _runtime()
++    if not runtime.capability.fma:
++        pytest.skip("host lacks AVX-512 FMA")
++    assert base.content_digest != fma.content_digest
++
++    assert _output_bytes(_launch(runtime, base))
++    assert len(lower_calls) == 1
++    fma_output = _output_bytes(_launch(runtime, fma))
++    assert fma_output
++    assert len(lower_calls) == 2, "a different target/flags must not reuse the lowering"
++    assert runtime_module.artifact_semantics_cache_stats()["entries"] == 2
++
++
++def test_native_bytes_change_is_rejected_with_warm_cache(tmp_path):
++    from pathlib import Path
++
++    _, artifact = _compile_avx512(_program(), tmp_path)
++    runtime = _runtime()
++    assert _output_bytes(_launch(runtime, artifact))
++
++    # A copy with appended bytes: the artifact's own captured digest matches
++    # the copy, so only the per-launch native read + declared native_digest
++    # comparison can reject it.  (Rewriting the loaded .so in place would be
++    # rejected earlier and makes dlclose crash the interpreter on exit.)
++    tampered_path = tmp_path / "tampered.so"
++    tampered_path.write_bytes(Path(artifact.path).read_bytes() + b"tamper")
++    tampered = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        path=str(tampered_path),
++        metadata=artifact.metadata,
++    )
++    for _ in range(2):
++        with pytest.raises(CpuAvx512ArtifactError, match="native artifact content digest mismatch"):
++            _launch(runtime, tampered)
++
++
++def test_clear_cache_forces_full_revalidation(tmp_path, lower_calls):
++    _, artifact = _compile_avx512(_program(), tmp_path)
++    runtime = _runtime()
++    assert _output_bytes(_launch(runtime, artifact))
++    assert len(lower_calls) == 1
++    assert runtime_module.clear_artifact_semantics_cache() == 1
++    assert _output_bytes(_launch(runtime, artifact))
++    assert len(lower_calls) == 2
+diff --git a/scripts/perf/lac_analyze.py b/scripts/perf/lac_analyze.py
+new file mode 100644
+index 000000000..97a221fda
+--- /dev/null
++++ b/scripts/perf/lac_analyze.py
+@@ -0,0 +1,200 @@
++#!/usr/bin/env python3
++"""N4.1 analysis: N4.0 base vs process-level artifact semantics cache.
++
++Reuses the N4.0 decomposition reader (``n4_analyze_decomposition``) but reports
++the N4.1 A/B labels and adds the per-launch cache counters that prove the
++duplicate lowering is gone:
++
++* ``lower_avx512`` call/seconds per launch;
++* ``_validate_primary_semantics`` call/seconds per launch;
++* the four driver-side tiers (setup / loop / teardown / launch) for T=5
++  prefill and T=1 decode, plus the setup segment table;
++* the output-buffer and ``artifact_content_digest`` sha256 cross-check over
++  every interleaved round.
++
++All absolute numbers are UNGATED (12 vCPU KVM guest, no cpufreq).
++
++Usage:
++
++    python3 scripts/perf/lac_analyze.py --evidence <evidence-dir>
++"""
++
++from __future__ import annotations
++
++import argparse
++import importlib.util
++import json
++from pathlib import Path
++import sys
++from typing import Any, Dict, List
++
++HERE = Path(__file__).resolve().parent
++N4_ANALYZER = HERE / "n4_analyze_decomposition.py"
++ROUNDS = ("base_r1", "base_r2", "base_r3", "after_r1", "after_r2", "after_r3")
++
++
++def load_n4() -> Any:
++    spec = importlib.util.spec_from_file_location("n4_analyze_decomposition", str(N4_ANALYZER))
++    if spec is None or spec.loader is None:
++        raise SystemExit("cannot load {}".format(N4_ANALYZER))
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++def per_launch_rows(rounds: Dict[str, Any], n4: Any) -> List[Dict[str, Any]]:
++    rows: List[Dict[str, Any]] = []
++    for tag in ROUNDS:
++        payload = rounds.get(tag)
++        if payload is None:
++            continue
++        for launch in payload["launches"]:
++            rows.append(
++                {
++                    "round": tag,
++                    "label": launch["label"],
++                    "launch_seconds": launch["launch_seconds"],
++                    "setup_seconds": launch["setup_seconds"],
++                    "loop_seconds": launch["loop_seconds"],
++                    "teardown_seconds": launch["teardown_seconds"],
++                    "op_count": launch["op_count"],
++                    "lower_calls": launch["calls_lower_avx512"],
++                    "lower_seconds": launch["seconds_lower_avx512"],
++                    "semantics_calls": launch["calls__validate_primary_semantics"],
++                    "semantics_seconds": launch["seconds__validate_primary_semantics"],
++                    "digest_calls": launch["calls__program_digest_from_metadata"],
++                    "digest_seconds": launch["seconds__program_digest_from_metadata"],
++                    "decode_calls": launch["calls__decode_artifact"],
++                    "decode_seconds": launch["seconds__decode_artifact"],
++                    "top_validate_seconds": launch["top_validate_seconds"],
++                }
++            )
++    return rows
++
++
++def counter_table(rows: List[Dict[str, Any]], n4: Any) -> List[str]:
++    lines = [
++        "| segment (per launch, all calls) | base prefill | after prefill | base decode | after decode |",
++        "|---|---:|---:|---:|---:|",
++    ]
++    for field in (
++        "lower_calls",
++        "lower_seconds",
++        "semantics_calls",
++        "semantics_seconds",
++        "digest_calls",
++        "digest_seconds",
++        "decode_seconds",
++        "top_validate_seconds",
++    ):
++        cells = []
++        for prefix, label in (("base", "prefill"), ("after", "prefill"),
++                              ("base", "decode"), ("after", "decode")):
++            values = [
++                row[field] for row in rows
++                if row["round"].startswith(prefix) and row["label"] == label
++            ]
++            cells.append(n4.fmt(n4.median(values), 4))
++        lines.append("| {} | {} | {} | {} | {} |".format(field, *cells))
++    return lines
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--evidence", required=True)
++    parser.add_argument("--table", default=None)
++    parser.add_argument("--output", default=None)
++    args = parser.parse_args()
++
++    n4 = load_n4()
++    n4.TAGS = ROUNDS
++    evidence = Path(args.evidence)
++    rounds = n4.collect(evidence)
++    if not rounds:
++        raise SystemExit("no rounds found under {}".format(evidence / "raw"))
++
++    rows = per_launch_rows(rounds, n4)
++    sections: List[str] = [
++        "<!-- generated by scripts/perf/lac_analyze.py -->",
++        "# N4.1 process-level artifact semantics cache — A/B (UNGATED)",
++        "",
++        "base = `port/pypto-x-integration @ acece0a92` (N4.0 per-launch memo), "
++        "after = N4.1 process cache.  Rounds are interleaved base_r1 / after_r1 / ... "
++        "(T=5 prefill + T=1 decode, real weights, s3, `--no-op-recorder`).",
++        "",
++    ]
++    for prefix, name in (("base", "base acece0a92 (N4.0 per-launch memo)"),
++                         ("after", "after (N4.1 process-level cache)")):
++        sections.append("## {} — four tiers (UNGATED)".format(name))
++        for label in ("prefill", "decode"):
++            selected = n4.select(rounds, prefix, label)
++            ops = n4.median([row["op_count"] for row in selected])
++            steps = 5 if label == "prefill" else 1
++            sections.append(
++                "### T={} {} ({} rounds, ops median {})".format(
++                    steps, label, len(selected), n4.fmt(ops, 0)
++                )
++            )
++            sections.extend(n4.tier_table(rounds, prefix, label))
++            sections.append("")
++        sections.append("### setup / teardown segments ({})".format(name))
++        for label in ("prefill", "decode"):
++            steps = 5 if label == "prefill" else 1
++            sections.append("#### T={} {}".format(steps, label))
++            sections.extend(n4.segment_table(rounds, prefix, label))
++            sections.append("")
++
++    sections.append("## A/B: N4.0 base vs N4.1 process cache (UNGATED)")
++    for label in ("prefill", "decode"):
++        steps = 5 if label == "prefill" else 1
++        sections.append("### T={} {}".format(steps, label))
++        sections.extend(n4.ab_table(rounds, label))
++        sections.append("")
++    sections.append("### per-launch cache counters (all calls)")
++    sections.extend(counter_table(rows, n4))
++    sections.append("")
++
++    ok, bit_lines = n4.bit_check(rounds)
++    sections.append("## Bit-level regression across every interleaved round")
++    sections.extend(bit_lines)
++    sections.append("")
++    sections.append("bit_identical={}".format(ok))
++
++    report = "\n".join(sections) + "\n"
++    table_path = Path(args.table) if args.table else evidence / "raw" / "decomposition-table.md"
++    table_path.parent.mkdir(parents=True, exist_ok=True)
++    table_path.write_text(report, encoding="utf-8")
++    print(report)
++
++    output_path = Path(args.output) if args.output else evidence / "raw" / "analysis.json"
++    payload = {
++        "harness": "lac_analyze",
++        "base": "acece0a9264d5b4ed1496363d93ba01222d7c7c1",
++        "tags": sorted(rounds),
++        "launch_counts": {tag: len(item["launches"]) for tag, item in sorted(rounds.items())},
++        "bit_identical": ok,
++        "outputs_compared": sorted(
++            {
++                name
++                for item in rounds.values()
++                for name in item["driver"].get("outputs", {})
++            }
++        ),
++        "artifact_content_digests": sorted(
++            {
++                item["driver"].get("compile", {}).get("artifact_content_digest")
++                for item in rounds.values()
++            }
++        ),
++        "per_launch": rows,
++    }
++    output_path.parent.mkdir(parents=True, exist_ok=True)
++    with output_path.open("w", encoding="utf-8") as stream:
++        json.dump(payload, stream, ensure_ascii=False, sort_keys=True, indent=2)
++        stream.write("\n")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/perf/lac_validation_probe.py b/scripts/perf/lac_validation_probe.py
+new file mode 100644
+index 000000000..30a35d6a0
+--- /dev/null
++++ b/scripts/perf/lac_validation_probe.py
+@@ -0,0 +1,177 @@
++#!/usr/bin/env python3
++"""N4.1 validation-path probe: the `launch()` prove-out bracket, cold vs warm.
++
++Builds the weighted Qwen3.5 T=5 CoreProgram (graph only, no weights), lowers
++and compiles a real AVX-512 artifact, then times the exact primary-artifact
++validation + `_decode_artifact` bracket that `launch()` runs, with the same
++per-launch memo `launch()` creates:
++
++    launch() -> _validate_primary_artifact(artifact, memo)
++             -> _decode_artifact(artifact, available, capability, memo)
++
++Two launches are measured for the same immutable artifact: a cold one (fills
++the process-level lowering cache) and a repeated one (may reuse it).  This is
++a design/orientation probe for the heavy locked A/B; absolute numbers are
++UNGATED (12 vCPU KVM guest, no cpufreq).
++
++Usage:
++
++    python3 scripts/perf/lac_validation_probe.py \
++        --tree /path/to/tree --steps 5 --output /path/to/probe.json
++"""
++
++from __future__ import annotations
++
++import argparse
++import importlib.util
++import json
++from pathlib import Path
++import sys
++import time
++from typing import Any, Dict, Optional
++
++
++def load_driver(tree: Path, driver: Optional[Path] = None) -> Any:
++    path = driver or tree / "python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py"
++    spec = importlib.util.spec_from_file_location("qwen35_weighted_execution_driver", str(path))
++    if spec is None or spec.loader is None:
++        raise SystemExit("cannot load driver from {}".format(path))
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++class LowerCounter:
++    """Count `runtime_module.lower_avx512` calls without changing behaviour."""
++
++    def __init__(self, module: Any) -> None:
++        self.module = module
++        self.original = getattr(module, "lower_avx512")
++        self.calls = 0
++
++    def install(self) -> None:
++        counter = self
++
++        def counting(*args: Any, **kwargs: Any) -> Any:
++            counter.calls += 1
++            return counter.original(*args, **kwargs)
++
++        self.module.lower_avx512 = counting
++
++
++def timed(function: Any) -> Any:
++    started = time.perf_counter()
++    result = function()
++    return result, time.perf_counter() - started
++
++
++def main(argv: Optional[list] = None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--tree", required=True)
++    parser.add_argument("--steps", type=int, default=5)
++    parser.add_argument("--past-length", type=int, default=0)
++    parser.add_argument("--driver", default=None)
++    parser.add_argument("--build-dir", default=None)
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--repeats", type=int, default=2)
++    args = parser.parse_args(argv)
++
++    tree = Path(args.tree).resolve()
++    for entry in (
++        tree / "python",
++        tree / "python/tests/ut",
++        tree / "python/tests/ut/pypto_x",
++    ):
++        sys.path.insert(0, str(entry))
++
++    driver = load_driver(tree, Path(args.driver) if args.driver else None)
++    from pypto.backends.cpu.x86 import Avx512Runtime
++    from pypto.backends.cpu.x86 import avx512 as runtime_module
++    from pypto.compiler import CompileOptions
++
++    capabilities = getattr(runtime_module, "_capabilities")
++    capability = capabilities.probe_avx512_capabilities()
++    if not capability.available:
++        raise SystemExit("host lacks AVX-512: {}".format(capability.reason))
++
++    program, _schema, _layout = driver.build_graph(args.steps, args.past_length)
++    backend = driver.make_backend("avx512")
++    compiler = backend["compiler"]
++    if args.build_dir:
++        build_dir = Path(args.build_dir)
++    else:
++        build_dir = Path(args.output).resolve().parent / "probe-build"
++    build_dir.mkdir(parents=True, exist_ok=True)
++
++    lower_counter = LowerCounter(runtime_module)
++    lower_counter.install()
++
++    compiled_started = time.perf_counter()
++    target_ir = compiler.lower(program, backend["target"])
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(artifact_format="pypto-x.cpu.avx512", extra={"build_dir": str(build_dir)}),
++    )
++    compile_seconds = time.perf_counter() - compiled_started
++
++    runtime = Avx512Runtime()
++    available = runtime.available_features
++    launches = []
++    lowers_before = lower_counter.calls
++    for index in range(args.repeats):
++        memo = runtime_module._LaunchValidationMemo()
++        validate_result, validate_seconds = timed(
++            lambda memo=memo: runtime_module._validate_primary_artifact(artifact, memo=memo)
++        )
++        loaded, decode_seconds = timed(
++            lambda memo=memo: runtime_module._decode_artifact(
++                artifact, available, runtime.capability, memo=memo
++            )
++        )
++        launches.append(
++            {
++                "index": index,
++                "cold": index == 0,
++                "validate_seconds": round(validate_seconds, 6),
++                "decode_seconds": round(decode_seconds, 6),
++                "total_seconds": round(validate_seconds + decode_seconds, 6),
++                "lower_calls": lower_counter.calls - lowers_before,
++                "loaded_entrypoint": loaded.target_ir.entrypoint,
++                "loaded_native_variant": loaded.target_ir.native_variant,
++            }
++        )
++        lowers_before = lower_counter.calls
++        assert validate_result is not None
++
++    stats = None
++    if hasattr(runtime_module, "artifact_semantics_cache_stats"):
++        stats = dict(runtime_module.artifact_semantics_cache_stats())
++
++    payload: Dict[str, Any] = {
++        "harness": "lac_validation_probe",
++        "tree": str(tree),
++        "steps": args.steps,
++        "past_length": args.past_length,
++        "operation_count": len(program.functions[0].body.operations),
++        "artifact_content_digest": artifact.content_digest,
++        "compile_seconds": round(compile_seconds, 3),
++        "launches": launches,
++        "cache_stats": stats,
++        "notes": [
++            "UNGATED: 12 vCPU KVM guest, no cpufreq",
++            "timed bracket is the launch() prove-out + _decode_artifact call only",
++            "no weight ingest, no op execution; graph construction and compile excluded",
++        ],
++    }
++    output = Path(args.output)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    with output.open("w", encoding="utf-8") as stream:
++        json.dump(payload, stream, ensure_ascii=False, sort_keys=True, indent=2)
++        stream.write("\n")
++    print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

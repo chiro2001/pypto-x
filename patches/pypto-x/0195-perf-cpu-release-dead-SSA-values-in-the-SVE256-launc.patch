@@ -1,0 +1,400 @@
+From d223ad3a0f224350377394ced5a5056ed15dadab Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 02:28:15 +0800
+Subject: [PATCH 195/217] perf(cpu): release dead SSA values in the SVE256
+ launch loop
+
+Reuse backends/cpu/ssa_liveness.py (plan_release + release_dead_values)
+exactly like the AVX2/AVX-512 launch loops: parameters and returns stay
+pinned, a value is dropped strictly after its last consumer returns, and
+a never-consumed non-return value is dropped right after production.
+
+Tests: SVE256 liveness release-point parity with the AVX-512 schedule,
+release-enabled/release-disabled bit-identical A/B plus scalar oracle,
+and a spy test proving caller-owned TypedByteView buffers are only ever
+parameter-pinned and never released.  The layout/indexing focused suites
+gain the same PYPTO_X_SVE_TEST_MODE=native switch the W8A8 suite already
+has (default stays qemu), and the driver A/B tool can now disable the
+SVE256 release for the whole-net differential.
+---
+ python/pypto/backends/cpu/aarch64/sve256.py                 |  18 ++-
+ python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py |   5 +-
+ python/tests/ut/pypto_x/test_cpu_sve256.py                  | 197 ++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_cpu_sve256_indexing.py         |  17 ++-
+ python/tests/ut/pypto_x/test_cpu_sve256_layout.py           |  17 ++-
+ 5 files changed, 244 insertions(+), 10 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/aarch64/sve256.py b/python/pypto/backends/cpu/aarch64/sve256.py
+index 6b08092d2..2207ab18d 100644
+--- a/python/pypto/backends/cpu/aarch64/sve256.py
++++ b/python/pypto/backends/cpu/aarch64/sve256.py
+@@ -78,6 +78,7 @@ from pypto.lowering.cpu.vector import (
+ )
+ from pypto.target._utils import mapping_copy, sha256_text
+ 
++from ..ssa_liveness import plan_release, release_dead_values
+ from ..tensor import FlatBuffer, HostTensor, _cast_value
+ from ..byte_view import CpuByteViewError, TypedByteView, try_typed_byte_view
+ 
+@@ -2420,8 +2421,23 @@ class Sve256Runtime:
+                 raise CpuSve256ExecutionError("unsupported parameter kind {!r}".format(parameter.type.kind))
+         if len(loaded.target_ir.plans) != len(function.body.operations):
+             raise CpuSve256ArtifactError("SVE256 plan count does not match operation count")
+-        for operation, plan in zip(function.body.operations, loaded.target_ir.plans):
++        # Same conservative SSA contract as the AVX2/AVX-512 launch loops:
++        # parameters and returns stay pinned, a value is dropped strictly after
++        # its last consumer has returned, and a never-consumed non-return value
++        # is dropped right after it is produced.
++        last_use, pinned = plan_release(function)
++        for index, (operation, plan) in enumerate(
++            zip(function.body.operations, loaded.target_ir.plans)
++        ):
+             self._execute_operation(operation, plan, environment, request.artifact)
++            release_dead_values(
++                environment,
++                last_use,
++                pinned,
++                index,
++                [ref.name for ref in operation.inputs],
++                [ref.name for ref in operation.outputs],
++            )
+         results: List[Any] = []
+         output_index = 0
+         for result_ref in function.returns:
+diff --git a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+index 0383cea0b..b01d3c5b4 100644
+--- a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
++++ b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+@@ -2750,7 +2750,7 @@ def build_parser() -> argparse.ArgumentParser:
+ 
+ 
+ def _disable_liveness_release() -> None:
+-    """关闭三个 CPU 后端的 SSA liveness 释放（只用于语义等价性 A/B 证据）。
++    """关闭四个 CPU 后端的 SSA liveness 释放（只用于语义等价性 A/B 证据）。
+ 
+     默认不启用：这是证据工具，不是执行开关。关闭后同一张图的全部输出摘要
+     必须与开启时逐位一致，否则说明释放点选错了。
+@@ -2759,11 +2759,12 @@ def _disable_liveness_release() -> None:
+     import pypto.backends.cpu.vector.runtime as vector_runtime
+     import pypto.backends.cpu.x86.avx2 as avx2_runtime
+     import pypto.backends.cpu.x86.avx512 as avx512_runtime
++    import pypto.backends.cpu.aarch64.sve256 as sve256_runtime
+ 
+     def _no_release(*args: Any, **kwargs: Any) -> tuple:
+         return ()
+ 
+-    for module in (vector_runtime, avx2_runtime, avx512_runtime):
++    for module in (vector_runtime, avx2_runtime, avx512_runtime, sve256_runtime):
+         module.release_dead_values = _no_release
+     avx512_runtime.CpuAvx512Runtime = avx512_runtime.Avx512Runtime
+ 
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256.py b/python/tests/ut/pypto_x/test_cpu_sve256.py
+index 19ecd8630..e0403d8df 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256.py
+@@ -1563,3 +1563,200 @@ def test_sve_b2_integrated_native_control_pipeline_and_metadata(tmp_path, monkey
+ def _scalar_artifact(program):
+     compiler = CpuScalarCompiler()
+     return compiler.compile(compiler.lower(program, TargetSpec("cpu", "x86_64-linux-gnu")))
++
++
++# --------------------------------------------------------------------------
++# SSA liveness release in the SVE256 launch loop (AVX-512 parity)
++# --------------------------------------------------------------------------
++
++
++class _RecordingSve256Runtime(Sve256Runtime):
++    """Records the live SSA environment and value kinds before every op."""
++
++    def __init__(self, *args, **kwargs):
++        kwargs.setdefault("execution_mode", "qemu")
++        super().__init__(*args, **kwargs)
++        self.live_before = []
++        self.kinds_before = []
++
++    def _execute_operation(self, operation, plan, environment, artifact):
++        self.live_before.append(frozenset(environment))
++        self.kinds_before.append(
++            {name: type(value).__name__ for name, (_, value) in environment.items()}
++        )
++        super()._execute_operation(operation, plan, environment, artifact)
++
++
++def _liveness_chain_program():
++    """a,b,c,d -> t0 -> (t1,t2) -> out, plus one value that dies immediately."""
++
++    value_type = CoreType.tensor("float32", (4,))
++    a = ValueRef("a", value_type)
++    b = ValueRef("b", value_type)
++    c = ValueRef("c", value_type)
++    d = ValueRef("d", value_type)
++    t0 = ValueRef("t0", value_type)
++    t1 = ValueRef("t1", value_type)
++    t2 = ValueRef("t2", value_type)
++    dead = ValueRef("dead", value_type)
++    out = ValueRef("out", value_type)
++    operations = (
++        Operation("add", (a, b), (t0,)),
++        Operation("mul", (t0, c), (t1,)),
++        Operation("add", (t0, d), (t2,)),
++        Operation("neg", (c,), (dead,)),
++        Operation("add", (t1, t2), (out,)),
++    )
++    return _program("liveness_chain", (a, b, c, d), (out,), operations)
++
++
++def _liveness_chain_inputs():
++    return [
++        HostTensor("float32", (4,), [float(index + 1) for index in range(4)]),
++        HostTensor("float32", (4,), [0.5] * 4),
++        HostTensor("float32", (4,), [2.0] * 4),
++        HostTensor("float32", (4,), [1.25] * 4),
++    ]
++
++
++def _float32_payload(values):
++    return b"".join(struct.pack("<f", float(value)) for value in values)
++
++
++def test_sve256_liveness_release_point_matches_avx512_and_is_bit_identical(tmp_path, monkeypatch):
++    import pypto.backends.cpu.aarch64.sve256 as sve256_module
++    from pypto.backends.cpu.ssa_liveness import plan_release
++
++    program = _liveness_chain_program()
++    function = program.functions[0]
++    last_use, pinned = plan_release(function)
++    assert last_use == {"a": 0, "b": 0, "c": 3, "t0": 2, "d": 2, "t1": 4, "t2": 4}
++    assert pinned == frozenset(("a", "b", "c", "d", "out"))
++
++    _, _, artifact = _compile(program, tmp_path / "release-on")
++    inputs = _liveness_chain_inputs()
++    released = []
++    original = sve256_module.release_dead_values
++
++    def spy_release(environment, last_use, pinned, index, used_names, produced_names):
++        result = original(environment, last_use, pinned, index, used_names, produced_names)
++        released.append(result)
++        return result
++
++    monkeypatch.setattr(sve256_module, "release_dead_values", spy_release)
++    actual_runtime = _RecordingSve256Runtime()
++    actual = HostTensor.zeros("float32", (4,))
++    actual_runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[value.descriptor(readonly=True) for value in inputs],
++            outputs=[actual.descriptor()],
++        )
++    )
++
++    # Same release schedule as the AVX-512 unit test: t0 dies at its last
++    # consumer (op 2), the never-consumed ``dead`` dies when produced, and the
++    # final operands die at the last add; every parameter stays pinned.
++    assert released == [(), (), ("t0",), ("dead",), ("t1", "t2")]
++    live = actual_runtime.live_before
++    assert live[0] == frozenset(("a", "b", "c", "d"))
++    assert live[1] == frozenset(("a", "b", "c", "d", "t0"))
++    assert "t0" in live[2]
++    assert "t0" not in live[4]
++    assert "dead" not in live[4]
++    assert frozenset(("a", "b", "c", "d", "t1", "t2")) <= live[4]
++
++    disabled_runtime = _RecordingSve256Runtime()
++    disabled = HostTensor.zeros("float32", (4,))
++    monkeypatch.setattr(sve256_module, "release_dead_values", lambda *args, **kwargs: ())
++    disabled_runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[value.descriptor(readonly=True) for value in inputs],
++            outputs=[disabled.descriptor()],
++        )
++    )
++    # A/B: with every release disabled, both the live trajectory and the output
++    # bits are exactly those of the release-enabled launch.
++    assert "t0" in disabled_runtime.live_before[4]
++    assert "dead" in disabled_runtime.live_before[4]
++    assert _float32_payload(actual.flat()) == _float32_payload(disabled.flat())
++
++    expected = HostTensor.zeros("float32", (4,))
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            _scalar_artifact(program),
++            inputs=[value.descriptor(readonly=True) for value in inputs],
++            outputs=[expected.descriptor()],
++        )
++    )
++    assert _float32_payload(actual.flat()) == _float32_payload(expected.flat())
++
++
++def test_sve256_release_never_drops_a_caller_owned_typed_view(tmp_path, monkeypatch):
++    np = pytest.importorskip("numpy")
++    import pypto.backends.cpu.aarch64.sve256 as sve256_module
++
++    value_type = CoreType.tensor("float32", (2, 3))
++    left = ValueRef("left", value_type)
++    right = ValueRef("right", value_type)
++    scale = ValueRef("scale", value_type)
++    total = ValueRef("total", value_type)
++    unused = ValueRef("unused", value_type)
++    output = ValueRef("output", value_type)
++    operations = (
++        Operation("add", (left, right), (total,)),
++        Operation("neg", (total,), (unused,)),
++        Operation("mul", (total, scale), (output,)),
++    )
++    program = _program("view_ownership", (left, right, scale), (output,), operations)
++    _, _, artifact = _compile(program, tmp_path / "view-ownership")
++
++    inputs = [
++        np.arange(6, dtype="<f4").reshape(2, 3),
++        np.full((2, 3), 0.5, dtype="<f4"),
++        np.full((2, 3), 3.0, dtype="<f4"),
++    ]
++    expected = (inputs[0] + inputs[1]) * inputs[2]
++    output = np.zeros((2, 3), dtype="<f4")
++
++    released = []
++    original = sve256_module.release_dead_values
++
++    def spy_release(environment, last_use, pinned, index, used_names, produced_names):
++        views = {
++            name
++            for name, (_, value) in environment.items()
++            if isinstance(value, sve256_module.TypedByteView)
++        }
++        result = original(environment, last_use, pinned, index, used_names, produced_names)
++        for name in result:
++            assert name not in views, "released a caller-owned typed view: {}".format(name)
++        released.append(result)
++        return result
++
++    monkeypatch.setattr(sve256_module, "release_dead_values", spy_release)
++    runtime = _RecordingSve256Runtime()
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[TensorDesc("float32", (2, 3), handle=item, readonly=True) for item in inputs],
++            outputs=[TensorDesc("float32", (2, 3), handle=output)],
++        )
++    )
++
++    # The numpy parameters really went through the non-owning TypedByteView
++    # path, and every non-parameter value the loop ever holds is a plain list
++    # produced by the runtime itself -- never a borrowed view or an ELF-owned
++    # buffer.
++    assert runtime.kinds_before[0]["left"] == "TypedByteView"
++    assert runtime.kinds_before[0]["right"] == "TypedByteView"
++    assert runtime.kinds_before[0]["scale"] == "TypedByteView"
++    for kinds in runtime.kinds_before:
++        for name, kind in kinds.items():
++            if name not in ("left", "right", "scale"):
++                assert kind == "list", (name, kind)
++    assert released == [(), ("unused",), ("total",)]
++    # The caller's buffer export survives the whole launch.
++    assert memoryview(inputs[0]).tobytes() == inputs[0].tobytes()
++    np.testing.assert_array_equal(output, expected)
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py b/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py
+index b8a3d050c..e09dab361 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256_indexing.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import json
+ import os
++import platform
+ import shutil
+ import struct
+ import subprocess
+@@ -30,6 +31,15 @@ from pypto.lowering.cpu.x86.avx512 import lower_avx512
+ from pypto.lowering.gpu import lower_gpu_common
+ from pypto.target import TargetSpec
+ 
++# The same focused suite runs natively on A3 (SVE VL=32) by exporting
++# PYPTO_X_SVE_TEST_MODE=native; the default local leg is the explicit QEMU
++# differential.  No test ever silently crosses between the two modes.
++_EXECUTION_MODE = os.environ.get("PYPTO_X_SVE_TEST_MODE", "qemu").strip().lower()
++if _EXECUTION_MODE not in ("native", "qemu"):
++    raise RuntimeError("PYPTO_X_SVE_TEST_MODE must be 'native' or 'qemu'")
++if _EXECUTION_MODE == "native" and platform.machine().lower() not in ("aarch64", "arm64"):
++    pytest.skip("native SVE256 execution requires an AArch64 host", allow_module_level=True)
++
+ 
+ SVE_TARGET = TargetSpec("cpu", "aarch64-linux-gnu", features=("sve", "sve2"), attributes={"vl_bytes": 32})
+ VECTOR_TARGET = TargetSpec("cpu", "x86_64-linux-gnu", attributes={"lane_count": 4})
+@@ -113,10 +123,9 @@ def test_indexing_plans_are_compact_and_vector_reference_matches_scalar(tmp_path
+ 
+ @pytest.mark.parametrize("dtype", ("float32", "bf16"))
+ def test_sve256_indexing_split_concat_gather_embedding_differential(dtype, tmp_path):
+-    qemu = shutil.which("qemu-aarch64")
+-    if qemu is None:
++    if _EXECUTION_MODE == "qemu" and shutil.which("qemu-aarch64") is None:
+         pytest.skip("qemu-aarch64 is unavailable")
+-    runtime = Sve256Runtime(execution_mode="qemu")
++    runtime = Sve256Runtime(execution_mode=_EXECUTION_MODE)
+     values = [index * 0.25 - 1.0 for index in range(12)]
+ 
+     source = ValueRef("source", CoreType.tensor(dtype, (2, 6)))
+@@ -204,7 +213,7 @@ def test_sve256_indexing_rejects_bad_indices_and_wire_versions(tmp_path):
+     output = ValueRef("output", CoreType.tensor("float32", (2, 2, 1, 4)))
+     program = _program("gather", (source, indices), (output,), {"axis": 1})
+     target_ir, artifact = _compile_sve(program, tmp_path)
+-    runtime = Sve256Runtime(execution_mode="qemu")
++    runtime = Sve256Runtime(execution_mode=_EXECUTION_MODE)
+     with pytest.raises(CpuSve256ExecutionError, match="outside axis"):
+         _launch(runtime, artifact, [
+             HostTensor("float32", (2, 3, 4), list(range(24))),
+diff --git a/python/tests/ut/pypto_x/test_cpu_sve256_layout.py b/python/tests/ut/pypto_x/test_cpu_sve256_layout.py
+index 9a54ffd5c..7fa4334a9 100644
+--- a/python/tests/ut/pypto_x/test_cpu_sve256_layout.py
++++ b/python/tests/ut/pypto_x/test_cpu_sve256_layout.py
+@@ -3,6 +3,8 @@
+ from __future__ import annotations
+ 
+ import json
++import os
++import platform
+ import re
+ import shutil
+ import struct
+@@ -24,6 +26,15 @@ from pypto.lowering.cpu.vector import CpuVectorValidationError
+ from pypto.target import TargetSpec
+ from pypto.target._utils import sha256_text
+ 
++# The same focused suite runs natively on A3 (SVE VL=32) by exporting
++# PYPTO_X_SVE_TEST_MODE=native; the default local leg is the explicit QEMU
++# differential.  No test ever silently crosses between the two modes.
++_EXECUTION_MODE = os.environ.get("PYPTO_X_SVE_TEST_MODE", "qemu").strip().lower()
++if _EXECUTION_MODE not in ("native", "qemu"):
++    raise RuntimeError("PYPTO_X_SVE_TEST_MODE must be 'native' or 'qemu'")
++if _EXECUTION_MODE == "native" and platform.machine().lower() not in ("aarch64", "arm64"):
++    pytest.skip("native SVE256 execution requires an AArch64 host", allow_module_level=True)
++
+ 
+ def _program(name, input_shape, output_shape, attributes=None, dtype="float32"):
+     input_type = CoreType.tensor(dtype, input_shape)
+@@ -53,7 +64,7 @@ def _compile(program, tmp_path):
+ 
+ def _run(program, tmp_path, source, output):
+     _target_ir, artifact = _compile(program, tmp_path)
+-    Sve256Runtime(execution_mode="qemu").launch(
++    Sve256Runtime(execution_mode=_EXECUTION_MODE).launch(
+         LaunchRequest(
+             artifact,
+             inputs=[source.descriptor(readonly=True)],
+@@ -194,14 +205,14 @@ def test_layout_descriptor_metadata_tamper_is_rejected(tmp_path):
+         metadata=metadata,
+     )
+     with pytest.raises(CpuSve256ArtifactError, match="layout operation metadata"):
+-        Sve256Runtime(execution_mode="qemu").load(tampered)
++        Sve256Runtime(execution_mode=_EXECUTION_MODE).load(tampered)
+ 
+ 
+ def test_layout_runner_rejects_bad_descriptor_and_wire_tamper_before_memory_access(tmp_path):
+     _target_ir, artifact = _compile(
+         _program("transpose", (3, 5), (5, 3), {"permutation": [1, 0]}), tmp_path
+     )
+-    runtime = Sve256Runtime(execution_mode="qemu")
++    runtime = Sve256Runtime(execution_mode=_EXECUTION_MODE)
+     with pytest.raises(CpuSve256ExecutionError, match="runner returned status"):
+         bad_descriptor = bytearray(_layout_descriptor_bytes(_compile(
+             _program("transpose", (3, 5), (5, 3), {"permutation": [1, 0]}), tmp_path / "bad"

@@ -1,0 +1,1168 @@
+From d47a42202177468800ff62a8cb58a1abd024b521 Mon Sep 17 00:00:00 2001
+From: PyPTO-X Agent <agent@pypto-x.local>
+Date: Sat, 12 Sep 2026 01:38:43 +0800
+Subject: [PATCH 147/217] survey(q8): harden AOCL build evidence and provider
+ probes (vendor-gemm-survey)
+
+Follow-ups after the first build window and the first probe runs:
+
+* scripts/vendor/aocl_build_report.py - standalone, light evidence generator
+  (repo/tag/commit, configure/make lines, toolchain, generated-header proof of
+  the explicit Zen4 config + active dim_t/BLAS-int width, per-file sha256,
+  aocl_gemm_* exports, zen4 symbols, vpddbusd disassembly count, kernel
+  objects).  Replaces the shell-heredoc report step, which was observed to be
+  killed (SIGPIPE/141) leaving the build complete but the report missing.
+* scripts/vendor/q8_full_heavy.sh - one-window chain: light report, probes,
+  then the matrix; the report step is non-fatal.
+* scripts/vendor/run_heavy_with_retry.sh - also retry the signal exit codes
+  (137/141/143) the lock waiter has been observed to surface.
+* scripts/perf/aocl_semantics_probe.py - fixed post-op construction (SCALE
+  needs zero_point_len 1 or >= n; group scales are aocl_pre_op_sf structs),
+  the numpy 2.x int() on a (1,1) array, E2 now really exceeds 2**24, and added
+  E10_bitwise_envelope (the machine-checkable exactness envelope that backs the
+  contract rule) + E7b multi-group layout proof.
+* scripts/perf/w8a8_vendor_parity_probe.py - fail closed when the sym_quant
+  reorder API returns buffer size 0 (K % 4 != 0), record the f32-block model
+  comparison and the int32-wrap picture for the overflow case.
+* scripts/perf/vendor_gemm_matrix.py - module-level numpy, prepared zero-arg
+  callables (no per-call struct building), artifact/threads/precision metadata,
+  incremental result dumps, fail-closed sym_quant reorder check, dim_t
+  resolution from the classic-path generated header.
+* scripts/perf/summarize_matrix.py - adds the exact(1T) vs bounded(6T) int8
+  trade-off table requested by the parent agent.
+* docs/pypto_x/0001-...-gemm-provider-contract.zh-CN.md - path A/B table with
+  the measured tolerance classes (int32_f32block_bounded), the K % 4 and
+  per-row-SCALE fail-closed rules, and the tightened bitwise trigger.
+---
+ docs/pypto_x/0001-2026-09-11-gemm-provider-contract.zh-CN.md |  23 ++-
+ scripts/perf/aocl_semantics_probe.py                         | 312 ++++++++++++++++++++++++++-----
+ scripts/perf/summarize_matrix.py                             |  35 ++++
+ scripts/perf/vendor_gemm_matrix.py                           |  86 ++++++++-
+ scripts/perf/w8a8_vendor_parity_probe.py                     |  75 ++++++++
+ scripts/vendor/aocl_build_report.py                          | 252 +++++++++++++++++++++++++
+ scripts/vendor/build_aocl_lpgemm_zen4.sh                     |  20 +-
+ scripts/vendor/q8_full_heavy.sh                              |  25 +++
+ scripts/vendor/run_heavy_with_retry.sh                       |  11 +-
+ 9 files changed, 786 insertions(+), 53 deletions(-)
+
+diff --git a/docs/pypto_x/0001-2026-09-11-gemm-provider-contract.zh-CN.md b/docs/pypto_x/0001-2026-09-11-gemm-provider-contract.zh-CN.md
+index 79e16f754..ef0f1b15d 100644
+--- a/docs/pypto_x/0001-2026-09-11-gemm-provider-contract.zh-CN.md
++++ b/docs/pypto_x/0001-2026-09-11-gemm-provider-contract.zh-CN.md
+@@ -101,6 +101,26 @@
+ * `k > accum_k_limit`（= `(2**31-1)/127/127` = 133144）→ 拒绝，不问 vendor。
+ * 非有限输入、保留码点、shape 不匹配 → 拒绝（沿用 C1 golden 的 Q2/Q3 规则）。
+ 
++### 4.6 两条 vendor 路径（以 AOCL/LPGEMM 为具体实例）
++
++同一份 LPGEMM 库可以按两种完全不同的方式接入，**必须作为两个 provider 实例登记**
++（`provider_fingerprint` 不同），不允许在两者之间静默切换：
++
++| | **路 A：精确整数 GEMM + 我们的 epilogue** | **路 B：融合 epilogue（sym_quant 单组）** |
++| --- | --- | --- |
++| 调用 | `aocl_gemm_s8s8s32os32`（int32 输出，无后处理） | `aocl_gemm_s8s8s32obf16_sym_quant`（`group_size=k`，B 需 group 格式 reorder） |
++| `accum_width` | `int32` | `int32`（组内），组间 f32 累加 |
++| `scale_granularity` | `{activation: per_token, weight: per_channel}` —— 由**我们**应用 | 由 vendor 应用：A scale `[m][1]`（per-token）、B scale `[1][n]`（per-channel） |
++| `epilogue_owner` | `pypto_x` | `vendor_fused` |
++| `tolerance_class` | **`int32_f32block_bounded`**（实测：LPGEMM 跨 `KC=2048` 块按 binary32 累加 → K=2048 偏差 ±1、K=3584 ≤3、K=16696 ≤33、K=133144 为 22；K≤1024 精确）。**不得**填 `bitwise`，除非 provider 是 `portable` 或我们自己的 kernel | `fp32_1ulp_epilogue`（两次顺序 f32 乘法 vs 我们的一次乘；**不得**填 `bitwise`） |
++| `precision_class` | `deterministic_bounded`（`k < KC` 时退化为 `bitwise_vs_portable`） | `deterministic_bounded`（bf16 层实测 0 mismatch，但机制不同构） |
++| 额外约束 | 需要一趟额外读写（int32 → dequant → bf16） | 需要 B 的 group 格式 reorder + `K % group_size == 0`；**K % 4 != 0 时 reorder API 返回缓冲区大小 0 = 不支持 → fail-closed**；per-row scale 只能走这条路 |
++| 失败的处置 | 若实测偏差超过登记的界（本机 K≤3584 为 3）→ 该 provider 对该形状禁用，退回 `portable`；偏差必须进 `precision_class` 报告 | 若 bf16 mismatch > 0 → 记录并降级到路 A（本机实测全部有效用例 0 mismatch，但仍按有界类登记） |
++
++设计约束（不是缺陷）：普通 `SCALE` 后处理**不支持 per-row(m)**（parser 明文拒绝），
++所以"per-token 激活 scale"要么走我们的 epilogue（路 A），要么走 sym_quant 单组（路 B），
++不存在第三条"用普通后处理拼出来"的路。
++
+ ### 4.5 运行期自证（每次启用新 provider 时必须落盘）
+ 1. **架构选择证明**：provider 必须能报告实际生效的内核/配置；
+    本任务提供 `raw/aocl-semantics-probe.json` 的 `E8_runtime_arch`（BLIS arch id/name）
+@@ -113,8 +133,9 @@
+ 
+ | `precision_class` | 触发条件 | 允许的对外表述 |
+ | --- | --- | --- |
+-| `bitwise_vs_portable` | provider = `portable`；或 vendor int8 + `epilogue_owner=pypto_x` 且探针 0 mismatch 且 `k <= accum_k_limit` | "与 portable 逐位一致" |
++| `bitwise_vs_portable` | provider = `portable`（含我们自己的 AVX-512/SVE256 kernel）；**或** vendor int8 且探针在该形状上 0 mismatch **且** `k < KC`（本机 KC=2048，单块内精确） | "与 portable 逐位一致" |
+ | `vendor_versioned_reproducible` | provider = vendor 且 `tolerance_class` 有实测支撑（同版本同输入 sha256 可复现），但位级未对齐 | "版本钉死可复现；位级一致性仅对 portable 声称" |
++| `deterministic_bounded` | provider = vendor 且偏差有**实测界**（例：AOCL int8 路 A 的 f32 分块累加，本机 K≤3584 ≤3 个 int32 LSB；路 B 的 bf16 输出实测 0 mismatch 但非同构） | "有界 + 确定性；界来自实测，不来自数学保证" |
+ | `bounded_fp32` | bf16/f32 累加路径（顺序相关）或 fused epilogue 有 ≤1 ulp 差异 | "有界误差 + 版本指纹" |
+ | `unverified` | 未跑探针的 provider（默认） | 不得进入生产路径 |
+ 
+diff --git a/scripts/perf/aocl_semantics_probe.py b/scripts/perf/aocl_semantics_probe.py
+index 316e3141b..440bd5188 100755
+--- a/scripts/perf/aocl_semantics_probe.py
++++ b/scripts/perf/aocl_semantics_probe.py
+@@ -80,6 +80,58 @@ def _portable():
+ #: argument list, so resolve it from the build that produced the library
+ #: instead of guessing: the CMake cache ``INT_SIZE`` entry and the generated
+ #: ``bli_config.h`` both record it.
++def _active_define(lines, name):
++    """Resolve the active branch of the generated #if/#elif chain for `name`."""
++    import re
++
++    defines = [
++        (index, int(match.group(1)))
++        for index, line in enumerate(lines)
++        for match in [re.match(r"#define\s+{}\s+(\d+)".format(name), line)]
++        if match
++    ]
++    if not defines:
++        return None
++    if len(defines) == 1:
++        return defines[0][1]
++    first_index, first_value = defines[0]
++    chain = [
++        (index, int(match.group(1)), int(match.group(2)))
++        for index, line in enumerate(lines)
++        for match in [re.match(r"#(?:if|elif)\s+(\d+)\s*==\s*(\d+)", line)]
++        if match and match and index < defines[-1][0] + 1
++    ]
++    for index, value in defines:
++        for cond_index, left, right in chain:
++            if cond_index < index and left == right:
++                return value
++    return first_value
++
++
++def _dim_from_config_header(evidence, ctypes_module):
++    """Read dim_t width from the classic-path generated bli_config.h."""
++    import glob
++    import os
++
++    roots = [
++        os.path.join(evidence, "src"),
++        os.path.join(evidence, "install"),
++    ]
++    for root in roots:
++        for path in glob.glob(os.path.join(root, "**", "bli_config.h"), recursive=True):
++            try:
++                text = open(path, "r", encoding="utf-8", errors="replace").read()
++            except OSError:
++                continue
++            bits = _active_define(text.splitlines(), "BLIS_INT_TYPE_SIZE")
++            if bits in (32, 64):
++                return (
++                    ctypes_module.c_int64 if bits == 64 else ctypes_module.c_int32,
++                    "{}:BLIS_INT_TYPE_SIZE={}".format(path, bits),
++                )
++    return None
++
++
+ def _resolve_dim_type():
+     import glob
+     import re
+@@ -116,6 +168,9 @@ def _resolve_dim_type():
+                     ctypes.c_int64 if bits == 64 else ctypes.c_int32,
+                     "{}:BLIS_INT_TYPE_SIZE={}".format(path, bits),
+                 )
++    from_config = _dim_from_config_header(evidence, ctypes)
++    if from_config is not None:
++        return from_config
+     return ctypes.c_int64, "fallback-assumed-64bit (no build metadata found)"
+ 
+ 
+@@ -394,10 +449,20 @@ class Lpgemm:
+ 
+     @staticmethod
+     def make_scale_post_op(scales, zero_points=None):
+-        """One SCALE post-op; scales is a 1-D fp32 array (len 1 or len n)."""
++        """One SCALE post-op; scales is a 1-D fp32 array (len 1 or len n).
++
++        ``lpgemm_post_ops.c`` requires ``zero_point_len`` to be 1 or >= n
++        (a length of 0 is rejected with "zero point length is < n"), so the
++        canonical "no zero point" is a length-1 array of zeros.  The kernel
++        then computes ``rne(acc*scale) + 0.0`` -- see
++        ``lpgemm_downscale_reference`` for the one observable consequence
++        (-0.0 is normalised to +0.0).
++        """
+         entries = [{"scale_factor": scales}]
+-        if zero_points is not None:
+-            entries[0]["zero_point"] = zero_points
++        entries[0]["zero_point"] = (
++            zero_points if zero_points is not None
++            else np.zeros(1, dtype=np.float32)
++        )
+         sum_buf, keep = Lpgemm._alloc_sum(entries)
+         seq = (ctypes.c_int * 1)(SCALE)
+         post = AoclPostOp()
+@@ -419,11 +484,21 @@ class Lpgemm:
+         single-group case), b_scale is [groups, n] fp32."""
+         a_scale = np.ascontiguousarray(a_scale, dtype=np.float32)
+         b_scale = np.ascontiguousarray(b_scale, dtype=np.float32)
++        a_sf = AoclPreOpSf(
++            scale_factor=_addr(a_scale),
++            scale_factor_len=int(a_scale.size),
++            scale_factor_type=AOCL_GEMM_F32,
++        )
++        b_sf = AoclPreOpSf(
++            scale_factor=_addr(b_scale),
++            scale_factor_len=int(b_scale.size),
++            scale_factor_type=AOCL_GEMM_F32,
++        )
+         grp = AoclGroupPostOp()
+         grp.group_size = int(group_size)
+         grp.seq_length = 1
+-        grp.a_scl = ctypes.cast(_addr(a_scale), ctypes.c_void_p)
+-        grp.b_scl = ctypes.cast(_addr(b_scale), ctypes.c_void_p)
++        grp.a_scl = ctypes.cast(ctypes.pointer(a_sf), ctypes.c_void_p)
++        grp.b_scl = ctypes.cast(ctypes.pointer(b_sf), ctypes.c_void_p)
+         grp.a_zp = None
+         grp.b_zp = None
+         post = AoclPostOp()
+@@ -494,6 +569,29 @@ def capture_stderr(fn, *args, **kwargs):
+     return buffer.getvalue()
+ 
+ 
++def lpgemm_downscale_reference(acc_i64, col_scales, add_zero_point=True):
++    """Model LPGEMM's DOWNSCALE post-op bit-for-bit.
++
++    The kernel computes ``rne_f32(rne_f32(f32(acc) * scale)) + zero_point``
++    (``MULADD_RND_F32``), where ``zero_point`` is 0.0 when not supplied.  The
++    trailing ``+0.0`` is exact for every finite value except ``-0.0``, which it
++    normalises to ``+0.0``; ``add_zero_point=False`` reproduces instead our
++    portable epilogue (single multiply by the pre-multiplied scale, no add).
++    """
++    scheme = _portable()
++    f32 = scheme.float32_round
++    acc = np.asarray(acc_i64, dtype=np.int64)
++    rows, cols = acc.shape
++    bits = np.zeros((rows, cols), dtype=np.uint16)
++    for i in range(rows):
++        for j in range(cols):
++            product = f32(f32(float(acc[i, j])) * float(col_scales[j]))
++            if add_zero_point:
++                product = f32(product + 0.0)
++            bits[i, j] = scheme.bf16_rne_bits(product)
++    return bits
++
++
+ def _small_random(rng, shape, low=-127, high=128, dtype=np.int8):
+     return rng.integers(low, high, size=shape, dtype=np.int16).astype(dtype)
+ 
+@@ -527,8 +625,10 @@ def e2_accum_width(lpg: Lpgemm, rng) -> dict:
+     """K=4096 makes the exact sum exceed 2**24 for many outputs, so an f32
+     accumulator would be inexact; an int32 one is exact."""
+     m, k, n = 4, 4096, 8
+-    a = _small_random(rng, (m, k))
+-    b = _small_random(rng, (k, n))
++    # all-127 operands push |dot| above 2**24 (127*127*4096 = 66_060_288), so a
++    # binary32 accumulator could not be exact while an int32 one is
++    a = np.full((m, k), 127, dtype=np.int8)
++    b = np.full((k, n), 127, dtype=np.int8)
+     out = lpg.s8s8s32os32(a, b, m, k, n)
+     exact = exact_int32_matmul(a, b)
+     portable = portable_qmatmul(a, b)
+@@ -545,40 +645,57 @@ def e2_accum_width(lpg: Lpgemm, rng) -> dict:
+ 
+ 
+ def e3_int32_overflow(lpg: Lpgemm, rng) -> dict:
+-    """K beyond MAX_ACCUMULATOR_K with extreme codes: the portable golden
+-    refuses; LPGEMM has no guard -- measure what it actually produces."""
++    """The exact boundary the contract must guard.
++
++    K = MAX_ACCUMULATOR_K (= 133144) is the largest K for which
++    127*127*K fits in int32 (127*127*133144 = 2147479576 <= INT32_MAX);
++    K = limit + 1 = 133145 overflows (2147495705).  The portable golden
++    refuses the overflow case, LPGEMM has no guard -- measure what it does.
++    """
+     scheme = _portable()
+-    limit = scheme.MAX_ACCUMULATOR_K
+-    k = 140000  # > 133143
++    limit = int(scheme.MAX_ACCUMULATOR_K)
+     n = 2
+     m = 1
+-    a = np.full((m, k), 127, dtype=np.int8)
+-    b = np.full((k, n), 127, dtype=np.int8)
+-    out = lpg.s8s8s32os32(a, b, m, k, n)
+-    exact = 127 * 127 * k
+-    wrapped = ((exact + 2 ** 31) % 2 ** 32) - 2 ** 31
+-    portable_refused = None
+-    try:
+-        scheme.qmatmul_s8s8_s32(
+-            a.reshape(-1).tolist(), b.reshape(-1).tolist(),
+-            left_shape=(m, k), right_shape=(k, n),
+-        )
+-        portable_refused = False
+-    except Exception as exc:  # noqa: BLE001 - the point is the refusal
+-        portable_refused = "{}: {}".format(type(exc).__name__, exc)
++    results = {}
++    for label, k in (("boundary", limit), ("overflow", limit + 1)):
++        a = np.full((m, k), 127, dtype=np.int8)
++        b = np.full((k, n), 127, dtype=np.int8)
++        out = lpg.s8s8s32os32(a, b, m, k, n)
++        exact = 127 * 127 * k
++        wrapped = ((exact + 2 ** 31) % 2 ** 32) - 2 ** 31
++        portable_refused = None
++        try:
++            scheme.qmatmul_s8s8_s32(
++                a.reshape(-1).tolist(), b.reshape(-1).tolist(),
++                left_shape=(m, k), right_shape=(k, n),
++            )
++            portable_refused = False
++        except Exception as exc:  # noqa: BLE001 - the refusal is the result
++            portable_refused = "{}: {}".format(type(exc).__name__, exc)
++        results[label] = {
++            "k": k,
++            "exact_dot": int(exact),
++            "fits_int32": bool(exact <= 2 ** 31 - 1),
++            "exact_mod_2_32_signed": int(wrapped),
++            "lpgemm_int32": out[0].tolist(),
++            "lpgemm_matches_exact": bool(int(out[0, 0]) == exact),
++            "lpgemm_matches_wraparound": bool(int(out[0, 0]) == wrapped),
++            "lpgemm_saturates_to_int32_max": bool(int(out[0, 0]) == 2 ** 31 - 1),
++            "lpgemm_reported_error": False,  # no error path exists in the API
++            "portable_refused": portable_refused,
++        }
+     return {
+-        "k": k,
+-        "portable_max_accumulator_k": int(limit),
+-        "k_exceeds_portable_limit": bool(k > limit),
+-        "exact_dot": int(exact),
+-        "exact_mod_2_32_signed": int(wrapped),
+-        "lpgemm_int32": out[0].tolist(),
+-        "lpgemm_matches_wraparound": bool(int(out[0, 0]) == wrapped == int(out[0, 1])),
+-        "lpgemm_saturates_to_int32_max": bool(int(out[0, 0]) == 2 ** 31 - 1),
+-        "portable_refused": portable_refused,
+-        "verdict": "LPGEMM_WRAPS_NO_SATURATION"
+-        if int(out[0, 0]) == wrapped
+-        else "UNEXPECTED",
++        "portable_max_accumulator_k": limit,
++        "int32_max": 2 ** 31 - 1,
++        "boundary_product": results["boundary"]["exact_dot"],
++        "overflow_product": results["overflow"]["exact_dot"],
++        "boundary": results["boundary"],
++        "overflow": results["overflow"],
++        "verdict": (
++            "LPGEMM_WRAPS_NO_SATURATION_NO_ERROR"
++            if results["overflow"]["lpgemm_matches_wraparound"]
++            else "UNEXPECTED"
++        ),
+     }
+ 
+ 
+@@ -596,6 +713,15 @@ def e4_reserved_code(lpg: Lpgemm) -> dict:
+         "lpgemm_int32": out[0].tolist(),
+         "exact_int64": int(exact),
+         "accepted_reserved_code": bool(int(out[0, 0]) == exact),
++        "error_or_warning_emitted": False,
++        "downstream_effect": (
++            "-128 is a legal int8 for LPGEMM, so handing it over produces a "
++            "well-formed int32 result with no error and no marker; a W8A8 "
++            "pipeline that assumes [-127,127] would silently accept a value "
++            "outside its quantization contract. The adapter (or the packer "
++            "that produces the codes) must therefore enforce the reservation "
++            "on our side."
++        ),
+         "verdict": "LPGEMM_ACCEPTS_-128" if int(out[0, 0]) == exact else "LPGEMM_REJECTS_-128",
+     }
+ 
+@@ -613,25 +739,39 @@ def e5_scale_post_op_granularity(lpg: Lpgemm, rng) -> dict:
+ 
+     # (a) per-tensor SCALE (len 1)
+     post, keep = Lpgemm.make_scale_post_op(tensor_scale)
+-    out_tensor = lpg.s8s8s32obf16(a, b, m, k, n, post_op=post)
+-    ref_tensor = portable_epilogue_bits(
+-        acc, [1.0] * m, [float(tensor_scale[0])] * n
++    sentinel = np.full((m, n), 0xBEEF, dtype=np.uint16)
++    err_tensor = capture_stderr(
++        lpg.s8s8s32obf16, a, b, m, k, n, post_op=post, c=sentinel
+     )
++    out_tensor = sentinel
++    ref_tensor = portable_epilogue_bits(acc, [1.0] * m, [float(tensor_scale[0])] * n)
++    ref_tensor_lpg = lpgemm_downscale_reference(acc, [float(tensor_scale[0])] * n)
+     result["per_tensor_len1"] = {
+         "scale": float(tensor_scale[0]),
+-        "accepted": True,
++        "stderr": err_tensor.strip(),
++        "produced_output": bool(not np.all(sentinel == 0xBEEF)),
+         "bitwise_equal_portable": bool(np.array_equal(out_tensor, ref_tensor)),
+-        "mismatch_count": int((out_tensor != ref_tensor).sum()),
++        "mismatch_count_vs_portable": int((out_tensor != ref_tensor).sum()),
++        "bitwise_equal_lpgemm_model": bool(np.array_equal(out_tensor, ref_tensor_lpg)),
++        "mismatch_count_vs_lpgemm_model": int((out_tensor != ref_tensor_lpg).sum()),
+     }
+ 
+     # (b) per-column SCALE (len n)
+     post, keep = Lpgemm.make_scale_post_op(col_scales)
+-    out_col = lpg.s8s8s32obf16(a, b, m, k, n, post_op=post)
++    sentinel = np.full((m, n), 0xBEEF, dtype=np.uint16)
++    err_col = capture_stderr(
++        lpg.s8s8s32obf16, a, b, m, k, n, post_op=post, c=sentinel
++    )
++    out_col = sentinel
+     ref_col = portable_epilogue_bits(acc, [1.0] * m, col_scales.tolist())
++    ref_col_lpg = lpgemm_downscale_reference(acc, col_scales.tolist())
+     result["per_column_len_n"] = {
+-        "accepted": True,
++        "stderr": err_col.strip(),
++        "produced_output": bool(not np.all(sentinel == 0xBEEF)),
+         "bitwise_equal_portable": bool(np.array_equal(out_col, ref_col)),
+-        "mismatch_count": int((out_col != ref_col).sum()),
++        "mismatch_count_vs_portable": int((out_col != ref_col).sum()),
++        "bitwise_equal_lpgemm_model": bool(np.array_equal(out_col, ref_col_lpg)),
++        "mismatch_count_vs_lpgemm_model": int((out_col != ref_col_lpg).sum()),
+         "elements": int(out_col.size),
+     }
+ 
+@@ -669,7 +809,7 @@ def e6_bf16_rounding(lpg: Lpgemm) -> dict:
+     k = len(codes)
+     a = np.ones((m, k), dtype=np.int8)
+     b = np.array(codes, dtype=np.int8).reshape(k, n)
+-    exact = int(a.astype(np.int64) @ b.astype(np.int64))
++    exact = int((a.astype(np.int64) @ b.astype(np.int64)).item())
+     out = lpg.s8s8s32obf16(a, b, m, k, n)
+     bits = int(out[0, 0])
+     value = float(bf16_bits_to_f32(np.array([bits], dtype=np.uint16))[0])
+@@ -827,6 +967,85 @@ def e7b_sym_quant_multi_group(lpg: Lpgemm, rng, m=3, k=128, n=32, group_size=32)
+     return result
+ 
+ 
++
++def e10_bitwise_envelope(lpg: Lpgemm) -> dict:
++    """Machine-checkable bitwise envelope for the int8 contract rule.
++
++    LPGEMM's S8S8S32OS32 accumulates per-``KC``-block int32 partials through
++    binary32 on this build (``KC`` = 2048 in
++    ``addon/aocl_gemm/config/lpgemm_blksz_map.h``).  The deviation from the
++    exact integer dot product therefore depends on *both* K and the magnitude
++    of the accumulated sums, so the contract cannot use a single "K < KC"
++    rule.  This probe measures the envelope directly: for a worst-case code
++    distribution (all-positive codes in [100, 127], which drive |acc| past
++    2**24 quickly) over three seeds it reports, per K, the maximum absolute
++    delta versus the exact integer product and the mismatch count.
++
++    The rule that follows is:
++
++        bitwise_vs_portable(int8) := provider in {portable, our kernels}
++            or (k <= bitwise_safe_k and observed_mismatch == 0)
++
++    with ``bitwise_safe_k`` read from this probe (not from the source).  The
++    envelope is distribution-dependent: with random +/-127 codes the same K
++    values come out exact (see ``random_codes_control``), which is exactly why
++    the rule must be empirical.
++    """
++    rng = np.random.default_rng(20260912)
++    m, n = 2, 6
++    ks = (512, 1024, 2048, 3584, 5099)
++    per_k = {}
++    for k in ks:
++        max_delta = 0
++        mismatch = 0
++        elements = 0
++        for seed in (1, 2, 3):
++            r = np.random.default_rng(seed)
++            a = r.integers(100, 128, size=(m, k), dtype=np.int16).astype(np.int8)
++            b = r.integers(100, 128, size=(k, n), dtype=np.int16).astype(np.int8)
++            out = lpg.s8s8s32os32(a, b, m, k, n).astype(np.int64)
++            exact = exact_int32_matmul(a, b)
++            delta = np.abs(out - exact)
++            max_delta = max(max_delta, int(delta.max()))
++            mismatch += int((delta > 0).sum())
++            elements += int(delta.size)
++        per_k["k{}".format(k)] = {
++            "k": k,
++            "max_abs_delta_vs_exact": max_delta,
++            "mismatch_count": mismatch,
++            "elements": elements,
++        }
++
++    control = {}
++    for k in (2048, 16696):
++        r = np.random.default_rng(9)
++        a = r.integers(-127, 128, size=(m, k), dtype=np.int16).astype(np.int8)
++        b = r.integers(-127, 128, size=(k, n), dtype=np.int16).astype(np.int8)
++        out = lpg.s8s8s32os32(a, b, m, k, n).astype(np.int64)
++        control["k{}".format(k)] = {
++            "max_abs_delta_vs_exact": int(np.abs(out - exact_int32_matmul(a, b)).max()),
++            "note": "random +/-127 codes: small |acc|, exact even above KC",
++        }
++
++    safe = [k for k in ks if per_k["k{}".format(k)]["max_abs_delta_vs_exact"] == 0]
++    return {
++        "worst_case_distribution": "codes uniform in [100,127], three seeds, m=2,n=6",
++        "per_k": per_k,
++        "random_codes_control": control,
++        "bitwise_safe_k": max(safe) if safe else None,
++        "deviation_bound_by_k": {
++            str(k): per_k["k{}".format(k)]["max_abs_delta_vs_exact"] for k in ks
++        },
++        "kc_config_value": 2048,
++        "kc_source": "addon/aocl_gemm/config/lpgemm_blksz_map.h LPGEMM_BLKSZ_MAP_ZEN4 S8S8S32OS32",
++        "rule": (
++            "bitwise_vs_portable(int8) := provider in {portable, our kernels} or "
++            "(k <= bitwise_safe_k and observed_mismatch == 0); otherwise use the "
++            "deviation_bound_by_k values as the registered tolerance bound"
++        ),
++    }
++
++
+ def e8_runtime_arch(lpg: Lpgemm) -> dict:
+     result = {"library": lpg.lib_path}
+     if lpg.has_arch_query:
+@@ -907,6 +1126,7 @@ def main() -> int:
+         ("E7_sym_quant_single_group", lambda: e7_sym_quant_single_group(lpg, rng)),
+         ("E7b_sym_quant_multi_group_layout", lambda: e7b_sym_quant_multi_group(lpg, rng)),
+         ("E8_runtime_arch", lambda: e8_runtime_arch(lpg)),
++        ("E10_bitwise_envelope", lambda: e10_bitwise_envelope(lpg)),
+         ("E9_imported_symbols", lambda: e9_imported_symbols(lib_path)),
+     ):
+         started = time.time()
+diff --git a/scripts/perf/summarize_matrix.py b/scripts/perf/summarize_matrix.py
+index 411461c4d..22d4b22a3 100644
+--- a/scripts/perf/summarize_matrix.py
++++ b/scripts/perf/summarize_matrix.py
+@@ -155,6 +155,41 @@ def main() -> int:
+             )
+         )
+ 
++
++    # precision vs speed trade-off: our exact 1-thread kernel against the
++    # 6-thread vendor kernel with a bounded integer deviation
++    if any(_ms(row, "ours_int8_qmatmul") is not None for row in rows):
++        lines.append("")
++        lines.append("### 精度 ↔ 速度取舍（int8）：我们自己的 kernel（1 线程，无条件精确） vs AOCL（{} 线程，有界偏差）".format(
++            data.get("provider_threads", {}).get("aocl_int8_packed", "?")
++        ))
++        lines.append("")
++        lines.append("| m | k | n | ours_int8 1T (ms) | aocl_int8 6T (ms) | AOCL/ours 加速比 | ours 与 portable 逐位 | AOCL 与 portable 逐位 | AOCL 偏差界（实测） |")
++        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
++        for row in rows:
++            ours = _ms(row, "ours_int8_qmatmul")
++            aocl = _ms(row, "aocl_int8_packed")
++            ratio = "-" if not ours or not aocl else "{:.2f}x".format(ours / aocl)
++            ours_bit = row.get("checks", {}).get("ours_int8_bitwise_portable")
++            aocl_bit = row.get("checks", {}).get("aocl_int8_packed_bitwise_portable")
++            lines.append(
++                "| {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
++                    row["m"], row["k"], row["n"],
++                    "-" if ours is None else "{:.5f}".format(ours),
++                    "-" if aocl is None else "{:.5f}".format(aocl),
++                    ratio, ours_bit, aocl_bit,
++                    "K<=1024: 0；K=2048: <=1；K=3584: <=4（见 parity 探针）",
++                )
++            )
++        lines.append("")
++        lines.append(
++            "注：ours_int8 是单线程 kernel（无 OpenMP）；AOCL 列使用 OMP_NUM_THREADS={}。"
++            "AOCL 的'与 portable 逐位'为 False 的行即跨 KC 块 binary32 累加的实测落点，"
++            "不是 epilogue 的差异（epilogue 本身在 E5 中逐位一致）。".format(
++                data.get("env", {}).get("threads_requested", "?")
++            )
++        )
++
+     text = "\n".join(lines) + "\n"
+     if args.output:
+         with open(args.output, "w", encoding="utf-8") as handle:
+diff --git a/scripts/perf/vendor_gemm_matrix.py b/scripts/perf/vendor_gemm_matrix.py
+index 6df280993..410827422 100755
+--- a/scripts/perf/vendor_gemm_matrix.py
++++ b/scripts/perf/vendor_gemm_matrix.py
+@@ -141,6 +141,58 @@ def _portable():
+ AOCL_GEMM_F32 = 0
+ 
+ 
++def _active_define(lines, name):
++    """Resolve the active branch of the generated #if/#elif chain for `name`."""
++    import re
++
++    defines = [
++        (index, int(match.group(1)))
++        for index, line in enumerate(lines)
++        for match in [re.match(r"#define\s+{}\s+(\d+)".format(name), line)]
++        if match
++    ]
++    if not defines:
++        return None
++    if len(defines) == 1:
++        return defines[0][1]
++    first_index, first_value = defines[0]
++    chain = [
++        (index, int(match.group(1)), int(match.group(2)))
++        for index, line in enumerate(lines)
++        for match in [re.match(r"#(?:if|elif)\s+(\d+)\s*==\s*(\d+)", line)]
++        if match and match and index < defines[-1][0] + 1
++    ]
++    for index, value in defines:
++        for cond_index, left, right in chain:
++            if cond_index < index and left == right:
++                return value
++    return first_value
++
++
++def _dim_from_config_header(evidence, ctypes_module):
++    """Read dim_t width from the classic-path generated bli_config.h."""
++    import glob
++    import os
++
++    roots = [
++        os.path.join(evidence, "src"),
++        os.path.join(evidence, "install"),
++    ]
++    for root in roots:
++        for path in glob.glob(os.path.join(root, "**", "bli_config.h"), recursive=True):
++            try:
++                text = open(path, "r", encoding="utf-8", errors="replace").read()
++            except OSError:
++                continue
++            bits = _active_define(text.splitlines(), "BLIS_INT_TYPE_SIZE")
++            if bits in (32, 64):
++                return (
++                    ctypes_module.c_int64 if bits == 64 else ctypes_module.c_int32,
++                    "{}:BLIS_INT_TYPE_SIZE={}".format(path, bits),
++                )
++    return None
++
++
+ def _resolve_dim_type():
+     import glob
+     import re
+@@ -169,7 +221,10 @@ def _resolve_dim_type():
+                     ctypes.c_int64 if bits == 64 else ctypes.c_int32,
+                     "{}:INT_SIZE={}".format(path, bits),
+                 )
+-    return ctypes.c_int64, "fallback-assumed-64bit"
++    from_config = _dim_from_config_header(evidence, ctypes)
++    if from_config is not None:
++        return from_config
++    return ctypes.c_int64, "fallback-assumed-64bit (no build metadata found)"
+ 
+ 
+ DIM_T, DIM_SOURCE = _resolve_dim_type()
+@@ -344,6 +399,11 @@ class Aocl:
+                 b"r", b"n", b"b", k, n, ctypes.byref(meta)
+             )
+         )
++        if size <= 0:
++            raise RuntimeError(
++                "sym_quant reorder is unsupported for k={} (buffer size 0; the API has no "
++                "layout for this K, e.g. K % 4 != 0)".format(k)
++            )
+         buf = np.zeros(max(size, 1), dtype=np.int8)
+         self.lib.aocl_reorder_s8s8s32os32_sym_quant(
+             b"r", b"n", b"b", _i8p(b), _i8p(buf), k, n, n, ctypes.byref(meta)
+@@ -646,6 +706,24 @@ def main() -> int:
+         },
+         aocl={"library": aocl_lib, "dim_t_source": DIM_SOURCE},
+         libxsmm=probe_libxsmm(),
++        provider_threads={
++            "onednn_bf16": args.threads,
++            "aocl_bf16_packed": args.threads,
++            "aocl_bf16_unpacked": args.threads,
++            "aocl_int8_packed": args.threads,
++            "aocl_int8_unpacked": args.threads,
++            "aocl_int8_symquant_bf16": args.threads,
++            "ours_bf16": args.threads,
++            "ours_int8_qmatmul": 1,
++            "ours_int8_epilogue_bf16": 1,
++        },
++        provider_precision={
++            "ours_int8_qmatmul": "unconditionally exact int32 (bitwise vs portable, pre-flight PASS)",
++            "aocl_int8_packed": "int32 output with vendor-internal cross-KC binary32 accumulation "
++                                "(bounded: see raw/w8a8-parity-probe.json)",
++            "aocl_int8_symquant_bf16": "fused per-token x per-channel epilogue, deterministic but "
++                                       "different f32 composition (no bitwise claim)",
++        },
+         env_noise_start=_env_noise(),
+         int8_quantizer="pypto.portable.qwen35_w8a8_weight.quantize_weight_per_output_channel "
+                        "+ qwen35_w8a8_scheme.quantize_per_token_s8 (contract-exact)",
+@@ -887,6 +965,12 @@ def main() -> int:
+                 if "median_ms" in value
+             )
+         rows.append(row)
++        # Incremental dump: a window can be lost mid-run, and the raw rounds
++        # must survive that.  The final write below is the authoritative one.
++        report["shapes"] = rows
++        with open(args.output, "w", encoding="utf-8") as handle:
++            json.dump(report, handle, indent=2, ensure_ascii=False)
++            handle.write("\n")
+         print(
+             "[m={} k={} n={}] {}".format(
+                 m, k, n,
+diff --git a/scripts/perf/w8a8_vendor_parity_probe.py b/scripts/perf/w8a8_vendor_parity_probe.py
+index 3ca686849..0d43c581f 100755
+--- a/scripts/perf/w8a8_vendor_parity_probe.py
++++ b/scripts/perf/w8a8_vendor_parity_probe.py
+@@ -71,6 +71,9 @@ def _fill(rng, case):
+         a = np.full((m, k), 127, dtype=np.int8)
+         b = np.full((k, n), 127, dtype=np.int8)
+         b[0, :] = -127
++    elif kind == "mixed_large":
++        a = rng.integers(100, 128, size=(m, k), dtype=np.int16).astype(np.int8)
++        b = rng.integers(100, 128, size=(k, n), dtype=np.int16).astype(np.int8)
+     elif kind == "reserved_code":
+         a = np.full((m, k), -128, dtype=np.int8)
+         b = np.ones((k, n), dtype=np.int8)
+@@ -80,6 +83,39 @@ def _fill(rng, case):
+     return a, b
+ 
+ 
++#: LPGEMM's S8S8S32OS32 block size on Zen4 (addon/aocl_gemm/config/lpgemm_blksz_map.h)
++LPGEMM_KC_ZEN4 = 2048
++
++
++def f32_block_model(a, b, kc=LPGEMM_KC_ZEN4):
++    """Model LPGEMM's cross-k-block accumulation.
++
++    Empirically (this probe) LPGEMM accumulates the exact per-KC-block int32
++    partials in **binary32** and finally wraps the result into int32, i.e.
++
++        acc_f32 = rne_f32(acc_f32 + rne_f32(block_partial))
++        result  = int32(acc_f32 mod 2**32)
++
++    (Verified: this model matches LPGEMM bit-for-bit for K = 3585, 5097, 5099,
++    16696, 133144 and even for the K = 133145 overflow wrap; see
++    ``model_vs_lpgemm`` in the results.)  Our portable golden and our AVX-512
++    kernel accumulate exact int32 across the whole K instead.
++    """
++    a = np.asarray(a, dtype=np.int64)
++    b = np.asarray(b, dtype=np.int64)
++    m, k = a.shape
++    n = b.shape[1]
++    acc = np.zeros((m, n), dtype=np.float32)
++    for start in range(0, k, kc):
++        stop = min(k, start + kc)
++        partial = a[:, start:stop] @ b[start:stop, :]
++        acc = (acc + partial.astype(np.float32)).astype(np.float32)
++    wide = acc.astype(np.float64).astype(np.int64)
++    wrapped = ((wide + 2 ** 31) % 2 ** 32) - 2 ** 31
++    return wrapped.astype(np.int64)
++
++
++
+ def run_case(lpg, rng, case, rounds_fused=True):
+     scheme = asp._portable()
+     m, k, n = case["m"], case["k"], case["n"]
+@@ -105,6 +141,15 @@ def run_case(lpg, rng, case, rounds_fused=True):
+ 
+     aocl_out = lpg.s8s8s32os32(a, b, m, k, n)
+     record["aocl_equals_exact"] = bool(np.array_equal(aocl_out.astype(np.int64), exact))
++    model = f32_block_model(a, b)
++    record["model_f32_block_equals_lpgemm"] = bool(
++        np.array_equal(model, aocl_out.astype(np.int64))
++    )
++    record["model_f32_block_equals_exact"] = bool(np.array_equal(model, exact))
++    record["f32_block_delta_max_abs"] = int(np.abs(model - exact).max())
++    # mod-2**32 picture: this is what a silent wrap would produce
++    exact_mod = ((exact + 2 ** 31) % 2 ** 32) - 2 ** 31
++    record["aocl_equals_int32_wrap"] = bool(np.array_equal(aocl_out.astype(np.int64), exact_mod))
+     if portable is not None:
+         record["aocl_int32_bitwise_portable"] = bool(
+             np.array_equal(aocl_out.astype(np.int64), portable)
+@@ -126,6 +171,13 @@ def run_case(lpg, rng, case, rounds_fused=True):
+                 b"r", b"n", b"b", k, n, ctypes.byref(meta)
+             )
+         )
++        if size <= 0:
++            record["fused_sym_quant"] = {
++                "produced_output": False,
++                "unsupported": "aocl_get_reorder_buf_size_s8s8s32os32_sym_quant returned 0 "
++                               "(the sym_quant reorder API has no layout for this K, e.g. K % 4 != 0)",
++            }
++            return record
+         reordered = np.zeros(max(size, 1), dtype=np.int8)
+         b_contig = np.ascontiguousarray(b)
+         lpg.lib.aocl_reorder_s8s8s32os32_sym_quant(
+@@ -195,6 +247,17 @@ def main() -> int:
+         }
+     )
+     cases.append({"name": "reserved_minus128", "m": 1, "k": 4, "n": 2, "kind": "reserved_code"})
++    # Cross-k-block (KC=2048) binary32 accumulation evidence: magnitudes above
++    # 2**24 make the f32 chain inexact for non-block-aligned K.
++    for k in (2048, 2049, 3584, 3585, 5097, 5099, 16696):
++        cases.append(
++            {"name": "large_k{}_max_codes".format(k), "m": 2, "k": k, "n": 34,
++             "kind": "all_positive"}
++        )
++        cases.append(
++            {"name": "large_k{}_mixed".format(k), "m": 2, "k": k, "n": 34,
++             "kind": "mixed_large"}
++        )
+ 
+     results = []
+     for case in cases:
+@@ -223,6 +286,18 @@ def main() -> int:
+             for r in results
+             if r.get("portable_error")
+         ],
++        "cases_where_lpgemm_differs_from_exact": [
++            {
++                "name": r["name"],
++                "k": r["k"],
++                "model_matches_lpgemm": r.get("model_f32_block_equals_lpgemm"),
++            }
++            for r in results
++            if r.get("aocl_equals_exact") is False
++        ],
++        "model_vs_lpgemm_disagreements": [
++            r["name"] for r in results if r.get("model_f32_block_equals_lpgemm") is False
++        ],
+         "fused_sym_quant_mismatch_cases": [
+             {
+                 "name": r["name"],
+diff --git a/scripts/vendor/aocl_build_report.py b/scripts/vendor/aocl_build_report.py
+new file mode 100755
+index 000000000..e50781969
+--- /dev/null
++++ b/scripts/vendor/aocl_build_report.py
+@@ -0,0 +1,252 @@
++#!/usr/bin/env python3
++"""Q8 / vendor-gemm-survey: AOCL-BLIS build evidence generator.
++
++Reads the *existing* source tree + install tree and writes
++``raw/aocl-build-report.json`` with the reproducibility contract:
++
++  repo/tag/commit, full configure/make/install command lines, toolchain and host
++  facts, the build log reference, generated-header evidence for the explicit
++  Zen4 configuration and the dim_t width, per-file sha256 of the install tree,
++  the main library hash, and symbol/instruction evidence (aocl_gemm_* exports,
++  zen4-named symbols, the VNNI disassembly count, the LPGEMM kernel objects).
++
++This replaced the shell-heredoc report step inside
++``build_aocl_lpgemm_zen4.sh``, which was observed to be killed exactly at that
++point (SIGPIPE/141) leaving the build complete but the report missing.  It is
++read-only w.r.t. the source/install trees, so it is a *light* step and does not
++need the local heavy lock.
++
++Usage:
++  python3 scripts/vendor/aocl_build_report.py \
++      [--src <blis source>] [--install <install prefix>] \
++      [--log <build log>] [--output <raw/aocl-build-report.json>]
++"""
++
++from __future__ import annotations
++
++import argparse
++import glob
++import hashlib
++import json
++import os
++import re
++import subprocess
++import sys
++import time
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++DEFAULT_EVIDENCE = "/home/chiro/projects/pypto/worktrees/_meta/pypto-x/vendor-gemm-survey"
++
++
++def sha256_file(path: str) -> str:
++    digest = hashlib.sha256()
++    with open(path, "rb") as handle:
++        for chunk in iter(lambda: handle.read(1 << 20), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def collect_artifacts(root: str) -> list:
++    out = []
++    for dirpath, _dirnames, filenames in os.walk(root):
++        for name in sorted(filenames):
++            path = os.path.join(dirpath, name)
++            rel = os.path.relpath(path, root)
++            if os.path.islink(path):
++                out.append({"path": rel, "symlink": os.readlink(path)})
++            else:
++                out.append(
++                    {"path": rel, "bytes": os.path.getsize(path), "sha256": sha256_file(path)}
++                )
++    return out
++
++
++def run(cmd: list) -> str:
++    return subprocess.run(cmd, capture_output=True, text=True, check=False).stdout
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    evidence = os.environ.get("PYPTO_X_VENDOR_EVIDENCE", DEFAULT_EVIDENCE)
++    parser.add_argument("--src", default=os.path.join(evidence, "src", "blis-5.3.2"))
++    parser.add_argument(
++        "--install", default=os.path.join(evidence, "install", "aocl-blis-5.3.2-zen4")
++    )
++    parser.add_argument("--log", default=None)
++    parser.add_argument("--output", default=os.path.join(evidence, "raw", "aocl-build-report.json"))
++    parser.add_argument("--mode", default="report-only")
++    args = parser.parse_args()
++
++    src, install = args.src, args.install
++    if not os.path.isdir(install):
++        raise SystemExit("install tree not found: {}".format(install))
++
++    logs = sorted(glob.glob(os.path.join(evidence, "logs", "aocl-build-*.log")))
++    build_log = args.log or (logs[-1] if logs else None)
++
++    def git(*cmd: str) -> str:
++        return run(["git", "-C", src, *cmd]).strip()
++
++    commit = git("rev-parse", "HEAD")
++    describe = git("describe", "--tags", "--always")
++    commit_date = git("log", "-1", "--format=%cI")
++
++    config_header = os.path.join(src, "bli_config.h")
++    addon_header = os.path.join(src, "bli_addon.h")
++    config_text = open(config_header, errors="replace").read() if os.path.exists(config_header) else ""
++    addon_text = open(addon_header, errors="replace").read() if os.path.exists(addon_header) else ""
++    int_defines = " ".join(
++        line for line in config_text.splitlines() if "BLIS_INT_TYPE_SIZE" in line or "BLIS_BLAS_INT_TYPE_SIZE" in line
++    )
++    int_guard = " ".join(
++        line
++        for line in config_text.splitlines()
++        if re.match(r"#(if|elif)\s+\d+\s+==\s+(32|64)", line)
++    )
++    # The generated header keeps both branches of the template; resolve which
++    # one is active: for each #define of interest, look back to the nearest
++    # #if/#elif whose two literals are equal.
++    lines = config_text.splitlines()
++
++    def active_define(name: str):
++        """Resolve which branch of the generated #if/#elif chain is active.
++
++        The template keeps both branches (e.g. ``#if 32 == 64`` /
++        ``#elif 32 == 32`` around two ``#define BLIS_BLAS_INT_TYPE_SIZE``
++        lines), so the value is the first condition whose two literals are
++        equal.
++        """
++        defines = [
++            (index, int(match.group(1)))
++            for index, line in enumerate(lines)
++            for match in [re.match(r"#define\s+{}\s+(\d+)".format(name), line)]
++            if match
++        ]
++        if not defines:
++            return None
++        first_index, first_value = defines[0]
++        conditions = [
++            (index, int(match.group(1)), int(match.group(2)))
++            for index, line in enumerate(lines[:first_index])
++            for match in [re.match(r"#(?:if|elif)\s+(\d+)\s*==\s*(\d+)", line)]
++            if match
++        ][-1:]
++        for index, value in defines:
++            for cond_index, left, right in conditions + [
++                (i, int(m.group(1)), int(m.group(2)))
++                for i, line in enumerate(lines)
++                for m in [re.match(r"#(?:if|elif)\s+(\d+)\s*==\s*(\d+)", line)]
++                if m and first_index < i < index + 1
++            ]:
++                if cond_index < index and left == right:
++                    return value
++        return first_value
++    libs = sorted(
++        glob.glob(os.path.join(install, "lib", "libblis-mt.so.*"))
++        or glob.glob(os.path.join(install, "**", "libblis-mt.so*"), recursive=True)
++    )
++    main_lib = libs[0] if libs else ""
++
++    nm_exports = run(["nm", "-D", "--defined-only", main_lib]) if main_lib else ""
++    aocl_symbols = sorted(
++        line.split()[-1] for line in nm_exports.splitlines() if "aocl_gemm_" in line
++    )
++    nm_all = run(["nm", "--defined-only", main_lib]) if main_lib else ""
++    zen4_symbols = [line for line in nm_all.splitlines() if "zen4" in line.lower()][:20]
++    vpdpbusd = 0
++    if main_lib:
++        disasm = run(["objdump", "-d", main_lib])
++        vpdpbusd = disasm.count("vpdpbusd")
++
++    objects = []
++    for path in sorted(glob.glob(os.path.join(src, "obj", "**", "*s8s8s32*", "*.o"), recursive=True)):
++        objects.append(path)
++    for path in sorted(glob.glob(os.path.join(src, "obj", "**", "*lpgemm*", "*.o"), recursive=True)):
++        if path not in objects:
++            objects.append(path)
++
++    cpuinfo = open("/proc/cpuinfo", errors="replace").read()
++    def first(pattern: str) -> str:
++        match = re.search(pattern, cpuinfo, re.MULTILINE)
++        return match.group(1).strip() if match else ""
++
++    report = {
++        "tag": "q8-aocl-lpgemm-zen4-build",
++        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++        "mode": args.mode,
++        "note": (
++            "evidence collected from the existing source/install trees; the compile+install "
++            "itself ran in the local heavy-lock window of 2026-09-11T16:57Z "
++            "(see logs/aocl-build-20260911T165743Z.log)"
++        ),
++        "repo_url": "https://github.com/amd/blis",
++        "repo_tag": "5.3.2",
++        "blis_config": "zen4",
++        "src_commit": commit,
++        "src_describe": describe,
++        "src_commit_date": commit_date,
++        "src_path": src,
++        "install_dir": install,
++        "configure_command": (
++            "CC=gcc CXX=g++ ./configure --prefix=<install> --enable-cblas "
++            "--enable-threading=openmp --enable-addon=aocl_gemm --int-size=64 "
++            "--blas-int-size=32 --disable-blis-arch-type zen4"
++        ),
++        "build_command": "make -j6",
++        "install_command": "make install",
++        "toolchain": {
++            "gcc": run(["gcc", "--version"]).splitlines()[0] if run(["gcc", "--version"]) else "",
++            "gxx": run(["g++", "--version"]).splitlines()[0] if run(["g++", "--version"]) else "",
++            "make": run(["make", "--version"]).splitlines()[0] if run(["make", "--version"]) else "",
++        },
++        "host_cpu": {
++            "model": first(r"^model name\s*:\s*(.+)$"),
++            "family": first(r"^cpu family\s*:\s*(.+)$"),
++            "model_id": first(r"^model\s*:\s*(.+)$"),
++            "flags": first(r"^flags\s*:\s*(.+)$").split(),
++        },
++        "generated_config_evidence": {
++            "config_header": config_header,
++            "addon_header": addon_header,
++            "config_defines": " ".join(
++                line for line in config_text.splitlines() if line.startswith("#define BLIS_CONFIG_")
++                or line.startswith("#define BLIS_KERNELS_")
++            ),
++            "int_type_defines": int_defines,
++            "int_guard_lines": int_guard,
++            "dim_t_bits_active": active_define("BLIS_INT_TYPE_SIZE"),
++            "blas_int_bits_active": active_define("BLIS_BLAS_INT_TYPE_SIZE"),
++            "addon_defines": " ".join(
++                line for line in addon_text.splitlines() if "ADDONS" in line or line.startswith("#include")
++            ),
++        },
++        "main_library": {
++            "path": main_lib,
++            "sha256": sha256_file(main_lib) if main_lib else "",
++            "bytes": os.path.getsize(main_lib) if main_lib else 0,
++        },
++        "artifacts": collect_artifacts(install),
++        "aocl_gemm_export_count": len(aocl_symbols),
++        "aocl_gemm_symbols": aocl_symbols,
++        "zen4_named_symbols": zen4_symbols,
++        "vpdpbusd_disassembly_count": vpdpbusd,
++        "lpgemm_kernel_objects": objects,
++        "build_log": build_log,
++    }
++
++    os.makedirs(os.path.dirname(args.output), exist_ok=True)
++    with open(args.output, "w", encoding="utf-8") as handle:
++        json.dump(report, handle, indent=2, ensure_ascii=False)
++        handle.write("\n")
++    print(
++        "report: {out} | commit={c} | exports={n} | lib sha256={s} | vpdpbusd={v} | artifacts={a}".format(
++            out=args.output, c=commit[:12], n=len(aocl_symbols),
++            s=(report["main_library"]["sha256"] or "")[:16], v=vpdpbusd,
++            a=len(report["artifacts"]),
++        )
++    )
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/vendor/build_aocl_lpgemm_zen4.sh b/scripts/vendor/build_aocl_lpgemm_zen4.sh
+index 370721124..9e4e5aee0 100755
+--- a/scripts/vendor/build_aocl_lpgemm_zen4.sh
++++ b/scripts/vendor/build_aocl_lpgemm_zen4.sh
+@@ -33,13 +33,20 @@ JOBS=${PYPTO_X_AOCL_JOBS:-6}
+ REPO_URL=${PYPTO_X_AOCL_REPO:-https://github.com/amd/blis}
+ REPO_TAG=${PYPTO_X_AOCL_TAG:-5.3.2}
+ BLIS_CONFIG=${PYPTO_X_AOCL_CONFIG:-zen4}
++# full       : fetch + configure + make + install + evidence (default)
++# report-only: evidence collection over an existing install (no build, seconds)
++MODE=${1:-full}
+ 
+ STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+ mkdir -p "${EVIDENCE_ROOT}/logs" "${EVIDENCE_ROOT}/raw"
+ BUILD_LOG="${EVIDENCE_ROOT}/logs/aocl-build-${STAMP}.log"
+ REPORT_JSON="${EVIDENCE_ROOT}/raw/aocl-build-report.json"
+ 
+-exec > >(tee -a "${BUILD_LOG}") 2>&1
++# NOTE: no `exec > >(tee ...)`: the process-substitution helper has been
++# observed to be reaped mid-run, which kills this script with SIGPIPE (141)
++# exactly at the report step.  Write the log directly; the heavy-runner
++# wrapper already tees this script's stdout/stderr into its own log.
++exec >>"${BUILD_LOG}" 2>&1
+ log() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+ 
+ log "=== Q8 AOCL/LPGEMM Zen4 build start stamp=${STAMP} ==="
+@@ -49,7 +56,10 @@ log "install_dir=${INSTALL_DIR}"
+ log "jobs=${JOBS}"
+ 
+ # ---------------------------------------------------------------- fetch (light)
+-if [ ! -d "${SRC}/.git" ]; then
++if [ "${MODE}" = "report-only" ]; then
++    log "mode=report-only: skipping fetch/configure/make/install; collecting evidence only"
++fi
++if [ "${MODE}" != "report-only" ] && [ ! -d "${SRC}/.git" ]; then
+     log "source tree missing; shallow-cloning ${REPO_URL} at tag ${REPO_TAG}"
+     rm -rf "${SRC}"
+     mkdir -p "$(dirname -- "${SRC}")"
+@@ -106,6 +116,11 @@ CONFIGURE_ARGS=(
+     "${BLIS_CONFIG}"
+ )
+ cd "${SRC}"
++if [ "${MODE}" = "report-only" ]; then
++    t_configure=null
++    t_build=null
++    t_install=null
++else
+ log "configure: CC=gcc CXX=g++ ./configure ${CONFIGURE_ARGS[*]}"
+ t0=$(date +%s)
+ CC=gcc CXX=g++ ./configure "${CONFIGURE_ARGS[@]}"
+@@ -142,6 +157,7 @@ t0=$(date +%s)
+ make install
+ t_install=$(( $(date +%s) - t0 ))
+ log "install done in ${t_install}s"
++fi
+ 
+ # ------------------------------------------------------------------- evidence
+ ARTIFACT_JSON=$(python3 - "${INSTALL_DIR}" <<'PY'
+diff --git a/scripts/vendor/q8_full_heavy.sh b/scripts/vendor/q8_full_heavy.sh
+new file mode 100755
+index 000000000..5d2c1cd2d
+--- /dev/null
++++ b/scripts/vendor/q8_full_heavy.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++# Q8 / vendor-gemm-survey: one heavy window, in priority order.
++#
++#   [0] evidence collection over the already-built AOCL install (report-only
++#       mode: seconds, no rebuild; the 16:57Z window did the compile+install).
++#       Non-fatal: the probes and the matrix must still run.
++#   [1] AOCL semantics probe E1-E10 (incl. the bitwise envelope);
++#   [2] W8A8 parity probe (Path A / Path B, hard constraints);
++#   [3] the four-way 12-shape GEMM matrix (plus a 1-thread int8 pass hint).
++set -uo pipefail
++
++WT=${PYPTO_X_VENDOR_WORKTREE:-/home/chiro/projects/pypto/worktrees/pypto-x/vendor-gemm-survey}
++EV=${PYPTO_X_VENDOR_EVIDENCE:-/home/chiro/projects/pypto/worktrees/_meta/pypto-x/vendor-gemm-survey}
++
++echo "=== [0/4] AOCL build report (light, python generator) $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
++PYPTO_X_VENDOR_EVIDENCE="${EV}" python3 "${WT}/scripts/vendor/aocl_build_report.py" \
++    || echo "WARN: report step returned non-zero; continuing to the probes"
++
++if ! find "${EV}/install/aocl-blis-5.3.2-zen4" -name 'libblis-mt.so*' -type f | head -1 | grep -q .; then
++    echo "FATAL: AOCL library missing under ${EV}/install" >&2
++    exit 66
++fi
++
++echo "=== [1-3/4] probes + matrix $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
++PYPTO_X_VENDOR_EVIDENCE="${EV}" "${WT}/scripts/vendor/q8_perf_matrix_heavy.sh" "$@"
+diff --git a/scripts/vendor/run_heavy_with_retry.sh b/scripts/vendor/run_heavy_with_retry.sh
+index 66018eeae..867b60739 100755
+--- a/scripts/vendor/run_heavy_with_retry.sh
++++ b/scripts/vendor/run_heavy_with_retry.sh
+@@ -47,8 +47,13 @@ while true; do
+     "${RUNNER}" --task "${TASK}" --agent "${AGENT}" -- "$@" >>"${LOG}" 2>&1
+     rc=$?
+     printf '=== runner_exit=%d attempt=%d utc=%s ===\n' "${rc}" "${attempt}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"${LOG}"
+-    if [ "${rc}" -ne 75 ] && [ "${rc}" -ne 69 ]; then
+-        exit "${rc}"
+-    fi
++    # 75 BUSY / 69 admission-denied are the protocol's retry codes; 137/141/143
++    # are "killed by signal" codes we have seen when the lock tool or its
++    # guardian is reaped underneath the waiter -- also retryable, because the
++    # wrapped command never got to decide anything.
++    case "${rc}" in
++        75|69|137|141|143) ;;
++        *) exit "${rc}" ;;
++    esac
+     sleep "${SLEEP}"
+ done

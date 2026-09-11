@@ -1,0 +1,247 @@
+From 77981213ea5d3c84fe313eeb750b8d5a315f5774 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 04:26:33 +0800
+Subject: [PATCH 205/217] test(scripts): pin the C6 timing harness
+ dispatch/preflight contract statically
+
+The D-1 regression (a later cherry-pick overwrote the C6 fix) was invisible
+to pytest because no test loads scripts/perf/c6_timing_harness.py.  Add a
+static AST contract guard so the same overwrite fails loudly:
+
+  * dispatch_overhead takes (runtime_proxy, proxy_driver, artifact, case,
+    rounds) with no *args/**kwargs, and its single collect() call is on
+    proxy_driver;
+  * every dispatch_overhead call site passes the TimingProxy as the second
+    positional argument, with no keywords;
+  * --preflight-max-utilization-pct / --skip-preflight exist, one range(5)
+    window reads the nvidia-smi utilization/clock facts inside the
+    skip-preflight guard, and the over-threshold branch writes
+    status=PREFLIGHT_NOISY and returns 3;
+  * the R6 block-per-row quantize launch domain count = m * int(
+    CUDA_W8A8_BLOCK) is still assigned exactly once in the
+    quantize_per_token_s8 branch.
+
+Negative control: the pre-fix harness (35b44bfe0 version) fails 4 of these
+6 checks; the repaired harness passes all 6.
+---
+ python/tests/ut/pypto_x/test_c6_timing_harness_contract.py | 212 +++++++++++++++++++++++++++++++++
+ 1 file changed, 212 insertions(+)
+
+diff --git a/python/tests/ut/pypto_x/test_c6_timing_harness_contract.py b/python/tests/ut/pypto_x/test_c6_timing_harness_contract.py
+new file mode 100644
+index 000000000..05ed325a9
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_c6_timing_harness_contract.py
+@@ -0,0 +1,212 @@
++"""``scripts/perf/c6_timing_harness.py`` 的静态契约守卫（D-1 事故回归）。
++
++背景（D-1，2026-09-12 集成体检发现）：integration 上这份 harness 被
++cherry-pick 顺序回退过一次——修复提交 ``c6a97dc80``（集成侧 ``60b9f9b86``）
++先落地，随后落地的功能提交 ``e4a61df8b`` 用**修复前的整份文件**覆盖了它：
++
++* ``dispatch_overhead`` 退回 ``(runtime_proxy, artifact, case, rounds)`` 并在
++  函数体内调用 ``runtime_proxy.collect()``；而调用点传入的 ``proxy_runtime``
++  是 ``CudaRuntime``（没有 ``collect``），于是每轮 dispatch 都抛
++  ``AttributeError``，又被 per-case ``try/except`` 吞成 error dict；
++* 五采样 nvidia-smi preflight 窗口、``--preflight-max-utilization-pct`` 与
++  ``--skip-preflight`` 开关整体消失。
++
++这两件事都不会让 pytest 变红（harness 是脚本，没有任何测试 import 它），
++所以本测试用 AST 把契约钉住：定义签名、调用点实参、``collect()`` 的接收者、
++preflight 的接线与中止分支，以及必须被保留下来的 R6 量化发射域。
++
++本测试**不导入** harness（避免拉起 CUDA / pypto 运行时依赖），只按路径读源码
++并解析。守卫失败时给出 ``ast.dump`` 级证据，绝不静默通过。
++"""
++
++from __future__ import annotations
++
++import ast
++from pathlib import Path
++
++
++REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
++HARNESS_PATH = REPOSITORY_ROOT / "scripts" / "perf" / "c6_timing_harness.py"
++
++#: ``dispatch_overhead`` 的形参契约：第二个形参必须是显式传入的 TimingProxy。
++DISPATCH_OVERHEAD_PARAMS = ("runtime_proxy", "proxy_driver", "artifact", "case", "rounds")
++
++#: preflight 采样所读的 nvidia-smi 事实字段。
++PREFLIGHT_FACTS = "utilization.gpu,memory.used,clocks.current.sm"
++
++
++def _tree() -> ast.Module:
++    assert HARNESS_PATH.is_file(), "缺少 harness 源码：{}".format(HARNESS_PATH)
++    return ast.parse(HARNESS_PATH.read_text(encoding="utf-8"))
++
++
++def _functions(tree: ast.Module):
++    return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
++
++
++def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
++    functions = _functions(tree)
++    assert name in functions, "harness 应定义 {}()：{}".format(name, sorted(functions))
++    return functions[name]
++
++
++def _collect_attributes(node):
++    return [
++        child
++        for child in ast.walk(node)
++        if isinstance(child, ast.Attribute) and child.attr == "collect"
++    ]
++
++
++def test_harness_exists_and_parses():
++    tree = _tree()
++    assert tree.body, "harness 不应是空文件"
++
++
++def test_dispatch_overhead_takes_the_driver_proxy_explicitly():
++    fn = _function(_tree(), "dispatch_overhead")
++    assert tuple(arg.arg for arg in fn.args.args) == DISPATCH_OVERHEAD_PARAMS
++    assert fn.args.vararg is None and fn.args.kwarg is None, (
++        "dispatch_overhead 不接受 *args/**kwargs，否则调用点实参契约会再次失守"
++    )
++
++
++def test_collect_is_only_called_on_the_driver_proxy_inside_dispatch_overhead():
++    fn = _function(_tree(), "dispatch_overhead")
++    collectors = _collect_attributes(fn)
++    assert len(collectors) == 1, "dispatch_overhead 里应当恰好有一处 collect()"
++    receiver = collectors[0].value
++    assert isinstance(receiver, ast.Name) and receiver.id == "proxy_driver", (
++        "collect() 的接收者必须是显式传入的 proxy_driver，实际是 {}".format(ast.dump(receiver))
++    )
++
++
++def test_every_dispatch_overhead_call_passes_the_timing_proxy_second():
++    tree = _tree()
++    calls = [
++        node
++        for node in ast.walk(tree)
++        if isinstance(node, ast.Call)
++        and isinstance(node.func, ast.Name)
++        and node.func.id == "dispatch_overhead"
++    ]
++    assert calls, "main() 里应至少有一处 dispatch_overhead 调用"
++    for call in calls:
++        assert len(call.args) == len(DISPATCH_OVERHEAD_PARAMS), ast.dump(call)
++        assert not call.keywords, ast.dump(call)
++        second = call.args[1]
++        assert isinstance(second, ast.Name) and second.id == "proxy", (
++            "dispatch_overhead 的第二个实参必须是 TimingProxy 变量 proxy，实际是 {}".format(
++                ast.dump(second)
++            )
++        )
++
++
++def test_preflight_window_flags_and_abort_are_wired():
++    main_fn = _function(_tree(), "main")
++
++    flags = []
++    for node in ast.walk(main_fn):
++        if not isinstance(node, ast.Call):
++            continue
++        func = node.func
++        if not (isinstance(func, ast.Attribute) and func.attr == "add_argument"):
++            continue
++        if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
++            flags.append(node.args[0].value)
++    for flag in ("--preflight-max-utilization-pct", "--skip-preflight"):
++        assert flag in flags, "缺少命令行开关 {}（现有 {}）".format(flag, sorted(flags))
++
++    five_sample_loops = [
++        node
++        for node in ast.walk(main_fn)
++        if isinstance(node, ast.For)
++        and isinstance(node.iter, ast.Call)
++        and isinstance(node.iter.func, ast.Name)
++        and node.iter.func.id == "range"
++        and len(node.iter.args) == 1
++        and isinstance(node.iter.args[0], ast.Constant)
++        and node.iter.args[0].value == 5
++    ]
++    assert len(five_sample_loops) == 1, "preflight 必须是恰好一个 range(5) 采样窗口"
++    loop = five_sample_loops[0]
++    facts = [
++        child.value
++        for child in ast.walk(loop)
++        if isinstance(child, ast.Constant) and isinstance(child.value, str)
++    ]
++    assert PREFLIGHT_FACTS in facts, (
++        "五采样窗口必须读取 nvidia-smi {}，实际字符串常量 {}".format(PREFLIGHT_FACTS, facts)
++    )
++
++    guarded = [
++        node
++        for node in ast.walk(main_fn)
++        if isinstance(node, ast.If)
++        and any(
++            isinstance(child, ast.Attribute) and child.attr == "skip_preflight"
++            for child in ast.walk(node.test)
++        )
++    ]
++    assert guarded, "preflight 采样必须受 --skip-preflight 守卫"
++    assert any(loop in list(ast.walk(node)) for node in guarded), (
++        "range(5) 采样窗口必须落在 --skip-preflight 守卫之内"
++    )
++
++    aborts = []
++    for node in ast.walk(main_fn):
++        if not isinstance(node, ast.If):
++            continue
++        if not any(
++            isinstance(child, ast.Attribute) and child.attr == "preflight_max_utilization_pct"
++            for child in ast.walk(node.test)
++        ):
++            continue
++        literals = {
++            child.value
++            for child in ast.walk(node)
++            if isinstance(child, ast.Constant) and isinstance(child.value, (str, int))
++        }
++        returns_three = any(
++            isinstance(child, ast.Return)
++            and isinstance(child.value, ast.Constant)
++            and child.value.value == 3
++            for child in ast.walk(node)
++        )
++        if "PREFLIGHT_NOISY" in literals and returns_three:
++            aborts.append(node)
++    assert aborts, "preflight 超阈值分支必须写 status=PREFLIGHT_NOISY 并 return 3"
++
++
++def test_r6_quantize_launch_domain_survives_the_fold():
++    fn = _function(_tree(), "launch_plan_for_case")
++    branches = [
++        node
++        for node in ast.walk(fn)
++        if isinstance(node, ast.If)
++        and isinstance(node.test, ast.Compare)
++        and isinstance(node.test.left, ast.Name)
++        and node.test.left.id == "opcode"
++        and len(node.test.comparators) == 1
++        and isinstance(node.test.comparators[0], ast.Constant)
++        and node.test.comparators[0].value == "quantize_per_token_s8"
++    ]
++    assert len(branches) == 1, "launch_plan_for_case 应有唯一的 quantize_per_token_s8 分支"
++    assigns = [
++        stmt
++        for stmt in branches[0].body
++        if isinstance(stmt, ast.Assign)
++        and len(stmt.targets) == 1
++        and isinstance(stmt.targets[0], ast.Name)
++        and stmt.targets[0].id == "count"
++    ]
++    assert len(assigns) == 1, "quantize 分支应恰好给 count 赋值一次"
++    assert isinstance(assigns[0].value, ast.BinOp) and isinstance(assigns[0].value.op, ast.Mult), (
++        "R6 block-per-row 量化发射域已被改写：{}".format(ast.dump(assigns[0].value))
++    )
++    expression = ast.unparse(assigns[0].value)
++    assert expression == "m * int(CUDA_W8A8_BLOCK)", (
++        "R6 block-per-row 量化发射域已被改写：count = {}（应为 m * int(CUDA_W8A8_BLOCK)）".format(
++            expression
++        )
++    )

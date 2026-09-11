@@ -1,0 +1,436 @@
+From 4cbd517d644c7006fa7206a00a48410748eca110 Mon Sep 17 00:00:00 2001
+From: n4-dispatch-residual <agent@pypto-x.local>
+Date: Sat, 12 Sep 2026 01:41:39 +0800
+Subject: [PATCH 162/217] tools(perf): add N4.0 dispatch decomposition harness
+ (n4-dispatch-residual)
+
+Driver-side monkeypatch wrappers around the AVX-512 launch path: setup /
+loop / teardown brackets derived from wrapper timestamps, per-op
+_execute_operation accumulation, release_dead_values and a nesting-aware
+call tree.  Runtime source is not modified; all wrappers call the original
+objects.  Used to decompose the B6 launch-minus-op residual.
+---
+ scripts/perf/n4_dispatch_decompose.py | 415 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 415 insertions(+)
+
+diff --git a/scripts/perf/n4_dispatch_decompose.py b/scripts/perf/n4_dispatch_decompose.py
+new file mode 100644
+index 000000000..0231458b1
+--- /dev/null
++++ b/scripts/perf/n4_dispatch_decompose.py
+@@ -0,0 +1,415 @@
++#!/usr/bin/env python3
++"""N4.0 dispatch residual decomposition harness (measurement only).
++
++Runs the weighted Qwen3.5 execution driver in-process with thin monkeypatch
++wrappers around the AVX-512 runtime launch path.  No runtime source is
++modified, no semantics are changed: every wrapper calls the original object
++and returns its result unchanged.
++
++Phase brackets are derived on the driver side from wrapper timestamps:
++
++    setup    = launch entry                -> first _execute_operation entry
++    loop     = first _execute_operation    -> last release_dead_values exit
++    teardown = last release_dead_values    -> launch return
++
++Within ``loop`` the harness separately accumulates:
++
++    op_internal           = time inside Avx512Runtime._execute_operation
++    release_dead_values   = time inside release_dead_values()
++    loop glue             = loop - op_internal - release_dead_values
++                            (the two ref-name list comprehensions + loop)
++
++Wrapped module functions are recorded as a call tree with nesting, so the
++setup tier can be split into exclusive segments (artifact validation,
++ELFs, lowering, parameter binding, ...) without double counting.
++
++Usage:
++
++    PYTHONPATH=<tree>/python:<tree>/python/tests/ut \
++    python3 scripts/perf/n4_dispatch_decompose.py \
++        --decomp-output <path.json> --driver <driver.py> -- \
++        --stage s3 --backend avx512 ... --no-op-recorder
++
++All absolute timings are UNGATED (12 vCPU KVM guest, no cpufreq).
++"""
++
++from __future__ import annotations
++
++import argparse
++import importlib.util
++import json
++import statistics
++import sys
++import time
++from pathlib import Path
++from typing import Any, Dict, List, Optional
++
++DEFAULT_DRIVER = "python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py"
++
++WRAPPED_FUNCTIONS = (
++    "_validate_primary_artifact",
++    "_validate_fallback_artifact",
++    "_program_digest_from_metadata",
++    "_validate_primary_semantics",
++    "_decode_artifact",
++    "_read_native_bytes",
++    "lower_avx512",
++    "_packed_dispatch_for",
++    "plan_release",
++    "_buffer_from_descriptor",
++    "_buffer_from_values",
++    "_find_function",
++    "_write_descriptor",
++    "_buffer_values",
++)
++
++
++def load_module(path: Path, name: str) -> Any:
++    spec = importlib.util.spec_from_file_location(name, str(path))
++    if spec is None or spec.loader is None:
++        raise SystemExit("cannot load module from {}".format(path))
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++class Event:
++    __slots__ = ("name", "start", "end", "depth", "children", "launch")
++
++    def __init__(self, name: str, start: float, depth: int, launch: int) -> None:
++        self.name = name
++        self.start = start
++        self.end: Optional[float] = None
++        self.depth = depth
++        self.children: List["Event"] = []
++        self.launch = launch
++
++    @property
++    def seconds(self) -> float:
++        if self.end is None:
++            return 0.0
++        return self.end - self.start
++
++    def exclusive(self) -> float:
++        return self.seconds - sum(child.seconds for child in self.children)
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "name": self.name,
++            "start": round(self.start, 6),
++            "end": round(self.end, 6) if self.end is not None else None,
++            "seconds": round(self.seconds, 6),
++            "exclusive_seconds": round(self.exclusive(), 6),
++            "children": [child.to_dict() for child in self.children],
++        }
++
++
++class Recorder:
++    """Per-launch wrapper event recorder with a nesting stack."""
++
++    def __init__(self) -> None:
++        self.roots: List[Event] = []
++        self.stack: List[Event] = []
++        self.launches: List[Dict[str, Any]] = []
++        self.current: Optional[Dict[str, Any]] = None
++        self.counts: Dict[str, int] = {}
++        self._launch_seq = 0
++
++    def begin_launch(self, label: str) -> Dict[str, Any]:
++        record: Dict[str, Any] = {
++            "index": self._launch_seq,
++            "label": label,
++            "start": time.perf_counter(),
++            "end": None,
++            "first_op_start": None,
++            "last_release_end": None,
++            "op_seconds": 0.0,
++            "op_count": 0,
++            "op_seconds_by_operation": {},
++            "release_seconds": 0.0,
++            "release_count": 0,
++            "events": [],
++        }
++        self._launch_seq += 1
++        self.current = record
++        return record
++
++    def end_launch(self, record: Dict[str, Any]) -> None:
++        record["end"] = time.perf_counter()
++        self.current = None
++        self.launches.append(record)
++
++    def begin_event(self, name: str) -> Event:
++        event = Event(name, time.perf_counter(), len(self.stack),
++                      self._launch_seq - 1 if self.current is not None else -1)
++        if self.current is not None:
++            self.counts[name] = self.counts.get(name, 0) + 1
++            if self.stack:
++                self.stack[-1].children.append(event)
++            else:
++                self.current["events"].append(event)
++        self.stack.append(event)
++        return event
++
++    def end_event(self, event: Event) -> None:
++        event.end = time.perf_counter()
++        if self.stack and self.stack[-1] is event:
++            self.stack.pop()
++        elif event in self.stack:
++            self.stack.remove(event)
++
++
++RECORDER = Recorder()
++
++
++def wrap_function(module: Any, name: str) -> None:
++    original = getattr(module, name)
++
++    def wrapped(*args: Any, **kwargs: Any) -> Any:
++        event = RECORDER.begin_event(name)
++        try:
++            return original(*args, **kwargs)
++        finally:
++            RECORDER.end_event(event)
++
++    wrapped.__name__ = getattr(original, "__name__", name)
++    wrapped.__doc__ = getattr(original, "__doc__", None)
++    wrapped._n4_original = original  # type: ignore[attr-defined]
++    setattr(module, name, wrapped)
++
++
++def install(rt: Any, driver: Any) -> None:
++    for name in WRAPPED_FUNCTIONS:
++        if hasattr(rt, name):
++            wrap_function(rt, name)
++    # Capability probing happens at runtime construction, not per launch.
++    probe_module = getattr(rt, "_capabilities")
++    if hasattr(probe_module, "probe_avx512_capabilities"):
++        original_probe = probe_module.probe_avx512_capabilities
++
++        def wrapped_probe(*args: Any, **kwargs: Any) -> Any:
++            event = RECORDER.begin_event("probe_avx512_capabilities")
++            try:
++                return original_probe(*args, **kwargs)
++            finally:
++                RECORDER.end_event(event)
++
++        probe_module.probe_avx512_capabilities = wrapped_probe
++
++    # release_dead_values is the per-op loop glue; accumulate it into the
++    # current launch record instead of the nesting tree (called ~once per op).
++    original_release = rt.release_dead_values
++
++    def wrapped_release(*args: Any, **kwargs: Any) -> Any:
++        started = time.perf_counter()
++        result = original_release(*args, **kwargs)
++        finished = time.perf_counter()
++        record = RECORDER.current
++        if record is not None:
++            record["release_seconds"] += finished - started
++            record["release_count"] += 1
++            record["last_release_end"] = finished
++        return result
++
++    rt.release_dead_values = wrapped_release
++
++    launch_request = getattr(rt, "LaunchRequest")
++    original_validate = launch_request.validate
++
++    def wrapped_request_validate(self: Any, *args: Any, **kwargs: Any) -> Any:
++        event = RECORDER.begin_event("LaunchRequest.validate")
++        try:
++            return original_validate(self, *args, **kwargs)
++        finally:
++            RECORDER.end_event(event)
++
++    launch_request.validate = wrapped_request_validate
++
++    base_runtime = driver.Avx512Runtime
++
++    class TimedAvx512Runtime(base_runtime):  # type: ignore[misc, valid-type]
++        """AVX-512 runtime with per-op accumulation and launch brackets."""
++
++        def __init__(self, *args: Any, **kwargs: Any) -> None:
++            started = time.perf_counter()
++            super().__init__(*args, **kwargs)
++            self._n4_construct_seconds = time.perf_counter() - started
++
++        def _execute_operation(self, operation: Any, plan: Any, environment: Any,
++                               module: Any) -> None:
++            started = time.perf_counter()
++            super()._execute_operation(operation, plan, environment, module)
++            elapsed = time.perf_counter() - started
++            record = RECORDER.current
++            if record is not None:
++                if record["first_op_start"] is None:
++                    record["first_op_start"] = started
++                record["op_seconds"] += elapsed
++                record["op_count"] += 1
++                name = str(getattr(plan, "operation", getattr(operation, "name", "?")))
++                by_op = record["op_seconds_by_operation"]
++                by_op[name] = by_op.get(name, 0.0) + elapsed
++
++        def launch(self, request: Any, *args: Any, **kwargs: Any) -> Any:
++            record = RECORDER.begin_launch("prefill" if RECORDER._launch_seq == 0 else "decode")
++            try:
++                return super().launch(request, *args, **kwargs)
++            finally:
++                RECORDER.end_launch(record)
++
++    driver.Avx512Runtime = TimedAvx512Runtime
++
++
++def _aggregate(events: List[Event]) -> Dict[str, Dict[str, float]]:
++    by_name: Dict[str, Dict[str, float]] = {}
++
++    def walk(event: Event) -> None:
++        entry = by_name.setdefault(event.name, {"calls": 0.0, "inclusive": 0.0, "exclusive": 0.0})
++        entry["calls"] += 1.0
++        entry["inclusive"] += event.seconds
++        entry["exclusive"] += event.exclusive()
++        for child in event.children:
++            walk(child)
++
++    for event in events:
++        walk(event)
++    return by_name
++
++
++def finish_launches() -> List[Dict[str, Any]]:
++    """Compute phase brackets and tier summaries for every recorded launch."""
++
++    output = []
++    for record in RECORDER.launches:
++        start = record["start"]
++        end = record["end"]
++        first_op = record["first_op_start"]
++        last_release = record["last_release_end"]
++        setup = None if first_op is None else first_op - start
++        loop = None if (first_op is None or last_release is None) else last_release - first_op
++        teardown = None if last_release is None else end - last_release
++        glue = None if loop is None else loop - record["op_seconds"] - record["release_seconds"]
++        events = record["events"]
++        aggregate = _aggregate(events)
++        output.append({
++            "index": record["index"],
++            "label": record["label"],
++            "launch_seconds": round(end - start, 6),
++            "setup_seconds": None if setup is None else round(setup, 6),
++            "loop_seconds": None if loop is None else round(loop, 6),
++            "teardown_seconds": None if teardown is None else round(teardown, 6),
++            "op_seconds": round(record["op_seconds"], 6),
++            "op_count": record["op_count"],
++            "op_seconds_by_operation": {
++                name: round(value, 6)
++                for name, value in sorted(record["op_seconds_by_operation"].items(),
++                                          key=lambda kv: -kv[1])
++            },
++            "release_seconds": round(record["release_seconds"], 6),
++            "release_count": record["release_count"],
++            "loop_glue_seconds": None if glue is None else round(glue, 6),
++            "setup_segments": {
++                name: {
++                    "calls": int(value["calls"]),
++                    "inclusive_seconds": round(value["inclusive"], 6),
++                    "exclusive_seconds": round(value["exclusive"], 6),
++                }
++                for name, value in sorted(aggregate.items())
++            },
++            "event_tree": [event.to_dict() for event in events],
++        })
++    return output
++
++
++def summarize(launches: List[Dict[str, Any]]) -> Dict[str, Any]:
++    def median(key: str, label: Optional[str] = None) -> Optional[float]:
++        values = [
++            item[key] for item in launches
++            if item.get(key) is not None and (label is None or item["label"] == label)
++        ]
++        return round(statistics.median(values), 6) if values else None
++
++    return {
++        "launch_count": len(launches),
++        "median": {
++            key: median(key)
++            for key in ("launch_seconds", "setup_seconds", "loop_seconds", "teardown_seconds",
++                        "op_seconds", "release_seconds", "loop_glue_seconds")
++        },
++        "median_prefill": {
++            key: median(key, "prefill")
++            for key in ("launch_seconds", "setup_seconds", "loop_seconds", "teardown_seconds",
++                        "op_seconds", "release_seconds", "loop_glue_seconds")
++        },
++        "median_decode": {
++            key: median(key, "decode")
++            for key in ("launch_seconds", "setup_seconds", "loop_seconds", "teardown_seconds",
++                        "op_seconds", "release_seconds", "loop_glue_seconds")
++        },
++    }
++
++
++def main(argv: Optional[List[str]] = None) -> int:
++    raw_argv = list(sys.argv[1:] if argv is None else argv)
++    if "--" not in raw_argv:
++        raise SystemExit("driver arguments must follow '--'")
++    split = raw_argv.index("--")
++    harness_argv = raw_argv[:split]
++    driver_args = raw_argv[split + 1:]
++
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--decomp-output", required=True)
++    parser.add_argument("--driver", default=DEFAULT_DRIVER)
++    parser.add_argument("--tree", default="")
++    args = parser.parse_args(harness_argv)
++
++    driver_path = Path(args.driver)
++    if not driver_path.is_file():
++        driver_path = Path(__file__).resolve().parents[2] / DEFAULT_DRIVER
++    driver = load_module(driver_path, "qwen35_weighted_execution_driver")
++
++    from pypto.backends.cpu.x86 import avx512 as rt  # noqa: E402  (PYTHONPATH selects the tree)
++
++    install(rt, driver)
++
++    started = time.time()
++    try:
++        rc = driver.main(driver_args)
++    finally:
++        launches = finish_launches()
++        payload = {
++            "harness": "n4_dispatch_decompose",
++            "tree": args.tree or "unknown",
++            "driver": str(driver_path),
++            "driver_args": driver_args,
++            "pythonpath": [entry for entry in sys.path if entry],
++            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(started)),
++            "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++            "wall_seconds": round(time.time() - started, 3),
++            "counts": dict(sorted(RECORDER.counts.items())),
++            "summary": summarize(launches),
++            "launches": launches,
++            "notes": [
++                "UNGATED: 12 vCPU KVM guest, no cpufreq, non-quiet window",
++                "phase brackets are derived from driver-side wrappers; runtime source unchanged",
++                "loop_glue = loop - op_internal(_execute_operation) - release_dead_values",
++            ],
++        }
++        output_path = Path(args.decomp_output)
++        output_path.parent.mkdir(parents=True, exist_ok=True)
++        with output_path.open("w", encoding="utf-8") as stream:
++            json.dump(payload, stream, ensure_ascii=False, sort_keys=True, indent=2)
++            stream.write("\n")
++        print(json.dumps({
++            "harness": "n4_dispatch_decompose",
++            "rc": rc,
++            "launches": len(launches),
++            "summary": payload["summary"]["median"],
++            "output": str(output_path),
++        }, ensure_ascii=False, sort_keys=True))
++    return rc
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

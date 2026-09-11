@@ -1,0 +1,1816 @@
+From 397bc30db0fb19a33d5075e70c2cabda14e4dd3d Mon Sep 17 00:00:00 2001
+From: chiro <chiro@local>
+Date: Sat, 12 Sep 2026 01:01:56 +0800
+Subject: [PATCH 155/217] feat(tools): add c8-l4-sve256 SVE256 driver backend,
+ L4 judge and blocker probe
+
+- qwen35_weighted_execution_driver: --backend sve256 (native/qemu), per-op
+  execution-mode census (native vector/scalar-lane/scalar-convert/host loop/
+  host_reference) and --skip-gold-alignment so the execution machine only
+  needs golden input_ids (gold arrays stay on the judging machine).
+- tools/c8_l4_compare.py: C8 L4 verdict (strict argmax + near-tie exception,
+  max_abs <= 2x band, cosine >= band_cosine - 1e-4); band/thresholds are
+  read from band.json and the path/sha256/pointer are printed.
+- tools/c8_sve256_w8a8_gap_probe.py: reproduces the whole-net W8A8 lowering
+  blocker (int8 weight transpose has no SVE256 layout path) and emits the
+  static execution-mode census; bf16 whole-net lowers as a control.
+- tools/c8_sve256_a3/: bundle/sync/fetch/diagnostic scripts for the A3
+  host-side (cpus 320-639) bf16 link diagnostic.
+---
+ python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py | 372 ++++++++++++++++++++++--
+ tools/c8_l4_compare.py                                      | 488 ++++++++++++++++++++++++++++++++
+ tools/c8_sve256_a3/fetch_results.sh                         |  34 +++
+ tools/c8_sve256_a3/make_bundle.sh                           |  62 ++++
+ tools/c8_sve256_a3/pack_ours_logits.py                      |  72 +++++
+ tools/c8_sve256_a3/run_a3_diagnostic.sh                     | 146 ++++++++++
+ tools/c8_sve256_a3/sync_to_a3.sh                            |  18 ++
+ tools/c8_sve256_w8a8_gap_probe.py                           | 436 ++++++++++++++++++++++++++++
+ 8 files changed, 1609 insertions(+), 19 deletions(-)
+
+diff --git a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+index aa3c8d741..b2f0dc249 100644
+--- a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
++++ b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+@@ -951,7 +951,8 @@ def runtime_input_bindings(
+ # --------------------------------------------------------------------------
+ 
+ 
+-def make_backend(name: str, precision: str = "bf16") -> Mapping[str, Any]:
++def make_backend(name: str, precision: str = "bf16",
++                 execution_mode: str = "native") -> Mapping[str, Any]:
+     if name == "avx512":
+         features = ("avx512f", "avx512vnni") if precision == "w8a8-linear" else ("avx512f",)
+         return {
+@@ -960,6 +961,22 @@ def make_backend(name: str, precision: str = "bf16") -> Mapping[str, Any]:
+                                  attributes={"lane_count": 16}),
+             "device": "cpu", "format": "pypto-x.cpu.avx512", "runtime": "avx512",
+         }
++    if name == "sve256":
++        # C8/Q5: the aarch64 target is the same one used by the C5/B2
++        # verification drivers (features=("sve","sve2","vl256"),
++        # attributes={"vl_bytes": 32}); the native ELF is produced by the
++        # host cc at compile time, so this backend is only executable on a
++        # native SVE256 aarch64 machine (A3) or via QEMU.
++        from pypto.compiler.targets.cpu_sve256 import DEFAULT_ARTIFACT_FORMAT, Sve256Compiler
++
++        return {
++            "compiler": Sve256Compiler(),
++            "target": TargetSpec("cpu", "aarch64-linux-gnu",
++                                 features=("sve", "sve2", "vl256"),
++                                 attributes={"vl_bytes": 32}),
++            "device": "cpu", "format": DEFAULT_ARTIFACT_FORMAT, "runtime": "sve256",
++            "execution_mode": execution_mode,
++        }
+     if name == "avx2":
+         return {
+             "compiler": Avx2Compiler(),
+@@ -1014,12 +1031,269 @@ def compile_program(backend: Mapping[str, Any], program: Any, build_dir: Path) -
+     }
+ 
+ 
++#: C8/Q5 execution-mode census vocabulary for the SVE256 runtime.
++#:
++#: ``native_*``       element computation happens inside the native AArch64 ELF
++#:                   (payload crosses the runner wire as raw storage bytes).
++#: ``host_*_loop_*``  the Python runtime orchestrates a per-slice/per-group
++#:                   loop around native rank-2 kernels and materialises the
++#:                   loop operands as Python lists (explicit host boundary).
++#: ``host_reference`` the operation is implemented in Python without native
++#:                   element compute.
++SVE256_W8A8_OPERATIONS = frozenset(
++    (
++        "qmatmul_s8s8_s32",
++        "quantize_per_token_s8",
++        "dequantize_s8",
++        "dequantize_epilogue_bf16",
++    )
++)
++#: artifact metadata ``scalar_math_lane_fallback``
++SVE256_SCALAR_MATH_LANE = frozenset(("exp", "sigmoid", "silu", "softplus"))
++#: artifact metadata ``scalar_conversion_lane_fallback``
++SVE256_SCALAR_CONVERSION_LANE = frozenset(("cast",))
++#: artifact metadata ``layout_scalar_lane_fallback`` / ``indexing_scalar_lane_fallback``
++#: (``bf16_reorder``): the descriptor is still evaluated natively, but the
++#: bf16 element load is a scalar lane loop (see ``ptx_layout_bf16`` /
++#: ``ptx_index_bf16`` in compiler/targets/cpu_sve256.py).
++SVE256_BF16_REORDER_LANE = frozenset(("transpose", "slice", "gather", "embedding"))
++#: Python host group loop around per-group native runner calls
++#: (``Sve256Runtime._execute_reduction``).
++SVE256_HOST_GROUP_LOOP = frozenset(("reduce_sum", "reduce_max", "reduce_mean"))
++
++
++def sve256_execution_decision(name: str, plan: Any) -> Mapping[str, Any]:
++    """Describe how the SVE256 runtime will execute one operation.
++
++    The decision mirrors ``Sve256Runtime._execute_operation`` /
++    ``_execute_reduction`` / ``_execute_w8a8_operation`` in
++    ``python/pypto/backends/cpu/aarch64/sve256.py`` plus the ELF scalar-lane
++    declarations in the artifact metadata
++    (``python/pypto/compiler/targets/cpu_sve256.py``).  It is evaluated on the
++    real plan object at execution time, so it cannot drift into a stale
++    name-only table.
++    """
++
++    dtype = str(getattr(plan, "dtype", ""))
++    matmul = getattr(plan, "matmul", None)
++    batch_shape = tuple(getattr(matmul, "batch_shape", ()) or ())
++    reduction = getattr(plan, "reduction", None)
++
++    def decision(mode: str, boundary: str, basis: str,
++                 list_elements: int = 0) -> Mapping[str, Any]:
++        return {
++            "mode": mode,
++            "boundary": boundary,
++            "basis": basis,
++            "python_list_elements": int(list_elements),
++        }
++
++    if name in SVE256_W8A8_OPERATIONS:
++        if name == "qmatmul_s8s8_s32" and batch_shape and matmul is not None:
++            batch = 1
++            for dimension in batch_shape:
++                batch *= int(dimension)
++            elements = batch * (int(matmul.m) * int(matmul.k) + int(matmul.k) * int(matmul.n))
++            return decision(
++                "host_batch_loop_native_kernel", "host_boundary",
++                "w8a8_batched_qmatmul_dispatch=host_batch_loop_rank2_native_kernel",
++                elements,
++            )
++        return decision(
++            "native_sve256_w8a8", "native",
++            "v6 W8A8 runner wire raw bytes; integer widening kernel in the ELF",
++        )
++    if name == "constant":
++        return decision(
++            "host_reference", "host_reference",
++            "Sve256Runtime builds the constant value in Python (no ELF call)",
++            int(getattr(plan, "element_count", 0) or 0),
++        )
++    if name in SVE256_HOST_GROUP_LOOP:
++        elements = 1
++        if reduction is not None:
++            for dimension in tuple(getattr(reduction, "input_shape", ()) or ()):
++                elements *= int(dimension)
++        return decision(
++            "host_group_loop_native_kernel", "host_boundary",
++            "Sve256Runtime._execute_reduction: Python group/bucket loop + one native runner call per group",
++            elements,
++        )
++    if name == "matmul" and batch_shape and matmul is not None:
++        batch = 1
++        for dimension in batch_shape:
++            batch *= int(dimension)
++        elements = batch * (int(matmul.m) * int(matmul.k) + int(matmul.k) * int(matmul.n))
++        return decision(
++            "host_batch_loop_native_kernel", "host_boundary",
++            "Sve256Runtime batched matmul: Python slice loop of rank-2 native runner calls",
++            elements,
++        )
++    if name in ("iota", "compare"):
++        return decision(
++            "native_sve256_scalar_lane", "native",
++            "B2 control runner: descriptor wire native, ELF descriptor loop is scalar; host_preexpanded_operations=[]",
++        )
++    if dtype not in ("float32", "bf16"):
++        # Defensive: the SVE256 runner wire only carries float32/bf16 payloads
++        # (the W8A8 plane above is the only integer exception), so an int8
++        # layout op is not executable by this runtime even if it lowered.
++        return decision(
++            "unsupported_by_sve256_runtime", "unsupported",
++            "Sve256Runtime._run_runner accepts float32/bf16 only; no int8 layout wire",
++        )
++    if name in SVE256_SCALAR_MATH_LANE:
++        return decision(
++            "native_sve256_scalar_lane", "native",
++            "artifact metadata scalar_math_lane_fallback; ptx_scalar_math_f32 / ptx_math_bf16",
++        )
++    if name in SVE256_SCALAR_CONVERSION_LANE:
++        return decision(
++            "native_sve256_scalar_lane", "native",
++            "artifact metadata scalar_conversion_lane_fallback; ptx_cast_* scalar lane loop",
++        )
++    if name in SVE256_BF16_REORDER_LANE and dtype == "bf16":
++        return decision(
++            "native_sve256_scalar_lane", "native",
++            "artifact metadata bf16_reorder; ptx_layout_bf16 / ptx_index_bf16 scalar lane loop",
++        )
++    if dtype != "float32" and name in (
++        "add", "sub", "mul", "div", "neg", "rsqrt", "matmul", "broadcast", "where",
++    ):
++        return decision(
++            "native_sve256_scalar_convert", "native",
++            "bf16 payload: ELF converts lanes with scalar helpers, element math stays SVE vector",
++        )
++    return decision(
++        "native_sve256_vector", "native",
++        "raw-byte runner wire; element math in SVE vector lanes",
++    )
++
++
++def sve256_census_summary(recorder: "OpRecorder") -> Mapping[str, Any]:
++    """Roll up the instrumented per-op decisions into native/host counts."""
++
++    per_op: Dict[str, Dict[str, Any]] = {}
++    boundary_totals: Dict[str, int] = {}
++    mode_totals: Dict[str, int] = {}
++    scalar_lane_total = 0
++    for record in recorder.records:
++        name = str(record.get("operation"))
++        mode = str(record.get("mode"))
++        decision = getattr(recorder, "sve256_basis", {}).get(str(record.get("index")), {})
++        boundary = decision.get("boundary")
++        if boundary is None:
++            if mode.startswith("native"):
++                boundary = "native"
++            elif mode == "host_reference":
++                boundary = "host_reference"
++            elif mode.startswith("host"):
++                boundary = "host_boundary"
++            else:
++                boundary = "unclassified"
++        entry = per_op.setdefault(
++            name,
++            {"count": 0, "boundary": boundary, "modes": set(), "basis": set(),
++             "seconds": 0.0},
++        )
++        entry["count"] += 1
++        entry["modes"].add(mode)
++        if decision.get("basis"):
++            entry["basis"].add(str(decision["basis"]))
++        entry["seconds"] += float(record.get("seconds", 0.0) or 0.0)
++        boundary_totals[boundary] = boundary_totals.get(boundary, 0) + 1
++        mode_totals[mode] = mode_totals.get(mode, 0) + 1
++        if mode == "native_sve256_scalar_lane":
++            scalar_lane_total += 1
++    return {
++        "definition": {
++            "native": "element compute inside the native AArch64 ELF (raw-byte runner wire)",
++            "host_boundary": (
++                "Python runtime orchestrates a per-slice/per-group loop around native "
++                "rank-2 kernels and materialises loop operands as Python lists"
++            ),
++            "host_reference": "Python implementation without native element compute",
++            "scalar_lane_detail": (
++                "native_sve256_scalar_lane = ELF executes the op with a scalar lane loop "
++                "(declared in artifact metadata); native_sve256_scalar_convert = ELF does "
++                "scalar lane conversion around SVE vector element math"
++            ),
++        },
++        "executed_operations": len(recorder.records),
++        "boundary_totals": dict(sorted(boundary_totals.items())),
++        "mode_totals": dict(sorted(mode_totals.items())),
++        "scalar_lane_operations": scalar_lane_total,
++        "by_operation": {
++            name: {
++                "count": entry["count"],
++                "boundary": entry["boundary"],
++                "modes": "+".join(sorted(entry["modes"])),
++                "seconds": round(entry["seconds"], 3),
++                "basis": "+".join(sorted(entry["basis"]))[:240],
++            }
++            for name, entry in sorted(per_op.items(), key=lambda kv: -kv[1]["seconds"])
++        },
++    }
++
++
++def make_sve256_census_runtime(recorder: Optional[OpRecorder],
++                               execution_mode: str = "native") -> Any:
++    """SVE256 runtime + per-op execution-mode census (semantics unchanged).
++
++    The subclass only wraps ``_execute_operation`` for timing and mode
++    bookkeeping.  It never alters the dispatch decision: the mode label is a
++    description computed from the same plan object the base class dispatches
++    on, and ``super()._execute_operation`` performs the real work.
++    """
++
++    from pypto.backends.cpu.aarch64.sve256 import Sve256Runtime
++
++    class Sve256CensusRuntime(Sve256Runtime):
++        def __init__(self) -> None:
++            super().__init__(execution_mode=execution_mode)
++            self._census_recorder = recorder
++            self._census_op_index = 0
++            self._census_basis: Dict[str, Mapping[str, Any]] = {}
++            if recorder is not None:
++                # Shared with sve256_census_summary(); keyed by op index.
++                recorder.sve256_basis = self._census_basis
++
++        def _execute_operation(self, operation: Any, plan: Any, environment: Any,
++                               artifact: Any) -> None:
++            active = self._census_recorder
++            if active is None:
++                return super()._execute_operation(operation, plan, environment, artifact)
++            index = self._census_op_index
++            self._census_op_index += 1
++            name = str(getattr(plan, "operation", operation.name))
++            out_bytes = sum(_ref_bytes(ref) for ref in operation.outputs)
++            in_bytes = sum(_ref_bytes(ref) for ref in operation.inputs)
++            decision = sve256_execution_decision(name, plan)
++            self._census_basis[str(index)] = decision
++            active.before_op(
++                index, name, in_bytes, out_bytes, mode=decision["mode"],
++                python_list_elements=decision["python_list_elements"],
++            )
++            started = time.perf_counter()
++            super()._execute_operation(operation, plan, environment, artifact)
++            active.record_op(
++                index, name, str(getattr(plan, "dtype", "")),
++                time.perf_counter() - started, out_bytes, in_bytes, mode=decision["mode"],
++            )
++
++    return Sve256CensusRuntime()
++
++
+ def make_runtime(backend: Mapping[str, Any], recorder: Optional[OpRecorder]) -> Any:
+     name = backend["runtime"]
+     if name == "avx512":
+         if recorder is None:
+             return Avx512Runtime()
+         return InstrumentedAvx512Runtime(recorder=recorder)
++    if name == "sve256":
++        return make_sve256_census_runtime(
++            recorder, execution_mode=str(backend.get("execution_mode", "native"))
++        )
+     if name == "avx2":
+         return Avx2Runtime()
+     if name == "scalar":
+@@ -1867,7 +2141,8 @@ def stage_s1(args: argparse.Namespace) -> Mapping[str, Any]:
+         "memory_model": memory_model(census),
+         "cgroup_memory_max_mib": budget,
+     }
+-    backend = make_backend(args.backend, precision=precision)
++    backend = make_backend(args.backend, precision=precision,
++                           execution_mode=getattr(args, "sve_execution_mode", "native"))
+     artifact, compile_info = compile_program(backend, program, build_dir)
+     result["compile"] = compile_info
+     result["rss_after_compile_mib"] = _maxrss_mib()
+@@ -1903,6 +2178,11 @@ def stage_s1(args: argparse.Namespace) -> Mapping[str, Any]:
+     result["launch_error"] = error
+     result["budget_watchdog_stop"] = recorder.stopped_reason if recorder is not None else None
+     result["op_summary"] = summarise_ops(recorder) if recorder is not None else None
++    result["execution_mode_census"] = (
++        sve256_census_summary(recorder)
++        if (recorder is not None and getattr(args, "backend", "") == "sve256")
++        else None
++    )
+     result["rss_peak_mib"] = _maxrss_mib()
+     result["cgroup_memory_peak_mib"] = _cgroup_mib("/memory.peak")
+     result["output_canary_intact"] = all(
+@@ -1948,7 +2228,8 @@ def _run_once(
+         quantized_linear_scope=getattr(args, "quantized_linear_scope", "default"),
+         quantize_lm_head=getattr(args, "quantize_lm_head", False),
+     )
+-    backend = make_backend(args.backend, precision=precision)
++    backend = make_backend(args.backend, precision=precision,
++                           execution_mode=getattr(args, "sve_execution_mode", "native"))
+     artifact, compile_info = compile_program(backend, program, build_dir)
+     tie = tie_word_embeddings_from_config(str(Path(args.asset_dir) / "config.json"))
+     mapping = build_weight_mapping(schema, program.metadata, reader, tie_word_embeddings=tie)
+@@ -2025,6 +2306,11 @@ def _run_once(
+         "launch_error": error,
+         "budget_watchdog_stop": recorder.stopped_reason if recorder is not None else None,
+         "op_summary": summarise_ops(recorder) if recorder is not None else None,
++        "execution_mode_census": (
++            sve256_census_summary(recorder)
++            if (recorder is not None and getattr(args, "backend", "") == "sve256")
++            else None
++        ),
+         "rss_peak_mib": _maxrss_mib(),
+         "cgroup_memory_peak_mib": _cgroup_mib("/memory.peak"),
+         "cgroup_memory_max_mib": _cgroup_mib("/memory.max"),
+@@ -2173,7 +2459,16 @@ def stage_s2(args: argparse.Namespace) -> Mapping[str, Any]:
+     record["prompt"] = prompt
+     record["rope_source"] = rope_source
+     if record["status"] == "PASS":
+-        _align_prefill(record, raw, reference, prompt, steps)
++        if getattr(args, "skip_gold_alignment", False):
++            # C8/Q5 A3 runs judge locally: the A3 side only needs the golden
++            # input_ids; no gold logits are shipped to the execution machine.
++            record["gold_alignment"] = "skipped_by_flag"
++            record["gold_alignment_note"] = (
++                "--skip-gold-alignment: 本机判定，gold 数组不落到执行机；"
++                "此处不产生任何 gold 对比数字"
++            )
++        else:
++            _align_prefill(record, raw, reference, prompt, steps)
+     return record
+ 
+ 
+@@ -2199,21 +2494,33 @@ def stage_s3(args: argparse.Namespace) -> Mapping[str, Any]:
+         )
+         record["prompt"] = prompt
+         record["rope_source"] = rope_source
++        skip_gold = bool(getattr(args, "skip_gold_alignment", False))
+         if record["status"] == "PASS":
+-            _align_prefill(record, raw, reference, prompt, steps)
++            if skip_gold:
++                record["gold_alignment"] = "skipped_by_flag"
++                record["gold_alignment_note"] = (
++                    "--skip-gold-alignment: gold 数组不落到执行机；decode 链为本实现"
++                    "自回归结果，L4 判定在持有 gold 的机器上完成"
++                )
++            else:
++                _align_prefill(record, raw, reference, prompt, steps)
+             # gold 对齐口径（已核对）：``decode_logits[k]`` 是**消费第 k 个生成 token
+             # 之前**的 logits，``decode_logits[0] == prefill_next_logits`` 逐位相等。
+             # 因此我们的 prefill 末行 == decode_logits[0]，
+             # 我们的第 step 步 decode（位置 steps+step）== decode_logits[step + 1]。
+-            decode_logits = gold["decode_logits"]
+-            decode_tokens = [int(v) for v in gold["decode_token_ids"]]
+-            generate_logits = gold["generate_logits"] if "generate_logits" in gold else None
++            decode_logits = None if skip_gold else gold["decode_logits"]
++            decode_tokens = [] if skip_gold else [int(v) for v in gold["decode_token_ids"]]
++            generate_logits = (
++                gold["generate_logits"] if (not skip_gold and "generate_logits" in gold) else None
++            )
+             current = int(
+                 _raw_to_float_array(raw["logits"], "bf16").astype("float64")[-248320:].argmax()
+             )
+             record["prefill_next_token"] = current
+-            record["gold_decode_token_ids"] = decode_tokens
+-            record["prefill_next_token_matches_gold"] = bool(decode_tokens) and current == decode_tokens[0]
++            record["gold_decode_token_ids"] = decode_tokens if decode_tokens else None
++            record["prefill_next_token_matches_gold"] = (
++                None if skip_gold else (bool(decode_tokens) and current == decode_tokens[0])
++            )
+             if args.decode_steps:
+                 for step in range(args.decode_steps):
+                     past = steps + step
+@@ -2228,20 +2535,34 @@ def stage_s3(args: argparse.Namespace) -> Mapping[str, Any]:
+                     step_record["decode_step"] = step
+                     step_record["position"] = past
+                     step_record["input_token"] = current
+-                    step_record["gold_input_token"] = decode_tokens[step] if step < len(decode_tokens) else None
++                    step_record["gold_input_token"] = (
++                        decode_tokens[step] if step < len(decode_tokens) else None
++                    )
+                     step_record["input_matches_gold"] = (
+-                        step < len(decode_tokens) and current == decode_tokens[step]
++                        (step < len(decode_tokens) and current == decode_tokens[step])
++                        if not skip_gold else None
+                     )
+                     step_record["rope_source"] = step_rope
+-                    gold_row = step + 1
+-                    step_record["gold_logits_row"] = (
+-                        gold_row if gold_row < int(decode_logits.shape[0]) else None
+-                    )
++                    if skip_gold:
++                        step_record["gold_logits_row"] = None
++                        step_record["gold_decode_token_id"] = None
++                        step_record["gold_argmax_token"] = None
++                        step_record["token_matches_gold_token_id"] = None
++                        step_record["token_matches_gold_argmax"] = None
++                        step_record["logits_vs_decode_logits"] = None
++                        step_record["note"] = (
++                            "--skip-gold-alignment: 本步 logits 交由持有 gold 的机器做 L4 判定"
++                        )
++                    else:
++                        gold_row = step + 1
++                        step_record["gold_logits_row"] = (
++                            gold_row if gold_row < int(decode_logits.shape[0]) else None
++                        )
+                     if step_record["status"] == "PASS":
+                         actual = _raw_to_float_array(raw["logits"], "bf16").astype("float64")
+                         argmax = int(actual.argmax())
+                         step_record["argmax_token"] = argmax
+-                        if step_record["gold_logits_row"] is not None:
++                        if (not skip_gold) and step_record["gold_logits_row"] is not None:
+                             row = step_record["gold_logits_row"]
+                             step_record["gold_decode_token_id"] = decode_tokens[row]
+                             step_record["gold_argmax_token"] = int(decode_logits[row].argmax())
+@@ -2260,7 +2581,7 @@ def stage_s3(args: argparse.Namespace) -> Mapping[str, Any]:
+                                     raw["logits"], "bf16", generate_logits[row], 1, 248320,
+                                     "generate_logits[{}]".format(row), mask_non_finite=True,
+                                 )
+-                        else:
++                        elif not skip_gold:
+                             step_record["gold_decode_token_id"] = None
+                             step_record["gold_argmax_token"] = None
+                             step_record["token_matches_gold_token_id"] = None
+@@ -2343,7 +2664,8 @@ def build_parser() -> argparse.ArgumentParser:
+     parser.add_argument("--stage", required=True,
+                         choices=("preflight", "boundary-audit", "s1", "s2", "s3", "s4"))
+     parser.add_argument("--shape-profile", default="model", choices=("model", "synthetic_test"))
+-    parser.add_argument("--backend", default="avx512", choices=("avx512", "avx2", "scalar", "cuda"))
++    parser.add_argument("--backend", default="avx512",
++                        choices=("avx512", "avx2", "sve256", "scalar", "cuda"))
+     parser.add_argument("--precision", default="bf16", choices=("bf16", "w8a8-linear"),
+                         help="bf16 (frozen v3 graph) or w8a8-linear (contract 0002 C7)")
+     parser.add_argument("--quantized-linear-scope", default="default", choices=("default", "all"),
+@@ -2357,6 +2679,18 @@ def build_parser() -> argparse.ArgumentParser:
+     parser.add_argument("--asset-dir", default=None)
+     parser.add_argument("--reference-dir", default=None)
+     parser.add_argument("--rope-dir", default=None)
++    parser.add_argument(
++        "--skip-gold-alignment",
++        action="store_true",
++        help=(
++            "C8/Q5 A3 运行：执行机只读 gold 的 input_ids，不做任何 gold 对比；"
++            "logits 由持有 gold 的机器做 L4 判定（gold 数组不落到执行机）"
++        ),
++    )
++    parser.add_argument(
++        "--sve-execution-mode", default="native", choices=("native", "qemu"),
++        help="--backend sve256：native（A3 原生）或 qemu（本机交叉）",
++    )
+     parser.add_argument("--output", required=True)
+     parser.add_argument("--progress", default=None)
+     parser.add_argument("--work-dir", default=None)
+diff --git a/tools/c8_l4_compare.py b/tools/c8_l4_compare.py
+new file mode 100755
+index 000000000..13878a30a
+--- /dev/null
++++ b/tools/c8_l4_compare.py
+@@ -0,0 +1,488 @@
++#!/usr/bin/env python3
++"""C8 L4 判定：我们的 W8A8 整网 logits vs W8A8 参照 gold。
++
++判据（docs/20-planning/0005-2026-09-11-c8-execution-queue.zh-CN.md §3；
++本脚本不改判据、不写死阈值）：
++
++    - 逐行 argmax 与 gold 一致（硬门槛）；
++      唯一例外：gold 该行 top1/top2 margin <= 0.5 x band 且
++      ours argmax == gold top2 -> 记 near-tie flip，不判失败，但单列计数。
++    - max|delta logits| <= 2 x band
++    - cosine >= band_cosine - 1e-4
++
++band 与 band_cosine 每次运行都从 ``--gold-dir`` 下的 ``band.json`` 读取
++（``variants.<variant>.per_prompt.<prompt>.band``），并把 band.json 的绝对
++路径、sha256、JSON pointer 与读到的数字打印到 stdout，同时写进输出 JSON 的
++``band_source``。
++
++判定粒度（防止同一批行被重复计入门禁）：
++
++    * primary：``prefill_logits``（T 行）、``prefill_next_logits``（1 行）、
++      ``decode_logits``（只含"本步输入 token 与 gold 一致"的 step，对应
++      gold decode_logits[1..k]，整体算一个 block）。
++    * breakdown（只报数）：每个 decode step 单行。
++    * informational：``last_hidden_state``（不是 logits，不套用 §3 判据）。
++    * diagnostic：``--diagnostic-variant``（默认 ``w8a8_f32ref``）单独成节，
++      明确标注不可比、不进入总判定。
++
++输入约定：``--ours-dir`` 下按 driver ``--debug-dump`` 命名：
++
++    <prompt>.s3-prefill.past0.npz
++    <prompt>.s3-decode.past<steps>.npz  ... past<steps+3>.npz
++
++每个 npz 至少含 ``logits`` 输出；可选 ``final_hidden``。
++
++本工具只依赖 numpy，只读文件，不执行模型/后端代码。
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import math
++from pathlib import Path
++from typing import Any, Dict, List, Mapping, Optional, Sequence
++
++import numpy as np
++
++TOOL = "c8_l4_compare"
++TOOL_VERSION = 1
++TWO_X = 2.0
++COSINE_SLACK = 1e-4
++PROMPTS = ("en_continuation", "zh_continuation", "chat_zh_user")
++VOCAB = 248320
++
++
++def sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with open(path, "rb") as stream:
++        for chunk in iter(lambda: stream.read(1 << 20), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def load_npz(path: Path) -> Mapping[str, np.ndarray]:
++    with np.load(str(path), allow_pickle=False) as data:
++        return {name: np.asarray(data[name]) for name in data.files}
++
++
++def flatten_rows(array: np.ndarray) -> np.ndarray:
++    array = np.asarray(array, dtype=np.float64)
++    if array.ndim == 1:
++        return array.reshape(1, -1)
++    return array.reshape(-1, array.shape[-1])
++
++
++def top2(row: np.ndarray) -> Mapping[str, Any]:
++    row = np.asarray(row, dtype=np.float64)
++    top1 = int(np.argmax(row))
++    top1_value = float(row[top1])
++    masked = np.where(np.arange(row.size) == top1, -np.inf, row)
++    top2_token = int(np.argmax(masked))
++    top2_value = float(masked[top2_token])
++    return {
++        "top1_token": top1, "top1_value": top1_value,
++        "top2_token": top2_token, "top2_value": top2_value,
++        "margin": top1_value - top2_value,
++    }
++
++
++def cosine(actual: np.ndarray, expected: np.ndarray) -> float:
++    a = np.asarray(actual, dtype=np.float64).reshape(-1)
++    b = np.asarray(expected, dtype=np.float64).reshape(-1)
++    na = math.sqrt(float(np.dot(a, a)))
++    nb = math.sqrt(float(np.dot(b, b)))
++    if na == 0.0 or nb == 0.0:
++        return float("nan")
++    return float(np.dot(a, b) / (na * nb))
++
++
++def classify(ours_argmax: int, gold: Mapping[str, Any], near_tie_threshold: float) -> str:
++    if ours_argmax == gold["top1_token"]:
++        return "strict_match"
++    if gold["margin"] <= near_tie_threshold and ours_argmax == gold["top2_token"]:
++        return "near_tie_flip"
++    return "argmax_fail"
++
++
++def compare_block(ours: np.ndarray, gold: np.ndarray, key: str, gate_role: str,
++                  band: Mapping[str, Any],
++                  comparable: Optional[Sequence[bool]] = None) -> Mapping[str, Any]:
++    ours_rows = flatten_rows(ours)
++    gold_rows = flatten_rows(gold)
++    if ours_rows.shape != gold_rows.shape:
++        raise SystemExit("{} shape mismatch: ours {} vs gold {}".format(
++            key, ours_rows.shape, gold_rows.shape))
++    if comparable is None:
++        comparable = [True] * ours_rows.shape[0]
++    near_tie_threshold = float(band["near_tie_threshold"])
++    max_abs_limit = TWO_X * float(band["max_abs"])
++    cosine_floor = float(band["cosine"]) - COSINE_SLACK
++
++    delta = np.abs(ours_rows - gold_rows)
++    rows = []
++    counts = {"strict_match": 0, "near_tie_flip": 0, "argmax_fail": 0,
++              "not_comparable": 0}
++    for index in range(ours_rows.shape[0]):
++        ours_t = top2(ours_rows[index])
++        gold_t = top2(gold_rows[index])
++        verdict = classify(ours_t["top1_token"], gold_t, near_tie_threshold)
++        if not bool(comparable[index]):
++            counts["not_comparable"] += 1
++        else:
++            counts[verdict] += 1
++        rows.append({
++            "row": index,
++            "comparable": bool(comparable[index]),
++            "classification": verdict if comparable[index] else "not_comparable",
++            "ours_argmax": ours_t["top1_token"],
++            "ours_top1_value": ours_t["top1_value"],
++            "ours_top2_token": ours_t["top2_token"],
++            "ours_margin": ours_t["margin"],
++            "gold_top1_token": gold_t["top1_token"],
++            "gold_top1_value": gold_t["top1_value"],
++            "gold_top2_token": gold_t["top2_token"],
++            "gold_margin": gold_t["margin"],
++        })
++    gated_rows = [row for row in rows if row["comparable"]]
++    max_abs = float(np.max(delta)) if delta.size else 0.0
++    mean_abs = float(np.mean(delta)) if delta.size else 0.0
++    cos = cosine(ours_rows, gold_rows)
++    if gated_rows:
++        gates = {
++            "argmax_gate": all(row["classification"] != "argmax_fail" for row in gated_rows),
++            "max_abs_gate": bool(max_abs <= max_abs_limit),
++            "max_abs_limit_2x_band": max_abs_limit,
++            "cosine_gate": bool(cos >= cosine_floor),
++            "cosine_floor": cosine_floor,
++        }
++    else:
++        gates = {"argmax_gate": None, "max_abs_gate": None,
++                 "max_abs_limit_2x_band": max_abs_limit, "cosine_gate": None,
++                 "cosine_floor": cosine_floor,
++                 "note": "无可比行；数字仅作信息"}
++    return {
++        "key": key,
++        "gate_role": gate_role,
++        "primary": gate_role == "primary",
++        "rows": int(ours_rows.shape[0]),
++        "gated_rows": len(gated_rows),
++        "max_abs": max_abs,
++        "mean_abs": mean_abs,
++        "cosine": cos,
++        "counts": counts,
++        "gold_near_tie_rows": sum(
++            1 for row in rows
++            if row["comparable"] and row["gold_margin"] <= near_tie_threshold
++        ),
++        "gates": gates,
++        "row_details": rows,
++        "near_tie_details": [
++            row for row in rows
++            if row["comparable"] and row["gold_margin"] <= near_tie_threshold
++        ],
++    }
++
++
++def read_band(band_json: Mapping[str, Any], variant: str, prompt: str,
++              band_path: Path, band_sha: str) -> Mapping[str, Any]:
++    pointer = ["variants", variant, "per_prompt", prompt, "band"]
++    node: Any = band_json
++    for step in pointer:
++        if not isinstance(node, Mapping) or step not in node:
++            raise SystemExit("band.json 缺少 {}（variant={} prompt={}）".format(
++                ".".join(pointer), variant, prompt))
++        node = node[step]
++    for field in ("max_abs", "cosine", "near_tie_threshold", "source_key"):
++        if field not in node:
++            raise SystemExit("band.json {} 缺少字段 {}".format(".".join(pointer), field))
++    max_abs = float(node["max_abs"])
++    near_tie = float(node["near_tie_threshold"])
++    return {
++        "path": str(band_path),
++        "sha256": band_sha,
++        "json_pointer": ".".join(pointer),
++        "source_key": node["source_key"],
++        "max_abs": max_abs,                         # band
++        "cosine": float(node["cosine"]),            # band_cosine
++        "near_tie_threshold": near_tie,             # 0.5 x band (from band.json)
++        "near_tie_equals_half_band": bool(abs(near_tie - 0.5 * max_abs) <= 1e-9 * max(1.0, max_abs)),
++        "two_x_band": TWO_X * max_abs,
++        "cosine_floor": float(node["cosine"]) - COSINE_SLACK,
++        "criteria_source": "docs/20-planning/0005-2026-09-11-c8-execution-queue.zh-CN.md §3",
++    }
++
++
++def per_key_band(band_json: Mapping[str, Any], variant: str,
++                 prompt: str) -> Mapping[str, Any]:
++    node = band_json.get("variants", {}).get(variant, {}).get("per_prompt", {}).get(prompt, {})
++    keys = node.get("keys", {})
++    out = {}
++    for key in ("prefill_logits", "prefill_next_logits", "decode_logits",
++                "last_hidden_state", "hidden_states_layers"):
++        if key in keys and isinstance(keys[key], Mapping) and "max_abs" in keys[key]:
++            out[key] = {
++                "max_abs": float(keys[key]["max_abs"]),
++                "cosine": (float(keys[key]["cosine"])
++                           if keys[key].get("cosine") is not None else None),
++                "note": "band.json 内该 key 自身统计，仅作交叉参考；门禁仍用 prefill_logits band",
++            }
++    return out
++
++
++def discover_decode(directory: Path, prompt: str) -> Dict[int, Path]:
++    found: Dict[int, Path] = {}
++    for path in sorted(directory.glob("{}.s3-decode.past*.npz".format(prompt))):
++        try:
++            past = int(path.name.split(".past")[-1].split(".")[0])
++        except ValueError:
++            continue
++        found[past] = path
++    return found
++
++
++def run_prompt(prompt: str, steps: int, ours_dir: Path, gold_dir: Path,
++               variant: str, band_json: Mapping[str, Any], band_path: Path,
++               band_sha: str,
++               diagnostic_variant: Optional[str]) -> Mapping[str, Any]:
++    gold_path = gold_dir / variant / "{}.npz".format(prompt)
++    if not gold_path.is_file():
++        raise SystemExit("gold npz 不存在: {}".format(gold_path))
++    gold = load_npz(gold_path)
++    for required in ("prefill_logits", "prefill_next_logits", "decode_logits",
++                     "decode_token_ids"):
++        if required not in gold:
++            raise SystemExit("gold {} 缺少键 {}".format(gold_path, required))
++    band = read_band(band_json, variant, prompt, band_path, band_sha)
++
++    prefill_path = ours_dir / "{}.s3-prefill.past0.npz".format(prompt)
++    if not prefill_path.is_file():
++        raise SystemExit("ours prefill npz 不存在: {}".format(prefill_path))
++    prefill = load_npz(prefill_path)
++    if "logits" not in prefill:
++        raise SystemExit("{} 缺少 'logits' 输出".format(prefill_path))
++    prefill_rows = flatten_rows(prefill["logits"])
++    if prefill_rows.shape[0] != steps:
++        raise SystemExit("{} prefill logits 行数 {} != steps {}".format(
++            prefill_path, prefill_rows.shape[0], steps))
++
++    keys: Dict[str, Any] = {}
++    keys["prefill_logits"] = compare_block(
++        prefill["logits"], gold["prefill_logits"], "prefill_logits", "primary", band)
++    keys["prefill_next_logits"] = compare_block(
++        prefill_rows[-1:], gold["prefill_next_logits"], "prefill_next_logits",
++        "primary", band)
++
++    gold_decode = flatten_rows(gold["decode_logits"])
++    gold_chain = [int(v) for v in gold["decode_token_ids"]]
++    ours_chain = [int(np.argmax(prefill_rows[-1]))]
++    decode_paths = discover_decode(ours_dir, prompt)
++    decode_steps = []
++    comparable_ours: List[np.ndarray] = []
++    comparable_gold: List[np.ndarray] = []
++    for step_index in range(4):
++        past = steps + step_index
++        path = decode_paths.get(past)
++        if path is None:
++            decode_steps.append({
++                "step_index": step_index, "past_length": past,
++                "status": "missing_dump", "path": str(path) if path else None,
++            })
++            continue
++        dump = load_npz(path)
++        if "logits" not in dump:
++            raise SystemExit("{} 缺少 'logits' 输出".format(path))
++        row = flatten_rows(dump["logits"])[0]
++        ours_argmax = int(np.argmax(row))
++        ours_input = ours_chain[step_index]
++        gold_input = gold_chain[step_index] if step_index < len(gold_chain) else None
++        comparable = gold_input is not None and ours_input == gold_input
++        gold_row = step_index + 1
++        step_record = {
++            "step_index": step_index,
++            "past_length": past,
++            "path": str(path),
++            "gold_row": gold_row if gold_row < gold_decode.shape[0] else None,
++            "ours_input_token": ours_input,
++            "gold_input_token": gold_input,
++            "input_comparable": bool(comparable),
++            "ours_argmax_token": ours_argmax,
++        }
++        if gold_row < gold_decode.shape[0]:
++            block = compare_block(row.reshape(1, -1), gold_decode[gold_row],
++                                  "decode_step_{}_gold_row_{}".format(step_index, gold_row),
++                                  "breakdown", band, [comparable])
++            block.update(step_record)
++            keys["decode_step_{}".format(step_index)] = block
++        if comparable:
++            comparable_ours.append(row)
++            comparable_gold.append(gold_decode[gold_row])
++        ours_chain.append(ours_argmax)
++        decode_steps.append(step_record)
++
++    if comparable_ours:
++        keys["decode_logits"] = compare_block(
++            np.vstack(comparable_ours), np.vstack(comparable_gold),
++            "decode_logits(rows_1..{})".format(len(comparable_ours)),
++            "primary", band)
++    else:
++        keys["decode_logits"] = {
++            "key": "decode_logits", "gate_role": "primary", "primary": True,
++            "status": "no_comparable_decode_rows",
++            "rows": 0, "gated_rows": 0,
++            "counts": {"strict_match": 0, "near_tie_flip": 0,
++                       "argmax_fail": 0, "not_comparable": 0},
++            "gold_near_tie_rows": 0,
++            "gates": {"argmax_gate": None, "max_abs_gate": None,
++                      "max_abs_limit_2x_band": band["two_x_band"],
++                      "cosine_gate": None, "cosine_floor": band["cosine_floor"],
++                      "note": "没有输入 token 与 gold 一致的 decode step"},
++        }
++    keys["decode_chain"] = {
++        "ours": ours_chain,
++        "gold_decode_token_ids": gold_chain,
++        "gold_argmax_tokens": [int(np.argmax(gold_decode[row]))
++                               for row in range(min(4, gold_decode.shape[0]))],
++        "steps": decode_steps,
++        "note": ("gold decode_token_ids[k] 是第 k 步消费的 token；"
++                 "我们的 decode 链第 k 步输入 = 上一步 argmax"),
++    }
++    if "final_hidden" in prefill and "last_hidden_state" in gold:
++        keys["last_hidden_state"] = compare_block(
++            prefill["final_hidden"], gold["last_hidden_state"],
++            "last_hidden_state", "informational", band)
++        keys["last_hidden_state"]["gates"] = {
++            "note": "hidden state 不是 logits，不套用 §3 判据；数字仅作信息"}
++
++    primary = [item for item in keys.values()
++               if isinstance(item, Mapping) and item.get("primary")]
++    strict = sum(item["counts"]["strict_match"] for item in primary)
++    near_tie = sum(item["counts"]["near_tie_flip"] for item in primary)
++    failed = sum(item["counts"]["argmax_fail"] for item in primary)
++    gated_rows = sum(item["gated_rows"] for item in primary)
++    argmax_gate = all(item["gates"]["argmax_gate"] for item in primary)
++    max_abs_gate = all(bool(item["gates"]["max_abs_gate"]) for item in primary)
++    cosine_gate = all(bool(item["gates"]["cosine_gate"]) for item in primary)
++    verdict = "PASS" if (argmax_gate and max_abs_gate and cosine_gate) else "FAIL"
++    result: Dict[str, Any] = {
++        "prompt": prompt,
++        "steps": steps,
++        "variant": variant,
++        "band": band,
++        "per_key_band_reference": per_key_band(band_json, variant, prompt),
++        "keys": keys,
++        "verdict": verdict,
++        "strict_argmax": strict,
++        "near_tie_flips": near_tie,
++        "argmax_failures": failed,
++        "gated_rows": gated_rows,
++        "gates": {"argmax_gate": argmax_gate, "max_abs_gate": max_abs_gate,
++                  "cosine_gate": cosine_gate},
++        "near_tie_rows": [
++            {"key": item["key"], **row}
++            for item in primary for row in item.get("near_tie_details", [])
++        ],
++    }
++    if diagnostic_variant:
++        diag_path = gold_dir / diagnostic_variant / "{}.npz".format(prompt)
++        if diag_path.is_file():
++            diag = load_npz(diag_path)
++            diag_band = read_band(band_json, diagnostic_variant, prompt, band_path, band_sha)
++            result["diagnostic_only_not_comparable"] = {
++                "variant": diagnostic_variant,
++                "warning": ("第二参照只作诊断：它的孤岛精度与主参照不同，"
++                            "不进入 L4 总判定，也不得与主参照数字混算"),
++                "band": diag_band,
++                "prefill_logits_vs_diagnostic_gold": compare_block(
++                    prefill["logits"], diag["prefill_logits"],
++                    "diagnostic_prefill_logits", "diagnostic", diag_band),
++                "decode_logits_vs_diagnostic_gold": compare_block(
++                    np.vstack(comparable_ours) if comparable_ours else prefill_rows[-1:],
++                    flatten_rows(diag["decode_logits"])[1:1 + len(comparable_ours)]
++                    if comparable_ours else flatten_rows(diag["decode_logits"])[0:1],
++                    "diagnostic_decode_logits", "diagnostic", diag_band),
++            }
++    return result
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description="C8 L4 判定（w8a8 主参照）")
++    parser.add_argument("--gold-dir", required=True)
++    parser.add_argument("--variant", default="w8a8")
++    parser.add_argument("--diagnostic-variant", default="w8a8_f32ref")
++    parser.add_argument("--ours-dir", required=True,
++                        help="driver --debug-dump 输出目录（<prompt>.s3-*.npz）")
++    parser.add_argument("--config", default=None, help="配置名（仅写进报告）")
++    parser.add_argument("--steps", default=None,
++                        help="逗号分隔 <prompt>=<steps> 覆盖，默认 5,8,18")
++    parser.add_argument("--prompt", action="append", choices=PROMPTS, default=None)
++    parser.add_argument("--output", required=True)
++    args = parser.parse_args()
++
++    gold_dir = Path(args.gold_dir).resolve()
++    ours_dir = Path(args.ours_dir).resolve()
++    band_path = gold_dir / "band.json"
++    if not band_path.is_file():
++        raise SystemExit("band.json 不存在: {}".format(band_path))
++    band_sha = sha256_file(band_path)
++    band_json = json.loads(band_path.read_text(encoding="utf-8"))
++    steps_map = {"en_continuation": 5, "zh_continuation": 8, "chat_zh_user": 18}
++    if args.steps:
++        for item in args.steps.split(","):
++            name, value = item.split("=", 1)
++            steps_map[name] = int(value)
++    prompts = list(args.prompt) if args.prompt else list(PROMPTS)
++    print("[{}/v{}] band source: {}".format(TOOL, TOOL_VERSION, band_path))
++    print("[{}/v{}] band.json sha256: {}".format(TOOL, TOOL_VERSION, band_sha))
++    print("[{}/v{}] criteria: docs/20-planning/0005-2026-09-11-c8-execution-queue.zh-CN.md §3".format(
++        TOOL, TOOL_VERSION))
++
++    report: Dict[str, Any] = {
++        "tool": TOOL,
++        "tool_version": TOOL_VERSION,
++        "backend_config": args.config,
++        "primary_variant": args.variant,
++        "diagnostic_variant": args.diagnostic_variant,
++        "band_source": {"path": str(band_path), "sha256": band_sha,
++                        "criteria_source": "0005 §3"},
++        "ours_dir": str(ours_dir),
++        "prompts": {},
++    }
++    overall_pass = True
++    for prompt in prompts:
++        steps = steps_map[prompt]
++        result = run_prompt(prompt, steps, ours_dir, gold_dir, args.variant,
++                            band_json, band_path, band_sha, args.diagnostic_variant)
++        report["prompts"][prompt] = result
++        overall_pass = overall_pass and result["verdict"] == "PASS"
++        band = result["band"]
++        print("[{}] band[{}] max_abs={:.6f} cosine={:.8f} near_tie=0.5*band={:.6f} "
++              "floor={:.6f} pointer={}".format(
++                  prompt, args.variant, band["max_abs"], band["cosine"],
++                  band["near_tie_threshold"], band["cosine_floor"], band["json_pointer"]))
++        for key in ("prefill_logits", "prefill_next_logits", "decode_logits"):
++            block = result["keys"][key]
++            print("  {:<20} rows={:>3} gated={:>3} strict={} near_tie={} fail={} "
++                  "max_abs={:.6f} cos={:.8f} gates={}".format(
++                      key, block["rows"], block["gated_rows"],
++                      block["counts"]["strict_match"], block["counts"]["near_tie_flip"],
++                      block["counts"]["argmax_fail"], block["max_abs"], block["cosine"],
++                      {k: v for k, v in block["gates"].items()
++                       if k.endswith("_gate") and v is not None}))
++        print("  chain ours={} gold={} verdict={}".format(
++            result["keys"]["decode_chain"]["ours"],
++            result["keys"]["decode_chain"]["gold_decode_token_ids"], result["verdict"]))
++        if result.get("diagnostic_only_not_comparable"):
++            print("  [diagnostic] {} 单独成节，标注不可比，不进入判定".format(
++                result["diagnostic_only_not_comparable"]["variant"]))
++    report["overall_verdict"] = "PASS" if overall_pass else "FAIL"
++    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
++    Path(args.output).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n",
++                                 encoding="utf-8")
++    print("[{}] overall={} output={}".format(TOOL, report["overall_verdict"], args.output))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/c8_sve256_a3/fetch_results.sh b/tools/c8_sve256_a3/fetch_results.sh
+new file mode 100755
+index 000000000..e0634351a
+--- /dev/null
++++ b/tools/c8_sve256_a3/fetch_results.sh
+@@ -0,0 +1,34 @@
++#!/usr/bin/env bash
++# C8/Q5: fetch the A3 diagnostic evidence back to the local evidence dir.
++# Runs on the LOCAL machine.  Bulk npz dumps stay on A3; only JSON/logs and
++# their sha256 lists move (plus the remote dump inventory for auditing).
++set -euo pipefail
++
++EV=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/c8-l4-sve256
++A3=a3-21
++A3_ROOT='pypto-x-a3/c8-l4-sve256'
++LOCAL_RAW="${EV}/raw/a3"
++LOCAL_LOGS="${EV}/logs/a3"
++mkdir -p "${LOCAL_RAW}" "${LOCAL_LOGS}"
++
++echo "[fetch] remote inventory"
++ssh -o BatchMode=yes "${A3}" "cd \$HOME/${A3_ROOT} && du -sb raw logs work 2>/dev/null; du -sh raw/bf16 raw/w8a8_repro 2>/dev/null; find raw -name '*.npz' -type f | sort | xargs -r sha256sum" \
++  > "${LOCAL_RAW}/a3_dump_inventory.txt"
++
++scp -q -o BatchMode=yes \
++  "${A3}:\$HOME/${A3_ROOT}/raw/bf16/*.json" \
++  "${A3}:\$HOME/${A3_ROOT}/raw/bf16/*.progress.log" \
++  "${A3}:\$HOME/${A3_ROOT}/raw/w8a8_repro/*.json" \
++  "${A3}:\$HOME/${A3_ROOT}/raw/w8a8_repro/*.log" \
++  "${A3}:\$HOME/${A3_ROOT}/raw/matrix_status.json" \
++  "${A3}:\$HOME/${A3_ROOT}/raw/sha256sums.txt" \
++  "${LOCAL_RAW}/"
++scp -q -o BatchMode=yes \
++  "${A3}:\$HOME/${A3_ROOT}/logs/*.log" \
++  "${LOCAL_LOGS}/"
++# The remote sha256sums.txt uses paths relative to the A3 root; keep both the
++# raw file and a local re-hash of what was actually fetched.
++( cd "${LOCAL_RAW}" && find . -type f ! -name 'LOCAL_SHA256SUMS.txt' -print0 \
++    | sort -z | xargs -0 sha256sum > LOCAL_SHA256SUMS.txt )
++echo "[fetch] local bytes:"
++du -sb "${LOCAL_RAW}" "${LOCAL_LOGS}"
+diff --git a/tools/c8_sve256_a3/make_bundle.sh b/tools/c8_sve256_a3/make_bundle.sh
+new file mode 100755
+index 000000000..240f02c8f
+--- /dev/null
++++ b/tools/c8_sve256_a3/make_bundle.sh
+@@ -0,0 +1,62 @@
++#!/usr/bin/env bash
++# C8/Q5: build the A3 transfer bundle from this worktree + evidence assets.
++#
++# Runs on the LOCAL machine.  Never contains model weights: the A3 side reads
++# the already-present ~/models/Qwen3.5-0.8B.  Everything staged here is small
++# enough to move over SSH (source tree + golden input_ids + RoPE tables).
++set -euo pipefail
++
++WT=/home/chiro/projects/pypto/worktrees/pypto-x/c8-l4-sve256
++EV=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/c8-l4-sve256
++GOLD=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/c8-w8a8-reference-gold/reference
++ROPE_SRC=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/qwen35-bf16-weighted-execution/reference_rope
++BUNDLE="${EV}/a3_bundle"
++
++rm -rf "${BUNDLE}"
++mkdir -p "${BUNDLE}/src/python/tests/ut/pypto_x" "${BUNDLE}/tools" "${BUNDLE}/refmin/float32" "${BUNDLE}/rope"
++
++# --- source (only what the driver needs; __pycache__ excluded) -------------
++tar -C "${WT}" -cf - --exclude='__pycache__' --exclude='*.pyc' python/pypto \
++    | tar -C "${BUNDLE}/src" -xf -
++cp -f "${WT}/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py" \
++      "${BUNDLE}/src/python/tests/ut/pypto_x/"
++cp -f "${WT}/tools/c8_l4_compare.py" "${WT}/tools/c8_sve256_w8a8_gap_probe.py" \
++      "${BUNDLE}/tools/"
++if [[ -d "${WT}/tools/c8_sve256_a3" ]]; then
++  cp -rf "${WT}/tools/c8_sve256_a3" "${BUNDLE}/tools/"
++fi
++
++# --- golden input_ids only (no logits are shipped to A3) -------------------
++python3 - "${GOLD}" "${BUNDLE}/refmin/float32" <<'PY'
++import sys
++from pathlib import Path
++import numpy as np
++
++gold = Path(sys.argv[1])
++out = Path(sys.argv[2])
++out.mkdir(parents=True, exist_ok=True)
++total = 0
++for prompt in ("en_continuation", "zh_continuation", "chat_zh_user"):
++    with np.load(gold / "float32" / (prompt + ".npz"), allow_pickle=False) as data:
++        ids = np.asarray(data["input_ids"])
++    path = out / (prompt + ".npz")
++    np.savez(path, input_ids=ids)
++    total += path.stat().st_size
++    print("[refmin] {} input_ids={} bytes={}".format(prompt, ids.tolist(), path.stat().st_size))
++print("[refmin] total_bytes={}".format(total))
++PY
++
++# --- RoPE tables (292 KiB) --------------------------------------------------
++cp -f "${ROPE_SRC}/rope_summary.json" "${BUNDLE}/rope/"
++for prompt in en_continuation zh_continuation chat_zh_user; do
++  cp -f "${ROPE_SRC}/${prompt}.npz" "${BUNDLE}/rope/"
++done
++
++# --- manifest ---------------------------------------------------------------
++( cd "${BUNDLE}" && find . -type f ! -name 'MANIFEST.sha256' -print0 \
++    | sort -z | xargs -0 sha256sum > MANIFEST.sha256 )
++BUNDLE_BYTES=$(du -sb "${BUNDLE}" | cut -f1)
++TAR="${EV}/a3_bundle.tar"
++tar -C "${EV}" -cf "${TAR}" a3_bundle
++echo "[bundle] dir=${BUNDLE} bytes=${BUNDLE_BYTES} tar=${TAR} tar_bytes=$(stat -c %s "${TAR}")"
++sha256sum "${TAR}" | tee "${EV}/a3_bundle.tar.sha256"
+diff --git a/tools/c8_sve256_a3/pack_ours_logits.py b/tools/c8_sve256_a3/pack_ours_logits.py
+new file mode 100755
+index 000000000..fb0a5e424
+--- /dev/null
++++ b/tools/c8_sve256_a3/pack_ours_logits.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++"""Compact the driver ``--debug-dump`` npz files into one judge pack per prompt.
++
++For a future (post-unblock) C8/Q5 SVE256 W8A8 run, the execution machine
++produces ``<prompt>.s3-prefill.past0.npz`` and
++``<prompt>.s3-decode.past<steps+k>.npz`` dumps.  This tool keeps only the
++``logits`` rows needed by ``tools/c8_l4_compare.py`` (prefill T x vocab and the
++4 decode rows) so only "our" arrays travel back to the machine that holds the
++gold (never gold to the execution machine).
++
++Usage::
++
++    python3 pack_ours_logits.py --ours-dir <raw/bf16-or-w8a8> \
++        --output-dir <pack> [--prompt en_continuation] [--steps 5]
++
++Output layout matches ``c8_l4_compare.py --ours-dir``:
++``<prompt>.s3-prefill.past0.npz`` and ``<prompt>.s3-decode.past*.npz``.
++"""
++
++from __future__ import annotations
++
++import argparse
++from pathlib import Path
++
++import numpy as np
++
++PROMPTS = (("en_continuation", 5), ("zh_continuation", 8), ("chat_zh_user", 18))
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--ours-dir", required=True)
++    parser.add_argument("--output-dir", required=True)
++    parser.add_argument("--prompt", action="append", default=None)
++    parser.add_argument("--steps", type=int, default=None)
++    args = parser.parse_args()
++
++    ours = Path(args.ours_dir).resolve()
++    out = Path(args.output_dir).resolve()
++    out.mkdir(parents=True, exist_ok=True)
++    selected = [item for item in PROMPTS if not args.prompt or item[0] in args.prompt]
++    total = 0
++    for prompt, steps in selected:
++        if args.steps is not None:
++            steps = args.steps
++        prefill_path = ours / "{}.s3-prefill.past0.npz".format(prompt)
++        with np.load(prefill_path, allow_pickle=False) as data:
++            arrays = {"logits": np.asarray(data["logits"], dtype=np.float32)}
++            if "final_hidden" in data.files:
++                arrays["final_hidden"] = np.asarray(data["final_hidden"], dtype=np.float32)
++        target = out / "{}.s3-prefill.past0.npz".format(prompt)
++        np.savez(target, **arrays)
++        total += target.stat().st_size
++        count = 0
++        for k in range(4):
++            path = ours / "{}.s3-decode.past{}.npz".format(prompt, steps + k)
++            if not path.is_file():
++                continue
++            with np.load(path, allow_pickle=False) as data:
++                row = np.asarray(data["logits"], dtype=np.float32)
++            decode_target = out / "{}.s3-decode.past{}.npz".format(prompt, steps + k)
++            np.savez(decode_target, logits=row)
++            total += decode_target.stat().st_size
++            count += 1
++        print("[pack] {} prefill_rows={} decode_rows={} bytes={}".format(
++            prompt, logits.shape[0], count, target.stat().st_size))
++    print("[pack] total_bytes={} (out={})".format(total, out))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/c8_sve256_a3/run_a3_diagnostic.sh b/tools/c8_sve256_a3/run_a3_diagnostic.sh
+new file mode 100755
+index 000000000..9f5e312bb
+--- /dev/null
++++ b/tools/c8_sve256_a3/run_a3_diagnostic.sh
+@@ -0,0 +1,146 @@
++#!/usr/bin/env bash
++# C8/Q5 A3-side diagnostic window (runs ON a3-21 as l00886679, NOT in the
++# container: the host side owns cpus 320-639 per a3_cpu_grant_2026_09_11).
++#
++# Scope, explicitly:
++#   * W8A8 whole-net SVE256 is expected to FAIL at lowering (int8 weight
++#     transpose has no SVE256 layout path); this script records that failure
++#     on A3 so the blocker is shown to be host-independent.
++#   * BF16 whole-net SVE256 is a NON-L4 LINK DIAGNOSTIC.  It produces an
++#     executed native/host_reference census and wall-clock magnitudes only.
++#     It is NOT an accuracy verdict, NOT an L4 verdict, NOT performance.
++#
++# Discipline: only writes under ~/pypto-x-a3/c8-l4-sve256, only taskset CPUs
++# 320-639, never touches chip7/NPU, no machine config changes, no residue.
++set -u
++
++ROOT="${HOME}/pypto-x-a3/c8-l4-sve256"
++PY="${HOME}/pypto-x-a3/envs/pypto-x-c8/bin/python"
++DRIVER="${ROOT}/src/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py"
++ASSET="${HOME}/models/Qwen3.5-0.8B"
++RAW="${ROOT}/raw"
++LOGS="${ROOT}/logs"
++WORK="${ROOT}/work"
++TMP="${ROOT}/tmp"
++mkdir -p "${RAW}/bf16" "${RAW}/w8a8_repro" "${LOGS}" "${WORK}/bf16" "${TMP}"
++rm -f "${RAW}/sha256sums.txt"
++
++export PYTHONPATH="${ROOT}/src/python"
++export PYPTO_X_PORTABLE_ONLY=1
++export TMPDIR="${TMP}"
++export OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 MKL_NUM_THREADS=8
++export OMP_PROC_BIND=close OMP_PLACES=cores
++
++# --- env evidence (append-only log) ----------------------------------------
++{
++  echo "== a3_c8_q5_window =="
++  date -u '+started_utc=%Y-%m-%dT%H:%M:%SZ'
++  date '+started_local=%Y-%m-%dT%H:%M:%S%z'
++  echo "hostname=$(hostname) user=$(whoami) home=${HOME}"
++  echo "cpuset_self=$(awk '/Cpus_allowed_list/{print $2}' /proc/self/status)"
++  echo "nproc=$(nproc) mem_available_kib=$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
++  echo "uname=$(uname -m) kernel=$(uname -r)"
++  grep -m1 -i '^features' /proc/cpuinfo || true
++  echo "python=$(${PY} --version 2>&1) cc=$(cc --version | head -1)"
++  echo "weight_bytes=$(stat -c %s "${ASSET}/model.safetensors-00001-of-00001.safetensors" 2>/dev/null)"
++  echo "env_numpy=$(${PY} -c 'import numpy; print(numpy.__version__)' 2>&1)"
++  # static link check with the exact SVE256 native flags
++  printf 'int main(void){return 0;}\n' > "${TMP}/static_probe.c"
++  if cc -static -O2 -std=c99 -march=armv8.2-a+sve -msve-vector-bits=scalable \
++        "${TMP}/static_probe.c" -o "${TMP}/static_probe" 2>"${TMP}/static_probe.err"; then
++    echo "static_probe=PASS"
++    file "${TMP}/static_probe" | head -1
++  else
++    echo "static_probe=FAIL"
++    head -5 "${TMP}/static_probe.err"
++  fi
++  ${PY} - <<'PY'
++from pypto.lowering.cpu.aarch64.sve import probe_sve256_capabilities
++import json
++capability = probe_sve256_capabilities(execution_mode="native")
++print("sve256_capability=" + json.dumps(capability.to_dict(), sort_keys=True))
++PY
++} > "${LOGS}/env_evidence.log" 2>&1
++
++echo "[run] W8A8 lowering repro on A3 (expected FAIL)"
++timeout 900 taskset -c 320,322,324,326,328,330,332,334 "${PY}" "${DRIVER}" \
++  --stage s1 --backend sve256 --precision w8a8-linear --quantized-linear-scope default \
++  --prompt en_continuation --steps 5 --shape-profile model \
++  --output "${RAW}/w8a8_repro/en_default.json" \
++  --progress "${RAW}/w8a8_repro/en_default.progress.log" \
++  --work-dir "${WORK}/w8a8_repro" --no-watchdog \
++  > "${LOGS}/w8a8_repro.log" 2>&1
++echo "[run] W8A8 repro exit=$?"
++
++# --- bf16 whole-net diagnostic: 3 prompts in parallel, 8 threads each ------
++# Physical-core map (Q1 measured): core c -> cpu 320 + (c/40)*80 + (c%40)*2.
++declare -A CPUS
++CPUS[en_continuation]="320,322,324,326,328,330,332,334"
++CPUS[zh_continuation]="336,338,340,342,344,346,348,350"
++CPUS[chat_zh_user]="352,354,356,358,360,362,364,366"
++STEPS=(5 8 18)
++PROMPTS=(en_continuation zh_continuation chat_zh_user)
++declare -a PIDS=()
++declare -a STARTS=()
++
++for index in 0 1 2; do
++  prompt="${PROMPTS[$index]}"
++  steps="${STEPS[$index]}"
++  out="${RAW}/bf16/${prompt}.json"
++  progress="${RAW}/bf16/${prompt}.progress.log"
++  log="${LOGS}/bf16_${prompt}.log"
++  STARTS[$index]=$(date +%s)
++  echo "[run] bf16 ${prompt} steps=${steps} cpus=${CPUS[$prompt]} start=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
++  setsid --wait timeout 7200 taskset -c "${CPUS[$prompt]}" \
++    env OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 MKL_NUM_THREADS=8 \
++        OMP_PROC_BIND=close OMP_PLACES=cores \
++    "${PY}" "${DRIVER}" \
++      --stage s3 --backend sve256 --precision bf16 \
++      --prompt "${prompt}" --steps "${steps}" --decode-steps 4 \
++      --asset-dir "${ASSET}" --reference-dir "${ROOT}/refmin" \
++      --rope-dir "${ROOT}/rope" \
++      --skip-gold-alignment \
++      --debug-dump "${RAW}/bf16/${prompt}" \
++      --output "${out}" --progress "${progress}" \
++      --work-dir "${WORK}/bf16/${prompt}" --no-watchdog \
++    > "${log}" 2>&1 &
++  PIDS+=("$!")
++  echo "[run] pid=${PIDS[$index]} log=${log}"
++done
++
++failures=0
++for index in 0 1 2; do
++  pid="${PIDS[$index]}"
++  prompt="${PROMPTS[$index]}"
++  status=0
++  wait "${pid}" || status=$?
++  elapsed=$(( $(date +%s) - STARTS[$index] ))
++  echo "[done] ${prompt} exit=${status} elapsed_s=${elapsed} end=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
++  if [[ ${status} -ne 0 ]]; then
++    failures=$((failures + 1))
++  fi
++done
++
++# --- compact status + sha256 of the JSON evidence --------------------------
++{
++  echo "{"
++  echo "  \"stage\": \"a3_c8_q5_diagnostic\","
++  echo "  \"not_l4\": true,"
++  echo "  \"note\": \"bf16 whole-net SVE256 is a link diagnostic only; no L4/accuracy/performance claim\","
++  echo "  \"a3_utc\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\","
++  echo "  \"failures\": ${failures}"
++  echo "}"
++} > "${RAW}/matrix_status.json"
++
++for prompt in en_continuation zh_continuation chat_zh_user; do
++  if [[ -f "${RAW}/bf16/${prompt}.json" ]]; then
++    sha256sum "${RAW}/bf16/${prompt}.json" "${RAW}/bf16/${prompt}.progress.log" \
++      >> "${RAW}/sha256sums.txt" 2>/dev/null || true
++  fi
++done
++sha256sum "${RAW}/w8a8_repro/en_default.json" >> "${RAW}/sha256sums.txt" 2>/dev/null || true
++
++date -u '+finished_utc=%Y-%m-%dT%H:%M:%SZ' >> "${LOGS}/env_evidence.log"
++date '+finished_local=%Y-%m-%dT%H:%M:%S%z' >> "${LOGS}/env_evidence.log"
++echo "[run] failures=${failures}"
++exit 0
+diff --git a/tools/c8_sve256_a3/sync_to_a3.sh b/tools/c8_sve256_a3/sync_to_a3.sh
+new file mode 100755
+index 000000000..00f375bd3
+--- /dev/null
++++ b/tools/c8_sve256_a3/sync_to_a3.sh
+@@ -0,0 +1,18 @@
++#!/usr/bin/env bash
++# C8/Q5: ship the bundle to A3 (a3-21) and verify it by sha256 manifest.
++# Runs on the LOCAL machine.  Must be called only after make_bundle.sh.
++set -euo pipefail
++
++EV=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/c8-l4-sve256
++TAR="${EV}/a3_bundle.tar"
++A3=a3-21
++A3_ROOT='pypto-x-a3/c8-l4-sve256'
++
++[[ -f "${TAR}" ]] || { echo "missing ${TAR}; run make_bundle.sh first" >&2; exit 2; }
++
++echo "[sync] local tar bytes=$(stat -c %s "${TAR}") sha256=$(cut -d' ' -f1 "${EV}/a3_bundle.tar.sha256")"
++ssh -o BatchMode=yes "${A3}" "mkdir -p \$HOME/${A3_ROOT} && rm -rf \$HOME/${A3_ROOT}/src \$HOME/${A3_ROOT}/tools \$HOME/${A3_ROOT}/refmin \$HOME/${A3_ROOT}/rope"
++scp -q -o BatchMode=yes "${TAR}" "${A3}:\$HOME/${A3_ROOT}/a3_bundle.tar"
++ssh -o BatchMode=yes "${A3}" "cd \$HOME/${A3_ROOT} && tar -xf a3_bundle.tar && rm -rf src tools refmin rope && mv a3_bundle/src . && mv a3_bundle/tools . && mv a3_bundle/refmin . && mv a3_bundle/rope . && mv a3_bundle/MANIFEST.sha256 . && rm -rf a3_bundle && (cd . && sha256sum -c MANIFEST.sha256 >/dev/null) && echo '[sync] remote manifest OK'"
++ssh -o BatchMode=yes "${A3}" "du -sh \$HOME/${A3_ROOT}; date -u '+[sync] a3_utc=%Y-%m-%dT%H:%M:%SZ'"
++date -u '+[sync] local_utc=%Y-%m-%dT%H:%M:%SZ'
+diff --git a/tools/c8_sve256_w8a8_gap_probe.py b/tools/c8_sve256_w8a8_gap_probe.py
+new file mode 100755
+index 000000000..9cebde17b
+--- /dev/null
++++ b/tools/c8_sve256_w8a8_gap_probe.py
+@@ -0,0 +1,436 @@
++#!/usr/bin/env python3
++"""C8/Q5 SVE256 W8A8 whole-net gap probe (local, no model, no compiler).
++
++Why this tool exists
++--------------------
++The C8/Q5 task requires running the integration tree's **SVE256** backend on
++the real-weight W8A8 whole-net graph.  That requires lowering the portable
++W8A8 graph to the SVE256 target first.  This probe reproduces, locally and
++without weights, the exact point where the integration tree fails.
++
++It reports two independent facts:
++
++1. ``whole_net_w8a8``: for every prompt length and both W8A8 configurations,
++   whether ``lower_sve256`` accepts the graph, the first failing plan index,
++   and a **shadow census** of every plan that the SVE256 plan validator would
++   reject.  The shadow census re-implements the validator checks from
++   ``python/pypto/lowering/cpu/aarch64/sve/lowering.py``
++   (``Sve256Program.validate``, lines ~296-340) so the report can state
++   whether fixing the first failure unblocks the rest.
++2. ``whole_net_bf16``: the same lowering attempt for the BF16 graph, which
++   contains no int8 plans.  This isolates the gap to the W8A8 planes.
++
++``minimal_repro`` shows a 1-op rank-2 int8 ``transpose`` is rejected while
++the identical bf16 program lowers fine.
++
++This tool never compiles native code and never loads weights.  A failure here
++is a *lowering* gap, not an A3 hardware result.
++"""
++
++from __future__ import annotations
++
++import argparse
++import collections
++import json
++import sys
++import time
++from pathlib import Path
++from typing import Any, Dict, List, Mapping, Optional
++
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu import canonical_dtype
++from pypto.lowering.cpu.aarch64.sve import lower_sve256
++from pypto.lowering.cpu.aarch64.sve.lowering import (
++    SVE256_REQUIRED_FEATURES,
++    SVE256_TAIL_POLICY,
++    W8A8_SVE256_OPERATIONS,
++    _w8a8_plan_error,
++)
++from pypto.lowering.cpu.vector import lower_cpu_vector
++from pypto.portable.qwen35 import build_qwen35_text_decoder_graph
++from pypto.target import TargetSpec
++
++TOOL = "c8_sve256_w8a8_gap_probe"
++PROMPTS = collections.OrderedDict(
++    (("en_continuation", 5), ("zh_continuation", 8), ("chat_zh_user", 18))
++)
++CONFIGS = (("default", "default", False), ("full", "all", True))
++
++TARGET = TargetSpec(
++    "cpu",
++    "aarch64-linux-gnu",
++    features=("sve", "sve2", "vl256"),
++    attributes={"vl_bytes": 32},
++)
++
++#: Source of the copied checks: python/pypto/lowering/cpu/aarch64/sve/lowering.py
++#: ``Sve256Program.validate`` (integration c2ec98f3c).
++VALIDATOR_SOURCE = "python/pypto/lowering/cpu/aarch64/sve/lowering.py::Sve256Program.validate"
++
++_DRIVER_DECISION = None
++
++
++def _driver_decision():
++    """Load the driver's ``sve256_execution_decision`` classifier.
++
++    The census must use the same classifier as the execution-time
++    instrumentation, so the static report and the executed report cannot drift.
++    """
++
++    global _DRIVER_DECISION
++    if _DRIVER_DECISION is None:
++        import importlib.util
++
++        path = (Path(__file__).resolve().parents[1]
++                / "python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py")
++        spec = importlib.util.spec_from_file_location("c8_q5_census_driver", str(path))
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        _DRIVER_DECISION = module.sve256_execution_decision
++    return _DRIVER_DECISION
++
++
++def _plan_violations(operation, plan) -> List[Mapping[str, Any]]:
++    """Return every SVE256 plan-validator violation for one (op, plan).
++
++    Faithful re-implementation of the checks in ``Sve256Program.validate`` so
++    the probe can enumerate *all* violations instead of the first one.
++    """
++
++    violations: List[Mapping[str, Any]] = []
++    plan_dtype = canonical_dtype(plan.dtype)
++    if plan.operation in W8A8_SVE256_OPERATIONS:
++        error = _w8a8_plan_error(operation, plan)
++        if error is not None:
++            violations.append({"kind": "w8a8_plan_error", "detail": error})
++        return violations
++    allowed_plan_dtype = plan_dtype in ("float32", "bf16") or (
++        plan.operation == "iota" and plan_dtype in ("int32", "int64")
++    ) or (plan.operation == "compare" and plan_dtype == "bool")
++    if not allowed_plan_dtype:
++        violations.append(
++            {
++                "kind": "output_dtype_not_allowed",
++                "detail": (
++                    "SVE256 supports float32/bf16 plans plus iota int32/int64 "
++                    "and compare bool, got {!r}".format(plan.dtype)
++                ),
++            }
++        )
++    for input_index, input_ref in enumerate(operation.inputs):
++        input_dtype = canonical_dtype(input_ref.type.dtype)
++        if input_dtype not in ("float32", "bf16") and not (
++            plan.operation == "where" and input_index == 0 and input_dtype == "bool"
++        ) and not (
++            plan.operation in ("gather", "embedding")
++            and input_index == 1
++            and input_dtype in ("int32", "int64")
++        ) and not (
++            plan.operation == "compare"
++            and input_dtype
++            in (
++                "bool", "int8", "uint8", "int16", "uint16",
++                "int32", "uint32", "int64", "uint64",
++            )
++        ):
++            violations.append(
++                {
++                    "kind": "input_dtype_not_allowed",
++                    "detail": (
++                        "SVE256 does not support {!r} input dtype for operation {!r}".format(
++                            input_dtype, plan.operation
++                        )
++                    ),
++                }
++            )
++    return violations
++
++
++def _shape_of(ref: ValueRef) -> Optional[List[int]]:
++    try:
++        return [int(value) for value in ref.type.shape]
++    except Exception:
++        return None
++
++
++def _audit_w8a8(prompt: str, steps: int, scope: str, quantize_lm_head: bool) -> Mapping[str, Any]:
++    started = time.time()
++    program = build_qwen35_text_decoder_graph(
++        batch=1,
++        steps=steps,
++        past_length=0,
++        precision="w8a8-linear",
++        quantized_linear_scope=scope,
++        quantize_lm_head=quantize_lm_head,
++    )
++    built = time.time()
++    operations = list(program.functions[0].body.operations)
++    record: Dict[str, Any] = {
++        "prompt": prompt,
++        "steps": steps,
++        "config": "full" if quantize_lm_head else "default",
++        "quantized_linear_scope": scope,
++        "quantize_lm_head": bool(quantize_lm_head),
++        "operation_total": len(operations),
++        "graph_build_seconds": round(built - started, 3),
++    }
++
++    # The vector common lowering succeeds; the SVE256-specific validator runs
++    # afterwards and is where the graph is rejected.
++    vector_program = lower_cpu_vector(
++        program,
++        TARGET,
++        None,
++        lane_count=8,
++        tail_policy=SVE256_TAIL_POLICY,
++        required_features=SVE256_REQUIRED_FEATURES,
++        specialization={"compact_iteration": True},
++    )
++    lowered = time.time()
++    record["vector_plan_count"] = len(vector_program.plans)
++    record["vector_lower_seconds"] = round(lowered - built, 3)
++
++    violations_by_op: Dict[str, Dict[str, Any]] = {}
++    first_violation_index = None
++    for index, (operation, plan) in enumerate(zip(operations, vector_program.plans)):
++        violations = _plan_violations(operation, plan)
++        if not violations:
++            continue
++        if first_violation_index is None:
++            first_violation_index = index
++        key = "{}|{}|{}".format(operation.name, plan.operation, canonical_dtype(plan.dtype))
++        entry = violations_by_op.setdefault(
++            key,
++            {
++                "operation": operation.name,
++                "plan_operation": plan.operation,
++                "plan_dtype": canonical_dtype(plan.dtype),
++                "count": 0,
++                "violation_kinds": sorted({item["kind"] for item in violations}),
++                "detail": violations[0]["detail"],
++                "sample_index": index,
++                "sample_input_shapes": [_shape_of(ref) for ref in operation.inputs],
++                "sample_output_shapes": [_shape_of(ref) for ref in operation.outputs],
++                "sample_attributes": {
++                    str(name): value for name, value in dict(operation.attributes).items()
++                    if name in ("permutation", "shape", "axis", "sizes", "starts", "steps")
++                },
++            },
++        )
++        entry["count"] += 1
++    record["shadow_violations"] = {
++        key: value for key, value in sorted(violations_by_op.items())
++    }
++    record["shadow_violation_operations"] = sum(
++        value["count"] for value in violations_by_op.values()
++    )
++    record["first_violation_index"] = first_violation_index
++    if first_violation_index is not None:
++        first_op = operations[first_violation_index]
++        record["first_violation_operation"] = first_op.name
++
++    consumers: Dict[str, int] = collections.Counter()
++    for operation in operations:
++        if operation.name != "transpose":
++            continue
++        if canonical_dtype(operation.outputs[0].type.dtype) != "int8":
++            continue
++        consumer_names = sorted(
++            {
++                other.name
++                for other in operations
++                if operation.outputs[0].name in {ref.name for ref in other.inputs}
++            }
++        )
++        consumers["+".join(consumer_names)] += 1
++    record["int8_transpose_consumers"] = dict(consumers)
++
++    # ---- plan-level execution-mode census (static; the graph cannot run) ----
++    decision_fn = _driver_decision()
++    census: Dict[str, Dict[str, Any]] = {}
++    boundary_totals: Dict[str, int] = collections.Counter()
++    mode_totals: Dict[str, int] = collections.Counter()
++    int8_transpose_bytes = 0
++    quantized_linear_ops = 0
++    for operation, plan in zip(operations, vector_program.plans):
++        name = plan.operation
++        decision = decision_fn(name, plan)
++        entry = census.setdefault(
++            name,
++            {"count": 0, "dtypes": set(), "modes": collections.Counter(),
++             "boundary": decision["boundary"], "unsupported": 0},
++        )
++        entry["count"] += 1
++        entry["dtypes"].add(canonical_dtype(plan.dtype))
++        entry["modes"][decision["mode"]] += 1
++        boundary_totals[decision["boundary"]] += 1
++        mode_totals[decision["mode"]] += 1
++        if decision["boundary"] == "unsupported":
++            entry["unsupported"] += 1
++        if name == "transpose" and canonical_dtype(plan.dtype) == "int8":
++            elements = 1
++            for ref in operation.inputs:
++                for dimension in tuple(getattr(ref.type, "shape", ()) or ()):
++                    elements *= int(dimension)
++            int8_transpose_bytes += elements * 1  # int8 = 1 byte/element
++        if name == "qmatmul_s8s8_s32":
++            quantized_linear_ops += 1
++    record["plan_census"] = {
++        "note": (
++            "static census from lowering plans (executed census is impossible: "
++            "Sve256Program.validate rejects this graph before compile/run); "
++            "mode/boundary labels come from the same classifier the runtime "
++            "instrumentation uses"
++        ),
++        "by_operation": {
++            name: {
++                "count": entry["count"],
++                "dtypes": sorted(entry["dtypes"]),
++                "modes": {mode: count for mode, count in sorted(entry["modes"].items())},
++                "boundary": entry["boundary"],
++                "unsupported_count": entry["unsupported"],
++            }
++            for name, entry in sorted(census.items())
++        },
++        "boundary_totals": dict(sorted(boundary_totals.items())),
++        "mode_totals": dict(sorted(mode_totals.items())),
++        "int8_transpose_bytes_positive": int8_transpose_bytes,
++        "quantized_linear_count": quantized_linear_ops,
++    }
++
++    try:
++        lower_sve256(program, TARGET)
++        record["lower_sve256"] = "OK"
++        record["lower_error"] = None
++    except Exception as exc:  # noqa: BLE001 - the error is the evidence
++        record["lower_sve256"] = "FAIL"
++        record["lower_error"] = "{}: {}".format(type(exc).__name__, exc)
++    record["audit_seconds"] = round(time.time() - lowered, 3)
++    return record
++
++
++def _audit_bf16(prompt: str, steps: int) -> Mapping[str, Any]:
++    program = build_qwen35_text_decoder_graph(
++        batch=1, steps=steps, past_length=0, precision="bf16"
++    )
++    record: Dict[str, Any] = {"prompt": prompt, "steps": steps,
++                              "operation_total": len(program.functions[0].body.operations)}
++    try:
++        target_ir = lower_sve256(program, TARGET)
++        record["lower_sve256"] = "OK"
++        record["plan_count"] = len(target_ir.plans)
++        record["plan_dtypes"] = dict(
++            sorted(collections.Counter(plan.dtype for plan in target_ir.plans).items())
++        )
++    except Exception as exc:  # noqa: BLE001
++        record["lower_sve256"] = "FAIL"
++        record["lower_error"] = "{}: {}".format(type(exc).__name__, exc)
++    return record
++
++
++def _minimal_transpose(dtype: str, permutation=(-1, 0)) -> Mapping[str, Any]:
++    input_type = CoreType.tensor(dtype, (3, 5))
++    output_type = CoreType.tensor(dtype, (5, 3))
++    source = ValueRef("source", input_type)
++    output = ValueRef("output", output_type)
++    operation = Operation(
++        "transpose", (source,), (output,), attributes={"permutation": list(permutation)}
++    )
++    program = CoreProgram(
++        functions=(
++            CoreFunction("transpose_probe", (source,), (output,), Region((operation,))),
++        )
++    )
++    result: Dict[str, Any] = {"dtype": dtype, "shape": [3, 5], "permutation": list(permutation)}
++    try:
++        lower_sve256(program, TARGET)
++        result["lower_sve256"] = "OK"
++        result["lower_error"] = None
++    except Exception as exc:  # noqa: BLE001
++        result["lower_sve256"] = "FAIL"
++        result["lower_error"] = "{}: {}".format(type(exc).__name__, exc)
++    return result
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--output", required=True, help="JSON evidence path")
++    args = parser.parse_args()
++
++    report: Dict[str, Any] = {
++        "tool": TOOL,
++        "integration_base": "c2ec98f3ccc8a6b8419a7a75abb2790cd62456b1",
++        "target_triple": TARGET.triple,
++        "validator_source": VALIDATOR_SOURCE,
++        "graph_contract": "qwen35 text decoder portable graph (W8A8-linear / bf16)",
++        "whole_net_w8a8": {},
++        "whole_net_bf16": {},
++        "minimal_repro": {},
++    }
++    print("[probe] whole-net W8A8 lowering attempts", flush=True)
++    for prompt, steps in PROMPTS.items():
++        for config, scope, quantize_lm_head in CONFIGS:
++            record = _audit_w8a8(prompt, steps, scope, quantize_lm_head)
++            report["whole_net_w8a8"]["{}/{}".format(prompt, config)] = record
++            print(
++                "  {} {:>4} steps={:>2} ops={:>5} lower={:<4} first_violation={!r} "
++                "violating_ops={}".format(
++                    prompt, config, steps, record["operation_total"],
++                    record["lower_sve256"], record["first_violation_operation"],
++                    record["shadow_violation_operations"],
++                ),
++                flush=True,
++            )
++    print("[probe] whole-net BF16 lowering attempts", flush=True)
++    for prompt, steps in PROMPTS.items():
++        record = _audit_bf16(prompt, steps)
++        report["whole_net_bf16"][prompt] = record
++        print(
++            "  {} {:>4} steps={:>2} ops={:>5} lower={}".format(
++                prompt, "bf16", steps, record["operation_total"], record["lower_sve256"]
++            ),
++            flush=True,
++        )
++    print("[probe] minimal int8 vs bf16 transpose", flush=True)
++    for dtype in ("int8", "bf16"):
++        record = _minimal_transpose(dtype)
++        report["minimal_repro"][dtype] = record
++        print("  {} -> {} ({})".format(dtype, record["lower_sve256"], record["lower_error"]), flush=True)
++
++    # Facts a follow-up implementation task needs; values are read from the
++    # integration tree instead of being retyped into the brief.
++    from pypto.backends.cpu.aarch64.sve256 import (
++        _DTYPE_CODES, _INDEXING_WIRE_VERSION, _LAYOUT_WIRE_VERSION,
++    )
++    from pypto.compiler.targets.cpu_sve256 import (
++        ARTIFACT_PAYLOAD_VERSION, RUNNER_PROTOCOL, W8A8_RUNNER_WIRE,
++    )
++    from pypto.lowering.cpu.aarch64.sve.lowering import SVE256_LOWERING_VERSION
++
++    report["code_facts"] = {
++        "sve256_lowering_version": SVE256_LOWERING_VERSION,
++        "artifact_payload_version": ARTIFACT_PAYLOAD_VERSION,
++        "runner_protocol": RUNNER_PROTOCOL,
++        "w8a8_runner_wire": W8A8_RUNNER_WIRE,
++        "layout_wire_version": _LAYOUT_WIRE_VERSION,
++        "indexing_wire_version": _INDEXING_WIRE_VERSION,
++        "runtime_dtype_codes": dict(sorted(_DTYPE_CODES.items())),
++        "validator_source": VALIDATOR_SOURCE,
++        "runtime_source": "python/pypto/backends/cpu/aarch64/sve256.py::Sve256Runtime._run_runner",
++        "native_c_source": "python/pypto/compiler/targets/cpu_sve256.py (ptx_layout_f32/ptx_layout_bf16 only)",
++        "avx2_host_reference_precedent": (
++            "python/pypto/backends/cpu/x86/avx2.py::_reference_operation delegates "
++            "layout/indexing/control to python/pypto/backends/cpu/vector/runtime.py::_execute_operation "
++            "and cpu_avx2.py::_execution_metadata declares host_reference_operations"
++        ),
++    }
++
++    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
++    Path(args.output).write_text(json.dumps(report, indent=2, sort_keys=True) + "\n",
++                                 encoding="utf-8")
++    print("[probe] wrote {}".format(args.output))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())

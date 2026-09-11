@@ -1,0 +1,213 @@
+From 64572701bdda5efa6d5f1944c108cd5ce5fdc68a Mon Sep 17 00:00:00 2001
+From: c8-axis-b-probe <agent@pypto-x.local>
+Date: Sat, 12 Sep 2026 01:15:05 +0800
+Subject: [PATCH 151/217] probe(c8-q4): add vLLM diff decomposition probe
+
+---
+ scripts/c8_axis_b_probe/03_vllm_diff_decompose.py | 198 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 198 insertions(+)
+
+diff --git a/scripts/c8_axis_b_probe/03_vllm_diff_decompose.py b/scripts/c8_axis_b_probe/03_vllm_diff_decompose.py
+new file mode 100644
+index 000000000..1d9ca6a46
+--- /dev/null
++++ b/scripts/c8_axis_b_probe/03_vllm_diff_decompose.py
+@@ -0,0 +1,198 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""C8 Q4 axis-B probe, step 3: decompose vLLM-vs-contract differences.
++
++Two questions:
++
++A.  Can the remaining bf16 output differences be fully attributed to the
++    *activation quantizer* (vLLM's own dynamic per-token int8 quantizer)
++    rather than to our weight artifact?  Test: recompute OUR contract epilogue
++    with vLLM's activation codes/scales; if that equals vLLM's output, the
++    kernel epilogue difference is zero at bf16.
++
++B.  Where do the few activation-code mismatches come from?  Test the
++    hypothesis that vLLM computes ``round_nearest_even(x * float32(1/scale))``
++    in fp32 while our frozen scalar reference computes ``rne(x / scale)`` in
++    binary64 (value and scale are exact fp32).
++
++Runs in the ``pypto-x-w8j`` env with our pure-python scheme importable.
++"""
++
++import argparse
++import json
++import math
++import sys
++
++import numpy as np
++import torch
++
++from pypto.portable.qwen35_w8a8_scheme import (  # noqa: E402
++    dequantize_epilogue_bf16,
++    quantize_per_token_s8,
++    rne_float_to_int,
++)
++from vllm import _custom_ops as vops  # noqa: E402
++
++
++def bf16_bits(t):
++    return t.contiguous().view(torch.int16).cpu().numpy().astype(np.int32)
++
++
++def f32_bits(a):
++    return np.asarray(a, dtype=np.float32).view(np.uint32)
++
++
++def rne_f32(x):
++    """round-nearest-even on a float32 value, in double, matching __float2int_rn."""
++    return rne_float_to_int(float(np.float32(x)))
++
++
++def decompose(name, codes, scales, seed, m=8):
++    n, k = codes.shape
++    gen = torch.Generator().manual_seed(seed)
++    x = torch.randn(m, k, generator=gen, dtype=torch.float32).to(torch.bfloat16)
++
++    # vLLM dynamic quantizer
++    x_q, x_s, _ = vops.onednn_scaled_int8_quant(x, None, None, True)
++    a_v = x_q.contiguous().numpy().astype(np.int64)
++    s_v = x_s.contiguous().numpy().reshape(-1).astype(np.float32)
++
++    # ours
++    q = quantize_per_token_s8(x.float().numpy().reshape(-1).tolist(), shape=(m, k))
++    a_o = np.asarray(q.codes, dtype=np.int64).reshape(m, k)
++    s_o = np.asarray(q.scales, dtype=np.float32).reshape(-1)
++
++    mism = np.argwhere(a_v != a_o)
++    detail = []
++    hyp = {"h1_f32_mul_inv": 0, "h2_f64_div": 0, "other": 0}
++    inv = (np.float32(1.0) / s_v).astype(np.float32)
++
++    # A: our epilogue with vLLM's activation codes/scales -> isolate kernel
++    def our_epilogue(a_q, a_s, w_q, w_s):
++        acc = a_q @ w_q.astype(np.int64).T
++        dq = dequantize_epilogue_bf16(
++            acc.reshape(-1).tolist(),
++            [float(s) for s in a_s],
++            [float(s) for s in w_s],
++            shape=(m, n),
++        )
++        bits = np.asarray(dq.bf16_bits, dtype=np.uint16).reshape(m, n)
++        return torch.from_numpy(bits.view(np.int16)).view(torch.bfloat16), acc
++
++    ref_ours, _ = our_epilogue(a_o, s_o, codes, scales)
++    ref_from_vllm_act, _ = our_epilogue(a_v, s_v, codes, scales)
++
++    from vllm.model_executor.layers.linear import ReplicatedLinear
++    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
++        CompressedTensorsConfig,
++    )
++
++    cfg = {
++        "config_groups": {"group_0": {
++            "targets": ["Linear"],
++            "weights": {"num_bits": 8, "type": "int", "symmetric": True,
++                        "strategy": "channel", "dynamic": False},
++            "input_activations": {"num_bits": 8, "type": "int", "symmetric": True,
++                                  "strategy": "token", "dynamic": True},
++        }},
++        "quant_method": "compressed-tensors",
++        "format": "int-quantized",
++        "ignore": [],
++    }
++    qc = CompressedTensorsConfig.from_config(cfg)
++    layer = ReplicatedLinear(k, n, bias=False, params_dtype=torch.bfloat16,
++                             quant_config=qc, prefix="probe." + name, disable_tp=True)
++    layer.weight.data.copy_(torch.from_numpy(codes.copy()))
++    layer.weight_scale.data.copy_(torch.from_numpy(scales.reshape(n, 1).copy()))
++    layer.quant_method.process_weights_after_loading(layer)
++    y = layer.forward(x)
++    y = y[0] if isinstance(y, tuple) else y
++
++    def cmp(a, b):
++        ab, bb = bf16_bits(a).reshape(-1), bf16_bits(b).reshape(-1)
++        d = ab != bb
++        return {
++            "n_diff": int(d.sum()),
++            "n_total": int(ab.size),
++            "max_abs_diff": float(
++                np.max(np.abs(a.float().numpy() - b.float().numpy()))
++            ),
++        }
++
++    for r, c in mism:
++        val = float(x[r, c].float())
++        ours_double_div = val / float(s_v[r])
++        h1 = rne_f32(np.float32(val) * inv[r])
++        h2 = rne_float_to_int(ours_double_div)
++        if h1 == a_v[r, c]:
++            hyp["h1_f32_mul_inv"] += 1
++        elif h2 == a_v[r, c]:
++            hyp["h2_f64_div"] += 1
++        else:
++            hyp["other"] += 1
++        detail.append({
++            "row": int(r), "col": int(c),
++            "x": val,
++            "vllm_code": int(a_v[r, c]), "ours_code": int(a_o[r, c]),
++            "vllm_scale_f32": float(s_v[r]), "ours_scale_f32": float(s_o[r]),
++            "scale_bits_equal": bool(f32_bits(s_v[r:r+1])[0] == f32_bits(s_o[r:r+1])[0]),
++            "h1_f32_mul_inv": int(h1), "h2_f64_div": int(h2),
++            "ratio_f64": float(ours_double_div),
++            "x_times_inv_f32": float(np.float32(np.float32(val) * inv[r])),
++        })
++
++    return {
++        "name": name,
++        "shape": [int(n), int(k)],
++        "n_activation_code_mismatch": int(len(mism)),
++        "mismatch_rows": sorted({int(r) for r, _ in mism}),
++        "mismatch_hypothesis": hyp,
++        "vllm_out_vs_our_contract": cmp(y, ref_ours),
++        "vllm_out_vs_contract_with_vllm_activation": cmp(y, ref_from_vllm_act),
++        "our_contract_vs_contract_with_vllm_activation": cmp(ref_ours, ref_from_vllm_act),
++        "mismatch_detail": detail,
++        "zero_row_scale_semantics": {
++            "ours": 1.0,
++            "vllm": 0.0,
++            "note": "all-zero activation row: vLLM scale=0 codes=0, ours scale=1.0 codes=0; "
++                    "row output is 0 in both (accumulator=0), so this is artifact-level only",
++        },
++    }
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--artifact-npz", required=True)
++    parser.add_argument("--out-json", required=True)
++    parser.add_argument("--seed", type=int, default=20260911)
++    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
++
++    import vllm.distributed.parallel_state as ps
++
++    ps.init_distributed_environment(
++        world_size=1, rank=0,
++        distributed_init_method="tcp://127.0.0.1:29533",
++        local_rank=0, backend="gloo",
++    )
++    ps._TP = ps._WORLD
++
++    z = np.load(args.artifact_npz)
++    names = sorted({k[: -len("__codes")] for k in z.files if k.endswith("__codes")})
++    report = {"schema": "pypto-x.c8-axis-b-probe.decomposition.v1", "tensors": []}
++    for i, name in enumerate(names):
++        entry = decompose(name, z[name + "__codes"].astype(np.int8),
++                          z[name + "__scales"].astype(np.float32), args.seed + i)
++        report["tensors"].append(entry)
++        print("[decompose] %s act_mismatch=%d vllm_vs_contract=%d "
++              "vllm_vs_contract_with_vllm_act=%d" % (
++                  name, entry["n_activation_code_mismatch"],
++                  entry["vllm_out_vs_our_contract"]["n_diff"],
++                  entry["vllm_out_vs_contract_with_vllm_activation"]["n_diff"]),
++              flush=True)
++    with open(args.out_json, "w", encoding="utf-8") as handle:
++        json.dump(report, handle, indent=1, sort_keys=True)
++    print(json.dumps(report, indent=1, sort_keys=True)[:3000])
++
++
++if __name__ == "__main__":
++    main()

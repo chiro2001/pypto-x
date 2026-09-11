@@ -1,0 +1,791 @@
+From 28cf76ac850a19c98a889a4f21060c65fbc5ccbf Mon Sep 17 00:00:00 2001
+From: c8-axis-b-probe <agent@pypto-x.local>
+Date: Sat, 12 Sep 2026 01:13:53 +0800
+Subject: [PATCH 150/217] probe(c8-q4): axis-B independent-stack probes
+ (vLLM-CPU layer + A3 checks)
+
+---
+ scripts/c8_axis_b_probe/01_extract_our_artifact.py | 164 +++++++++++++++++++
+ scripts/c8_axis_b_probe/02_vllm_cpu_layer_probe.py | 347 +++++++++++++++++++++++++++++++++++++++++
+ scripts/c8_axis_b_probe/10_a3_probe.sh             |  52 ++++++
+ scripts/c8_axis_b_probe/11_a3_vllm_probe.py        | 191 +++++++++++++++++++++++
+ 4 files changed, 754 insertions(+)
+
+diff --git a/scripts/c8_axis_b_probe/01_extract_our_artifact.py b/scripts/c8_axis_b_probe/01_extract_our_artifact.py
+new file mode 100644
+index 000000000..5e489e605
+--- /dev/null
++++ b/scripts/c8_axis_b_probe/01_extract_our_artifact.py
+@@ -0,0 +1,164 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""C8 Q4 axis-B probe: materialize OUR frozen W8A8 int8 codes + fp32 scales.
++
++This is the only script in the Q4 probe that imports ``pypto`` (our own
++offline ingestion implementation), mirroring the Q2 ``packer_side_a.py``
++discipline.  It runs in the independent reference venv with
++
++    PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=<repo>/python
++
++and extracts a small, explicitly listed subset of the 150 quantized weights.
++Every extracted tensor is checked against the frozen
++``weight_scale_manifest.json`` (per-tensor codes/scales/source sha256) so the
++output is provably OUR artifact and not a re-quantization by a third party.
++
++Outputs:
++  * ``--out-npz``  : ``<name>__codes`` int8 [out, in] and ``<name>__scales``
++                     float32 [out] arrays (little-endian raw payloads)
++  * ``--out-json`` : provenance / sha256 checks / quantization-side metadata
++"""
++
++import argparse
++import json
++import os
++import sys
++
++# Q4 selection: cover the shapes that matter for the axis-B probe.
++#   in_proj_qkv  -> [6144, 1024]  (QKV projection, largest row count)
++#   in_proj_z    -> [2048, 1024]
++#   q_proj       -> [4096, 1024]
++#   mlp_down     -> [1024, 3584]  (largest K)
++SELECTED = (
++    "layer_00_in_proj_qkv_weight",
++    "layer_00_in_proj_z_weight",
++    "layer_23_q_proj_weight",
++    "layer_00_mlp_down_proj_weight",
++)
++
++
++def parse_args(argv):
++    parser = argparse.ArgumentParser(description="materialize our frozen W8A8 artifact")
++    parser.add_argument("--assets-dir", required=True)
++    parser.add_argument("--checkpoint", required=True)
++    parser.add_argument("--manifest", required=True)
++    parser.add_argument("--out-npz", required=True)
++    parser.add_argument("--out-json", required=True)
++    return parser.parse_args(argv)
++
++
++def main(argv=None):
++    args = parse_args(argv if argv is not None else sys.argv[1:])
++
++    import numpy as np
++
++    from pypto.portable.qwen35 import build_qwen35_text_decoder_graph
++    from pypto.portable.qwen35_w8a8_weight import quantize_weight_from_view
++    from pypto.portable.qwen35_weight_map import (
++        build_weight_mapping,
++        tie_word_embeddings_from_config,
++    )
++    from pypto.portable.runtime_binding import build_binding_schema, build_packed_layout
++    from pypto.portable.safetensors_reader import SafetensorsReader
++
++    with open(args.manifest, "r", encoding="utf-8") as handle:
++        frozen = json.load(handle)
++    frozen_by_name = {entry["name"]: entry for entry in frozen["tensors"]}
++
++    program = build_qwen35_text_decoder_graph(
++        1, 5, past_length=0, shape_profile="model",
++        precision="w8a8-linear", quantized_linear_scope="default",
++        quantize_lm_head=False,
++    )
++    schema = build_binding_schema(program)
++    layout = build_packed_layout(schema)
++    schema_by_name = {
++        entry.name: entry for entry in schema.parameters if entry.quant is not None
++    }
++    missing = [name for name in SELECTED if name not in schema_by_name]
++    if missing:
++        raise SystemExit("selected names not in schema: %s" % missing)
++    if not set(SELECTED).issubset(frozen_by_name):
++        raise SystemExit("selected names not in frozen manifest")
++
++    tie = tie_word_embeddings_from_config(os.path.join(args.assets_dir, "config.json"))
++    reader = SafetensorsReader(args.checkpoint, mode="mmap")
++    arrays = {}
++    report = {
++        "schema": "pypto-x.c8-axis-b-probe.our-artifact.v1",
++        "assets_dir": os.path.abspath(args.assets_dir),
++        "checkpoint": os.path.abspath(args.checkpoint),
++        "manifest": os.path.abspath(args.manifest),
++        "frozen_manifest_digest": frozen.get("weight_scale_manifest_digest"),
++        "graph_digest": program.metadata.get("graph_digest"),
++        "packed_region_count": len(layout.regions),
++        "selected": list(SELECTED),
++        "tensors": [],
++    }
++    with reader:
++        mapping = build_weight_mapping(
++            schema, program.metadata, reader, tie_word_embeddings=tie
++        )
++        by_name = {item.parameter: item for item in mapping.mappings}
++
++        for name in SELECTED:
++            entry = schema_by_name[name]
++            item = by_name[name]
++            view = reader.view(item.source.official_name)
++            try:
++                quantized = quantize_weight_from_view(
++                    view,
++                    dtype=item.source.pypto_dtype,
++                    shape=entry.shape,
++                    name=name,
++                )
++            finally:
++                view.release()
++            frozen_entry = frozen_by_name[name]
++            codes = np.frombuffer(quantized.codes, dtype=np.int8).reshape(
++                int(entry.shape[0]), int(entry.shape[1])
++            )
++            scales = np.frombuffer(quantized.scales, dtype="<f4").astype(np.float32)
++            checks = {
++                "codes_sha256_match": quantized.codes_sha256
++                == frozen_entry["codes_sha256"],
++                "scales_sha256_match": quantized.scales_sha256
++                == frozen_entry["scales_sha256"],
++                "source_sha256_match": quantized.source_sha256
++                == frozen_entry["source_sha256"],
++            }
++            if not all(checks.values()):
++                raise SystemExit("artifact identity check failed for %s: %s" % (name, checks))
++            arrays[name + "__codes"] = codes
++            arrays[name + "__scales"] = scales
++            report["tensors"].append(
++                {
++                    "name": name,
++                    "official_name": item.source.official_name,
++                    "shape": [int(dim) for dim in entry.shape],
++                    "source_dtype": item.source.pypto_dtype,
++                    "codes_sha256": quantized.codes_sha256,
++                    "scales_sha256": quantized.scales_sha256,
++                    "source_sha256": quantized.source_sha256,
++                    "saturation_count": int(quantized.saturation_count),
++                    "zero_row_count": int(quantized.zero_row_count),
++                    "max_abs": float(quantized.max_abs),
++                    "scale_min": float(quantized.scale_min),
++                    "scale_max": float(quantized.scale_max),
++                    "frozen_manifest_entry_match": checks,
++                }
++            )
++
++    np.savez(args.out_npz, **arrays)
++    report["match_frozen_manifest_digest_reference"] = (
++        "per-tensor sha256 equality against the frozen manifest; the full 150-tensor "
++        "digest reproduction is Q2 c8-w8a8-reference-gold evidence "
++        "(4fe99771d9b5ee395f28d60c2bf7fcebc636e3c93803d0afa67f66802c21dc87)"
++    )
++    with open(args.out_json, "w", encoding="utf-8") as handle:
++        json.dump(report, handle, indent=1, sort_keys=True)
++    print(json.dumps(report["tensors"], indent=1, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/c8_axis_b_probe/02_vllm_cpu_layer_probe.py b/scripts/c8_axis_b_probe/02_vllm_cpu_layer_probe.py
+new file mode 100644
+index 000000000..9c12b378c
+--- /dev/null
++++ b/scripts/c8_axis_b_probe/02_vllm_cpu_layer_probe.py
+@@ -0,0 +1,347 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""C8 Q4 axis-B probe: can vLLM-CPU 0.29.0 consume OUR pre-quantized
++int8 weights + fp32 per-output-channel scales through its native
++compressed-tensors W8A8-int8 path?
++
++Runs in the local ``pypto-x-w8j`` env (vllm-cpu==0.29.0, torch==2.13.0+cpu).
++Imports our pure-python scalar scheme as the contract reference
++(``PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=<repo>/python``), so the comparison is
++against OUR definition, not a hand-rolled imitation.
++
++What it does, per selected tensor of the frozen artifact:
++
++1. Builds ``CompressedTensorsConfig`` from a config.json-shaped dict with
++   weights: {int8, channel, symmetric, dynamic=false} and input_activations:
++   {int8, token, symmetric, dynamic=true} -> exactly our contract's granularity.
++2. Builds a real vLLM ``ReplicatedLinear`` layer (disable_tp, bf16 params) with
++   that config and checks the selected scheme/kernel and parameter schema.
++3. Fills the layer with OUR int8 codes and OUR scales (shape [out,1]), calls
++   vLLM's own ``process_weights_after_loading`` and ``forward``.
++4. Compares against (a) our scalar contract reference (int32 accumulation +
++   single fused fp32 scale multiply + bf16 RNE) and (b) a gold-like fp32
++   fake-quant matmul (dequantize then fp32 accumulate + bf16 RNE).
++5. Separately probes vLLM's dynamic per-token int8 quantizer against our
++   ``quantize_per_token_s8`` on random and crafted (RNE-tie / zero row /
++   outlier / underflow) rows.
++
++All numbers are CPU-only, single-layer, synthetic activations.  This is an
++axis-B deployment probe, NOT a bug verdict and NOT a precision pass/fail.
++"""
++
++import argparse
++import json
++import os
++import sys
++import time
++
++import numpy as np
++import torch
++
++# ---- our pure-python contract reference -------------------------------------
++from pypto.portable.qwen35_w8a8_scheme import (  # noqa: E402
++    W8A8QuantizationError,
++    dequantize_epilogue_bf16,
++    quantize_per_token_s8,
++)
++
++# ---- vLLM -------------------------------------------------------------------
++from vllm.model_executor.layers.linear import ReplicatedLinear  # noqa: E402
++from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E402
++    CompressedTensorsConfig,
++)
++from vllm import _custom_ops as vops  # noqa: E402
++
++WEIGHT_CONFIG = {
++    "num_bits": 8,
++    "type": "int",
++    "symmetric": True,
++    "strategy": "channel",
++    "dynamic": False,
++}
++INPUT_CONFIG = {
++    "num_bits": 8,
++    "type": "int",
++    "symmetric": True,
++    "strategy": "token",
++    "dynamic": True,
++}
++QUANT_CONFIG_DICT = {
++    "config_groups": {
++        "group_0": {
++            "targets": ["Linear"],
++            "weights": WEIGHT_CONFIG,
++            "input_activations": INPUT_CONFIG,
++        }
++    },
++    "quant_method": "compressed-tensors",
++    "format": "int-quantized",
++    # our contract keeps these BF16 / unquantized (D1/D4/D9)
++    "ignore": ["lm_head", "re:.*conv1d$", "re:.*in_proj_b$", "re:.*in_proj_a$"],
++}
++
++
++def f32_bits(arr):
++    return np.asarray(arr, dtype=np.float32).view(np.uint32)
++
++
++def bf16_bits(t):
++    return t.contiguous().view(torch.int16).cpu().numpy().astype(np.int32)
++
++
++def compare_bf16(a, b):
++    """a, b: torch bf16 tensors -> difference statistics."""
++    assert a.shape == b.shape and a.dtype == b.dtype == torch.bfloat16
++    fa = a.float().numpy().reshape(-1).astype(np.float64)
++    fb = b.float().numpy().reshape(-1).astype(np.float64)
++    ab = bf16_bits(a).reshape(-1)
++    bb = bf16_bits(b).reshape(-1)
++    diff = ab != bb
++    return {
++        "n_total": int(ab.size),
++        "n_diff_bf16": int(diff.sum()),
++        "frac_diff": float(diff.mean()),
++        "max_abs_diff": float(np.max(np.abs(fa - fb))) if fa.size else 0.0,
++        "mean_abs_diff": float(np.mean(np.abs(fa - fb))) if fa.size else 0.0,
++        "max_bf16_bit_delta": int(np.max(np.abs(ab - bb))) if ab.size else 0,
++        "n_diff_bit_delta_le_1": int((np.abs(ab - bb) <= 1).sum()),
++    }
++
++
++def build_layer(qc, in_features, out_features, prefix):
++    return ReplicatedLinear(
++        in_features,
++        out_features,
++        bias=False,
++        params_dtype=torch.bfloat16,
++        quant_config=qc,
++        prefix=prefix,
++        disable_tp=True,
++    )
++
++
++def run_one_tensor(name, codes, scales, seed, m=8):
++    n, k = codes.shape
++    qc = CompressedTensorsConfig.from_config(json.loads(json.dumps(QUANT_CONFIG_DICT)))
++    layer = build_layer(qc, k, n, "model.language_layer.dummy." + name)
++    result = {
++        "name": name,
++        "shape": [int(n), int(k)],
++        "scheme": type(layer.scheme).__name__,
++        "kernel": type(layer.scheme.kernel).__name__,
++        "quant_method": type(layer.quant_method).__name__,
++        "weight_dtype": str(layer.weight.dtype),
++        "weight_shape": list(layer.weight.shape),
++        "weight_scale_dtype": str(layer.weight_scale.dtype),
++        "weight_scale_shape": list(layer.weight_scale.shape),
++    }
++
++    # fill OUR artifact into vLLM's parameters (shape [out,1] is the
++    # compressed-tensors channel-strategy checkpoint layout)
++    layer.weight.data.copy_(torch.from_numpy(codes.copy()))
++    layer.weight_scale.data.copy_(torch.from_numpy(scales.reshape(n, 1).copy()))
++    layer.quant_method.process_weights_after_loading(layer)
++
++    gen = torch.Generator().manual_seed(seed)
++    out = {}
++    for x_dtype, tag in ((torch.bfloat16, "bf16"), (torch.float32, "fp32diag")):
++        x = torch.randn(m, k, generator=gen, dtype=torch.float32).to(x_dtype)
++        y = layer.forward(x)
++        y = y[0] if isinstance(y, tuple) else y  # (output, bias)
++
++        # ---- our contract reference ----
++        x_np = x.float().numpy()
++        q = quantize_per_token_s8(x_np.reshape(-1).tolist(), shape=(m, k))
++        a_q = np.asarray(q.codes, dtype=np.int64).reshape(m, k)
++        acc = a_q @ codes.astype(np.int64).T  # int32-exact by contract (K limit)
++        assert acc.min() >= -(2**31) and acc.max() <= 2**31 - 1, "int32 accumulation bound"
++        dq = dequantize_epilogue_bf16(
++            acc.reshape(-1).tolist(),
++            [float(s) for s in q.scales],
++            [float(s) for s in scales],
++            shape=(m, n),
++        )
++        ref_bits = np.asarray(dq.bf16_bits, dtype=np.uint16).reshape(m, n)
++        ref_bf16 = torch.from_numpy(ref_bits.view(np.int16)).view(torch.bfloat16)
++        ref_fp32 = np.asarray(dq.fp32_values, dtype=np.float32).reshape(m, n)
++
++        # ---- gold-like fp32 fake-quant reference (Q2 gold execution shape) ----
++        a_fq = (
++            a_q.astype(np.float64) * np.asarray(q.scales, dtype=np.float64)[:, None]
++        ).astype(np.float32)
++        w_fq = (
++            codes.astype(np.float64) * scales.astype(np.float64)[:, None]
++        ).astype(np.float32)
++        gold_fp32 = a_fq @ w_fq.T  # numpy fp32 BLAS
++        gold_bf16 = torch.from_numpy(gold_fp32).to(torch.bfloat16)
++
++        entry = {
++            "x_dtype": tag,
++            "vllm_out_dtype": str(y.dtype),
++            "activation_quant_vs_ours": activation_compare(x, q, tag),
++        }
++        if y.dtype == torch.bfloat16:
++            entry["vllm_vs_contract"] = compare_bf16(y, ref_bf16)
++            entry["vllm_vs_goldlike"] = compare_bf16(y, gold_bf16)
++            entry["contract_vs_goldlike"] = compare_bf16(ref_bf16, gold_bf16)
++            out[tag] = {"vllm": y, "contract": ref_bf16, "goldlike": gold_bf16}
++        else:
++            assert y.dtype == torch.float32
++            y_np = y.numpy().astype(np.float32)
++            d_contract = y_np.reshape(-1).astype(np.float64) - ref_fp32.reshape(-1).astype(np.float64)
++            d_gold = y_np.reshape(-1).astype(np.float64) - gold_fp32.reshape(-1).astype(np.float64)
++            d_cg = ref_fp32.reshape(-1).astype(np.float64) - gold_fp32.reshape(-1).astype(np.float64)
++            entry["vllm_vs_contract_fp32"] = {
++                "n_total": int(y_np.size),
++                "n_diff_bits": int((f32_bits(y_np) != f32_bits(ref_fp32)).sum()),
++                "max_abs_diff": float(np.max(np.abs(d_contract))),
++                "mean_abs_diff": float(np.mean(np.abs(d_contract))),
++            }
++            entry["vllm_vs_goldlike_fp32"] = {
++                "n_total": int(y_np.size),
++                "n_diff_bits": int((f32_bits(y_np) != f32_bits(gold_fp32)).sum()),
++                "max_abs_diff": float(np.max(np.abs(d_gold))),
++                "mean_abs_diff": float(np.mean(np.abs(d_gold))),
++            }
++            entry["contract_vs_goldlike_fp32"] = {
++                "n_total": int(ref_fp32.size),
++                "n_diff_bits": int((f32_bits(ref_fp32) != f32_bits(gold_fp32)).sum()),
++                "max_abs_diff": float(np.max(np.abs(d_cg))),
++                "mean_abs_diff": float(np.mean(np.abs(d_cg))),
++            }
++            # bf16 view of the same run (what a real bf16 model forward would see)
++            entry["vllm_bf16cast_vs_contract"] = compare_bf16(
++                y.to(torch.bfloat16), ref_bf16
++            )
++            out[tag] = {"vllm": y, "contract": ref_fp32, "goldlike": gold_fp32}
++        result[tag] = entry
++
++    # 4) activation-quantizer equivalence on random + crafted rows
++    result["activation_quant_crafted"] = activation_crafted_probe()
++    return result, out
++
++
++def activation_compare(x, ours, tag):
++    """vLLM dynamic per-token int8 quantizer vs our quantize_per_token_s8."""
++    x_q, x_s, _ = vops.onednn_scaled_int8_quant(x, None, None, True)
++    xq = x_q.contiguous().numpy().astype(np.int32)
++    ours_q = np.asarray(ours.codes, dtype=np.int32).reshape(xq.shape)
++    vllm_s = x_s.contiguous().numpy().reshape(-1).astype(np.float32)
++    ours_s = np.asarray(ours.scales, dtype=np.float32).reshape(-1)
++    return {
++        "x_dtype": tag,
++        "n_rows": int(xq.shape[0]),
++        "codes_equal": bool(np.array_equal(xq, ours_q)),
++        "n_code_mismatch": int((xq != ours_q).sum()),
++        "scales_bitwise_equal": bool(np.array_equal(f32_bits(vllm_s), f32_bits(ours_s))),
++        "n_scale_bit_mismatch": int(
++            (f32_bits(vllm_s) != f32_bits(ours_s)).sum()
++        ),
++        "vllm_scale_sample": vllm_s[:3].tolist(),
++        "ours_scale_sample": ours_s[:3].tolist(),
++    }
++
++
++def activation_crafted_probe():
++    rows = [
++        # RNE ties at scale == 1.0: 63.5->64 (tie to even), 2.5->2, -0.5->0
++        [127.0, 63.5, -63.5, 2.5, -0.5, 1.5, 0.0, 0.0],
++        # all zero row (Q1: s=1.0, q=0)
++        [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
++        # heavy outlier row
++        [1000.0, 1.0, -1.0, 0.5, -0.5, 0.25, -0.25, 0.0],
++        # tiny row: fp32 scale underflows to 0 for absmax/127 (our contract fails closed)
++        [1e-44, -1e-44, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
++    ]
++    x = torch.tensor(rows, dtype=torch.bfloat16)
++    out = {"input": rows, "rows": []}
++    x_q, x_s, _ = vops.onednn_scaled_int8_quant(x, None, None, True)
++    xq = x_q.contiguous().numpy().astype(np.int32)
++    xs = x_s.contiguous().numpy().reshape(-1).astype(np.float32)
++    for i, row in enumerate(rows):
++        try:
++            ours = quantize_per_token_s8(row, shape=(1, len(row)))
++            ours_codes = np.asarray(ours.codes, dtype=np.int32)
++            ours_scale = np.asarray(ours.scales, dtype=np.float32)
++            entry = {
++                "row": row,
++                "vllm_codes": xq[i].tolist(),
++                "ours_codes": ours_codes.tolist(),
++                "vllm_scale_f32bits": int(f32_bits(xs[i : i + 1])[0]),
++                "ours_scale_f32bits": int(f32_bits(ours_scale)[0]),
++                "codes_equal": bool(np.array_equal(xq[i], ours_codes)),
++                "scale_bits_equal": bool(
++                    f32_bits(xs[i : i + 1])[0] == f32_bits(ours_scale)[0]
++                ),
++            }
++        except W8A8QuantizationError as exc:
++            entry = {
++                "row": row,
++                "vllm_codes": xq[i].tolist(),
++                "vllm_scale_f32bits": int(f32_bits(xs[i : i + 1])[0]),
++                "ours_error": "%s: %s" % (type(exc).__name__, exc),
++            }
++        out["rows"].append(entry)
++    return out
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description="vLLM-CPU int8 layer probe with our artifact")
++    parser.add_argument("--artifact-npz", required=True)
++    parser.add_argument("--out-json", required=True)
++    parser.add_argument("--out-npz", required=True)
++    parser.add_argument("--seed", type=int, default=20260911)
++    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
++
++    # single-process stand-in for vLLM's TP group so that vLLM parameter
++    # construction works outside a full engine (no model, no weight download)
++    import vllm.distributed.parallel_state as ps
++
++    ps.init_distributed_environment(
++        world_size=1,
++        rank=0,
++        distributed_init_method="tcp://127.0.0.1:29531",
++        local_rank=0,
++        backend="gloo",
++    )
++    ps._TP = ps._WORLD
++
++    z = np.load(args.artifact_npz)
++    names = sorted({k[: -len("__codes")] for k in z.files if k.endswith("__codes")})
++    report = {
++        "schema": "pypto-x.c8-axis-b-probe.vllm-cpu-layer.v1",
++        "vllm_version": __import__("vllm").__version__,
++        "torch_version": torch.__version__,
++        "quant_config_dict": QUANT_CONFIG_DICT,
++        "note": "independent stack consumes OUR int8 codes + OUR fp32 scales; "
++        "no re-quantization of weights; activations are quantized dynamically "
++        "by vLLM's own kernel at call time",
++        "tensors": [],
++    }
++    outputs = {}
++    for i, name in enumerate(names):
++        codes = z[name + "__codes"].astype(np.int8)
++        scales = z[name + "__scales"].astype(np.float32)
++        t0 = time.time()
++        result, out = run_one_tensor(name, codes, scales, args.seed + i)
++        result["wall_s"] = round(time.time() - t0, 3)
++        report["tensors"].append(result)
++        for tag, tensors in out.items():
++            def as_np(t):
++                if isinstance(t, np.ndarray):
++                    return t
++                return t.to(torch.float32).numpy()
++
++            outputs["%s.%s.vllm" % (name, tag)] = as_np(tensors["vllm"])
++            outputs["%s.%s.contract" % (name, tag)] = as_np(tensors["contract"])
++            outputs["%s.%s.goldlike" % (name, tag)] = as_np(tensors["goldlike"])
++        print("[probe] %s done wall=%.2fs" % (name, result["wall_s"]), flush=True)
++
++    np.savez(args.out_npz, **outputs)
++    with open(args.out_json, "w", encoding="utf-8") as handle:
++        json.dump(report, handle, indent=1, sort_keys=True)
++    print(json.dumps(report, indent=1, sort_keys=True)[:4000])
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/c8_axis_b_probe/10_a3_probe.sh b/scripts/c8_axis_b_probe/10_a3_probe.sh
+new file mode 100644
+index 000000000..274c00b2f
+--- /dev/null
++++ b/scripts/c8_axis_b_probe/10_a3_probe.sh
+@@ -0,0 +1,52 @@
++#!/usr/bin/env bash
++# A3 axis-B probe driver (light): host facts + container vLLM CPU/int8 existence.
++#
++# Discipline: host-side heavy work pinned to CPUs 320-639; container is limited
++# to its own cpuset 560-639 by construction; NPU/chip7 untouched
++# (ASCEND_RT_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES cleared for every exec).
++set -uo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++PYPROBE="$SCRIPT_DIR/11_a3_vllm_probe.py"
++ENV_PY="$HOME/pypto-x-a3/envs/pypto-x-c8/bin/python"
++CONTAINER="${CONTAINER:-pypto-x-a3}"
++HOST_CPUS="${HOST_CPUS:-320-639}"
++
++echo "### A3 axis-B probe $(date -u +%Y-%m-%dT%H:%M:%SZ)"
++echo "--- host facts ---"
++hostname
++uname -a
++nproc
++grep -E 'MemTotal|MemAvailable' /proc/meminfo
++echo "Cpus_allowed(self)=$(grep Cpus_allowed_list /proc/self/status | cut -d: -f2 | tr -d ' ')"
++echo "sve_default_vector_length=$(cat /proc/sys/abi/sve_default_vector_length 2>/dev/null || echo n/a)"
++lscpu 2>/dev/null | grep -iE 'Model name|Features|CPU\(s\)|NUMA' | head -6
++
++echo "--- host conda env $ENV_PY ---"
++if [[ -x "$ENV_PY" ]]; then
++    taskset -c "$HOST_CPUS" "$ENV_PY" -VV
++    echo "-- host env probe (vllm likely absent) --"
++    mkdir -p "$SCRIPT_DIR/../logs"
++    taskset -c "$HOST_CPUS" timeout 300 "$ENV_PY" "$PYPROBE" > "$SCRIPT_DIR/../logs/host_env_probe.json" 2>"$SCRIPT_DIR/../logs/host_env_probe.stderr.log"
++    echo "host_env_probe_rc=$?"
++else
++    echo "MISSING host env python: $ENV_PY"
++fi
++
++echo "--- aarch64 vllm-cpu wheel existence (metadata only, no download) ---"
++taskset -c "$HOST_CPUS" timeout 60 "$ENV_PY" -m pip index versions vllm-cpu 2>&1 | tail -4
++taskset -c "$HOST_CPUS" timeout 60 "$ENV_PY" -m pip index versions vllm 2>&1 | tail -4
++
++echo "--- container $CONTAINER ---"
++docker ps --format '{{.Names}} {{.Image}} {{.Status}}' | head -5
++echo "image_digest=$(docker inspect --format '{{.Image}}' "$CONTAINER" 2>/dev/null)"
++echo "cpuset=$(docker exec "$CONTAINER" grep Cpus_allowed_list /proc/self/status 2>/dev/null | cut -d: -f2 | tr -d ' ')"
++echo "-- container python/dist versions --"
++docker exec -e ASCEND_RT_VISIBLE_DEVICES= -e CUDA_VISIBLE_DEVICES= "$CONTAINER" \
++    sh -c 'for p in torch transformers vllm vllm-ascend vllm-cpu numpy compressed-tensors; do python3 -c "import importlib.metadata as md; print(\"$p\", md.version(\"$p\"))" 2>/dev/null || echo "$p ABSENT"; done' 2>&1 | tail -8
++echo "-- container probe (stdin, no file written in container) --"
++docker exec -i -e ASCEND_RT_VISIBLE_DEVICES= -e CUDA_VISIBLE_DEVICES= \
++    -e OMP_NUM_THREADS=8 -e HF_HUB_OFFLINE=1 "$CONTAINER" \
++    timeout 600 python3 - < "$PYPROBE" > "$SCRIPT_DIR/../logs/container_probe.json" 2>"$SCRIPT_DIR/../logs/container_probe.stderr.log"
++echo "container_probe_rc=$?"
++echo "### done $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+diff --git a/scripts/c8_axis_b_probe/11_a3_vllm_probe.py b/scripts/c8_axis_b_probe/11_a3_vllm_probe.py
+new file mode 100644
+index 000000000..a9762100d
+--- /dev/null
++++ b/scripts/c8_axis_b_probe/11_a3_vllm_probe.py
+@@ -0,0 +1,191 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""A3 (aarch64) axis-B probe: can vLLM run CPU-only and does an int8 CPU path exist?
++
++Runs either in the A3 container (`python3`) or in the host conda env
++(`~/pypto-x-a3/envs/pypto-x-c8/bin/python`).  Light only: imports + op presence,
++no model weights are loaded, no NPU is touched.
++
++Output: one JSON document on stdout.
++"""
++
++import glob
++import importlib.metadata as md
++import json
++import os
++import platform
++import subprocess
++import sys
++
++
++def dist_versions():
++    out = {}
++    for name in ("vllm", "vllm-ascend", "vllm-cpu", "torch", "transformers", "numpy",
++                 "compressed-tensors", "torch-npu", "oneDNN", "onednn"):
++        try:
++            out[name] = md.version(name)
++        except Exception:
++            pass
++    return out
++
++
++def so_symbol_report():
++    report = {}
++    try:
++        import vllm
++        base = os.path.dirname(vllm.__file__)
++        for so in sorted(glob.glob(os.path.join(base, "_C*.so"))):
++            entry = {"path": so, "bytes": os.path.getsize(so)}
++            strings = ""
++            for tool in (["strings", so],):
++                try:
++                    strings = subprocess.run(
++                        tool, capture_output=True, text=True, timeout=60
++                    ).stdout
++                    break
++                except Exception as exc:  # pragma: no cover
++                    entry["strings_error"] = str(exc)
++            entry["has_dynamic_scaled_int8_quant"] = "dynamic_scaled_int8_quant" in strings
++            entry["has_onednn_scaled_mm"] = "onednn_scaled_mm" in strings
++            entry["has_create_onednn_scaled_mm_handler"] = (
++                "create_onednn_scaled_mm_handler" in strings
++            )
++            entry["has_aarch64_tag"] = ("aarch64" in strings) or ("AArch64" in strings)
++            report[os.path.basename(so)] = entry
++    except Exception as exc:
++        report["error"] = "%s: %s" % (type(exc).__name__, exc)
++    return report
++
++
++def main():
++    info = {
++        "schema": "pypto-x.c8-axis-b-probe.a3-vllm-probe.v1",
++        "python": sys.version.split()[0],
++        "executable": sys.executable,
++        "machine": platform.machine(),
++        "system": platform.system(),
++        "cpus_allowed": None,
++        "cpuinfo_features": None,
++        "dist_versions": dist_versions(),
++        "imports": {},
++        "so_symbols": so_symbol_report(),
++    }
++    try:
++        with open("/proc/self/status", "r", encoding="utf-8") as handle:
++            for line in handle:
++                if line.startswith("Cpus_allowed_list"):
++                    info["cpus_allowed"] = line.split(":", 1)[1].strip()
++    except Exception:
++        pass
++    try:
++        with open("/proc/cpuinfo", "r", encoding="utf-8") as handle:
++            for line in handle:
++                if line.startswith("Features") or line.startswith("flags"):
++                    info["cpuinfo_features"] = line.split(":", 1)[1].strip()
++                    break
++    except Exception:
++        pass
++
++    def probe(name, fn):
++        try:
++            info["imports"][name] = fn()
++        except Exception as exc:
++            info["imports"][name] = "ERROR %s: %s" % (type(exc).__name__, str(exc)[:300])
++
++    def import_torch():
++        import torch
++
++        return {
++            "version": torch.__version__,
++            "cuda_available": torch.cuda.is_available(),
++            "mkldnn_available": bool(torch.backends.mkldnn.is_available()),
++        }
++
++    def import_vllm():
++        import vllm
++
++        return {"version": vllm.__version__, "file": vllm.__file__}
++
++    def platform_info():
++        from vllm.platforms import current_platform
++
++        return {
++            "class": type(current_platform).__name__,
++            "device_type": str(getattr(current_platform, "device_type", None)),
++            "device_name": str(getattr(current_platform, "device_name", None)),
++            "supported_quantization": list(current_platform.supported_quantization),
++        }
++
++    def cpu_int8_ops():
++        import torch
++        from vllm import _custom_ops as ops
++
++        x = torch.randn(2, 8, dtype=torch.bfloat16)
++        result = {}
++        for opname in ("onednn_scaled_int8_quant", "dynamic_scaled_int8_quant"):
++            fn = getattr(ops, opname, None)
++            if fn is None:
++                result[opname] = "attribute missing"
++                continue
++            if opname == "onednn_scaled_int8_quant":
++                out = fn(x, None, None, True)
++                result[opname] = {
++                    "ok": True,
++                    "codes_dtype": str(out[0].dtype),
++                    "scale_dtype": str(out[1].dtype),
++                }
++            else:
++                out = torch.empty_like(x, dtype=torch.int8)
++                scale = torch.empty((2, 1), dtype=torch.float32)
++                fn(out, x, scale, None)
++                result[opname] = {"ok": True, "scale": scale.flatten().tolist()}
++        return result
++
++    def tp_group_probe():
++        import vllm.distributed.parallel_state as ps
++        import torch
++
++        ps.init_distributed_environment(
++            world_size=1, rank=0,
++            distributed_init_method="tcp://127.0.0.1:29547",
++            local_rank=0, backend="gloo",
++        )
++        ps._TP = ps._WORLD
++        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
++            CompressedTensorsConfig,
++        )
++        from vllm.model_executor.layers.linear import ReplicatedLinear
++
++        cfg = {
++            "config_groups": {"group_0": {
++                "targets": ["Linear"],
++                "weights": {"num_bits": 8, "type": "int", "symmetric": True,
++                            "strategy": "channel", "dynamic": False},
++                "input_activations": {"num_bits": 8, "type": "int", "symmetric": True,
++                                      "strategy": "token", "dynamic": True},
++            }},
++            "quant_method": "compressed-tensors",
++            "format": "int-quantized",
++            "ignore": [],
++        }
++        qc = CompressedTensorsConfig.from_config(cfg)
++        layer = ReplicatedLinear(
++            64, 128, bias=False, params_dtype=torch.bfloat16, quant_config=qc,
++            prefix="probe.layer", disable_tp=True,
++        )
++        return {
++            "quant_method": type(layer.quant_method).__name__,
++            "scheme": type(layer.scheme).__name__,
++            "kernel": type(layer.scheme.kernel).__name__,
++        }
++
++    probe("torch", import_torch)
++    probe("vllm", import_vllm)
++    probe("platform", platform_info)
++    probe("cpu_int8_ops", cpu_int8_ops)
++    probe("w8a8_layer", tp_group_probe)
++    print(json.dumps(info, indent=1, sort_keys=True))
++
++
++if __name__ == "__main__":
++    main()

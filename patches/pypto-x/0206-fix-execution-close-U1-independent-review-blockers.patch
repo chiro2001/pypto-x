@@ -1,0 +1,1060 @@
+From 8360a9aeef5380827d4703bcce587b424933dc70 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 04:04:56 +0800
+Subject: [PATCH 206/217] fix(execution): close U1 independent-review blockers
+
+task=u1-matmul-policy-slice
+review=independent-u1-review-3-blockers
+
+- target probe: capability snapshots must match the probed local host
+  (CapabilitySnapshot.probe_host / matches_host_probe); explicit policy
+  targets are checked against the probe instead of being copied into a
+  synthetic cpu snapshot. Fabricated triples (aarch64-linux-gnu, cuda-linux,
+  riscv64-unknown, ...) now fail CAPABILITY_UNAVAILABLE before execution and
+  can never run the portable CPU runtime under a false target.
+- policy_from_dict: only schema_version == int(1) is accepted; missing,
+  wrong-type or other values fail POLICY_INVALID_VALUE (no silent drop).
+- alias safety: an output that is the same object as, or shares storage
+  with, an input is rejected with OP_CONTRACT_INVALID before compile/launch;
+  layout_decision.alias_check reports verified_distinct on success.
+- hardening: artifact version declaration is validated before
+  CpuScalarRuntime.launch (failures leave the output buffer untouched);
+  policy/dtype error leaks are converted to structured execution errors;
+  capability deterministic must be a real bool; provider required_features
+  participate in candidate filtering; ExecutionPlan.validate type-checks
+  shape/dtype/provider/artifact/fallback fields so malformed plans are
+  rejected before any provider call.
+- tests: 7 new regressions covering all three blockers and the hardening
+  items (50 focused tests total).
+---
+ python/pypto/execution/capability.py             |  27 +++++
+ python/pypto/execution/entry.py                  |  98 ++++++++++-------
+ python/pypto/execution/plan.py                   | 155 ++++++++++++++++++++++++++
+ python/pypto/execution/policy.py                 |  19 +++-
+ python/pypto/execution/providers.py              |  55 +++++++++-
+ python/pypto/execution/report.py                 |   9 ++
+ python/pypto/execution/resolver.py               |  80 ++++++++++----
+ python/tests/ut/pypto_x/test_execution_matmul.py | 254 ++++++++++++++++++++++++++++++++++++++++---
+ 8 files changed, 622 insertions(+), 75 deletions(-)
+
+diff --git a/python/pypto/execution/capability.py b/python/pypto/execution/capability.py
+index 73273d0db..f1435917f 100644
+--- a/python/pypto/execution/capability.py
++++ b/python/pypto/execution/capability.py
+@@ -120,6 +120,13 @@ class ProviderCapability:
+                 requested=available,
+                 reason="invalid_availability",
+             )
++        if not isinstance(deterministic, bool):
++            raise CapabilityUnavailableError(
++                "provider capability deterministic must be a bool",
++                field="capability.provider.deterministic",
++                requested=deterministic,
++                reason="invalid_deterministic_flag",
++            )
+         if not available and not reason:
+             raise CapabilityUnavailableError(
+                 "an unavailable provider must carry a reason",
+@@ -321,6 +328,26 @@ class CapabilitySnapshot:
+     ) -> "CapabilitySnapshot":
+         return cls(kind=kind, triple=triple, features=features, providers=providers)
+ 
++    @classmethod
++    def probe_host(
++        cls,
++        features: Iterable[str] = (),
++        providers: Optional[Sequence[ProviderCapability]] = None
++    ) -> "CapabilitySnapshot":
++        """Build a cpu snapshot from the real local probe only.
++
++        Execution must never use a caller-supplied triple to claim a target
++        that was not probed on this host; ``probe_host`` is the constructor
++        used by the entry layer.
++        """
++
++        return cls(kind="cpu", triple=host_triple(), features=features, providers=providers)
++
++    def matches_host_probe(self) -> bool:
++        """True when the snapshot describes the actually probed local host."""
++
++        return self.kind == "cpu" and self.triple == host_triple()
++
+     def provider(self, provider_id: str) -> Optional[ProviderCapability]:
+         for entry in self.providers:
+             if entry.provider_id == provider_id:
+diff --git a/python/pypto/execution/entry.py b/python/pypto/execution/entry.py
+index 65f6eb507..a0629b3d1 100644
+--- a/python/pypto/execution/entry.py
++++ b/python/pypto/execution/entry.py
+@@ -22,7 +22,13 @@ from pypto.backends.cpu import HostTensor
+ from pypto.target._utils import mapping_copy
+ 
+ from .capability import CapabilitySnapshot
+-from .errors import ArtifactMismatchError, OpContractError, ProviderUnavailableError
++from .errors import (
++    ArtifactMismatchError,
++    CapabilityUnavailableError,
++    OpContractError,
++    PolicyInvalidValueError,
++    ProviderUnavailableError,
++)
+ from .op_registry import get_op_definition
+ from .plan import ExecutionPlan
+ from .policy import KNOWN_TARGET_KINDS, ExecutionPolicy
+@@ -39,8 +45,14 @@ def capability_for_policy(
+     policy: ExecutionPolicy,
+     capability: Optional[CapabilitySnapshot]
+ ) -> CapabilitySnapshot:
+-    """Return the capability snapshot to resolve against."""
++    """Return the capability snapshot to resolve against.
+ 
++    The portable provider executes on the local host, so the snapshot must
++    describe the *probed* local host.  An explicit policy target is checked
++    against the probe; it is never copied into a synthetic snapshot.
++    """
++
++    host = CapabilitySnapshot.probe_host()
+     if capability is not None:
+         if not isinstance(capability, CapabilitySnapshot):
+             raise ProviderUnavailableError(
+@@ -50,15 +62,33 @@ def capability_for_policy(
+                 reason="not_a_capability_snapshot",
+             )
+         capability.verify_digest()
++        if not capability.matches_host_probe():
++            raise CapabilityUnavailableError(
++                "capability snapshot does not match the probed local host",
++                field="capability",
++                requested={"kind": capability.kind, "triple": capability.triple},
++                available={"kind": host.kind, "triple": host.triple},
++                reason="capability_does_not_match_host_probe",
++                capability_digest=capability.digest,
++            )
+         return capability
+     if policy.target == "auto" or policy.target == "cpu":
+-        return CapabilitySnapshot.for_host(kind="cpu")
++        return host
+     if policy.target in KNOWN_TARGET_KINDS:
+-        return CapabilitySnapshot.for_host(
+-            kind=policy.target,
+-            triple="{}-unknown".format(policy.target),
++        # Non-cpu kind: keep a snapshot with an explicitly unavailable
++        # portable provider so the resolver rejects it structurally.
++        return CapabilitySnapshot.for_host(kind=policy.target)
++    if policy.target != host.triple:
++        raise CapabilityUnavailableError(
++            "target is not available on the probed local host",
++            field="target",
++            requested=policy.target,
++            available=host.triple,
++            reason="target_not_available_on_host",
++            suggested_policy={"target": "auto"},
++            capability_digest=host.digest,
+         )
+-    return CapabilitySnapshot.for_host(kind="cpu", triple=policy.target)
++    return host
+ 
+ 
+ def plan_matmul(
+@@ -71,13 +101,7 @@ def plan_matmul(
+     """Resolve one matmul request without executing it."""
+ 
+     active_policy = policy if policy is not None else ExecutionPolicy()
+-    if not isinstance(active_policy, ExecutionPolicy):
+-        raise OpContractError(
+-            "policy must be an ExecutionPolicy",
+-            field="policy",
+-            requested=type(active_policy).__name__,
+-            reason="not_an_execution_policy",
+-        )
++    _require_execution_policy(active_policy)
+     active_capability = capability_for_policy(active_policy, capability)
+     return resolve_matmul(active_policy, active_capability, left_shape, right_shape, dtype)
+ 
+@@ -100,6 +124,7 @@ def execute_matmul(
+             reason="dtype_mismatch",
+         )
+     active_policy = policy if policy is not None else ExecutionPolicy()
++    _require_execution_policy(active_policy)
+     active_capability = capability_for_policy(active_policy, capability)
+     resolution = resolve_matmul(active_policy, active_capability, left.shape, right.shape, left.dtype)
+     return _execute(plan=resolution.plan, left=left, right=right, capability=active_capability, output=output)
+@@ -165,7 +190,6 @@ def _execute(
+     output: Optional[HostTensor]
+ ) -> Tuple[HostTensor, ExecutionReport]:
+     plan.validate()
+-    definition = get_op_definition(plan.opcode)
+     if output is None:
+         output = HostTensor.zeros(plan.dtype, plan.output_shape)
+     if not isinstance(output, HostTensor):
+@@ -186,13 +210,15 @@ def _execute(
+             reason="declared_provider_does_not_match_executor",
+         )
+     started = time.perf_counter()
++    # PortableProvider.execute validates the request, the numeric contract and
++    # the artifact version triple *before* CpuScalarRuntime.launch, so a
++    # declaration mismatch can never write into the caller's output buffer.
+     outcome = provider.execute(plan, left, right, output, capability)
+     wall_seconds = time.perf_counter() - started
+     op_seconds = float(outcome.op_seconds)
+     if wall_seconds < op_seconds:
+         wall_seconds = op_seconds
+     dispatch_seconds = wall_seconds - op_seconds
+-    _verify_artifact_declaration(plan, outcome, definition)
+     report = ExecutionReport(
+         _build_report_payload(
+             plan=plan,
+@@ -207,26 +233,6 @@ def _execute(
+     return outcome.output, report
+ 
+ 
+-def _verify_artifact_declaration(plan: ExecutionPlan, outcome: ProviderOutcome, definition: Any) -> None:
+-    declared = plan.artifact_versions
+-    actual = {
+-        "contract_version": definition.contract_version,
+-        "lowering_version": outcome.lowering_version,
+-        "runner_version": PORTABLE_RUNNER_VERSION,
+-        "wire_version": outcome.wire_version,
+-        "provider_version": outcome.provider_version,
+-    }
+-    for name, value in actual.items():
+-        if declared.get(name) != value:
+-            raise ArtifactMismatchError(
+-                "executed artifact {} does not match the frozen plan declaration".format(name),
+-                field="plan.artifact." + name,
+-                requested=value,
+-                available=declared.get(name),
+-                reason="artifact_declaration_mismatch",
+-            )
+-
+-
+ def _build_report_payload(
+     *,
+     plan: ExecutionPlan,
+@@ -255,7 +261,7 @@ def _build_report_payload(
+         "requested_policy": mapping_copy(payload["policy"]["requested"]),
+         "resolved_policy": mapping_copy(payload["policy"]["resolved"]),
+         "policy_applicability": mapping_copy(payload["policy_applicability"]),
+-        "layout_decision": mapping_copy(payload["layout_decision"]),
++        "layout_decision": _report_layout_decision(payload["layout_decision"]),
+         "resolved": {
+             "target": {
+                 "kind": capability.kind,
+@@ -383,6 +389,14 @@ def _build_report_payload(
+     }
+ 
+ 
++def _report_layout_decision(layout_decision: Any) -> Any:
++    """Report the layout decision after the runtime alias check ran."""
++
++    document = mapping_copy(layout_decision)
++    document["alias_check"] = "verified_distinct"
++    return document
++
++
+ def _explain(plan: ExecutionPlan) -> str:
+     payload = plan.payload
+     selected = plan.selected
+@@ -420,6 +434,16 @@ def _explain(plan: ExecutionPlan) -> str:
+     )
+ 
+ 
++def _require_execution_policy(policy: Any) -> None:
++    if not isinstance(policy, ExecutionPolicy):
++        raise PolicyInvalidValueError(
++            "policy must be an ExecutionPolicy",
++            field="policy",
++            requested=type(policy).__name__,
++            reason="not_an_execution_policy",
++        )
++
++
+ def _require_host_tensors(left: Any, right: Any) -> None:
+     for label, value in (("left", left), ("right", right)):
+         if not isinstance(value, HostTensor):
+diff --git a/python/pypto/execution/plan.py b/python/pypto/execution/plan.py
+index 87f6b09fb..ae1565ccd 100644
+--- a/python/pypto/execution/plan.py
++++ b/python/pypto/execution/plan.py
+@@ -54,6 +54,7 @@ _REQUIRED_PATHS = (
+     "policy_applicability.rejected_fields",
+     "layout_decision.requested_view_mode",
+     "layout_decision.resolved_view_mode",
++    "layout_decision.alias_check",
+     "layout_decision.alias_proof_digest",
+     "layout_decision.layout_copy_bytes",
+     "layout_decision.transfer_bytes",
+@@ -96,6 +97,159 @@ def _walk(data: Mapping[str, Any], path: str) -> Any:
+     return current
+ 
+ 
++def _require_type(data: Mapping[str, Any], path: str, types: Any, allow_none: bool = False) -> Any:
++    value = _walk(data, path)
++    if value is None and allow_none:
++        return None
++    bool_mismatch = isinstance(value, bool) and types is not bool
++    if bool_mismatch or not isinstance(value, types):
++        raise ArtifactMismatchError(
++            "execution plan field {!r} has the wrong type".format(path),
++            field="plan." + path,
++            requested=type(value).__name__,
++            available=[item.__name__ if hasattr(item, "__name__") else str(item) for item in types]
++            if isinstance(types, tuple)
++            else [getattr(types, "__name__", str(types))],
++            reason="plan_field_wrong_type",
++        )
++    return value
++
++
++def _require_string(data: Mapping[str, Any], path: str) -> str:
++    value = _require_type(data, path, str)
++    if not value.strip():
++        raise ArtifactMismatchError(
++            "execution plan field {!r} must not be empty".format(path),
++            field="plan." + path,
++            requested=value,
++            reason="plan_field_empty",
++        )
++    return value
++
++
++def _require_sha256(data: Mapping[str, Any], path: str, allow_none: bool = False) -> Any:
++    value = _walk(data, path)
++    if value is None and allow_none:
++        return None
++    if not isinstance(value, str) or not value.startswith("sha256:"):
++        raise ArtifactMismatchError(
++            "execution plan field {!r} must be a sha256: string".format(path),
++            field="plan." + path,
++            requested=value,
++            reason="plan_digest_field_invalid",
++        )
++    return value
++
++
++def _require_shape(data: Mapping[str, Any], path: str) -> None:
++    value = _walk(data, path)
++    if not isinstance(value, list):
++        raise ArtifactMismatchError(
++            "execution plan field {!r} must be a list of static dimensions".format(path),
++            field="plan." + path,
++            requested=value,
++            reason="plan_shape_field_invalid",
++        )
++    for index, dimension in enumerate(value):
++        if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension < 0:
++            raise ArtifactMismatchError(
++                "execution plan field {!r}[{}] must be a non-negative integer".format(path, index),
++                field="plan.{}.{}".format(path, index),
++                requested=dimension,
++                reason="plan_shape_field_invalid",
++            )
++
++
++def _validate_plan_types(data: Mapping[str, Any]) -> None:
++    """Reject structurally malformed plans before any provider is invoked."""
++
++    _require_type(data, "plan_schema_version", int)
++    _require_string(data, "contract.opcode")
++    _require_string(data, "contract.version")
++    _require_sha256(data, "contract.digest")
++    _require_string(data, "request.op")
++    _require_shape(data, "request.left_shape")
++    _require_shape(data, "request.right_shape")
++    _require_shape(data, "request.output_shape")
++    _require_string(data, "request.dtype")
++    _require_sha256(data, "request.policy_digest")
++    _require_string(data, "target.kind")
++    _require_string(data, "target.triple")
++    _require_type(data, "target.features", list)
++    _require_sha256(data, "target.capability_digest")
++    _require_type(data, "policy.requested", Mapping)
++    _require_type(data, "policy.resolved", Mapping)
++    _require_type(data, "policy_applicability.status", str)
++    _require_type(data, "policy_applicability.rejected_fields", list)
++    _require_type(data, "layout_decision.requested_view_mode", str)
++    _require_type(data, "layout_decision.resolved_view_mode", str)
++    _require_type(data, "layout_decision.alias_check", str)
++    _require_sha256(data, "layout_decision.alias_proof_digest", allow_none=True)
++    _require_type(data, "layout_decision.layout_copy_bytes", int)
++    _require_type(data, "layout_decision.transfer_bytes", int)
++    _require_string(data, "selected.provider")
++    _require_string(data, "selected.provider_version")
++    _require_string(data, "selected.implementation")
++    _require_string(data, "selected.numeric_class")
++    _require_type(data, "selected.deterministic", bool)
++    _require_type(data, "selected.threads", int)
++    _require_string(data, "numeric_guarantee.class")
++    _require_string(data, "numeric_guarantee.reference")
++    _require_string(data, "numeric_guarantee.scope")
++    _require_string(data, "numeric_guarantee.accumulation")
++    _require_string(data, "numeric_guarantee.rounding")
++    _require_string(data, "numeric_guarantee.reduction_order")
++    _require_string(data, "numeric_guarantee.reduction_order_id")
++    _require_string(data, "numeric_guarantee.exactness_basis")
++    _require_type(data, "numeric_guarantee.deterministic", bool)
++    _require_type(data, "artifact.contract_version", str)
++    for path in ("artifact.lowering_version", "artifact.runner_version", "artifact.wire_version"):
++        value = _require_type(data, path, int)
++        if value <= 0:
++            raise ArtifactMismatchError(
++                "execution plan field {!r} must be a positive integer".format(path),
++                field="plan." + path,
++                requested=value,
++                reason="plan_artifact_version_invalid",
++            )
++    _require_string(data, "artifact.provider_version")
++    candidates = _require_type(data, "candidates", list)
++    for index, candidate in enumerate(candidates):
++        if not isinstance(candidate, Mapping):
++            raise ArtifactMismatchError(
++                "execution plan candidate[{}] must be a mapping".format(index),
++                field="plan.candidates.{}".format(index),
++                requested=type(candidate).__name__,
++                reason="plan_candidate_invalid",
++            )
++        _require_string(candidate, "id")
++        _require_type(candidate, "state", str)
++        _require_type(candidate, "reason", str)
++        _require_type(candidate, "tie_break_key", list)
++    fallback = _require_type(data, "fallback", Mapping)
++    _require_type(fallback, "mode", str)
++    chain = _require_type(fallback, "chain", list)
++    if not chain or not all(isinstance(item, str) and item for item in chain):
++        raise ArtifactMismatchError(
++            "execution plan fallback.chain must be a non-empty list of provider ids",
++            field="plan.fallback.chain",
++            requested=chain,
++            reason="plan_fallback_chain_invalid",
++        )
++    if chain[0] != _walk(data, "selected.provider"):
++        raise ArtifactMismatchError(
++            "execution plan fallback.chain must start with the selected provider",
++            field="plan.fallback.chain",
++            requested=chain,
++            available=_walk(data, "selected.provider"),
++            reason="plan_fallback_chain_invalid",
++        )
++    _require_type(fallback, "events", list)
++    _require_type(fallback, "degraded", bool)
++    _require_type(data, "resolution.rules", list)
++    _require_type(data, "resolution.tie_break", list)
++
++
+ @dataclass(frozen=True, init=False)
+ class ExecutionPlan:
+     """Frozen resolution result; runtime only validates, never re-selects."""
+@@ -147,6 +301,7 @@ class ExecutionPlan:
+             )
+         for path in _REQUIRED_PATHS:
+             _walk(data, path)
++        _validate_plan_types(data)
+         if not isinstance(data["candidates"], list) or not data["candidates"]:
+             raise ArtifactMismatchError(
+                 "execution plan must carry at least one candidate",
+diff --git a/python/pypto/execution/policy.py b/python/pypto/execution/policy.py
+index 6b2c072dd..d12fd1756 100644
+--- a/python/pypto/execution/policy.py
++++ b/python/pypto/execution/policy.py
+@@ -425,8 +425,25 @@ def policy_from_dict(data: Mapping[str, Any]) -> ExecutionPolicy:
+             reason="not_a_mapping",
+         )
+     payload = dict(data)
++    if "schema_version" not in payload:
++        raise PolicyInvalidValueError(
++            "policy document is missing schema_version",
++            field="schema_version",
++            requested=None,
++            available=POLICY_SCHEMA_VERSION,
++            reason="policy_schema_version_missing",
++        )
++    schema_version = payload["schema_version"]
++    if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != POLICY_SCHEMA_VERSION:
++        raise PolicyInvalidValueError(
++            "unsupported policy schema version",
++            field="schema_version",
++            requested=schema_version,
++            available=POLICY_SCHEMA_VERSION,
++            reason="policy_schema_version_mismatch",
++        )
+     payload.pop("schema_version", None)
+-    return ExecutionPolicy(**payload)
++    return ExecutionPolicy(schema_version=schema_version, **payload)
+ 
+ 
+ __all__ = [
+diff --git a/python/pypto/execution/providers.py b/python/pypto/execution/providers.py
+index be1af6897..7d06c972c 100644
+--- a/python/pypto/execution/providers.py
++++ b/python/pypto/execution/providers.py
+@@ -28,9 +28,15 @@ from .capability import (
+     PORTABLE_PROVIDER_ID,
+     PORTABLE_PROVIDER_VERSION,
+     ProviderCapability,
++    host_triple,
+     portable_provider_capability,
+ )
+-from .errors import ArtifactMismatchError, OpContractError, ProviderUnavailableError
++from .errors import (
++    ArtifactMismatchError,
++    CapabilityUnavailableError,
++    OpContractError,
++    ProviderUnavailableError,
++)
+ from .op_registry import get_op_definition
+ from .plan import ExecutionPlan
+ 
+@@ -112,7 +118,17 @@ class PortableProvider:
+         _check_host_tensor(left, "left")
+         _check_host_tensor(right, "right")
+         _check_host_tensor(output, "output")
++        if not capability.matches_host_probe():
++            raise CapabilityUnavailableError(
++                "portable provider requires a capability snapshot of the probed local host",
++                field="capability",
++                requested={"kind": capability.kind, "triple": capability.triple},
++                available={"kind": "cpu", "triple": host_triple()},
++                reason="capability_does_not_match_host_probe",
++                capability_digest=capability.digest,
++            )
+         _check_plan_request(plan, left, right, output)
++        _check_no_alias(left, right, output)
+         target = TargetSpec("cpu", capability.triple, features=capability.features)
+         program, operation = build_matmul_program(
+             CoreType.tensor(left.dtype, left.shape),
+@@ -122,6 +138,9 @@ class PortableProvider:
+         definition.verify_operation(operation)
+         compiler = CpuScalarCompiler()
+         artifact = compiler.compile(compiler.lower(program, target))
++        # Declaration == execution, validated before any launch side effect:
++        # the artifact version triple and provider version must match the plan.
++        _verify_artifact_declaration(plan, definition, artifact, self)
+         request = LaunchRequest(
+             artifact,
+             inputs=[left.descriptor(readonly=True), right.descriptor(readonly=True)],
+@@ -145,6 +164,40 @@ class PortableProvider:
+         )
+ 
+ 
++def _verify_artifact_declaration(plan: ExecutionPlan, definition: Any, artifact: Any, provider: Any) -> None:
++    declared = plan.artifact_versions
++    actual = {
++        "contract_version": definition.contract_version,
++        "lowering_version": int(artifact.metadata["lowering_version"]),
++        "runner_version": int(provider.runner_version),
++        "wire_version": int(artifact.metadata["artifact_payload_version"]),
++        "provider_version": provider.version,
++    }
++    for name, value in actual.items():
++        if declared.get(name) != value:
++            raise ArtifactMismatchError(
++                "compiled artifact {} does not match the frozen plan declaration".format(name),
++                field="plan.artifact." + name,
++                requested=value,
++                available=declared.get(name),
++                reason="artifact_declaration_mismatch",
++            )
++
++
++def _check_no_alias(left: HostTensor, right: HostTensor, output: HostTensor) -> None:
++    """Reject an output that aliases an input (contract: distinct storage)."""
++
++    for label, operand in (("left", left), ("right", right)):
++        if output is operand or output.data is operand.data:
++            raise OpContractError(
++                "output must not alias the {} input buffer".format(label),
++                field="output",
++                requested={"alias": label, "same_object": output is operand, "same_storage": output.data is operand.data},
++                available="distinct output storage",
++                reason="output_input_alias",
++            )
++
++
+ def _check_host_tensor(value: Any, label: str) -> None:
+     if not isinstance(value, HostTensor):
+         raise OpContractError(
+diff --git a/python/pypto/execution/report.py b/python/pypto/execution/report.py
+index c119a991b..33696bd1f 100644
+--- a/python/pypto/execution/report.py
++++ b/python/pypto/execution/report.py
+@@ -45,6 +45,7 @@ _REQUIRED_FIELDS = (
+     ("layout_decision", (Mapping,)),
+     ("layout_decision.requested_view_mode", (str,)),
+     ("layout_decision.resolved_view_mode", (str,)),
++    ("layout_decision.alias_check", (str,)),
+     ("layout_decision.layout_copy_bytes", (int,)),
+     ("layout_decision.transfer_bytes", (int,)),
+     ("resolved", (Mapping,)),
+@@ -264,6 +265,14 @@ def validate_report_schema(report: Mapping[str, Any]) -> Mapping[str, Any]:
+             available={"requested_view_mode": "not_applicable", "resolved_view_mode": "not_applicable"},
+             reason="layout_decision_not_applicable_expected",
+         )
++    if layout["alias_check"] != "verified_distinct":
++        raise ReportSchemaError(
++            "the runtime alias check must be reported as verified_distinct",
++            field="report.layout_decision.alias_check",
++            requested=layout["alias_check"],
++            available="verified_distinct",
++            reason="layout_alias_check_not_verified",
++        )
+     if layout["layout_copy_bytes"] < 0 or layout["transfer_bytes"] < 0:
+         raise ReportSchemaError(
+             "layout/transfer byte counts must be non-negative",
+diff --git a/python/pypto/execution/resolver.py b/python/pypto/execution/resolver.py
+index dc3658ffe..0c595ee38 100644
+--- a/python/pypto/execution/resolver.py
++++ b/python/pypto/execution/resolver.py
+@@ -22,10 +22,15 @@ from typing import Any, Mapping, Optional, Sequence, Tuple
+ 
+ from pypto.compiler.targets.cpu import ARTIFACT_PAYLOAD_VERSION
+ from pypto.core_ir import CoreType
+-from pypto.lowering.cpu import LOWERING_VERSION, canonical_dtype, CpuScalarValidationError
++from pypto.lowering.cpu import (
++    LOWERING_VERSION,
++    CpuScalarUnsupportedError,
++    CpuScalarValidationError,
++    canonical_dtype,
++)
+ from pypto.target._utils import mapping_copy
+ 
+-from .capability import CapabilitySnapshot, ProviderCapability
++from .capability import CapabilitySnapshot, ProviderCapability, host_triple
+ from .errors import (
+     ArtifactMismatchError,
+     CapabilityUnavailableError,
+@@ -153,9 +158,9 @@ def _shape_tuple(shape: Any, label: str) -> Tuple[int, ...]:
+ def _normalize_dtype(dtype: Any) -> str:
+     try:
+         return canonical_dtype(dtype)
+-    except CpuScalarValidationError as exc:
++    except (CpuScalarValidationError, CpuScalarUnsupportedError) as exc:
+         raise OpContractError(
+-            "matmul request dtype is invalid",
++            "matmul request dtype is invalid or outside the registered domain",
+             field="request.dtype",
+             requested=dtype,
+             reason="invalid_dtype",
+@@ -268,18 +273,33 @@ def _check_policy_applicability(policy: ExecutionPolicy, capability: CapabilityS
+ 
+ 
+ def _check_target(policy: ExecutionPolicy, capability: CapabilitySnapshot) -> None:
++    # The capability snapshot must describe the actually probed local host.
++    # A snapshot with a caller-supplied triple for another machine must never
++    # lead to executing the portable CPU runtime while claiming that target.
++    probed_triple = host_triple()
++    if capability.kind != "cpu":
++        raise CapabilityUnavailableError(
++            "the portable provider only supports cpu targets",
++            field="capability.kind",
++            requested=capability.kind,
++            available="cpu",
++            reason="portable_provider_requires_cpu_target",
++            suggested_policy={"target": "cpu"},
++            capability_digest=capability.digest,
++        )
++    if capability.triple != probed_triple:
++        raise CapabilityUnavailableError(
++            "capability triple does not match the probed local host",
++            field="capability.triple",
++            requested=capability.triple,
++            available=probed_triple,
++            reason="capability_triple_does_not_match_host_probe",
++            suggested_policy={"target": "auto"},
++            capability_digest=capability.digest,
++        )
++
+     target = policy.target
+     if target == "auto":
+-        if capability.kind != "cpu":
+-            raise CapabilityUnavailableError(
+-                "the portable provider only supports cpu targets",
+-                field="target",
+-                requested="auto",
+-                available={"kind": capability.kind, "provider": PORTABLE_PROVIDER_ID},
+-                reason="portable_provider_requires_cpu_target",
+-                suggested_policy={"target": "cpu"},
+-                capability_digest=capability.digest,
+-            )
+         return
+     if target in KNOWN_TARGET_KINDS:
+         if target != "cpu":
+@@ -292,15 +312,6 @@ def _check_target(policy: ExecutionPolicy, capability: CapabilitySnapshot) -> No
+                 suggested_policy={"target": "cpu"},
+                 capability_digest=capability.digest,
+             )
+-        if capability.kind != "cpu":
+-            raise CapabilityUnavailableError(
+-                "target=cpu does not match the capability snapshot kind",
+-                field="target",
+-                requested="cpu",
+-                available=capability.kind,
+-                reason="target_kind_mismatch",
+-                capability_digest=capability.digest,
+-            )
+         return
+     if target != capability.triple:
+         raise PolicyConflictError(
+@@ -420,6 +431,8 @@ def resolve_matmul(
+             reason = "provider_not_portable_mode"
+         elif policy.profile == "portable" and entry.provider_id != PORTABLE_PROVIDER_ID:
+             reason = "provider_not_portable_trunk"
++        elif set(entry.required_features) - set(capability.features):
++            reason = "provider_required_features_missing"
+         elif not _satisfies_numeric(entry, policy.numeric.requirement):
+             reason = "numeric_requirement_unmet"
+         elif policy.deterministic and not entry.deterministic:
+@@ -526,6 +539,7 @@ def resolve_matmul(
+     layout_decision = {
+         "requested_view_mode": "not_applicable",
+         "resolved_view_mode": "not_applicable",
++        "alias_check": "contract_requires_distinct_storage",
+         "alias_proof_digest": None,
+         "layout_copy_bytes": 0,
+         "transfer_bytes": 0,
+@@ -646,6 +660,26 @@ def _raise_no_candidate(
+             suggested_policy={"numeric": {"requirement": "portable"}, "deterministic": True},
+             capability_digest=capability.digest,
+         )
++    if "deterministic_requirement_unmet" in reasons:
++        raise NumericGuaranteeUnmetError(
++            "no provider satisfies deterministic=true",
++            field="deterministic",
++            requested=True,
++            available=[item["entry"].deterministic for item in evaluations],
++            reason="deterministic_requirement_unmet",
++            suggested_policy={"deterministic": False},
++            capability_digest=capability.digest,
++        )
++    if "provider_required_features_missing" in reasons:
++        raise CapabilityUnavailableError(
++            "no provider has all of its required host features",
++            field="capability.features",
++            requested=sorted(set(sum((list(item["entry"].required_features) for item in evaluations), []))),
++            available=list(capability.features),
++            reason="provider_required_features_missing",
++            suggested_policy={"target": "auto"},
++            capability_digest=capability.digest,
++        )
+     if "resource_budget_exceeded" in reasons:
+         raise ResourceBudgetExceededError(
+             "no provider fits resources.max_threads",
+diff --git a/python/tests/ut/pypto_x/test_execution_matmul.py b/python/tests/ut/pypto_x/test_execution_matmul.py
+index e8308235f..09932a939 100644
+--- a/python/tests/ut/pypto_x/test_execution_matmul.py
++++ b/python/tests/ut/pypto_x/test_execution_matmul.py
+@@ -65,6 +65,7 @@ def _imports():
+             policy_from_dict,
+             portable_provider_capability,
+             registered_opcodes,
++            host_triple,
+             resolve_matmul,
+             validate_report_schema,
+         )
+@@ -115,6 +116,7 @@ capability_for_policy = _C["capability_for_policy"]
+ execute_matmul = _C["execute_matmul"]
+ execute_matmul_plan = _C["execute_matmul_plan"]
+ get_op_definition = _C["get_op_definition"]
++host_triple = _C["host_triple"]
+ lookup_canonical_opcode = _C["lookup_canonical_opcode"]
+ lowering_cpu = _C["lowering_cpu"]
+ plan_matmul = _C["plan_matmul"]
+@@ -301,27 +303,54 @@ def test_policy_profile_and_fallback_applicability_happens_at_resolution():
+ 
+ 
+ def test_explicit_target_must_match_capability_snapshot():
+-    capability = CapabilitySnapshot.for_host(kind="cpu", triple="aarch64-linux-gnu")
++    host = CapabilitySnapshot.probe_host()
++    # Direct resolver use: a host-aligned snapshot plus a non-host target is a
++    # policy/capability conflict (not an execution of a fabricated target).
+     _assert_failure(
+         POLICY_CONFLICT,
++        lambda: resolve_matmul(
++            ExecutionPolicy(target="aarch64-linux-gnu"),
++            host,
++            (2, 3),
++            (3, 4),
++            "float32",
++        ),
++    )
++    # Entry-level: without a capability argument the target is checked against
++    # the real probe and rejected before any snapshot is fabricated.
++    _assert_failure(
++        CAPABILITY_UNAVAILABLE,
+         lambda: plan_matmul(
+             (2, 3),
+             (3, 4),
+             "float32",
+-            ExecutionPolicy(target="x86_64-linux-gnu"),
+-            capability=capability,
++            ExecutionPolicy(target="aarch64-linux-gnu"),
+         ),
+     )
++    # A fabricated capability triple is rejected even when the policy says auto.
++    _assert_failure(
++        CAPABILITY_UNAVAILABLE,
++        lambda: resolve_matmul(
++            ExecutionPolicy(),
++            CapabilitySnapshot(kind="cpu", triple="aarch64-linux-gnu"),
++            (2, 3),
++            (3, 4),
++            "float32",
++        ),
++    )
++    # The actually probed host triple is accepted and reported.
++    result = resolve_matmul(
++        ExecutionPolicy(target=host.triple), host, (2, 3), (3, 4), "float32"
++    )
++    assert result.plan.payload["target"]["triple"] == host.triple
+ 
+ 
+ def test_forged_plan_cannot_invoke_an_unregistered_provider():
+     plan = plan_matmul((2, 3), (3, 4), "float32").plan
+-    forged = ExecutionPlan(
+-        dict(
+-            plan.payload,
+-            selected=dict(plan.selected, provider="vendor:onednn"),
+-        )
+-    )
++    forged_payload = dict(plan.payload)
++    forged_payload["selected"] = dict(plan.selected, provider="vendor:onednn")
++    forged_payload["fallback"] = dict(forged_payload["fallback"], chain=["vendor:onednn"])
++    forged = ExecutionPlan(forged_payload)
+     left = _tensor("float32", (2, 3), seed=1)
+     right = _tensor("float32", (3, 4), seed=2)
+     details = _assert_failure(PROVIDER_UNAVAILABLE, lambda: execute_matmul_plan(forged, left, right))
+@@ -371,6 +400,7 @@ def test_plan_digest_is_deterministic_for_policy_capability_shape_dtype():
+     assert plan_document["policy_applicability"] == {"status": "validated", "rejected_fields": []}
+     assert plan_document["layout_decision"]["requested_view_mode"] == "not_applicable"
+     assert plan_document["layout_decision"]["resolved_view_mode"] == "not_applicable"
++    assert plan_document["layout_decision"]["alias_check"] == "contract_requires_distinct_storage"
+     assert plan_document["numeric_guarantee"]["reduction_order_id"] == "portable_serial_k_ascending_v1"
+     assert plan_document["numeric_guarantee"]["exactness_basis"] == "contract_and_order"
+     assert ExecutionPlan.from_dict(plan_document).digest == plan.digest
+@@ -655,6 +685,7 @@ def test_report_is_traceable_reproducible_and_ungated():
+     assert document["policy_applicability"] == {"status": "validated", "rejected_fields": []}
+     assert document["layout_decision"]["requested_view_mode"] == "not_applicable"
+     assert document["layout_decision"]["resolved_view_mode"] == "not_applicable"
++    assert document["layout_decision"]["alias_check"] == "verified_distinct"
+     assert document["layout_decision"]["alias_proof_digest"] is None
+     assert document["layout_decision"]["layout_copy_bytes"] == 0
+     assert document["layout_decision"]["transfer_bytes"] == 0
+@@ -694,11 +725,20 @@ def test_report_is_traceable_reproducible_and_ungated():
+ 
+ def test_capability_for_policy_and_default_host_snapshot():
+     policy = ExecutionPolicy.portable()
+-    assert capability_for_policy(policy, None).kind == "cpu"
+-    explicit = CapabilitySnapshot.for_host(kind="cpu", triple="x86_64-linux-gnu", features=("fma",))
++    probed = capability_for_policy(policy, None)
++    assert probed.kind == "cpu"
++    assert probed.triple == host_triple()
++    assert probed.digest == CapabilitySnapshot.probe_host().digest
++    explicit = CapabilitySnapshot.for_host(kind="cpu", triple=host_triple(), features=("fma",))
+     assert capability_for_policy(policy, explicit).digest == explicit.digest
+-    explicit_triple = ExecutionPolicy(target="x86_64-linux-gnu")
+-    assert capability_for_policy(explicit_triple, None).triple == "x86_64-linux-gnu"
++    explicit_triple = ExecutionPolicy(target=host_triple())
++    assert capability_for_policy(explicit_triple, None).triple == host_triple()
++    _assert_failure(
++        CAPABILITY_UNAVAILABLE,
++        lambda: capability_for_policy(
++            policy, CapabilitySnapshot(kind="cpu", triple="aarch64-linux-gnu")
++        ),
++    )
+ 
+ 
+ def test_non_cpu_target_fails_closed():
+@@ -730,6 +770,194 @@ def test_registry_is_a_view_of_the_core_ir_alias_table():
+     assert definition.numeric_contract["reduction_order"] == "k_ascending_serial_per_output_element"
+ 
+ 
++
++# ---------------------------------------------------------------------------
++# independent-review regressions: target probe, versioning, alias safety
++# ---------------------------------------------------------------------------
++def test_fabricated_targets_never_execute_and_leave_output_untouched():
++    left = _tensor("float32", (2, 2), seed=1)
++    right = _tensor("float32", (2, 2), seed=2)
++    for target in ("aarch64-linux-gnu", "cuda-linux", "riscv64-unknown"):
++        output = HostTensor("float32", (2, 2), [9, 9, 9, 9])
++        details = _assert_failure(
++            CAPABILITY_UNAVAILABLE,
++            lambda target=target: execute_matmul(
++                left, right, ExecutionPolicy(target=target), output=output
++            ),
++        )
++        assert details["reason"] == "target_not_available_on_host"
++        assert output.tolist() == [[9.0, 9.0], [9.0, 9.0]]
++        assert left.tolist() == _tensor("float32", (2, 2), seed=1).tolist()
++
++    output, report = execute_matmul(left, right, ExecutionPolicy(target=host_triple()))
++    payload = report.to_dict()
++    assert payload["resolved"]["target"]["triple"] == host_triple()
++    assert payload["capability"]["triple"] == host_triple()
++
++
++def test_policy_from_dict_requires_the_registered_schema_version():
++    document = ExecutionPolicy().to_dict()
++    for broken in (999, 1.5, "1", True, None):
++        candidate = dict(document)
++        if broken is None:
++            candidate.pop("schema_version", None)
++        else:
++            candidate["schema_version"] = broken
++        details = _assert_failure(
++            POLICY_INVALID_VALUE,
++            lambda candidate=candidate: policy_from_dict(candidate),
++        )
++        assert details["field"] == "schema_version"
++        assert details["available"] == 1
++    assert policy_from_dict(document).digest == ExecutionPolicy().digest
++
++
++def test_output_must_not_alias_input_storage():
++    left = HostTensor("float32", (2, 2), [1, 2, 3, 4])
++    right = HostTensor("float32", (2, 2), [1, 0, 0, 1])
++    for label, target in (("left", left), ("right", right)):
++        details = _assert_failure(
++            OP_CONTRACT_INVALID,
++            lambda target=target: execute_matmul(
++                left, right, ExecutionPolicy.portable(), output=target
++            ),
++        )
++        assert details["reason"] == "output_input_alias"
++        assert details["requested"]["alias"] == label
++    assert left.tolist() == [[1.0, 2.0], [3.0, 4.0]]
++
++    shared = HostTensor("float32", (2, 2), [9, 9, 9, 9])
++    shared.data = left.data
++    details = _assert_failure(
++        OP_CONTRACT_INVALID,
++        lambda: execute_matmul(left, right, ExecutionPolicy.portable(), output=shared),
++    )
++    assert details["reason"] == "output_input_alias"
++    assert details["requested"]["same_storage"] is True
++
++
++def test_artifact_declaration_is_checked_before_launch():
++    resolution = plan_matmul((2, 2), (2, 2), "float32")
++    payload = resolution.plan.payload
++    payload["artifact"]["lowering_version"] = 999
++    forged = ExecutionPlan(payload)
++    left = HostTensor("float32", (2, 2), [1, 2, 3, 4])
++    right = HostTensor("float32", (2, 2), [1, 0, 0, 1])
++    output = HostTensor("float32", (2, 2), [7, 7, 7, 7])
++    details = _assert_failure(
++        ARTIFACT_MISMATCH,
++        lambda: execute_matmul_plan(forged, left, right, output=output),
++    )
++    assert details["reason"] == "artifact_declaration_mismatch"
++    assert details["field"] == "plan.artifact.lowering_version"
++    assert output.tolist() == [[7.0, 7.0], [7.0, 7.0]]
++    assert left.tolist() == [[1.0, 2.0], [3.0, 4.0]]
++
++
++def test_policy_and_dtype_errors_are_structured():
++    _assert_failure(
++        POLICY_INVALID_VALUE,
++        lambda: execute_matmul(
++            _tensor("float32", (2, 2), seed=1),
++            _tensor("float32", (2, 2), seed=2),
++            {"profile": "portable"},
++        ),
++    )
++    _assert_failure(OP_CONTRACT_INVALID, lambda: plan_matmul((2, 3), (3, 4), "fp8"))
++    _assert_failure(OP_CONTRACT_INVALID, lambda: plan_matmul((2, 3), (3, 4), 7))
++    _assert_failure(
++        CAPABILITY_UNAVAILABLE,
++        lambda: ProviderCapability(provider_id="portable", version="v", deterministic="false"),
++    )
++
++
++def test_deterministic_and_required_features_participate_in_filtering():
++    definition = get_op_definition("matmul")
++    non_deterministic = CapabilitySnapshot(
++        kind="cpu",
++        providers=(
++            ProviderCapability(
++                provider_id=PORTABLE_PROVIDER_ID,
++                version="portable.cpu.scalar.v1",
++                deterministic=False,
++                contracts={"matmul": definition.contract_digest},
++            ),
++        ),
++    )
++    details = _assert_failure(
++        NumericGuaranteeUnmetError.code,
++        lambda: plan_matmul(
++            (2, 2), (2, 2), "float32", ExecutionPolicy(), capability=non_deterministic
++        ),
++    )
++    assert details["field"] == "deterministic"
++
++    required_features = CapabilitySnapshot(
++        kind="cpu",
++        providers=(
++            ProviderCapability(
++                provider_id=PORTABLE_PROVIDER_ID,
++                version="portable.cpu.scalar.v1",
++                required_features=("avx512vnni",),
++                contracts={"matmul": definition.contract_digest},
++            ),
++        ),
++    )
++    details = _assert_failure(
++        CAPABILITY_UNAVAILABLE,
++        lambda: plan_matmul(
++            (2, 2), (2, 2), "float32", ExecutionPolicy(), capability=required_features
++        ),
++    )
++    assert details["reason"] == "provider_required_features_missing"
++
++    satisfied = CapabilitySnapshot(
++        kind="cpu",
++        features=("avx512vnni",),
++        providers=(
++            ProviderCapability(
++                provider_id=PORTABLE_PROVIDER_ID,
++                version="portable.cpu.scalar.v1",
++                required_features=("avx512vnni",),
++                contracts={"matmul": definition.contract_digest},
++            ),
++        ),
++    )
++    result = plan_matmul((2, 2), (2, 2), "float32", ExecutionPolicy(), capability=satisfied)
++    assert result.plan.selected_provider == PORTABLE_PROVIDER_ID
++
++
++def test_malformed_plan_is_rejected_before_the_provider_is_called():
++    plan = plan_matmul((2, 2), (2, 2), "float32").plan
++    payload = plan.payload
++    payload["request"]["left_shape"] = "ab"
++    malformed = ExecutionPlan(payload)
++    details = _assert_failure(ARTIFACT_MISMATCH, malformed.validate)
++    assert details["reason"] in ("plan_shape_field_invalid", "plan_field_wrong_type")
++
++    calls = []
++
++    class SpyProvider(providers_module.PortableProvider):
++        def execute(self, plan, left, right, output, capability):
++            calls.append(plan.digest)
++            return super(SpyProvider, self).execute(plan, left, right, output, capability)
++
++    original = providers_module.PROVIDERS[PORTABLE_PROVIDER_ID]
++    providers_module.PROVIDERS[PORTABLE_PROVIDER_ID] = SpyProvider()
++    try:
++        _assert_failure(
++            ARTIFACT_MISMATCH,
++            lambda: execute_matmul_plan(
++                malformed,
++                _tensor("float32", (2, 2), seed=1),
++                _tensor("float32", (2, 2), seed=2),
++            ),
++        )
++    finally:
++        providers_module.PROVIDERS[PORTABLE_PROVIDER_ID] = original
++    assert calls == []
++
++
+ def test_new_sources_parse_under_python37():
+     sources = sorted(EXECUTION_DIR.glob("*.py")) + [Path(__file__)]
+     assert sources

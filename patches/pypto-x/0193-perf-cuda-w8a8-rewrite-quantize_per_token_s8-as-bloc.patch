@@ -1,0 +1,1372 @@
+From 7bd750d0c3dbdb1b77f3cc3e0c9a7bc010bb8aa5 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 03:48:08 +0800
+Subject: [PATCH 193/217] perf(cuda-w8a8): rewrite quantize_per_token_s8 as
+ block-per-row (R6)
+
+The C6 timing evidence (9ad9d4801) measured quantize_per_token_s8 at
+0.29-1.03 ms per call on the RTX 5080, 84.7-92.2% of the full W8A8 op,
+because kernel version 1 ran one serial thread per row (m=1/5 -> 1/5
+active threads) with a per-element div.rn.f64 + cvt.rni.s32.f64.
+
+Rewrite (numeric semantics unchanged):
+
+- one 128-thread block per row (grid.x == rows);
+- absmax via local max.f32 + warp shfl.sync.down + 64 B shared/bar.sync
+  tree; max.f32 is exact and order independent, so the absmax and the
+  div.rn.f32(absmax, 127.0f) scale are bit-identical to kernel v1;
+- per-element rounding keeps the RNE decision of cvt.rni.s32.f64 without
+  an f64 division: div.rn.f32 -> cvt.rni.s32.f32 candidate + an exact
+  fma.rn.f64 residual (d = x - n*scale), then 2|d| vs scale decides the
+  half-way case.  The old f64 quotient is within 2**-45 of the exact ratio
+  while a nonzero distance to a half boundary is >= 2**-25, so both agree
+  bit-for-bit on finite inputs;
+- zero-row (scale 1.0, codes 0), NaN/Inf (status 1), scale underflow
+  (status 2) and the saturation counter keep their exact write-back
+  conventions.
+
+Runtime/harness: the quantize launch domain becomes rows*CUDA_W8A8_BLOCK
+(grid.x == rows); the other three opcodes are untouched.  The c6 timing
+harness and its selftest mirror the geometry (the only measurement-
+instrument change).  New scripts/perf/c6_quantize_bitdiff.py renders the
+base-tree PTX and the rewritten PTX and diffs codes/scales/saturation/
+status byte-for-byte on the device (58 cases / 73,256 elements / 45
+shapes, full-buffer SHA256).
+
+Evidence (see the task evidence dir for raw files):
+
+- old-vs-new differential: 58/58 PASS on sm_120; 206 corpus elements
+  would change code under a plain f32 quotient, and the residual path
+  keeps them identical;
+- independent verify-qwen35-w8a8-gpu-kernels harness: 121/121 PASS;
+- 12-shape cuEvent medians (R=51, warmup=5): 289-1034 us -> 11.2-22.2 us,
+  19-50x (median 24x).  All numbers UNGATED: the GamePC window was shared
+  (GPU util median 71.5-73.5%) and the rate gate failed, so the speedup
+  is a magnitude-level, conservative lower bound.
+- local full pytest python/tests/ut/pypto_x: 1268 passed / 7 skipped /
+  0 failed (base collects 1269, this tree 1275 = base + 6 new tests).
+---
+ python/pypto/backends/cuda/runtime.py                  |   6 +-
+ python/pypto/compiler/targets/cuda_w8a8.py             | 235 ++++++++++-----
+ python/tests/ut/pypto_x/test_w8a8_cuda.py              |  44 +++
+ python/tests/ut/pypto_x/test_w8a8_quantize_rounding.py | 253 +++++++++++++++++
+ scripts/perf/README-c6-quantize-rewrite.md             |  78 +++++
+ scripts/perf/c6_quantize_bitdiff.py                    | 565 +++++++++++++++++++++++++++++++++++++
+ scripts/perf/c6_timing_harness.py                      |   5 +-
+ scripts/perf/c6_timing_selftest.py                     |   3 +-
+ 8 files changed, 1120 insertions(+), 69 deletions(-)
+
+diff --git a/python/pypto/backends/cuda/runtime.py b/python/pypto/backends/cuda/runtime.py
+index 794af84e1..5b5651829 100644
+--- a/python/pypto/backends/cuda/runtime.py
++++ b/python/pypto/backends/cuda/runtime.py
+@@ -1050,11 +1050,15 @@ class CudaRuntime:
+         ) as (values_pointer, codes_pointer, scales_pointer, saturation_pointer, status_pointer):
+             self.driver.memcpy_htod(values_pointer, _pack("float32", f32_values))
+             self.driver.memcpy_htod(status_pointer, zero_status)
++            # The quantize kernel is block-per-row (kernel version 1 was one
++            # serial thread per row): its launch domain is rows * block, so
++            # grid.x == rows.  The other W8A8 kernels keep the flat
++            # one-thread-per-output-element domain.
+             self._w8a8_launch(
+                 loaded,
+                 plan.kernel,
+                 (values_pointer, codes_pointer, scales_pointer, saturation_pointer, status_pointer),
+-                plan.rows,
++                plan.rows * CUDA_W8A8_BLOCK,
+             )
+             status = _unpack("int32", self.driver.memcpy_dtoh(status_pointer, plan.rows * 4))
+             if any(int(value) != 0 for value in status):
+diff --git a/python/pypto/compiler/targets/cuda_w8a8.py b/python/pypto/compiler/targets/cuda_w8a8.py
+index ab53817be..d4ec3c306 100644
+--- a/python/pypto/compiler/targets/cuda_w8a8.py
++++ b/python/pypto/compiler/targets/cuda_w8a8.py
+@@ -7,9 +7,10 @@ opcodes and emits a dedicated PTX correctness kernel per operation:
+ * ``qmatmul_s8s8_s32``            native ``dp4a.s32.s32`` main loop with an
+                                   explicit widening (``cvt.s32.s8`` +
+                                   ``mad.lo.s32``) K tail;
+-* ``quantize_per_token_s8``       per-row absmax, double-precision division,
+-                                  RNE ties-to-even, clamp/saturation count,
+-                                  NaN/Inf and scale-underflow fail-closed;
++* ``quantize_per_token_s8``       block-per-row absmax reduction, exact
++                                  ``cvt.rni.s32.f64``-equivalent RNE without a
++                                  per-element f64 division, clamp/saturation
++                                  count, NaN/Inf and scale-underflow fail-closed;
+ * ``dequantize_s8``               int8 x fp32 -> fp32;
+ * ``dequantize_epilogue_bf16``    single-rounding fp32 epilogue with the
+                                   project's RNE bf16 bit rule implemented
+@@ -371,7 +372,7 @@ def _plan_digest(operations: Sequence[CudaW8A8OperationPlan]) -> str:
+ # PTX rendering
+ # ---------------------------------------------------------------------------
+ 
+-_PREAMBLE = """    .reg .pred %p<16>;
++_PREAMBLE = """    .reg .pred %p<32>;
+     .reg .b32 %r<64>;
+     .reg .b64 %rd<64>;
+     .reg .f32 %f<32>;
+@@ -562,101 +563,203 @@ def _render_epilogue(plan: CudaW8A8OperationPlan) -> str:
+ 
+ 
+ def _render_quantize(plan: CudaW8A8OperationPlan) -> str:
++    """Block-per-row ``quantize_per_token_s8`` (R6 quantize rewrite).
++
++    Geometry: ``grid.x == rows``, ``block.x == CUDA_W8A8_BLOCK`` (128).  One
++    block owns one row (``row == %ctaid.x``), so every row is covered by 128
++    threads instead of the single serial per-row thread of kernel version 1.
++
++    Semantics are unchanged (bit-identical, see the differential harness):
++
++    * **absmax** is a warp-shuffle/block tree of the exact ``max.f32`` of
++      ``abs(x)``; max is associative and exact, so the reduction order does not
++      change the value;
++    * **scale** is still ``div.rn.f32(absmax, 127.0f)`` and the zero-row
++      (``scale = 1.0``, codes 0, saturation 0) and scale-underflow
++      (``status = 2``) conventions are unchanged;
++    * **per-element rounding** still reproduces ``cvt.rni.s32.f64(x /
++      scale)`` bit-for-bit without an f64 division.  ``div.rn.f32`` gives the
++      correctly rounded f32 quotient ``q32`` (within ``2**-24`` relative of
++      the exact ratio), ``cvt.rni.s32.f32`` gives a candidate integer, and the
++      exact residual ``d = x - n*scale`` is formed with a single exact
++      ``fma.rn.f64``; comparing ``2|d|`` against ``scale`` decides the RNE
++      tie/near-tie case.  A nonzero ``|q - (k+0.5)|`` is bounded below by
++      ``2**-25`` while the f64 quotient error is below ``2**-45``, so this
++      reproduces the old f64 decision exactly;
++    * NaN/Inf still fail closed with ``status = 1`` and write nothing else.
++
++    The tolerance-free argument above is validated element-by-element on the
++    device by ``scripts/perf/c6_quantize_bitdiff.py`` (old PTX vs new PTX,
++    full-buffer SHA256).
++    """
++
+     rows, k = plan.rows, plan.k
+     lines = [_render_kernel_header(plan.kernel, 5)]
++    lines.append("    .shared .align 4 .b8 pxw8a8_red[64];")
+     lines.append("    ld.param.u64 %rd1, [p0];")
+     lines.append("    ld.param.u64 %rd2, [p1];")
+     lines.append("    ld.param.u64 %rd3, [p2];")
+     lines.append("    ld.param.u64 %rd4, [p3];")
+     lines.append("    ld.param.u64 %rd5, [p4];")
+-    lines.append("    setp.ge.u64 %p0, %rd0, {};".format(rows))
++    # One block per row: %r0 (%ctaid.x) is the row, %r2 (%tid.x) the lane.
++    lines.append("    setp.ge.u32 %p0, %r0, {};".format(rows))
+     lines.append("    @%p0 bra DONE;")
+-    # Row base addresses.
++    lines.append("    setp.eq.u32 %p8, %r2, 0;")
++    # Row base addresses (u64 math; codes row base is row * k bytes).  %rd0 is
++    # re-derived as the row so the ``row * k`` codes offset stays the pinned
++    # ``mul.lo.u64 %rd13, %rd0, %rd10`` arithmetic of kernel version 1.
++    lines.append("    cvt.u64.u32 %rd0, %r0;")
+     lines.append("    mov.u64 %rd10, {};".format(k))
+-    lines.append("    mul.lo.u64 %rd11, %rd0, %rd10;")
+-    lines.append("    mul.lo.u64 %rd11, %rd11, 4;")
+-    lines.append("    add.u64 %rd12, %rd1, %rd11;")
+-    # codes row base: row * k int8 elements (NOT row bytes).
+     lines.append("    mul.lo.u64 %rd13, %rd0, %rd10;")
+-    lines.append("    add.u64 %rd13, %rd2, %rd13;")
+-    lines.append("    mul.lo.u64 %rd14, %rd0, 4;")
+-    lines.append("    add.u64 %rd15, %rd3, %rd14;")
+-    lines.append("    add.u64 %rd16, %rd4, %rd14;")
+-    lines.append("    add.u64 %rd17, %rd5, %rd14;")
+-    # Pass 1: absmax + NaN/Inf detection.
++    lines.append("    add.u64 %rd15, %rd2, %rd13;")
++    lines.append("    mul.lo.u64 %rd11, %rd13, 4;")
++    lines.append("    add.u64 %rd14, %rd1, %rd11;")
++    lines.append("    mul.lo.u64 %rd16, %rd0, 4;")
++    lines.append("    add.u64 %rd17, %rd3, %rd16;")
++    lines.append("    add.u64 %rd18, %rd4, %rd16;")
++    lines.append("    add.u64 %rd19, %rd5, %rd16;")
++    # Pass 1: per-thread absmax + NaN/Inf flag.
+     lines.append("    mov.f32 %f0, 0f00000000;")
+-    lines.append("    mov.u64 %rd20, 0;")
+-    lines.append("    mov.u32 %r20, 0;")
+-    lines.append("    mov.u64 %rd21, {};".format(k))
++    lines.append("    mov.u32 %r21, 0;")
++    lines.append("    mov.u32 %r20, %r2;")
+     lines.append("ABSLOOP:")
+-    lines.append("    setp.ge.u64 %p1, %rd20, %rd21;")
++    lines.append("    setp.ge.u32 %p1, %r20, {};".format(k))
+     lines.append("    @%p1 bra ABSDONE;")
+-    lines.append("    mul.lo.u64 %rd22, %rd20, 4;")
+-    lines.append("    add.u64 %rd23, %rd12, %rd22;")
+-    lines.append("    ld.global.f32 %f1, [%rd23];")
++    lines.append("    cvt.u64.u32 %rd20, %r20;")
++    lines.append("    mul.lo.u64 %rd21, %rd20, 4;")
++    lines.append("    add.u64 %rd22, %rd14, %rd21;")
++    lines.append("    ld.global.f32 %f1, [%rd22];")
+     lines.append("    testp.finite.f32 %p2, %f1;")
+     lines.append("    not.pred %p2, %p2;")
+-    lines.append("    @%p2 mov.u32 %r20, 1;")
++    lines.append("    @%p2 mov.u32 %r21, 1;")
+     lines.append("    abs.f32 %f2, %f1;")
+     lines.append("    max.f32 %f0, %f0, %f2;")
+-    lines.append("    add.u64 %rd20, %rd20, 1;")
++    lines.append("    add.u32 %r20, %r20, %r1;")
+     lines.append("    bra ABSLOOP;")
+     lines.append("ABSDONE:")
+-    lines.append("    setp.ne.u32 %p3, %r20, 0;")
+-    lines.append("    @%p3 bra BAD;")
+-    lines.append("    setp.eq.f32 %p4, %f0, 0f00000000;")
+-    lines.append("    @%p4 bra ZEROROW;")
+-    lines.append("    div.rn.f32 %f3, %f0, 0f42FE0000;")
+-    lines.append("    setp.eq.f32 %p5, %f3, 0f00000000;")
+-    lines.append("    @%p5 bra UNDERFLOW;")
+-    lines.append("    st.global.f32 [%rd15], %f3;")
+-    # Pass 2: double-precision ratio + RNE ties-to-even + clamp/saturation.
+-    lines.append("    mov.u64 %rd20, 0;")
+-    lines.append("    mov.u32 %r21, 0;")
+-    lines.append("    cvt.f64.f32 %fd1, %f3;")
++    # Warp shuffle reduction of the absmax (5 steps) and of the bad flag.
++    lines.append("    mov.u32 %r22, 0xffffffff;")
++    for offset in (16, 8, 4, 2, 1):
++        lines.append("    mov.b32 %r23, %f0;")
++        lines.append("    shfl.sync.down.b32 %r24, %r23, {}, 0x1f, %r22;".format(offset))
++        lines.append("    mov.b32 %f3, %r24;")
++        lines.append("    max.f32 %f0, %f0, %f3;")
++    lines.append("    setp.ne.u32 %p2, %r21, 0;")
++    lines.append("    vote.sync.ballot.b32 %r25, %p2, %r22;")
++    # One f32 slot + one u32 ballot slot per warp (block is 128 = 4 warps).
++    lines.append("    mov.u32 %r26, pxw8a8_red;")
++    lines.append("    and.b32 %r27, %r2, 31;")
++    lines.append("    setp.eq.u32 %p3, %r27, 0;")
++    lines.append("    shr.u32 %r28, %r2, 5;")
++    lines.append("    mul.lo.u32 %r29, %r28, 4;")
++    lines.append("    add.u32 %r29, %r26, %r29;")
++    lines.append("    @%p3 st.shared.f32 [%r29], %f0;")
++    lines.append("    @%p3 st.shared.u32 [%r29+16], %r25;")
++    lines.append("    bar.sync 0;")
++    # Every thread recombines the four warp maxes and the four ballots.
++    lines.append("    ld.shared.f32 %f4, [%r26+0];")
++    lines.append("    ld.shared.f32 %f5, [%r26+4];")
++    lines.append("    ld.shared.f32 %f6, [%r26+8];")
++    lines.append("    ld.shared.f32 %f7, [%r26+12];")
++    lines.append("    max.f32 %f4, %f4, %f5;")
++    lines.append("    max.f32 %f6, %f6, %f7;")
++    lines.append("    max.f32 %f8, %f4, %f6;")
++    lines.append("    ld.shared.u32 %r32, [%r26+16];")
++    lines.append("    ld.shared.u32 %r33, [%r26+20];")
++    lines.append("    ld.shared.u32 %r34, [%r26+24];")
++    lines.append("    ld.shared.u32 %r35, [%r26+28];")
++    lines.append("    or.b32 %r32, %r32, %r33;")
++    lines.append("    or.b32 %r34, %r34, %r35;")
++    lines.append("    or.b32 %r32, %r32, %r34;")
++    lines.append("    setp.ne.u32 %p5, %r32, 0;")
++    lines.append("    @%p5 bra BAD;")
++    lines.append("    setp.eq.f32 %p6, %f8, 0f00000000;")
++    lines.append("    @%p6 bra ZEROROW;")
++    # Scale is still a single correctly rounded f32 division; identical on
++    # every thread, so no shared broadcast is needed.
++    lines.append("    div.rn.f32 %f12, %f8, 0f42FE0000;")
++    lines.append("    setp.eq.f32 %p7, %f12, 0f00000000;")
++    lines.append("    @%p7 bra UNDERFLOW;")
++    lines.append("    @%p8 st.global.f32 [%rd17], %f12;")
++    lines.append("    cvt.f64.f32 %fd1, %f12;")
++    # Pass 2: per-thread exact RNE quantization.
++    lines.append("    mov.u32 %r36, 0;")
++    lines.append("    mov.u32 %r20, %r2;")
+     lines.append("QUANTLOOP:")
+-    lines.append("    setp.ge.u64 %p1, %rd20, %rd21;")
++    lines.append("    setp.ge.u32 %p1, %r20, {};".format(k))
+     lines.append("    @%p1 bra QUANTDONE;")
+-    lines.append("    mul.lo.u64 %rd22, %rd20, 4;")
+-    lines.append("    add.u64 %rd23, %rd12, %rd22;")
+-    lines.append("    ld.global.f32 %f1, [%rd23];")
+-    lines.append("    cvt.f64.f32 %fd0, %f1;")
+-    lines.append("    div.rn.f64 %fd2, %fd0, %fd1;")
+-    lines.append("    min.f64 %fd2, %fd2, 0d4069000000000000;")
+-    lines.append("    max.f64 %fd2, %fd2, 0dC069000000000000;")
+-    lines.append("    cvt.rni.s32.f64 %r30, %fd2;")
+-    lines.append("    setp.gt.s32 %p2, %r30, 127;")
+-    lines.append("    setp.lt.s32 %p3, %r30, -127;")
+-    lines.append("    @%p2 add.u32 %r21, %r21, 1;")
+-    lines.append("    @%p3 add.u32 %r21, %r21, 1;")
+-    lines.append("    min.s32 %r30, %r30, 127;")
+-    lines.append("    max.s32 %r30, %r30, -127;")
+-    lines.append("    add.u64 %rd24, %rd13, %rd20;")
+-    lines.append("    st.global.u8 [%rd24], %r30;")
+-    lines.append("    add.u64 %rd20, %rd20, 1;")
++    lines.append("    cvt.u64.u32 %rd20, %r20;")
++    lines.append("    mul.lo.u64 %rd21, %rd20, 4;")
++    lines.append("    add.u64 %rd22, %rd14, %rd21;")
++    lines.append("    ld.global.f32 %f10, [%rd22];")
++    lines.append("    div.rn.f32 %f11, %f10, %f12;")
++    lines.append("    cvt.rni.s32.f32 %r37, %f11;")
++    lines.append("    neg.s32 %r38, %r37;")
++    lines.append("    cvt.rn.f64.s32 %fd2, %r38;")
++    lines.append("    cvt.f64.f32 %fd0, %f10;")
++    lines.append("    fma.rn.f64 %fd3, %fd2, %fd1, %fd0;")
++    lines.append("    add.f64 %fd4, %fd3, %fd3;")
++    lines.append("    neg.f64 %fd5, %fd3;")
++    lines.append("    add.f64 %fd5, %fd5, %fd5;")
++    lines.append("    setp.gt.f64 %p9, %fd4, %fd1;")
++    lines.append("    setp.gt.f64 %p10, %fd5, %fd1;")
++    lines.append("    setp.eq.f64 %p11, %fd4, %fd1;")
++    lines.append("    setp.eq.f64 %p12, %fd5, %fd1;")
++    lines.append("    setp.gt.f64 %p13, %fd3, 0d0000000000000000;")
++    lines.append("    selp.s32 %r39, 1, -1, %p13;")
++    lines.append("    or.pred %p14, %p9, %p10;")
++    lines.append("    @%p14 add.s32 %r37, %r37, %r39;")
++    lines.append("    and.b32 %r40, %r37, 1;")
++    lines.append("    setp.ne.s32 %p15, %r40, 0;")
++    lines.append("    or.pred %p11, %p11, %p12;")
++    lines.append("    and.pred %p11, %p11, %p15;")
++    lines.append("    @%p11 add.s32 %r37, %r37, %r39;")
++    lines.append("    setp.gt.s32 %p9, %r37, 127;")
++    lines.append("    setp.lt.s32 %p10, %r37, -127;")
++    lines.append("    or.pred %p9, %p9, %p10;")
++    lines.append("    @%p9 add.u32 %r36, %r36, 1;")
++    lines.append("    min.s32 %r37, %r37, 127;")
++    lines.append("    max.s32 %r37, %r37, -127;")
++    lines.append("    add.u64 %rd23, %rd15, %rd20;")
++    lines.append("    st.global.u8 [%rd23], %r37;")
++    lines.append("    add.u32 %r20, %r20, %r1;")
+     lines.append("    bra QUANTLOOP;")
+     lines.append("QUANTDONE:")
+-    lines.append("    st.global.u32 [%rd16], %r21;")
++    # Warp + block reduction of the per-row saturation count.
++    for offset in (16, 8, 4, 2, 1):
++        lines.append("    mov.b32 %r41, %r36;")
++        lines.append("    shfl.sync.down.b32 %r42, %r41, {}, 0x1f, %r22;".format(offset))
++        lines.append("    add.u32 %r36, %r36, %r42;")
++    lines.append("    @%p3 st.shared.u32 [%r29+32], %r36;")
++    lines.append("    bar.sync 0;")
++    lines.append("    ld.shared.u32 %r43, [%r26+32];")
++    lines.append("    ld.shared.u32 %r44, [%r26+36];")
++    lines.append("    ld.shared.u32 %r45, [%r26+40];")
++    lines.append("    ld.shared.u32 %r46, [%r26+44];")
++    lines.append("    add.u32 %r43, %r43, %r44;")
++    lines.append("    add.u32 %r45, %r45, %r46;")
++    lines.append("    add.u32 %r43, %r43, %r45;")
++    lines.append("    @%p8 st.global.u32 [%rd18], %r43;")
+     lines.append("    bra DONE;")
+-    # All-zero row: scale 1.0, codes 0, saturation 0.
+     lines.append("ZEROROW:")
+-    lines.append("    st.global.f32 [%rd15], 0f3F800000;")
+-    lines.append("    mov.u64 %rd20, 0;")
++    lines.append("    @%p8 st.global.f32 [%rd17], 0f3F800000;")
++    lines.append("    mov.u32 %r20, %r2;")
+     lines.append("ZEROLOOP:")
+-    lines.append("    setp.ge.u64 %p1, %rd20, %rd21;")
++    lines.append("    setp.ge.u32 %p1, %r20, {};".format(k))
+     lines.append("    @%p1 bra ZERODONE;")
+-    lines.append("    add.u64 %rd24, %rd13, %rd20;")
+-    lines.append("    st.global.u8 [%rd24], 0;")
+-    lines.append("    add.u64 %rd20, %rd20, 1;")
++    lines.append("    cvt.u64.u32 %rd20, %r20;")
++    lines.append("    add.u64 %rd23, %rd15, %rd20;")
++    lines.append("    st.global.u8 [%rd23], 0;")
++    lines.append("    add.u32 %r20, %r20, %r1;")
+     lines.append("    bra ZEROLOOP;")
+     lines.append("ZERODONE:")
+-    lines.append("    st.global.u32 [%rd16], 0;")
++    lines.append("    @%p8 st.global.u32 [%rd18], 0;")
+     lines.append("    bra DONE;")
+     lines.append("BAD:")
+-    lines.append("    st.global.u32 [%rd17], 1;")
++    lines.append("    @%p8 st.global.u32 [%rd19], 1;")
+     lines.append("    bra DONE;")
+     lines.append("UNDERFLOW:")
+-    lines.append("    st.global.u32 [%rd17], 2;")
++    lines.append("    @%p8 st.global.u32 [%rd19], 2;")
+     lines.append("DONE:")
+     lines.append("    ret;")
+     lines.append("}")
+diff --git a/python/tests/ut/pypto_x/test_w8a8_cuda.py b/python/tests/ut/pypto_x/test_w8a8_cuda.py
+index 5ebaffb0b..e255174e1 100644
+--- a/python/tests/ut/pypto_x/test_w8a8_cuda.py
++++ b/python/tests/ut/pypto_x/test_w8a8_cuda.py
+@@ -510,7 +510,51 @@ def test_ptx_tail_and_codes_row_base_arithmetic_is_pinned():
+     for right_offset in (12, 15, 18):
+         assert "ld.global.s8 %r32, [%rd9+{}];".format(right_offset) in qmatmul_ir.ptx
+     _, quantize_ir = _compile(_quantize_program((3, 5)))
++    # row = %ctaid.x; %rd13 = row * k; codes row base = codes + row * k.
++    assert "cvt.u64.u32 %rd0, %r0;" in quantize_ir.ptx
+     assert "mul.lo.u64 %rd13, %rd0, %rd10;" in quantize_ir.ptx
++    assert "add.u64 %rd15, %rd2, %rd13;" in quantize_ir.ptx
++
++
++def test_quantize_kernel_is_block_per_row_with_exact_residual_rounding():
++    """R6: block-per-row quantize without a per-element f64 division.
++
++    The rewritten kernel must (a) treat ``%ctaid.x`` as the row, (b) reduce
++    the row absmax across the block with warp shuffle + shared memory,
++    (c) keep ``div.rn.f64`` out of the element loop, and (d) settle the RNE
++    half-way case with an exact ``fma.rn.f64`` residual around a candidate
++    produced by ``cvt.rni.s32.f32``.
++    """
++
++    _, quantize_ir = _compile(_quantize_program((3, 5)))
++    ptx = quantize_ir.ptx
++    assert "setp.ge.u32 %p0, %r0, 3;" in ptx
++    assert "div.rn.f64" not in ptx
++    assert "shfl.sync.down.b32" in ptx
++    assert "vote.sync.ballot.b32" in ptx
++    assert "bar.sync 0;" in ptx
++    assert "div.rn.f32 %f12, %f8, 0f42FE0000;" in ptx
++    assert "cvt.rni.s32.f32 %r37, %f11;" in ptx
++    assert "fma.rn.f64 %fd3, %fd2, %fd1, %fd0;" in ptx
++    assert ".shared .align 4 .b8 pxw8a8_red[64];" in ptx
++
++
++def test_quantize_launch_domain_is_one_block_per_row():
++    """The runtime must launch the block-per-row kernel with grid.x == rows."""
++
++    from pypto.compiler.targets.cuda_w8a8 import CUDA_W8A8_BLOCK
++
++    shape = (5, 7)
++    artifact, target_ir = _compile(_quantize_program(shape))
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    CudaRuntime(driver=driver).run_w8a8_quantize_per_token_s8(
++        artifact, [0.0] * (shape[0] * shape[1])
++    )
++    function, grid, block, _pointers = driver.launches[-1]
++    assert function == target_ir.operations[0].kernel
++    assert grid == (shape[0], 1, 1)
++    assert block == (CUDA_W8A8_BLOCK, 1, 1)
+ 
+ 
+ def test_all_four_opcodes_lower_into_one_artifact():
+diff --git a/python/tests/ut/pypto_x/test_w8a8_quantize_rounding.py b/python/tests/ut/pypto_x/test_w8a8_quantize_rounding.py
+new file mode 100644
+index 000000000..8485d7357
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_w8a8_quantize_rounding.py
+@@ -0,0 +1,253 @@
++"""Host-side bit-exactness argument for the R6 CUDA quantize rewrite.
++
++Kernel version 1 rounded each element with a correctly rounded double
++division followed by ``cvt.rni.s32.f64`` (ties-to-even).  The rewritten
++block-per-row kernel drops the per-element ``div.rn.f64``: it computes the
++correctly rounded binary32 quotient ``q32 = div.rn.f32(x, scale)``, takes
++``n = cvt.rni.s32.f32(q32)`` as a candidate, forms the *exact* residual
++``d = x - n * scale`` with a single ``fma.rn.f64`` and compares ``2*|d|``
++against ``scale`` to settle the RNE half-way case.
++
++This module pins that algebra on the host.  It does not execute PTX; the
++device leg (old PTX vs new PTX, full-buffer SHA256) is
++``scripts/perf/c6_quantize_bitdiff.py``.  What is proven here is why the
++residual step is load-bearing: the plain ``cvt.rni.s32.f32(div.rn.f32(...))``
++scheme really does disagree with the old kernel on reachable inputs, while the
++residual scheme agrees on the whole generated corpus.
++"""
++
++from __future__ import annotations
++
++import math
++import random
++import struct
++from typing import Iterator, Tuple
++
++QUANT_MAX = 127
++QUANT_MIN = -127
++
++_F32 = struct.Struct("<f")
++_F32_BITS = struct.Struct("<I")
++
++
++def _f32(value: float) -> float:
++    return _F32.unpack(_F32.pack(float(value)))[0]
++
++
++def _sf32(value: float):
++    try:
++        return _f32(value)
++    except OverflowError:
++        return None
++
++
++def _decompose(value: float) -> Tuple[int, int]:
++    """Exact ``value == mantissa * 2**exponent`` for a finite binary32."""
++
++    bits = _F32_BITS.unpack(_F32.pack(float(value)))[0]
++    sign = -1 if bits >> 31 else 1
++    exponent = (bits >> 23) & 0xFF
++    fraction = bits & 0x7FFFFF
++    if exponent == 0:
++        return sign * fraction, -149
++    return sign * (fraction | 0x800000), exponent - 150
++
++
++def _rne_integer(value: float) -> int:
++    """Nearest integer, ties-to-even (mirrors ``cvt.rni.s32``)."""
++
++    floor = math.floor(value)
++    fraction = value - floor
++    if fraction < 0.5:
++        return floor
++    if fraction > 0.5:
++        return floor + 1
++    return floor if floor % 2 == 0 else floor + 1
++
++
++def _clamp_count(quantized: int) -> Tuple[int, int]:
++    count = 1 if (quantized > QUANT_MAX or quantized < QUANT_MIN) else 0
++    return max(QUANT_MIN, min(QUANT_MAX, quantized)), count
++
++
++def _kernel_v1_code(value: float, scale: float) -> Tuple[int, int]:
++    """Kernel version 1: f64 division, +/-200 clamp, cvt.rni.s32.f64."""
++
++    ratio = float(value) / float(scale)
++    ratio = min(max(ratio, -200.0), 200.0)
++    return _clamp_count(_rne_integer(ratio))
++
++
++def _naive_f32_code(value: float, scale: float) -> Tuple[int, int]:
++    """What a plain f32 quotient would produce (shown to be insufficient)."""
++
++    return _clamp_count(_rne_integer(_f32(float(value) / float(scale))))
++
++
++def _residual_code(value: float, scale: float) -> Tuple[int, int, bool]:
++    """The rewritten kernel's per-element rule, with an exact integer residual.
++
++    Returns ``(code, saturation, residual_is_f64_exact)``.  The residual is
++    kept as an exact integer here (``fraction`` module not needed); the
++    boolean reports whether the residual is representable in binary64, which
++    is what makes the single ``fma.rn.f64`` exact on the device.
++    """
++
++    candidate = _rne_integer(_f32(float(value) / float(scale)))
++    value_mantissa, value_exponent = _decompose(value)
++    scale_mantissa, scale_exponent = _decompose(scale)
++    common = min(value_exponent, scale_exponent)
++    residual = value_mantissa * (1 << (value_exponent - common)) - candidate * scale_mantissa * (
++        1 << (scale_exponent - common)
++    )
++    exact = residual.bit_length() <= 53
++    # 2*|residual| * 2**common  vs  scale_mantissa * 2**scale_exponent
++    lhs = 2 * abs(residual)
++    rhs = scale_mantissa * (1 << (scale_exponent - common))
++    if residual > 0:
++        if lhs > rhs:
++            quantized = candidate + 1
++        elif lhs == rhs:
++            quantized = candidate if candidate % 2 == 0 else candidate + 1
++        else:
++            quantized = candidate
++    elif residual < 0:
++        if lhs > rhs:
++            quantized = candidate - 1
++        elif lhs == rhs:
++            quantized = candidate if candidate % 2 == 0 else candidate - 1
++        else:
++            quantized = candidate
++    else:
++        quantized = candidate
++    code, count = _clamp_count(quantized)
++    return code, count, exact
++
++
++def _corpus() -> Iterator[Tuple[float, float]]:
++    """Deterministic adversarial (value, f32 scale) pairs.
++
++    Scales are reachable: every pair satisfies ``|value| <= 127.5 * scale`` so
++    it can come from a row whose ``absmax`` produced the f32 scale
++    ``fl32(absmax / 127)``.
++    """
++
++    rng = random.Random(20260912)
++    pairs = []
++    for _ in range(6000):
++        value = _f32(rng.uniform(-1.0, 1.0) * 2.0 ** rng.randint(-140, 128))
++        absmax = _f32(abs(value) if value != 0.0 else 1.0)
++        scale = _f32(absmax / QUANT_MAX)
++        pairs.append((value, scale))
++    for _ in range(300):
++        width = rng.randint(1, 40)
++        row = [_f32(rng.gauss(0.0, 1.0) * 2.0 ** rng.randint(-30, 30)) for _ in range(width)]
++        absmax = max(abs(item) for item in row)
++        if absmax == 0.0:
++            continue
++        scale = _f32(absmax / QUANT_MAX)
++        pairs.extend((item, scale) for item in row)
++    # Exact half-way ties on every boundary, plus +/-2 ulp neighbours.
++    for base in range(-127, 128):
++        value = _f32(base + 0.5)
++        pairs.append((value, 1.0))
++        for step in (-2, -1, 1, 2):
++            pairs.append((_f32(value + step * math.ulp(value)), 1.0))
++    # Near-ties for arbitrary scales: value = fl32(scale * (k + 0.5)).
++    for _ in range(4000):
++        scale = _f32(2.0 ** rng.randint(-120, 0) * rng.uniform(0.5, 2.0))
++        if scale == 0.0:
++            continue
++        target = _f32(float(scale) * (rng.randint(-127, 126) + 0.5))
++        if target == 0.0:
++            continue
++        for step in (-1, 0, 1):
++            value = _f32(target + step * math.ulp(target))
++            pairs.append((value, scale))
++    # Subnormal scales, signed zeros and extremes.
++    for exponent in range(-149, -120):
++        scale = _f32(2.0 ** exponent)
++        if scale == 0.0:
++            continue
++        for _ in range(60):
++            value = _f32(rng.uniform(-1.0, 1.0) * 2.0 ** rng.randint(-140, -100))
++            pairs.append((value, scale))
++    for scale in (_f32(1.0), _f32(1e-38), _f32(3.4e38), _f32(1.0 / QUANT_MAX)):
++        for value in (
++            0.0,
++            -0.0,
++            _f32(1e-45),
++            _f32(-1e-45),
++            _f32(3.4e38),
++            _f32(-3.4e38),
++            _f32(float(scale) * 0.5),
++            _f32(float(scale) * -0.5),
++            _sf32(float(scale) * 126.5),
++        ):
++            if value is not None:
++                pairs.append((value, scale))
++
++    filtered = []
++    for value, scale in pairs:
++        if scale == 0.0 or not math.isfinite(value) or not math.isfinite(scale):
++            continue
++        if abs(value) > float(scale) * 127.5:
++            continue
++        filtered.append((value, scale))
++    return filtered
++
++
++def test_residual_rounding_matches_kernel_v1_on_the_corpus():
++    corpus = _corpus()
++    assert len(corpus) > 20000
++    mismatches = []
++    for value, scale in corpus:
++        expected = _kernel_v1_code(value, scale)
++        actual = _residual_code(value, scale)[:2]
++        if actual != expected:
++            mismatches.append((value, scale, expected, actual))
++    assert mismatches == []
++
++
++def test_residual_is_exactly_representable_in_binary64():
++    corpus = _corpus()
++    inexact = [
++        (value, scale)
++        for value, scale in corpus
++        if not _residual_code(value, scale)[2]
++    ]
++    assert inexact == []
++
++
++def test_exact_half_way_ties_follow_rne():
++    for value, expected in (
++        (0.5, 0),
++        (1.5, 2),
++        (2.5, 2),
++        (3.5, 4),
++        (-0.5, 0),
++        (-1.5, -2),
++        (-2.5, -2),
++        (-3.5, -4),
++    ):
++        assert _kernel_v1_code(value, 1.0)[0] == expected
++        assert _residual_code(value, 1.0)[0] == expected
++
++
++def test_naive_f32_quotient_is_not_enough():
++    """The residual correction is required: plain f32 RNE changes codes.
++
++    Every pair below is reachable (``|value| <= 127.5 * scale``) and the old
++    kernel's double quotient sits on the other side of a half-way boundary
++    than the rounded binary32 quotient.
++    """
++
++    examples = []
++    for value, scale in _corpus():
++        if _naive_f32_code(value, scale) != _kernel_v1_code(value, scale):
++            examples.append((value, scale))
++            if len(examples) >= 3:
++                break
++    assert len(examples) == 3
++    for value, scale in examples:
++        assert _residual_code(value, scale)[:2] == _kernel_v1_code(value, scale)
+diff --git a/scripts/perf/README-c6-quantize-rewrite.md b/scripts/perf/README-c6-quantize-rewrite.md
+new file mode 100644
+index 000000000..9564f0808
+--- /dev/null
++++ b/scripts/perf/README-c6-quantize-rewrite.md
+@@ -0,0 +1,78 @@
++# R6 `quantize_per_token_s8` 重写：逐位一致 + cuEvent 前后对比
++
++任务 `cuda-quantize-rewrite`。本目录新增/更新的工具与内核改动配套；详细证据在
++`/home/chiro/projects/pypto/worktrees/_meta/pypto-x/cuda-quantize-rewrite/`。
++
++## 改动摘要
++
++- `python/pypto/compiler/targets/cuda_w8a8.py`：`quantize_per_token_s8` 由
++  “每行一个线程、每元素 `div.rn.f64`” 改为 **block-per-row**：每行一个 128 线程
++  block；absmax 用 `max.f32` + warp `shfl.sync.down` + shared/`bar.sync` 树形归约；
++  per-token scale 仍是 `div.rn.f32(absmax, 127.0f)`；每元素取整改为
++  `div.rn.f32` + `cvt.rni.s32.f32` 候选 + 单条精确 `fma.rn.f64` 残差判定
++  （无 f64 除法），逐步复现原 `cvt.rni.s32.f64` 的 RNE 决策；零行 / NaN-Inf /
++  scale 下溢的写回约定不变。
++- `python/pypto/backends/cuda/runtime.py`：quantize 的 launch domain 改为
++  `rows * CUDA_W8A8_BLOCK`（`grid.x == rows`）；其余三个 opcode 不变。
++- `scripts/perf/c6_timing_harness.py` / `c6_timing_selftest.py`：测量仪器同步新
++  几何（唯一一处必要改动），测量方法与口径不变。
++- 测试：`python/tests/ut/pypto_x/test_w8a8_quantize_rounding.py`（主机侧旧语义 vs
++  新残差算法对抗语料 + residual 精确性 + RNE 平局 + 朴素 f32 反例）；
++  `test_w8a8_cuda.py` 增加 block-per-row 结构 pin 与 launch domain pin。
++
++## 逐位一致（首选判据）
++
++`scripts/perf/c6_quantize_bitdiff.py` 在 base 树（`git archive 9ad9d4801`）渲染旧
++PTX、在本树渲染新 PTX，在同一 RTX 5080 / sm_120 上以同一输入 buffer 双跑，比较
++`codes` / `scales` / `saturation` / `status` 全量字节 + SHA256：
++
++- **58 case / 73,256 元素 / 45 形状，58/58 PASS**；语料含随机 f32、bf16 精确可
++  表示值、非 8/16 倍数行宽、全零行/`-0.0`、absmax 极值（3.4e38 / 最小正规 /
++  subnormal scale / 1e-45 下溢）、每个可达边界的精确 RNE 平局、24 行可达 scale
++  的近平局对抗行、NaN/±Inf 行。
++- 语料中 **206 个元素**用“朴素 f32 商直接 RNE”会与旧内核差码；residual 修正后
++  全部逐位一致（该分支被真实覆盖）。
++- 独立验收 harness `verify-qwen35-w8a8-gpu-kernels` 重跑：**121/121 PASS**。
++- SASS（sm_120）：旧内核含 `MUFU.RCP64H`（f64 除法），新内核 **0**；`DFMA` 16 → 1
++  （每元素 residual）；新内核 36 寄存器 / 0 spill / 64 B smem。
++
++## 12 形状前后对比（cuEvent，**UNGATED**）
++
++同一 `c6_timing_harness.py`，`--rounds 51 --warmup 5 --skip-vendor`，每侧 2 轮
++（ABAB），跨轮中位：
++
++| m | k | n | 旧中位 (µs) | 新中位 (µs) | 加速 |
++|---:|---:|---:|---:|---:|---:|
++| 1 | 1024 | 32 | 292.74 | 12.34 | 23.7× |
++| 1 | 1024 | 5120 | 290.64 | 11.71 | 24.8× |
++| 1 | 1024 | 7168 | 292.98 | 15.18 | 19.3× |
++| 1 | 1024 | 8192 | 293.01 | 12.48 | 23.5× |
++| 1 | 2048 | 1024 | 585.22 | 16.21 | 36.1× |
++| 1 | 3584 | 1024 | 1027.84 | 20.64 | 49.8× |
++| 5 | 1024 | 32 | 294.82 | 12.46 | 23.6× |
++| 5 | 1024 | 5120 | 295.98 | 12.50 | 23.7× |
++| 5 | 1024 | 7168 | 294.75 | 12.19 | 24.2× |
++| 5 | 1024 | 8192 | 295.73 | 12.40 | 23.9× |
++| 5 | 2048 | 1024 | 588.85 | 16.70 | 35.2× |
++| 5 | 3584 | 1024 | 1034.30 | 21.82 | 47.4× |
++
++加速 **19.3–49.8×，中位 24.0×**。四轮 quantize correctness check 全部 PASS。
++
++**环境状态：`ENV_NOISY / SHARED_WINDOW`**——窗口 GPU util 中位 71.5–73.5%、max
++77–99%，`memory.used ≈ 12.0 GiB`（机主 Windows 图形/VR 负载）；rate 门 FAIL
++（线性度 9.45% > 3%），ERR-0004 下全部 case `UNSTABLE/INVALID_VARIANCE`。因此：
++
++- 全部数字 **UNGATED**，不是门槛，不做跨平台结论；
++- 新内核 11–22 µs 已接近本平台 launch + 共享窗口调度的有效分辨力，共享窗口只会
++  高估新数值（旧实现串行 0.3–1 ms，受影响小），故 **19–50× 是保守下界**。
++
++## 未覆盖 / 红旗（详见证据目录 brief）
++
++- 仅 sm_120 / RTX 5080 / WSL2 实测；`.target sm_75` 只做 ptxas 编译验证。
++- 逐位参照是旧实现，不是形式化契约；契约级等价由独立 121 checks 的 portable
++  golden 覆盖。
++- 独立 harness 的 `ptx_text_evidence` 硬编码旧寄存器序列
++  `mul.lo.u64 %rd13, %rd0, %rd10;`（codes 行基址 = row*k）：重写保留了该行字面量
++  （把 `%rd0` 重定义为 row），语义与 pin 同时成立。
++- 计时无 cpufreq/clock 锁、窗口非静默；公开入口 dispatch 上界探针在 base 上即有
++  `CudaRuntime has no attribute collect`（旧/新同样失败，pre-existing）。
+diff --git a/scripts/perf/c6_quantize_bitdiff.py b/scripts/perf/c6_quantize_bitdiff.py
+new file mode 100644
+index 000000000..e0bc95018
+--- /dev/null
++++ b/scripts/perf/c6_quantize_bitdiff.py
+@@ -0,0 +1,565 @@
++#!/usr/bin/env python3
++"""Old-kernel vs new-kernel bit-exactness harness for ``quantize_per_token_s8``.
++
++The R6 rewrite replaced kernel version 1 (one serial thread per row, per
++element ``div.rn.f64`` + ``cvt.rni.s32.f64``) with a block-per-row kernel
++(warp/block absmax reduction, ``div.rn.f32`` + exact ``fma.rn.f64`` residual,
++``cvt.rni.s32.f32``).  This harness renders both PTX variants for the same
++static shapes and executes them back to back on the real device with the same
++input buffer, then compares the *raw bytes* of the ``codes``, ``scales``,
++``saturation`` and ``status`` outputs (full-buffer SHA256).
++
++Two subcommands:
++
++    # 1) render PTX with the tree on PYTHONPATH (run once in the old tree,
++    #    once in the new tree):
++    PYTHONPATH=<tree>/python python3 scripts/perf/c6_quantize_bitdiff.py \
++        render-ptx --output <dir>
++
++    # 2) execute old vs new on the device (new tree on PYTHONPATH):
++    PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=<new-tree>/python python3 \
++        scripts/perf/c6_quantize_bitdiff.py run \
++        --old-ptx <dir> --output <raw.json>
++
++Corpus coverage: random f32/bf16-rounded values, widths that are not
++multiples of 8/16, all-zero rows, signed zero, reachable absmax extremes
++(3.4e38 down to subnormals), exact RNE half-way ties on every boundary,
++near-tie adversarial rows built from reachable subnormal/normal scales,
++scale-underflow rows, and NaN/Inf rows (fail-closed contract behaviour).
++
++The device is used directly through ``CudaDriver``: no ``gamepc`` lock is
++taken for GPU-only work, and no remote file is left behind by this script.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import math
++import os
++import random
++import struct
++import sys
++import time
++from pathlib import Path
++from typing import Any, Dict, List, Sequence, Tuple
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++
++_F32 = struct.Struct("<f")
++_I32 = struct.Struct("<i")
++
++BLOCK = 128
++
++#: Shapes exercised both by the corpus and by the near-tie generator.  They
++#: include widths that are not multiples of 8/16 and rows > 128 (old grid > 1).
++CORPUS_SHAPES: Tuple[Tuple[int, int], ...] = (
++    (1, 1),
++    (1, 2),
++    (1, 4),
++    (1, 7),
++    (1, 17),
++    (1, 128),
++    (1, 129),
++    (2, 3),
++    (2, 5),
++    (3, 5),
++    (3, 16),
++    (4, 6),
++    (4, 9),
++    (4, 16),
++    (5, 8),
++    (5, 9),
++    (5, 33),
++    (7, 17),
++    (130, 17),
++    (200, 5),
++    (1, 1024),
++    (5, 1024),
++    (1, 8192),
++    (5, 4096),
++    (130, 257),
++)
++
++
++def _f32(value: float) -> float:
++    return _F32.unpack(_F32.pack(float(value)))[0]
++
++
++def _sf32(value: float):
++    try:
++        return _f32(value)
++    except OverflowError:
++        return None
++
++
++def _bf16_round(value: float) -> float:
++    bits = struct.unpack("<I", struct.pack("<f", _f32(value)))[0]
++    return struct.unpack("<f", struct.pack("<I", bits & 0xFFFF0000))[0]
++
++
++def _rne_integer(value: float) -> int:
++    floor = math.floor(value)
++    fraction = value - floor
++    if fraction < 0.5:
++        return floor
++    if fraction > 0.5:
++        return floor + 1
++    return floor if floor % 2 == 0 else floor + 1
++
++
++def _naive_disagreements(values: Sequence[float], rows: int, k: int) -> int:
++    """Elements where a plain f32 quotient changes the code vs f64 (host model)."""
++
++    count = 0
++    for row in range(rows):
++        row_values = [float(value) for value in values[row * k : (row + 1) * k]]
++        finite = [value for value in row_values if math.isfinite(value)]
++        if not finite:
++            continue
++        absmax = max(abs(value) for value in finite)
++        if absmax == 0.0:
++            continue
++        scale = _f32(absmax / 127.0)
++        if scale == 0.0:
++            continue
++        for value in finite:
++            ratio = value / float(scale)
++            if not math.isfinite(ratio):
++                continue
++            old = _rne_integer(ratio)
++            naive = _rne_integer(_f32(ratio))
++            if old != naive:
++                count += 1
++    return count
++
++
++def _quantize_ptx(rows: int, k: int) -> str:
++    """Render the quantize kernel of the tree currently on ``sys.path``."""
++
++    from pypto.compiler.targets.cuda import CUDA_PTX_VERSION
++    from pypto.compiler.targets.cuda_w8a8 import (
++        CUDA_W8A8_PTX_TARGET,
++        W8A8_QUANTIZE_MODE,
++        CudaW8A8OperationPlan,
++        render_w8a8_ptx,
++    )
++    from pypto.lowering.cpu import W8A8_QUANTIZE_OPCODE
++    from pypto.lowering.gpu.cuda_w8a8 import CUDA_W8A8_COMPENSATION
++
++    plan = CudaW8A8OperationPlan(
++        operation_index=0,
++        operation=W8A8_QUANTIZE_OPCODE,
++        kernel="px_w8a8_op0_quantize_per_token_s8",
++        mode=W8A8_QUANTIZE_MODE,
++        input_names=("values",),
++        output_names=("codes", "scales"),
++        input_dtype="float32",
++        codes_dtype="int8",
++        scales_dtype="float32",
++        rows=int(rows),
++        k=int(k),
++        input_shape=(int(rows), int(k)),
++        codes_shape=(int(rows), int(k)),
++        scales_shape=(int(rows),),
++        compensation=CUDA_W8A8_COMPENSATION,
++    )
++    return render_w8a8_ptx([plan], CUDA_W8A8_PTX_TARGET, CUDA_PTX_VERSION)
++
++
++def _random_values(rng: random.Random, count: int, low: int = -30, high: int = 30) -> List[float]:
++    return [_f32(rng.uniform(-1.0, 1.0) * 2.0 ** rng.randint(low, high)) for _ in range(count)]
++
++
++def _reachable_scales(rng: random.Random, wanted: int) -> List[float]:
++    """Scales ``s`` for which ``absmax = fl32(127*s)`` reproduces ``s``."""
++
++    found: List[float] = []
++    attempts = 0
++    while len(found) < wanted and attempts < 100000:
++        attempts += 1
++        exponent = rng.randint(-140, -1)
++        candidate = _sf32(2.0 ** exponent * rng.uniform(0.5, 2.0))
++        if candidate is None or candidate == 0.0:
++            continue
++        absmax = _sf32(127.0 * candidate)
++        if absmax is None or absmax == 0.0 or not math.isfinite(absmax):
++            continue
++        if _f32(absmax / 127.0) == candidate:
++            found.append(candidate)
++    return found
++
++
++def build_cases() -> List[Dict[str, Any]]:
++    """Deterministic adversarial corpus: ``[{name, rows, k, values, note}]``."""
++
++    rng = random.Random(20260912)
++    cases: List[Dict[str, Any]] = []
++
++    def add(
++        name: str,
++        rows: int,
++        k: int,
++        values: Sequence[float],
++        note: str,
++        expected_status: Sequence[int] = None,
++    ) -> None:
++        assert len(values) == rows * k, (name, len(values), rows, k)
++        cases.append(
++            {
++                "name": name,
++                "rows": rows,
++                "k": k,
++                "values": [float(_f32(value)) for value in values],
++                "note": note,
++                "expected_status": list(expected_status) if expected_status is not None else None,
++            }
++        )
++
++    # All-zero rows / signed zero.
++    add("zero_rows", 2, 8, [0.0] * 8 + _random_values(rng, 8), "one all-zero row, one random row")
++    add(
++        "negative_zero",
++        2,
++        4,
++        [-0.0] * 4 + [-0.0, 1.0, -1.0, 127.0],
++        "all -0.0 row (zero row contract) and a mixed -0.0 row",
++    )
++
++    # Exact RNE ties on every reachable boundary with scale == 1.0.
++    ties = [_f32(value + 0.5) for value in range(-127, 127)]
++    add("exact_half_way_ties", 1, len(ties), ties, "every k+0.5 boundary, absmax=127 -> scale 1.0")
++    add(
++        "exact_ties_three_rows",
++        3,
++        5,
++        [0.5, 1.5, 2.5, 3.5, 127.0]
++        + [-0.5, -1.5, -2.5, -3.5, 127.0]
++        + [0.0, 0.0, 0.0, 0.0, 0.0],
++        "ties-to-even positive/negative plus a zero row",
++    )
++
++    # Random f32 and bf16-rounded widths, including non-8/16 multiples.
++    for rows, k in CORPUS_SHAPES:
++        add("random_f32_{}x{}".format(rows, k), rows, k, _random_values(rng, rows * k), "random f32")
++    add(
++        "random_bf16_rounded_4x16",
++        4,
++        16,
++        [_bf16_round(value) for value in _random_values(rng, 64)],
++        "values exactly representable as bf16 (host conversion result)",
++    )
++
++    # Reachable absmax extremes.
++    add(
++        "extreme_absmax_large",
++        2,
++        9,
++        [
++            3.4028234663852886e38,
++            -3.4028234663852886e38,
++            1.0e38,
++            -1.0e38,
++            1.0,
++            -1.0,
++            0.0,
++            1.0e30,
++            -1.0e30,
++        ]
++        + _random_values(rng, 9),
++        "absmax = f32 max",
++    )
++    min_normal = 1.1754943508222875e-38
++    add(
++        "extreme_absmax_min_normal",
++        2,
++        9,
++        [
++            min_normal,
++            _f32(-min_normal / 2.0),
++            _f32(min_normal / 4.0),
++            _f32(-min_normal / 8.0),
++            0.0,
++            _f32(min_normal / 16.0),
++            _f32(-min_normal / 32.0),
++            _f32(min_normal / 64.0),
++            _f32(-min_normal / 128.0),
++        ]
++        + _random_values(rng, 9),
++        "absmax = smallest normal f32 -> subnormal scale path",
++    )
++    add(
++        "scale_underflow_and_mixed",
++        3,
++        4,
++        [1.0e-45, 0.0, 0.0, 0.0]
++        + [1.0e-40, -1.0e-40, 5.0e-41, -5.0e-41]
++        + _random_values(rng, 4),
++        "row 0 underflows the f32 scale (status 2); row 1 subnormal scale",
++        expected_status=[2, 0, 0],
++    )
++
++    # NaN / Inf fail-closed rows plus a valid row in the same launch.
++    add(
++        "nan_inf_rows",
++        4,
++        6,
++        [float("nan"), 1.0, 2.0, 3.0, 4.0, 5.0]
++        + [float("inf"), 1.0, 2.0, 3.0, 4.0, 5.0]
++        + [float("-inf"), -1.0, -2.0, -3.0, -4.0, -5.0]
++        + _random_values(rng, 6),
++        "rows 0-2 fail closed with status 1, row 3 must still be bit-exact",
++        expected_status=[1, 1, 1, 0],
++    )
++
++    # Near-tie adversarial rows built from reachable scales: values sit on
++    # k+0.5 boundaries and +/- one ulp next to them.
++    scales = _reachable_scales(rng, 24)
++    for index, scale in enumerate(scales):
++        absmax = _f32(127.0 * scale)
++        width = rng.randint(9, 33)
++        values = [absmax]
++        while len(values) < width:
++            boundary = rng.randint(-127, 126) + 0.5
++            target = _sf32(scale * boundary)
++            if target is None or target == 0.0:
++                continue
++            step = rng.choice((-1, 0, 1))
++            value = _sf32(target + step * math.ulp(target))
++            if value is None:
++                continue
++            values.append(value)
++        add(
++            "near_tie_{}".format(index),
++            1,
++            width,
++            values,
++            "reachable scale {!r}: f32 quotient lands on the half-way boundary".format(scale),
++        )
++
++    return cases
++
++
++def _sha256(raw: bytes) -> str:
++    return hashlib.sha256(raw).hexdigest()
++
++
++def _pack_f32(values: Sequence[float]) -> bytes:
++    return struct.pack("<{}f".format(len(values)), *values)
++
++
++def render_ptx_dir(output: Path) -> int:
++    output.mkdir(parents=True, exist_ok=True)
++    shapes = sorted({(case["rows"], case["k"]) for case in build_cases()})
++    for rows, k in shapes:
++        ptx = _quantize_ptx(rows, k)
++        path = output / "quantize_{}x{}.ptx".format(rows, k)
++        path.write_text(ptx)
++        print("rendered {} ({} bytes)".format(path, len(ptx)))
++    print("RENDER_PTX_OK {} shapes -> {}".format(len(shapes), output))
++    return 0
++
++
++def run_diff(old_dir: Path, output: Path, gpu_index: int = 0) -> int:
++    if str(REPO_ROOT / "python") not in sys.path:
++        sys.path.insert(0, str(REPO_ROOT / "python"))
++
++    from pypto.backends.cuda import CudaDriver, CudaRuntime
++
++    cases = build_cases()
++    shapes = sorted({(case["rows"], case["k"]) for case in cases})
++
++    new_ptx = {}
++    old_ptx = {}
++    for rows, k in shapes:
++        new_ptx[(rows, k)] = _quantize_ptx(rows, k)
++        path = old_dir / "quantize_{}x{}.ptx".format(rows, k)
++        if not path.is_file():
++            raise SystemExit("missing old PTX: {}".format(path))
++        old_ptx[(rows, k)] = path.read_text()
++        if "div.rn.f64" not in old_ptx[(rows, k)]:
++            raise SystemExit("old PTX {} is not kernel version 1 (no div.rn.f64)".format(path))
++        if "div.rn.f64" in new_ptx[(rows, k)]:
++            raise SystemExit("new PTX {} still contains div.rn.f64".format(path))
++
++    driver = CudaDriver()
++    device_info = driver.device_info(gpu_index)
++    runtime = CudaRuntime(driver=driver, device_index=gpu_index)
++    runtime._ensure_context()
++
++    report: Dict[str, Any] = {
++        "artifact_kind": "pypto-x.c6-w8a8-quantize-bitdiff",
++        "schema_version": 1,
++        "started_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++        "git": os.environ.get("C6_GIT_HEAD"),
++        "worktree": os.environ.get("C6_WORKTREE", str(REPO_ROOT)),
++        "device": device_info.to_dict() if hasattr(device_info, "to_dict") else str(device_info),
++        "python": sys.version,
++        "old_ptx_dir": str(old_dir),
++        "geometry": {
++            "block": BLOCK,
++            "old_launch_domain": "rows (grid = ceil(rows/128), one serial thread per row)",
++            "new_launch_domain": "rows * 128 (grid = rows, one block per row)",
++        },
++        "corpus": {
++            "cases": len(cases),
++            "shapes": ["{}x{}".format(rows, k) for rows, k in shapes],
++            "elements": sum(case["rows"] * case["k"] for case in cases),
++            "notes": [
++                "random f32 / bf16-rounded values",
++                "widths not multiples of 8/16; rows > 128",
++                "all-zero rows, -0.0",
++                "reachable absmax extremes (f32 max, min normal, subnormal scale)",
++                "exact RNE half-way ties on every boundary",
++                "near-tie adversarial rows for reachable scales",
++                "scale-underflow rows (status 2)",
++                "NaN/Inf rows (status 1) beside valid rows",
++            ],
++        },
++        "cases": [],
++    }
++
++    failures: List[str] = []
++    sanity_failures: List[str] = []
++    for case in cases:
++        rows, k = case["rows"], case["k"]
++        shape = (rows, k)
++        old_module = driver.module_load_data(old_ptx[shape])
++        new_module = driver.module_load_data(new_ptx[shape])
++        old_kernel = old_module.get_function("px_w8a8_op0_quantize_per_token_s8")
++        new_kernel = new_module.get_function("px_w8a8_op0_quantize_per_token_s8")
++        pointers = []
++        try:
++            values_ptr = driver.mem_alloc(rows * k * 4)
++            pointers.append(values_ptr)
++            codes_ptr = driver.mem_alloc(max(1, rows * k))
++            pointers.append(codes_ptr)
++            scales_ptr = driver.mem_alloc(rows * 4)
++            pointers.append(scales_ptr)
++            sat_ptr = driver.mem_alloc(rows * 4)
++            pointers.append(sat_ptr)
++            status_ptr = driver.mem_alloc(rows * 4)
++            pointers.append(status_ptr)
++            zero_status = b"\0" * (rows * 4)
++            zero_codes = b"\0" * (rows * k)
++            zero_scales = b"\0" * (rows * 4)
++            driver.memcpy_htod(values_ptr, _pack_f32(case["values"]))
++            old_params = (values_ptr, codes_ptr, scales_ptr, sat_ptr, status_ptr)
++            new_params = (values_ptr, codes_ptr, scales_ptr, sat_ptr, status_ptr)
++            old_grid = ((rows + BLOCK - 1) // BLOCK, 1, 1)
++            new_grid = (rows, 1, 1)
++            # Both kernels must start from identical, zeroed output buffers.
++            driver.memcpy_htod(codes_ptr, zero_codes)
++            driver.memcpy_htod(scales_ptr, zero_scales)
++            driver.memcpy_htod(sat_ptr, zero_scales)
++            driver.memcpy_htod(status_ptr, zero_status)
++            driver.launch_kernel(old_kernel, old_grid, (BLOCK, 1, 1), old_params, None, 0)
++            driver.context_synchronize()
++            old_codes = driver.memcpy_dtoh(codes_ptr, rows * k)
++            old_scales = driver.memcpy_dtoh(scales_ptr, rows * 4)
++            old_sat = driver.memcpy_dtoh(sat_ptr, rows * 4)
++            old_status = driver.memcpy_dtoh(status_ptr, rows * 4)
++            driver.memcpy_htod(codes_ptr, zero_codes)
++            driver.memcpy_htod(scales_ptr, zero_scales)
++            driver.memcpy_htod(sat_ptr, zero_scales)
++            driver.memcpy_htod(status_ptr, zero_status)
++            driver.launch_kernel(new_kernel, new_grid, (BLOCK, 1, 1), new_params, None, 0)
++            driver.context_synchronize()
++            new_codes = driver.memcpy_dtoh(codes_ptr, rows * k)
++            new_scales = driver.memcpy_dtoh(scales_ptr, rows * 4)
++            new_sat = driver.memcpy_dtoh(sat_ptr, rows * 4)
++            new_status = driver.memcpy_dtoh(status_ptr, rows * 4)
++        finally:
++            for pointer in pointers:
++                try:
++                    driver.mem_free(pointer)
++                except Exception:
++                    pass
++            for module in (old_module, new_module):
++                try:
++                    module.close()
++                except Exception:
++                    pass
++
++        status_words = [int(value) for value in struct.unpack("<{}i".format(rows), old_status)]
++        entry = {
++            "name": case["name"],
++            "rows": rows,
++            "k": k,
++            "note": case["note"],
++            "old_grid": list(old_grid),
++            "new_grid": list(new_grid),
++            "status_words": status_words,
++            "expected_status": case["expected_status"],
++            "codes_nonzero": sum(1 for value in old_codes if value != 0),
++            "codes_bytes": len(old_codes),
++            "scales_finite": sum(
++                1 for value in struct.unpack("<{}f".format(rows), old_scales) if math.isfinite(value)
++            ),
++            "naive_f32_disagreements_host_model": _naive_disagreements(case["values"], rows, k),
++        }
++        if case["expected_status"] is not None and status_words != case["expected_status"]:
++            sanity_failures.append(
++                "{}.status_sanity expected {} got {}".format(
++                    case["name"], case["expected_status"], status_words
++                )
++            )
++        for label, old_raw, new_raw in (
++            ("codes", old_codes, new_codes),
++            ("scales", old_scales, new_scales),
++            ("saturation", old_sat, new_sat),
++            ("status", old_status, new_status),
++        ):
++            entry[label] = {
++                "old_sha256": _sha256(old_raw),
++                "new_sha256": _sha256(new_raw),
++                "bytes": len(old_raw),
++                "equal": old_raw == new_raw,
++            }
++            if old_raw != new_raw:
++                failures.append("{}.{}".format(case["name"], label))
++        entry["pass"] = all(entry[label]["equal"] for label in ("codes", "scales", "saturation", "status"))
++        report["cases"].append(entry)
++
++    if not any(entry["codes_nonzero"] for entry in report["cases"]):
++        sanity_failures.append("degenerate output: no nonzero codes in the whole corpus")
++    if not any(entry["naive_f32_disagreements_host_model"] for entry in report["cases"]):
++        sanity_failures.append("degenerate corpus: no naive-f32 disagreement cases")
++    report["summary"] = {
++        "cases": len(cases),
++        "failures": failures,
++        "sanity_failures": sanity_failures,
++        "naive_f32_disagreements_host_model_total": sum(
++            entry["naive_f32_disagreements_host_model"] for entry in report["cases"]
++        ),
++        "status": "PASS" if not failures and not sanity_failures else "FAIL",
++    }
++    report["finished_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++    output.parent.mkdir(parents=True, exist_ok=True)
++    output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
++    print(
++        "bitdiff: {} cases, {} -> {} ({})".format(
++            len(cases), report["summary"]["status"], output, ", ".join(failures[:5]) or "no mismatch"
++        )
++    )
++    return 0 if not failures and not sanity_failures else 1
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    sub = parser.add_subparsers(dest="command", required=True)
++    render = sub.add_parser("render-ptx", help="render the current tree's quantize PTX per shape")
++    render.add_argument("--output", required=True)
++    run = sub.add_parser("run", help="execute old vs new PTX on the device and compare bytes")
++    run.add_argument("--old-ptx", required=True)
++    run.add_argument("--output", required=True)
++    run.add_argument("--gpu-index", type=int, default=0)
++    args = parser.parse_args(argv)
++    if args.command == "render-ptx":
++        return render_ptx_dir(Path(args.output))
++    return run_diff(Path(args.old_ptx), Path(args.output), args.gpu_index)
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/perf/c6_timing_harness.py b/scripts/perf/c6_timing_harness.py
+index fc76ef82b..d67c99aff 100644
+--- a/scripts/perf/c6_timing_harness.py
++++ b/scripts/perf/c6_timing_harness.py
+@@ -745,7 +745,10 @@ def launch_plan_for_case(runtime, plan, case, buffers):
+         count = m * n
+         parameters = [buffers["codes"], buffers["scales"], buffers["output"]]
+     elif opcode == "quantize_per_token_s8":
+-        count = m
++        # Block-per-row kernel (R6 quantize rewrite): launch domain is
++        # rows * block so that grid.x == rows, mirroring
++        # CudaRuntime.run_w8a8_quantize_per_token_s8.
++        count = m * int(CUDA_W8A8_BLOCK)
+         parameters = [
+             buffers["values"],
+             buffers["codes"],
+diff --git a/scripts/perf/c6_timing_selftest.py b/scripts/perf/c6_timing_selftest.py
+index 2421daff0..6065d0036 100644
+--- a/scripts/perf/c6_timing_selftest.py
++++ b/scripts/perf/c6_timing_selftest.py
+@@ -118,7 +118,8 @@ def test_launch_plan_mapping():
+             assert count == m * n
+             assert parameters == [pointers["codes"], pointers["scales"], pointers["output"]]
+         elif opcode == "quantize_per_token_s8":
+-            assert count == m and grid == ((m + 127) // 128, 1, 1)
++            # Block-per-row kernel (R6 quantize rewrite): grid.x == rows.
++            assert count == m * 128 and grid == (m, 1, 1)
+             assert parameters == [
+                 pointers["values"],
+                 pointers["codes"],

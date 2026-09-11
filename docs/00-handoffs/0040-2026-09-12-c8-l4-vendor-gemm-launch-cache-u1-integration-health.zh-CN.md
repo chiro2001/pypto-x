@@ -17,10 +17,12 @@
 ```text
 upstream base        34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad
 integration base     195ace3eb8a521950c72ffc62f0349aed6c7ac04（0039 交接点）
-integration head     TBD_AT_FREEZE（本批已知节点：健康检查受检 7e2aea514 → D-1/D-2 修复 77981213e → U1 回修 8360a9aee → C7 工具修复 dcb8ae7fc → Q9 op-bench 合入 140c88446 → D-3 修复后为最终 tip）
-patches              TBD_AT_FREEZE（0039 收口后为 144）
-控制仓 main          TBD_AT_FREEZE（本批本地提交，未推送）
+integration head     c63558e9e9550ff59737ab8790c87cf3780c0e67（本批 75 提交）
+patches              217（patches/pypto-x，SERIES 217 行）
+控制仓 main          本次收口提交（本地，未推送；上次 push 为 7857ae6、补丁 144）
 ```
+
+**导出复核（2026-09-12 收口时实测）**：`git clone --shared` 上游 → checkout base → `git am patches/pypto-x/*.patch`（217 个）→ 结果 **tree = `93f75ff51efa56c8853f0976dc2b5e4ed970aecb`，与 integration tip `c63558e9e` 的 tree 逐字相同**，`am_rc=0`。本批关键集成节点：健康检查受检 `7e2aea514` → D-1/D-2 修复 `77981213e` → U1 回修 `8360a9aee` → C7 工具修复 `dcb8ae7fc` → Q9 op-bench 合入 `140c88446` → D-3 修复 `c63558e9e`（最终）。
 
 本批新增/合入的提交以 `development_lock.yaml` 的 `integration_commits` 为准；父 agent 已用
 `git merge-base --is-ancestor` 对全部 22 个登记 SHA（外加一个 8 提交区间）做过**祖先审计**（`integration_history_audit_2026_09_12`），结论 0 缺失。
@@ -92,7 +94,7 @@ patches              TBD_AT_FREEZE（0039 收口后为 144）
 
 ## 10. 在途与排队（收口时按 lock 更新）
 
-`verify-c6-harness-preflight-fold`（D-1/D-2 验收 + 新 tip 全量）｜`verify-sve256-int8-layout`（Q10）｜`op-bench-framework`（Q9）｜`c7-decode-gap-localization`（oracle swap）｜`u1-matmul-policy-slice` 回修 + 复验｜`avx2-layout-native`（本批外，AVX2 原生 layout）｜A3 相关 leg 全部 `PENDING_A3_OUTAGE`。
+收口时全部落地：`verify-c6-harness-preflight-fold` **PASS**（最终 tip `c63558e9e` 全量 1438/1431/7/0/0）｜`verify-u1-matmul-policy-slice` **PASS_WITH_BOUNDARIES**｜`verify-sve256-int8-layout` **PASS_WITH_BOUNDARIES**（仅 A3 leg `PENDING_A3_OUTAGE`）｜`op-bench-framework` x86 全绿（其独立验收在收口时进行中）｜`c7-decode-gap-localization` 四问闭环 + 下钻完成｜`avx2-layout-native` **完成、待验收、刻意不并入本批**（下一批）。
 
 ## 11. 待用户决策（7 项，见 `pending_user_decisions_2026_09_11`）
 

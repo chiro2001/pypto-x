@@ -1,0 +1,703 @@
+From e9122aae2b4cf7bebfdf3490a84d835cd9f3e982 Mon Sep 17 00:00:00 2001
+From: c8-axis-b-probe <agent@pypto-x.local>
+Date: Sat, 12 Sep 2026 01:31:46 +0800
+Subject: [PATCH 152/217] probe(c8-q4): add A3 aarch64 vllm-cpu install/run
+ probes and torchao consumer probe
+
+---
+ scripts/c8_axis_b_probe/02_vllm_cpu_layer_probe.py  |   5 +-
+ scripts/c8_axis_b_probe/04_torchao_consume_probe.py | 109 ++++++++++++++++++++
+ scripts/c8_axis_b_probe/12_a3_wheel_check.sh        |  22 ++++
+ scripts/c8_axis_b_probe/13_a3_install_vllm_cpu.sh   |  82 +++++++++++++++
+ scripts/c8_axis_b_probe/14_a3_cpu_probe.py          | 152 ++++++++++++++++++++++++++++
+ scripts/c8_axis_b_probe/20_cublaslt_int8_probe.cu   | 216 ++++++++++++++++++++++++++++++++++++++++
+ scripts/c8_axis_b_probe/20_gamepc_probe_local.sh    |  40 ++++++++
+ 7 files changed, 624 insertions(+), 2 deletions(-)
+
+diff --git a/scripts/c8_axis_b_probe/02_vllm_cpu_layer_probe.py b/scripts/c8_axis_b_probe/02_vllm_cpu_layer_probe.py
+index 9c12b378c..010917f46 100644
+--- a/scripts/c8_axis_b_probe/02_vllm_cpu_layer_probe.py
++++ b/scripts/c8_axis_b_probe/02_vllm_cpu_layer_probe.py
+@@ -184,7 +184,7 @@ def run_one_tensor(name, codes, scales, seed, m=8):
+             entry["vllm_vs_contract"] = compare_bf16(y, ref_bf16)
+             entry["vllm_vs_goldlike"] = compare_bf16(y, gold_bf16)
+             entry["contract_vs_goldlike"] = compare_bf16(ref_bf16, gold_bf16)
+-            out[tag] = {"vllm": y, "contract": ref_bf16, "goldlike": gold_bf16}
++            out[tag] = {"vllm": y, "contract": ref_bf16, "goldlike": gold_bf16, "x": x}
+         else:
+             assert y.dtype == torch.float32
+             y_np = y.numpy().astype(np.float32)
+@@ -213,7 +213,7 @@ def run_one_tensor(name, codes, scales, seed, m=8):
+             entry["vllm_bf16cast_vs_contract"] = compare_bf16(
+                 y.to(torch.bfloat16), ref_bf16
+             )
+-            out[tag] = {"vllm": y, "contract": ref_fp32, "goldlike": gold_fp32}
++            out[tag] = {"vllm": y, "contract": ref_fp32, "goldlike": gold_fp32, "x": x}
+         result[tag] = entry
+ 
+     # 4) activation-quantizer equivalence on random + crafted rows
+@@ -335,6 +335,7 @@ def main(argv=None):
+             outputs["%s.%s.vllm" % (name, tag)] = as_np(tensors["vllm"])
+             outputs["%s.%s.contract" % (name, tag)] = as_np(tensors["contract"])
+             outputs["%s.%s.goldlike" % (name, tag)] = as_np(tensors["goldlike"])
++            outputs["%s.%s.x" % (name, tag)] = as_np(tensors["x"])
+         print("[probe] %s done wall=%.2fs" % (name, result["wall_s"]), flush=True)
+ 
+     np.savez(args.out_npz, **outputs)
+diff --git a/scripts/c8_axis_b_probe/04_torchao_consume_probe.py b/scripts/c8_axis_b_probe/04_torchao_consume_probe.py
+new file mode 100644
+index 000000000..8b6f217f8
+--- /dev/null
++++ b/scripts/c8_axis_b_probe/04_torchao_consume_probe.py
+@@ -0,0 +1,109 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""C8 Q4 axis-B alternative-stack probe: torchao 0.18.0.
++
++Question: can torchao build an int8-dynamic-activation / int8-weight linear
++from OUR pre-quantized int8 codes + OUR fp32 per-channel scales WITHOUT
++re-quantizing the weights, and does it agree with the x86 vLLM/contract
++results?
++
++torchao is imported from an unpacked wheel via PYTHONPATH (no install).
++Its public scheme entry point is Int8DynamicActivationInt8WeightConfig, whose
++transform calls ``Int8Tensor.from_hp`` (re-quantizes from fp).  The low-level
++``Int8Tensor(qdata, scale, block_size, dtype, act_quant_kwargs=...)``
++constructor is what we exercise here to inject our artifact directly.
++"""
++
++import argparse
++import json
++import sys
++import traceback
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++
++from torchao.quantization.granularity import PerRow
++from torchao.quantization.quant_primitives import MappingType
++from torchao.quantization.quantize_.workflows.int8.int8_tensor import (
++    Int8Tensor,
++    QuantizeTensorToInt8Kwargs,
++)
++
++
++def bf16_bits(t):
++    return t.contiguous().view(torch.int16).cpu().numpy().astype(np.int32)
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--artifact-npz", required=True)
++    parser.add_argument("--x86-outputs", required=True)
++    parser.add_argument("--out-json", required=True)
++    parser.add_argument("--mapping-type", default="SYMMETRIC",
++                        choices=["SYMMETRIC", "SYMMETRIC_NO_CLIPPING_ERR", "ASYMMETRIC"])
++    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
++
++    import torchao
++
++    art = np.load(args.artifact_npz)
++    x86 = np.load(args.x86_outputs)
++    names = sorted({k[: -len("__codes")] for k in art.files if k.endswith("__codes")})
++    report = {
++        "schema": "pypto-x.c8-axis-b-probe.torchao.v1",
++        "torchao_version": torchao.__version__,
++        "torch_version": torch.__version__,
++        "mapping_type": args.mapping_type,
++        "entry_point_note": "Int8DynamicActivationInt8WeightConfig -> Int8Tensor.from_hp "
++                            "(re-quantizes); low-level Int8Tensor ctor used here to inject "
++                            "our pre-quantized codes+scales",
++        "tensors": [],
++    }
++    for name in names:
++        entry = {"name": name}
++        try:
++            codes = torch.from_numpy(art[name + "__codes"].astype(np.int8))
++            scales = torch.from_numpy(art[name + "__scales"].astype(np.float32).reshape(-1, 1))
++            n, k = codes.shape
++            x = torch.from_numpy(x86["%s.bf16.x" % name].astype(np.float32)).to(torch.bfloat16)
++            wt = Int8Tensor(
++                qdata=codes,
++                scale=scales,
++                block_size=[1, k],
++                dtype=torch.bfloat16,
++                zero_point=None,
++                act_quant_kwargs=QuantizeTensorToInt8Kwargs(
++                    granularity=PerRow(),
++                    mapping_type=getattr(MappingType, args.mapping_type),
++                ),
++            )
++            y = F.linear(x, wt)
++            y = y if isinstance(y, torch.Tensor) else y[0]
++            x86_vllm = torch.from_numpy(x86["%s.bf16.vllm" % name].astype(np.float32)).to(torch.bfloat16)
++            x86_contract = torch.from_numpy(x86["%s.bf16.contract" % name].astype(np.float32)).to(torch.bfloat16)
++            yb = bf16_bits(y.to(torch.bfloat16)).reshape(-1)
++            vb = bf16_bits(x86_vllm).reshape(-1)
++            cb = bf16_bits(x86_contract).reshape(-1)
++            entry.update({
++                "status": "ok",
++                "shape": [int(n), int(k)],
++                "output_dtype": str(y.dtype),
++                "vs_x86_vllm_n_diff_bf16": int((yb != vb).sum()),
++                "vs_x86_vllm_n_total": int(yb.size),
++                "vs_x86_vllm_max_abs": float((y.float() - x86_vllm.float()).abs().max()),
++                "vs_x86_contract_n_diff_bf16": int((yb != cb).sum()),
++                "vs_x86_contract_max_abs": float((y.float() - x86_contract.float()).abs().max()),
++            })
++        except Exception:
++            entry["status"] = "ERROR"
++            entry["error"] = traceback.format_exc()
++        report["tensors"].append(entry)
++        print("[torchao] %s %s" % (name, entry.get("status")), flush=True)
++
++    with open(args.out_json, "w", encoding="utf-8") as handle:
++        json.dump(report, handle, indent=1, sort_keys=True)
++    print(json.dumps(report, indent=1, sort_keys=True)[:4000])
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/c8_axis_b_probe/12_a3_wheel_check.sh b/scripts/c8_axis_b_probe/12_a3_wheel_check.sh
+new file mode 100644
+index 000000000..a72a4e995
+--- /dev/null
++++ b/scripts/c8_axis_b_probe/12_a3_wheel_check.sh
+@@ -0,0 +1,22 @@
++#!/usr/bin/env bash
++# A3 follow-up (light): do aarch64 wheels exist for vllm-cpu / vllm on the
++# NJU mirror?  Metadata only: fetch the simple-index HTML and list filenames.
++set -uo pipefail
++ENV_PY="$HOME/pypto-x-a3/envs/pypto-x-c8/bin/python"
++MIRROR="${MIRROR:-https://mirror.nju.edu.cn/pypi/web/simple}"
++echo "### wheel availability check $(date -u +%Y-%m-%dT%H:%M:%SZ)"
++echo "mirror=$MIRROR"
++for pkg in vllm-cpu vllm; do
++    echo "--- $pkg ---"
++    html="$(curl -s --max-time 40 "$MIRROR/$pkg/" || true)"
++    echo "html_bytes=${#html}"
++    echo "$html" | tr '>' '\n' | grep -oE '[A-Za-z0-9_.+-]+\.whl' | sort -u > /tmp/c8q4_${pkg}_wheels.txt
++    echo "total_unique_wheels=$(wc -l < /tmp/c8q4_${pkg}_wheels.txt)"
++    echo "aarch64_wheels:"
++    grep -E 'aarch64|arm64' /tmp/c8q4_${pkg}_wheels.txt | head -10 || echo "  (none)"
++    echo "0.29.0_wheels:"
++    grep -E '0\.29\.0(-|\.)' /tmp/c8q4_${pkg}_wheels.txt | head -10 || echo "  (none)"
++    echo "aarch64_0.29.0_wheels:"
++    grep -E '0\.29\.0(-|\.)' /tmp/c8q4_${pkg}_wheels.txt | grep -E 'aarch64|arm64' | head -5 || echo "  (none)"
++done
++echo "### done $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+diff --git a/scripts/c8_axis_b_probe/13_a3_install_vllm_cpu.sh b/scripts/c8_axis_b_probe/13_a3_install_vllm_cpu.sh
+new file mode 100644
+index 000000000..13bd9a5e0
+--- /dev/null
++++ b/scripts/c8_axis_b_probe/13_a3_install_vllm_cpu.sh
+@@ -0,0 +1,82 @@
++#!/usr/bin/env bash
++# A3 follow-up: create a NEW, removable aarch64 venv with system-site-packages
++# (reusing the Q1 pypto-x-c8 torch/transformers) and install the aarch64
++# vllm-cpu 0.29.0 wheel with --no-deps, then reproduce the x86 single-layer
++# results with OUR artifact.
++#
++# Writes only under ~/pypto-x-a3/** (PIP_CACHE_DIR / TMPDIR / venv / wheel).
++set -uo pipefail
++
++BASE="$HOME/pypto-x-a3"
++RUN="$BASE/c8axisb"
++ENV_BASE="$BASE/envs/pypto-x-c8"
++VENV="$BASE/envs/pypto-x-c8-axisb"
++PY_BASE="$ENV_BASE/bin/python"
++MIRROR="${MIRROR:-https://mirror.nju.edu.cn/pypi/web/simple}"
++WHEEL_DIR="$RUN/wheel"
++LOG="$RUN/logs/13_a3_install.log"
++
++export PIP_CACHE_DIR="$RUN/pip-cache"
++export TMPDIR="$RUN/tmp"
++mkdir -p "$PIP_CACHE_DIR" "$TMPDIR" "$WHEEL_DIR" "$RUN/logs"
++
++echo "### A3 vllm-cpu aarch64 install probe $(date -u +%Y-%m-%dT%H:%M:%SZ)"
++echo "base_python=$($PY_BASE -VV 2>&1)"
++
++echo "--- locate aarch64 wheel ---"
++RAW_HREF="$(curl -s --max-time 60 "$MIRROR/vllm-cpu/" | tr '>' '\n' \
++    | grep -oE 'href="[^"]*vllm_cpu-0\.29\.0[^"]*aarch64\.whl[^"]*"' | head -1 \
++    | sed 's/^href="//; s/"$//')"
++echo "raw_href=$RAW_HREF"
++WHEEL_URL="$("$PY_BASE" - "$MIRROR/vllm-cpu/" "$RAW_HREF" <<'PY'
++import sys
++from urllib.parse import urljoin
++base, href = sys.argv[1], sys.argv[2]
++print(urljoin(base, href.split('#')[0]))
++PY
++)"
++echo "wheel_url=$WHEEL_URL"
++echo -n "content_length_bytes="
++curl -sIL --max-time 60 "$WHEEL_URL" | grep -i '^content-length' | tail -1 | tr -d '\r' || echo unknown
++
++echo "--- venv (system-site-packages => reuse Q1 torch 2.14.0+cu130, transformers 5.17.0) ---"
++rm -rf "$VENV"
++"$PY_BASE" -m venv --system-site-packages "$VENV" || { echo "venv_failed"; exit 1; }
++"$VENV/bin/python" -c "import torch, transformers; print('inherited torch', torch.__version__, 'transformers', transformers.__version__)"
++
++echo "--- download + install vllm-cpu wheel (--no-deps) ---"
++timeout 900 "$VENV/bin/pip" download --no-deps -d "$WHEEL_DIR" "$WHEEL_URL" 2>&1 | tail -3
++WHEEL="$(ls "$WHEEL_DIR"/vllm_cpu-0.29.0*aarch64*.whl 2>/dev/null | head -1)"
++if [[ -z "$WHEEL" ]]; then echo "wheel_download_FAILED"; exit 1; fi
++ls -la "$WHEEL"
++"$VENV/bin/pip" install --no-deps --no-index "$WHEEL" 2>&1 | tail -3
++
++echo "--- install remaining dist requirements (skip torch; reuse inherited) ---"
++"$VENV/bin/python" - "$WHEEL" <<'PY' > "$RUN/logs/13_requirements.txt"
++import sys, zipfile, re
++wheel = sys.argv[1]
++with zipfile.ZipFile(wheel) as z:
++    meta = [n for n in z.namelist() if n.endswith('.dist-info/METADATA')][0]
++    text = z.read(meta).decode('utf-8', 'replace')
++for line in text.splitlines():
++    if line.startswith('Requires-Dist:'):
++        req = line.split(':', 1)[1].strip()
++        # keep environment markers (e.g. `; extra == "image"`) so pip skips
++        # optional extras instead of installing the whole closure
++        print(req)
++PY
++grep -viE '^torch([=<> ]|$)|^nvidia|^triton' "$RUN/logs/13_requirements.txt" > "$RUN/logs/13_requirements_filtered.txt" || true
++wc -l "$RUN/logs/13_requirements_filtered.txt"
++mapfile -t DEPS < "$RUN/logs/13_requirements_filtered.txt"
++timeout 900 "$VENV/bin/pip" install --no-input "${DEPS[@]}" 2>&1 | tail -5
++echo "pip_install_rc=$?"
++
++echo "--- run the cross-architecture single-layer probe ---"
++timeout 900 "$VENV/bin/python" "$RUN/scripts/14_a3_cpu_probe.py" \
++    --artifact-npz "$RUN/artifact/our_artifact_subset.npz" \
++    --x86-outputs "$RUN/artifact/vllm_cpu_layer_probe_outputs.npz" \
++    --out-json "$RUN/logs/14_a3_cpu_probe.json" \
++    > "$RUN/logs/14_a3_cpu_probe.stdout.log" 2>&1
++echo "probe_rc=$?"
++tail -30 "$RUN/logs/14_a3_cpu_probe.stdout.log"
++echo "### done $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+diff --git a/scripts/c8_axis_b_probe/14_a3_cpu_probe.py b/scripts/c8_axis_b_probe/14_a3_cpu_probe.py
+new file mode 100644
+index 000000000..786c9af09
+--- /dev/null
++++ b/scripts/c8_axis_b_probe/14_a3_cpu_probe.py
+@@ -0,0 +1,152 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""A3 follow-up: run the SAME single-layer artifact probe on aarch64
++(vLLM-CPU 0.29.0 aarch64 wheel) and compare with the x86 results bitwise.
++
++Inputs:
++  --artifact-npz   our frozen int8 codes + fp32 scales (from 01)
++  --x86-outputs    x86 probe outputs (contains the exact activation inputs
++                   under ``<name>.bf16.x`` plus vLLM/contract outputs)
++
++This test does not import pypto: it feeds the exact x86 activation tensors so
++the comparison is an apples-to-apples cross-architecture check.
++
++Output: JSON with per-tensor results; every failure is captured, not raised.
++"""
++
++import argparse
++import json
++import sys
++import traceback
++
++import numpy as np
++import torch
++
++CONFIG = {
++    "config_groups": {"group_0": {
++        "targets": ["Linear"],
++        "weights": {"num_bits": 8, "type": "int", "symmetric": True,
++                    "strategy": "channel", "dynamic": False},
++        "input_activations": {"num_bits": 8, "type": "int", "symmetric": True,
++                              "strategy": "token", "dynamic": True},
++    }},
++    "quant_method": "compressed-tensors",
++    "format": "int-quantized",
++    "ignore": [],
++}
++
++
++def bf16_bits(t):
++    return t.contiguous().view(torch.int16).cpu().numpy().astype(np.int32)
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--artifact-npz", required=True)
++    parser.add_argument("--x86-outputs", required=True)
++    parser.add_argument("--out-json", required=True)
++    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
++
++    report = {
++        "schema": "pypto-x.c8-axis-b-probe.a3-layer.v1",
++        "machine": __import__("platform").machine(),
++        "torch_version": torch.__version__,
++        "vllm_version": None,
++        "platform_class": None,
++        "cpu_int8_op_probe": None,
++        "tensors": [],
++    }
++
++    try:
++        import vllm
++        import vllm.distributed.parallel_state as ps
++
++        report["vllm_version"] = vllm.__version__
++        ps.init_distributed_environment(
++            world_size=1, rank=0,
++            distributed_init_method="tcp://127.0.0.1:29551",
++            local_rank=0, backend="gloo",
++        )
++        ps._TP = ps._WORLD
++        from vllm.platforms import current_platform
++
++        report["platform_class"] = type(current_platform).__name__
++    except Exception:
++        report["setup_error"] = traceback.format_exc()
++        with open(args.out_json, "w", encoding="utf-8") as handle:
++            json.dump(report, handle, indent=1, sort_keys=True)
++        print(json.dumps(report, indent=1, sort_keys=True))
++        return
++
++    # raw op presence
++    try:
++        from vllm import _custom_ops as ops
++
++        x = torch.randn(2, 8, dtype=torch.bfloat16)
++        out, s, _ = ops.onednn_scaled_int8_quant(x, None, None, True)
++        report["cpu_int8_op_probe"] = {
++            "ok": True, "codes_dtype": str(out.dtype), "scale_dtype": str(s.dtype)
++        }
++    except Exception as exc:
++        report["cpu_int8_op_probe"] = "ERROR %s: %s" % (type(exc).__name__, exc)
++
++    art = np.load(args.artifact_npz)
++    x86 = np.load(args.x86_outputs)
++    names = sorted({k[: -len("__codes")] for k in art.files if k.endswith("__codes")})
++    for name in names:
++        entry = {"name": name}
++        try:
++            codes = art[name + "__codes"].astype(np.int8)
++            scales = art[name + "__scales"].astype(np.float32)
++            n, k = codes.shape
++            x = torch.from_numpy(x86["%s.bf16.x" % name].astype(np.float32)).to(torch.bfloat16)
++
++            from vllm.model_executor.layers.linear import ReplicatedLinear
++            from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (
++                CompressedTensorsConfig,
++            )
++
++            qc = CompressedTensorsConfig.from_config(json.loads(json.dumps(CONFIG)))
++            layer = ReplicatedLinear(k, n, bias=False, params_dtype=torch.bfloat16,
++                                     quant_config=qc, prefix="probe." + name, disable_tp=True)
++            entry["scheme"] = type(layer.scheme).__name__
++            entry["kernel"] = type(layer.scheme.kernel).__name__
++            layer.weight.data.copy_(torch.from_numpy(codes.copy()))
++            layer.weight_scale.data.copy_(torch.from_numpy(scales.reshape(n, 1).copy()))
++            layer.quant_method.process_weights_after_loading(layer)
++            y = layer.forward(x)
++            y = y[0] if isinstance(y, tuple) else y
++            x86_vllm = torch.from_numpy(
++                x86["%s.bf16.vllm" % name].astype(np.float32)
++            ).to(torch.bfloat16)
++            x86_contract = torch.from_numpy(
++                x86["%s.bf16.contract" % name].astype(np.float32)
++            ).to(torch.bfloat16)
++            yb, vb = bf16_bits(y).reshape(-1), bf16_bits(x86_vllm).reshape(-1)
++            cb = bf16_bits(x86_contract).reshape(-1)
++            entry.update({
++                "output_dtype": str(y.dtype),
++                "vs_x86_vllm_n_diff_bf16": int((yb != vb).sum()),
++                "vs_x86_vllm_n_total": int(yb.size),
++                "vs_x86_vllm_max_abs": float(
++                    (y.float() - x86_vllm.float()).abs().max()
++                ),
++                "vs_x86_contract_n_diff_bf16": int((yb != cb).sum()),
++                "vs_x86_contract_max_abs": float(
++                    (y.float() - x86_contract.float()).abs().max()
++                ),
++                "status": "ok",
++            })
++        except Exception:
++            entry["status"] = "ERROR"
++            entry["error"] = traceback.format_exc()
++        report["tensors"].append(entry)
++        print("[a3] %s %s" % (name, entry.get("status")), flush=True)
++
++    with open(args.out_json, "w", encoding="utf-8") as handle:
++        json.dump(report, handle, indent=1, sort_keys=True)
++    print(json.dumps(report, indent=1, sort_keys=True)[:4000])
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/c8_axis_b_probe/20_cublaslt_int8_probe.cu b/scripts/c8_axis_b_probe/20_cublaslt_int8_probe.cu
+new file mode 100644
+index 000000000..471d07d30
+--- /dev/null
++++ b/scripts/c8_axis_b_probe/20_cublaslt_int8_probe.cu
+@@ -0,0 +1,216 @@
++// C8 Q4 axis-B existence probe on GamePC RTX 5080 (sm_120):
++// does cuBLASLt / cuBLAS support INT8 GEMM, and specifically INT8 + scale
++// (the fused A_SCALE/B_SCALE path) which is what a W8A8 deployment needs?
++//
++// This is an existence probe only: every call is attempted and its status is
++// printed; nothing aborts.  GPU-only, short, no model, no downloads.
++//
++// Compile (inside GamePC WSL2):
++//   nvcc -O2 -arch=sm_120 20_cublaslt_int8_probe.cu -lcublas -lcublasLt \
++//        -o /tmp/cublaslt_int8_probe
++
++#include <cstdint>
++#include <cstdio>
++#include <cuda_runtime.h>
++#include <cublasLt.h>
++#include <cublas_v2.h>
++
++static const char* cl_status(cublasStatus_t s) {
++    switch (s) {
++        case CUBLAS_STATUS_SUCCESS: return "SUCCESS";
++        case CUBLAS_STATUS_NOT_INITIALIZED: return "NOT_INITIALIZED";
++        case CUBLAS_STATUS_ALLOC_FAILED: return "ALLOC_FAILED";
++        case CUBLAS_STATUS_INVALID_VALUE: return "INVALID_VALUE";
++        case CUBLAS_STATUS_ARCH_MISMATCH: return "ARCH_MISMATCH";
++        case CUBLAS_STATUS_MAPPING_ERROR: return "MAPPING_ERROR";
++        case CUBLAS_STATUS_EXECUTION_FAILED: return "EXECUTION_FAILED";
++        case CUBLAS_STATUS_INTERNAL_ERROR: return "INTERNAL_ERROR";
++        case CUBLAS_STATUS_NOT_SUPPORTED: return "NOT_SUPPORTED";
++        case CUBLAS_STATUS_LICENSE_ERROR: return "LICENSE_ERROR";
++        default: return "UNKNOWN";
++    }
++}
++
++#define PRINT_STATUS(label, call)                                              \
++    do {                                                                       \
++        cublasStatus_t _s = (call);                                            \
++        std::printf("%-58s : %-16s (%d)\n", (label), cl_status(_s), (int)_s);  \
++    } while (0)
++
++#define CK_CUDA(label, call)                                                   \
++    do {                                                                       \
++        cudaError_t _e = (call);                                               \
++        std::printf("%-58s : %s (%d)\n", (label), cudaGetErrorString(_e),      \
++                    (int)_e);                                                  \
++    } while (0)
++
++static cublasLtMatmulDesc_t make_desc(cublasComputeType_t compute,
++                                      cudaDataType_t scale_type) {
++    cublasLtMatmulDesc_t op = nullptr;
++    cublasStatus_t s = cublasLtMatmulDescCreate(&op, compute, scale_type);
++    if (s != CUBLAS_STATUS_SUCCESS) return nullptr;
++    cublasOperation_t ta = CUBLAS_OP_N, tb = CUBLAS_OP_N;
++    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta));
++    cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb));
++    return op;
++}
++
++static void try_lt_case(const char* tag, int m, int n, int k,
++                        cudaDataType_t c_type, cublasComputeType_t compute,
++                        cudaDataType_t scale_type, bool with_scale,
++                        bool with_bias_epilogue) {
++    std::printf("--- LT case [%s] m=%d n=%d k=%d C=%d compute=%d scaleType=%d "
++                "scalePtrs=%d biasEpilogue=%d ---\n",
++                tag, m, n, k, (int)c_type, (int)compute, (int)scale_type,
++                (int)with_scale, (int)with_bias_epilogue);
++
++    cublasLtHandle_t lt = nullptr;
++    PRINT_STATUS("  cublasLtCreate", cublasLtCreate(&lt));
++    if (!lt) return;
++
++    cublasLtMatmulDesc_t op = make_desc(compute, scale_type);
++    if (!op) {
++        std::printf("  MatmulDescCreate FAILED\n");
++        cublasLtDestroy(lt);
++        return;
++    }
++
++    cublasLtMatrixLayout_t A = nullptr, B = nullptr, C = nullptr;
++    PRINT_STATUS("  MatrixLayoutCreate A(CUDA_R_8I)",
++                 cublasLtMatrixLayoutCreate(&A, CUDA_R_8I, m, k, m));
++    PRINT_STATUS("  MatrixLayoutCreate B(CUDA_R_8I)",
++                 cublasLtMatrixLayoutCreate(&B, CUDA_R_8I, k, n, k));
++    PRINT_STATUS("  MatrixLayoutCreate C",
++                 cublasLtMatrixLayoutCreate(&C, c_type, m, n, m));
++
++    int8_t *dA = nullptr, *dB = nullptr;
++    void *dC = nullptr, *dD = nullptr;
++    float* d_scale_a = nullptr;
++    float* d_scale_b = nullptr;
++    void* dBias = nullptr;
++    CK_CUDA("  cudaMalloc A", cudaMalloc(&dA, (size_t)m * k));
++    CK_CUDA("  cudaMalloc B", cudaMalloc(&dB, (size_t)k * n));
++    size_t c_bytes = (size_t)m * n * (c_type == CUDA_R_32I ? 4 : 2);
++    CK_CUDA("  cudaMalloc C", cudaMalloc(&dC, c_bytes));
++    CK_CUDA("  cudaMalloc D", cudaMalloc(&dD, c_bytes));
++    if (with_scale) {
++        CK_CUDA("  cudaMalloc scale_a", cudaMalloc(&d_scale_a, 4));
++        CK_CUDA("  cudaMalloc scale_b", cudaMalloc(&d_scale_b, 4));
++        float one = 1.0f;
++        CK_CUDA("  cudaMemcpy scale_a", cudaMemcpy(d_scale_a, &one, 4, cudaMemcpyHostToDevice));
++        CK_CUDA("  cudaMemcpy scale_b", cudaMemcpy(d_scale_b, &one, 4, cudaMemcpyHostToDevice));
++        PRINT_STATUS("  SetAttribute A_SCALE_POINTER",
++                     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
++                                                    &d_scale_a, sizeof(d_scale_a)));
++        PRINT_STATUS("  SetAttribute B_SCALE_POINTER",
++                     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
++                                                    &d_scale_b, sizeof(d_scale_b)));
++    }
++    if (with_bias_epilogue) {
++        CK_CUDA("  cudaMalloc bias", cudaMalloc(&dBias, (size_t)n * (c_type == CUDA_R_32I ? 4 : 2)));
++        cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
++        PRINT_STATUS("  SetAttribute EPILOGUE=BIAS",
++                     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_EPILOGUE,
++                                                    &epilogue, sizeof(epilogue)));
++        PRINT_STATUS("  SetAttribute BIAS_POINTER",
++                     cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
++                                                    &dBias, sizeof(dBias)));
++    }
++
++    cublasLtMatmulPreference_t pref = nullptr;
++    PRINT_STATUS("  PreferenceCreate", cublasLtMatmulPreferenceCreate(&pref));
++    if (pref) {
++        size_t ws = 1u << 22;
++        cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
++                                             &ws, sizeof(ws));
++    }
++
++    cublasLtMatmulHeuristicResult_t heur{};
++    int returned = 0;
++    PRINT_STATUS("  AlgoGetHeuristic",
++                 cublasLtMatmulAlgoGetHeuristic(lt, op, A, B, C, C, pref, 1, &heur, &returned));
++    std::printf("  heuristic_returned=%d\n", returned);
++
++    if (returned > 0) {
++        int32_t alpha_i = 1, beta_i = 0;
++        float alpha_f = 1.0f, beta_f = 0.0f;
++        void* alpha = (compute == CUBLAS_COMPUTE_32I) ? (void*)&alpha_i : (void*)&alpha_f;
++        void* beta = (compute == CUBLAS_COMPUTE_32I) ? (void*)&beta_i : (void*)&beta_f;
++        PRINT_STATUS("  Matmul",
++                     cublasLtMatmul(lt, op, alpha, dA, A, dB, B, beta, dC, C, dD, C,
++                                    &heur.algo, nullptr, 0, 0));
++        CK_CUDA("  cudaDeviceSynchronize", cudaDeviceSynchronize());
++    }
++
++    if (pref) cublasLtMatmulPreferenceDestroy(pref);
++    if (A) cublasLtMatrixLayoutDestroy(A);
++    if (B) cublasLtMatrixLayoutDestroy(B);
++    if (C) cublasLtMatrixLayoutDestroy(C);
++    cublasLtMatmulDescDestroy(op);
++    if (dA) cudaFree(dA);
++    if (dB) cudaFree(dB);
++    if (dC) cudaFree(dC);
++    if (dD) cudaFree(dD);
++    if (d_scale_a) cudaFree(d_scale_a);
++    if (d_scale_b) cudaFree(d_scale_b);
++    if (dBias) cudaFree(dBias);
++    cublasLtDestroy(lt);
++}
++
++static void try_gemmex(int m, int n, int k) {
++    std::printf("--- cublasGemmEx INT8 -> INT32 (CUBLAS_COMPUTE_32I) m=%d n=%d k=%d ---\n", m, n, k);
++    cublasHandle_t h = nullptr;
++    PRINT_STATUS("  cublasCreate", cublasCreate(&h));
++    PRINT_STATUS("  cublasSetMathMode(TENSOR_OP)",
++                 cublasSetMathMode(h, CUBLAS_TENSOR_OP_MATH));
++    int8_t *dA = nullptr, *dB = nullptr;
++    int32_t* dC = nullptr;
++    CK_CUDA("  cudaMalloc A", cudaMalloc(&dA, (size_t)m * k));
++    CK_CUDA("  cudaMalloc B", cudaMalloc(&dB, (size_t)k * n));
++    CK_CUDA("  cudaMalloc C", cudaMalloc(&dC, (size_t)m * n * 4));
++    int32_t alpha = 1, beta = 0;
++    PRINT_STATUS("  cublasGemmEx",
++                 cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, m, n, k, &alpha, dA, CUDA_R_8I, m,
++                              dB, CUDA_R_8I, k, &beta, dC, CUDA_R_32I, m,
++                              CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
++    CK_CUDA("  cudaDeviceSynchronize", cudaDeviceSynchronize());
++    cublasDestroy(h);
++    if (dA) cudaFree(dA);
++    if (dB) cudaFree(dB);
++    if (dC) cudaFree(dC);
++}
++
++int main() {
++    int dev = 0;
++    cudaGetDevice(&dev);
++    cudaDeviceProp prop{};
++    cudaGetDeviceProperties(&prop, dev);
++    int driver_version = 0;
++    cudaDriverGetVersion(&driver_version);
++    std::printf("device=%s sm=%d.%d runtime=%d driver=%d\n", prop.name, prop.major,
++                prop.minor, CUDART_VERSION, driver_version);
++
++    size_t free_mem = 0, total_mem = 0;
++    cudaMemGetInfo(&free_mem, &total_mem);
++    std::printf("memory free=%zu MiB total=%zu MiB\n", free_mem >> 20, total_mem >> 20);
++
++    try_gemmex(64, 64, 64);
++    try_gemmex(256, 256, 256);
++
++    // plain INT8 -> INT32 through cuBLASLt
++    try_lt_case("plain-int8-32i", 64, 64, 64, CUDA_R_32I, CUBLAS_COMPUTE_32I,
++                CUDA_R_32I, false, false);
++    // INT8 + A/B scale pointers, int32 accumulation, int32 output
++    try_lt_case("int8-scale-32i-out32i", 64, 64, 64, CUDA_R_32I,
++                CUBLAS_COMPUTE_32I, CUDA_R_32I, true, false);
++    // INT8 + A/B scale pointers with fp32 scale type (what most APIs use)
++    try_lt_case("int8-scale-f32scale-out32i", 64, 64, 64, CUDA_R_32I,
++                CUBLAS_COMPUTE_32I, CUDA_R_32F, true, false);
++    // INT8 + scale -> bf16 output (the W8A8 deployment shape)
++    try_lt_case("int8-scale-outbf16", 64, 64, 64, CUDA_R_16BF, CUBLAS_COMPUTE_32F,
++                CUDA_R_32F, true, false);
++    // INT8 + bias epilogue
++    try_lt_case("int8-scale-bias-epilogue-outbf16", 64, 64, 64, CUDA_R_16BF,
++                CUBLAS_COMPUTE_32F, CUDA_R_32F, true, true);
++    return 0;
++}
+diff --git a/scripts/c8_axis_b_probe/20_gamepc_probe_local.sh b/scripts/c8_axis_b_probe/20_gamepc_probe_local.sh
+new file mode 100644
+index 000000000..b54bcf14b
+--- /dev/null
++++ b/scripts/c8_axis_b_probe/20_gamepc_probe_local.sh
+@@ -0,0 +1,40 @@
++#!/usr/bin/env bash
++# C8 Q4 axis-B probe driver (local side): push the cuBLASLt INT8 existence
++# probe to GamePC's WSL2 guest and capture the raw output.
++#
++# GPU-only short probe (no gamepc resource lock per project policy: GPU-only
++# short probes do not take the lock; no host-heavy work, no model download).
++#
++# usage: bash 20_gamepc_probe_local.sh <out-log>
++set -uo pipefail
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++CU="$SCRIPT_DIR/20_cublaslt_int8_probe.cu"
++OUT="${1:-/home/chiro/projects/pypto/worktrees/_meta/pypto-x/c8-axis-b-probe/logs/20_gamepc_cublaslt.log}"
++B64="$(base64 -w0 "$CU")"
++
++PAYLOAD="$(mktemp /tmp/gamepc_payload.XXXXXX.sh)"
++trap 'rm -f "$PAYLOAD"' EXIT
++{
++    echo 'set -uo pipefail'
++    echo 'export PATH=/usr/local/cuda/bin:$PATH'
++    echo 'echo "### GamePC WSL2 cublasLt INT8 probe $(date -u +%Y-%m-%dT%H:%M:%SZ)"'
++    echo 'hostname; uname -r'
++    echo "nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total --format=csv,noheader 2>&1 | head -3"
++    echo 'which nvcc; nvcc --version 2>&1 | tail -3'
++    echo "ldconfig -p 2>/dev/null | grep -E 'libcublas(Lt)?\\.so' | head -4"
++    echo "echo '$B64' | base64 -d > /tmp/c8q4_cublaslt_int8_probe.cu"
++    echo 'cd /tmp'
++    echo 'nvcc -O2 -arch=sm_120 c8q4_cublaslt_int8_probe.cu -lcublas -lcublasLt -o c8q4_cublaslt_int8_probe 2> /tmp/c8q4_compile.err'
++    echo 'echo "compile_rc=$?"'
++    echo "tail -60 /tmp/c8q4_compile.err"
++    echo './c8q4_cublaslt_int8_probe'
++    echo 'echo "run_rc=$?"'
++    echo 'rm -f /tmp/c8q4_cublaslt_int8_probe /tmp/c8q4_cublaslt_int8_probe.cu /tmp/c8q4_compile.err'
++} > "$PAYLOAD"
++
++mkdir -p "$(dirname "$OUT")"
++echo "[local] payload=$(wc -l < "$PAYLOAD") lines -> GamePC WSL2, log=$OUT"
++timeout 600 ssh -o BatchMode=yes -o ConnectTimeout=20 192.168.101.5 'wsl.exe -e bash -s' \
++    < "$PAYLOAD" > "$OUT" 2>&1
++echo "[local] ssh_rc=$?"

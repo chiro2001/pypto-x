@@ -1,0 +1,2237 @@
+From d5bde05b3449c27b27ed5018a5a3746dc3acb2bc Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 03:10:21 +0800
+Subject: [PATCH 190/217] feat(tools): add C7 decode-gap diagnostic scripts (no
+ implementation change)
+
+- analyze_decode_gap.py: lock-free reuse of Q3 raw dumps; per-row decode
+  cosine/max_abs curves, triangle relations, cosine-gate-implied L2 budget,
+  reference-self distributions.
+- state_trajectory_ours.py: ours-only state invariants (KV prefix, conv
+  sliding window, finiteness) and step-to-step state change.
+- dump_gold_states.py: dump official HF w8a8 conv/GDR/KV states on the
+  same inference path (fallback-safe, bitwise validation vs existing gold).
+- compare_states.py: ours-vs-gold state comparison per layer/step.
+- state_swap_experiment.py: oracle state-swap attribution (state reflow vs
+  per-step compute) + per-layer ablation, run on the HF gold model.
+- render_tables.py / summarize_swap.py / make_evidence_manifest.py and the
+  heavy-lock wrappers (run_c7_heavy.sh etc).
+
+Diagnostic only: does not modify implementation, judge, band or comparison
+objects.
+---
+ tools/diag_c7/analyze_decode_gap.py       | 557 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ tools/diag_c7/compare_states.py           | 326 +++++++++++++++++++++++++++++
+ tools/diag_c7/dump_gold_states.py         | 233 +++++++++++++++++++++
+ tools/diag_c7/make_evidence_manifest.py   |  49 +++++
+ tools/diag_c7/postprocess_after_heavy.sh  |  39 ++++
+ tools/diag_c7/render_tables.py            | 110 ++++++++++
+ tools/diag_c7/run_c7_heavy.sh             |  50 +++++
+ tools/diag_c7/run_gold_states_heavy.sh    |  54 +++++
+ tools/diag_c7/state_swap_experiment.py    | 439 +++++++++++++++++++++++++++++++++++++++
+ tools/diag_c7/state_trajectory_ours.py    | 165 +++++++++++++++
+ tools/diag_c7/summarize_swap.py           |  73 +++++++
+ tools/diag_c7/wait_and_run_gold_states.sh |  34 +++
+ 12 files changed, 2129 insertions(+)
+
+diff --git a/tools/diag_c7/analyze_decode_gap.py b/tools/diag_c7/analyze_decode_gap.py
+new file mode 100644
+index 000000000..dfc3e1786
+--- /dev/null
++++ b/tools/diag_c7/analyze_decode_gap.py
+@@ -0,0 +1,557 @@
++#!/usr/bin/env python3
++"""C7 诊断：decode 缺口的逐步曲线 + 参照自洽性量化（只读 Q3 产物，不重跑模型）。
++
++输入（全部只读）：
++  * gold:  <gold-dir>/band.json, <gold-dir>/w8a8/*.npz, <gold-dir>/float32/*.npz
++  * ours:  <evidence-raw>/ours_manifest_<config>.json 指向的 prefill/decode npz
++           （位于 <evidence-raw>/dumps/<config>/）
++  * Q3 判定: <evidence-raw>/judgment_<config>.json（对照用，不重算判据）
++  * Q3 逐层: <evidence-raw>/hidden_layers_default_en.json（prefill 量级对照）
++
++输出：一个 JSON，包含
++  1) per_row:  每个 prompt/config 的 row0..3 的 ours-vs-gold / gold-vs-fp32 / ours-vs-fp32
++                cosine、max_abs、误差范数、误差方向夹角；
++  2) blocks:   rows0..3（band.json declared key 的行集合）与 rows1..3 的块级三角关系；
++  3) distributions: 12 行（3 prompt x 4 row）的 ours cos 与参照自身 cos 的分位数；
++  4) strictness: 蒙特卡洛零假设：与参照同范数、但误差方向与参照不相关的实现，
++                在 declared-key 块判据下的通过率；
++  5) prefill_ref: 从 Q3 judgment/hidden_layers 直接摘出的 prefill 量级（仅供对比）。
++
++本脚本只依赖 numpy + 标准库；不改判据、不写 band、不执行任何模型代码。
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import math
++from pathlib import Path
++
++import numpy as np
++
++PROMPTS = ("en_continuation", "zh_continuation", "chat_zh_user")
++CONFIGS = ("default", "full")
++COSINE_SLACK = 1e-4
++
++
++def sha256_file(path: Path) -> str:
++    digest = hashlib.sha256()
++    with open(path, "rb") as stream:
++        for chunk in iter(lambda: stream.read(1 << 20), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def load_npz(path: Path) -> dict:
++    with np.load(str(path), allow_pickle=False) as data:
++        return {name: np.asarray(data[name]) for name in data.files}
++
++
++def rows_of(array: np.ndarray) -> np.ndarray:
++    array = np.asarray(array, dtype=np.float64)
++    if array.ndim == 1:
++        return array.reshape(1, -1)
++    return array.reshape(-1, array.shape[-1])
++
++
++def cosine(a: np.ndarray, b: np.ndarray) -> float:
++    a = np.asarray(a, dtype=np.float64).reshape(-1)
++    b = np.asarray(b, dtype=np.float64).reshape(-1)
++    na = math.sqrt(float(np.dot(a, a)))
++    nb = math.sqrt(float(np.dot(b, b)))
++    if na == 0.0 or nb == 0.0:
++        return float("nan")
++    return float(np.dot(a, b) / (na * nb))
++
++
++def vec_stats(actual: np.ndarray, expected: np.ndarray) -> dict:
++    a = np.asarray(actual, dtype=np.float64).reshape(-1)
++    b = np.asarray(expected, dtype=np.float64).reshape(-1)
++    delta = a - b
++    return {
++        "cosine": cosine(a, b),
++        "max_abs": float(np.max(np.abs(delta))) if delta.size else 0.0,
++        "mean_abs": float(np.mean(np.abs(delta))) if delta.size else 0.0,
++        "rms_abs": float(math.sqrt(float(np.mean(delta * delta)))) if delta.size else 0.0,
++        "ours_norm": float(math.sqrt(float(np.dot(a, a)))),
++        "gold_norm": float(math.sqrt(float(np.dot(b, b)))),
++        "delta_norm": float(math.sqrt(float(np.dot(delta, delta)))),
++        "finite_ours": bool(np.all(np.isfinite(a))),
++        "finite_gold": bool(np.all(np.isfinite(b))),
++    }
++
++
++def top2(row: np.ndarray) -> tuple:
++    row = np.asarray(row, dtype=np.float64)
++    top1 = int(np.argmax(row))
++    masked = np.where(np.arange(row.size) == top1, -np.inf, row)
++    top2_token = int(np.argmax(masked))
++    return top1, float(row[top1]), top2_token, float(masked[top2_token])
++
++
++def percentile(values, q):
++    values = [v for v in values if v == v]  # drop NaN
++    if not values:
++        return None
++    return float(np.percentile(np.asarray(values, dtype=np.float64), q))
++
++
++def summarize_values(values) -> dict:
++    values = [float(v) for v in values if v == v]
++    if not values:
++        return {"count": 0}
++    array = np.asarray(values, dtype=np.float64)
++    return {
++        "count": len(values),
++        "min": float(array.min()),
++        "p10": percentile(values, 10),
++        "p25": percentile(values, 25),
++        "median": float(np.median(array)),
++        "p75": percentile(values, 75),
++        "p90": percentile(values, 90),
++        "max": float(array.max()),
++        "mean": float(array.mean()),
++        "std": float(array.std(ddof=0)),
++    }
++
++
++def block_metrics(ours_rows, gold_rows, ref_rows) -> dict:
++    ours = np.vstack(ours_rows)
++    gold = np.vstack(gold_rows)
++    ref = np.vstack(ref_rows)
++    out = {
++        "rows": int(ours.shape[0]),
++        "ours_vs_gold": vec_stats(ours, gold),
++        "gold_vs_fp32_reference_self": vec_stats(ref, gold),
++        "ours_vs_fp32": vec_stats(ours, ref),
++    }
++    out["delta_norm_ratio_ours_over_ref"] = (
++        out["ours_vs_gold"]["delta_norm"] / out["gold_vs_fp32_reference_self"]["delta_norm"]
++        if out["gold_vs_fp32_reference_self"]["delta_norm"] else None
++    )
++    # 逐行误差能量占比（精确分解：block ||Δ||² 的行份额；对 near-orthogonal 行集
++    # 与 block cosine 亏损的份额近似成正比，数值稳定）
++    ours_f = ours.reshape(-1)
++    gold_f = gold.reshape(-1)
++    ref_f = ref.reshape(-1)
++    total_ours_energy = float(np.dot(ours_f - gold_f, ours_f - gold_f))
++    total_ref_energy = float(np.dot(ref_f - gold_f, ref_f - gold_f))
++    per_row = []
++    for i in range(ours.shape[0]):
++        ours_energy = float(np.dot(ours[i] - gold[i], ours[i] - gold[i]))
++        ref_energy = float(np.dot(ref[i] - gold[i], ref[i] - gold[i]))
++        per_row.append({
++            "row": i,
++            "ours_error_energy": ours_energy,
++            "ref_error_energy": ref_energy,
++            "ours_energy_share": (ours_energy / total_ours_energy) if total_ours_energy else None,
++            "ref_energy_share": (ref_energy / total_ref_energy) if total_ref_energy else None,
++            "ours_row_norm_ratio": (math.sqrt(ours_energy) / math.sqrt(ref_energy)) if ref_energy else None,
++        })
++    out["per_row_error_energy"] = per_row
++    out["rows_1_3_error_energy_share_ours"] = (
++        sum(item["ours_error_energy"] for item in per_row[1:]) / total_ours_energy
++        if total_ours_energy else None)
++    out["row0_error_energy_share_ours"] = (
++        per_row[0]["ours_error_energy"] / total_ours_energy if total_ours_energy else None)
++    # 误差方向相关性：δ=ours-gold 与 e=gold-fp32 的 cosine（rows 拼接后）
++    delta = ours_f - gold_f
++    err = ref_f - gold_f
++    out["delta_vs_ref_error_cosine"] = cosine(delta, err)
++    out["delta_vs_ref_error_norm_ratio"] = (
++        math.sqrt(float(np.dot(delta, delta))) / math.sqrt(float(np.dot(err, err)))
++        if float(np.dot(err, err)) else None
++    )
++    return out
++
++
++def direction_ladder(gold_rows, ref_rows, delta_rows, floor):
++    """解析式的"方向阶梯"（替代蒙特卡洛，避免 248k 维采样）：
++
++    固定误差范数 n，问不同误差方向下的 cos(ours, gold)：
++      * 下界（误差与 gold 正交，= 高维独立噪声的典型情形）: ||g||/sqrt(||g||²+n²)
++      * 上界: 1（误差与 gold 同向）
++      * 参考误差方向: ours = gold + e = 2*gold - fp32 的真实 cosine
++      * 实测 ours
++    对 ours / 参照 两种范数各算一遍，即可区分"范数超了"与"方向不相关"。
++    """
++    gold_rows = np.vstack(gold_rows)
++    ref_rows = np.vstack(ref_rows)
++    delta_rows = np.vstack(delta_rows)
++
++    def ladder_one(gold, ref, delta):
++        e = ref - gold
++        gn = float(np.linalg.norm(gold))
++        n_ref = float(np.linalg.norm(e))
++        n_ours = float(np.linalg.norm(delta))
++        return {
++            "gold_norm": gn,
++            "ref_error_norm": n_ref,
++            "ours_error_norm": n_ours,
++            "ours_over_ref_norm": (n_ours / n_ref) if n_ref else None,
++            "ref_actual_cosine": cosine(ref, gold),
++            "ours_actual_cosine": cosine(gold + delta, gold),
++            "orthogonal_null_ref_norm_cosine": gn / math.sqrt(gn * gn + n_ref * n_ref) if gn else None,
++            "orthogonal_null_ours_norm_cosine": gn / math.sqrt(gn * gn + n_ours * n_ours) if gn else None,
++            "ref_direction_ref_norm_cosine": cosine(gold + e / max(n_ref, 1e-30) * n_ref, gold) if n_ref else None,
++            "ref_direction_ours_norm_cosine": (
++                cosine(gold + e / max(n_ref, 1e-30) * n_ours, gold) if n_ref else None),
++            "floor": floor,
++        }
++
++    per_row = []
++    for i in range(gold_rows.shape[0]):
++        row = ladder_one(gold_rows[i], ref_rows[i], delta_rows[i])
++        row["row"] = i
++        row["orthogonal_null_ref_norm_passes_floor"] = bool(
++            row["orthogonal_null_ref_norm_cosine"] >= floor - 1e-12)
++        row["orthogonal_null_ours_norm_passes_floor"] = bool(
++            row["orthogonal_null_ours_norm_cosine"] >= floor - 1e-12)
++        row["ours_actual_passes_floor"] = bool(row["ours_actual_cosine"] >= floor - 1e-12)
++        per_row.append(row)
++    block = ladder_one(gold_rows.reshape(-1), ref_rows.reshape(-1), delta_rows.reshape(-1))
++    block["passes_floor_orthogonal_null_ref_norm"] = bool(
++        block["orthogonal_null_ref_norm_cosine"] >= floor - 1e-12)
++    block["passes_floor_orthogonal_null_ours_norm"] = bool(
++        block["orthogonal_null_ours_norm_cosine"] >= floor - 1e-12)
++    block["ours_actual_passes_floor"] = bool(block["ours_actual_cosine"] >= floor - 1e-12)
++    return {
++        "definition": ("固定误差范数、扫描误差方向的解析界：orthogonal-null = 误差与 gold 正交"
++                       "（高维独立噪声的典型 cosine）；ref-direction = 误差方向与参照自身误差一致；"
++                       "ours-actual = 实测。floor 为对应口径的 cosine 下限（band_cosine - 1e-4）。"),
++        "per_row": per_row,
++        "block": block,
++    }
++
++
++def cosine_gate_norm_budget(band_cosine, floor, ref_error_norm, ours_error_norm):
++    """cosine 门限在"误差近似正交"下等价于一个误差 L2 范数预算。
++
++    cos ≈ 1/sqrt(1+r²)；r_floor = sqrt(1/floor²-1)，r_ref = sqrt(1/band_cos²-1)。
++    allowed_norm_ratio = r_floor/r_ref：门限允许的 ||ours-gold|| / ||gold-fp32|| 上限。
++    """
++    import math as _math
++    if not (0 < floor <= 1) or not (0 < band_cosine <= 1):
++        return None
++    r_floor = _math.sqrt(1.0 / (floor * floor) - 1.0)
++    r_ref = _math.sqrt(1.0 / (band_cosine * band_cosine) - 1.0)
++    return {
++        "allowed_norm_ratio_cosine": (r_floor / r_ref) if r_ref else None,
++        "measured_norm_ratio": (ours_error_norm / ref_error_norm) if ref_error_norm else None,
++        "ratio_over_budget": ((ours_error_norm / ref_error_norm) / (r_floor / r_ref)
++                              if ref_error_norm and r_ref else None),
++        "max_abs_headroom_ratio": None,  # 由调用方填（2*band_max_abs / ref_max_abs）
++    }
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--gold-dir", required=True)
++    parser.add_argument("--evidence-raw", required=True)
++    parser.add_argument("--output", required=True)
++    return parser.parse_args()
++
++
++def main():
++    args = parse_args()
++    gold_dir = Path(args.gold_dir).resolve()
++    raw = Path(args.evidence_raw).resolve()
++    band_path = gold_dir / "band.json"
++    band = json.loads(band_path.read_text(encoding="utf-8"))
++    band_sha = sha256_file(band_path)
++    result = {
++        "tool": "analyze_decode_gap",
++        "generated_at_utc": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime()),
++        "gold_dir": str(gold_dir),
++        "band_source": {
++            "path": str(band_path),
++            "sha256": band_sha,
++            "definition": band.get("definition"),
++        },
++        "evidence_raw": str(raw),
++        "configs": {},
++    }
++
++    # 直接摘录 Q3 的 prefill 量级（不重算判据）
++    prefill_ref = {"judgments": {}, "hidden_layers_default_en": None}
++    for config in CONFIGS:
++        judgment_path = raw / "judgment_{}.json".format(config)
++        if not judgment_path.is_file():
++            continue
++        judgment = json.loads(judgment_path.read_text(encoding="utf-8"))
++        entry = {}
++        for prompt in PROMPTS:
++            keys = judgment.get("prompts", {}).get(prompt, {}).get("keys", {})
++            pre = keys.get("prefill_logits", {})
++            pre_next = keys.get("prefill_next_logits", {})
++            entry[prompt] = {
++                "prefill_logits": {
++                    "ours_vs_gold_cosine": pre.get("cosine"),
++                    "ours_vs_gold_max_abs": pre.get("max_abs"),
++                    "ref_self_cosine": (pre.get("reference_self_check_vs_fp32") or {}).get("cosine"),
++                    "ref_self_max_abs": (pre.get("reference_self_check_vs_fp32") or {}).get("max_abs"),
++                    "verdict": judgment.get("prompts", {}).get(prompt, {}).get("verdict_prefill_logits"),
++                },
++                "prefill_next_logits": {
++                    "ours_vs_gold_cosine": pre_next.get("cosine"),
++                    "ours_vs_gold_max_abs": pre_next.get("max_abs"),
++                    "ref_self_cosine": (pre_next.get("reference_self_check_vs_fp32") or {}).get("cosine"),
++                    "ref_self_max_abs": (pre_next.get("reference_self_check_vs_fp32") or {}).get("max_abs"),
++                },
++            }
++        prefill_ref["judgments"][config] = entry
++    hidden_path = raw / "hidden_layers_default_en.json"
++    if hidden_path.is_file():
++        hidden = json.loads(hidden_path.read_text(encoding="utf-8"))
++        prefill_ref["hidden_layers_default_en"] = {
++            "path": str(hidden_path),
++            "sha256": sha256_file(hidden_path),
++            "summary": hidden.get("summary") if isinstance(hidden, dict) else None,
++            "per_layer": (hidden.get("per_layer") or hidden.get("layers")) if isinstance(hidden, dict) else None,
++        }
++    result["prefill_ref"] = prefill_ref
++
++    all_rows = []          # 12 行集合，用于分布
++    for config in CONFIGS:
++        manifest_path = raw / "ours_manifest_{}.json".format(config)
++        if not manifest_path.is_file():
++            continue
++        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
++        config_result = {"manifest": str(manifest_path), "manifest_sha256": sha256_file(manifest_path),
++                         "prompts": {}}
++        for prompt in PROMPTS:
++            entry = manifest["prompts"][prompt]
++            gold = load_npz(gold_dir / "w8a8" / "{}.npz".format(prompt))
++            fp32 = load_npz(gold_dir / "float32" / "{}.npz".format(prompt))
++            prefill = load_npz(Path(entry["prefill_npz"]))
++            ours_prefill_logits = rows_of(prefill["logits"])
++            gold_decode = rows_of(gold["decode_logits"])
++            fp32_decode = rows_of(fp32["decode_logits"])
++            gold_chain = [int(v) for v in gold["decode_token_ids"]]
++
++            # row0 = 我们 prefill 末行 vs gold prefill_next_logits（= gold decode_logits[0]）
++            gold_row0 = np.asarray(gold["prefill_next_logits"], dtype=np.float64).reshape(1, -1)
++            row0_bitwise = bool(np.array_equal(gold_decode[0], gold_row0[0]))
++            ours_pref_next = ours_prefill_logits[-1:]
++            prefill_argmax = int(np.argmax(ours_pref_next[0]))
++            ours_chain = [prefill_argmax]
++
++            rows = [{
++                "row": 0,
++                "kind": "prefill_next / gold_decode_row0",
++                "ours_source": "{}.logits[-1]".format(Path(entry["prefill_npz"]).name),
++                "input_token": None,
++                "gold_decode_row0_equals_prefill_next_bitwise": row0_bitwise,
++                "ours": vec_stats(ours_pref_next[0], gold_row0[0]),
++                "gold_vs_fp32": vec_stats(fp32_decode[0], gold_row0[0]),
++                "ours_vs_fp32": vec_stats(ours_pref_next[0], fp32_decode[0]),
++                "ours_argmax": prefill_argmax,
++                "gold_argmax": int(np.argmax(gold_row0[0])),
++            }]
++
++            decode_pasts = sorted(int(k) for k in entry.get("decode_npz", {}))
++            for step_index, past in enumerate(decode_pasts):
++                gold_row_index = step_index + 1
++                dump = load_npz(Path(entry["decode_npz"][str(past)]))
++                ours_row = rows_of(dump["logits"])[0]
++                ours_argmax = int(np.argmax(ours_row))
++                ours_input = ours_chain[step_index]
++                gold_input = gold_chain[step_index] if step_index < len(gold_chain) else None
++                comparable = gold_input is not None and ours_input == gold_input
++                ours_chain.append(ours_argmax)
++                item = {
++                    "row": gold_row_index,
++                    "kind": "decode_step_{}".format(step_index),
++                    "past_length": past,
++                    "ours_source": Path(entry["decode_npz"][str(past)]).name,
++                    "ours_input_token": ours_input,
++                    "gold_input_token": gold_input,
++                    "input_comparable": comparable,
++                    "ours_argmax": ours_argmax,
++                }
++                if gold_row_index < gold_decode.shape[0]:
++                    item["ours"] = vec_stats(ours_row, gold_decode[gold_row_index])
++                    item["gold_vs_fp32"] = vec_stats(fp32_decode[gold_row_index], gold_decode[gold_row_index])
++                    item["ours_vs_fp32"] = vec_stats(ours_row, fp32_decode[gold_row_index])
++                    item["gold_argmax"] = int(np.argmax(gold_decode[gold_row_index]))
++                    item["gold_top2_margin"] = (
++                        top2(gold_decode[gold_row_index])[1] - top2(gold_decode[gold_row_index])[3]
++                    )
++                else:
++                    item["status"] = "not_covered_by_gold_decode_logits"
++                    item["ours_only"] = {
++                        "absmax": float(np.max(np.abs(ours_row))),
++                        "norm": float(np.linalg.norm(ours_row)),
++                    }
++                rows.append(item)
++            gold_prefill = rows_of(gold["prefill_logits"])
++            fp32_prefill = rows_of(fp32["prefill_logits"])
++            ours_prefill_rows = rows_of(prefill["logits"])
++            prefill_block = block_metrics(ours_prefill_rows, gold_prefill, fp32_prefill)
++            prefill_block["per_position"] = []
++            for position in range(ours_prefill_rows.shape[0]):
++                o = vec_stats(ours_prefill_rows[position], gold_prefill[position])
++                r = vec_stats(fp32_prefill[position], gold_prefill[position])
++                prefill_block["per_position"].append({
++                    "position": position,
++                    "ours_cosine": o["cosine"],
++                    "ref_self_cosine": r["cosine"],
++                    "ours_max_abs": o["max_abs"],
++                    "ref_self_max_abs": r["max_abs"],
++                    "norm_ratio": (o["delta_norm"] / r["delta_norm"]) if r["delta_norm"] else None,
++                })
++            prefill_block["ours_last_row_vs_gold_prefill_next"] = vec_stats(
++                ours_prefill_rows[-1], np.asarray(gold["prefill_next_logits"], dtype=np.float64))
++            prefill_block["declared_prefill_band"] = band["variants"]["w8a8"]["per_prompt"][prompt]["band"]
++            prefill_block["ours_last_row_cosine_floor"] = (
++                band["variants"]["w8a8"]["per_prompt"][prompt]["band"]["cosine"] - COSINE_SLACK)
++            config_result["prompts"][prompt] = {
++                "prefill_block": prefill_block,
++                "band": {
++                    "declared_key": band["variants"]["w8a8"]["per_prompt"][prompt]["band"],
++                    "keys_decode_logits": band["variants"]["w8a8"]["per_prompt"][prompt]["keys"]["decode_logits"],
++                    "keys_prefill_logits": band["variants"]["w8a8"]["per_prompt"][prompt]["keys"]["prefill_logits"],
++                    "json_pointer_declared": "variants.w8a8.per_prompt.{}.band".format(prompt),
++                    "json_pointer_decode_key": "variants.w8a8.per_prompt.{}.keys.decode_logits".format(prompt),
++                },
++                "token_chain_ours": ours_chain,
++                "gold_decode_token_ids": gold_chain,
++                "rows": rows,
++            }
++
++            # 块级：rows 0..3（须全部可比）
++            comparable_rows = [r for r in rows if r["row"] <= 3 and "ours" in r and r.get("input_comparable", True)]
++            if len(comparable_rows) >= 4:
++                gold_rows = []
++                ours_rows = []
++                ref_rows = []
++                for r in comparable_rows:
++                    ours_rows.append(rows_of(prefill["logits"])[-1] if r["row"] == 0
++                                     else rows_of(load_npz(Path(entry["decode_npz"][str(r["past_length"])]))["logits"])[0])
++                    gold_rows.append(gold_row0[0] if r["row"] == 0 else gold_decode[r["row"]])
++                    ref_rows.append(fp32_decode[0] if r["row"] == 0 else fp32_decode[r["row"]])
++                config_result["prompts"][prompt]["blocks"] = {
++                    "rows_0_3": block_metrics(ours_rows, gold_rows, ref_rows),
++                }
++                declared_floor = band["variants"]["w8a8"]["per_prompt"][prompt]["keys"]["decode_logits"]["cosine"] - COSINE_SLACK
++                config_result["prompts"][prompt]["blocks"]["rows_0_3"]["declared_key_band"] = {
++                    "pointer": "variants.w8a8.per_prompt.{}.keys.decode_logits".format(prompt),
++                    "max_abs": band["variants"]["w8a8"]["per_prompt"][prompt]["keys"]["decode_logits"]["max_abs"],
++                    "cosine": band["variants"]["w8a8"]["per_prompt"][prompt]["keys"]["decode_logits"]["cosine"],
++                    "cosine_floor": declared_floor,
++                    "ours_block_cosine": config_result["prompts"][prompt]["blocks"]["rows_0_3"]["ours_vs_gold"]["cosine"],
++                    "ours_cosine_margin_vs_floor": (
++                        config_result["prompts"][prompt]["blocks"]["rows_0_3"]["ours_vs_gold"]["cosine"] - declared_floor
++                    ),
++                    "headroom_in_cosine_units": COSINE_SLACK,
++                }
++                blk03 = config_result["prompts"][prompt]["blocks"]["rows_0_3"]
++                blk03["cosine_gate_budget"] = cosine_gate_norm_budget(
++                    blk03["gold_vs_fp32_reference_self"]["cosine"], declared_floor,
++                    blk03["gold_vs_fp32_reference_self"]["delta_norm"],
++                    blk03["ours_vs_gold"]["delta_norm"])
++                blk03["cosine_gate_budget"]["max_abs_headroom_ratio"] = (
++                    2.0 * blk03["declared_key_band"]["max_abs"]
++                    / blk03["gold_vs_fp32_reference_self"]["max_abs"])
++                config_result["prompts"][prompt]["blocks"]["rows_0_3"]["direction_ladder"] = direction_ladder(
++                    gold_rows, ref_rows, [o - g for o, g in zip(ours_rows, gold_rows)],
++                    declared_floor)
++            # rows1..3 块级
++            comparable_rows_13 = [r for r in rows if 1 <= r["row"] <= 3 and "ours" in r and r.get("input_comparable")]
++            if len(comparable_rows_13) >= 3:
++                ours_rows = [rows_of(load_npz(Path(entry["decode_npz"][str(r["past_length"])]))["logits"])[0]
++                             for r in comparable_rows_13]
++                gold_rows = [gold_decode[r["row"]] for r in comparable_rows_13]
++                ref_rows = [fp32_decode[r["row"]] for r in comparable_rows_13]
++                blk = block_metrics(ours_rows, gold_rows, ref_rows)
++                blk["band_recomputed"] = {
++                    "definition": "|w8a8 gold - fp32 gold| on rows1..3",
++                    "max_abs": float(np.max(np.abs(np.vstack(gold_rows) - np.vstack(ref_rows)))),
++                    "cosine": cosine(np.vstack(gold_rows), np.vstack(ref_rows)),
++                }
++                blk["band_recomputed"]["cosine_floor"] = blk["band_recomputed"]["cosine"] - COSINE_SLACK
++                blk["ours_cosine_margin_vs_floor"] = (
++                    blk["ours_vs_gold"]["cosine"] - blk["band_recomputed"]["cosine_floor"])
++                config_result["prompts"][prompt]["blocks"]["rows_1_3"] = blk
++                blk13 = config_result["prompts"][prompt]["blocks"]["rows_1_3"]
++                blk13["cosine_gate_budget"] = cosine_gate_norm_budget(
++                    blk13["band_recomputed"]["cosine"], blk13["band_recomputed"]["cosine_floor"],
++                    blk13["gold_vs_fp32_reference_self"]["delta_norm"],
++                    blk13["ours_vs_gold"]["delta_norm"])
++                blk13["cosine_gate_budget"]["max_abs_headroom_ratio"] = (
++                    2.0 * blk13["band_recomputed"]["max_abs"]
++                    / blk13["gold_vs_fp32_reference_self"]["max_abs"])
++                config_result["prompts"][prompt]["blocks"]["rows_1_3"]["direction_ladder"] = direction_ladder(
++                    gold_rows, ref_rows, [o - g for o, g in zip(ours_rows, gold_rows)],
++                    blk["band_recomputed"]["cosine_floor"])
++            for r in rows:
++                if "ours" in r:
++                    all_rows.append({
++                        "config": config,
++                        "prompt": prompt,
++                        "row": r["row"],
++                        "kind": r["kind"],
++                        "input_comparable": r.get("input_comparable", True),
++                        "ours_cos": r["ours"]["cosine"],
++                        "ours_max_abs": r["ours"]["max_abs"],
++                        "ours_delta_norm": r["ours"]["delta_norm"],
++                        "ref_self_cos": r["gold_vs_fp32"]["cosine"],
++                        "ref_self_max_abs": r["gold_vs_fp32"]["max_abs"],
++                        "ref_self_delta_norm": r["gold_vs_fp32"]["delta_norm"],
++                        "ours_vs_fp32_cos": r["ours_vs_fp32"]["cosine"],
++                        "ours_over_ref_norm": (r["ours"]["delta_norm"] / r["gold_vs_fp32"]["delta_norm"]
++                                               if r["gold_vs_fp32"]["delta_norm"] else None),
++                    })
++        result["configs"][config] = config_result
++
++    # 汇总分布：全部 12 行；再按 config / prompt 分组
++    distributions = {}
++    for config in CONFIGS:
++        sub = [r for r in all_rows if r["config"] == config]
++        if not sub:
++            continue
++        distributions[config] = {
++            "rows": len(sub),
++            "ours_cos": summarize_values([r["ours_cos"] for r in sub]),
++            "ref_self_cos": summarize_values([r["ref_self_cos"] for r in sub]),
++            "ours_cos_minus_ref_self_cos": summarize_values(
++                [r["ours_cos"] - r["ref_self_cos"] for r in sub]),
++            "ours_over_ref_norm": summarize_values([r["ours_over_ref_norm"] for r in sub]),
++            "ours_max_abs": summarize_values([r["ours_max_abs"] for r in sub]),
++            "ref_self_max_abs": summarize_values([r["ref_self_max_abs"] for r in sub]),
++            "per_prompt": {},
++            "rows_below_ref_self_floor": [
++                {"prompt": r["prompt"], "row": r["row"], "kind": r["kind"],
++                 "ours_cos": r["ours_cos"], "ref_row_floor": r["ref_self_cos"] - COSINE_SLACK}
++                for r in sub if r["ours_cos"] < r["ref_self_cos"] - COSINE_SLACK
++            ],
++        }
++        for prompt in PROMPTS:
++            sub_p = [r for r in sub if r["prompt"] == prompt]
++            if not sub_p:
++                continue
++            distributions[config]["per_prompt"][prompt] = {
++                "ours_cos": summarize_values([r["ours_cos"] for r in sub_p]),
++                "ref_self_cos": summarize_values([r["ref_self_cos"] for r in sub_p]),
++                "ours_minus_ref": summarize_values([r["ours_cos"] - r["ref_self_cos"] for r in sub_p]),
++            }
++    result["distributions"] = distributions
++    result["rows_flat"] = all_rows
++
++    out_path = Path(args.output)
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    out_path.write_text(json.dumps(result, indent=1, sort_keys=False), encoding="utf-8")
++    print("[analyze_decode_gap] wrote {}".format(out_path))
++    # 控制台摘要
++    for config, item in distributions.items():
++        print("[{}] ours_cos min={:.8f} med={:.8f} | ref_self_cos min={:.8f} med={:.8f} | "
++              "min(ours-ref)={:.6f} | max norm ratio={:.4f}".format(
++                  config, item["ours_cos"]["min"], item["ours_cos"]["median"],
++                  item["ref_self_cos"]["min"], item["ref_self_cos"]["median"],
++                  item["ours_cos_minus_ref_self_cos"]["min"],
++                  item["ours_over_ref_norm"]["max"]))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/diag_c7/compare_states.py b/tools/diag_c7/compare_states.py
+new file mode 100644
+index 000000000..3b7e72421
+--- /dev/null
++++ b/tools/diag_c7/compare_states.py
+@@ -0,0 +1,326 @@
++#!/usr/bin/env python3
++"""C7 诊断：ours decode state vs gold(HF w8a8) decode state 逐步对比。
++
++输入：
++  * --ours-raw  <c8-l4-avx512/raw>（ours_manifest_{default,full}.json + dumps）
++  * --gold-dir  <...>/c7-decode-gap-localization/raw/gold_states_w8a8（dump_gold_states.py 产物）
++可选：
++  * --gold-fp32-dir  gold_states_float32（参照自身 state 不确定性 = w8a8 vs float32）
++
++输出 JSON：
++  * per prompt/config/layer/state/step：shape、dtype、max_abs、mean_abs、rms、rel_l2、
++    cosine、是否 finite、是否逐位一致（gold cast float32 后）；
++  * per step 聚合：state 输入误差（上一步输出）与 logits 误差的对应；
++  * 误差趋势：after_prefill -> step_0..3 的 rel_l2 序列（判断 state 误差是否累积）；
++  * 与参照自身 state 不确定性（fp32 需要 --gold-fp32-dir）的比值。
++
++state 语义映射（双方都是"消耗当前 token 之后"的 state）：
++  ours layer_XX_causal_conv_new_state        <-> gold layer_XX conv_state
++  ours layer_XX_recurrent_step_{s}_new_state <-> gold layer_XX recurrent_state
++  ours layer_XX_new_k / layer_XX_new_v       <-> gold layer_XX key_cache / value_cache
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import re
++from pathlib import Path
++
++import numpy as np
++
++PROMPTS = ("en_continuation", "zh_continuation", "chat_zh_user")
++CONFIGS = ("default", "full")
++TAGS = ("after_prefill", "step_0", "step_1", "step_2", "step_3")
++GOLD_KIND = {
++    "conv_state": "conv",
++    "recurrent_state": "recurrent",
++    "key_cache": "key",
++    "value_cache": "value",
++}
++OURS_KIND = {
++    "conv": "causal_conv_new_state",
++    "recurrent": None,   # 由 regex 匹配 recurrent_step_*_new_state
++    "key": "new_k",
++    "value": "new_v",
++}
++
++
++def load_npz(path):
++    with np.load(str(path), allow_pickle=False) as data:
++        return {name: np.asarray(data[name]) for name in data.files}
++
++
++def cosine(a, b):
++    a = np.asarray(a, dtype=np.float64).reshape(-1)
++    b = np.asarray(b, dtype=np.float64).reshape(-1)
++    na = math.sqrt(float(np.dot(a, a)))
++    nb = math.sqrt(float(np.dot(b, b)))
++    if na == 0.0 or nb == 0.0:
++        return float("nan")
++    return float(np.dot(a, b) / (na * nb))
++
++
++def compare(ours, gold):
++    ours = np.asarray(ours)
++    gold = np.asarray(gold)
++    out = {
++        "ours_shape": list(ours.shape),
++        "gold_shape": list(gold.shape),
++        "ours_dtype": str(ours.dtype),
++        "gold_dtype": str(gold.dtype),
++    }
++    if ours.shape != gold.shape:
++        out["status"] = "shape_mismatch"
++        return out
++    a = ours.astype(np.float64).reshape(-1)
++    b = gold.astype(np.float64).reshape(-1)
++    delta = a - b
++    gn = math.sqrt(float(np.dot(b, b)))
++    out.update({
++        "status": "ok",
++        "finite_ours": bool(np.all(np.isfinite(a))),
++        "finite_gold": bool(np.all(np.isfinite(b))),
++        "max_abs": float(np.max(np.abs(delta))) if delta.size else 0.0,
++        "mean_abs": float(np.mean(np.abs(delta))) if delta.size else 0.0,
++        "rms_abs": float(math.sqrt(float(np.mean(delta * delta)))) if delta.size else 0.0,
++        "rel_l2": float(math.sqrt(float(np.dot(delta, delta))) / gn) if gn else None,
++        "cosine": cosine(a, b),
++        "ours_absmax": float(np.max(np.abs(a))) if a.size else 0.0,
++        "gold_absmax": float(np.max(np.abs(b))) if b.size else 0.0,
++    })
++    try:
++        out["bitwise_equal_float32_cast"] = bool(
++            np.array_equal(ours.astype(np.float32), gold.astype(np.float32)))
++    except Exception:  # pragma: no cover
++        out["bitwise_equal_float32_cast"] = None
++    return out
++
++
++def find_ours_key(keys, layer, kind):
++    if kind == "conv":
++        name = "layer_{:02d}_causal_conv_new_state".format(layer)
++        return name if name in keys else None
++    if kind in ("key", "value"):
++        name = "layer_{:02d}_{}".format(layer, OURS_KIND[kind])
++        return name if name in keys else None
++    pattern = re.compile(r"^layer_{:02d}_recurrent_step_\d+_new_state$".format(layer))
++    matches = [key for key in keys if pattern.match(key)]
++    return matches[0] if len(matches) == 1 else None
++
++
++def summarize_values(values):
++    values = [float(v) for v in values if v is not None and v == v]
++    if not values:
++        return {"count": 0}
++    arr = np.asarray(values, dtype=np.float64)
++    return {
++        "count": len(values),
++        "min": float(arr.min()),
++        "median": float(np.median(arr)),
++        "mean": float(arr.mean()),
++        "max": float(arr.max()),
++    }
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--ours-raw", required=True)
++    parser.add_argument("--gold-dir", required=True)
++    parser.add_argument("--gold-reference-dir", default="",
++                        help="既有 gold reference 目录（w8a8/*.npz，用于对照 logits）")
++    parser.add_argument("--gold-fp32-dir", default="")
++    parser.add_argument("--output", required=True)
++    return parser.parse_args()
++
++
++def main():
++    args = parse_args()
++    raw = Path(args.ours_raw).resolve()
++    gold_dir = Path(args.gold_dir).resolve()
++    gold_fp32_dir = Path(args.gold_fp32_dir).resolve() if args.gold_fp32_dir else None
++    gold_reference_dir = Path(args.gold_reference_dir).resolve() if args.gold_reference_dir else None
++    result = {
++        "tool": "compare_states",
++        "gold_dir": str(gold_dir),
++        "ours_raw": str(raw),
++        "tags": list(TAGS),
++        "gold_reference_dir": str(gold_reference_dir) if gold_reference_dir else None,
++        "configs": {},
++    }
++
++    # 先列出 gold 各 tag 有哪些 layer/kind（形状表）
++    for config in CONFIGS:
++        manifest_path = raw / "ours_manifest_{}.json".format(config)
++        if not manifest_path.is_file():
++            continue
++        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
++        config_out = {"manifest": str(manifest_path), "prompts": {}}
++        for prompt in PROMPTS:
++            entry = manifest["prompts"][prompt]
++            gold_path = gold_dir / "{}.npz".format(prompt)
++            if not gold_path.is_file():
++                config_out["prompts"][prompt] = {"status": "gold_states_missing", "path": str(gold_path)}
++                continue
++            gold = load_npz(gold_path)
++            ours_prefill = load_npz(Path(entry["prefill_npz"]))
++            decode_npz = {int(k): Path(v) for k, v in entry["decode_npz"].items()}
++            decode_pasts = sorted(decode_npz)
++            ours_steps = {tag: ours_prefill for tag in ("after_prefill",)}
++            for step_index, past in enumerate(decode_pasts):
++                ours_steps["step_{}".format(step_index)] = load_npz(decode_npz[past])
++
++            prompt_out = {"rows": [], "layers": {}, "step_summary": [], "gold_validation": None}
++            # 记录 dump 与既有 gold logits 的逐位校验（如果 manifest 里有）
++            gold_manifest = gold_dir / "gold_states_manifest.json"
++            if gold_manifest.is_file():
++                gm = json.loads(gold_manifest.read_text(encoding="utf-8"))
++                for run in gm.get("runs", []):
++                    if run.get("prompt") == prompt:
++                        prompt_out["gold_validation"] = run.get("validation_vs_gold")
++
++            layer_indices = sorted({int(re.match(r"after_prefill__layer_(\d+)__", key).group(1))
++                                    for key in gold if key.startswith("after_prefill__layer_")})
++            for layer in layer_indices:
++                layer_out = {}
++                for gold_kind, ours_kind in GOLD_KIND.items():
++                    kind_entry = {"steps": {}}
++                    for tag in TAGS:
++                        gold_key = "{}__layer_{:02d}__{}".format(tag, layer, gold_kind)
++                        if gold_key not in gold:
++                            continue
++                        ours_key = find_ours_key(ours_steps.get(tag, {}), layer, ours_kind)
++                        if ours_key is None:
++                            kind_entry["steps"][tag] = {
++                                "status": "ours_key_missing",
++                                "gold_key": gold_key,
++                                "ours_expected_kind": ours_kind,
++                            }
++                            continue
++                        kind_entry["steps"][tag] = compare(ours_steps[tag][ours_key], gold[gold_key])
++                        kind_entry["steps"][tag]["ours_key"] = ours_key
++                        kind_entry["steps"][tag]["gold_key"] = gold_key
++                    if kind_entry["steps"]:
++                        ok_steps = [s for s in kind_entry["steps"].values() if s.get("status") == "ok"]
++                        kind_entry["trend_rel_l2"] = [
++                            kind_entry["steps"][tag].get("rel_l2") for tag in TAGS
++                            if tag in kind_entry["steps"] and kind_entry["steps"][tag].get("status") == "ok"]
++                        kind_entry["trend_max_abs"] = [
++                            kind_entry["steps"][tag].get("max_abs") for tag in TAGS
++                            if tag in kind_entry["steps"] and kind_entry["steps"][tag].get("status") == "ok"]
++                        kind_entry["trend_ours_gold_cosine"] = [
++                            kind_entry["steps"][tag].get("cosine") for tag in TAGS
++                            if tag in kind_entry["steps"] and kind_entry["steps"][tag].get("status") == "ok"]
++                        kind_entry["steps_ok"] = len(ok_steps)
++                    layer_out[gold_kind] = kind_entry
++                prompt_out["layers"]["layer_{:02d}".format(layer)] = layer_out
++
++            # step 级汇总：state 误差（上一步输出=本步输入）vs 本步 logits ours-vs-gold
++            ours_prefill_logits = np.asarray(ours_prefill["logits"], dtype=np.float64)
++            ours_next = ours_prefill_logits.reshape(-1, ours_prefill_logits.shape[-1])[-1]
++            gold_logits = None
++            if gold_reference_dir is not None:
++                gold_npz_path = gold_reference_dir / "w8a8" / "{}.npz".format(prompt)
++                if gold_npz_path.is_file():
++                    gold_logits = load_npz(gold_npz_path)
++            for step_index in range(len(decode_pasts) + 1):
++                tag_in = "after_prefill" if step_index == 0 else "step_{}".format(step_index - 1)
++                rel_l2_values = []
++                max_abs_values = []
++                for layer in layer_indices:
++                    for gold_kind in GOLD_KIND:
++                        step = prompt_out["layers"]["layer_{:02d}".format(layer)][gold_kind]["steps"].get(tag_in)
++                        if step and step.get("status") == "ok":
++                            rel_l2_values.append(step["rel_l2"])
++                            max_abs_values.append(step["max_abs"])
++                logits_metric = None
++                if gold_logits is not None:
++                    if step_index == 0:
++                        ours_row = ours_next
++                        gold_row = np.asarray(gold_logits["prefill_next_logits"], dtype=np.float64)
++                    elif step_index <= len(decode_pasts):
++                        path = decode_npz[decode_pasts[step_index - 1]]
++                        ours_row = np.asarray(load_npz(path)["logits"], dtype=np.float64).reshape(-1)
++                        if step_index < gold_logits["decode_logits"].shape[0]:
++                            gold_row = np.asarray(gold_logits["decode_logits"][step_index], dtype=np.float64)
++                        else:
++                            gold_row = None
++                    else:
++                        gold_row = None
++                    if gold_row is not None:
++                        delta = ours_row - gold_row
++                        gn = float(np.linalg.norm(gold_row))
++                        logits_metric = {
++                            "cosine": cosine(ours_row, gold_row),
++                            "rel_l2": float(np.linalg.norm(delta) / gn) if gn else None,
++                            "max_abs": float(np.max(np.abs(delta))),
++                        }
++                prompt_out["step_summary"].append({
++                    "step_index": step_index,
++                    "state_input_tag": tag_in,
++                    "state_rel_l2": summarize_values(rel_l2_values),
++                    "state_max_abs": summarize_values(max_abs_values),
++                    "logits_ours_vs_gold": logits_metric,
++                })
++            config_out["prompts"][prompt] = prompt_out
++        result["configs"][config] = config_out
++
++    # 参照自身 state 不确定性（可选）：w8a8 gold state vs float32 gold state
++    if gold_fp32_dir is not None:
++        ref_uncertainty = {}
++        for prompt in PROMPTS:
++            a_path = gold_dir / "{}.npz".format(prompt)
++            b_path = gold_fp32_dir / "{}.npz".format(prompt)
++            if not (a_path.is_file() and b_path.is_file()):
++                continue
++            a = load_npz(a_path)
++            b = load_npz(b_path)
++            entries = {}
++            for tag in TAGS:
++                rel_l2_values = []
++                max_abs_values = []
++                cosines = []
++                for key in sorted(a):
++                    if not key.startswith(tag + "__"):
++                        continue
++                    if key not in b:
++                        continue
++                    cmp = compare(a[key], b[key])
++                    if cmp.get("status") == "ok":
++                        rel_l2_values.append(cmp["rel_l2"])
++                        max_abs_values.append(cmp["max_abs"])
++                        cosines.append(cmp["cosine"])
++                entries[tag] = {
++                    "state_rel_l2": summarize_values(rel_l2_values),
++                    "state_max_abs": summarize_values(max_abs_values),
++                    "state_cosine": summarize_values(cosines),
++                    "key_count": len(rel_l2_values),
++                }
++            ref_uncertainty[prompt] = entries
++        result["reference_self_state_uncertainty_w8a8_vs_fp32"] = {
++            "gold_a": str(gold_dir),
++            "gold_b": str(gold_fp32_dir),
++            "per_prompt": ref_uncertainty,
++        }
++
++    out_path = Path(args.output)
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    out_path.write_text(json.dumps(result, indent=1), encoding="utf-8")
++    print("[compare_states] wrote {}".format(out_path))
++    for config, item in result["configs"].items():
++        for prompt, data in item["prompts"].items():
++            if data.get("status"):
++                print("[{}] {}: {}".format(config, prompt, data["status"]))
++                continue
++            for step in data["step_summary"]:
++                lm = step["logits_ours_vs_gold"] or {}
++                print("[{}] {} step{} state_rel_l2 med={} max={} | logits cos={} rel_l2={}".format(
++                    config, prompt, step["step_index"],
++                    step["state_rel_l2"].get("median"), step["state_rel_l2"].get("max"),
++                    None if lm.get("cosine") is None else round(lm["cosine"], 8),
++                    None if lm.get("rel_l2") is None else round(lm["rel_l2"], 6)))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/diag_c7/dump_gold_states.py b/tools/diag_c7/dump_gold_states.py
+new file mode 100644
+index 000000000..d904aea48
+--- /dev/null
++++ b/tools/diag_c7/dump_gold_states.py
+@@ -0,0 +1,233 @@
++#!/usr/bin/env python3
++"""C7 诊断：用官方 HF 参照实现 dump decode 各步的 state（conv / GDR recurrent / KV cache）。
++
++背景：gold 产物 c8-w8a8-reference-gold/reference/w8a8/*.npz 只含 logits 与 hidden，
++不含 decode state，无法直接回答"缺口是否来自 state 回灌"。本脚本在官方
++run_reference.py 的同一条推理路径（同 seed / 同 threads / 同 eager attn /
++同 w8a8 fake-quant）上，逐步抄写 HF Cache 里的 state 张量：
++
++  after_prefill / step_0..step_{N-1}（消耗 token 之后）：
++    * 线性注意力层: cache.layers[i].conv_states[0]        -> ours layer_XX_causal_conv_new_state
++                    cache.layers[i].recurrent_states[0]   -> ours layer_XX_recurrent_step_0_new_state
++    * 全注意力层:   cache.layers[i].keys / .values        -> ours layer_XX_new_k / layer_XX_new_v
++
++同时把 prefill_logits / decode_logits 一并落盘，用于逐位校验"本 dump 与既有
++gold npz 是同一次运行"，校验结果写进 manifest JSON。
++
++只读资产目录（local_files_only=True），不联网、不下载权重；不改判据。
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import importlib.util
++import json
++import os
++import platform
++import random
++import sys
++import time
++
++import numpy as np
++
++
++def sha256_file(path):
++    digest = hashlib.sha256()
++    with open(path, "rb") as handle:
++        for chunk in iter(lambda: handle.read(1 << 20), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def load_module(name, path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++def layer_snapshots(model, past, tag, out, dtypes):
++    """把 HF cache 中各层 state 以 float32 numpy copy 写入 out[<tag>__...]。
++
++    注意：torch bf16 张量不能直接 .numpy()，这里统一升级到 float32 保存，
++    原始 dtype 记入 dtypes（bf16 可被 float32 精确表示，无额外精度损失）。
++    """
++    import torch
++    layers = model.model.language_model.layers
++    shapes = {}
++    for index, layer in enumerate(layers):
++        cache_layer = past.layers[index]
++        conv_states = getattr(cache_layer, "conv_states", None)
++        recurrent_states = getattr(cache_layer, "recurrent_states", None)
++        if conv_states is not None:
++            conv = conv_states.get(0)
++            if conv is not None:
++                key = "{}__layer_{:02d}__conv_state".format(tag, index)
++                dtypes[key] = str(conv.dtype)
++                out[key] = conv.detach().to(torch.float32).cpu().numpy().copy()
++                shapes[key] = list(out[key].shape)
++        if recurrent_states is not None:
++            recurrent = recurrent_states.get(0)
++            if recurrent is not None:
++                key = "{}__layer_{:02d}__recurrent_state".format(tag, index)
++                dtypes[key] = str(recurrent.dtype)
++                out[key] = recurrent.detach().to(torch.float32).cpu().numpy().copy()
++                shapes[key] = list(out[key].shape)
++        keys = getattr(cache_layer, "keys", None)
++        values = getattr(cache_layer, "values", None)
++        if keys is not None and hasattr(keys, "numel") and keys.numel():
++            key = "{}__layer_{:02d}__key_cache".format(tag, index)
++            dtypes[key] = str(keys.dtype)
++            out[key] = keys.detach().to(torch.float32).cpu().numpy().copy()
++            shapes[key] = list(out[key].shape)
++        if values is not None and hasattr(values, "numel") and values.numel():
++            key = "{}__layer_{:02d}__value_cache".format(tag, index)
++            dtypes[key] = str(values.dtype)
++            out[key] = values.detach().to(torch.float32).cpu().numpy().copy()
++            shapes[key] = list(out[key].shape)
++    return shapes
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--harness", required=True, help="path to tools/qwen35_reference/run_reference.py")
++    parser.add_argument("--assets-dir", required=True)
++    parser.add_argument("--variant", default="w8a8", help="w8a8 | w8a8_f32ref | float32")
++    parser.add_argument("--out-dir", required=True)
++    parser.add_argument("--max-new-tokens", type=int, default=4)
++    parser.add_argument("--threads", type=int, default=6)
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument("--prompts", default="en_continuation,zh_continuation,chat_zh_user")
++    parser.add_argument("--gold-dir", default="", help="optional: validate decode_logits against gold npz")
++    parser.add_argument("--dry-run", action="store_true")
++    return parser.parse_args()
++
++
++def main():
++    args = parse_args()
++    out_dir = os.path.abspath(args.out_dir)
++    os.makedirs(out_dir, exist_ok=True)
++
++    harness = load_module("c7_run_reference", os.path.abspath(args.harness))
++    import w8a8_reference  # noqa: F401  (harness 同目录; sys.path 已由 harness 注入)
++
++    torch = harness.torch
++    torch.set_num_threads(args.threads)
++    random.seed(args.seed)
++    np.random.seed(args.seed)
++    torch.manual_seed(args.seed)
++
++    import transformers
++    from transformers import AutoTokenizer
++
++    tokenizer = AutoTokenizer.from_pretrained(args.assets_dir, local_files_only=True)
++    only_ids = [item.strip() for item in args.prompts.split(",") if item.strip()]
++    prompts = harness.encode_prompts(tokenizer, only_ids)
++    print("[dump] prompts: {}".format([(item["id"], item["seq_len"]) for item in prompts]), flush=True)
++    if args.dry_run:
++        print("[dump] dry-run: tokenizer + harness import OK; model NOT loaded")
++        return 0
++
++    variant = harness.W8A8_VARIANTS.get(args.variant)
++    base_dtype = variant["base_dtype"] if variant else harness.dtype_from_name(args.variant)
++    print("[dump] loading base_dtype={} variant={}".format(base_dtype, args.variant), flush=True)
++    start = time.time()
++    model = harness.load_model(args.assets_dir, base_dtype, "eager")
++    audit = None
++    if variant is not None:
++        audit = w8a8_reference.apply_fake_quant(model, args.variant)
++    print("[dump] loaded in %.1fs peak_rss=%.1fMiB" % (time.time() - start, harness.peak_rss_mib()), flush=True)
++
++    manifest = {
++        "tool": "dump_gold_states",
++        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++        "variant": args.variant,
++        "assets_dir": args.assets_dir,
++        "harness": os.path.abspath(args.harness),
++        "harness_sha256": sha256_file(os.path.abspath(args.harness)),
++        "threads": args.threads,
++        "seed": args.seed,
++        "max_new_tokens": args.max_new_tokens,
++        "python": sys.version,
++        "platform": platform.platform(),
++        "versions": {"torch": torch.__version__, "transformers": transformers.__version__},
++        "fake_quant_audit": (audit or {}).get("scope"),
++        "runs": [],
++    }
++    for item in prompts:
++        print("[dump] prompt={}".format(item["id"]), flush=True)
++        tensor_ids = torch.tensor([item["forward_ids"]], dtype=torch.long)
++        out = {}
++        dtypes = {}
++        with torch.no_grad():
++            outputs = model(input_ids=tensor_ids, use_cache=True, return_dict=True)
++            past = outputs.past_key_values
++            out["prefill_logits"] = outputs.logits[0].detach().to(torch.float32).cpu().numpy().copy()
++            shapes = layer_snapshots(model, past, "after_prefill", out, dtypes)
++            running_logits = outputs.logits
++            step_ids = []
++            step_logits = []
++            for step in range(args.max_new_tokens):
++                last_logits = running_logits[0, -1].to(torch.float32)
++                next_id = int(torch.argmax(last_logits).item())
++                step_logits.append(last_logits.cpu().numpy().copy())
++                step_ids.append(next_id)
++                step_out = model(
++                    input_ids=torch.tensor([[next_id]], dtype=torch.long),
++                    past_key_values=past,
++                    use_cache=True,
++                    return_dict=True,
++                )
++                past = step_out.past_key_values
++                running_logits = step_out.logits
++                snap = layer_snapshots(model, past, "step_{}".format(step), out, dtypes)
++                shapes.update(snap)
++        out["decode_logits"] = np.stack(step_logits, axis=0)
++        out["decode_token_ids"] = np.asarray(step_ids, dtype=np.int64)
++        out["input_ids"] = np.asarray(item["forward_ids"], dtype=np.int64)
++        npz_path = os.path.join(out_dir, "{}.npz".format(item["id"]))
++        np.savez(npz_path, **out)
++
++        entry = {
++            "prompt": item["id"],
++            "npz": npz_path,
++            "npz_sha256": sha256_file(npz_path),
++            "npz_bytes": os.path.getsize(npz_path),
++            "keys": sorted(out.keys()),
++            "state_shapes": {k: v for k, v in sorted(shapes.items())},
++            "state_dtypes": {k: v for k, v in sorted(dtypes.items())},
++            "decode_token_ids": [int(v) for v in step_ids],
++        }
++        if args.gold_dir:
++            gold_path = os.path.join(args.gold_dir, "w8a8", "{}.npz".format(item["id"]))
++            if os.path.isfile(gold_path):
++                with np.load(gold_path, allow_pickle=False) as gold:
++                    entry["validation_vs_gold"] = {
++                        "gold_npz": gold_path,
++                        "gold_npz_sha256": sha256_file(gold_path),
++                        "decode_logits_bitwise_equal": bool(
++                            np.array_equal(out["decode_logits"], np.asarray(gold["decode_logits"]))),
++                        "decode_logits_max_abs_diff": float(np.max(np.abs(
++                            out["decode_logits"].astype(np.float64)
++                            - np.asarray(gold["decode_logits"], dtype=np.float64)))),
++                        "decode_token_ids_equal": bool(
++                            np.array_equal(out["decode_token_ids"], np.asarray(gold["decode_token_ids"]))),
++                        "prefill_logits_bitwise_equal": bool(
++                            np.array_equal(out["prefill_logits"], np.asarray(gold["prefill_logits"]))),
++                    }
++        print("[dump]   {} keys={} decode_tokens={} {}".format(
++            item["id"], len(out), step_ids,
++            json.dumps(entry.get("validation_vs_gold", {}))), flush=True)
++        manifest["runs"].append(entry)
++
++    manifest_path = os.path.join(out_dir, "gold_states_manifest.json")
++    with open(manifest_path, "w", encoding="utf-8") as handle:
++        json.dump(manifest, handle, ensure_ascii=False, indent=2)
++    print("[dump] wrote {} + {}".format(out_dir, manifest_path), flush=True)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/diag_c7/make_evidence_manifest.py b/tools/diag_c7/make_evidence_manifest.py
+new file mode 100644
+index 000000000..9bcf1cf29
+--- /dev/null
++++ b/tools/diag_c7/make_evidence_manifest.py
+@@ -0,0 +1,49 @@
++#!/usr/bin/env python3
++"""C7 诊断证据 manifest：对 _meta/pypto-x/c7-decode-gap-localization 下所有文件生成 sha256 清单。"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++from pathlib import Path
++
++
++def sha256(path):
++    digest = hashlib.sha256()
++    with open(path, "rb") as handle:
++        for chunk in iter(lambda: handle.read(1 << 20), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--evidence-dir", required=True)
++    parser.add_argument("--output", default="")
++    args = parser.parse_args()
++    root = Path(args.evidence_dir).resolve()
++    entries = []
++    total = 0
++    for path in sorted(root.rglob("*")):
++        if not path.is_file():
++            continue
++        if path.name == "evidence_manifest.json":
++            continue
++        size = path.stat().st_size
++        total += size
++        entries.append({
++            "path": str(path.relative_to(root)),
++            "bytes": size,
++            "sha256": sha256(path),
++        })
++    payload = {"evidence_dir": str(root), "file_count": len(entries), "total_bytes": total,
++               "files": entries}
++    output = Path(args.output) if args.output else root / "raw" / "evidence_manifest.json"
++    output.parent.mkdir(parents=True, exist_ok=True)
++    output.write_text(json.dumps(payload, indent=1, ensure_ascii=False), encoding="utf-8")
++    print("[manifest] {} files {} bytes -> {}".format(len(entries), total, output))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/diag_c7/postprocess_after_heavy.sh b/tools/diag_c7/postprocess_after_heavy.sh
+new file mode 100755
+index 000000000..09bcefed5
+--- /dev/null
++++ b/tools/diag_c7/postprocess_after_heavy.sh
+@@ -0,0 +1,39 @@
++#!/usr/bin/env bash
++# C7 诊断：heavy 产物后处理（不占锁）：state 对比 + swap 汇总 + 表格 + manifest。
++# usage: postprocess_after_heavy.sh <evidence-dir> <worktree>
++set -uo pipefail
++
++EV=${1:?evidence dir required}
++WT=${2:-/home/chiro/projects/pypto/worktrees/pypto-x/c7-decode-gap-localization}
++RAW="${EV}/raw"
++GOLD=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/c8-w8a8-reference-gold/reference
++OURS_RAW=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/c8-l4-avx512/raw
++mkdir -p "${RAW}"
++
++if [[ -d "${RAW}/gold_states_w8a8" ]]; then
++  python3 "${WT}/tools/diag_c7/compare_states.py" \
++    --ours-raw "${OURS_RAW}" \
++    --gold-dir "${RAW}/gold_states_w8a8" \
++    --gold-reference-dir "${GOLD}" \
++    --gold-fp32-dir "${RAW}/gold_states_float32" \
++    --output "${RAW}/compare_states.json" || true
++fi
++
++if [[ -f "${RAW}/state_swap_experiment.json" ]]; then
++  python3 "${WT}/tools/diag_c7/summarize_swap.py" \
++    --swap "${RAW}/state_swap_experiment.json" \
++    --output "${RAW}/state_swap_summary.json" || true
++fi
++
++python3 "${WT}/tools/diag_c7/analyze_decode_gap.py" \
++  --gold-dir "${GOLD}" --evidence-raw "${OURS_RAW}" \
++  --output "${RAW}/decode_gap_analysis.json"
++python3 "${WT}/tools/diag_c7/render_tables.py" \
++  --analysis "${RAW}/decode_gap_analysis.json" \
++  --output "${RAW}/tables_decode_gap.md"
++python3 "${WT}/tools/diag_c7/state_trajectory_ours.py" \
++  --ours-raw "${OURS_RAW}" \
++  --analysis-json "${RAW}/decode_gap_analysis.json" \
++  --output "${RAW}/state_trajectory_ours.json"
++python3 "${WT}/tools/diag_c7/make_evidence_manifest.py" --evidence-dir "${EV}"
++echo "[c7-postprocess] done $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+diff --git a/tools/diag_c7/render_tables.py b/tools/diag_c7/render_tables.py
+new file mode 100644
+index 000000000..993c6c085
+--- /dev/null
++++ b/tools/diag_c7/render_tables.py
+@@ -0,0 +1,110 @@
++#!/usr/bin/env python3
++"""C7 诊断：把 decode_gap_analysis.json 渲染成 markdown 表格（raw/tables.md）。"""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++PROMPTS = ("en_continuation", "zh_continuation", "chat_zh_user")
++
++
++def fmt(value, digits=6):
++    if value is None:
++        return "-"
++    return "{:.{d}f}".format(value, d=digits)
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--analysis", required=True)
++    parser.add_argument("--output", required=True)
++    args = parser.parse_args()
++    data = json.loads(Path(args.analysis).read_text(encoding="utf-8"))
++    lines = []
++    lines.append("# C7 decode 缺口：分析表格（由 decode_gap_analysis.json 生成）\n")
++    lines.append("band 来源：`{}` sha256 `{}`\n".format(
++        data["band_source"]["path"], data["band_source"]["sha256"]))
++    lines.append("## 1. 逐步曲线：row0=prefill_next（=gold decode_logits[0]），row1..3=3 个 decode step\n")
++    lines.append("| config | prompt | row | 口径 | ours cos | ours max_abs | 参照自身 cos | 参照自身 max_abs | 误差范数比 ours/参照 | ours-vs-fp32 cos |")
++    lines.append("|---|---|---|---|---|---|---|---|---|---|")
++    for config in ("default", "full"):
++        for prompt in PROMPTS:
++            for row in data["configs"][config]["prompts"][prompt]["rows"]:
++                if "ours" not in row:
++                    continue
++                kind = "prefill_next" if row["row"] == 0 else "decode_step_{}".format(row["row"] - 1)
++                lines.append("| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
++                    config, prompt, row["row"], kind,
++                    fmt(row["ours"]["cosine"], 8), fmt(row["ours"]["max_abs"], 4),
++                    fmt(row["gold_vs_fp32"]["cosine"], 8), fmt(row["gold_vs_fp32"]["max_abs"], 4),
++                    fmt(row["ours"]["delta_norm"] / row["gold_vs_fp32"]["delta_norm"], 3)
++                    if row["gold_vs_fp32"]["delta_norm"] else "-",
++                    fmt(row["ours_vs_fp32"]["cosine"], 8)))
++
++    lines.append("\n## 2. prefill block 对照（同一批 prompt token）\n")
++    lines.append("| config | prompt | rows | ours cos | ours max_abs | 参照自身 cos | 参照自身 max_abs | 误差范数比 |")
++    lines.append("|---|---|---|---|---|---|---|---|")
++    for config in ("default", "full"):
++        for prompt in PROMPTS:
++            block = data["configs"][config]["prompts"][prompt]["prefill_block"]
++            ours = block["ours_vs_gold"]
++            ref = block["gold_vs_fp32_reference_self"]
++            lines.append("| {} | {} | {} | {} | {} | {} | {} | {} |".format(
++                config, prompt, block["rows"], fmt(ours["cosine"], 8), fmt(ours["max_abs"], 4),
++                fmt(ref["cosine"], 8), fmt(ref["max_abs"], 4),
++                fmt(ours["delta_norm"] / ref["delta_norm"], 3) if ref["delta_norm"] else "-"))
++
++    lines.append("\n## 3. rows0..3 block：误差能量份额与 cosine 门限预算\n")
++    lines.append("| config | prompt | ours cos | 声明 floor | margin | 参照自 cos | 范数比 | cosine 允许的范数比 | 超预算 | max_abs 允许比 | row3 能量份额(ours) |")
++    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
++    for config in ("default", "full"):
++        for prompt in PROMPTS:
++            block = data["configs"][config]["prompts"][prompt]["blocks"]["rows_0_3"]
++            ours = block["ours_vs_gold"]
++            ref = block["gold_vs_fp32_reference_self"]
++            band = block["declared_key_band"]
++            budget = block["cosine_gate_budget"]
++            energy = block["per_row_error_energy"]
++            lines.append("| {} | {} | {} | {} | {:+0.6f} | {} | {} | {} | {} | {} | {} |".format(
++                config, prompt, fmt(ours["cosine"], 8), fmt(band["cosine_floor"], 8),
++                band["ours_cosine_margin_vs_floor"], fmt(ref["cosine"], 8),
++                fmt(budget["measured_norm_ratio"], 3), fmt(budget["allowed_norm_ratio_cosine"], 5),
++                fmt(budget["ratio_over_budget"], 3), fmt(budget["max_abs_headroom_ratio"], 3),
++                fmt(energy[3]["ours_energy_share"], 3)))
++
++    lines.append("\n## 4. 分布（12 个 decode 行：3 prompt x 4 row）\n")
++    lines.append("| config | 指标 | min | p25 | median | p75 | max |")
++    lines.append("|---|---|---|---|---|---|---|")
++    for config in ("default", "full"):
++        dist = data["distributions"][config]
++        for key, label in (("ours_cos", "ours v gold cos"),
++                           ("ref_self_cos", "参照自身 cos (gold v fp32)"),
++                           ("ours_cos_minus_ref_self_cos", "ours cos - 参照自身 cos"),
++                           ("ours_over_ref_norm", "误差范数比 ours/参照")):
++            item = dist[key]
++            lines.append("| {} | {} | {} | {} | {} | {} | {} |".format(
++                config, label, fmt(item["min"], 6), fmt(item["p25"], 6), fmt(item["median"], 6),
++                fmt(item["p75"], 6), fmt(item["max"], 6)))
++    lines.append("\n## 5. 逐行方向阶梯（orthogonal null = 与 gold 正交的等范数误差）\n")
++    lines.append("| config | prompt | row | floor | ours actual | null(ref 范数) | 通过 | null(ours 范数) | 通过 | 范数比 |")
++    lines.append("|---|---|---|---|---|---|---|---|---|---|")
++    for config in ("default", "full"):
++        for prompt in PROMPTS:
++            for row in data["configs"][config]["prompts"][prompt]["blocks"]["rows_0_3"]["direction_ladder"]["per_row"]:
++                lines.append("| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |".format(
++                    config, prompt, row["row"], fmt(row["floor"], 8),
++                    fmt(row["ours_actual_cosine"], 8),
++                    fmt(row["orthogonal_null_ref_norm_cosine"], 8),
++                    "Y" if row["orthogonal_null_ref_norm_passes_floor"] else "N",
++                    fmt(row["orthogonal_null_ours_norm_cosine"], 8),
++                    "Y" if row["orthogonal_null_ours_norm_passes_floor"] else "N",
++                    fmt(row["ours_over_ref_norm"], 3)))
++    output = Path(args.output)
++    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
++    print("[tables] wrote {}".format(output))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/diag_c7/run_c7_heavy.sh b/tools/diag_c7/run_c7_heavy.sh
+new file mode 100755
+index 000000000..2ab3d69b2
+--- /dev/null
++++ b/tools/diag_c7/run_c7_heavy.sh
+@@ -0,0 +1,50 @@
++#!/usr/bin/env bash
++# C7 诊断 heavy 总入口（在 local 锁内顺序执行）：
++#   1) dump gold(HF w8a8/bfloat16/float32) prefill+decode state
++#   2) state 注入自检（gold state -> gold logits 逐位）
++#   3) state swap 归因实验（逐层消融）
++# usage: run_c7_heavy.sh <evidence-dir> <worktree>
++set -uo pipefail
++
++EV=${1:?evidence dir required}
++WT=${2:-/home/chiro/projects/pypto/worktrees/pypto-x/c7-decode-gap-localization}
++VENV=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/qwen35-bf16-reference/venv
++ASSETS=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/assets/qwen35-0.8b/2fc06364715b967f1860aea9cf38778875588b17
++GOLD=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/c8-w8a8-reference-gold/reference
++RAW="${EV}/raw"
++LOGS="${EV}/logs"
++mkdir -p "${RAW}" "${LOGS}"
++
++bash "${WT}/tools/diag_c7/run_gold_states_heavy.sh" "${EV}" "${WT}"
++rc=$?
++if [[ ${rc} -ne 0 ]]; then
++  echo "[c7-heavy] gold state dump failed rc=${rc}"
++  exit ${rc}
++fi
++
++COMMON=(
++  --harness "${WT}/tools/qwen35_reference/run_reference.py"
++  --assets-dir "${ASSETS}"
++  --ours-raw /home/chiro/projects/pypto/worktrees/_meta/pypto-x/c8-l4-avx512/raw
++  --gold-states-dir "${RAW}/gold_states_w8a8"
++  --gold-reference-dir "${GOLD}"
++  --steps 3 --threads 6 --seed 0 --variants w8a8
++)
++
++echo "[c7-heavy] state injection self-check $(date -u +%Y-%m-%dT%H:%M:%SZ)"
++"${VENV}/bin/python" "${WT}/tools/diag_c7/state_swap_experiment.py" \
++  "${COMMON[@]}" --self-check --out "${RAW}/state_swap_selfcheck.json" \
++  2>&1 | tee "${LOGS}/state_swap_selfcheck.log"
++rc=${PIPESTATUS[0]}
++if [[ ${rc} -ne 0 ]]; then
++  echo "[c7-heavy] self-check failed rc=${rc}"
++  exit ${rc}
++fi
++
++echo "[c7-heavy] state swap experiment $(date -u +%Y-%m-%dT%H:%M:%SZ)"
++"${VENV}/bin/python" "${WT}/tools/diag_c7/state_swap_experiment.py" \
++  "${COMMON[@]}" --out "${RAW}/state_swap_experiment.json" \
++  2>&1 | tee "${LOGS}/state_swap_experiment.log"
++rc=${PIPESTATUS[0]}
++echo "[c7-heavy] state swap experiment exit=${rc} $(date -u +%Y-%m-%dT%H:%M:%SZ)"
++exit ${rc}
+diff --git a/tools/diag_c7/run_gold_states_heavy.sh b/tools/diag_c7/run_gold_states_heavy.sh
+new file mode 100755
+index 000000000..c3311e027
+--- /dev/null
++++ b/tools/diag_c7/run_gold_states_heavy.sh
+@@ -0,0 +1,54 @@
++#!/usr/bin/env bash
++# C7 诊断 heavy inner：在 local 锁内 dump gold(HF 参照) 的 prefill/decode state。
++# 由 scripts/resource/run_local_heavy.sh 在锁内调用（本脚本自身不加锁）。
++#
++# usage: run_gold_states_heavy.sh <evidence-dir> [worktree]
++set -uo pipefail
++
++EV=${1:?evidence dir required}
++WT=${2:-/home/chiro/projects/pypto/worktrees/pypto-x/c7-decode-gap-localization}
++VENV=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/qwen35-bf16-reference/venv
++ASSETS=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/assets/qwen35-0.8b/2fc06364715b967f1860aea9cf38778875588b17
++GOLD=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/c8-w8a8-reference-gold/reference
++PY="${VENV}/bin/python"
++RAW="${EV}/raw"
++LOGS="${EV}/logs"
++mkdir -p "${RAW}" "${LOGS}"
++
++run_variant() {
++  local variant=$1
++  local out="${RAW}/gold_states_${variant}"
++  if [[ -f "${out}/gold_states_manifest.json" ]]; then
++    echo "[gold-states] skip ${variant} (exists)"
++    return 0
++  fi
++  echo "[gold-states] variant=${variant} start $(date -u +%Y-%m-%dT%H:%M:%SZ)"
++  "${PY}" "${WT}/tools/diag_c7/dump_gold_states.py" \
++    --harness "${WT}/tools/qwen35_reference/run_reference.py" \
++    --assets-dir "${ASSETS}" \
++    --variant "${variant}" \
++    --out-dir "${out}" \
++    --max-new-tokens 4 --threads 6 --seed 0 \
++    --gold-dir "${GOLD}" \
++    2>&1 | tee "${LOGS}/dump_gold_states_${variant}.log"
++  local status=${PIPESTATUS[0]}
++  echo "[gold-states] variant=${variant} exit=${status} at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
++  return ${status}
++}
++
++# w8a8 是必需项；C7_VARIANTS 可追加 bfloat16/float32 作为 state 口径参照
++# （锁竞争激烈时默认只跑 w8a8，减少占锁时间）。
++VARIANTS=${C7_VARIANTS:-w8a8}
++run_variant w8a8 || exit $?
++for extra in ${VARIANTS//,/ }; do
++  [[ ${extra} == w8a8 ]] && continue
++  if [[ ${extra} == float32 ]]; then
++    avail=$(awk '/^MemAvailable:/ {printf "%d", $2/1024; exit}' /proc/meminfo)
++    if (( avail < 13000 )); then
++      echo "[gold-states] skip float32 dump: MemAvailable=${avail}MiB < 13000MiB" | tee "${LOGS}/dump_gold_states_float32.skipped"
++      continue
++    fi
++  fi
++  run_variant "${extra}" || echo "[gold-states] warn: ${extra} dump failed (non-fatal)"
++done
++echo "[gold-states] done $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+diff --git a/tools/diag_c7/state_swap_experiment.py b/tools/diag_c7/state_swap_experiment.py
+new file mode 100644
+index 000000000..d20ba9d44
+--- /dev/null
++++ b/tools/diag_c7/state_swap_experiment.py
+@@ -0,0 +1,439 @@
++#!/usr/bin/env python3
++"""C7 诊断：state 回灌归因实验（oracle state swap，跑在官方 HF w8a8 gold 上）。
++
++问题：decode 的 logits 缺口里，多少来自"我们的 state（conv/GDR/KV）逐步回灌"，
++多少来自"给定相同 state 时的单步计算差异"？
++
++方法（全部在 gold 模型上做，不涉及我们的运行时）：
++  对每个 prompt 的第 j 个 decode step（消耗 gold token j）：
++    * cache 中装入 gold state（step j 的输入 state）→ 前向 → A_j（=gold logits，逐位校验）；
++    * cache 中装入 ours state（同一位置）      → 前向 → B_j；
++    * 逐层消融：ours state 中只把 layer L 换成 gold state → D_j^L；
++    * ours 自己 dump 的 logits C_j（只读既有产物）。
++  于是：
++    ||C_j - A_j||                 = 总缺口（= 判据看到的量）
++    ||B_j - A_j||                 = state 回灌能解释的部分
++    ||C_j - B_j||                 = 相同 state 下的单步计算差异
++    ||D_j^L - A_j|| 相对 B_j 的下降 = layer L 的 state 误差对总缺口的边际贡献
++
++state 语义（双方均为"消耗 token j-1 之后"）：
++  after_prefill -> step_0 -> step_1 -> step_2 -> step_3
++映射：ours layer_XX_causal_conv_new_state / layer_XX_recurrent_step_*_new_state /
++layer_XX_new_k,new_v  <->  HF cache 的 conv_states[0] / recurrent_states[0] / keys,values。
++ours state 以 float32 dump，注入前 cast 到模型 dtype（w8a8 为 bf16），结果中记录该 cast。
++
++只读资产目录（local_files_only=True）；输出 JSON。
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import importlib.util
++import json
++import math
++import os
++import random
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++
++PROMPTS = ("en_continuation", "zh_continuation", "chat_zh_user")
++CONFIGS = ("default", "full")
++
++
++def load_module(name, path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++def cosine(a, b):
++    a = np.asarray(a, dtype=np.float64).reshape(-1)
++    b = np.asarray(b, dtype=np.float64).reshape(-1)
++    na = math.sqrt(float(np.dot(a, a)))
++    nb = math.sqrt(float(np.dot(b, b)))
++    if na == 0.0 or nb == 0.0:
++        return float("nan")
++    return float(np.dot(a, b) / (na * nb))
++
++
++def compare(actual, baseline):
++    actual = np.asarray(actual, dtype=np.float64).reshape(-1)
++    baseline = np.asarray(baseline, dtype=np.float64).reshape(-1)
++    delta = actual - baseline
++    gn = math.sqrt(float(np.dot(baseline, baseline)))
++    return {
++        "cosine": cosine(actual, baseline),
++        "rel_l2": float(math.sqrt(float(np.dot(delta, delta))) / gn) if gn else None,
++        "max_abs": float(np.max(np.abs(delta))),
++    }
++
++
++def ours_snapshot(npz, layer):
++    out = {}
++    conv = npz.get("layer_{:02d}_causal_conv_new_state".format(layer))
++    if conv is not None:
++        out["conv"] = conv
++    recurrent = [key for key in npz
++                 if key.startswith("layer_{:02d}_recurrent_step_".format(layer))
++                 and key.endswith("_new_state")]
++    if len(recurrent) == 1:
++        out["recurrent"] = npz[recurrent[0]]
++    elif len(recurrent) > 1:
++        raise SystemExit("layer {} has {} recurrent states".format(layer, len(recurrent)))
++    key = npz.get("layer_{:02d}_new_k".format(layer))
++    value = npz.get("layer_{:02d}_new_v".format(layer))
++    if key is not None and value is not None:
++        out["k"] = key
++        out["v"] = value
++    return out
++
++
++def gold_snapshot(npz, tag, layer):
++    out = {}
++    for suffix, name in (("conv_state", "conv"), ("recurrent_state", "recurrent"),
++                         ("key_cache", "k"), ("value_cache", "v")):
++        arr = npz.get("{}__layer_{:02d}__{}".format(tag, layer, suffix))
++        if arr is not None:
++            out[name] = arr
++    return out
++
++
++def make_cache(model):
++    from transformers import DynamicCache
++    return DynamicCache(config=model.model.language_model.config)
++
++
++def inject(cache, snapshots, dtype):
++    import torch
++    for index, cache_layer in enumerate(cache.layers):
++        snap = snapshots.get(index, {})
++        if hasattr(cache_layer, "conv_states"):
++            if "conv" in snap:
++                tensor = torch.as_tensor(np.ascontiguousarray(snap["conv"]), dtype=dtype)
++                cache_layer.conv_states[0] = tensor
++                cache_layer.is_conv_states_initialized[0] = True
++                cache_layer.conv_kernel_size[0] = int(tensor.shape[-1])
++            if "recurrent" in snap:
++                cache_layer.recurrent_states[0] = torch.as_tensor(
++                    np.ascontiguousarray(snap["recurrent"]), dtype=dtype)
++                cache_layer.is_recurrent_states_initialized[0] = True
++                cache_layer.has_previous_state[0] = True
++            cache_layer.dtype = dtype
++            cache_layer.device = torch.device("cpu")
++        else:
++            if "k" in snap and "v" in snap:
++                cache_layer.keys = torch.as_tensor(np.ascontiguousarray(snap["k"]), dtype=dtype)
++                cache_layer.values = torch.as_tensor(np.ascontiguousarray(snap["v"]), dtype=dtype)
++                cache_layer.is_initialized = True
++                cache_layer.dtype = dtype
++                cache_layer.device = torch.device("cpu")
++
++
++def measure(model, cache, token_id):
++    import torch
++    with torch.no_grad():
++        out = model(
++            input_ids=torch.tensor([[int(token_id)]], dtype=torch.long),
++            past_key_values=cache,
++            use_cache=True,
++            return_dict=True,
++        )
++    return out.logits[0, -1].to(torch.float32).cpu().numpy().copy()
++
++
++def sequential_gold(model, input_ids, steps):
++    """返回 logits 序列：logits[0]=prefill 末行，logits[j+1]=消耗 token j 之后的输出。"""
++    import torch
++    with torch.no_grad():
++        out = model(input_ids=torch.tensor([list(input_ids)], dtype=torch.long),
++                    use_cache=True, return_dict=True)
++    past = out.past_key_values
++    logits = [out.logits[0, -1].to(torch.float32).cpu().numpy().copy()]
++    tokens = []
++    for _ in range(steps):
++        next_id = int(np.argmax(logits[-1]))
++        tokens.append(next_id)
++        with torch.no_grad():
++            out = model(input_ids=torch.tensor([[next_id]], dtype=torch.long),
++                        past_key_values=past, use_cache=True, return_dict=True)
++        past = out.past_key_values
++        logits.append(out.logits[0, -1].to(torch.float32).cpu().numpy().copy())
++    return logits, tokens
++
++
++def snapshot_inline(past):
++    """从 HF cache 现场抄出 {layer: {conv/recurrent/k/v}}（float32 copy）。"""
++    import torch
++    out = {}
++    for index, cache_layer in enumerate(past.layers):
++        entry = {}
++        conv_states = getattr(cache_layer, "conv_states", None)
++        if conv_states is not None:
++            conv = conv_states.get(0)
++            if conv is not None:
++                entry["conv"] = conv.detach().to(torch.float32).cpu().numpy().copy()
++            recurrent = cache_layer.recurrent_states.get(0)
++            if recurrent is not None:
++                entry["recurrent"] = recurrent.detach().to(torch.float32).cpu().numpy().copy()
++        keys = getattr(cache_layer, "keys", None)
++        values = getattr(cache_layer, "values", None)
++        if keys is not None and keys.numel():
++            entry["k"] = keys.detach().to(torch.float32).cpu().numpy().copy()
++            entry["v"] = values.detach().to(torch.float32).cpu().numpy().copy()
++        out[index] = entry
++    return out
++
++
++def self_check(model, item, param_dtype, steps=3):
++    """注入现场捕获的 gold state，验证 A_j 与顺序前向 logits 逐位一致。"""
++    import torch
++    with torch.no_grad():
++        out = model(input_ids=torch.tensor([list(item["forward_ids"])], dtype=torch.long),
++                    use_cache=True, return_dict=True)
++    past = out.past_key_values
++    logits = [out.logits[0, -1].to(torch.float32).cpu().numpy().copy()]
++    snaps = [snapshot_inline(past)]
++    chain = []
++    for _ in range(steps):
++        next_id = int(np.argmax(logits[-1]))
++        chain.append(next_id)
++        with torch.no_grad():
++            out = model(input_ids=torch.tensor([[next_id]], dtype=torch.long),
++                        past_key_values=past, use_cache=True, return_dict=True)
++        past = out.past_key_values
++        logits.append(out.logits[0, -1].to(torch.float32).cpu().numpy().copy())
++        snaps.append(snapshot_inline(past))
++    checks = []
++    for j in range(steps):
++        cache = make_cache(model)
++        inject(cache, snaps[j], param_dtype)
++        measured = measure(model, cache, chain[j])
++        checks.append({
++            "step": j,
++            "token": int(chain[j]),
++            "bitwise_equal_sequential": bool(np.array_equal(measured, logits[j + 1])),
++            "max_abs_diff": float(np.max(np.abs(measured.astype(np.float64)
++                                             - logits[j + 1].astype(np.float64)))),
++            "cosine": cosine(measured, logits[j + 1]),
++            "layers_captured": len(snaps[j]),
++        })
++    return {"prompt": item["id"], "checks": checks}
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--harness", required=True)
++    parser.add_argument("--assets-dir", required=True)
++    parser.add_argument("--ours-raw", required=True)
++    parser.add_argument("--gold-states-dir", required=True)
++    parser.add_argument("--gold-reference-dir", required=True)
++    parser.add_argument("--out", required=True)
++    parser.add_argument("--steps", type=int, default=4)
++    parser.add_argument("--threads", type=int, default=6)
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument("--variants", default="w8a8")
++    parser.add_argument("--max-layers", type=int, default=0, help=">0 时只消融前 N 层（调试用）")
++    parser.add_argument("--self-check", action="store_true",
++                        help="只做注入自检（gold state -> gold logits 逐位），不跑消融")
++    return parser.parse_args()
++
++
++def main():
++    args = parse_args()
++    harness = load_module("c7_run_reference", os.path.abspath(args.harness))
++    import w8a8_reference  # noqa: F401
++    import torch
++
++    torch.set_num_threads(args.threads)
++    random.seed(args.seed)
++    np.random.seed(args.seed)
++    torch.manual_seed(args.seed)
++
++    from transformers import AutoTokenizer
++
++    tokenizer = AutoTokenizer.from_pretrained(args.assets_dir, local_files_only=True)
++    prompts = harness.encode_prompts(tokenizer, list(PROMPTS))
++    variant = harness.W8A8_VARIANTS[args.variants]
++    model = harness.load_model(args.assets_dir, variant["base_dtype"], "eager")
++    audit = w8a8_reference.apply_fake_quant(model, args.variants)
++    param_dtype = next(model.parameters()).dtype
++    print("[swap] variant={} param_dtype={} quantized={}".format(
++        args.variants, param_dtype, audit["scope"]["quantized_module_count"]), flush=True)
++
++    if args.self_check:
++        report = {"tool": "state_swap_experiment.self_check",
++                  "param_dtype": str(param_dtype),
++                  "variant": args.variants,
++                  "prompts": [self_check(model, prompt, param_dtype, steps=min(3, args.steps))
++                              for prompt in prompts]}
++        out_path = Path(args.out)
++        out_path.parent.mkdir(parents=True, exist_ok=True)
++        out_path.write_text(json.dumps(report, indent=1), encoding="utf-8")
++        ok = all(check["max_abs_diff"] <= 1e-5
++                 for prompt in report["prompts"] for check in prompt["checks"])
++        print("[swap] self-check ok={} -> {}".format(ok, out_path), flush=True)
++        return 0 if ok else 1
++
++    layer_count = len(model.model.language_model.layers)
++    if args.max_layers > 0:
++        layer_count = min(layer_count, args.max_layers)
++
++    ours_raw = Path(args.ours_raw).resolve()
++    gold_states_dir = Path(args.gold_states_dir).resolve()
++    gold_reference_dir = Path(args.gold_reference_dir).resolve()
++
++    result = {
++        "tool": "state_swap_experiment",
++        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++        "harness": os.path.abspath(args.harness),
++        "harness_sha256": hashlib.sha256(
++            open(os.path.abspath(args.harness), "rb").read()).hexdigest(),
++        "ours_raw": str(ours_raw),
++        "gold_states_dir": str(gold_states_dir),
++        "gold_reference_dir": str(gold_reference_dir),
++        "param_dtype": str(param_dtype),
++        "variant": args.variants,
++        "fake_quant_scope": audit.get("scope"),
++        "definition": {
++            "A_j": "gold states 注入后前向（=gold logits）",
++            "B_j": "ours states 注入后前向",
++            "C_j": "ours 自己 dump 的 logits",
++            "D_j^L": "ours states，仅 layer L 换成 gold state",
++            "total_gap": "C_j vs A_j",
++            "state_reflow_gap": "B_j vs A_j",
++            "compute_gap_given_state": "C_j vs B_j",
++            "layer_fix_gain": "rel_l2(B_j-A_j) - rel_l2(D_j^L-A_j)（越大说明该层 state 误差贡献越大）",
++        },
++        "prompts": {},
++    }
++
++    for item in prompts:
++        prompt = item["id"]
++        print("[swap] prompt={}".format(prompt), flush=True)
++        gold_states = {}
++        gold_states_path = gold_states_dir / "{}.npz".format(prompt)
++        with np.load(str(gold_states_path), allow_pickle=False) as data:
++            for key in data.files:
++                gold_states[key] = np.asarray(data[key])
++        gold_ref = {}
++        with np.load(str(gold_reference_dir / "w8a8" / "{}.npz".format(prompt)),
++                     allow_pickle=False) as data:
++            for key in data.files:
++                gold_ref[key] = np.asarray(data[key])
++
++        logits_seq, chain = sequential_gold(model, item["forward_ids"], args.steps)
++        print("[swap]   token chain={}".format(chain), flush=True)
++
++        prompt_out = {
++            "gold_token_chain": [int(v) for v in chain],
++            "gold_logits_sequence_validation": [],
++            "configs": {},
++        }
++        # 逐位校验：sequential_gold 的 logits[1..] 必须与既有 gold decode_logits 一致
++        decode_logits_ref = np.asarray(gold_ref["decode_logits"], dtype=np.float32)
++        for j in range(min(args.steps, decode_logits_ref.shape[0])):
++            identical = bool(np.array_equal(logits_seq[j], decode_logits_ref[j]))
++            prompt_out["gold_logits_sequence_validation"].append({
++                "index": j, "bitwise_equal_gold_npz": identical,
++                "max_abs_diff": float(np.max(np.abs(
++                    logits_seq[j].astype(np.float64) - decode_logits_ref[j].astype(np.float64)))),
++            })
++
++        for config in CONFIGS:
++            manifest_path = ours_raw / "ours_manifest_{}.json".format(config)
++            if not manifest_path.is_file():
++                continue
++            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
++            entry = manifest["prompts"][prompt]
++            with np.load(entry["prefill_npz"], allow_pickle=False) as data:
++                ours_prefill = {key: np.asarray(data[key]) for key in data.files}
++            ours_decode = {}
++            for past, path in sorted(entry["decode_npz"].items(), key=lambda kv: int(kv[0])):
++                with np.load(path, allow_pickle=False) as data:
++                    ours_decode[int(past)] = {key: np.asarray(data[key]) for key in data.files}
++            decode_pasts = sorted(ours_decode)
++
++            config_out = {"steps": []}
++            for j in range(min(args.steps, len(decode_pasts))):
++                token = int(chain[j])
++                tag_in = "after_prefill" if j == 0 else "step_{}".format(j - 1)
++                ours_snap = {
++                    layer: ours_snapshot(ours_prefill if j == 0 else ours_decode[decode_pasts[j - 1]], layer)
++                    for layer in range(layer_count)
++                }
++                gold_snap = {
++                    layer: gold_snapshot(gold_states, tag_in, layer)
++                    for layer in range(layer_count)
++                }
++                # A_j: gold states
++                cache = make_cache(model)
++                inject(cache, gold_snap, param_dtype)
++                baseline = measure(model, cache, token)
++                baseline_vs_seq = compare(baseline, logits_seq[j + 1])
++                baseline_vs_seq["bitwise_equal"] = bool(np.array_equal(
++                    baseline, logits_seq[j + 1]))
++                # B_j: ours states
++                cache = make_cache(model)
++                inject(cache, ours_snap, param_dtype)
++                ours_swap = measure(model, cache, token)
++                # C_j: ours dump logits（j 步的 dump = 消耗 token j 之后）
++                ours_dump = np.asarray(
++                    ours_decode[decode_pasts[j]]["logits"], dtype=np.float32).reshape(-1)
++                step_entry = {
++                    "step_index": j,
++                    "token": token,
++                    "state_input_tag": tag_in,
++                    "baseline_vs_sequential": baseline_vs_seq,
++                    "total_gap_C_vs_A": compare(ours_dump, baseline),
++                    "state_reflow_gap_B_vs_A": compare(ours_swap, baseline),
++                    "compute_gap_C_vs_B": compare(ours_dump, ours_swap),
++                    "per_layer_fix": [],
++                }
++                reflow_rel = step_entry["state_reflow_gap_B_vs_A"]["rel_l2"]
++                for layer in range(layer_count):
++                    fixed_snap = dict(ours_snap)
++                    fixed_snap[layer] = gold_snap[layer]
++                    cache = make_cache(model)
++                    inject(cache, fixed_snap, param_dtype)
++                    fixed = measure(model, cache, token)
++                    metric = compare(fixed, baseline)
++                    gain = None
++                    if reflow_rel is not None and metric["rel_l2"] is not None:
++                        gain = reflow_rel - metric["rel_l2"]
++                    step_entry["per_layer_fix"].append({
++                        "layer": layer,
++                        "vs_A": metric,
++                        "fix_gain": gain,
++                    })
++                step_entry["per_layer_fix_ranking"] = sorted(
++                    [{"layer": item["layer"], "fix_gain": item["fix_gain"],
++                      "rel_l2_after_fix": item["vs_A"]["rel_l2"],
++                      "cosine_after_fix": item["vs_A"]["cosine"]}
++                     for item in step_entry["per_layer_fix"]],
++                    key=lambda x: (x["fix_gain"] is None, -(x["fix_gain"] or 0.0)))[:8]
++                config_out["steps"].append(step_entry)
++                print("[swap]   {} step{} token={} total_rel={:.5f} reflow_rel={:.5f} "
++                      "compute_rel={:.5f} top_fix={}".format(
++                          config, j, token,
++                          step_entry["total_gap_C_vs_A"]["rel_l2"] or -1,
++                          step_entry["state_reflow_gap_B_vs_A"]["rel_l2"] or -1,
++                          step_entry["compute_gap_C_vs_B"]["rel_l2"] or -1,
++                          step_entry["per_layer_fix_ranking"][:3]), flush=True)
++            prompt_out["configs"][config] = config_out
++        result["prompts"][prompt] = prompt_out
++
++    out_path = Path(args.out)
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    out_path.write_text(json.dumps(result, indent=1), encoding="utf-8")
++    print("[swap] wrote {}".format(out_path), flush=True)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/diag_c7/state_trajectory_ours.py b/tools/diag_c7/state_trajectory_ours.py
+new file mode 100644
+index 000000000..64daf6bc0
+--- /dev/null
++++ b/tools/diag_c7/state_trajectory_ours.py
+@@ -0,0 +1,165 @@
++#!/usr/bin/env python3
++"""C7 诊断（不依赖 gold state）：ours decode state 轨迹自洽性与变化量。
++
++检查项：
++  1. KV cache 前缀不变式：step k 的 cache[:, :, :T_k-1] 必须逐位等于 step k-1 的 cache；
++  2. conv state 滑动窗不变式：prev[:, :, 1:] 必须逐位等于 cur[:, :, :3]；
++  3. 所有 state finite、dtype/shape 稳定；
++  4. 每层/每类 state 的步间相对变化量 ||s_k - s_{k-1}|| / ||s_k||；
++  5. 与 decode logits 的 ours-vs-gold cosine 序列并排（logits 数据可选，来自
++     decode_gap_analysis.json）。
++
++输出 JSON；只读 ours 产物。
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import re
++from pathlib import Path
++
++import numpy as np
++
++PROMPTS = ("en_continuation", "zh_continuation", "chat_zh_user")
++CONFIGS = ("default", "full")
++
++
++def rel_change(a, b):
++    a = np.asarray(a, dtype=np.float64).reshape(-1)
++    b = np.asarray(b, dtype=np.float64).reshape(-1)
++    nb = math.sqrt(float(np.dot(b, b)))
++    return float(math.sqrt(float(np.dot(a - b, a - b))) / nb) if nb else None
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--ours-raw", required=True)
++    parser.add_argument("--analysis-json", default="")
++    parser.add_argument("--output", required=True)
++    return parser.parse_args()
++
++
++def main():
++    args = parse_args()
++    raw = Path(args.ours_raw).resolve()
++    analysis = {}
++    if args.analysis_json:
++        analysis = json.loads(Path(args.analysis_json).read_text(encoding="utf-8"))
++    out = {"tool": "state_trajectory_ours", "ours_raw": str(raw), "configs": {}}
++
++    for config in CONFIGS:
++        manifest_path = raw / "ours_manifest_{}.json".format(config)
++        if not manifest_path.is_file():
++            continue
++        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
++        cfg_out = {"prompts": {}}
++        for prompt in PROMPTS:
++            entry = manifest["prompts"][prompt]
++            prefill = dict(np.load(entry["prefill_npz"], allow_pickle=False))
++            pasts = sorted(entry["decode_npz"], key=int)
++            steps = [dict(np.load(entry["decode_npz"][p], allow_pickle=False)) for p in pasts]
++            prompt_out = {"violations": [], "state_change": [], "logits_series": None}
++
++            # 1) KV prefix invariant + 2) conv sliding window
++            for step_index in range(1, len(steps)):
++                prev = steps[step_index - 1]
++                cur = steps[step_index]
++                for key in prev:
++                    if not key.endswith("_new_k") and not key.endswith("_causal_conv_new_state"):
++                        continue
++                    if key not in cur:
++                        prompt_out["violations"].append({"kind": "missing_key", "key": key, "step": step_index})
++                        continue
++                    a = prev[key].astype(np.float64)
++                    b = cur[key].astype(np.float64)
++                    if key.endswith("_new_k"):
++                        if a.shape[2] + 1 != b.shape[2]:
++                            prompt_out["violations"].append({
++                                "kind": "kv_shape", "key": key, "step": step_index,
++                                "prev": list(a.shape), "cur": list(b.shape)})
++                            continue
++                        diff = float(np.max(np.abs(a - b[:, :, :a.shape[2], :])))
++                        if diff != 0.0:
++                            prompt_out["violations"].append({
++                                "kind": "kv_prefix_mismatch", "key": key, "step": step_index,
++                                "max_abs_diff": diff})
++                    else:
++                        diff = float(np.max(np.abs(a[:, :, 1:] - b[:, :, :a.shape[2] - 1])))
++                        if diff != 0.0:
++                            prompt_out["violations"].append({
++                                "kind": "conv_shift_mismatch", "key": key, "step": step_index,
++                                "max_abs_diff": diff})
++
++            # 4) per-state step-to-step relative change (from prefill state to last step)
++            def normalized(entry):
++                out = {}
++                for key, value in entry.items():
++                    match = re.match(r"^(layer_\d+)_recurrent_step_\d+_new_state$", key)
++                    out[match.group(1) + "_recurrent_state" if match else key] = value
++                return out
++            sequence = [normalized(item) for item in [prefill] + steps]
++            for key in sorted(sequence[0]):
++                if key not in sequence[-1]:
++                    continue
++                if key in ("logits", "final_hidden", "position_ids"):
++                    continue
++                values = []
++                finite = True
++                for index in range(1, len(sequence)):
++                    a = sequence[index - 1][key]
++                    b = sequence[index][key]
++                    if a.shape != b.shape:
++                        # KV cache grows: compare the overlapping prefix
++                        n = min(a.shape[2], b.shape[2]) if a.ndim == 4 and b.ndim == 4 else 0
++                        if n == 0:
++                            values.append(None)
++                            continue
++                        change = rel_change(b[:, :, :n, :], a[:, :, :n, :])
++                    else:
++                        change = rel_change(b, a)
++                    values.append(change)
++                    if not (np.all(np.isfinite(a)) and np.all(np.isfinite(b))):
++                        finite = False
++                prompt_out["state_change"].append({
++                    "key": key, "rel_change_per_step": values, "finite": finite,
++                    "absmax_last": float(np.max(np.abs(sequence[-1][key]))),
++                })
++
++            # 5) logits series joined from analysis json
++            if analysis:
++                rows = analysis.get("configs", {}).get(config, {}).get("prompts", {}).get(prompt, {}).get("rows", [])
++                prompt_out["logits_series"] = [
++                    {"row": row["row"], "kind": row["kind"],
++                     "ours_cos": (row.get("ours") or {}).get("cosine"),
++                     "ours_max_abs": (row.get("ours") or {}).get("max_abs"),
++                     "ref_self_cos": (row.get("gold_vs_fp32") or {}).get("cosine")}
++                    for row in rows if "ours" in row]
++            cfg_out["prompts"][prompt] = prompt_out
++        out["configs"][config] = cfg_out
++
++    out_path = Path(args.output)
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    out_path.write_text(json.dumps(out, indent=1), encoding="utf-8")
++    violations = sum(len(item["violations"])
++                     for cfg in out["configs"].values()
++                     for item in cfg["prompts"].values())
++    print("[state_trajectory_ours] wrote {} violations={}".format(out_path, violations))
++    for config, cfg in out["configs"].items():
++        for prompt, item in cfg["prompts"].items():
++            rec = [x for x in item["state_change"] if "recurrent" in x["key"]]
++            conv = [x for x in item["state_change"] if "conv" in x["key"]]
++            def last(values):
++                return None if not values else values[-1]
++            print("[{}] {} violations={} rec_last_rel_change_med={} conv_last={} logits={}".format(
++                config, prompt, len(item["violations"]),
++                None if not rec else float(np.median([last(x["rel_change_per_step"]) or 0 for x in rec])),
++                None if not conv else float(np.median([last(x["rel_change_per_step"]) or 0 for x in conv])),
++                None if not item["logits_series"] else [
++                    None if x["ours_cos"] is None else round(x["ours_cos"], 6)
++                    for x in item["logits_series"]]))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/diag_c7/summarize_swap.py b/tools/diag_c7/summarize_swap.py
+new file mode 100644
+index 000000000..a08450c77
+--- /dev/null
++++ b/tools/diag_c7/summarize_swap.py
+@@ -0,0 +1,73 @@
++#!/usr/bin/env python3
++"""C7 诊断：汇总 state_swap_experiment.json（控制台 + 可选 JSON）。"""
++
++from __future__ import annotations
++
++import argparse
++import json
++from pathlib import Path
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--swap", required=True)
++    parser.add_argument("--output", default="")
++    args = parser.parse_args()
++    data = json.loads(Path(args.swap).read_text(encoding="utf-8"))
++    summary = {"meta": {key: data.get(key) for key in (
++        "variant", "param_dtype", "gold_states_dir", "generated_at_utc")}, "prompts": {}}
++    print("variant={} param_dtype={} gold_states={}".format(
++        data.get("variant"), data.get("param_dtype"), data.get("gold_states_dir")))
++    for prompt, prompt_data in data.get("prompts", {}).items():
++        print("== {} chain={} ==".format(prompt, prompt_data.get("gold_token_chain")))
++        entry = {"gold_token_chain": prompt_data.get("gold_token_chain"), "configs": {}}
++        for config, config_data in prompt_data.get("configs", {}).items():
++            entry["configs"][config] = []
++            for step in config_data.get("steps", []):
++                total = step["total_gap_C_vs_A"]
++                reflow = step["state_reflow_gap_B_vs_A"]
++                compute = step["compute_gap_C_vs_B"]
++                top = step["per_layer_fix_ranking"][:3]
++                entry["configs"][config].append({
++                    "step_index": step["step_index"],
++                    "token": step["token"],
++                    "total_rel_l2": total.get("rel_l2"), "total_cos": total.get("cosine"),
++                    "reflow_rel_l2": reflow.get("rel_l2"), "reflow_cos": reflow.get("cosine"),
++                    "compute_rel_l2": compute.get("rel_l2"), "compute_cos": compute.get("cosine"),
++                    "top_fix_layers": top,
++                    "baseline_bitwise": step.get("baseline_vs_sequential", {}).get("bitwise_equal"),
++                })
++                print("  {:<8} step{} token={:<7} total(rel={:.5f} cos={:.6f}) "
++                      "state_reflow(rel={:.5f} cos={:.6f}) compute(rel={:.5f}) top_fix={}".format(
++                          config, step["step_index"], step["token"],
++                          total.get("rel_l2") or -1, total.get("cosine") or -1,
++                          reflow.get("rel_l2") or -1, reflow.get("cosine") or -1,
++                          compute.get("rel_l2") or -1,
++                          [(item["layer"], round(item["fix_gain"] or 0, 5)) for item in top]))
++        summary["prompts"][prompt] = entry
++
++    # 跨 step 的层贡献排名（按 fix_gain 求和，只在 steps>=1 上聚合，避免 prefill_next 权重）
++    ranking = {}
++    for prompt, prompt_data in data.get("prompts", {}).items():
++        for config, config_data in prompt_data.get("configs", {}).items():
++            for step in config_data.get("steps", []):
++                if step["step_index"] == 0:
++                    continue
++                for item in step["per_layer_fix"]:
++                    key = (prompt, config, item["layer"])
++                    ranking[key] = ranking.get(key, 0.0) + (item["fix_gain"] or 0.0)
++    top_overall = sorted(ranking.items(), key=lambda kv: -kv[1])[:12]
++    summary["top_layers_sum_over_decode_steps"] = [
++        {"prompt": key[0], "config": key[1], "layer": key[2], "sum_fix_gain": value}
++        for key, value in top_overall]
++    print("== top layers (sum fix_gain over decode steps >=1) ==")
++    for item in summary["top_layers_sum_over_decode_steps"]:
++        print("  {} {} layer_{:02d} sum_fix_gain={:.6f}".format(
++            item["prompt"], item["config"], item["layer"], item["sum_fix_gain"]))
++    if args.output:
++        Path(args.output).write_text(json.dumps(summary, indent=1), encoding="utf-8")
++        print("[summarize_swap] wrote {}".format(args.output))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/diag_c7/wait_and_run_gold_states.sh b/tools/diag_c7/wait_and_run_gold_states.sh
+new file mode 100755
+index 000000000..7dd4b12a3
+--- /dev/null
++++ b/tools/diag_c7/wait_and_run_gold_states.sh
+@@ -0,0 +1,34 @@
++#!/usr/bin/env bash
++# C7 诊断：以 300s 节奏重试获取 local 锁，锁内 dump gold states。
++# 背景运行：nohup tools/diag_c7/wait_and_run_gold_states.sh <evidence-dir> &
++set -uo pipefail
++
++EV=${1:?evidence dir required}
++WT=${2:-/home/chiro/projects/pypto/worktrees/pypto-x/c7-decode-gap-localization}
++RUNNER=/home/chiro/projects/pypto/pypto_x/scripts/resource/run_local_heavy.sh
++mkdir -p "${EV}/logs"
++OUT="${EV}/logs/heavy_gold_states.out"
++echo "[c7-waiter] start $(date -u +%Y-%m-%dT%H:%M:%SZ) pid=$$" | tee -a "${OUT}"
++
++for attempt in $(seq 1 40); do
++  echo "[c7-waiter] attempt ${attempt} $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${OUT}"
++  "${RUNNER}" \
++    --task c7-gold-states --agent c7-decode-gap-localization \
++    --min-available-mib 8192 --safety-floor-mib 4096 --max-cpus 6 \
++    --log-file "${EV}/logs/heavy_gold_states_resource.log" \
++    -- bash "${WT}/tools/diag_c7/run_c7_heavy.sh" "${EV}" "${WT}" \
++    >> "${OUT}" 2>&1
++  rc=$?
++  echo "[c7-waiter] attempt ${attempt} rc=${rc} $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${OUT}"
++  if [[ ${rc} -eq 0 ]]; then
++    echo "[c7-waiter] SUCCESS" | tee -a "${OUT}"
++    exit 0
++  fi
++  if [[ ${rc} -ne 75 && ${rc} -ne 69 ]]; then
++    echo "[c7-waiter] non-retryable rc=${rc}" | tee -a "${OUT}"
++    exit ${rc}
++  fi
++  sleep 300
++done
++echo "[c7-waiter] gave up after attempts" | tee -a "${OUT}"
++exit 1

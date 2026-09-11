@@ -1,0 +1,458 @@
+From 1dc9c1261d7c5dc691355b60d9082b8c1f373a3d Mon Sep 17 00:00:00 2001
+From: n4-dispatch-residual <agent@pypto-x.local>
+Date: Sat, 12 Sep 2026 01:41:39 +0800
+Subject: [PATCH 161/217] perf(cpu): dedup AVX-512 per-launch artifact
+ validation (n4-dispatch-residual)
+
+launch() validates the primary AVX-512 artifact and then _decode_artifact()
+validates it again; each fallback candidate re-validates the primary once
+more.  On a 6728-op program that repeats CoreProgram.from_dict(),
+canonical_json()+sha256 and the full lower_avx512() semantic comparison.
+
+Add a per-launch _LaunchValidationMemo keyed by the immutable Artifact
+identity (and its frozen metadata mapping).  The memo is created inside one
+launch() call and dropped when it returns, so:
+
+* every launch still rejects tampered metadata / version / digest mismatches;
+* replacing artifact.metadata (identity change) forces full re-validation;
+* a changed declared program_digest still misses the digest memo and is
+  recomputed and rejected;
+* fallback candidates reuse the primary result but are validated themselves.
+
+The digest re-check keeps the fail-closed behaviour; no dispatch semantics,
+Core IR/ABI contract or other backend is touched.  Focused tests pin the
+memo, the tamper/version rejections and bit-identical repeated launches.
+---
+ python/pypto/backends/cpu/x86/avx512.py                         |  92 +++++++++--
+ .../tests/ut/pypto_x/test_cpu_avx512_launch_validation_memo.py  | 241 ++++++++++++++++++++++++++++
+ 2 files changed, 319 insertions(+), 14 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/x86/avx512.py b/python/pypto/backends/cpu/x86/avx512.py
+index c80396d8b..6d8ddcb36 100644
+--- a/python/pypto/backends/cpu/x86/avx512.py
++++ b/python/pypto/backends/cpu/x86/avx512.py
+@@ -1119,11 +1119,53 @@ def _metadata_bool(metadata: Mapping[str, Any], key: str) -> bool:
+     return value
+ 
+ 
+-def _program_digest_from_metadata(metadata: Mapping[str, Any], context: str) -> str:
++class _LaunchValidationMemo:
++    """Per-launch dedup for AVX-512 primary-artifact metadata validation (N4.0).
++
++    ``launch()`` validates the primary artifact and then ``_decode_artifact()``
++    validates it again before mapping the ELF; each fallback candidate also
++    re-validates the primary.  One memo instance is created per launch call and
++    dropped when that call returns, so a metadata, version or digest mismatch
++    is still rejected by every launch.
++
++    Entries are keyed by ``id(artifact)`` and hold a strong reference to the
++    immutable ``artifact.metadata`` mapping that was validated.  A cached
++    entry is only reused while that exact mapping object is still attached to
++    the artifact (identity check), so replacing the mapping (for example via
++    ``object.__setattr__``) forces a full re-validation.
++
++    Digest entries additionally re-check the declared ``program_digest`` on
++    every hit; a tampered digest string misses the memo and is recomputed,
++    which restores the fail-closed rejection.  All callers pass
++    ``mapping_copy(artifact.metadata)`` together with the exact artifact it
++    came from, so the identity key always denotes the same frozen program
++    graph (``Artifact`` and its deeply frozen metadata are immutable).
++    """
++
++    __slots__ = ("digests", "primary")
++
++    def __init__(self) -> None:
++        #: id(artifact) -> (artifact.metadata, verified digest)
++        self.digests: Dict[int, Tuple[Any, str]] = {}
++        #: id(artifact) -> artifact.metadata (validated this launch)
++        self.primary: Dict[int, Any] = {}
++
++
++def _program_digest_from_metadata(
++    metadata: Mapping[str, Any],
++    context: str,
++    memo: Optional["_LaunchValidationMemo"] = None,
++    artifact: Optional[Artifact] = None,
++) -> str:
+     program_data = metadata.get("program")
+     digest = metadata.get("program_digest")
+     if not isinstance(program_data, Mapping) or not isinstance(digest, str):
+         raise CpuAvx512ArtifactError("{} is missing CoreProgram digest metadata".format(context))
++    cached = memo.digests.get(id(artifact)) if (memo is not None and artifact is not None) else None
++    if cached is not None:
++        cached_metadata, cached_digest = cached
++        if cached_metadata is artifact.metadata and digest == cached_digest:
++            return cached_digest
+     try:
+         program = CoreProgram.from_dict(program_data)
+     except Exception as exc:
+@@ -1131,6 +1173,8 @@ def _program_digest_from_metadata(metadata: Mapping[str, Any], context: str) ->
+     actual = hashlib.sha256(program.canonical_json().encode("utf-8")).hexdigest()
+     if actual != digest:
+         raise CpuAvx512ArtifactError("{} CoreProgram digest is inconsistent".format(context))
++    if memo is not None and artifact is not None:
++        memo.digests[id(artifact)] = (artifact.metadata, actual)
+     return digest
+ 
+ 
+@@ -1214,7 +1258,10 @@ def _validate_primary_semantics(artifact: Artifact, metadata: Mapping[str, Any])
+         raise CpuAvx512ArtifactError("primary artifact required feature source mismatch")
+ 
+ 
+-def _validate_primary_artifact(artifact: Artifact) -> Mapping[str, Any]:
++def _validate_primary_artifact(
++    artifact: Artifact,
++    memo: Optional["_LaunchValidationMemo"] = None,
++) -> Mapping[str, Any]:
+     """Validate primary metadata before capability dispatch or fallback use."""
+ 
+     if not isinstance(artifact, Artifact):
+@@ -1248,17 +1295,27 @@ def _validate_primary_artifact(artifact: Artifact) -> Mapping[str, Any]:
+     _string_sequence(metadata.get("required_features"), "primary artifact required_features")
+     if not {"avx", "avx512f", "osxsave", "ymm", "opmask", "zmm"}.issubset(required):
+         raise CpuAvx512ArtifactError("primary artifact required_features omit AVX/ZMM safety fields")
+-    _program_digest_from_metadata(metadata, "primary artifact")
++    if memo is not None:
++        cached = memo.primary.get(id(artifact))
++        if cached is not None and cached is artifact.metadata:
++            return metadata
++    _program_digest_from_metadata(metadata, "primary artifact", memo=memo, artifact=artifact)
+     _validate_primary_semantics(artifact, metadata)
++    if memo is not None:
++        memo.primary[id(artifact)] = artifact.metadata
+     return metadata
+ 
+ 
+-def _validate_fallback_artifact(primary: Artifact, fallback: Artifact) -> None:
++def _validate_fallback_artifact(
++    primary: Artifact,
++    fallback: Artifact,
++    memo: Optional["_LaunchValidationMemo"] = None,
++) -> None:
+     """Validate fallback identity without mapping its native shared object."""
+ 
+     if not isinstance(fallback, Artifact):
+         raise CpuAvx512ArtifactError("fallback must be an Artifact")
+-    _validate_primary_artifact(primary)
++    _validate_primary_artifact(primary, memo=memo)
+     try:
+         fallback.validate()
+     except Exception as exc:
+@@ -1277,8 +1334,12 @@ def _validate_fallback_artifact(primary: Artifact, fallback: Artifact) -> None:
+     fallback_metadata = mapping_copy(fallback.metadata)
+     if fallback_metadata.get("entrypoint") != fallback.entrypoint:
+         raise CpuAvx512ArtifactError("fallback metadata entrypoint is inconsistent")
+-    primary_digest = _program_digest_from_metadata(primary_metadata, "primary artifact")
+-    fallback_digest = _program_digest_from_metadata(fallback_metadata, "fallback artifact")
++    primary_digest = _program_digest_from_metadata(
++        primary_metadata, "primary artifact", memo=memo, artifact=primary
++    )
++    fallback_digest = _program_digest_from_metadata(
++        fallback_metadata, "fallback artifact", memo=memo, artifact=fallback
++    )
+     if fallback_digest != primary_digest:
+         raise CpuAvx512ArtifactError("fallback CoreProgram digest does not match primary artifact")
+     if fallback.format == DEFAULT_ARTIFACT_FORMAT:
+@@ -1321,8 +1382,9 @@ def _decode_artifact(
+     artifact: Artifact,
+     available: CpuFeatureSet,
+     capability: Avx512Capability,
++    memo: Optional["_LaunchValidationMemo"] = None,
+ ) -> LoadedAvx512Artifact:
+-    _validate_primary_artifact(artifact)
++    _validate_primary_artifact(artifact, memo=memo)
+     if not isinstance(artifact, Artifact):
+         raise CpuAvx512ArtifactError("AVX-512 runtime requires Artifact")
+     try:
+@@ -1408,9 +1470,7 @@ def _decode_artifact(
+             raise CpuAvx512ArtifactError("AVX-512 {} metadata mismatch".format(key))
+     if target_ir.native_variant != metadata.get("native_variant"):
+         raise CpuAvx512ArtifactError("AVX-512 native variant metadata is inconsistent")
+-    program_digest = hashlib.sha256(program.canonical_json().encode("utf-8")).hexdigest()
+-    if metadata.get("program_digest") != program_digest:
+-        raise CpuAvx512ArtifactError("AVX-512 program digest mismatch")
++    _program_digest_from_metadata(metadata, "AVX-512 artifact", memo=memo, artifact=artifact)
+     if metadata.get("plan_digest") != target_ir.plan_digest:
+         raise CpuAvx512ArtifactError("AVX-512 plan digest mismatch")
+     if metadata.get("target_digest") != sha256_text(artifact.target.to_dict()):
+@@ -1654,6 +1714,10 @@ class Avx512Runtime:
+     ) -> Tuple[Any, ...]:
+         if fallback_artifact is not None and fallback is not None:
+             raise ValueError("fallback_artifact and fallback are aliases; pass only one")
++        # Per-launch memo: the primary artifact is validated here and again by
++        # _decode_artifact (and once more per fallback candidate).  The memo is
++        # local to this call, so every launch re-validates from scratch.
++        memo = _LaunchValidationMemo()
+         fallback_artifacts = _fallback_sequence(
+             fallback_artifact if fallback_artifact is not None else fallback
+         )
+@@ -1664,11 +1728,11 @@ class Avx512Runtime:
+                 "AVX2 fallback must be supplied explicitly via fallback_artifact; "
+                 "an AVX2 artifact cannot masquerade as an AVX-512 launch"
+             )
+-        _validate_primary_artifact(request.artifact)
++        _validate_primary_artifact(request.artifact, memo=memo)
+         # Validate every candidate before choosing one.  This is metadata-only;
+         # no fallback shared object is opened by this loop.
+         for candidate in fallback_artifacts:
+-            _validate_fallback_artifact(request.artifact, candidate)
++            _validate_fallback_artifact(request.artifact, candidate, memo=memo)
+         # A supplied capability is useful for load-time tests, but launch still
+         # performs a real probe before mapping an ELF.  This also lets a fake
+         # low-capability host exercise the AVX2 fallback without loading the
+@@ -1730,7 +1794,7 @@ class Avx512Runtime:
+         except Exception as exc:
+             raise CpuAvx512ExecutionError("invalid LaunchRequest: {}".format(exc)) from exc
+         self._selected_artifact = request.artifact
+-        loaded = _decode_artifact(request.artifact, available, real_capability)
++        loaded = _decode_artifact(request.artifact, available, real_capability, memo=memo)
+         target = loaded.target_ir.target
+         if target.kind != "cpu" or not target.triple.startswith(("x86_64", "amd64")):
+             raise CpuAvx512ExecutionError("AVX-512 artifact target must be x86_64 CPU")
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx512_launch_validation_memo.py b/python/tests/ut/pypto_x/test_cpu_avx512_launch_validation_memo.py
+new file mode 100644
+index 000000000..4c9117573
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cpu_avx512_launch_validation_memo.py
+@@ -0,0 +1,241 @@
++"""N4.0: per-launch AVX-512 validation dedup must not weaken fail-closed checks.
++
++The launch path validates the primary artifact metadata in ``launch()`` and
++again in ``_decode_artifact()`` (plus once per fallback candidate).  N4.0
++memoizes that work inside a single ``launch()`` call only.  These tests pin:
++
++* the digest memo reuses a verified digest inside one launch and still
++  recomputes (and rejects) a changed declared ``program_digest``;
++* every new launch re-validates: replacing ``artifact.metadata`` after a
++  successful launch is rejected by the next launch;
++* tampered program/version metadata is rejected on every launch, including a
++  repeated launch with the same artifact object;
++* repeated launches produce bit-identical output.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import struct
++
++import pytest
++
++from pypto.abi import LaunchRequest
++from pypto.backends.cpu import HostTensor
++from pypto.backends.cpu.x86 import Avx512Runtime, CpuAvx512ArtifactError
++from pypto.backends.cpu.x86 import avx512 as runtime_module
++from pypto.compiler import Artifact, CompileOptions
++from pypto.compiler.targets.cpu_avx2 import Avx2Compiler
++from pypto.compiler.targets.cpu_avx512 import Avx512Compiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.target import TargetSpec
++from pypto.target._utils import mapping_copy
++
++
++AVX512_TARGET = TargetSpec(
++    "cpu", "x86_64-linux-gnu", features=("avx512f",), attributes={"lane_count": 16}
++)
++AVX2_TARGET = TargetSpec(
++    "cpu", "x86_64-linux-gnu", features=("avx2",), attributes={"lane_count": 8}
++)
++SHAPE = (17,)
++
++
++def _program(operation="add", shape=SHAPE):
++    value_type = CoreType.tensor("float32", shape)
++    left = ValueRef("left", value_type)
++    right = ValueRef("right", value_type)
++    output = ValueRef("output", value_type)
++    inputs = (left,) if operation == "neg" else (left, right)
++    return CoreProgram(
++        functions=(
++            CoreFunction(
++                operation,
++                inputs,
++                (output,),
++                Region((Operation(operation, inputs, (output,)),)),
++            ),
++        )
++    )
++
++
++def _compile_avx512(program, tmp_path, name="native"):
++    compiler = Avx512Compiler()
++    target_ir = compiler.lower(program, AVX512_TARGET)
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format="pypto-x.cpu.avx512", extra={"build_dir": str(tmp_path / name)}
++        ),
++    )
++    return target_ir, artifact
++
++
++def _compile_avx2(program, tmp_path, name="fallback-avx2"):
++    compiler = Avx2Compiler()
++    return compiler.compile(
++        compiler.lower(program, AVX2_TARGET),
++        CompileOptions(
++            artifact_format="pypto-x.cpu.avx2", extra={"build_dir": str(tmp_path / name)}
++        ),
++    )
++
++
++def _runtime():
++    runtime = Avx512Runtime()
++    if not runtime.is_available():
++        pytest.skip("host lacks AVX-512/ZMM capability: {}".format(runtime.availability().to_dict()))
++    return runtime
++
++
++def _left(shape=SHAPE):
++    return HostTensor("float32", shape, [float(index) for index in range(shape[0])])
++
++
++def _launch(runtime, artifact, shape=SHAPE, fallback=None):
++    output = HostTensor.zeros("float32", shape)
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[_left(shape).descriptor(readonly=True), _left(shape).descriptor(readonly=True)],
++            outputs=[output.descriptor()],
++        ),
++        fallback_artifact=fallback,
++    )
++    return output
++
++
++def _output_bytes(tensor):
++    return struct.pack("<%df" % len(tensor.data), *tensor.data)
++
++
++def test_digest_memo_reuses_verified_digest_and_rechecks_declared_digest(tmp_path, monkeypatch):
++    _, artifact = _compile_avx512(_program(), tmp_path)
++    memo = runtime_module._LaunchValidationMemo()
++    first = runtime_module._program_digest_from_metadata(
++        mapping_copy(artifact.metadata), "primary artifact", memo=memo, artifact=artifact
++    )
++    assert first == artifact.metadata["program_digest"]
++
++    real_core_program = runtime_module.CoreProgram
++    calls = {"count": 0}
++
++    class CountingCoreProgram:
++        @staticmethod
++        def from_dict(payload):
++            calls["count"] += 1
++            return real_core_program.from_dict(payload)
++
++    monkeypatch.setattr(runtime_module, "CoreProgram", CountingCoreProgram)
++    second = runtime_module._program_digest_from_metadata(
++        mapping_copy(artifact.metadata), "primary artifact", memo=memo, artifact=artifact
++    )
++    assert second == first
++    assert calls["count"] == 0, "memo hit must not rebuild the CoreProgram"
++
++    tampered = mapping_copy(artifact.metadata)
++    tampered["program_digest"] = "0" * 64
++    with pytest.raises(CpuAvx512ArtifactError, match="CoreProgram digest is inconsistent"):
++        runtime_module._program_digest_from_metadata(
++            tampered, "primary artifact", memo=memo, artifact=artifact
++        )
++    assert calls["count"] == 1, "changed declared digest must miss the memo and recompute"
++
++
++def test_primary_validation_runs_once_per_launch_and_metadata_replacement_is_rejected(
++    tmp_path, monkeypatch
++):
++    _, artifact = _compile_avx512(_program(), tmp_path)
++    real_validate = runtime_module._validate_primary_semantics
++    calls = []
++
++    def counting(artifact_arg, metadata_arg):
++        calls.append(artifact_arg)
++        return real_validate(artifact_arg, metadata_arg)
++
++    monkeypatch.setattr(runtime_module, "_validate_primary_semantics", counting)
++    runtime = _runtime()
++
++    first = _output_bytes(_launch(runtime, artifact))
++    assert len(calls) == 1, "one launch must run the semantic validation exactly once"
++
++    second = _output_bytes(_launch(runtime, artifact))
++    assert len(calls) == 2, "each launch must re-run the semantic validation"
++    assert first == second
++
++    # Replace the frozen metadata mapping after a successful launch: identity
++    # changed, so the next launch must validate from scratch and reject.
++    tampered = dict(artifact.metadata)
++    tampered["plan_version"] = 2
++    object.__setattr__(artifact, "metadata", tampered)
++    with pytest.raises(CpuAvx512ArtifactError, match="unsupported CPU vector plan version"):
++        _launch(runtime, artifact)
++
++
++@pytest.mark.parametrize(
++    "tamper, message",
++    [
++        ("program_digest", "CoreProgram digest is inconsistent"),
++        ("program", "CoreProgram digest is inconsistent"),
++        ("lowering_version", "unsupported AVX-512 lowering version"),
++        ("artifact_payload_version", "unsupported AVX-512 artifact payload version"),
++        ("plan_version", "unsupported CPU vector plan version"),
++        ("required_features", "required_features omit AVX/ZMM safety fields"),
++    ],
++)
++def test_tampered_metadata_is_rejected_on_every_launch(tmp_path, tamper, message):
++    _, artifact = _compile_avx512(_program(), tmp_path)
++    runtime = _runtime()
++    metadata = dict(artifact.metadata)
++    if tamper == "program_digest":
++        metadata["program_digest"] = "f" * 64
++    elif tamper == "program":
++        _, other = _compile_avx512(_program(operation="neg"), tmp_path, name="other")
++        metadata["program"] = mapping_copy(other.metadata)["program"]
++    elif tamper == "required_features":
++        plan_data = dict(metadata["vector_plan"])
++        required = dict(plan_data["required_features"])
++        required["features"] = tuple(
++            feature for feature in required["features"] if feature != "avx512f"
++        )
++        plan_data["required_features"] = required
++        metadata["vector_plan"] = plan_data
++        metadata["required_features"] = required["features"]
++    else:
++        metadata[tamper] = int(metadata[tamper]) + 1
++    tampered = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        path=artifact.path,
++        metadata=metadata,
++    )
++    for _ in range(2):
++        with pytest.raises(CpuAvx512ArtifactError, match=message):
++            _launch(runtime, tampered)
++
++
++def test_fallback_candidate_reuses_primary_validation_memo(tmp_path, monkeypatch):
++    _, artifact = _compile_avx512(_program(), tmp_path)
++    fallback = _compile_avx2(_program(), tmp_path)
++    real_validate = runtime_module._validate_primary_semantics
++    calls = []
++
++    def counting(artifact_arg, metadata_arg):
++        calls.append(artifact_arg)
++        return real_validate(artifact_arg, metadata_arg)
++
++    monkeypatch.setattr(runtime_module, "_validate_primary_semantics", counting)
++    _launch(_runtime(), artifact, fallback=fallback)
++    assert len(calls) == 1, "fallback loop must not re-run primary semantic validation"
++
++
++def test_repeated_launches_are_bit_identical(tmp_path):
++    _, artifact = _compile_avx512(_program(), tmp_path)
++    runtime = _runtime()
++    digests = set()
++    for _ in range(3):
++        output = _launch(runtime, artifact)
++        digests.add(hashlib.sha256(_output_bytes(output)).hexdigest())
++    assert len(digests) == 1

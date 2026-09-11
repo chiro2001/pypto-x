@@ -1,0 +1,654 @@
+From a8a7a437f4e5db3f81f755f610b3391ccff2bc8a Mon Sep 17 00:00:00 2001
+From: PyPTO-X Agent <agent@pypto-x.local>
+Date: Sat, 12 Sep 2026 02:02:14 +0800
+Subject: [PATCH 166/217] survey(q8b): KleidiAI semantics probe + 12-shape
+ bench driver (A3 leg)
+
+---
+ scripts/vendor/q8b/a3_run_kai_bench.sh |  49 +++++++
+ scripts/vendor/q8b/kai_bench.c         | 180 ++++++++++++++++++++++++
+ scripts/vendor/q8b/kai_semantics.py    | 395 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 624 insertions(+)
+
+diff --git a/scripts/vendor/q8b/a3_run_kai_bench.sh b/scripts/vendor/q8b/a3_run_kai_bench.sh
+new file mode 100755
+index 000000000..4c303d403
+--- /dev/null
++++ b/scripts/vendor/q8b/a3_run_kai_bench.sh
+@@ -0,0 +1,49 @@
++#!/usr/bin/env bash
++# Q8b aarch64 leg: build + run the KleidiAI 12-shape benchmark on A3.
++# One case = one process, 8 threads pinned to 8 distinct physical cores inside
++# the granted 320-639 range; cases run sequentially.
++set -euo pipefail
++HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++# shellcheck source=/dev/null
++source "$HERE/a3_env.sh"
++q8b_mkdirs
++
++K="$Q8B_KLEIDIAI_DIR"
++BIN="$Q8B_INSTALL/kleidiai/kai_bench"
++mkdir -p "$Q8B_RAW/kai-bench"
++
++gcc -O3 -fopenmp -std=gnu11 -march=armv8.2-a+dotprod+i8mm -mtune=native -I"$K" \
++    "$HERE/kai_bench.c" "$Q8B_INSTALL/kleidiai/lib64/libkleidiai.a" -lm -o "$BIN"
++
++CPUS="$(q8b_pick_cpus 8)"
++echo "pinned_cpus=$CPUS" | tee "$Q8B_LOGS/kai-bench-window.log"
++date -u +started_utc=%Y-%m-%dT%H:%M:%SZ | tee -a "$Q8B_LOGS/kai-bench-window.log"
++lscpu -p=CPU,CORE,SOCKET,NODE | grep -v '^#' | awk -F, '$1>=320 && $1<=639' \
++    | head -20 | tee -a "$Q8B_LOGS/kai-bench-window.log"
++
++# (m, k, n, label); the W8J 12-shape set from scripts/perf/vendor_gemm_matrix.py
++SHAPES=(
++  "1024 32 gdn_in_proj_ba"
++  "1024 5120 attn_qkv_proj"
++  "1024 7168 mlp_gate_up_proj"
++  "1024 8192 gdn_in_proj_qkvz"
++  "2048 1024 gdn_out_proj_attn_o_proj"
++  "3584 1024 mlp_down_proj"
++)
++
++for mv in 1 5; do
++  for shape in "${SHAPES[@]}"; do
++    read -r k n label <<<"$shape"
++    cell=$((mv * k * n))
++    iters=$((20000000 / (cell > 0 ? cell : 1)))
++    [ "$iters" -lt 2 ] && iters=2
++    [ "$iters" -gt 200 ] && iters=200
++    out="$Q8B_RAW/kai-bench/m${mv}_k${k}_n${n}.json"
++    variant="auto"
++    echo "== m=$mv k=$k n=$n ($label) iters=$iters ==" | tee -a "$Q8B_LOGS/kai-bench-window.log"
++    taskset -c "$CPUS" env OMP_NUM_THREADS=8 OMP_PROC_BIND=close OMP_PLACES=cores \
++        "$BIN" "$mv" "$k" "$n" 8 5 "$iters" "$variant" "$out" \
++        | tee -a "$Q8B_LOGS/kai-bench-window.log"
++  done
++done
++date -u +finished_utc=%Y-%m-%dT%H:%M:%SZ | tee -a "$Q8B_LOGS/kai-bench-window.log"
+diff --git a/scripts/vendor/q8b/kai_bench.c b/scripts/vendor/q8b/kai_bench.c
+new file mode 100644
+index 000000000..32129d869
+--- /dev/null
++++ b/scripts/vendor/q8b/kai_bench.c
+@@ -0,0 +1,180 @@
++/* Q8b aarch64 leg: KleidiAI qai8dxp x qsi8cxp 12-shape benchmark (A3).
++ *
++ * Build: see a3_run_kai_bench.sh  (links the full static libkleidiai.a)
++ * Usage: kai_bench <m> <k> <n> <threads> <rounds> <iters> <variant auto|dot_1x8|i8mm_4x8> <json>
++ *
++ * The timed pipeline is "quantize+pack activations -> ukernel", with the RHS
++ * (weights + per-channel scales) packed once outside the timed region, which is
++ * how our W8A8 graph would cache weights.  Threads are OpenMP-driven over N
++ * tiles; the launcher pins them to distinct physical cores.
++ */
++#include <omp.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "kai/ukernels/matmul/pack/kai_lhs_quant_pack_qai8dxp_f32.h"
++#include "kai/ukernels/matmul/pack/kai_rhs_pack_kxn_qsi8cxp_qsi8cx_neon.h"
++#include "kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm.h"
++#include "kai/ukernels/matmul/matmul_clamp_f32_qai8dxp_qsi8cxp/kai_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod.h"
++
++typedef struct {
++    const char *name;
++    size_t (*m_step)(void);
++    size_t (*n_step)(void);
++    size_t (*mr)(void);
++    size_t (*nr)(void);
++    size_t (*kr)(void);
++    size_t (*sr)(void);
++    size_t (*lhs_off)(size_t, size_t);
++    size_t (*rhs_off)(size_t, size_t);
++    void (*run)(size_t, size_t, size_t, const void *, const void *, float *, size_t, size_t, float,
++                float);
++} uk_t;
++
++static const uk_t I8MM = {
++    .name = "i8mm_4x8",
++    .m_step = kai_get_m_step_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm,
++    .n_step = kai_get_n_step_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm,
++    .mr = kai_get_mr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm,
++    .nr = kai_get_nr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm,
++    .kr = kai_get_kr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm,
++    .sr = kai_get_sr_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm,
++    .lhs_off = kai_get_lhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm,
++    .rhs_off = kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm,
++    .run = kai_run_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm,
++};
++
++static const uk_t DOT1 = {
++    .name = "dot_1x8",
++    .m_step = kai_get_m_step_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod,
++    .n_step = kai_get_n_step_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod,
++    .mr = kai_get_mr_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod,
++    .nr = kai_get_nr_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod,
++    .kr = kai_get_kr_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod,
++    .sr = kai_get_sr_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod,
++    .lhs_off =
++        kai_get_lhs_packed_offset_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod,
++    .rhs_off =
++        kai_get_rhs_packed_offset_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod,
++    .run = kai_run_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod,
++};
++
++static double median(double *v, int n) {
++    for (int i = 1; i < n; i++) {
++        double x = v[i];
++        int j = i - 1;
++        while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
++        v[j + 1] = x;
++    }
++    return (n % 2) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
++}
++
++int main(int argc, char **argv) {
++    if (argc != 9) {
++        fprintf(stderr, "usage: %s m k n threads rounds iters variant json\n", argv[0]);
++        return 2;
++    }
++    size_t m = strtoul(argv[1], NULL, 10), k = strtoul(argv[2], NULL, 10),
++           n = strtoul(argv[3], NULL, 10);
++    int threads = atoi(argv[4]), rounds = atoi(argv[5]), iters = atoi(argv[6]);
++    const char *vname = argv[7];
++    const char *jpath = argv[8];
++
++    const uk_t *uk = &I8MM;
++    if (!strcmp(vname, "dot_1x8")) uk = &DOT1;
++    else if (!strcmp(vname, "auto")) uk = (m <= 2) ? &DOT1 : &I8MM;
++
++    const size_t mr = uk->mr(), kr = uk->kr(), sr = uk->sr(), nr = uk->nr();
++    const size_t m_step = uk->m_step(), n_step = uk->n_step();
++
++    /* deterministic inputs */
++    float *a = aligned_alloc(64, m * k * sizeof(float));
++    int8_t *b = aligned_alloc(64, k * n);
++    float *scales = aligned_alloc(64, n * sizeof(float));
++    for (size_t i = 0; i < m * k; i++) {
++        uint32_t x = (uint32_t)(i * 2654435761u + 12345u);
++        a[i] = ((float)(x >> 8) / 16777216.0f - 0.5f) * 3.0f;
++    }
++    for (size_t i = 0; i < k * n; i++) {
++        uint32_t x = (uint32_t)(i * 2246822519u + 6789u);
++        b[i] = (int8_t)((int)((x >> 9) % 255) - 127);
++    }
++    for (size_t j = 0; j < n; j++) scales[j] = 0.25f + 0.001f * (float)(j % 17);
++
++    size_t lhs_size = kai_get_lhs_packed_size_lhs_quant_pack_qai8dxp_f32(m, k, mr, kr, sr);
++    void *lhs = aligned_alloc(64, lhs_size + 64);
++    size_t rhs_size = kai_get_rhs_packed_size_rhs_pack_kxn_qsi8cxp_qsi8cx_neon(n, k, nr, kr, sr);
++    void *rhs = aligned_alloc(64, rhs_size + 64);
++    struct kai_rhs_pack_qsi8cx_params params = {.lhs_zero_point = 0, .scale_multiplier = 1.0f};
++    kai_run_rhs_pack_kxn_qsi8cxp_qsi8cx_neon(1, n, k, nr, kr, sr, b, NULL, scales, rhs, 0, &params);
++
++    float *dst = aligned_alloc(64, m * n * sizeof(float));
++    memset(dst, 0, m * n * sizeof(float));
++
++    double *pack_ms = malloc(sizeof(double) * rounds);
++    double *mm_ms = malloc(sizeof(double) * rounds);
++    double *tot_ms = malloc(sizeof(double) * rounds);
++
++    for (int r = 0; r < rounds; r++) {
++        double t0 = omp_get_wtime();
++        for (int it = 0; it < iters; it++)
++            kai_run_lhs_quant_pack_qai8dxp_f32(m, k, mr, kr, sr, 0, a, k * sizeof(float), lhs);
++        double t1 = omp_get_wtime();
++        for (int it = 0; it < iters; it++) {
++#pragma omp parallel for num_threads(threads) schedule(static)
++            for (long long n0 = 0; n0 < (long long)n; n0 += (long long)n_step) {
++                size_t nb = (n - (size_t)n0 < n_step) ? (n - (size_t)n0) : n_step;
++                for (size_t m0 = 0; m0 < m; m0 += m_step) {
++                    size_t mb = (m - m0 < m_step) ? (m - m0) : m_step;
++                    uk->run(mb, nb, k, (const char *)lhs + uk->lhs_off(m0, k),
++                            (const char *)rhs + uk->rhs_off((size_t)n0, k),
++                            dst + m0 * n + (size_t)n0, n * sizeof(float), sizeof(float), -3.0e38f,
++                            3.0e38f);
++                }
++            }
++        }
++        double t2 = omp_get_wtime();
++        pack_ms[r] = (t1 - t0) / iters * 1e3;
++        mm_ms[r] = (t2 - t1) / iters * 1e3;
++        tot_ms[r] = (t2 - t0) / iters * 1e3;
++    }
++
++    uint64_t checksum = 1469598103934665603ULL;
++    for (size_t i = 0; i < m * n; i++) {
++        uint32_t bits;
++        memcpy(&bits, &dst[i], 4);
++        checksum ^= bits;
++        checksum *= 1099511628211ULL;
++    }
++    float maxabs = 0.0f;
++    for (size_t i = 0; i < m * n; i++)
++        if (fabsf(dst[i]) > maxabs) maxabs = fabsf(dst[i]);
++
++    FILE *f = fopen(jpath, "w");
++    if (!f) { perror("json"); return 3; }
++    fprintf(f,
++            "{\"probe\":\"q8b-kai-bench\",\"variant\":\"%s\",\"m\":%zu,\"k\":%zu,\"n\":%zu,"
++            "\"threads\":%d,\"rounds\":%d,\"iters\":%d,"
++            "\"m_step\":%zu,\"n_step\":%zu,\"mr\":%zu,\"nr\":%zu,\"kr\":%zu,\"sr\":%zu,"
++            "\"lhs_packed_size\":%zu,\"rhs_packed_size\":%zu,"
++            "\"pack_ms\":{\"rounds\":[",
++            uk->name, m, k, n, threads, rounds, iters, m_step, n_step, mr, nr, kr, sr, lhs_size,
++            rhs_size);
++    for (int r = 0; r < rounds; r++) fprintf(f, "%s%.6f", r ? "," : "", pack_ms[r]);
++    fprintf(f, "],\"median\":%.6f,\"min\":%.6f},", median(pack_ms, rounds), pack_ms[0]);
++    fprintf(f, "\"matmul_ms\":{\"rounds\":[");
++    for (int r = 0; r < rounds; r++) fprintf(f, "%s%.6f", r ? "," : "", mm_ms[r]);
++    fprintf(f, "],\"median\":%.6f,\"min\":%.6f},", median(mm_ms, rounds), mm_ms[0]);
++    fprintf(f, "\"total_ms\":{\"rounds\":[");
++    for (int r = 0; r < rounds; r++) fprintf(f, "%s%.6f", r ? "," : "", tot_ms[r]);
++    fprintf(f, "],\"median\":%.6f,\"min\":%.6f},", median(tot_ms, rounds), tot_ms[0]);
++    fprintf(f, "\"dst_checksum_hex\":\"%016llx\",\"dst_max_abs\":%.6f}\n",
++            (unsigned long long)checksum, maxabs);
++    fclose(f);
++
++    free(a); free(b); free(scales); free(lhs); free(rhs); free(dst);
++    free(pack_ms); free(mm_ms); free(tot_ms);
++    return 0;
++}
+diff --git a/scripts/vendor/q8b/kai_semantics.py b/scripts/vendor/q8b/kai_semantics.py
+new file mode 100644
+index 000000000..01e86436b
+--- /dev/null
++++ b/scripts/vendor/q8b/kai_semantics.py
+@@ -0,0 +1,395 @@
++#!/usr/bin/env python3
++"""Q8b aarch64 leg: KleidiAI qai8dxp x qsi8cxp semantics probe (no root, A3).
++
++Answers, with bit-level evidence:
++  1. is there a native per-token activation-scale x per-channel weight-scale int8
++     path (KleidiAI qai8dxp x qsi8cxp)?  -> yes, dynamic per-row quant is fused
++     into the LHS pack; per-channel scales are packed into the RHS.
++  2. is the accumulation exact int32 for the legal code range [-127,127]?
++  3. what happens at the int32 accumulator bound (K ~= 133144) and for K%8 != 0?
++
++The official pack APIs are used for the "dynamic per-token" path.  For the
++"pre-quantized int8 activations + per-token scale" path (what our W8A8 graph
++actually holds) the packed-LHS layout is learned from the packer itself and
++then constructed directly; both are compared against int64 references.
++
++Every conclusion this script prints is measured here.
++"""
++
++from __future__ import annotations
++
++import argparse
++import ctypes
++import hashlib
++import json
++import math
++import os
++import platform
++import struct
++import subprocess
++import sys
++import time
++
++import numpy as np
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++DEFAULT_SO = os.path.join(
++    os.environ.get("Q8B_ROOT", os.path.expanduser("~/pypto-x-a3/vendor-gemm-survey-2")),
++    "install", "kleidiai", "libkai_probe.so",
++)
++
++I8MM4x8 = "kai_matmul_clamp_f32_qai8dxp4x8_qsi8cxp4x8_16x4_neon_i8mm"
++DOT1x8 = "kai_matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod"
++DOT4x4 = "kai_matmul_clamp_f32_qai8dxp4x4_qsi8cxp4x4_16x4_neon_dotprod"
++LHS_PACK = "kai_lhs_quant_pack_qai8dxp_f32"
++RHS_PACK = "kai_rhs_pack_kxn_qsi8cxp_qsi8cx_neon"
++
++
++class LhsPackParams(ctypes.Structure):
++    _fields_ = [("lhs_zero_point", ctypes.c_int32), ("scale_multiplier", ctypes.c_float)]
++
++
++class Ukernel:
++    def __init__(self, lib: ctypes.CDLL, prefix: str):
++        self.prefix = prefix
++        self.lib = lib
++        g = lambda n, res, args: _bind(lib, prefix + n, res, args)  # noqa: E731
++        c = ctypes.c_size_t
++        self.m_step = g("_get_m_step", c, [])
++        self.n_step = g("_get_n_step", c, [])
++        self.mr = g("_get_mr", c, [])
++        self.nr = g("_get_nr", c, [])
++        self.kr = g("_get_kr", c, [])
++        self.sr = g("_get_sr", c, [])
++        self.lhs_off = g("_get_lhs_packed_offset", c, [c, c])
++        self.rhs_off = g("_get_rhs_packed_offset", c, [c, c])
++        self.dst_off = g("_get_dst_offset", c, [c, c, c])
++        self.dst_size = g("_get_dst_size", c, [c, c])
++        self.run = g(
++            "_run_matmul",
++            None,
++            [c, c, c, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, c, c,
++             ctypes.c_float, ctypes.c_float],
++        )
++
++
++def _bind(lib, name, restype, argtypes):
++    fn = getattr(lib, name)
++    fn.restype = restype
++    fn.argtypes = argtypes
++    return fn
++
++
++class Kai:
++    def __init__(self, so: str):
++        self.so = so
++        self.lib = ctypes.CDLL(so)
++        c, vp, fp = ctypes.c_size_t, ctypes.c_void_p, ctypes.POINTER(ctypes.c_float)
++        self.u = {n: Ukernel(self.lib, p) for n, p in
++                  (("i8mm_4x8", I8MM4x8), ("dot_1x8", DOT1x8), ("dot_4x4", DOT4x4))}
++        self.lhs_size = _bind(self.lib, "kai_get_lhs_packed_size_" + LHS_PACK, c, [c, c, c, c, c])
++        self.lhs_run = _bind(
++            self.lib, "kai_run_" + LHS_PACK, None,
++            [c, c, c, c, c, c, fp, c, vp])
++        self.rhs_size = _bind(self.lib, "kai_get_rhs_packed_size_" + RHS_PACK, c, [c, c, c, c, c])
++        self.rhs_run = _bind(
++            self.lib, "kai_run_" + RHS_PACK, None,
++            [c, c, c, c, c, c, ctypes.POINTER(ctypes.c_int8), fp, fp, vp, c,
++             ctypes.POINTER(LhsPackParams)])
++
++    # ---------------- packing helpers ----------------
++    def pack_lhs_f32(self, a: np.ndarray, uk: Ukernel):
++        m, k = a.shape
++        mr, kr, sr = uk.mr(), uk.kr(), uk.sr()
++        size = self.lhs_size(m, k, mr, kr, sr)
++        buf = ctypes.create_string_buffer(int(size))
++        a = np.ascontiguousarray(a, dtype=np.float32)
++        self.lhs_run(m, k, mr, kr, sr, 0, a.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
++                     a.strides[0], buf)
++        return buf, int(size), (mr, kr, sr)
++
++    def pack_rhs_kxn(self, b_kn: np.ndarray, scales: np.ndarray, uk: Ukernel,
++                     lhs_zp: int = 0) -> ctypes.Array:
++        k, n = b_kn.shape
++        nr, kr, sr = uk.nr(), uk.kr(), uk.sr()
++        size = self.rhs_size(n, k, nr, kr, sr)
++        buf = ctypes.create_string_buffer(int(size))
++        b = np.ascontiguousarray(b_kn, dtype=np.int8)
++        sc = np.ascontiguousarray(scales, dtype=np.float32)
++        params = LhsPackParams(int(lhs_zp), 1.0)
++        self.rhs_run(1, n, k, nr, kr, sr, b.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)),
++                     None, sc.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), buf, 0,
++                     ctypes.byref(params))
++        return buf
++
++    def run(self, uk: Ukernel, m, n, k, lhs_buf, rhs_buf):
++        out = np.zeros((m, n), dtype=np.float32)
++        ldo = uk.lhs_off(0, k)
++        rdo = uk.rhs_off(0, k)
++        uk.run(m, n, k, ctypes.byref(lhs_buf, int(ldo)), ctypes.byref(rhs_buf, int(rdo)),
++               out.ctypes.data_as(ctypes.c_void_p), n * 4, 4, -3.0e38, 3.0e38)
++        return out
++
++    # ---------------- layout helpers ----------------
++    @staticmethod
++    def parse_packed_lhs(buf: bytes, m: int, k: int, uk: Ukernel):
++        mr, kr, sr = uk.mr(), uk.kr(), uk.sr()
++        kb = kr // sr
++        kinternal = ((k + 31) // 32) * 32
++        stride = mr * (kinternal + 8)
++        codes = np.zeros((m, k), dtype=np.int8)
++        zps = np.zeros(m, dtype=np.int32)
++        recip = np.zeros(m, dtype=np.float32)
++        raw = bytes(buf)
++        for i in range(m):
++            blk, dx = divmod(i, mr)
++            base = blk * stride
++            for j in range(k):
++                bi, t = divmod(j, kb)
++                off = base + dx * kb + bi * mr * kb + t
++                codes[i, j] = struct.unpack_from("<b", raw, off)[0]
++            off = base + mr * kinternal + dx * 4
++            zps[i] = struct.unpack_from("<i", raw, off)[0]
++            recip[i] = struct.unpack_from("<f", raw, off + mr * 4)[0]
++        return codes, zps, recip
++
++    @staticmethod
++    def build_packed_lhs(codes: np.ndarray, row_mult: np.ndarray, uk: Ukernel,
++                         offsets: np.ndarray = None):
++        """Interleaved qai8dxp layout as written by kai_run_lhs_quant_pack_*.
++
++        ``row_mult`` is the float multiplier the kernel applies to the row
++        (i.e. 1/scale in KleidiAI terms); ``offsets`` is the int32 added to every
++        code before the multiply (KleidiAI stores -zero_point there).  Symmetric
++        pre-quantized data -> offsets all zero, row_mult = per-token scale.
++        """
++        m, k = codes.shape
++        mr, kr, sr = uk.mr(), uk.kr(), uk.sr()
++        kb = kr // sr
++        kinternal = ((k + 31) // 32) * 32
++        stride = mr * (kinternal + 8)
++        nblk = (m + mr - 1) // mr
++        buf = bytearray(nblk * stride)
++        if offsets is None:
++            offsets = np.zeros(m, dtype=np.int32)
++        for i in range(m):
++            blk, dx = divmod(i, mr)
++            base = blk * stride
++            for j in range(k):
++                bi, t = divmod(j, kb)
++                buf[base + dx * kb + bi * mr * kb + t] = int(codes[i, j]) & 0xFF
++            struct.pack_into("<i", buf, base + mr * kinternal + dx * 4, int(offsets[i]))
++            struct.pack_into("<f", buf, base + mr * kinternal + mr * 4 + dx * 4,
++                             float(row_mult[i]))
++        return ctypes.create_string_buffer(bytes(buf), len(buf))
++
++
++def wrap_int32(x: np.ndarray) -> np.ndarray:
++    x = np.asarray(x, dtype=np.int64)
++    return ((x + 2 ** 31) % 2 ** 32) - 2 ** 31
++
++
++def env_facts() -> dict:
++    facts = {
++        "python": sys.version.split()[0],
++        "numpy": np.__version__,
++        "machine": platform.machine(),
++        "platform": platform.platform(),
++    }
++    try:
++        with open("/proc/cpuinfo") as fh:
++            text = fh.read()
++        facts["cpu_model"] = next((l.split(":", 1)[1].strip() for l in text.splitlines()
++                                   if l.startswith("CPU part")), "unknown")
++        m = next((l for l in text.splitlines() if l.startswith("Features")), "")
++        facts["features"] = sorted(set(m.split(":", 1)[1].split())) if ":" in m else []
++    except OSError:
++        pass
++    return facts
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--so", default=DEFAULT_SO)
++    ap.add_argument("--out", default=os.path.join(os.path.dirname(DEFAULT_SO), "..", "..",
++                                                  "raw", "a3-kleidiai-semantics.json"))
++    ap.add_argument("--self-pack-k", type=int, default=0,
++                    help="child mode: only run the official LHS pack at this K")
++    ap.add_argument("--seed", type=int, default=20260912)
++    args = ap.parse_args()
++
++    if args.self_pack_k:
++        kai = Kai(args.so)
++        uk = kai.u["i8mm_4x8"]
++        a = np.zeros((1, args.self_pack_k), dtype=np.float32)
++        kai.pack_lhs_f32(a, uk)
++        print("pack-ok")
++        return 0
++
++    kai = Kai(args.so)
++    rng = np.random.default_rng(args.seed)
++    result: dict = {
++        "probe": "q8b-kleidiai-semantics",
++        "started_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++        "so": os.path.abspath(args.so),
++        "so_sha256": hashlib.sha256(open(args.so, "rb").read()).hexdigest(),
++        "env": env_facts(),
++        "variants": {},
++    }
++    for name, uk in kai.u.items():
++        result["variants"][name] = dict(prefix=uk.prefix, m_step=uk.m_step(), n_step=uk.n_step(),
++                                        mr=uk.mr(), nr=uk.nr(), kr=uk.kr(), sr=uk.sr())
++
++    # ---- 1. layout learned from the official packer (dynamic per-token) ----
++    m, k, n = 5, 256, 16
++    a = (rng.standard_normal((m, k)) * 1.7).astype(np.float32)
++    b = rng.integers(-127, 128, size=(k, n), dtype=np.int16).astype(np.int8)
++    uk = kai.u["i8mm_4x8"]
++    buf, size, (mr, kr, sr) = kai.pack_lhs_f32(a, uk)
++    codes, offs, recip = Kai.parse_packed_lhs(buf, m, k, uk)
++    result["layout"] = {
++        "packed_size": size,
++        "m,k,n": [m, k, n],
++        "recovered_dequant_max_abs_err": float(np.max(np.abs(
++            (codes.astype(np.float64) + offs[:, None]) * recip[:, None].astype(np.float64) - a))),
++        "all_codes_legal": bool(codes.min() >= -128 and codes.max() <= 127),
++        "zero_point_values": [int(x) for x in (-offs)],
++        "multiplier_kleidiai": [float(x) for x in recip],
++        "note": "multiplier is KleidiAI's 1/scale; dequant = (q + stored_offset) * multiplier",
++    }
++
++    # ---- 2. dynamic path: int32-exact accumulation vs int64 reference ----
++    exact_rows = []
++    for kk in (256, 512, 1024, 2048, 3584):
++        m2, n2 = 5, 32
++        a = (rng.standard_normal((m2, kk)) * 1.3).astype(np.float32)
++        b = rng.integers(-127, 128, size=(kk, n2), dtype=np.int16).astype(np.int8)
++        sc = (0.5 + rng.random(n2)).astype(np.float32)
++        buf, _, _ = kai.pack_lhs_f32(a, uk)
++        codes, offs, recip = Kai.parse_packed_lhs(buf, m2, kk, uk)
++        rhs = kai.pack_rhs_kxn(b, sc, uk, lhs_zp=0)
++        out = kai.run(uk, m2, n2, kk, buf, rhs)
++        ref = (codes.astype(np.int64) + offs[:, None].astype(np.int64)) @ b.astype(np.int64)
++        expect = ref.astype(np.float64) * recip[:, None].astype(np.float64) * sc[None, :].astype(np.float64)
++        recovered = np.rint(out.astype(np.float64) / (recip[:, None].astype(np.float64) * sc[None, :].astype(np.float64))).astype(np.int64)
++        exact_rows.append({
++            "k": kk,
++            "int32_bitwise_exact": bool(np.array_equal(recovered, ref)),
++            "mismatch_count": int((recovered != ref).sum()),
++            "max_abs_acc": int(np.abs(ref).max()),
++            "f32_out_max_rel_err": float(np.max(np.abs(out.astype(np.float64) - expect) /
++                                                 np.maximum(np.abs(expect), 1e-30))),
++            "codes_min": int(codes.min()), "codes_max": int(codes.max()),
++        })
++    result["dynamic_per_token_exactness"] = exact_rows
++
++    # ---- 3. pre-quantized symmetric path: hand-built packed LHS ----
++    pre_rows = []
++    for kk, dtype_scale in ((256, 1.0), (1024, 0.25), (2048, 0.0), (3584, 0.0), (3585, 0.0), (3588, 0.0)):
++        m2, n2 = 5, 32
++        codes = rng.integers(-127, 128, size=(m2, kk), dtype=np.int16).astype(np.int8)
++        b = rng.integers(-127, 128, size=(kk, n2), dtype=np.int16).astype(np.int8)
++        row_s = np.array([2.0 ** (-3 - (i % 3)) for i in range(m2)], dtype=np.float32)
++        col_s = np.array([2.0 ** (-1 - (j % 4)) for j in range(n2)], dtype=np.float32)
++        lhs = Kai.build_packed_lhs(codes, row_s, uk)
++        rhs = kai.pack_rhs_kxn(b, col_s, uk, lhs_zp=0)
++        out = kai.run(uk, m2, n2, kk, lhs, rhs)
++        ref = codes.astype(np.int64) @ b.astype(np.int64)
++        expect = ref.astype(np.float64) * row_s[:, None].astype(np.float64) * col_s[None, :].astype(np.float64)
++        recovered = np.rint(out.astype(np.float64) /
++                            (row_s[:, None].astype(np.float64) * col_s[None, :].astype(np.float64))).astype(np.int64)
++        pre_rows.append({
++            "k": kk,
++            "k_multiple_of_8": bool(kk % 8 == 0),
++            "int32_bitwise_exact": bool(np.array_equal(recovered, ref)),
++            "mismatch_count": int((recovered != ref).sum()),
++            "max_abs_acc": int(np.abs(ref).max()),
++            "f32_out_max_rel_err": float(np.max(np.abs(out.astype(np.float64) - expect) /
++                                                 np.maximum(np.abs(expect), 1e-30))),
++        })
++    result["prequant_symmetric_per_token"] = pre_rows
++
++    # ---- 4. accumulator bound / saturation ----
++    bound_rows = []
++    for kk in (512, 133136, 133144, 133152, 266288):
++        m2, n2 = 1, 4
++        codes = np.full((m2, kk), 127, dtype=np.int8)
++        b = np.full((kk, n2), 127, dtype=np.int8)
++        row_s = np.array([2.0 ** -8], dtype=np.float32)
++        col_s = np.array([2.0 ** -8], dtype=np.float32)
++        lhs = Kai.build_packed_lhs(codes, row_s, uk)
++        rhs = kai.pack_rhs_kxn(b, col_s, uk, lhs_zp=0)
++        out = kai.run(uk, m2, n2, kk, lhs, rhs)
++        acc = 127 * 127 * kk
++        got = float(out[0, 0]) / (float(row_s[0]) * float(col_s[0]))
++        bound_rows.append({
++            "k": kk,
++            "exact_acc": acc,
++            "exact_fits_int32": bool(acc <= 2 ** 31 - 1),
++            "expected_wrap_int32": int(wrap_int32(np.int64(acc))),
++            "expected_saturate_int32": int(min(acc, 2 ** 31 - 1)),
++            "got_scaled_back": got,
++            "got_rounded": int(round(got)),
++            "matches_wrap": bool(round(got) == int(wrap_int32(np.int64(acc)))),
++            "matches_saturate": bool(round(got) == int(min(acc, 2 ** 31 - 1))),
++        })
++    result["accumulator_bound"] = bound_rows
++
++    # ---- 5. negative bound ----
++    neg_rows = []
++    for kk in (133144, 133152):
++        codes = np.full((1, kk), -127, dtype=np.int8)
++        b = np.full((kk, 4), 127, dtype=np.int8)
++        row_s = np.array([2.0 ** -8], dtype=np.float32)
++        col_s = np.array([2.0 ** -8], dtype=np.float32)
++        lhs = Kai.build_packed_lhs(codes, row_s, uk)
++        rhs = kai.pack_rhs_kxn(b, col_s, uk, lhs_zp=0)
++        out = kai.run(uk, 1, 4, kk, lhs, rhs)
++        acc = -127 * 127 * kk
++        got = float(out[0, 0]) / (float(row_s[0]) * float(col_s[0]))
++        neg_rows.append({
++            "k": kk, "exact_acc": acc,
++            "got_rounded": int(round(got)),
++            "matches_wrap": bool(round(got) == int(wrap_int32(np.int64(acc)))),
++            "matches_saturate": bool(round(got) == -2 ** 31),
++        })
++    result["accumulator_bound_negative"] = neg_rows
++
++    # ---- 6. reserved code -128 via the pre-quantized path (our contract forbids it) ----
++    codes = np.full((2, 64), -128, dtype=np.int8)
++    b = np.full((64, 4), 127, dtype=np.int8)
++    lhs = Kai.build_packed_lhs(codes, np.ones(2, dtype=np.float32), uk)
++    rhs = kai.pack_rhs_kxn(b, np.ones(4, dtype=np.float32), uk, lhs_zp=0)
++    out = kai.run(uk, 2, 4, 64, lhs, rhs)
++    result["reserved_minus128"] = {
++        "got": int(round(float(out[0, 0]))),
++        "expected_if_computed": -128 * 127 * 64,
++        "note": "vendor accepted the reserved code silently (no error); our kernel fails closed",
++    }
++
++    # ---- 7. official pack API at K % 8 != 0 (child process: KAI_ASSERT may abort) ----
++    child_rows = []
++    for kk in (3585, 3588, 3592):
++        proc = subprocess.run([sys.executable, os.path.abspath(__file__), "--so", args.so,
++                               "--self-pack-k", str(kk)], capture_output=True, text=True, timeout=120)
++        child_rows.append({
++            "k": kk, "returncode": proc.returncode,
++            "stdout": proc.stdout.strip()[-400:],
++            "stderr": proc.stderr.strip()[-400:],
++        })
++    result["official_pack_k_not_multiple_of_8"] = child_rows
++
++    result["finished_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
++    with open(args.out, "w") as fh:
++        json.dump(result, fh, indent=2, sort_keys=True)
++    print(json.dumps({k: result[k] for k in
++                      ("variants", "layout", "accumulator_bound", "accumulator_bound_negative",
++                       "reserved_minus128", "official_pack_k_not_multiple_of_8")},
++                     indent=2, sort_keys=True))
++    print("wrote", args.out)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
