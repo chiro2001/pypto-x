@@ -19,7 +19,7 @@ W8B B2（SVE256 四类原生化）与 B3c（本机 L0/L1 + dispatch 分解）；
 ```text
 upstream base        34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad
 integration base     8700f741629616bdc16848e49ffe7fecde6807d3（0037 收口）
-integration head     bef73643b79a75719ca7099dc6e5480504987193（本批 +23 提交）
+integration head     bef73643b… → 195ace3eb8a521950c72ffc62f0349aed6c7ac04（0039 交接后 C6 合入）
 patches              134（base 34475e0d8；本批新增提交尚未重新导出）
 控制仓 main          8 个本地提交未推送（含 A3 登记 / N2–N4 验收 / E4 step2 暂停 / 本快照）
 ```
@@ -129,8 +129,10 @@ bef73643b  perf(cpu): add local L0 microbench and L1 op-dispatch decomposition  
 ```text
 C5 验收      verify-qwen35-w8a8-sve256（agent 14ddcd05）
 B3c 验收     verify-local-perf-l0-l1（agent f178cb9b）
-C6 实现      qwen35-w8a8-gpu-kernels（agent e42039e3；CUDA W8A8 整数内核 dp4a/imma + 可选 AMD 静态）
+C6 验收      verify-qwen35-w8a8-gpu-kernels（agent 85b8a8ec；实现已合入 195ace3eb）
 N5 封存      ir-to-pto-minimal-bridge-2（等用户 NPU 用完）
+（注：C6 实现已完成并合入——真机 sm_120 53/53 PASS，真机抓到 2 个 fake-driver 不可见的 PTX 地址 bug 并已修；
+  其 AMD static 半**未做**；本批 integration HEAD 因此前移到 195ace3eb）
 ```
 
 ---
