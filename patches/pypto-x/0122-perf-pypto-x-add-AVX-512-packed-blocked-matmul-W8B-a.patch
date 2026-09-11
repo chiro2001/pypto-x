@@ -1,0 +1,2000 @@
+From f1a606023b241d75885bbcb759074c46884b7b84 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 05:45:28 +0800
+Subject: [PATCH 122/134] perf(pypto-x): add AVX-512 packed/blocked matmul (W8B
+ avx512-blocked-gemm)
+
+Implement the packed/blocked rank-2 matmul plane for long-standing Qwen3.5
+dense-linear shapes on cpu.avx512:
+
+- K64 x N64 tile layout, k-pair interleaved bf16, four ZMM column
+  accumulators, bounded pthread workers (<= 6), and bitwise-preserving k
+  order so the packed result is byte-identical to the shipped column-block
+  kernel for f32 and bf16.
+- Parameter-chain dispatch: a rank-2 matmul whose right operand is a cast/
+  transpose/identity chain rooted in one function parameter is packed once
+  and executed by ptx_avx512_matmul_packed_{f32,bf16,bf16_f32}; every other
+  rank-2 matmul stays on native_avx512_zmm and is enumerated with a reason in
+  matmul_legacy_operations (no silent fallback).
+- The runtime recomputes the dispatch from the immutable program with the
+  same predicate that writes the artifact metadata; a declared parameter that
+  is unavailable fails closed.
+- Opt-in cross-launch packed-weight cache (PYPTO_X_AVX512_WEIGHT_CACHE) with
+  sampled-fingerprint invalidation and a 2 GiB byte bound; default is
+  per-launch packing.
+- Bounded thread count via PYPTO_X_AVX512_GEMM_THREADS (1..6, invalid values
+  fail loud); batched rank-4 matmul now walks pointer offsets instead of
+  materializing Python element lists per batch.
+
+Artifact contract: payload 3 -> 4, native ABI marker 4 -> 5; old artifacts
+are rejected before load and tampered packed dispatch metadata fails the
+metadata recomputation check. Numerics are unchanged (bit-identical).
+
+New focused tests cover f32/bf16/mixed parameter chains, K/N/M tails,
+bitwise equality against the legacy kernel, bounded threads, the opt-in
+cache, metadata tampering, and the 187 packed plans of the real decoder
+graph.
+---
+ python/pypto/backends/cpu/x86/avx512.py                | 510 +++++++++++++++++++++++--
+ python/pypto/compiler/targets/cpu_avx512.py            | 749 ++++++++++++++++++++++++++++++++++++-
+ python/tests/ut/pypto_x/test_cpu_avx512_packed_gemm.py | 503 +++++++++++++++++++++++++
+ 3 files changed, 1719 insertions(+), 43 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/x86/avx512.py b/python/pypto/backends/cpu/x86/avx512.py
+index 9d563c773..2a300d527 100644
+--- a/python/pypto/backends/cpu/x86/avx512.py
++++ b/python/pypto/backends/cpu/x86/avx512.py
+@@ -15,6 +15,7 @@ from pathlib import Path
+ from numbers import Integral
+ import struct
+ import stat
++import threading
+ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+ 
+ from pypto.abi import Availability, LaunchRequest, TensorDesc
+@@ -27,11 +28,16 @@ from pypto.compiler.targets.cpu_avx512 import (
+     NATIVE_ABI_MARKER,
+     PACKED_CAST_MODE,
+     PACKED_EMBEDDING_MODE,
++    PACKED_GEMM_K_TILE,
++    PACKED_GEMM_MAX_THREADS,
++    PACKED_GEMM_MODE,
++    PACKED_GEMM_N_TILE,
+     PACKED_KERNEL_VERSION,
+     PACKED_TRANSPOSE_MODE,
+     _execution_metadata,
+     broadcast_native_contract,
+     packed_kernel_contract,
++    packed_matmul_dispatch,
+     reduction_gather_symbol,
+     reduction_group_contiguous,
+ )
+@@ -243,6 +249,26 @@ def _call_reduce(module: Any, name: str, dtype: str, source: _NativeBuffer, dest
+     function(source.pointer, destination.pointer, source.count)
+ 
+ 
++def _call_matmul_pointers(
++    module: Any,
++    dtype: str,
++    left: Any,
++    right: Any,
++    destination: Any,
++    m: int,
++    k: int,
++    n: int,
++) -> None:
++    """Invoke the rank-2 native kernel on raw pointers (batch-loop views)."""
++
++    function = _safe_symbol(
++        module,
++        "ptx_avx512_matmul_{}".format(_native_suffix(dtype)),
++        [_pointer(dtype), _pointer(dtype), _pointer(dtype), ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t],
++    )
++    function(left, right, destination, m, k, n)
++
++
+ def _call_matmul(
+     module: Any,
+     dtype: str,
+@@ -252,13 +278,233 @@ def _call_matmul(
+     m: int,
+     k: int,
+     n: int,
++) -> None:
++    _call_matmul_pointers(module, dtype, left.pointer, right.pointer, destination.pointer, m, k, n)
++
++
++def _buffer_base_address(buffer: _NativeBuffer) -> int:
++    return int(ctypes.cast(buffer.pointer, ctypes.c_void_p).value)
++
++
++# --------------------------------------------------------------------------
++# Packed/blocked rank-2 matmul plane help (artifact payload version 4).
++# --------------------------------------------------------------------------
++
++_PACKED_WEIGHT_CACHE: Dict[Any, Any] = {}
++_PACKED_WEIGHT_CACHE_LOCK = threading.RLock()
++_PACKED_WEIGHT_CACHE_MAX_ENTRIES = 4096
++#: The opt-in cross-launch cache must stay byte-bounded: one model can contain
++#: several graph digests (prefill T shapes plus every decode past_length), and
++#: an unbounded cache would retain a packed copy per digest.
++_PACKED_WEIGHT_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
++_PACKED_WEIGHT_CACHE_BYTES = 0
++_PACKED_WEIGHT_CACHE_STATS: Dict[str, int] = {
++    "packs": 0,
++    "hits": 0,
++    "misses": 0,
++    "invalidations": 0,
++    "evictions": 0,
++}
++_PACKED_DISPATCH_CACHE: Dict[str, Dict[int, dict]] = {}
++_PACKED_DISPATCH_LOCK = threading.RLock()
++_TRUTHY = frozenset(("1", "true", "yes", "on"))
++_FALSY = frozenset(("", "0", "false", "no", "off"))
++
++
++def _packed_weight_cache_evict(size: int) -> None:
++    """Evict oldest entries until ``size`` bytes fit inside the byte budget."""
++
++    global _PACKED_WEIGHT_CACHE_BYTES
++    _PACKED_WEIGHT_CACHE_STATS["evictions"] += 1
++    while _PACKED_WEIGHT_CACHE and (
++        len(_PACKED_WEIGHT_CACHE) >= _PACKED_WEIGHT_CACHE_MAX_ENTRIES
++        or _PACKED_WEIGHT_CACHE_BYTES + size > _PACKED_WEIGHT_CACHE_MAX_BYTES
++    ):
++        _, evicted = _PACKED_WEIGHT_CACHE.popitem(last=False)
++        _PACKED_WEIGHT_CACHE_BYTES -= int(evicted.get("bytes", 0))
++        if not _PACKED_WEIGHT_CACHE:
++            break
++
++
++def _packed_blocks(length: int, tile: int) -> int:
++    return 0 if length <= 0 else (length + tile - 1) // tile
++
++
++def packed_matmul_pack_elements(k: int, n: int) -> int:
++    """Element count of one packed tile (also the padding-inclusive size)."""
++
++    return _packed_blocks(k, PACKED_GEMM_K_TILE) * _packed_blocks(n, PACKED_GEMM_N_TILE) * PACKED_GEMM_K_TILE * PACKED_GEMM_N_TILE
++
++
++def _buffer_address(buffer: _NativeBuffer) -> Optional[int]:
++    if buffer.count == 0:
++        return None
++    try:
++        return int(ctypes.cast(buffer.pointer, ctypes.c_void_p).value)
++    except (TypeError, ValueError):
++        return None
++
++
++def _buffer_sample(buffer: _NativeBuffer) -> Optional[Tuple[bytes, ...]]:
++    """Cheap content guard for the opt-in cross-launch packed-weight cache.
++
++    The cache contract requires immutable, address-stable source buffers.  The
++    sampled fingerprint catches accidental rebinding at the same address; it is
++    a guard rail, not a proof.  Callers that cannot guarantee immutability must
++    leave the cache disabled (the default).
++    """
++
++    address = _buffer_address(buffer)
++    if address is None:
++        return None
++    element = ctypes.sizeof(_ctype(buffer.dtype))
++    total = int(buffer.count) * element
++    if total <= 0:
++        return None
++    chunks = []
++    step = max(total // 16, 1)
++    for index in range(16):
++        offset = index * step
++        if offset >= total:
++            break
++        size = min(32, total - offset)
++        chunks.append(ctypes.string_at(address + offset, size))
++    return tuple(chunks)
++
++
++def _call_packed_matmul_pack(
++    module: Any,
++    kernel: str,
++    source: _NativeBuffer,
++    packed: _NativeBuffer,
++    k: int,
++    n: int,
++    source_k_stride: int,
++    source_n_stride: int,
+ ) -> None:
+     function = _safe_symbol(
+         module,
+-        "ptx_avx512_matmul_{}".format(_native_suffix(dtype)),
+-        [_pointer(dtype), _pointer(dtype), _pointer(dtype), ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t],
++        "ptx_avx512_{}".format(kernel),
++        [
++            _pointer(source.dtype),
++            _pointer(packed.dtype),
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++        ],
+     )
+-    function(left.pointer, right.pointer, destination.pointer, m, k, n)
++    function(source.pointer, packed.pointer, k, n, source_k_stride, source_n_stride)
++
++
++def _call_packed_matmul(
++    module: Any,
++    kernel: str,
++    dtype: str,
++    packed_dtype: str,
++    left: _NativeBuffer,
++    packed: _NativeBuffer,
++    destination: _NativeBuffer,
++    m: int,
++    k: int,
++    n: int,
++    threads: int,
++) -> None:
++    function = _safe_symbol(
++        module,
++        "ptx_avx512_{}".format(kernel),
++        [
++            _pointer(dtype),
++            _pointer(packed_dtype),
++            _pointer(dtype),
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++        ],
++    )
++    function(left.pointer, packed.pointer, destination.pointer, m, k, n, threads)
++
++
++def _resolve_gemm_threads(override: Optional[int]) -> int:
++    """Return the bounded packed-matmul thread count (1..6), fail loud."""
++
++    if override is None:
++        raw = os.environ.get("PYPTO_X_AVX512_GEMM_THREADS", "")
++        if not str(raw).strip():
++            return 1
++        try:
++            value = int(str(raw).strip())
++        except (TypeError, ValueError) as exc:
++            raise CpuAvx512ExecutionError(
++                "PYPTO_X_AVX512_GEMM_THREADS must be an integer in [1, {}]".format(
++                    PACKED_GEMM_MAX_THREADS
++                )
++            ) from exc
++    else:
++        if isinstance(override, bool) or not isinstance(override, Integral):
++            raise CpuAvx512ExecutionError("packed matmul threads must be an integer")
++        value = int(override)
++    if value < 1 or value > PACKED_GEMM_MAX_THREADS:
++        raise CpuAvx512ExecutionError(
++            "packed matmul threads must be in [1, {}], got {}".format(
++                PACKED_GEMM_MAX_THREADS, value
++            )
++        )
++    return value
++
++
++def _resolve_weight_cache(override: Optional[bool]) -> bool:
++    if override is not None:
++        if not isinstance(override, bool):
++            raise CpuAvx512ExecutionError("packed weight cache flag must be bool")
++        return override
++    raw = str(os.environ.get("PYPTO_X_AVX512_WEIGHT_CACHE", "")).strip().lower()
++    if raw in _TRUTHY:
++        return True
++    if raw in _FALSY:
++        return False
++    raise CpuAvx512ExecutionError(
++        "PYPTO_X_AVX512_WEIGHT_CACHE must be one of {} (got {!r})".format(
++            sorted(_TRUTHY | _FALSY), raw
++        )
++    )
++
++
++def _packed_dispatch_for(target_ir: Any, program_digest: str) -> Dict[int, dict]:
++    """Cache the immutable packed-plan dispatch per (program, plan) digest.
++
++    The vector plan digest alone does not include SSA parameter names, so the
++    program digest is part of the key; otherwise two programs with identical
++    shapes but different parameter names would share a stale dispatch.
++    """
++
++    digest = "{}:{}".format(program_digest, getattr(target_ir, "plan_digest", ""))
++    with _PACKED_DISPATCH_LOCK:
++        cached = _PACKED_DISPATCH_CACHE.get(digest)
++        if cached is not None:
++            return cached
++    packed, _legacy = packed_matmul_dispatch(target_ir)
++    with _PACKED_DISPATCH_LOCK:
++        if len(_PACKED_DISPATCH_CACHE) >= 8:
++            _PACKED_DISPATCH_CACHE.clear()
++        _PACKED_DISPATCH_CACHE[digest] = packed
++    return packed
++
++
++def packed_weight_cache_stats() -> Mapping[str, int]:
++    with _PACKED_WEIGHT_CACHE_LOCK:
++        stats = dict(_PACKED_WEIGHT_CACHE_STATS)
++        stats["entries"] = len(_PACKED_WEIGHT_CACHE)
++        stats["bytes"] = _PACKED_WEIGHT_CACHE_BYTES
++        return stats
++
++
++def clear_packed_weight_cache() -> None:
++    global _PACKED_WEIGHT_CACHE_BYTES
++    with _PACKED_WEIGHT_CACHE_LOCK:
++        _PACKED_WEIGHT_CACHE.clear()
++        _PACKED_WEIGHT_CACHE_BYTES = 0
+ 
+ 
+ def _call_packed_cast(
+@@ -845,11 +1091,20 @@ class Avx512Runtime:
+         available_features: Any = None,
+         capability: Optional[Avx512Capability] = None,
+         probe_directory: Optional[str] = None,
++        *,
++        gemm_threads: Optional[int] = None,
++        packed_weight_cache: Optional[bool] = None,
+     ) -> None:
+         if capability is not None and available_features is not None:
+             raise ValueError("capability and available_features are aliases; pass only one")
+         injected = capability is not None or available_features is not None
+         self._probe_directory = probe_directory
++        self._packed_matmul_state: Dict[int, dict] = {}
++        self._packed_plan_digest: str = ""
++        self._gemm_threads_override = gemm_threads
++        self._gemm_threads = 1
++        self._weight_cache_override = packed_weight_cache
++        self._packed_weight_cache_enabled = False
+         if capability is None and available_features is None:
+             try:
+                 capability = _capabilities.probe_avx512_capabilities(directory=probe_directory)
+@@ -1097,18 +1352,34 @@ class Avx512Runtime:
+         if len(loaded.target_ir.plans) != len(function.body.operations):
+             raise CpuAvx512ArtifactError("AVX-512 plan count does not match operation count")
+         last_use, pinned = plan_release(function)
+-        for index, (operation, plan) in enumerate(
+-            zip(function.body.operations, loaded.target_ir.plans)
+-        ):
+-            self._execute_operation(operation, plan, environment, loaded.module)
+-            release_dead_values(
+-                environment,
+-                last_use,
+-                pinned,
+-                index,
+-                [ref.name for ref in operation.inputs],
+-                [ref.name for ref in operation.outputs],
+-            )
++        # The packed-matmul dispatch is recomputed from the immutable program
++        # with the same predicate that wrote the artifact metadata; a declared
++        # packed plan therefore cannot silently execute the legacy kernel.
++        program_digest = str(metadata.get("program_digest", ""))
++        self._packed_plan_digest = "{}:{}".format(program_digest, loaded.target_ir.plan_digest)
++        self._packed_matmul_state = _packed_dispatch_for(loaded.target_ir, program_digest)
++        if self._packed_matmul_state:
++            self._packed_weight_cache_enabled = _resolve_weight_cache(self._weight_cache_override)
++            self._gemm_threads = _resolve_gemm_threads(self._gemm_threads_override)
++        else:
++            self._packed_weight_cache_enabled = False
++            self._gemm_threads = 1
++        try:
++            for index, (operation, plan) in enumerate(
++                zip(function.body.operations, loaded.target_ir.plans)
++            ):
++                self._execute_operation(operation, plan, environment, loaded.module)
++                release_dead_values(
++                    environment,
++                    last_use,
++                    pinned,
++                    index,
++                    [ref.name for ref in operation.inputs],
++                    [ref.name for ref in operation.outputs],
++                )
++        finally:
++            self._packed_matmul_state = {}
++            self._packed_plan_digest = ""
+         results: List[Any] = []
+         output_index = 0
+         for result_ref in function.returns:
+@@ -1189,6 +1460,23 @@ class Avx512Runtime:
+         elif name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
+             mode = "native_scalar_math_lane" if native_float else "host_reference"
+         elif name == "matmul":
++            contract = (
++                self._packed_matmul_state.get(plan.operation_index)
++                if plan.matmul is not None and not plan.matmul.batch_shape
++                else None
++            )
++            if contract is not None and native_float:
++                mode = PACKED_GEMM_MODE
++                return {
++                    "operation": name,
++                    "mode": mode,
++                    "kernel": contract["gemm_kernel"],
++                    "packed": None,
++                    "packed_matmul": contract,
++                    "inputs": tuple(inputs),
++                    "python_list_elements": 0,
++                    "output_ref": output_ref,
++                }
+             if not native_float:
+                 mode = "host_reference"
+             elif plan.matmul is not None and plan.matmul.batch_shape:
+@@ -1241,6 +1529,11 @@ class Avx512Runtime:
+             if mode == BROADCAST_MODE:
+                 environment.update(self._execute_broadcast(decision, operation, plan, module))
+                 return
++            if mode == PACKED_GEMM_MODE:
++                environment.update(
++                    self._execute_packed_matmul(decision, operation, plan, module, environment)
++                )
++                return
+             output_ref = operation.outputs[0]
+             dtype = canonical_dtype(output_ref.type.dtype)
+             if mode == "host_materialize":
+@@ -1286,10 +1579,9 @@ class Avx512Runtime:
+             elif name == "matmul":
+                 matmul = plan.matmul
+                 if matmul.batch_shape:
+-                    values = self._execute_batched_matmul(
++                    destination = self._execute_batched_matmul(
+                         inputs[0], inputs[1], dtype, matmul, module, output_ref.name
+                     )
+-                    destination = _buffer_from_values(dtype, values, output_ref.name)
+                 else:
+                     destination = _buffer_alloc(dtype, matmul.output_elements, output_ref.name)
+                     _call_matmul(
+@@ -1379,6 +1671,146 @@ class Avx512Runtime:
+             raise CpuAvx512ArtifactError("unsupported AVX-512 packed mode {!r}".format(mode))
+         return {output_ref.name: _RuntimeValue(output_ref.type, destination)}
+ 
++    # -- packed/blocked rank-2 matmul ----------------------------------
++    def _packed_weight(
++        self,
++        contract: Mapping[str, Any],
++        source: _NativeBuffer,
++        module: Any,
++    ) -> _NativeBuffer:
++        """Pack one parameter-derived right operand (or reuse the opt-in cache)."""
++
++        global _PACKED_WEIGHT_CACHE_BYTES
++        k = int(contract["k"])
++        n = int(contract["n"])
++        packed_dtype = canonical_dtype(contract["pack_dtype"])
++        count = packed_matmul_pack_elements(k, n)
++        address = _buffer_address(source)
++        key = (
++            self._packed_plan_digest,
++            contract["pack_kernel"],
++            contract["gemm_kernel"],
++            contract["source_parameter"],
++            tuple(contract["chain"]),
++            contract["source_dtype"],
++            tuple(contract["source_shape"]),
++            int(contract["source_k_stride"]),
++            int(contract["source_n_stride"]),
++            k,
++            n,
++            packed_dtype,
++            address,
++            int(source.count),
++        )
++        if self._packed_weight_cache_enabled and address is not None:
++            fingerprint = _buffer_sample(source)
++            with _PACKED_WEIGHT_CACHE_LOCK:
++                entry = _PACKED_WEIGHT_CACHE.get(key)
++                if entry is not None and entry["fingerprint"] == fingerprint:
++                    _PACKED_WEIGHT_CACHE_STATS["hits"] += 1
++                    return entry["packed"]
++                if entry is not None:
++                    _PACKED_WEIGHT_CACHE_STATS["invalidations"] += 1
++                    _PACKED_WEIGHT_CACHE_BYTES -= int(entry.get("bytes", 0))
++                    del _PACKED_WEIGHT_CACHE[key]
++        else:
++            fingerprint = None
++        packed = _buffer_alloc(packed_dtype, count, "packed_right")
++        _call_packed_matmul_pack(
++            module,
++            contract["pack_kernel"],
++            source,
++            packed,
++            k,
++            n,
++            int(contract["source_k_stride"]),
++            int(contract["source_n_stride"]),
++        )
++        with _PACKED_WEIGHT_CACHE_LOCK:
++            _PACKED_WEIGHT_CACHE_STATS["packs"] += 1
++            if self._packed_weight_cache_enabled:
++                _PACKED_WEIGHT_CACHE_STATS["misses"] += 1
++                if address is not None:
++                    size = count * ctypes.sizeof(_ctype(packed_dtype))
++                    _packed_weight_cache_evict(size)
++                    _PACKED_WEIGHT_CACHE[key] = {
++                        "packed": packed,
++                        "fingerprint": fingerprint,
++                        "bytes": size,
++                    }
++                    _PACKED_WEIGHT_CACHE_BYTES += size
++        return packed
++
++    def _execute_packed_matmul(
++        self,
++        decision: Mapping[str, Any],
++        operation: Operation,
++        plan: Any,
++        module: Any,
++        environment: Mapping[str, _RuntimeValue],
++    ) -> Mapping[str, _RuntimeValue]:
++        """Run one packed/blocked rank-2 matmul on the shared native module."""
++
++        contract = decision["packed_matmul"]
++        inputs = list(decision["inputs"])
++        if len(inputs) != 2:
++            raise CpuAvx512ArtifactError("AVX-512 packed matmul requires two tensor inputs")
++        output_ref = operation.outputs[0]
++        dtype = canonical_dtype(output_ref.type.dtype)
++        m = int(contract["m"])
++        k = int(contract["k"])
++        n = int(contract["n"])
++        if int(plan.matmul.m) != m or int(plan.matmul.k) != k or int(plan.matmul.n) != n:
++            raise CpuAvx512ArtifactError("AVX-512 packed matmul plan shape changed")
++        left = inputs[0].buffer
++        if canonical_dtype(left.dtype) != dtype or left.count != m * k:
++            raise CpuAvx512ArtifactError(
++                "AVX-512 packed matmul left operand does not match M={} K={}".format(m, k)
++            )
++        source_name = contract["source_parameter"]
++        source_value = environment.get(source_name)
++        if source_value is None:
++            raise CpuAvx512ArtifactError(
++                "AVX-512 packed matmul parameter {!r} is unavailable".format(source_name)
++            )
++        source = source_value.buffer
++        source_shape = tuple(int(dimension) for dimension in contract["source_shape"])
++        if (
++            canonical_dtype(source.dtype) != canonical_dtype(contract["source_dtype"])
++            or source.count != source_shape[0] * source_shape[1]
++        ):
++            raise CpuAvx512ArtifactError(
++                "AVX-512 packed matmul parameter {!r} does not match its contract".format(source_name)
++            )
++        packed = self._packed_weight(contract, source, module)
++        destination = _buffer_alloc(dtype, m * n, output_ref.name)
++        _call_packed_matmul(
++            module,
++            contract["gemm_kernel"],
++            dtype,
++            canonical_dtype(contract["pack_dtype"]),
++            left,
++            packed,
++            destination,
++            m,
++            k,
++            n,
++            int(self._gemm_threads),
++        )
++        return {output_ref.name: _RuntimeValue(output_ref.type, destination)}
++
++    def clear_packed_weight_cache(self) -> None:
++        """Drop the opt-in cross-launch packed-weight cache."""
++
++        clear_packed_weight_cache()
++
++    def packed_weight_cache_stats(self) -> Mapping[str, int]:
++        with _PACKED_WEIGHT_CACHE_LOCK:
++            stats = dict(_PACKED_WEIGHT_CACHE_STATS)
++            stats["entries"] = len(_PACKED_WEIGHT_CACHE)
++            stats["bytes"] = _PACKED_WEIGHT_CACHE_BYTES
++        return stats
++
+     def _execute_batched_matmul(
+         self,
+         left: _RuntimeValue,
+@@ -1387,12 +1819,14 @@ class Avx512Runtime:
+         matmul: Any,
+         module: Any,
+         context: str,
+-    ) -> List[Any]:
++    ) -> _NativeBuffer:
+         """Run rank-2 native ZMM matmul once per batch on the host.
+ 
+         The AVX-512 native ABI remains rank-2.  This is intentionally a host
+         batch loop over real AVX-512 rank-2 kernels, not a fused batched SIMD
+-        lowering; the distinction is part of artifact metadata.
++        lowering; the distinction is part of artifact metadata.  Batch views
++        are pointer offsets into the caller's buffers, so the loop never
++        materializes a Python element list.
+         """
+ 
+         batch_count = 1
+@@ -1400,28 +1834,30 @@ class Avx512Runtime:
+             batch_count *= dimension
+         left_matrix_elements = matmul.m * matmul.k
+         right_matrix_elements = matmul.k * matmul.n
+-        left_values = _buffer_raw(left.buffer)
+-        right_values = _buffer_raw(right.buffer)
+-        if len(left_values) != batch_count * left_matrix_elements or len(right_values) != batch_count * right_matrix_elements:
++        output_matrix_elements = matmul.m * matmul.n
++        if (
++            left.buffer.count != batch_count * left_matrix_elements
++            or right.buffer.count != batch_count * right_matrix_elements
++        ):
+             raise CpuAvx512ExecutionError("{} batched matmul input length mismatch".format(context))
+-        result: List[Any] = []
++        destination = _buffer_alloc(dtype, batch_count * output_matrix_elements, context)
++        element_bytes = ctypes.sizeof(_ctype(dtype))
++        left_base = _buffer_base_address(left.buffer)
++        right_base = _buffer_base_address(right.buffer)
++        output_base = _buffer_base_address(destination)
++        pointer = _pointer(dtype)
+         for batch_index in range(batch_count):
+-            left_batch = _buffer_from_raw(
+-                dtype,
+-                left_values[batch_index * left_matrix_elements:(batch_index + 1) * left_matrix_elements],
+-                context + ".left_batch",
+-            )
+-            right_batch = _buffer_from_raw(
++            _call_matmul_pointers(
++                module,
+                 dtype,
+-                right_values[batch_index * right_matrix_elements:(batch_index + 1) * right_matrix_elements],
+-                context + ".right_batch",
+-            )
+-            output_batch = _buffer_from_values(
+-                dtype, [0] * (matmul.m * matmul.n), context + ".output_batch"
++                ctypes.cast(left_base + batch_index * left_matrix_elements * element_bytes, pointer),
++                ctypes.cast(right_base + batch_index * right_matrix_elements * element_bytes, pointer),
++                ctypes.cast(output_base + batch_index * output_matrix_elements * element_bytes, pointer),
++                matmul.m,
++                matmul.k,
++                matmul.n,
+             )
+-            _call_matmul(module, dtype, left_batch, right_batch, output_batch, matmul.m, matmul.k, matmul.n)
+-            result.extend(_buffer_values(output_batch))
+-        return result
++        return destination
+ 
+     def _execute_broadcast(
+         self,
+diff --git a/python/pypto/compiler/targets/cpu_avx512.py b/python/pypto/compiler/targets/cpu_avx512.py
+index a4128aebb..6087b19c2 100644
+--- a/python/pypto/compiler/targets/cpu_avx512.py
++++ b/python/pypto/compiler/targets/cpu_avx512.py
+@@ -26,20 +26,24 @@ from pypto.target import TargetSpec
+ from pypto.target._utils import mapping_copy, sha256_bytes, sha256_text
+ 
+ 
+-# Payload 3 adds the native broadcast kernel and the native reduction group
+-# gather, and moves broadcast out of the host pre-expansion boundary.  Payload
++# Payload 4 adds the packed/blocked rank-2 matmul plane (weight-derived
++# parameter chains, f32/bf16/mixed kernels, optional bounded threading).
++# Payload 3 added the native broadcast kernel and the native reduction group
++# gather, and moved broadcast out of the host pre-expansion boundary.  Payload
+ # 2 added the packed parameter-scale native kernels (cast / rank-2 transpose /
+ # embedding); payload 1 described those operations as host_reference and is
+ # rejected by the runtime.
+-ARTIFACT_PAYLOAD_VERSION = 3
++ARTIFACT_PAYLOAD_VERSION = 4
+ DEFAULT_ARTIFACT_FORMAT = "pypto-x.cpu.avx512"
+-#: Native shared-object ABI marker.  ``:4`` adds broadcast/gather kernels.
+-NATIVE_ABI_MARKER = "pypto-x.cpu.avx512:4"
++#: Native shared-object ABI marker.  ``:5`` adds the packed/blocked matmul
++#: symbols and their pthread worker entry points.
++NATIVE_ABI_MARKER = "pypto-x.cpu.avx512:5"
+ 
+ 
+ _NATIVE_SOURCE = r'''
+ #include <immintrin.h>
+ #include <math.h>
++#include <pthread.h>
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <string.h>
+@@ -66,7 +70,7 @@ _NATIVE_SOURCE = r'''
+ __attribute__((visibility("default"))) const char *ptx_avx512_variant = PTX_VARIANT;
+ __attribute__((visibility("default"))) const char *ptx_avx512_source_digest = PTX_SOURCE_DIGEST;
+ __attribute__((visibility("default"))) const unsigned int ptx_avx512_feature_mask = PTX_FEATURE_MASK;
+-__attribute__((visibility("default"))) const char *ptx_avx512_abi = "pypto-x.cpu.avx512:4";
++__attribute__((visibility("default"))) const char *ptx_avx512_abi = "pypto-x.cpu.avx512:5";
+ 
+ static inline __m512 ptx_binary_f32(int op, __m512 a, __m512 b) {
+     if (op == 0) return _mm512_add_ps(a, b);
+@@ -641,6 +645,470 @@ void ptx_avx512_vnni_dot_i8(const uint8_t *left, const int8_t *right,
+     for (; i < n; ++i) *output += (int32_t)left[i] * (int32_t)right[i];
+ }
+ #endif
++
++/* ------------------------------------------------------------------ *
++ * Packed/blocked rank-2 matmul plane (artifact payload version 4).
++ *
++ * The runtime packs parameter-derived right operands once per source
++ * (optionally caching the packed tile across launches) and calls the
++ * matching kernel; the accumulation order per output element is the
++ * legacy k order, so results stay bit-identical to the column-block
++ * kernels above.  Threading is bounded to PTX_PACKED_GEMM_MAX_THREADS
++ * and partitions the N-tile range only, which keeps the result
++ * deterministic.
++ * ------------------------------------------------------------------ */
++#define PTX_PACKED_GEMM_K_TILE 64
++#define PTX_PACKED_GEMM_N_TILE 64
++#define PTX_PACKED_GEMM_MAX_THREADS 6
++
++static inline float ptx_accumulate_scalar(float a, float b, float acc) {
++    return a * b + acc;
++}
++
++static inline size_t ptx_blocks(size_t length, size_t tile) {
++    return length == 0 ? 0 : (length + tile - 1) / tile;
++}
++
++/* ------------------------------------------------------------------ */
++/* pack kernels                                                       */
++/* ------------------------------------------------------------------ */
++
++void ptx_avx512_pack_matmul_f32(const float *source, float *packed,
++                                size_t k, size_t n,
++                                size_t source_k_stride, size_t source_n_stride) {
++    size_t num_kb = ptx_blocks(k, PTX_PACKED_GEMM_K_TILE);
++    size_t num_nb = ptx_blocks(n, PTX_PACKED_GEMM_N_TILE);
++    size_t nb, kb, kk, nn;
++    for (nb = 0; nb < num_nb; ++nb) {
++        size_t nt = n - nb * PTX_PACKED_GEMM_N_TILE;
++        if (nt > PTX_PACKED_GEMM_N_TILE) nt = PTX_PACKED_GEMM_N_TILE;
++        for (kb = 0; kb < num_kb; ++kb) {
++            size_t kt = k - kb * PTX_PACKED_GEMM_K_TILE;
++            float *block = packed + (nb * num_kb + kb) * (size_t)PTX_PACKED_GEMM_K_TILE * PTX_PACKED_GEMM_N_TILE;
++            if (kt > PTX_PACKED_GEMM_K_TILE) kt = PTX_PACKED_GEMM_K_TILE;
++            for (kk = 0; kk < kt; ++kk) {
++                size_t ki = kb * PTX_PACKED_GEMM_K_TILE + kk;
++                float *dst = block + kk * PTX_PACKED_GEMM_N_TILE;
++                if (source_n_stride == 1 && nt == PTX_PACKED_GEMM_N_TILE) {
++                    const float *src = source + ki * source_k_stride + nb * PTX_PACKED_GEMM_N_TILE;
++                    for (nn = 0; nn < PTX_PACKED_GEMM_N_TILE; ++nn) dst[nn] = src[nn];
++                } else {
++                    for (nn = 0; nn < nt; ++nn)
++                        dst[nn] = source[ki * source_k_stride + (nb * PTX_PACKED_GEMM_N_TILE + nn) * source_n_stride];
++                    for (; nn < PTX_PACKED_GEMM_N_TILE; ++nn) dst[nn] = 0.0f;
++                }
++            }
++            for (; kk < PTX_PACKED_GEMM_K_TILE; ++kk) {
++                memset(block + kk * PTX_PACKED_GEMM_N_TILE, 0, PTX_PACKED_GEMM_N_TILE * sizeof(float));
++            }
++        }
++    }
++}
++
++static void ptx_pack_bf16_impl(const void *source, uint16_t *packed,
++                               size_t k, size_t n,
++                               size_t source_k_stride, size_t source_n_stride,
++                               int source_is_f32) {
++    size_t num_kb = ptx_blocks(k, PTX_PACKED_GEMM_K_TILE);
++    size_t num_nb = ptx_blocks(n, PTX_PACKED_GEMM_N_TILE);
++    size_t nb, kb, pair, nn;
++    for (nb = 0; nb < num_nb; ++nb) {
++        size_t nt = n - nb * PTX_PACKED_GEMM_N_TILE;
++        if (nt > PTX_PACKED_GEMM_N_TILE) nt = PTX_PACKED_GEMM_N_TILE;
++        for (kb = 0; kb < num_kb; ++kb) {
++            size_t kt = k - kb * PTX_PACKED_GEMM_K_TILE;
++            uint16_t *block = packed + (nb * num_kb + kb) * (size_t)PTX_PACKED_GEMM_K_TILE * PTX_PACKED_GEMM_N_TILE;
++            if (kt > PTX_PACKED_GEMM_K_TILE) kt = PTX_PACKED_GEMM_K_TILE;
++            for (pair = 0; pair < PTX_PACKED_GEMM_K_TILE / 2; ++pair) {
++                size_t k0 = kb * PTX_PACKED_GEMM_K_TILE + 2 * pair;
++                uint16_t *dst = block + pair * 2 * PTX_PACKED_GEMM_N_TILE;
++                int first_ok = k0 < k;
++                int second_ok = (k0 + 1) < k;
++                for (nn = 0; nn < PTX_PACKED_GEMM_N_TILE; ++nn) {
++                    size_t ni = nb * PTX_PACKED_GEMM_N_TILE + nn;
++                    uint16_t lo = 0;
++                    uint16_t hi = 0;
++                    if (ni < n) {
++                        size_t offset = ni * source_n_stride;
++                        if (first_ok) {
++                            if (source_is_f32)
++                                lo = ptx_f32_to_bf16(((const float *)source)[k0 * source_k_stride + offset]);
++                            else
++                                lo = ((const uint16_t *)source)[k0 * source_k_stride + offset];
++                        }
++                        if (second_ok) {
++                            if (source_is_f32)
++                                hi = ptx_f32_to_bf16(((const float *)source)[(k0 + 1) * source_k_stride + offset]);
++                            else
++                                hi = ((const uint16_t *)source)[(k0 + 1) * source_k_stride + offset];
++                        }
++                    }
++                    dst[2 * nn] = lo;
++                    dst[2 * nn + 1] = hi;
++                }
++            }
++        }
++    }
++}
++
++void ptx_avx512_pack_matmul_bf16(const uint16_t *source, uint16_t *packed,
++                                 size_t k, size_t n,
++                                 size_t source_k_stride, size_t source_n_stride) {
++    ptx_pack_bf16_impl(source, packed, k, n, source_k_stride, source_n_stride, 0);
++}
++
++void ptx_avx512_pack_matmul_bf16_from_f32(const float *source, uint16_t *packed,
++                                          size_t k, size_t n,
++                                          size_t source_k_stride, size_t source_n_stride) {
++    ptx_pack_bf16_impl(source, packed, k, n, source_k_stride, source_n_stride, 1);
++}
++
++/* ------------------------------------------------------------------ */
++/* f32 gemm                                                           */
++/* ------------------------------------------------------------------ */
++
++static void ptx_matmul_packed_f32_range(const float *left, const float *packed, float *output,
++                                        size_t m, size_t k, size_t n,
++                                        size_t nb_begin, size_t nb_end) {
++    size_t num_kb = ptx_blocks(k, PTX_PACKED_GEMM_K_TILE);
++    size_t nb, row, kb, kk, c;
++    for (nb = nb_begin; nb < nb_end; ++nb) {
++        size_t n0 = nb * PTX_PACKED_GEMM_N_TILE;
++        size_t ncount = n - n0;
++        if (ncount > PTX_PACKED_GEMM_N_TILE) ncount = PTX_PACKED_GEMM_N_TILE;
++        for (row = 0; row < m; ++row) {
++            __m512 acc0 = _mm512_setzero_ps();
++            __m512 acc1 = _mm512_setzero_ps();
++            __m512 acc2 = _mm512_setzero_ps();
++            __m512 acc3 = _mm512_setzero_ps();
++            const float *a = left + row * k;
++            for (kb = 0; kb < num_kb; ++kb) {
++                size_t kt = k - kb * PTX_PACKED_GEMM_K_TILE;
++                const float *b = packed + (nb * num_kb + kb) * (size_t)PTX_PACKED_GEMM_K_TILE * PTX_PACKED_GEMM_N_TILE;
++                if (kt > PTX_PACKED_GEMM_K_TILE) kt = PTX_PACKED_GEMM_K_TILE;
++                for (kk = 0; kk < kt; ++kk) {
++                    __m512 av = _mm512_set1_ps(a[kb * PTX_PACKED_GEMM_K_TILE + kk]);
++                    acc0 = ptx_accumulate(av, _mm512_loadu_ps(b + kk * PTX_PACKED_GEMM_N_TILE + 0), acc0);
++                    acc1 = ptx_accumulate(av, _mm512_loadu_ps(b + kk * PTX_PACKED_GEMM_N_TILE + 16), acc1);
++                    acc2 = ptx_accumulate(av, _mm512_loadu_ps(b + kk * PTX_PACKED_GEMM_N_TILE + 32), acc2);
++                    acc3 = ptx_accumulate(av, _mm512_loadu_ps(b + kk * PTX_PACKED_GEMM_N_TILE + 48), acc3);
++                }
++            }
++            for (c = 0; c < 4; ++c) {
++                size_t lane = c * 16;
++                __m512 acc;
++                size_t remaining;
++                if (lane >= ncount) break;
++                acc = (c == 0) ? acc0 : (c == 1) ? acc1 : (c == 2) ? acc2 : acc3;
++                remaining = ncount - lane;
++                if (remaining >= 16) {
++                    _mm512_storeu_ps(output + row * n + n0 + lane, acc);
++                } else {
++                    __mmask16 mask = (__mmask16)((1U << remaining) - 1U);
++                    _mm512_mask_storeu_ps(output + row * n + n0 + lane, mask, acc);
++                }
++            }
++        }
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* bf16 gemm (bitwise mirror of the legacy column-block kernel)       */
++/* ------------------------------------------------------------------ */
++
++static void ptx_matmul_packed_bf16_range(const uint16_t *left, const uint16_t *packed, uint16_t *output,
++                                         size_t m, size_t k, size_t n,
++                                         size_t nb_begin, size_t nb_end) {
++    size_t num_kb = ptx_blocks(k, PTX_PACKED_GEMM_K_TILE);
++    size_t nb, row, kb, pair, kk, c;
++    for (nb = nb_begin; nb < nb_end; ++nb) {
++        size_t n0 = nb * PTX_PACKED_GEMM_N_TILE;
++        size_t ncount = n - n0;
++        size_t full_groups, tail_columns;
++        if (ncount > PTX_PACKED_GEMM_N_TILE) ncount = PTX_PACKED_GEMM_N_TILE;
++        full_groups = ncount / 16;
++        tail_columns = ncount % 16;
++        for (row = 0; row < m; ++row) {
++            float lanes[64];
++            __m512 acc[4];
++            size_t lane;
++            const uint16_t *a = left + row * k;
++            for (lane = 0; lane < ncount; ++lane) lanes[lane] = 0.0f;
++            acc[0] = _mm512_setzero_ps();
++            acc[1] = _mm512_setzero_ps();
++            acc[2] = _mm512_setzero_ps();
++            acc[3] = _mm512_setzero_ps();
++            for (kb = 0; kb < num_kb; ++kb) {
++                size_t kt = k - kb * PTX_PACKED_GEMM_K_TILE;
++                const uint16_t *b = packed + (nb * num_kb + kb) * (size_t)PTX_PACKED_GEMM_K_TILE * PTX_PACKED_GEMM_N_TILE;
++                if (kt > PTX_PACKED_GEMM_K_TILE) kt = PTX_PACKED_GEMM_K_TILE;
++                for (pair = 0; pair + 1 < kt; pair += 2) {
++                    size_t k0 = kb * PTX_PACKED_GEMM_K_TILE + pair;
++                    const uint16_t *bp = b + (pair / 2) * 2 * PTX_PACKED_GEMM_N_TILE;
++#if PTX_USE_BF16
++                    {
++                        uint32_t pair_bits;
++                        __m512i av;
++                        memcpy(&pair_bits, a + k0, sizeof(pair_bits));
++                        av = _mm512_set1_epi32((int)pair_bits);
++                        if (full_groups > 0)
++                            acc[0] = _mm512_dpbf16_ps(acc[0], (__m512bh)av, (__m512bh)_mm512_loadu_si512(bp + 0));
++                        if (full_groups > 1)
++                            acc[1] = _mm512_dpbf16_ps(acc[1], (__m512bh)av, (__m512bh)_mm512_loadu_si512(bp + 32));
++                        if (full_groups > 2)
++                            acc[2] = _mm512_dpbf16_ps(acc[2], (__m512bh)av, (__m512bh)_mm512_loadu_si512(bp + 64));
++                        if (full_groups > 3)
++                            acc[3] = _mm512_dpbf16_ps(acc[3], (__m512bh)av, (__m512bh)_mm512_loadu_si512(bp + 96));
++                    }
++#else
++                    {
++                        __m512 a0 = _mm512_set1_ps(ptx_bf16_to_f32(a[k0]));
++                        __m512 a1 = _mm512_set1_ps(ptx_bf16_to_f32(a[k0 + 1]));
++                        __m512i hi = _mm512_set1_epi32((int)0xFFFF0000U);
++                        __m512i v0 = _mm512_loadu_si512(bp + 0);
++                        acc[0] = ptx_accumulate(a0, _mm512_castsi512_ps(_mm512_slli_epi32(v0, 16)), acc[0]);
++                        acc[0] = ptx_accumulate(a1, _mm512_castsi512_ps(_mm512_and_si512(v0, hi)), acc[0]);
++                        if (full_groups > 1) {
++                            __m512i v1 = _mm512_loadu_si512(bp + 32);
++                            acc[1] = ptx_accumulate(a0, _mm512_castsi512_ps(_mm512_slli_epi32(v1, 16)), acc[1]);
++                            acc[1] = ptx_accumulate(a1, _mm512_castsi512_ps(_mm512_and_si512(v1, hi)), acc[1]);
++                        }
++                        if (full_groups > 2) {
++                            __m512i v2 = _mm512_loadu_si512(bp + 64);
++                            acc[2] = ptx_accumulate(a0, _mm512_castsi512_ps(_mm512_slli_epi32(v2, 16)), acc[2]);
++                            acc[2] = ptx_accumulate(a1, _mm512_castsi512_ps(_mm512_and_si512(v2, hi)), acc[2]);
++                        }
++                        if (full_groups > 3) {
++                            __m512i v3 = _mm512_loadu_si512(bp + 96);
++                            acc[3] = ptx_accumulate(a0, _mm512_castsi512_ps(_mm512_slli_epi32(v3, 16)), acc[3]);
++                            acc[3] = ptx_accumulate(a1, _mm512_castsi512_ps(_mm512_and_si512(v3, hi)), acc[3]);
++                        }
++                    }
++#endif
++                }
++                if ((kt & 1) != 0 && full_groups > 0) {
++                    float group[64];
++                    uint16_t last = a[kb * PTX_PACKED_GEMM_K_TILE + kt - 1];
++                    const uint16_t *src = b + ((kt - 1) / 2) * 2 * PTX_PACKED_GEMM_N_TILE;
++                    size_t l;
++                    _mm512_storeu_ps(group + 0, acc[0]);
++                    _mm512_storeu_ps(group + 16, acc[1]);
++                    _mm512_storeu_ps(group + 32, acc[2]);
++                    _mm512_storeu_ps(group + 48, acc[3]);
++                    for (l = 0; l < full_groups * 16; ++l) {
++                        group[l] += ptx_bf16_to_f32(last) * ptx_bf16_to_f32(src[2 * l]);
++                    }
++                    acc[0] = _mm512_loadu_ps(group + 0);
++                    acc[1] = _mm512_loadu_ps(group + 16);
++                    acc[2] = _mm512_loadu_ps(group + 32);
++                    acc[3] = _mm512_loadu_ps(group + 48);
++                }
++            }
++            for (c = 0; c < full_groups; ++c) _mm512_storeu_ps(lanes + c * 16, acc[c]);
++            if (tail_columns != 0) {
++                float *tail = lanes + full_groups * 16;
++                for (kk = 0; kk < k; ++kk) {
++                    size_t kb = kk / PTX_PACKED_GEMM_K_TILE;
++                    size_t within = kk % PTX_PACKED_GEMM_K_TILE;
++                    size_t pair_index = within / 2;
++                    size_t half = within & 1;
++                    const uint16_t *b = packed + (nb * num_kb + kb) * (size_t)PTX_PACKED_GEMM_K_TILE * PTX_PACKED_GEMM_N_TILE;
++                    const uint16_t *src = b + pair_index * 2 * PTX_PACKED_GEMM_N_TILE + full_groups * 32;
++                    float av = ptx_bf16_to_f32(a[kk]);
++                    size_t l;
++                    for (l = 0; l < tail_columns; ++l) {
++                        tail[l] = ptx_accumulate_scalar(av, ptx_bf16_to_f32(src[2 * l + half]), tail[l]);
++                    }
++                }
++            }
++            for (lane = 0; lane < ncount; ++lane) {
++                output[row * n + n0 + lane] = ptx_f32_to_bf16(lanes[lane]);
++            }
++        }
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* mixed bf16-packed / f32-activation gemm                            */
++/* ------------------------------------------------------------------ */
++
++static void ptx_matmul_packed_bf16_f32_range(const float *left, const uint16_t *packed, float *output,
++                                             size_t m, size_t k, size_t n,
++                                             size_t nb_begin, size_t nb_end) {
++    size_t num_kb = ptx_blocks(k, PTX_PACKED_GEMM_K_TILE);
++    size_t nb, row, kb, pair, kk, c;
++    for (nb = nb_begin; nb < nb_end; ++nb) {
++        size_t n0 = nb * PTX_PACKED_GEMM_N_TILE;
++        size_t ncount = n - n0;
++        if (ncount > PTX_PACKED_GEMM_N_TILE) ncount = PTX_PACKED_GEMM_N_TILE;
++        for (row = 0; row < m; ++row) {
++            __m512 acc0 = _mm512_setzero_ps();
++            __m512 acc1 = _mm512_setzero_ps();
++            __m512 acc2 = _mm512_setzero_ps();
++            __m512 acc3 = _mm512_setzero_ps();
++            const float *a = left + row * k;
++            for (kb = 0; kb < num_kb; ++kb) {
++                size_t kt = k - kb * PTX_PACKED_GEMM_K_TILE;
++                const uint16_t *b = packed + (nb * num_kb + kb) * (size_t)PTX_PACKED_GEMM_K_TILE * PTX_PACKED_GEMM_N_TILE;
++                if (kt > PTX_PACKED_GEMM_K_TILE) kt = PTX_PACKED_GEMM_K_TILE;
++                for (pair = 0; pair + 1 < kt; pair += 2) {
++                    size_t k0 = kb * PTX_PACKED_GEMM_K_TILE + pair;
++                    const uint16_t *bp = b + (pair / 2) * 2 * PTX_PACKED_GEMM_N_TILE;
++                    __m512 av0 = _mm512_set1_ps(a[k0]);
++                    __m512 av1 = _mm512_set1_ps(a[k0 + 1]);
++                    __m512i v0 = _mm512_loadu_si512(bp + 0);
++                    __m512i v1 = _mm512_loadu_si512(bp + 32);
++                    __m512i v2 = _mm512_loadu_si512(bp + 64);
++                    __m512i v3 = _mm512_loadu_si512(bp + 96);
++                    __m512i hi = _mm512_set1_epi32((int)0xFFFF0000U);
++                    acc0 = ptx_accumulate(av0, _mm512_castsi512_ps(_mm512_slli_epi32(v0, 16)), acc0);
++                    acc0 = ptx_accumulate(av1, _mm512_castsi512_ps(_mm512_and_si512(v0, hi)), acc0);
++                    acc1 = ptx_accumulate(av0, _mm512_castsi512_ps(_mm512_slli_epi32(v1, 16)), acc1);
++                    acc1 = ptx_accumulate(av1, _mm512_castsi512_ps(_mm512_and_si512(v1, hi)), acc1);
++                    acc2 = ptx_accumulate(av0, _mm512_castsi512_ps(_mm512_slli_epi32(v2, 16)), acc2);
++                    acc2 = ptx_accumulate(av1, _mm512_castsi512_ps(_mm512_and_si512(v2, hi)), acc2);
++                    acc3 = ptx_accumulate(av0, _mm512_castsi512_ps(_mm512_slli_epi32(v3, 16)), acc3);
++                    acc3 = ptx_accumulate(av1, _mm512_castsi512_ps(_mm512_and_si512(v3, hi)), acc3);
++                }
++                if ((kt & 1) != 0) {
++                    float tail[64];
++                    size_t l;
++                    float av = a[kb * PTX_PACKED_GEMM_K_TILE + kt - 1];
++                    const uint16_t *src = b + ((kt - 1) / 2) * 2 * PTX_PACKED_GEMM_N_TILE;
++                    _mm512_storeu_ps(tail + 0, acc0);
++                    _mm512_storeu_ps(tail + 16, acc1);
++                    _mm512_storeu_ps(tail + 32, acc2);
++                    _mm512_storeu_ps(tail + 48, acc3);
++                    for (l = 0; l < ncount; ++l) {
++                        tail[l] = ptx_accumulate_scalar(av, ptx_bf16_to_f32(src[2 * l]), tail[l]);
++                    }
++                    acc0 = _mm512_loadu_ps(tail + 0);
++                    acc1 = _mm512_loadu_ps(tail + 16);
++                    acc2 = _mm512_loadu_ps(tail + 32);
++                    acc3 = _mm512_loadu_ps(tail + 48);
++                }
++            }
++            for (c = 0; c < 4; ++c) {
++                size_t lane = c * 16;
++                __m512 acc;
++                size_t remaining;
++                if (lane >= ncount) break;
++                acc = (c == 0) ? acc0 : (c == 1) ? acc1 : (c == 2) ? acc2 : acc3;
++                remaining = ncount - lane;
++                if (remaining >= 16) {
++                    _mm512_storeu_ps(output + row * n + n0 + lane, acc);
++                } else {
++                    __mmask16 mask = (__mmask16)((1U << remaining) - 1U);
++                    _mm512_mask_storeu_ps(output + row * n + n0 + lane, mask, acc);
++                }
++            }
++        }
++    }
++}
++
++/* ------------------------------------------------------------------ */
++/* bounded threading                                                  */
++/* ------------------------------------------------------------------ */
++
++typedef struct {
++    const void *left;
++    const void *packed;
++    void *output;
++    size_t m, k, n, nb_begin, nb_end;
++} ptx_gemm_task;
++
++typedef void *(*ptx_task_fn)(void *);
++
++static void *ptx_worker_f32(void *argument) {
++    ptx_gemm_task *task = (ptx_gemm_task *)argument;
++    ptx_matmul_packed_f32_range((const float *)task->left, (const float *)task->packed,
++                               (float *)task->output, task->m, task->k, task->n,
++                               task->nb_begin, task->nb_end);
++    return NULL;
++}
++
++static void *ptx_worker_bf16(void *argument) {
++    ptx_gemm_task *task = (ptx_gemm_task *)argument;
++    ptx_matmul_packed_bf16_range((const uint16_t *)task->left, (const uint16_t *)task->packed,
++                                (uint16_t *)task->output, task->m, task->k, task->n,
++                                task->nb_begin, task->nb_end);
++    return NULL;
++}
++
++static void *ptx_worker_bf16_f32(void *argument) {
++    ptx_gemm_task *task = (ptx_gemm_task *)argument;
++    ptx_matmul_packed_bf16_f32_range((const float *)task->left, (const uint16_t *)task->packed,
++                                    (float *)task->output, task->m, task->k, task->n,
++                                    task->nb_begin, task->nb_end);
++    return NULL;
++}
++
++static size_t ptx_bounded_threads(size_t threads, size_t num_nb, size_t m, size_t k, size_t n) {
++    if (threads > PTX_PACKED_GEMM_MAX_THREADS) threads = PTX_PACKED_GEMM_MAX_THREADS;
++    if (threads < 1 || num_nb <= 1) return 1;
++    if (m * k * n < (size_t)262144) return 1;
++    if (threads > num_nb) threads = num_nb;
++    return threads;
++}
++
++static void ptx_run_tasks(size_t threads, size_t num_nb, ptx_task_fn worker, ptx_gemm_task *template_task) {
++    pthread_t tids[PTX_PACKED_GEMM_MAX_THREADS];
++    int spawned[PTX_PACKED_GEMM_MAX_THREADS];
++    ptx_gemm_task tasks[PTX_PACKED_GEMM_MAX_THREADS];
++    size_t index, workers = threads - 1;
++    for (index = 0; index < workers; ++index) {
++        tasks[index] = *template_task;
++        tasks[index].nb_begin = (index + 1) * num_nb / threads;
++        tasks[index].nb_end = (index + 2) * num_nb / threads;
++        spawned[index] = pthread_create(&tids[index], NULL, worker, &tasks[index]) == 0;
++    }
++    {
++        ptx_gemm_task main_task = *template_task;
++        main_task.nb_begin = 0;
++        main_task.nb_end = num_nb / threads;
++        if (main_task.nb_end > 0) worker(&main_task);
++    }
++    for (index = 0; index < workers; ++index) {
++        if (spawned[index]) {
++            pthread_join(tids[index], NULL);
++        } else {
++            worker(&tasks[index]);
++        }
++    }
++}
++
++void ptx_avx512_matmul_packed_f32(const float *left, const float *packed, float *output,
++                                  size_t m, size_t k, size_t n, size_t threads) {
++    size_t num_nb = ptx_blocks(n, PTX_PACKED_GEMM_N_TILE);
++    ptx_gemm_task task;
++    size_t count = ptx_bounded_threads(threads, num_nb, m, k, n);
++    task.left = left; task.packed = packed; task.output = output;
++    task.m = m; task.k = k; task.n = n; task.nb_begin = 0; task.nb_end = num_nb;
++    if (count <= 1) { ptx_worker_f32(&task); return; }
++    ptx_run_tasks(count, num_nb, ptx_worker_f32, &task);
++}
++
++void ptx_avx512_matmul_packed_bf16(const uint16_t *left, const uint16_t *packed, uint16_t *output,
++                                   size_t m, size_t k, size_t n, size_t threads) {
++    size_t num_nb = ptx_blocks(n, PTX_PACKED_GEMM_N_TILE);
++    ptx_gemm_task task;
++    size_t count = ptx_bounded_threads(threads, num_nb, m, k, n);
++    task.left = left; task.packed = packed; task.output = output;
++    task.m = m; task.k = k; task.n = n; task.nb_begin = 0; task.nb_end = num_nb;
++    if (count <= 1) { ptx_worker_bf16(&task); return; }
++    ptx_run_tasks(count, num_nb, ptx_worker_bf16, &task);
++}
++
++void ptx_avx512_matmul_packed_bf16_f32(const float *left, const uint16_t *packed, float *output,
++                                       size_t m, size_t k, size_t n, size_t threads) {
++    size_t num_nb = ptx_blocks(n, PTX_PACKED_GEMM_N_TILE);
++    ptx_gemm_task task;
++    size_t count = ptx_bounded_threads(threads, num_nb, m, k, n);
++    task.left = left; task.packed = packed; task.output = output;
++    task.m = m; task.k = k; task.n = n; task.nb_begin = 0; task.nb_end = num_nb;
++    if (count <= 1) { ptx_worker_bf16_f32(&task); return; }
++    ptx_run_tasks(count, num_nb, ptx_worker_bf16_f32, &task);
++}
+ '''
+ 
+ 
+@@ -844,6 +1312,233 @@ def packed_kernel_contract(operation: Any, plan: Any) -> Optional[dict]:
+     return None
+ 
+ 
++#: Packed/blocked rank-2 matmul plane (artifact payload version 4).
++#:
++#: A rank-2 matmul whose right operand is a *parameter-derived* tensor (a chain
++#: of value-preserving ``cast`` / ``transpose`` / ``identity`` operations rooted
++#: in one function parameter) is executed by packing that parameter into the
++#: blocked tile layout once and calling the matching packed kernel.  The
++#: predicate below is shared by the artifact metadata and the runtime, so a
++#: declared packed plan can never silently fall back to the column-block
++#: kernel.  Non-qualifying rank-2 matmuls stay on the legacy ``native_avx512_zmm``
++#: kernel and are enumerated (with a reason) in ``matmul_legacy_operations``.
++PACKED_GEMM_MODE = "native_avx512_packed_matmul"
++PACKED_GEMM_KERNEL_VERSION = 1
++PACKED_GEMM_LAYOUT_VERSION = 1
++PACKED_GEMM_K_TILE = 64
++PACKED_GEMM_N_TILE = 64
++PACKED_GEMM_MAX_THREADS = 6
++_PACKED_GEMM_CHAIN_OPERATIONS = frozenset(("cast", "transpose", "identity"))
++#: (root dtype, plan dtype) -> (pack kernel, gemm kernel, packed dtype)
++_PACKED_GEMM_VARIANTS = {
++    ("float32", "float32"): ("pack_matmul_f32", "matmul_packed_f32", "float32"),
++    ("bf16", "float32"): ("pack_matmul_bf16", "matmul_packed_bf16_f32", "bf16"),
++    ("bf16", "bf16"): ("pack_matmul_bf16", "matmul_packed_bf16", "bf16"),
++}
++
++
++def _entrypoint_function(target_ir: Avx512Program) -> Any:
++    for function in target_ir.program.functions:
++        if function.name == target_ir.entrypoint:
++            return function
++    raise ValueError("AVX-512 entrypoint {!r} is missing from the program".format(target_ir.entrypoint))
++
++
++def _producer_map(function: Any) -> dict:
++    produced = {}
++    for index, operation in enumerate(function.body.operations):
++        for ref in operation.outputs:
++            produced[ref.name] = (index, operation)
++    return produced
++
++
++def _packed_matmul_contract(function: Any, plan: Any) -> Optional[dict]:
++    """Describe the packed kernel for one rank-2 matmul plan, or ``None``.
++
++    ``None`` means the matmul keeps the legacy column-block kernel; the caller
++    records the reason from :func:`packed_matmul_dispatch`.
++    """
++
++    if plan is None or plan.operation != "matmul" or plan.matmul is None:
++        return None
++    matmul = plan.matmul
++    if tuple(matmul.batch_shape):
++        return None
++    dtype = canonical_dtype(plan.dtype)
++    if dtype not in _PACKED_DTYPES:
++        return None
++    m, k, n = int(matmul.m), int(matmul.k), int(matmul.n)
++    if m <= 0 or k <= 0 or n <= 0:
++        return None
++    if not (0 <= plan.operation_index < len(function.body.operations)):
++        return None
++    operation = function.body.operations[plan.operation_index]
++    if canonical_operation_name(operation.name) != "matmul" or len(operation.inputs) < 2:
++        return None
++    right = operation.inputs[1]
++    if getattr(right.type, "kind", "") not in _PACKED_TENSOR_KINDS:
++        return None
++    if canonical_dtype(right.type.dtype) != dtype:
++        return None
++    parameters = {ref.name: ref for ref in function.parameters}
++    produced = _producer_map(function)
++    name = right.name
++    chain = []
++    transposed = 0
++    visited = set()
++    while name not in parameters:
++        if name in visited:
++            return None
++        visited.add(name)
++        record = produced.get(name)
++        if record is None:
++            return None
++        op = record[1]
++        op_name = canonical_operation_name(op.name)
++        if op_name not in _PACKED_GEMM_CHAIN_OPERATIONS or len(op.inputs) != 1:
++            return None
++        if op_name == "cast":
++            source_dtype = canonical_dtype(op.inputs[0].type.dtype)
++            target_dtype = canonical_dtype(op.attributes.get("dtype", op.outputs[0].type.dtype))
++            if (source_dtype, target_dtype) not in (
++                ("bf16", "bf16"), ("bf16", "float32"), ("float32", "float32")
++            ):
++                return None
++        elif op_name == "transpose":
++            permutation = op.attributes.get("permutation")
++            if permutation is None:
++                permutation = op.attributes.get("perm")
++            try:
++                permutation = tuple(int(value) for value in permutation)
++            except (TypeError, ValueError):
++                return None
++            if permutation != (1, 0):
++                return None
++            if len(op.inputs[0].type.shape) != 2 or len(op.outputs[0].type.shape) != 2:
++                return None
++            transposed ^= 1
++        chain.append(op_name)
++        name = op.inputs[0].name
++    root = parameters[name]
++    root_dtype = canonical_dtype(root.type.dtype)
++    root_shape = tuple(int(dimension) for dimension in root.type.shape)
++    if len(root_shape) != 2 or root_dtype not in _PACKED_DTYPES:
++        return None
++    variant = _PACKED_GEMM_VARIANTS.get((root_dtype, dtype))
++    if variant is None:
++        return None
++    root_elements = root_shape[0] * root_shape[1]
++    if root_elements != k * n:
++        return None
++    if transposed:
++        if root_shape != (n, k):
++            return None
++        source_k_stride, source_n_stride = 1, root_shape[1]
++    else:
++        if root_shape != (k, n):
++            return None
++        source_k_stride, source_n_stride = root_shape[1], 1
++    pack_kernel, gemm_kernel, pack_dtype = variant
++    return {
++        "operation_index": int(plan.operation_index),
++        "mode": PACKED_GEMM_MODE,
++        "operation": "matmul",
++        "dtype": dtype,
++        "m": m,
++        "k": k,
++        "n": n,
++        "source_parameter": name,
++        "source_dtype": root_dtype,
++        "source_shape": [root_shape[0], root_shape[1]],
++        "source_k_stride": int(source_k_stride),
++        "source_n_stride": int(source_n_stride),
++        "chain": list(reversed(chain)),
++        "pack_dtype": pack_dtype,
++        "pack_kernel": pack_kernel,
++        "gemm_kernel": gemm_kernel,
++        "k_tile": PACKED_GEMM_K_TILE,
++        "n_tile": PACKED_GEMM_N_TILE,
++        "layout_version": PACKED_GEMM_LAYOUT_VERSION,
++    }
++
++
++def _packed_matmul_reason(function: Any, plan: Any) -> str:
++    """Classify why one rank-2 matmul plan cannot use the packed plane."""
++
++    if plan is None or plan.operation != "matmul" or plan.matmul is None:
++        return "not_rank2_matmul"
++    if tuple(plan.matmul.batch_shape):
++        return "not_rank2_matmul"
++    if canonical_dtype(plan.dtype) not in _PACKED_DTYPES:
++        return "unsupported_dtype"
++    if not (0 <= plan.operation_index < len(function.body.operations)):
++        return "unsupported_chain_operation"
++    operation = function.body.operations[plan.operation_index]
++    if canonical_operation_name(operation.name) != "matmul" or len(operation.inputs) < 2:
++        return "unsupported_chain_operation"
++    right = operation.inputs[1]
++    parameters = {ref.name: ref for ref in function.parameters}
++    produced = _producer_map(function)
++    name = right.name
++    visited = set()
++    while name not in parameters:
++        if name in visited:
++            return "unsupported_chain_operation"
++        visited.add(name)
++        record = produced.get(name)
++        if record is None:
++            return "right_operand_not_parameter_derived"
++        op = record[1]
++        op_name = canonical_operation_name(op.name)
++        if op_name not in _PACKED_GEMM_CHAIN_OPERATIONS or len(op.inputs) != 1:
++            return "unsupported_chain_operation"
++        if op_name == "cast":
++            source_dtype = canonical_dtype(op.inputs[0].type.dtype)
++            target_dtype = canonical_dtype(op.attributes.get("dtype", op.outputs[0].type.dtype))
++            if (source_dtype, target_dtype) not in (
++                ("bf16", "bf16"), ("bf16", "float32"), ("float32", "float32")
++            ):
++                return "lossy_or_unsupported_cast"
++        elif op_name == "transpose":
++            permutation = op.attributes.get("permutation")
++            if permutation is None:
++                permutation = op.attributes.get("perm")
++            try:
++                permutation = tuple(int(value) for value in permutation)
++            except (TypeError, ValueError):
++                return "unsupported_transpose"
++            if permutation != (1, 0):
++                return "unsupported_transpose"
++        name = op.inputs[0].name
++    root = parameters[name]
++    if canonical_dtype(root.type.dtype) not in _PACKED_DTYPES or len(root.type.shape) != 2:
++        return "unsupported_root_dtype"
++    return "root_shape_mismatch"
++
++
++def packed_matmul_dispatch(target_ir: Avx512Program) -> tuple:
++    """Return ``(packed_by_index, legacy_reason_by_index)`` for rank-2 matmuls.
++
++    The same predicate feeds :func:`_execution_metadata` and the runtime, so
++    the declared and executed algorithm can never disagree.
++    """
++
++    function = _entrypoint_function(target_ir)
++    packed = {}
++    legacy = {}
++    for plan in target_ir.plans:
++        if plan.operation != "matmul" or plan.matmul is None:
++            continue
++        if tuple(plan.matmul.batch_shape):
++            continue
++        contract = _packed_matmul_contract(function, plan)
++        if contract is not None:
++            packed[plan.operation_index] = contract
++        else:
++            legacy[plan.operation_index] = _packed_matmul_reason(function, plan)
++    return packed, legacy
++
++
+ #: Native broadcast plane.  Broadcast is standard shape expansion (input dim 1
+ #: or equal to the output dim) with the same dtype, expressed to the kernel as
+ #: per-output-axis input strides; it no longer uses host pre-expansion.
+@@ -950,6 +1645,7 @@ def _execution_metadata(target_ir: Avx512Program) -> dict:
+     broadcast_operations = []
+     native_helpers = set()
+     core_operations = _core_operations(target_ir)
++    packed_matmul, legacy_matmul = packed_matmul_dispatch(target_ir)
+     for plan in target_ir.plans:
+         name = plan.operation
+         dtype = plan.dtype
+@@ -993,6 +1689,9 @@ def _execution_metadata(target_ir: Avx512Program) -> dict:
+             mode = "native_scalar_math_lane"
+             if name not in math_fallback:
+                 math_fallback.append(name)
++        elif name == "matmul" and plan.operation_index in packed_matmul:
++            mode = PACKED_GEMM_MODE
++            native_operations.append(name)
+         elif name == "matmul" and plan.matmul is not None and plan.matmul.batch_shape:
+             mode = "host_batch_loop_rank2_native"
+         elif name in (
+@@ -1065,6 +1764,33 @@ def _execution_metadata(target_ir: Avx512Program) -> dict:
+             for plan in target_ir.plans
+             if plan.matmul is not None and plan.matmul.batch_shape
+         ],
++        "packed_matmul_mode": PACKED_GEMM_MODE,
++        "packed_matmul_kernel_version": PACKED_GEMM_KERNEL_VERSION,
++        "packed_matmul_layout_version": PACKED_GEMM_LAYOUT_VERSION,
++        "packed_matmul_k_tile": PACKED_GEMM_K_TILE,
++        "packed_matmul_n_tile": PACKED_GEMM_N_TILE,
++        "packed_matmul_max_threads": PACKED_GEMM_MAX_THREADS,
++        "packed_matmul_operations": [
++            packed_matmul[index] for index in sorted(packed_matmul)
++        ],
++        "packed_matmul_kernels": sorted(
++            {contract["gemm_kernel"] for contract in packed_matmul.values()}
++        ),
++        "matmul_legacy_operations": [
++            {
++                "operation_index": index,
++                "operation": "matmul",
++                "mode": (
++                    "native_avx512_zmm"
++                    if canonical_dtype(
++                        next(plan.dtype for plan in target_ir.plans if plan.operation_index == index)
++                    ) in _PACKED_DTYPES
++                    else "host_reference"
++                ),
++                "reason": legacy_matmul[index],
++            }
++            for index in sorted(legacy_matmul)
++        ],
+     }
+ 
+ 
+@@ -1211,6 +1937,10 @@ def _compile_native(target_ir: Avx512Program, options: Optional[CompileOptions])
+         if target_ir.use_bf16:
+             command.append("-mavx512bf16")
+             feature_flags.append("-mavx512bf16")
++        # Bounded pthread workers for the packed matmul plane.  ``-pthread`` is a
++        # process/ABI flag rather than an ISA feature, so it is deliberately not
++        # part of the ``native_flags`` variant contract.
++        command.append("-pthread")
+         command.extend([str(source_path), "-lm", "-o", str(temporary_output)])
+         environment = dict(os.environ)
+         environment["TMPDIR"] = str(build_dir / "tmp")
+@@ -1401,8 +2131,15 @@ __all__ = [
+     "NATIVE_ABI_MARKER",
+     "PACKED_CAST_MODE",
+     "PACKED_EMBEDDING_MODE",
++    "PACKED_GEMM_KERNEL_VERSION",
++    "PACKED_GEMM_K_TILE",
++    "PACKED_GEMM_LAYOUT_VERSION",
++    "PACKED_GEMM_MAX_THREADS",
++    "PACKED_GEMM_MODE",
++    "PACKED_GEMM_N_TILE",
+     "PACKED_KERNEL_VERSION",
+     "PACKED_TRANSPOSE_MODE",
+     "compile_cpu_avx512",
+     "packed_kernel_contract",
++    "packed_matmul_dispatch",
+ ]
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx512_packed_gemm.py b/python/tests/ut/pypto_x/test_cpu_avx512_packed_gemm.py
+new file mode 100644
+index 000000000..6e9bb09a5
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cpu_avx512_packed_gemm.py
+@@ -0,0 +1,503 @@
++"""Focused tests for the AVX-512 packed/blocked rank-2 matmul plane.
++
++Every packed execution is compared *bitwise* against the same program forced
++onto the legacy column-block kernel (an extra ``add(right, zero)`` breaks the
++parameter chain without changing the values), and against the scalar reference
++where a tolerance comparison is meaningful.  The artifact payload/ABI boundary
++is exercised by tampering with the packed dispatch metadata.
++"""
++
++from __future__ import annotations
++
++import math
++import os
++from pathlib import Path
++import shutil
++import struct
++import subprocess
++import sys
++import types
++
++import pytest
++
++
++def _imports():
++    package_root = Path(__file__).parents[3] / "pypto"
++    saved = {
++        name: module
++        for name, module in sys.modules.items()
++        if name == "pypto" or name.startswith("pypto.")
++    }
++    for name in list(saved):
++        del sys.modules[name]
++    package = types.ModuleType("pypto")
++    package.__path__ = [str(package_root)]
++    sys.modules["pypto"] = package
++    try:
++        from pypto.abi import LaunchRequest, TensorDesc
++        from pypto.backends.cpu import CpuScalarRuntime, HostTensor
++        from pypto.backends.cpu.x86 import Avx512Runtime
++        import pypto.backends.cpu.x86.avx512 as runtime_module
++        from pypto.compiler import CompileOptions
++        from pypto.compiler.targets.cpu import CpuScalarCompiler
++        from pypto.compiler.targets.cpu_avx512 import (
++            ARTIFACT_PAYLOAD_VERSION,
++            Avx512Compiler,
++            NATIVE_ABI_MARKER,
++            PACKED_GEMM_K_TILE,
++            PACKED_GEMM_MAX_THREADS,
++            PACKED_GEMM_MODE,
++            PACKED_GEMM_N_TILE,
++        )
++        import pypto.compiler.targets.cpu_avx512 as compiler_module
++        from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++        from pypto.target import TargetSpec
++        return locals()
++    finally:
++        for name in list(sys.modules):
++            if name == "pypto" or name.startswith("pypto."):
++                del sys.modules[name]
++        sys.modules.update(saved)
++
++
++_C = _imports()
++LaunchRequest = _C["LaunchRequest"]
++TensorDesc = _C["TensorDesc"]
++CpuScalarRuntime = _C["CpuScalarRuntime"]
++HostTensor = _C["HostTensor"]
++Avx512Runtime = _C["Avx512Runtime"]
++runtime_module = _C["runtime_module"]
++CompileOptions = _C["CompileOptions"]
++CpuScalarCompiler = _C["CpuScalarCompiler"]
++ARTIFACT_PAYLOAD_VERSION = _C["ARTIFACT_PAYLOAD_VERSION"]
++Avx512Compiler = _C["Avx512Compiler"]
++NATIVE_ABI_MARKER = _C["NATIVE_ABI_MARKER"]
++PACKED_GEMM_K_TILE = _C["PACKED_GEMM_K_TILE"]
++PACKED_GEMM_MAX_THREADS = _C["PACKED_GEMM_MAX_THREADS"]
++PACKED_GEMM_MODE = _C["PACKED_GEMM_MODE"]
++PACKED_GEMM_N_TILE = _C["PACKED_GEMM_N_TILE"]
++compiler_module = _C["compiler_module"]
++CoreFunction = _C["CoreFunction"]
++CoreProgram = _C["CoreProgram"]
++CoreType = _C["CoreType"]
++Operation = _C["Operation"]
++Region = _C["Region"]
++ValueRef = _C["ValueRef"]
++TargetSpec = _C["TargetSpec"]
++
++
++F32_SHAPES = (
++    (1, 1, 1),
++    (1, 3, 17),
++    (2, 3, 17),
++    (3, 5, 17),
++    (4, 17, 19),
++    (2, 33, 7),
++    (5, 63, 65),
++    (7, 64, 64),
++    (1, 65, 129),
++    (5, 127, 33),
++    (18, 129, 130),
++    (64, 64, 64),
++    (1, 1, 63),
++    (64, 1, 1),
++)
++BF16_SHAPES = (
++    (2, 3, 17),
++    (4, 17, 19),
++    (5, 63, 65),
++    (7, 64, 64),
++    (1, 65, 129),
++    (18, 65, 66),
++)
++
++
++def _target(*features, lane_count=16):
++    return TargetSpec(
++        "cpu", "x86_64-linux-gnu", features=features, attributes={"lane_count": lane_count}
++    )
++
++
++def _program(name, parameters, returns, operations):
++    return CoreProgram(
++        functions=(CoreFunction(name, parameters, returns, Region(tuple(operations))),)
++    )
++
++
++def _values(count, offset=0.0):
++    return [((index * 37 + 11) % 101 - 50) / 43.0 + offset for index in range(count)]
++
++
++def _compile(program, target, tmp_path, options=None):
++    compiler = Avx512Compiler()
++    target_ir = compiler.lower(program, target)
++    if options is None:
++        options = CompileOptions(
++            artifact_format="pypto-x.cpu.avx512",
++            extra={"build_dir": str(tmp_path / "native")},
++        )
++    return compiler, target_ir, compiler.compile(target_ir, options)
++
++
++def _run(artifact, inputs, outputs, runtime=None, scalars=None):
++    (runtime or Avx512Runtime()).launch(
++        LaunchRequest(
++            artifact,
++            inputs=[value.descriptor(readonly=True) for value in inputs],
++            outputs=[output.descriptor() for output in outputs],
++            scalars=scalars or {},
++        )
++    )
++
++
++def _make_shapes_program(shapes, dtype, *, derive):
++    parameters = []
++    returns = []
++    operations = []
++    for index, (m, k, n) in enumerate(shapes):
++        left = ValueRef("left_{}".format(index), CoreType.tensor(dtype, (m, k)))
++        right = ValueRef("right_{}".format(index), CoreType.tensor(dtype, (k, n)))
++        output = ValueRef("output_{}".format(index), CoreType.tensor(dtype, (m, n)))
++        parameters.append(left)
++        parameters.append(right)
++        if derive:
++            zero = ValueRef("zero_{}".format(index), CoreType.tensor(dtype, (k, n)))
++            derived = ValueRef("derived_{}".format(index), CoreType.tensor(dtype, (k, n)))
++            parameters.append(zero)
++            operations.append(Operation("add", (right, zero), (derived,)))
++            right_operand = derived
++        else:
++            right_operand = right
++        operations.append(Operation("matmul", (left, right_operand), (output,)))
++        returns.append(output)
++    return _program("shapes_{}".format(dtype), tuple(parameters), tuple(returns), operations)
++
++
++def _run_shapes(shapes, dtype, target, tmp_path, *, runtime=None, derive):
++    program = _make_shapes_program(shapes, dtype, derive=derive)
++    _, _, artifact = _compile(program, target, tmp_path / ("derive" if derive else "packed"))
++    inputs = []
++    for (m, k, n) in shapes:
++        inputs.append(HostTensor(dtype, (m, k), _values(m * k)))
++        inputs.append(HostTensor(dtype, (k, n), _values(k * n, 0.25)))
++        if derive:
++            inputs.append(HostTensor.zeros(dtype, (k, n)))
++    outputs = [HostTensor.zeros(dtype, (m, n)) for (m, k, n) in shapes]
++    _run(artifact, inputs, outputs, runtime=runtime)
++    return artifact, outputs
++
++
++def test_packed_f32_direct_matmul_is_bitwise_identical_to_legacy(tmp_path):
++    packed_artifact, packed_outputs = _run_shapes(
++        F32_SHAPES, "float32", _target("avx512f", "fma"), tmp_path, derive=False
++    )
++    legacy_artifact, legacy_outputs = _run_shapes(
++        F32_SHAPES, "float32", _target("avx512f", "fma"), tmp_path, derive=True
++    )
++    assert len(packed_artifact.metadata["packed_matmul_operations"]) == len(F32_SHAPES)
++    assert not packed_artifact.metadata["matmul_legacy_operations"]
++    assert len(legacy_artifact.metadata["matmul_legacy_operations"]) == len(F32_SHAPES)
++    assert not legacy_artifact.metadata["packed_matmul_operations"]
++    for actual, expected in zip(packed_outputs, legacy_outputs):
++        assert actual.flat() == expected.flat()
++    first = packed_artifact.metadata["packed_matmul_operations"][0]
++    assert first["mode"] == PACKED_GEMM_MODE
++    assert first["k_tile"] == PACKED_GEMM_K_TILE
++    assert first["n_tile"] == PACKED_GEMM_N_TILE
++    assert first["gemm_kernel"] == "matmul_packed_f32"
++
++
++def test_packed_f32_without_fma_is_bitwise_identical_to_legacy(tmp_path):
++    packed_artifact, packed_outputs = _run_shapes(
++        F32_SHAPES, "float32", _target("avx512f"), tmp_path / "nofma", derive=False
++    )
++    _, legacy_outputs = _run_shapes(
++        F32_SHAPES, "float32", _target("avx512f"), tmp_path / "nofma", derive=True
++    )
++    assert len(packed_artifact.metadata["packed_matmul_operations"]) == len(F32_SHAPES)
++    for actual, expected in zip(packed_outputs, legacy_outputs):
++        assert actual.flat() == expected.flat()
++
++
++def _chain_case(dtype_root, shapes, *, derive):
++    """Build a cast/transpose parameter-chain program for one root dtype."""
++
++    parameters = []
++    returns = []
++    operations = []
++    inputs = []
++    for index, (m, k, n) in enumerate(shapes):
++        left = ValueRef("left_{}".format(index), CoreType.tensor("float32", (m, k)))
++        root = ValueRef("root_{}".format(index), CoreType.tensor(dtype_root, (n, k)))
++        transposed = ValueRef("transposed_{}".format(index), CoreType.tensor("float32", (k, n)))
++        output = ValueRef("output_{}".format(index), CoreType.tensor("float32", (m, n)))
++        parameters.extend((left, root))
++        if dtype_root == "bf16":
++            cast = ValueRef("cast_{}".format(index), CoreType.tensor("float32", (n, k)))
++            operations.append(Operation("cast", (root,), (cast,), attributes={"dtype": "float32"}))
++            source = cast
++        else:
++            source = root
++        operations.append(
++            Operation("transpose", (source,), (transposed,), attributes={"permutation": (1, 0)})
++        )
++        if derive:
++            zero = ValueRef("zero_{}".format(index), CoreType.tensor("float32", (k, n)))
++            shifted = ValueRef("shifted_{}".format(index), CoreType.tensor("float32", (k, n)))
++            parameters.append(zero)
++            operations.append(Operation("add", (transposed, zero), (shifted,)))
++            right_operand = shifted
++        else:
++            right_operand = transposed
++        operations.append(Operation("matmul", (left, right_operand), (output,)))
++        returns.append(output)
++        inputs.append(HostTensor("float32", (m, k), _values(m * k)))
++        root_values = _values(n * k, 0.5)
++        if dtype_root == "bf16":
++            root_values = [
++                struct.unpack("<f", struct.pack("<I", _bf16_bits(value) << 16))[0]
++                for value in root_values
++            ]
++        inputs.append(HostTensor(dtype_root, (n, k), root_values))
++        if derive:
++            inputs.append(HostTensor.zeros("float32", (k, n)))
++    program = _program(
++        "chain_{}_{}".format(dtype_root, "derive" if derive else "packed"),
++        tuple(parameters),
++        tuple(returns),
++        operations,
++    )
++    outputs = [HostTensor.zeros("float32", (m, n)) for (m, k, n) in shapes]
++    return program, inputs, outputs
++
++
++def test_packed_bf16_and_mixed_parameter_chains_are_bitwise_identical(tmp_path):
++    target = _target("avx512f", "avx512bf16", "fma")
++    # bf16 direct right operands (bf16 -> bf16 kernel).
++    packed_artifact, packed_outputs = _run_shapes(
++        BF16_SHAPES, "bf16", target, tmp_path / "bf16", derive=False
++    )
++    _, legacy_outputs = _run_shapes(
++        BF16_SHAPES, "bf16", target, tmp_path / "bf16", derive=True
++    )
++    assert len(packed_artifact.metadata["packed_matmul_operations"]) == len(BF16_SHAPES)
++    for actual, expected in zip(packed_outputs, legacy_outputs):
++        assert actual.flat() == expected.flat()
++
++    # mixed: bf16 parameter -> cast -> transpose -> f32 matmul (the Qwen graph
++    # shape), plus an f32 parameter -> transpose -> f32 matmul.
++    shapes = ((5, 64, 96), (18, 65, 66))
++    for dtype_root, suffix in (("bf16", "mixed"), ("float32", "f32root")):
++        packed_program, packed_inputs, packed_outputs = _chain_case(dtype_root, shapes, derive=False)
++        _, _, packed_artifact = _compile(packed_program, target, tmp_path / suffix)
++        assert len(packed_artifact.metadata["packed_matmul_operations"]) == len(shapes)
++        expected_kernel = (
++            "matmul_packed_bf16_f32" if dtype_root == "bf16" else "matmul_packed_f32"
++        )
++        assert packed_artifact.metadata["packed_matmul_operations"][0]["gemm_kernel"] == expected_kernel
++        _run(packed_artifact, packed_inputs, packed_outputs)
++
++        legacy_program, legacy_inputs, legacy_outputs = _chain_case(dtype_root, shapes, derive=True)
++        _, _, legacy_artifact = _compile(legacy_program, target, tmp_path / (suffix + "_legacy"))
++        assert not legacy_artifact.metadata["packed_matmul_operations"]
++        assert len(legacy_artifact.metadata["matmul_legacy_operations"]) == len(shapes)
++        _run(legacy_artifact, legacy_inputs, legacy_outputs)
++        for actual, expected in zip(packed_outputs, legacy_outputs):
++            assert actual.flat() == expected.flat()
++
++
++def _bf16_bits(value):
++    bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++    if (bits & 0x7F800000) == 0x7F800000:
++        return (bits >> 16) & 0xFFFF
++    return ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) & 0xFFFF
++
++
++def test_packed_bf16_without_bf16_isa_is_bitwise_identical_to_legacy(tmp_path):
++    # The packed fallback must mirror the legacy scalar-lane bf16 kernel.
++    target = _target("avx512f", "fma")
++    packed_artifact, packed_outputs = _run_shapes(
++        BF16_SHAPES, "bf16", target, tmp_path / "plain", derive=False
++    )
++    _, legacy_outputs = _run_shapes(
++        BF16_SHAPES, "bf16", target, tmp_path / "plain", derive=True
++    )
++    assert len(packed_artifact.metadata["packed_matmul_operations"]) == len(BF16_SHAPES)
++    for actual, expected in zip(packed_outputs, legacy_outputs):
++        assert actual.flat() == expected.flat()
++
++
++def test_native_bf16_packed_kernel_uses_vdpbf16(tmp_path):
++    artifact, _ = _run_shapes(
++        ((2, 3, 17),), "bf16", _target("avx512f", "avx512bf16", "fma"),
++        tmp_path / "isa", derive=False,
++    )
++    objdump = shutil.which("objdump")
++    if objdump is None:
++        pytest.skip("GNU objdump is unavailable")
++    disassembly = subprocess.run(
++        [objdump, "-d", "-Mintel", artifact.path],
++        stdout=subprocess.PIPE,
++        universal_newlines=True,
++        check=True,
++    ).stdout.lower()
++    assert "vdpbf16ps" in disassembly
++
++
++def test_packed_artifact_contract_and_legacy_reasons(tmp_path):
++    assert ARTIFACT_PAYLOAD_VERSION == 4
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx512:5"
++    # Non parameter-derived right operand -> explicit legacy reason.
++    artifact, _ = _run_shapes(
++        ((3, 5, 17),), "float32", _target("avx512f", "fma"), tmp_path / "reason", derive=True
++    )
++    legacy = artifact.metadata["matmul_legacy_operations"]
++    assert len(legacy) == 1
++    assert legacy[0]["mode"] == "native_avx512_zmm"
++    assert legacy[0]["reason"] == "unsupported_chain_operation"
++    assert artifact.metadata["packed_matmul_mode"] == PACKED_GEMM_MODE
++    assert artifact.metadata["packed_matmul_max_threads"] == PACKED_GEMM_MAX_THREADS
++    assert artifact.metadata["batched_matmul_fallback"] == "host_batch_loop_rank2_native"
++
++
++def test_packed_dispatch_metadata_tampering_fails_closed(tmp_path):
++    artifact, _ = _run_shapes(
++        ((3, 5, 17),), "float32", _target("avx512f", "fma"), tmp_path / "tamper", derive=False
++    )
++    runtime = Avx512Runtime()
++    metadata = dict(artifact.metadata)
++    operations = [dict(entry) for entry in metadata["packed_matmul_operations"]]
++    operations[0]["gemm_kernel"] = "matmul_packed_f32_tampered"
++    metadata["packed_matmul_operations"] = operations
++    object.__setattr__(artifact, "metadata", metadata)
++    with pytest.raises(runtime_module.CpuAvx512ArtifactError, match="packed_matmul_operations"):
++        runtime.load(artifact)
++
++
++def test_packed_matmul_threads_are_bounded_and_deterministic(tmp_path, monkeypatch):
++    shapes = ((64, 64, 256),)
++    program = _make_shapes_program(shapes, "float32", derive=False)
++    _, _, artifact = _compile(program, _target("avx512f", "fma"), tmp_path / "threads")
++    inputs = [
++        HostTensor("float32", (64, 64), _values(64 * 64)),
++        HostTensor("float32", (64, 256), _values(64 * 256, 0.25)),
++    ]
++    single = [HostTensor.zeros("float32", (64, 256))]
++    _run(artifact, inputs, single, runtime=Avx512Runtime(gemm_threads=1))
++    for threads in (2, 4, PACKED_GEMM_MAX_THREADS):
++        parallel = [HostTensor.zeros("float32", (64, 256))]
++        _run(artifact, inputs, parallel, runtime=Avx512Runtime(gemm_threads=threads))
++        assert parallel[0].flat() == single[0].flat()
++
++    monkeypatch.setenv("PYPTO_X_AVX512_GEMM_THREADS", "9")
++    with pytest.raises(runtime_module.CpuAvx512ExecutionError, match="threads must be in"):
++        _run(artifact, inputs, [HostTensor.zeros("float32", (64, 256))])
++    monkeypatch.setenv("PYPTO_X_AVX512_GEMM_THREADS", "not-a-number")
++    with pytest.raises(runtime_module.CpuAvx512ExecutionError, match="integer"):
++        _run(artifact, inputs, [HostTensor.zeros("float32", (64, 256))])
++
++
++def test_packed_weight_cache_is_opt_in_and_invalidates(tmp_path):
++    import ctypes
++
++    shapes = ((5, 64, 96),)
++    program = _make_shapes_program(shapes, "float32", derive=False)
++    _, _, artifact = _compile(program, _target("avx512f", "fma"), tmp_path / "cache")
++    left = HostTensor("float32", (5, 64), _values(5 * 64))
++    raw = (ctypes.c_float * (64 * 96))(*_values(64 * 96, 0.25))
++    weight = TensorDesc(
++        "float32", (64, 96), address=ctypes.addressof(raw), readonly=True
++    )
++    runtime_module.clear_packed_weight_cache()
++    runtime = Avx512Runtime(packed_weight_cache=True)
++    before = runtime.packed_weight_cache_stats()
++
++    def _launch():
++        runtime.launch(
++            LaunchRequest(
++                artifact,
++                inputs=[left.descriptor(readonly=True), weight],
++                outputs=[HostTensor.zeros("float32", (5, 96)).descriptor()],
++            )
++        )
++
++    _launch()
++    packed_once = [HostTensor.zeros("float32", (5, 96))]
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[left.descriptor(readonly=True), weight],
++            outputs=[packed_once[0].descriptor()],
++        )
++    )
++    after = runtime.packed_weight_cache_stats()
++    assert after["packs"] - before["packs"] == 1
++    assert after["hits"] - before["hits"] == 1
++    assert after["entries"] == 1
++    # k=64, n=96 -> 2 N-tiles of 64x64 f32 elements
++    assert after["bytes"] == 2 * 64 * 64 * 4
++    # Rebind different content at the same address: the sampled fingerprint must
++    # invalidate the entry and repack.
++    raw[0] = 12345.0
++    rebound = [HostTensor.zeros("float32", (5, 96))]
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[left.descriptor(readonly=True), weight],
++            outputs=[rebound[0].descriptor()],
++        )
++    )
++    invalidated = runtime.packed_weight_cache_stats()
++    assert invalidated["invalidations"] - after["invalidations"] == 1
++    assert invalidated["packs"] - after["packs"] == 1
++    assert rebound[0].flat() != packed_once[0].flat()
++    runtime.clear_packed_weight_cache()
++    assert runtime.packed_weight_cache_stats()["entries"] == 0
++
++
++def test_packed_dispatch_prefers_parameter_chains_on_the_qwen_graph():
++    # The real decoder graph lowers to 187 packed rank-2 matmuls and no legacy
++    # rank-2 matmul; batched attention matmuls keep their own declared mode.
++    import importlib.util
++
++    driver_path = Path(__file__).resolve().parent / "qwen35_weighted_execution_driver.py"
++    package_root = Path(__file__).parents[3] / "pypto"
++    saved = {
++        name: module
++        for name, module in sys.modules.items()
++        if name == "pypto" or name.startswith("pypto.")
++    }
++    for name in list(saved):
++        del sys.modules[name]
++    package = types.ModuleType("pypto")
++    package.__path__ = [str(package_root)]
++    sys.modules["pypto"] = package
++    try:
++        spec = importlib.util.spec_from_file_location("qwen35_driver_packed_test", driver_path)
++        driver = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(driver)
++        from pypto.compiler.targets import cpu_avx512 as local_compiler_module
++        from pypto.target import TargetSpec
++
++        program, _schema, _layout = driver.build_graph(5, 0)
++        target = TargetSpec(
++            "cpu", "x86_64-linux-gnu", features=("avx512f",), attributes={"lane_count": 16}
++        )
++        compiler = local_compiler_module.Avx512Compiler()
++        target_ir = compiler.lower(program, target)
++        packed, legacy = local_compiler_module.packed_matmul_dispatch(target_ir)
++        assert len(packed) == 187
++        assert legacy == {}
++        contracts = list(packed.values())
++        assert {entry["gemm_kernel"] for entry in contracts} == {"matmul_packed_bf16_f32"}
++        sample = contracts[0]
++        assert sample["source_dtype"] == "bf16"
++        assert sample["pack_dtype"] == "bf16"
++        assert sample["chain"] == ["cast", "transpose"]
++        assert sample["source_k_stride"] == 1
++        assert sample["source_n_stride"] == sample["k"]
++    finally:
++        for name in list(sys.modules):
++            if name == "pypto" or name.startswith("pypto."):
++                del sys.modules[name]
++        sys.modules.update(saved)

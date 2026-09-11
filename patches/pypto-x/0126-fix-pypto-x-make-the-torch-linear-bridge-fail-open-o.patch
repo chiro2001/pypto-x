@@ -1,0 +1,986 @@
+From fa8ab359d2704dbd4b6a20e3e41a59da93b9127a Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 06:48:07 +0800
+Subject: [PATCH 126/134] fix(pypto-x): make the torch linear bridge fail open
+ on real build failures (W8J J1 fix 1)
+
+V8J-D1: read-only cache directories, clang failures and artifact load
+failures leaked raw PermissionError / Avx512CompileError /
+CpuAvx512RuntimeError through both torch.ops.pypto_x.linear and
+linear_strict, so the fail-open contract did not hold and no fallback event
+was recorded.
+
+- linear_kernel: wrap every real build/lower/compile/load exception into
+  PyPTOXBuildError with cache_unwritable / compile_failed / load_failed /
+  build_io_error / build_failed reason codes; PyPTOXBuildError now derives
+  from PyPTOXUnsupportedError so strict callers catch one structured type;
+  optional clang override for failure-injection tests.
+- torch_ops: the fail-open op absorbs the real exception families as a
+  second line of defence; the strict op wraps any raw leak into a
+  structured PyPTOXUnsupportedError.
+- V8J-D2: a content-addressed .so whose bytes no longer match its filename
+  digest (or the sidecar digest) is quarantined as
+  *.corrupt-<stamp>-<pid> before the rebuild; the bytes are kept for audit
+  instead of making the digest path permanently unusable.
+- V8J-D3: pack_weight copies the transposed payload directly into the
+  handle tensor (one np.copyto instead of four payload copies).
+- V8J-D4: docs/tests now state that a requires_grad forward falls back to
+  F.linear but .backward() raises "no autograd formula" (J1 is
+  inference-only).
+- bf16 no-bias correctness is K-bucketed: bitwise for the sampled K <= 128
+  shapes, one-LSB tolerance above, because the rebased packed plane can
+  flip one bf16 ULP on a near-zero output (the independent verifier
+  measured 6.104e-05 at K=1024).
+- the packed payload-4 plane is declared by the plan while this bridge still
+  executes the legacy ZMM symbol; LinearKernelEntry now records
+  declared_plane/executed_plane so the divergence is explicit instead of
+  silent.
+
+New real-failure tests: read-only cache directory, fake clang compiler,
+corrupt .so quarantine/rebuild with and without a sidecar, payload-3
+sidecar invalidation after rebasing onto payload 4, pack copy count,
+autograd behaviour, the K buckets and the declared/executed plane metadata.
+---
+ python/pypto/framework/errors.py                                |  11 +-
+ python/pypto/framework/linear_kernel.py                         | 205 ++++++++++++++++++++++++----
+ python/pypto/framework/torch_bridge.py                          |  34 ++++-
+ python/pypto/framework/torch_ops.py                             |  63 +++++++--
+ python/pypto/framework/weight_pack.py                           |  33 ++++-
+ python/tests/framework_torch/test_torch_linear_cache.py         | 117 ++++++++++++++++
+ python/tests/framework_torch/test_torch_linear_correctness.py   |  77 ++++++++++-
+ .../framework_torch/test_torch_linear_failure_semantics.py      |  90 +++++++++++-
+ 8 files changed, 577 insertions(+), 53 deletions(-)
+
+diff --git a/python/pypto/framework/errors.py b/python/pypto/framework/errors.py
+index caedb6598..21102dc90 100644
+--- a/python/pypto/framework/errors.py
++++ b/python/pypto/framework/errors.py
+@@ -66,12 +66,15 @@ class PyPTOXUnsupportedError(PyPTOXBridgeError):
+         super().__init__(message, reason_code=reason_code, details=details)
+ 
+ 
+-class PyPTOXBuildError(PyPTOXBridgeError):
++class PyPTOXBuildError(PyPTOXUnsupportedError):
+     """The kernel could not be built, loaded or verified.
+ 
+-    Build failures are not input-contract failures; silently falling back is
+-    still semantically safe, but the condition should be visible in logs and
+-    counters.  The fail-closed entry points re-raise this unchanged.
++    Build failures are not input-contract failures, but they are still a
++    reason for the caller to fall back.  The class intentionally derives from
++    :class:`PyPTOXUnsupportedError` so a fail-closed caller can catch one
++    exception type for both "input unsupported" and "kernel unavailable";
++    ``reason_code`` distinguishes the concrete condition (``cache_unwritable``,
++    ``compile_failed``, ``load_failed``...).
+     """
+ 
+     def __init__(
+diff --git a/python/pypto/framework/linear_kernel.py b/python/pypto/framework/linear_kernel.py
+index 19932bfa7..01a4a10c5 100644
+--- a/python/pypto/framework/linear_kernel.py
++++ b/python/pypto/framework/linear_kernel.py
+@@ -25,27 +25,33 @@ from __future__ import annotations
+ from collections import OrderedDict
+ from dataclasses import dataclass
+ import ctypes
++import errno
+ import hashlib
+ import json
+ import os
+ from pathlib import Path
++import re
+ import threading
+ import tempfile
++import time
+ from typing import Any, Dict, Mapping, Optional, Tuple
+ 
+ from pypto.backends.cpu.x86 import Avx512Runtime
++from pypto.backends.cpu.x86.avx512 import CpuAvx512RuntimeError
+ from pypto.compiler import CompileOptions
+ from pypto.compiler.artifact import ABI_VERSION, ARTIFACT_FORMAT_VERSION, Artifact
+ from pypto.compiler.targets.cpu_avx512 import (
+     ARTIFACT_PAYLOAD_VERSION,
+     DEFAULT_ARTIFACT_FORMAT,
++    Avx512CompileError,
+     Avx512Compiler,
++    packed_matmul_dispatch,
+ )
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
+ from pypto.lowering.cpu.x86.avx512 import AVX512_LOWERING_VERSION
+ from pypto.target import TargetSpec
+ 
+-from .errors import PyPTOXBuildError, PyPTOXUnsupportedError
++from .errors import PyPTOXBridgeError, PyPTOXBuildError, PyPTOXUnsupportedError
+ 
+ 
+ LINEAR_KERNEL_CACHE_VERSION = 1
+@@ -134,7 +140,10 @@ class LinearKernelKey:
+ class LinearKernelEntry:
+     """A loaded AVX-512 matmul artifact plus its direct native entry point."""
+ 
+-    __slots__ = ("key", "artifact", "loaded", "_native", "m", "k", "n", "dtype", "disk_backed")
++    __slots__ = (
++        "key", "artifact", "loaded", "_native", "m", "k", "n", "dtype",
++        "disk_backed", "declared_plane",
++    )
+ 
+     def __init__(
+         self,
+@@ -144,6 +153,7 @@ class LinearKernelEntry:
+         native: Any,
+         *,
+         disk_backed: bool,
++        declared_plane: str = "legacy",
+     ) -> None:
+         self.key = key
+         self.artifact = artifact
+@@ -154,11 +164,20 @@ class LinearKernelEntry:
+         self.n = key.n
+         self.dtype = key.dtype
+         self.disk_backed = bool(disk_backed)
++        # The artifact payload 4 packed plane is declared by the plan; this
++        # bridge executes the legacy ZMM symbol for the plan dtype.  Keep the
++        # divergence explicit in the entry metadata (and in the report) so a
++        # future switch to the packed plane is visible instead of silent.
++        self.declared_plane = str(declared_plane)
+ 
+     @property
+     def native_symbol(self) -> str:
+         return "ptx_avx512_matmul_{}".format(_DTYPE_NATIVE_SUFFIX[self.dtype])
+ 
++    @property
++    def executed_plane(self) -> str:
++        return "legacy_avx512_zmm"
++
+     def invoke(self, left_address: int, right_address: int, output_address: int) -> None:
+         """Call the single native matmul kernel with raw buffer addresses."""
+ 
+@@ -178,10 +197,42 @@ class LinearKernelEntry:
+             "artifact_digest": self.artifact.content_digest,
+             "native_symbol": self.native_symbol,
+             "native_variant": getattr(self.loaded.target_ir, "native_variant", None),
++            "declared_plane": self.declared_plane,
++            "executed_plane": self.executed_plane,
+             "disk_backed": self.disk_backed,
+         }
+ 
+ 
++_ARTIFACT_NAME = re.compile(r"^pypto_x_avx512_([0-9a-f]{64})\.so$")
++
++
++def build_failure_reason(exc: BaseException) -> str:
++    """Map a real build/load exception to a stable reason code."""
++
++    if isinstance(exc, PermissionError):
++        return "cache_unwritable"
++    if isinstance(exc, Avx512CompileError):
++        return "compile_failed"
++    if isinstance(exc, CpuAvx512RuntimeError):
++        return "load_failed"
++    if isinstance(exc, OSError):
++        if exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
++            return "cache_unwritable"
++        return "build_io_error"
++    return "build_failed"
++
++
++def _sha256_file(path: Path) -> Optional[str]:
++    try:
++        digest = hashlib.sha256()
++        with path.open("rb") as handle:
++            for chunk in iter(lambda: handle.read(1 << 20), b""):
++                digest.update(chunk)
++        return digest.hexdigest()
++    except OSError:
++        return None
++
++
+ def _matmul_program(dtype: str, m: int, k: int, n: int) -> CoreProgram:
+     left_type = CoreType.tensor(dtype, (m, k))
+     right_type = CoreType.tensor(dtype, (k, n))
+@@ -255,7 +306,12 @@ def _resolve_native(loaded: Any, key: LinearKernelKey, artifact: Artifact) -> An
+         ctypes.c_size_t,
+     ]
+     native.restype = None
+-    return native
++    try:
++        packed, _legacy = packed_matmul_dispatch(loaded.target_ir)
++        declared = "packed" if packed else "legacy"
++    except Exception:  # metadata/diagnostic only: never fail the build here
++        declared = "unknown"
++    return native, declared
+ 
+ 
+ class LinearKernelCache:
+@@ -269,6 +325,7 @@ class LinearKernelCache:
+         disk_cache: bool = True,
+         max_entries: int = _DEFAULT_MAX_ENTRIES,
+         build_dir: Optional[Any] = None,
++        clang: Optional[str] = None,
+     ) -> None:
+         if max_entries <= 0:
+             raise ValueError("max_entries must be positive")
+@@ -281,6 +338,7 @@ class LinearKernelCache:
+         self._disk_cache = bool(disk_cache)
+         self._cache_dir = Path(os.fspath(cache_dir)).expanduser() if cache_dir is not None else None
+         self._build_dir = Path(os.fspath(build_dir)).expanduser() if build_dir is not None else None
++        self._clang = str(clang) if clang is not None else None
+         self._max_entries = int(max_entries)
+         self._stats: Dict[str, int] = {
+             "kernel_builds": 0,
+@@ -288,6 +346,8 @@ class LinearKernelCache:
+             "disk_hits": 0,
+             "compile_calls": 0,
+             "load_failures": 0,
++            "quarantined": 0,
++            "build_failures": 0,
+             "unsupported": 0,
+         }
+         self._last_disk_error: Optional[str] = None
+@@ -315,6 +375,7 @@ class LinearKernelCache:
+                 "disk_cache": self._disk_cache,
+                 "entries": len(self._memory),
+                 "max_entries": self._max_entries,
++                "clang": self._clang,
+                 "stats": dict(self._stats),
+                 "last_disk_error": self._last_disk_error,
+             }
+@@ -422,11 +483,15 @@ class LinearKernelCache:
+         sidecar = self._sidecar(digest)
+         if not sidecar.is_file():
+             return None
++        artifact_path: Optional[str] = None
++        expected_digest: Optional[str] = None
+         try:
+             payload = json.loads(sidecar.read_text(encoding="utf-8"))
+             if payload.get("key") != key.to_dict():
+                 raise ValueError("sidecar cache key does not match the requested key")
+             data = payload["artifact"]
++            artifact_path = data.get("path")
++            expected_digest = data.get("content_digest")
+             target = TargetSpec(**dict(data["target"]))
+             artifact = Artifact(
+                 format=data["format"],
+@@ -438,13 +503,21 @@ class LinearKernelCache:
+                 format_version=data["format_version"],
+             )
+             loaded = runtime.load(artifact)
+-            native = _resolve_native(loaded, key, artifact)
++            native, declared_plane = _resolve_native(loaded, key, artifact)
+         except Exception as exc:  # sidecar/artifact is untrusted input: repair by rebuilding
+             self._stats["load_failures"] += 1
+             self._last_disk_error = "{}: {}".format(type(exc).__name__, exc)
++            # A content-addressed .so whose bytes no longer match its digest can
++            # never be published again (the compiler refuses to overwrite it),
++            # so quarantine the corrupt bytes and let the rebuild write a fresh
++            # file.  A healthy-but-stale artifact is left untouched.
++            self._quarantine_corrupt(artifact_path, expected_digest)
++            self._audit_artifacts()
+             return None
+         self._stats["disk_hits"] += 1
+-        return LinearKernelEntry(key, artifact, loaded, native, disk_backed=True)
++        return LinearKernelEntry(
++            key, artifact, loaded, native, disk_backed=True, declared_plane=declared_plane
++        )
+ 
+     def _write_sidecar(self, key: LinearKernelKey, artifact: Artifact, digest: str) -> None:
+         if not self._disk_cache or self.cache_dir is None:
+@@ -473,28 +546,113 @@ class LinearKernelCache:
+             # A read-only cache directory must not break execution.
+             self._last_disk_error = "{}: {}".format(type(exc).__name__, exc)
+ 
++    # -- corrupt-artifact quarantine -----------------------------------
++    def _artifacts_dir(self) -> Optional[Path]:
++        if self._build_dir is not None:
++            return self._build_dir / "artifacts"
++        if self.cache_dir is not None:
++            return self.cache_dir / "build" / "artifacts"
++        return None
++
++    def _quarantine_file(self, path: Path, reason: str) -> Optional[Path]:
++        """Rename a corrupt artifact aside; never delete the bytes."""
++
++        try:
++            stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
++            target = path.with_name("{}.corrupt-{}-{}".format(path.name, stamp, os.getpid()))
++            os.replace(str(path), str(target))
++        except OSError as exc:
++            self._last_disk_error = "quarantine failed for {}: {}".format(path, exc)
++            return None
++        with self._lock:
++            self._stats["quarantined"] += 1
++        self._last_disk_error = "quarantined corrupt artifact {} ({})".format(path, reason)
++        return target
++
++    def _quarantine_corrupt(self, path: Optional[Any], expected_digest: Optional[str]) -> Optional[Path]:
++        """Quarantine ``path`` only when its bytes do not match the digest."""
++
++        if not path or not expected_digest:
++            return None
++        artifact_path = Path(str(path))
++        if not artifact_path.is_file():
++            return None
++        actual = _sha256_file(artifact_path)
++        if actual is None or actual == expected_digest:
++            return None
++        return self._quarantine_file(artifact_path, "content digest mismatch")
++
++    def _audit_artifacts(self) -> int:
++        """Quarantine any content-addressed .so whose bytes no longer match its name."""
++
++        directory = self._artifacts_dir()
++        if directory is None or not directory.is_dir():
++            return 0
++        repaired = 0
++        try:
++            entries = sorted(directory.glob("pypto_x_avx512_*.so"))
++        except OSError:
++            return 0
++        for path in entries:
++            match = _ARTIFACT_NAME.match(path.name)
++            if match is None:
++                continue
++            actual = _sha256_file(path)
++            if actual is None or actual == match.group(1):
++                continue
++            if self._quarantine_file(path, "filename/bytes digest mismatch") is not None:
++                repaired += 1
++        return repaired
++
+     # -- build ---------------------------------------------------------
+     def _compile(self, runtime: Avx512Runtime, key: LinearKernelKey, digest: str) -> LinearKernelEntry:
+         self._stats["kernel_builds"] += 1
+-        program = _matmul_program(key.dtype, key.m, key.k, key.n)
+-        target = TargetSpec(**dict(key.target))
+-        compiler = Avx512Compiler()
+-        target_ir = compiler.lower(program, target)
+-        build_dir = self._build_dir
+-        if build_dir is None and self.cache_dir is not None:
+-            build_dir = self.cache_dir / "build"
+-        if build_dir is None:
+-            build_dir = Path(tempfile.mkdtemp(prefix="pypto-x-torch-linear-"))
+-        options = CompileOptions(
+-            artifact_format=DEFAULT_ARTIFACT_FORMAT,
+-            extra={"build_dir": str(build_dir)},
+-        )
+-        self._stats["compile_calls"] += 1
+-        artifact = compiler.compile(target_ir, options)
+-        loaded = runtime.load(artifact)
+-        native = _resolve_native(loaded, key, artifact)
++        try:
++            # Content-addressed artifacts are immutable; if one was truncated
++            # or rewritten, isolate it before clang refuses the same-digest path.
++            self._audit_artifacts()
++            program = _matmul_program(key.dtype, key.m, key.k, key.n)
++            target = TargetSpec(**dict(key.target))
++            compiler = Avx512Compiler()
++            target_ir = compiler.lower(program, target)
++            build_dir = self._build_dir
++            if build_dir is None and self.cache_dir is not None:
++                build_dir = self.cache_dir / "build"
++            if build_dir is None:
++                build_dir = Path(tempfile.mkdtemp(prefix="pypto-x-torch-linear-"))
++            extra = {"build_dir": str(build_dir)}
++            if self._clang is not None:
++                extra["clang"] = self._clang
++            options = CompileOptions(
++                artifact_format=DEFAULT_ARTIFACT_FORMAT,
++                extra=extra,
++            )
++            self._stats["compile_calls"] += 1
++            artifact = compiler.compile(target_ir, options)
++            loaded = runtime.load(artifact)
++            native, declared_plane = _resolve_native(loaded, key, artifact)
++        except PyPTOXBridgeError:
++            raise
++        except Exception as exc:
++            # Real clang / filesystem / artifact failures must be visible to the
++            # fail-open op and structured for strict callers.
++            self._stats["build_failures"] += 1
++            reason = build_failure_reason(exc)
++            details = {
++                "exception_type": type(exc).__name__,
++                "cache_dir": str(self.cache_dir) if self.cache_dir is not None else None,
++                "build_dir": str(self._build_dir) if self._build_dir is not None else None,
++                "clang": self._clang,
++            }
++            raise PyPTOXBuildError(
++                "PyPTOX AVX-512 linear kernel build failed ({}): {}".format(type(exc).__name__, exc),
++                reason_code=reason,
++                details=details,
++            ) from exc
+         self._write_sidecar(key, artifact, digest)
+-        return LinearKernelEntry(key, artifact, loaded, native, disk_backed=False)
++        return LinearKernelEntry(
++            key, artifact, loaded, native, disk_backed=False, declared_plane=declared_plane
++        )
+ 
+     # -- maintenance ---------------------------------------------------
+     def clear(self) -> None:
+@@ -538,6 +696,7 @@ def reset_linear_kernel_cache(cache: Optional[LinearKernelCache] = None) -> None
+ __all__ = [
+     "LINEAR_KERNEL_CACHE_VERSION",
+     "LinearKernelCache",
++    "build_failure_reason",
+     "LinearKernelEntry",
+     "LinearKernelKey",
+     "default_cache_dir",
+diff --git a/python/pypto/framework/torch_bridge.py b/python/pypto/framework/torch_bridge.py
+index 43d9a1696..18f527e66 100644
+--- a/python/pypto/framework/torch_bridge.py
++++ b/python/pypto/framework/torch_bridge.py
+@@ -15,6 +15,9 @@ Copy and ownership rules (J1 acceptance requires these to be explicit):
+ * ``packed_tensor_to_view`` parses a packed handle produced by
+   ``pack_weight``; the payload is a zero-copy numpy view of the handle's bytes
+   (the handle tensor must stay alive while the view is used).
++* ``pack_view_to_tensor`` (used by ``pack_weight``) copies the transposed
++  ``(N, K) -> (K, N)`` payload directly into the newly allocated handle
++  tensor: exactly 1 payload copy, no intermediate bytes object.
+ * No implicit dtype casts and no implicit device transfers happen here.
+ """
+ 
+@@ -29,7 +32,15 @@ import torch
+ from pypto.abi import TensorDesc
+ 
+ from .errors import PyPTOXBridgeError, PyPTOXUnsupportedError
+-from .weight_pack import HEADER_SIZE, PACK_MAGIC, PackedWeight, parse_packed_bytes
++from .weight_pack import (
++    HEADER_SIZE,
++    PACK_MAGIC,
++    PackedWeight,
++    header_bytes_for,
++    numpy_dtype,
++    packed_size_bytes,
++    parse_packed_bytes,
++)
+ 
+ 
+ TORCH_DTYPES = {torch.float32: "float32", torch.bfloat16: "bf16"}
+@@ -364,12 +375,25 @@ def bytes_to_tensor(payload: bytes) -> torch.Tensor:
+ 
+ 
+ def pack_view_to_tensor(view: BufferView, k: int, n: int) -> torch.Tensor:
+-    """Pack a ``(N, K)`` weight view and return a uint8 handle tensor."""
++    """Pack a ``(N, K)`` weight view into a uint8 handle tensor.
+ 
+-    from .weight_pack import pack_view
++    The transposed payload is copied **directly into the handle tensor** with
++    one ``np.copyto``; there is no intermediate bytes object.  This is the
++    only payload copy performed by ``pack_weight``.
++    """
+ 
+-    packed = pack_view(view.array, k=k, n=n, dtype=view.dtype)
+-    return bytes_to_tensor(packed.to_bytes())
++    size = packed_size_bytes(k, n, view.dtype)
++    handle = torch.empty(size, dtype=torch.uint8)
++    array = handle.numpy()
++    array[:HEADER_SIZE] = np.frombuffer(header_bytes_for(k, n, view.dtype), dtype=np.uint8)
++    destination = np.frombuffer(
++        array.data,
++        dtype=numpy_dtype(view.dtype),
++        count=int(k) * int(n),
++        offset=HEADER_SIZE,
++    ).reshape(int(k), int(n))
++    np.copyto(destination, view.array.T)
++    return handle
+ 
+ 
+ __all__ = [
+diff --git a/python/pypto/framework/torch_ops.py b/python/pypto/framework/torch_ops.py
+index 93c716a39..5d4350aca 100644
+--- a/python/pypto/framework/torch_ops.py
++++ b/python/pypto/framework/torch_ops.py
+@@ -3,11 +3,13 @@
+ Public ops (registered on import, idempotent):
+ 
+ * ``torch.ops.pypto_x.linear(x, weight, bias=None)`` - fail-open: on any
+-  unsupported input or unavailable kernel it records a fallback event and
++  unsupported input, real build failure (read-only cache, clang failure,
++  corrupt artifact) or unavailable kernel it records a fallback event and
+   returns ``torch.nn.functional.linear`` semantics.  A ``RuntimeWarning`` is
+   emitted once per reason unless ``PYPTO_X_TORCH_FALLBACK_WARNINGS=0``.
+ * ``torch.ops.pypto_x.linear_strict(x, weight, bias=None)`` - fail-closed:
+-  raises ``PyPTOXUnsupportedError`` / ``PyPTOXBuildError`` unchanged.
++  raises ``PyPTOXUnsupportedError`` with a structured ``reason_code`` (build
++  failures are the ``PyPTOXBuildError`` subclass).
+ * ``torch.ops.pypto_x.pack_weight(weight)`` - fail-closed one-time BF16/FP32
+   weight pre-pack into a self-describing 1-D uint8 handle.
+ * ``torch.ops.pypto_x.linear_prepacked(x, packed, bias=None)`` - fail-closed
+@@ -16,6 +18,13 @@ Public ops (registered on import, idempotent):
+ ``linear`` covers exactly rank-2 CPU tensors of dtype BF16/FP32 with matching
+ activation/weight/bias dtype; anything else (rank != 2, float64, int32,
+ requires_grad, M/K/N <= 0, packed handles on the wrong path) is explicit.
++
++Autograd is out of scope (J1 is an inference bridge): a ``requires_grad``
++input takes the fail-open path and the forward matches ``F.linear``.  Torch
++attaches a generated ``grad_fn`` to the result, but no backward formula is
++registered for this custom op, so ``.backward()`` raises ``RuntimeError:
++... no autograd formula was registered``.  Training callers must use
++``F.linear`` directly.
+ Fake implementations are registered for ``linear``/``linear_strict``/
+ ``pack_weight`` so ``meta`` shape inference and ``torch.compile`` tracing see
+ correct metadata; packed handles cannot be traced because the K/N values live
+@@ -32,8 +41,11 @@ import weakref
+ 
+ import torch
+ 
++from pypto.backends.cpu.x86.avx512 import CpuAvx512RuntimeError
++from pypto.compiler.targets.cpu_avx512 import Avx512CompileError
++
+ from .errors import PyPTOXBridgeError, PyPTOXUnsupportedError
+-from .linear_kernel import linear_kernel_cache
++from .linear_kernel import build_failure_reason, linear_kernel_cache
+ from .torch_bridge import (
+     TORCH_DTYPES,
+     allocate_output_address,
+@@ -54,14 +66,34 @@ _FALLBACK_LOCK = threading.Lock()
+ _FALLBACK_STATS: Dict[str, int] = {}
+ _FALLBACK_WARNED = set()
+ 
++#: Real failure families the fail-open op must absorb: filesystem/build errors,
++#: clang failures and artifact load/runtime validation failures.  Structured
++#: ``PyPTOXBridgeError`` covers everything the cache wraps; the raw families
++#: are kept as a second line of defence for paths outside ``_compile``.
++_FALLBACK_EXCEPTIONS = (
++    PyPTOXBridgeError,
++    PermissionError,
++    OSError,
++    Avx512CompileError,
++    CpuAvx512RuntimeError,
++)
++
++
++def _fallback_reason(error: BaseException) -> str:
++    reason = getattr(error, "reason_code", None)
++    if isinstance(reason, str) and reason:
++        return reason
++    return build_failure_reason(error)
++
+ 
+ def _warnings_enabled() -> bool:
+     value = os.environ.get("PYPTO_X_TORCH_FALLBACK_WARNINGS", "1").strip().lower()
+     return value not in ("0", "false", "no", "off")
+ 
+ 
+-def _record_fallback(operation: str, error: Exception) -> None:
+-    reason = getattr(error, "reason_code", "unknown")
++def _record_fallback(operation: str, error: BaseException, reason: Optional[str] = None) -> None:
++    if reason is None:
++        reason = _fallback_reason(error)
+     key = "{}:{}".format(operation, reason)
+     with _FALLBACK_LOCK:
+         _FALLBACK_STATS[key] = _FALLBACK_STATS.get(key, 0) + 1
+@@ -336,7 +368,7 @@ def _linear_impl(
+ 
+     try:
+         return _linear_entry(x, weight, bias)
+-    except PyPTOXBridgeError as exc:
++    except _FALLBACK_EXCEPTIONS as exc:
+         if is_packed_like(weight):
+             # An opaque packed handle has no meaningful torch fallback: fail
+             # closed instead of surfacing an unrelated F.linear error.
+@@ -348,9 +380,24 @@ def _linear_impl(
+ def _linear_strict_impl(
+     x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
+ ) -> torch.Tensor:
+-    """Fail-closed single-kernel linear (see module docstring)."""
++    """Fail-closed single-kernel linear (see module docstring).
++
++    Build/load failures surface as :class:`PyPTOXUnsupportedError` (the
++    ``PyPTOXBuildError`` subclass) with a structured ``reason_code``; raw
++    compiler/runtime exceptions are wrapped here so strict callers never see
++    an unstructured leak from the bridge boundary.
++    """
+ 
+-    return _linear_entry(x, weight, bias)
++    try:
++        return _linear_entry(x, weight, bias)
++    except PyPTOXBridgeError:
++        raise
++    except (PermissionError, OSError, Avx512CompileError, CpuAvx512RuntimeError) as exc:
++        raise PyPTOXUnsupportedError(
++            "PyPTO-X linear kernel unavailable ({}): {}".format(type(exc).__name__, exc),
++            reason_code=_fallback_reason(exc),
++            details={"exception_type": type(exc).__name__},
++        ) from exc
+ 
+ 
+ def _pack_weight_impl(weight: torch.Tensor) -> torch.Tensor:
+diff --git a/python/pypto/framework/weight_pack.py b/python/pypto/framework/weight_pack.py
+index 03f038727..3f3234047 100644
+--- a/python/pypto/framework/weight_pack.py
++++ b/python/pypto/framework/weight_pack.py
+@@ -24,10 +24,12 @@ The payload is a raw byte copy of the kernel operand: ``uint16`` bits for
+ BF16 and ``float32`` for FP32.  Packing copies exactly ``K * N * itemsize``
+ bytes; the header is O(1).
+ 
+-Copy accounting: :func:`pack_view` performs exactly one element copy (the
+-``(N, K) -> (K, N)`` materialisation).  Returning a torch handle from
+-``pack_weight`` serialises that payload into the handle tensor, which is a
+-second byte copy at *pack* time only (never in the call hot path).
++Copy accounting: one-time packing performs exactly one payload element copy.
++:func:`pack_view` materialises ``(N, K) -> (K, N)`` into its own buffer;
++:func:`pypto.framework.torch_bridge.pack_view_to_tensor` instead copies the
++transposed payload *directly into the returned handle tensor* (single
++``np.copyto``), so ``pack_weight`` also performs exactly one payload copy.
++No copy happens in the per-call hot path.
+ """
+ 
+ from __future__ import annotations
+@@ -153,11 +155,34 @@ def packed_size_bytes(k: int, n: int, dtype: str) -> int:
+     return HEADER_SIZE + int(k) * int(n) * itemsize
+ 
+ 
++def numpy_dtype(dtype: str) -> Any:
++    """Return the raw numpy container dtype for a packed payload."""
++
++    try:
++        return _NUMPY_DTYPES[dtype]
++    except KeyError as exc:
++        raise ValueError("unsupported packed weight dtype {!r}".format(dtype)) from exc
++
++
++def header_bytes_for(k: int, n: int, dtype: str) -> bytes:
++    """Return the self-describing header bytes for a packed payload."""
++
++    if k <= 0 or n <= 0:
++        raise ValueError("packed weight K and N must be positive")
++    try:
++        dtype_id = _DTYPE_IDS[dtype]
++    except KeyError as exc:
++        raise ValueError("unsupported packed weight dtype {!r}".format(dtype)) from exc
++    return _HEADER.pack(PACK_MAGIC, PACK_VERSION, dtype_id, 0, int(k), int(n))
++
++
+ __all__ = [
+     "HEADER_SIZE",
+     "PACK_MAGIC",
+     "PACK_VERSION",
+     "PackedWeight",
++    "header_bytes_for",
++    "numpy_dtype",
+     "pack_view",
+     "packed_size_bytes",
+     "parse_packed_bytes",
+diff --git a/python/tests/framework_torch/test_torch_linear_cache.py b/python/tests/framework_torch/test_torch_linear_cache.py
+index 43df59bb6..4fdc81d0c 100644
+--- a/python/tests/framework_torch/test_torch_linear_cache.py
++++ b/python/tests/framework_torch/test_torch_linear_cache.py
+@@ -152,3 +152,120 @@ def test_kernel_cache_clear_keeps_the_compiled_artifact_usable(fresh_caches):
+     output, output_view = allocate_output("bf16", (2, 5))
+     entry.invoke(left.address, packed.address, output_view.address)
+     assert torch.equal(output, got)
++
++
++def test_corrupt_content_addressed_so_is_quarantined_and_rebuilt(fresh_caches):
++    """V8J-D2: a rewritten content-addressed .so must self-heal.
++
++    The compiler refuses to publish different bytes at an existing digest
++    path, so the bridge has to quarantine the corrupt file first; the bytes
++    are renamed aside (kept for audit), not deleted.
++    """
++
++    import os
++    from pathlib import Path
++
++    got, x, weight = _call(m=2, k=4, n=5)
++    assert torch.equal(got, torch.nn.functional.linear(x, weight))
++    key = fresh_caches.key("bf16", 2, 4, 5)
++    sidecar = fresh_caches.cache_dir / ("pypto_x_linear_{}.json".format(key.digest[:32]))
++    payload = json.loads(sidecar.read_text(encoding="utf-8"))
++    so_path = Path(payload["artifact"]["path"])
++    original = so_path.read_bytes()
++    # Never truncate a file that this process may still have mapped (that is a
++    # SIGBUS, not a Python error).  Rename the mapped inode aside and publish
++    # a *new* corrupt inode at the same path: this is exactly what a second
++    # process would see after external corruption.
++    mapped_original = so_path.with_name(so_path.name + ".pre-tamper")
++    os.replace(so_path, mapped_original)
++    so_path.write_bytes(original[:96] + b"\x00" * 16)
++
++    second = LinearKernelCache(cache_dir=fresh_caches.cache_dir, disk_cache=True)
++    reset_linear_kernel_cache(second)
++    recovered, x2, weight2 = _call(m=2, k=4, n=5)
++    assert torch.equal(recovered, torch.nn.functional.linear(x2, weight2))
++
++    stats = second.stats
++    assert stats["load_failures"] == 1
++    assert stats["quarantined"] >= 1
++    assert stats["kernel_builds"] == 1
++    assert stats["compile_calls"] == 1
++    assert so_path.is_file()
++    assert list(so_path.parent.glob(so_path.name + ".corrupt-*"))
++
++    # A third fresh process must now be a normal disk hit.
++    third = LinearKernelCache(cache_dir=fresh_caches.cache_dir, disk_cache=True)
++    reset_linear_kernel_cache(third)
++    again, x3, weight3 = _call(m=2, k=4, n=5)
++    assert torch.equal(again, torch.nn.functional.linear(x3, weight3))
++    stats = third.stats
++    assert stats["disk_hits"] == 1
++    assert stats["kernel_builds"] == 0
++    assert stats["quarantined"] == 0
++
++
++def test_payload_version_bump_invalidates_old_sidecars(fresh_caches):
++    """Rebasing onto payload 4 must make payload-3 sidecars a natural miss."""
++
++    from pathlib import Path
++
++    _call(m=1, k=2, n=3)
++    key = fresh_caches.key("bf16", 1, 2, 3)
++    sidecar = fresh_caches.cache_dir / ("pypto_x_linear_{}.json".format(key.digest[:32]))
++    payload = json.loads(sidecar.read_text(encoding="utf-8"))
++    payload["key"]["payload_version"] = key.payload_version - 1
++    sidecar.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
++
++    second = LinearKernelCache(cache_dir=fresh_caches.cache_dir, disk_cache=True)
++    reset_linear_kernel_cache(second)
++    got, x, weight = _call(m=1, k=2, n=3)
++    assert torch.equal(got, torch.nn.functional.linear(x, weight))
++    stats = second.stats
++    assert stats["load_failures"] == 1
++    assert stats["kernel_builds"] == 1
++    assert stats["compile_calls"] == 1
++    # the sidecar has been rewritten with the current key
++    rewritten = json.loads(sidecar.read_text(encoding="utf-8"))
++    assert rewritten["key"]["payload_version"] == key.payload_version
++
++
++def test_corrupt_so_without_sidecar_is_quarantined_by_the_build_audit(fresh_caches):
++    import os
++    from pathlib import Path
++
++    got, x, weight = _call(m=1, k=2, n=3)
++    key = fresh_caches.key("bf16", 1, 2, 3)
++    sidecar = fresh_caches.cache_dir / ("pypto_x_linear_{}.json".format(key.digest[:32]))
++    payload = json.loads(sidecar.read_text(encoding="utf-8"))
++    so_path = Path(payload["artifact"]["path"])
++    original = so_path.read_bytes()
++    mapped_original = so_path.with_name(so_path.name + ".pre-tamper")
++    os.replace(so_path, mapped_original)
++    so_path.write_bytes(original[:64] + b"\x00" * 16)
++    sidecar.unlink()
++
++    second = LinearKernelCache(cache_dir=fresh_caches.cache_dir, disk_cache=True)
++    reset_linear_kernel_cache(second)
++    recovered, x2, weight2 = _call(m=1, k=2, n=3)
++    assert torch.equal(recovered, torch.nn.functional.linear(x2, weight2))
++    stats = second.stats
++    assert stats["quarantined"] == 1
++    assert stats["kernel_builds"] == 1
++    assert so_path.is_file()
++
++
++def test_entry_exposes_declared_packed_plane_and_executed_legacy_plane(fresh_caches):
++    """Payload 4 declares the packed plane; this J1 bridge still calls legacy.
++
++    The divergence is deliberate for the fix round (the verifier validated the
++    legacy numerics) and is exposed in the entry metadata so switching to the
++    packed plane later is an explicit, testable change rather than a silent one.
++    """
++
++    _call(m=1, k=2, n=3)
++    entry = linear_kernel_cache().get("bf16", 1, 2, 3)
++    assert entry.declared_plane == "packed"
++    assert entry.executed_plane == "legacy_avx512_zmm"
++    assert entry.to_dict()["declared_plane"] == "packed"
++    assert entry.to_dict()["executed_plane"] == "legacy_avx512_zmm"
++    assert entry.to_dict()["native_symbol"] == "ptx_avx512_matmul_bf16"
+diff --git a/python/tests/framework_torch/test_torch_linear_correctness.py b/python/tests/framework_torch/test_torch_linear_correctness.py
+index ddadf0712..af8390f29 100644
+--- a/python/tests/framework_torch/test_torch_linear_correctness.py
++++ b/python/tests/framework_torch/test_torch_linear_correctness.py
+@@ -10,8 +10,11 @@ Tolerance policy (self-documented, measured on the AVX-512 host):
+   scale s is ``2**-8 * s``.  The bridge allows 2 LSB against gold and 4 LSB
+   against ``F.linear`` because the bias is added after the kernel's bf16
+   output rounding (torch/oneDNN fuses bias into the fp32 accumulator).
+-  Without bias the measured difference vs F.linear is bitwise zero for most
+-  shapes and <= 2.4e-4 for the largest tested one.
++  Without bias the comparison is K-bucketed: for the sampled K <= 128 shapes
++  the result is bitwise identical to ``F.linear``; for K > 128 accumulation
++  order can flip one bf16 ULP on a near-zero output, so a 1-LSB tolerance is
++  asserted instead of bitwise equality (the independent verifier measured
++  6.104e-05 at K=1024, i.e. below one LSB at scale 1).
+ """
+ 
+ from __future__ import annotations
+@@ -223,3 +226,73 @@ def test_runtime_descriptor_launch_consumes_zero_copy_torch_buffers(fresh_caches
+     )
+     reference = torch.nn.functional.linear(x, weight)
+     assert _max_abs(output, reference) <= 4.0 * BF16_LSB * max(1.0, reference.abs().max().item())
++
++
++BF16_SMALL_K_SHAPES = ((1, 64, 64), (5, 128, 129), (5, 65, 33))
++
++
++@pytest.mark.parametrize("shape", BF16_SMALL_K_SHAPES, ids=lambda s: "{}x{}x{}".format(*s))
++def test_bf16_no_bias_small_k_is_bitwise_equal(shape, fresh_caches):
++    """K <= 128: the bridge and F.linear agree bit-for-bit on the pinned seeds."""
++
++    m, k, n = shape
++    generator = torch.Generator().manual_seed(20260911 + m * 31 + k * 7 + n)
++    x = _rand(torch.bfloat16, (m, k), generator, 1.0 / k ** 0.5)
++    weight = _rand(torch.bfloat16, (n, k), generator, 1.0 / k ** 0.5)
++    got = torch.ops.pypto_x.linear(x, weight)
++    ref = torch.nn.functional.linear(x, weight)
++    assert torch.equal(got, ref), (got.float() - ref.float()).abs().max().item()
++
++
++def test_bf16_no_bias_large_k_uses_bucketed_tolerance(fresh_caches):
++    """K > 128: bitwise equality is NOT claimed; allow one bf16 ULP.
++
++    The verifier's independent probe measured max|ours-F.linear| = 6.104e-05
++    at (1, 1024, 1024) - one bf16 ULP on a near-zero output, caused by a
++    different accumulation order/rounding than oneDNN, not by a wrong value.
++    """
++
++    m, k, n = 1, 1024, 1024
++    generator = torch.Generator().manual_seed(2008)
++    x = _rand(torch.bfloat16, (m, k), generator, 1.0 / k ** 0.5)
++    weight = _rand(torch.bfloat16, (n, k), generator, 1.0 / k ** 0.5)
++    got = torch.ops.pypto_x.linear(x, weight)
++    ref = torch.nn.functional.linear(x, weight)
++    gold = torch.nn.functional.linear(x.double(), weight.double())
++    scale = max(1.0, gold.abs().max().item())
++    assert _max_abs(got, ref) <= 1.0 * BF16_LSB * scale
++    assert _max_abs(got, gold) <= 2.0 * BF16_LSB * scale
++
++
++def test_bf16_packed_path_matches_direct_at_large_k(fresh_caches):
++    m, k, n = 2, 1024, 512
++    generator = torch.Generator().manual_seed(31415)
++    x = _rand(torch.bfloat16, (m, k), generator, 1.0 / k ** 0.5)
++    weight = _rand(torch.bfloat16, (n, k), generator, 1.0 / k ** 0.5)
++    packed = torch.ops.pypto_x.pack_weight(weight)
++    assert torch.equal(
++        torch.ops.pypto_x.linear_prepacked(x, packed),
++        torch.ops.pypto_x.linear(x, weight),
++    )
++
++
++def test_pack_weight_performs_exactly_one_payload_copy(fresh_caches, monkeypatch):
++    import numpy as np
++
++    from pypto.framework.weight_pack import parse_packed_bytes
++
++    calls = []
++    original_copyto = np.copyto
++
++    def counting_copyto(destination, source, *args, **kwargs):
++        calls.append((destination.shape, source.shape))
++        return original_copyto(destination, source, *args, **kwargs)
++
++    monkeypatch.setattr(np, "copyto", counting_copyto)
++    weight = torch.randn(17, 130, dtype=torch.bfloat16)
++    handle = torch.ops.pypto_x.pack_weight(weight)
++    assert len(calls) == 1
++
++    parsed = parse_packed_bytes(handle.numpy())
++    reference = weight.t().contiguous().view(torch.uint16).numpy()
++    assert np.array_equal(parsed.payload, reference)
+diff --git a/python/tests/framework_torch/test_torch_linear_failure_semantics.py b/python/tests/framework_torch/test_torch_linear_failure_semantics.py
+index f655822ca..3bce7d534 100644
+--- a/python/tests/framework_torch/test_torch_linear_failure_semantics.py
++++ b/python/tests/framework_torch/test_torch_linear_failure_semantics.py
+@@ -1,13 +1,15 @@
+ """J1 failure semantics: fail-open vs fail-closed must both be explicit.
+ 
+-* ``torch.ops.pypto_x.linear`` is fail-open.  Any unsupported input raises a
+-  structured ``PyPTOXUnsupportedError`` internally, is recorded in the
+-  process fallback counters, warns once per reason, and recomputes the exact
+-  reference with ``F.linear``.  The only exception is an opaque packed-weight
+-  handle (1-D uint8): there is no meaningful torch fallback for it, so it
+-  fails closed with ``packed_handle_invalid``.
++* ``torch.ops.pypto_x.linear`` is fail-open.  Any unsupported input **and any
++  real build/load failure** (read-only cache directory, clang failure, corrupt
++  content-addressed artifact) raises a structured error internally, is
++  recorded in the process fallback counters, warns once per reason, and
++  recomputes the exact reference with ``F.linear``.  The only exception is an
++  opaque packed-weight handle (1-D uint8): there is no meaningful torch
++  fallback for it, so it fails closed with ``packed_handle_invalid``.
+ * ``torch.ops.pypto_x.linear_strict`` never falls back: the structured error
+-  propagates and the fallback counters stay untouched.
++  propagates (build failures are ``PyPTOXBuildError``, a subclass of
++  ``PyPTOXUnsupportedError``) and the fallback counters stay untouched.
+ """
+ 
+ from __future__ import annotations
+@@ -281,3 +283,77 @@ def test_missing_fma_capability_falls_back(tmp_path):
+         got = torch.ops.pypto_x.linear(x, weight)
+     assert torch.equal(got, torch.nn.functional.linear(x, weight))
+     assert cache.stats["kernel_builds"] == 0
++
++
++# --------------------------------------------------------------------------- #
++# real build/load failure cases (V8J-D1)
++# --------------------------------------------------------------------------- #
++def test_readonly_cache_dir_real_build_failure_falls_back(tmp_path, fresh_caches):
++    from pypto.framework.linear_kernel import LinearKernelCache, reset_linear_kernel_cache
++
++    readonly = tmp_path / "readonly-cache"
++    readonly.mkdir()
++    readonly.chmod(0o555)
++    cache = LinearKernelCache(cache_dir=readonly, disk_cache=True)
++    reset_linear_kernel_cache(cache)
++    x = torch.randn(2, 4, dtype=BF16)
++    weight = torch.randn(5, 4, dtype=BF16)
++    try:
++        with pytest.warns(RuntimeWarning, match="cache_unwritable"):
++            got = torch.ops.pypto_x.linear(x, weight)
++        assert torch.equal(got, torch.nn.functional.linear(x, weight))
++        assert _fallback_events()["linear:cache_unwritable"] == 1
++        assert cache.stats["build_failures"] == 1
++        assert fresh_caches.stats["kernel_builds"] == 0
++
++        with pytest.raises(PyPTOXUnsupportedError) as info:
++            torch.ops.pypto_x.linear_strict(x, weight)
++        assert info.value.reason_code == "cache_unwritable"
++        assert torch_ops.fallback_stats()["total"] == 1  # strict added nothing
++    finally:
++        readonly.chmod(0o755)
++
++
++def test_fake_clang_failure_falls_back_with_compile_reason(tmp_path, fresh_caches):
++    from pypto.framework.linear_kernel import LinearKernelCache, reset_linear_kernel_cache
++
++    fake_clang = tmp_path / "clang"
++    fake_clang.write_text(
++        "#!/bin/sh\n"
++        'if [ "$1" = "--version" ]; then echo "clang version 99.0.0"; exit 0; fi\n'
++        'if [ "$1" = "-print-target-triple" ]; then echo "x86_64-unknown-linux-gnu"; exit 0; fi\n'
++        "echo 'fake clang compile failure' >&2\n"
++        "exit 1\n",
++        encoding="utf-8",
++    )
++    fake_clang.chmod(0o755)
++    cache = LinearKernelCache(cache_dir=tmp_path / "clang-cache", clang=str(fake_clang))
++    reset_linear_kernel_cache(cache)
++    x = torch.randn(2, 4, dtype=BF16)
++    weight = torch.randn(5, 4, dtype=BF16)
++
++    with pytest.warns(RuntimeWarning, match="compile_failed"):
++        got = torch.ops.pypto_x.linear(x, weight)
++    assert torch.equal(got, torch.nn.functional.linear(x, weight))
++    assert _fallback_events()["linear:compile_failed"] == 1
++    assert cache.stats["build_failures"] == 1
++    assert cache.stats["compile_calls"] == 1
++
++    with pytest.raises(PyPTOXUnsupportedError) as info:
++        torch.ops.pypto_x.linear_strict(x, weight)
++    assert info.value.reason_code == "compile_failed"
++
++
++def test_requires_grad_forward_falls_back_but_backward_is_not_registered(fresh_caches):
++    """J1 is inference-only; the docstring must not promise autograd support."""
++
++    x = torch.randn(2, 4, dtype=BF16, requires_grad=True)
++    weight = torch.randn(5, 4, dtype=BF16, requires_grad=True)
++    with pytest.warns(RuntimeWarning, match="requires_grad"):
++        out = torch.ops.pypto_x.linear(x, weight)
++    assert torch.equal(out, torch.nn.functional.linear(x, weight))
++    # torch attaches a generated grad_fn, but no autograd formula is
++    # registered for the custom op, so backward fails loudly.
++    assert out.requires_grad
++    with pytest.raises(RuntimeError, match="no autograd formula"):
++        out.sum().backward()

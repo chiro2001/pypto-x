@@ -1,0 +1,1927 @@
+From 9ab96f52b3ef3e1337ab3d53c701009b2ff9bd3c Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 03:01:47 +0800
+Subject: [PATCH 127/134] perf(cuda): add GEMM vs cuBLAS relative-baseline
+ harness (B3b)
+
+Add scripts/smoke/cuda_gemm_baseline_smoke.py with three modes:
+- measure: one independent G2 round (R=21 batched samples per side, fixed
+  CPU affinity, clock assertion, in-run cuEvent rate calibration), G1
+  correctness and per-case dispatch_seconds for the dispatch-dominated gate;
+- g1: deterministic correctness only (exact-integer equivalence, pure-Python
+  float64 oracle, full-shape exact-ones check), no timing;
+- aggregate: three rounds -> candidate_ratio only (no lock/threshold files).
+
+cuBLAS is bound through ctypes (Sgemm_v2 / GemmEx with
+CUBLAS_COMPUTE_32F); the default case set covers 4096^3 and 2048x4096x4096
+GEMMs plus two Qwen3.5-0.8B-shaped GEMMs expected to be dispatch-dominated.
+
+No thresholds are frozen and no configs/perf_lock.yaml is touched.
+---
+ scripts/smoke/cuda_gemm_baseline_smoke.py | 1898 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 1898 insertions(+)
+
+diff --git a/scripts/smoke/cuda_gemm_baseline_smoke.py b/scripts/smoke/cuda_gemm_baseline_smoke.py
+new file mode 100644
+index 000000000..55d64e6bf
+--- /dev/null
++++ b/scripts/smoke/cuda_gemm_baseline_smoke.py
+@@ -0,0 +1,1898 @@
++#!/usr/bin/env python3
++"""CUDA GEMM relative baseline (PyPTO-X matmul vs cuBLAS) for the RTX 5080.
++
++This is the W8B B3b measurement driver.  It produces the G1/G2/G3 evidence
++required by ``docs/PERF_MEASUREMENT_PROTOCOL.zh-CN.md``:
++
++* G1 correctness -- independent references (exact integer arithmetic and a
++  pure-Python float64 oracle) plus a full-shape exact-ones check;
++* G2 stability  -- R=21 measured launches per case, one process per round,
++  three rounds, fixed CPU affinity, protocol variance gates;
++* G3 relative   -- only GEMM vs cuBLAS, ``ratio = pypto_x_median /
++  cublas_median`` over 3 rounds; the report only emits ``candidate_ratio``
++  (no thresholds are frozen here).
++
++Two modes:
++
++    measure   one independent round on GamePC WSL2; writes one JSON file;
++    g1        deterministic correctness only (no timing; usable in a
++              contended/interactive window);
++    aggregate combine three round JSONs into ``validation.json`` (local).
++
++The driver never writes any lock file.  Run it pinned to a fixed CPU set:
++
++    PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=python taskset -c 0-5 \
++        python3 scripts/smoke/cuda_gemm_baseline_smoke.py \
++        --mode measure --round 1 --json-out /tmp/round1.json
++
++cuBLAS is located at runtime (``/usr/local/cuda/lib64/libcublas.so.13``);
++no compiler or header is required.
++"""
++
++from __future__ import annotations
++
++import argparse
++import ctypes
++import json
++import math
++import os
++import platform
++import statistics
++import struct
++import subprocess
++import sys
++import threading
++import time
++from pathlib import Path
++
++try:  # Linux/WSL2 only; the measurement host is GamePC
++    import resource as _resource
++except ImportError:  # pragma: no cover
++    _resource = None
++
++if __package__ in (None, ""):
++    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
++
++from pypto.abi import GpuLaunchRequest, TensorDesc  # noqa: E402
++from pypto.backends.cuda import CudaRuntime  # noqa: E402
++from pypto.compiler.targets.cuda import (  # noqa: E402
++    CUDA_PTX_VERSION,
++    DEFAULT_PTX_TARGET,
++    CudaPtxCompiler,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef  # noqa: E402
++from pypto.target import TargetSpec  # noqa: E402
++
++
++TASK = "cuda-gemm-baseline"
++DEFAULT_AGENT = "cuda-gemm-baseline"
++DEFAULT_AFFINITY = "0-5"
++DEFAULT_WORKGROUP = 256
++DEFAULT_TILE = (64, 64)
++DEFAULT_REPEATS = 21
++DEFAULT_WARMUP = 5
++DEFAULT_CLOCK_WARMUP_SECONDS = 3.0
++DEFAULT_RATE_GAP_SECONDS = 3.0
++DEFAULT_CALIBRATION_ROUNDS = 2
++DEFAULT_CLOCK_INTERVAL = 0.4
++WARMUP_ACCEPTANCE = 0.05
++WARMUP_ATTEMPTS = 3
++
++# Protocol §3.4 variance ceilings.  ``clock_unlocked`` selects the relaxed row.
++VARIANCE_LIMITS_LOCKED = {"cv": 0.03, "p95_over_median": 1.15}
++VARIANCE_LIMITS_UNLOCKED = {"cv": 0.05, "p95_over_median": 1.25}
++MEDIAN_SPREAD_LIMIT = 0.10
++CLOCK_RATIO_MIN = 0.9
++
++# GamePC host noise gate (mirrors the protocol's local-noise rule).
++HOST_LOAD_MAX_RATIO = 1.0
++HOST_PSI_MAX_AVG10 = 25.0
++
++SMALL_FLOAT_SHAPE = (64, 96, 80)
++SMALL_INTEGER_SHAPE = (128, 192, 160)
++
++GPU_QUERY = (
++    "name,driver_version,clocks.sm,clocks.max.sm,clocks.mem,clocks.max.memory,"
++    "power.draw,power.limit,temperature.gpu,utilization.gpu,memory.used,memory.total,"
++    "persistence_mode,compute_mode"
++)
++CLOCK_QUERY = "clocks.sm,clocks.max.sm"
++
++# Default case set: two large non-dispatch-dominated GEMMs (the G3 keys) plus
++# two scaled-down large GEMMs and two model-shaped GEMMs that are expected to
++# be dispatch-dominated and therefore stay out of the ratio gate.
++DEFAULT_CASES = (
++    {"name": "gemm_f32_4096x4096x4096", "m": 4096, "n": 4096, "k": 4096, "dtype": "float32"},
++    {"name": "gemm_bf16_4096x4096x4096", "m": 4096, "n": 4096, "k": 4096, "dtype": "bf16"},
++    {"name": "gemm_f32_2048x4096x4096", "m": 2048, "n": 4096, "k": 4096, "dtype": "float32"},
++    {"name": "gemm_bf16_2048x4096x4096", "m": 2048, "n": 4096, "k": 4096, "dtype": "bf16"},
++    # Qwen3.5-0.8B prefill projection shape (T=128, hidden 1024 -> 3584).
++    {"name": "qwen_prefill_proj_bf16_128x3584x1024", "m": 128, "n": 3584, "k": 1024, "dtype": "bf16"},
++    # Qwen3.5-0.8B decode lm_head shape (T=1, hidden 1024 -> vocab 248320).
++    {"name": "qwen_decode_lmhead_bf16_1x248320x1024", "m": 1, "n": 248320, "k": 1024, "dtype": "bf16"},
++)
++
++
++# ---------------------------------------------------------------------------
++# Core IR / artifact helpers
++# ---------------------------------------------------------------------------
++
++
++def _matmul_program(m: int, n: int, k: int, dtype: str) -> CoreProgram:
++    left_type = CoreType.tensor(dtype, (m, k))
++    right_type = CoreType.tensor(dtype, (k, n))
++    output_type = CoreType.tensor(dtype, (m, n))
++    left = ValueRef("left", left_type)
++    right = ValueRef("right", right_type)
++    output = ValueRef("out", output_type)
++    return CoreProgram(
++        functions=(
++            CoreFunction(
++                "matmul",
++                (left, right),
++                (output,),
++                Region((Operation("matmul", (left, right), (output,)),)),
++            ),
++        )
++    )
++
++
++def _build_case(shape_m: int, shape_n: int, shape_k: int, dtype: str, name: str = "") -> dict:
++    """Lower + compile one matmul case and return its immutable description."""
++
++    tile = DEFAULT_TILE
++    target = TargetSpec(
++        "gpu",
++        "gpu-neutral",
++        attributes={"workgroup": (DEFAULT_WORKGROUP,), "tile": tile},
++    )
++    compiler = CudaPtxCompiler()
++    started = time.perf_counter()
++    target_ir = compiler.lower(_matmul_program(shape_m, shape_n, shape_k, dtype), target)
++    lower_seconds = time.perf_counter() - started
++    started = time.perf_counter()
++    artifact = compiler.compile(target_ir)
++    compile_seconds = time.perf_counter() - started
++    plan = target_ir.gpu_program.plans[0]
++    return {
++        "name": name or "gemm_{}x{}x{}_{}".format(shape_m, shape_n, shape_k, dtype),
++        "m": int(shape_m),
++        "n": int(shape_n),
++        "k": int(shape_k),
++        "dtype": dtype,
++        "tile": list(tile),
++        "workgroup": DEFAULT_WORKGROUP,
++        "artifact": artifact,
++        "plan": plan,
++        "ptx_target": target_ir.ptx_target,
++        "ptx_version": target_ir.ptx_version,
++        "ptx_digest": artifact.metadata.get("ptx_digest"),
++        "plan_digest": artifact.metadata.get("plan_digest"),
++        "program_digest": artifact.metadata.get("program_digest"),
++        "artifact_bytes": len(artifact.payload),
++        "lower_seconds": lower_seconds,
++        "compile_seconds": compile_seconds,
++        "ptx_bytes": len(target_ir.ptx.encode("utf-8")),
++        "kernel_count": len(target_ir.gpu_program.plans),
++    }
++
++
++# ---------------------------------------------------------------------------
++# dtype packing helpers
++# ---------------------------------------------------------------------------
++
++
++def _itemsize(dtype: str) -> int:
++    return 2 if dtype == "bf16" else 4
++
++
++def _ones_pattern(dtype: str) -> bytes:
++    if dtype == "bf16":
++        return b"\x80\x3f"  # 1.0 bf16 = 0x3f80 little-endian
++    return b"\x00\x00\x80\x3f"  # 1.0f = 0x3f800000 little-endian
++
++
++def _float_word(dtype: str, value: float) -> bytes:
++    if dtype == "bf16":
++        return struct.pack("<H", _bf16_bits(value))
++    return struct.pack("<f", float(value))
++
++
++def _bf16_bits(value: float) -> int:
++    """Round a Python float to bf16 with round-to-nearest-even."""
++
++    f32 = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++    upper = f32 >> 16
++    lower = f32 & 0xFFFF
++    if lower > 0x8000 or (lower == 0x8000 and (upper & 1)):
++        upper += 1
++    return upper & 0xFFFF
++
++
++def _round_to_dtype(dtype: str, value: float) -> float:
++    if dtype == "bf16":
++        return struct.unpack("<f", struct.pack("<I", _bf16_bits(value) << 16))[0]
++    return struct.unpack("<f", struct.pack("<f", float(value)))[0]
++
++
++def _pack_values(dtype: str, values) -> bytes:
++    if dtype == "bf16":
++        return b"".join(struct.pack("<H", _bf16_bits(value)) for value in values)
++    return struct.pack("<{}f".format(len(values)), *[float(value) for value in values])
++
++
++def _unpack_values(dtype: str, raw: bytes):
++    count = len(raw) // _itemsize(dtype)
++    if dtype == "bf16":
++        return [
++            struct.unpack("<f", struct.pack("<I", struct.unpack_from("<H", raw, index * 2)[0] << 16))[0]
++            for index in range(count)
++        ]
++    return list(struct.unpack("<{}f".format(count), raw))
++
++
++# ---------------------------------------------------------------------------
++# statistics / environment helpers
++# ---------------------------------------------------------------------------
++
++
++def _percentile_nearest_rank(values, fraction):
++    ordered = sorted(values)
++    if not ordered:
++        return None
++    index = max(0, math.ceil(fraction * len(ordered)) - 1)
++    return ordered[index]
++
++
++def _dispersion(values) -> dict:
++    """Protocol §3.3 statistics: min/median/p95(nearest-rank)/max/stdev/cv."""
++
++    if not values:
++        return {"n": 0}
++    ordered = sorted(values)
++    median = statistics.median(ordered)
++    stdev = statistics.stdev(ordered) if len(ordered) > 1 else 0.0
++    p95 = _percentile_nearest_rank(ordered, 0.95)
++    mad = (
++        statistics.median([abs(value - median) for value in ordered]) if len(ordered) > 1 else 0.0
++    )
++    outlier_threshold = 3.0 * 1.4826 * mad
++    outliers = (
++        sum(1 for value in ordered if abs(value - median) > outlier_threshold) if mad > 0.0 else 0
++    )
++    return {
++        "n": len(ordered),
++        "min": ordered[0],
++        "median": median,
++        "p95": p95,
++        "p95_method": "nearest_rank",
++        "max": ordered[-1],
++        "mean": statistics.fmean(ordered),
++        "stdev": stdev,
++        "stdev_method": "sample_n_minus_1",
++        "cv_over_median": (stdev / median) if median else 0.0,
++        "cv_method": "stdev/median (perf protocol §3.3)",
++        "p95_over_median": (p95 / median) if median else 0.0,
++        "mad": mad,
++        "outliers_marked": outliers,
++        "outlier_ratio": (outliers / len(ordered)) if ordered else 0.0,
++    }
++
++
++def _variance_verdict(stats: dict, limits: dict) -> str:
++    if stats.get("n", 0) < 11:
++        return "INSUFFICIENT_SAMPLES"
++    if stats["cv_over_median"] > limits["cv"] or stats["p95_over_median"] > limits["p95_over_median"]:
++        return "INVALID_VARIANCE"
++    return "VALID"
++
++
++def _run(command, timeout=30):
++    completed = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
++    return completed.stdout.strip(), completed.stderr.strip(), completed.returncode
++
++
++def _nvidia_smi_fingerprint() -> dict:
++    raw, _err, code = _run(["nvidia-smi", "--query-gpu=" + GPU_QUERY, "--format=csv,noheader"])
++    apps, _err, _code = _run(
++        ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"]
++    )
++    perf, _err, _code = _run(["nvidia-smi", "-q", "-d", "PERFORMANCE"])
++    version, _err, _code = _run(["nvidia-smi", "-q"])
++    kmd = cuda_umd = None
++    for line in version.splitlines():
++        stripped = line.strip()
++        if stripped.startswith("KMD Version"):
++            kmd = stripped.split(":", 1)[1].strip()
++        elif stripped.startswith("CUDA UMD Version"):
++            cuda_umd = stripped.split(":", 1)[1].strip()
++    return {
++        "query_command": "nvidia-smi --query-gpu={} --format=csv,noheader".format(GPU_QUERY),
++        "raw_csv": raw,
++        "query_returncode": code,
++        "compute_apps_command": "nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader",
++        "compute_apps_raw": apps,
++        "compute_apps_empty": not apps.strip(),
++        "performance_head": "\n".join(perf.splitlines()[:25]),
++        "driver_kmd": kmd,
++        "cuda_umd": cuda_umd,
++    }
++
++
++def _clock_sample():
++    raw, _err, code = _run(["nvidia-smi", "--query-gpu=" + CLOCK_QUERY, "--format=csv,noheader,nounits"])
++    if code != 0:
++        return None
++    parts = [part.strip() for part in raw.split(",")]
++    try:
++        return {"clocks_sm_mhz": int(float(parts[0])), "clocks_max_sm_mhz": int(float(parts[1]))}
++    except (IndexError, ValueError):
++        return None
++
++
++class _ClockSampler(threading.Thread):
++    """Poll nvidia-smi clocks while the main thread keeps the GPU loaded."""
++
++    def __init__(self, interval=DEFAULT_CLOCK_INTERVAL):
++        super().__init__(daemon=True)
++        self.interval = float(interval)
++        self.samples = []
++        self._stop_event = threading.Event()
++
++    def run(self):
++        while not self._stop_event.is_set():
++            sample = _clock_sample()
++            if sample is not None:
++                self.samples.append(sample)
++            self._stop_event.wait(self.interval)
++
++    def stop(self):
++        self._stop_event.set()
++        self.join(timeout=10)
++
++
++def _cpu_model() -> str:
++    try:
++        with open("/proc/cpuinfo", encoding="utf-8") as handle:
++            for line in handle:
++                if line.lower().startswith("model name"):
++                    return line.split(":", 1)[1].strip()
++    except OSError:
++        pass
++    return platform.processor() or "unknown"
++
++
++def _mem_total_mib():
++    try:
++        with open("/proc/meminfo", encoding="utf-8") as handle:
++            for line in handle:
++                if line.startswith("MemTotal:"):
++                    return int(line.split()[1]) // 1024
++    except OSError:
++        pass
++    return None
++
++
++def _mem_available_mib():
++    try:
++        with open("/proc/meminfo", encoding="utf-8") as handle:
++            for line in handle:
++                if line.startswith("MemAvailable:"):
++                    return int(line.split()[1]) // 1024
++    except OSError:
++        pass
++    return None
++
++
++def _psi_cpu_avg10():
++    try:
++        with open("/proc/pressure/cpu", encoding="utf-8") as handle:
++            for line in handle:
++                if line.startswith("some"):
++                    for field in line.split()[1:]:
++                        if field.startswith("avg10="):
++                            return float(field.split("=", 1)[1])
++    except OSError:
++        pass
++    return None
++
++
++def _host_noise_sample() -> dict:
++    try:
++        load1 = os.getloadavg()[0]
++    except OSError:  # pragma: no cover
++        load1 = None
++    return {
++        "load1": load1,
++        "cpu_psi_avg10": _psi_cpu_avg10(),
++        "mem_available_mib": _mem_available_mib(),
++        "timestamp": time.time(),
++    }
++
++
++def _host_fingerprint(gpu: dict) -> str:
++    material = "|".join(
++        str(part)
++        for part in (
++            _cpu_model(),
++            len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count(),
++            ",".join(str(cpu) for cpu in sorted(os.sched_getaffinity(0))) if hasattr(os, "sched_getaffinity") else "unknown",
++            platform.release(),
++            "wsl2" if "microsoft" in platform.release().lower() else "linux",
++            gpu.get("name"),
++            gpu.get("driver_kmd"),
++            _mem_total_mib(),
++        )
++    )
++    import hashlib
++
++    return hashlib.sha256(material.encode("utf-8")).hexdigest()
++
++
++def _peak_rss_mib():
++    if _resource is None:
++        return None
++    return _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss / 1024.0
++
++
++def _round(value, digits=9):
++    return None if value is None else round(float(value), digits)
++
++
++# ---------------------------------------------------------------------------
++# cuBLAS binding (ctypes; no headers/compiler required)
++# ---------------------------------------------------------------------------
++
++
++CUBLAS_OP_N = 0
++CUDA_R_32F = 0
++CUDA_R_16BF = 14
++CUBLAS_COMPUTE_32F = 68
++CUBLAS_GEMM_DEFAULT = -1
++CUBLAS_DEFAULT_MATH = 0
++CUBLAS_STATUS_SUCCESS = 0
++
++
++class CublasError(RuntimeError):
++    pass
++
++
++class Cublas:
++    """Minimal cuBLAS binding for f32 SGEMM and bf16 GemmEx."""
++
++    _CANDIDATES = (
++        "/usr/local/cuda/lib64/libcublas.so.13",
++        "/usr/local/cuda/lib64/libcublas.so",
++        "libcublas.so.13",
++        "libcublas.so",
++    )
++
++    def __init__(self):
++        last_error = None
++        lt_candidates = (
++            "/usr/local/cuda/lib64/libcublasLt.so.13",
++            "/usr/local/cuda/lib64/libcublasLt.so",
++        )
++        for candidate in lt_candidates:
++            if Path(candidate).exists():
++                try:
++                    ctypes.CDLL(candidate, mode=ctypes.RTLD_GLOBAL)
++                except OSError:
++                    pass
++        self.path = None
++        for candidate in self._CANDIDATES:
++            try:
++                self.library = ctypes.CDLL(candidate)
++                self.path = candidate
++                break
++            except OSError as exc:
++                last_error = exc
++        else:  # pragma: no cover
++            raise CublasError("cuBLAS library not found: {}".format(last_error))
++
++        library = self.library
++        library.cublasCreate_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
++        library.cublasCreate_v2.restype = ctypes.c_int
++        library.cublasDestroy_v2.argtypes = [ctypes.c_void_p]
++        library.cublasDestroy_v2.restype = ctypes.c_int
++        library.cublasGetVersion_v2.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
++        library.cublasGetVersion_v2.restype = ctypes.c_int
++        library.cublasSetStream_v2.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
++        library.cublasSetStream_v2.restype = ctypes.c_int
++        library.cublasSetMathMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
++        library.cublasSetMathMode.restype = ctypes.c_int
++        library.cublasSgemm_v2.argtypes = [
++            ctypes.c_void_p,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.POINTER(ctypes.c_float),
++            ctypes.c_void_p,
++            ctypes.c_int,
++            ctypes.c_void_p,
++            ctypes.c_int,
++            ctypes.POINTER(ctypes.c_float),
++            ctypes.c_void_p,
++            ctypes.c_int,
++        ]
++        library.cublasSgemm_v2.restype = ctypes.c_int
++        # handle, transa, transb, m, n, k, alpha, A, Atype, lda, B, Btype, ldb,
++        # beta, C, Ctype, ldc, computeType, algo
++        library.cublasGemmEx.argtypes = [
++            ctypes.c_void_p,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.c_void_p,
++            ctypes.c_void_p,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.c_void_p,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.c_void_p,
++            ctypes.c_void_p,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.c_int,
++            ctypes.c_int,
++        ]
++        library.cublasGemmEx.restype = ctypes.c_int
++
++        handle = ctypes.c_void_p()
++        status = library.cublasCreate_v2(ctypes.byref(handle))
++        if status != CUBLAS_STATUS_SUCCESS:
++            raise CublasError("cublasCreate_v2 failed with status {}".format(status))
++        self.handle = handle
++        self._check("cublasSetMathMode", library.cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH))
++        self._check("cublasSetStream_v2", library.cublasSetStream_v2(handle, ctypes.c_void_p(0)))
++        version = ctypes.c_int(0)
++        self.version_raw = None
++        if library.cublasGetVersion_v2(handle, ctypes.byref(version)) == CUBLAS_STATUS_SUCCESS:
++            self.version_raw = int(version.value)
++
++    def _check(self, operation, status):
++        if status != CUBLAS_STATUS_SUCCESS:
++            raise CublasError("{} failed with status {}".format(operation, status))
++
++    def call(self, case: dict, left_ptr: int, right_ptr: int, out_ptr: int) -> None:
++        """Compute C(m,n) = A(m,k) @ B(k,n) with the buffer's row-major layout.
++
++        cuBLAS is column-major, so we compute C^T = B^T @ A^T on the same
++        storage: ``m`` and ``n`` are swapped and both operands are passed with
++        the identity transposition, which is the standard row-major mapping.
++        """
++
++        m, n, k, dtype = case["m"], case["n"], case["k"], case["dtype"]
++        if dtype == "float32":
++            alpha = ctypes.c_float(1.0)
++            beta = ctypes.c_float(0.0)
++            self._check(
++                "cublasSgemm_v2",
++                self.library.cublasSgemm_v2(
++                    self.handle,
++                    CUBLAS_OP_N,
++                    CUBLAS_OP_N,
++                    n,
++                    m,
++                    k,
++                    ctypes.byref(alpha),
++                    ctypes.c_void_p(int(right_ptr)),
++                    n,
++                    ctypes.c_void_p(int(left_ptr)),
++                    k,
++                    ctypes.byref(beta),
++                    ctypes.c_void_p(int(out_ptr)),
++                    n,
++                ),
++            )
++            return
++        if dtype == "bf16":
++            alpha = ctypes.c_float(1.0)
++            beta = ctypes.c_float(0.0)
++            self._check(
++                "cublasGemmEx",
++                self.library.cublasGemmEx(
++                    self.handle,
++                    CUBLAS_OP_N,
++                    CUBLAS_OP_N,
++                    n,
++                    m,
++                    k,
++                    ctypes.byref(alpha),
++                    ctypes.c_void_p(int(right_ptr)),
++                    CUDA_R_16BF,
++                    n,
++                    ctypes.c_void_p(int(left_ptr)),
++                    CUDA_R_16BF,
++                    k,
++                    ctypes.byref(beta),
++                    ctypes.c_void_p(int(out_ptr)),
++                    CUDA_R_16BF,
++                    n,
++                    CUBLAS_COMPUTE_32F,
++                    CUBLAS_GEMM_DEFAULT,
++                ),
++            )
++            return
++        raise CublasError("unsupported cuBLAS dtype {!r}".format(dtype))
++
++    def close(self) -> None:
++        if getattr(self, "handle", None):
++            self.library.cublasDestroy_v2(self.handle)
++            self.handle = None
++
++
++# ---------------------------------------------------------------------------
++# measurement primitives
++# ---------------------------------------------------------------------------
++
++
++def _gpu_request(case: dict, left_ptr: int, right_ptr: int, out_ptr: int) -> GpuLaunchRequest:
++    dtype, m, n, k = case["dtype"], case["m"], case["n"], case["k"]
++    return GpuLaunchRequest(
++        case["artifact"],
++        geometries=(case["plan"].geometry,),
++        inputs=(
++            TensorDesc(dtype, (m, k), device="gpu", address=left_ptr, readonly=True),
++            TensorDesc(dtype, (k, n), device="gpu", address=right_ptr, readonly=True),
++        ),
++        outputs=(TensorDesc(dtype, (m, n), device="gpu", address=out_ptr),),
++    )
++
++
++def _launch_cublas_timed(driver, cublas: Cublas, case: dict, left_ptr, right_ptr, out_ptr):
++    """One cuBLAS call bracketed by device events and a host wall clock."""
++
++    start_event = driver.event_create()
++    stop_event = driver.event_create()
++    try:
++        start_event.record(None)
++        wall_started = time.perf_counter()
++        cublas.call(case, left_ptr, right_ptr, out_ptr)
++        wall_seconds = time.perf_counter() - wall_started
++        stop_event.record(None)
++        driver.event_synchronize(stop_event)
++        kernel_seconds = start_event.elapsed_time_seconds(stop_event)
++    finally:
++        for event in (start_event, stop_event):
++            try:
++                event.close()
++            except Exception:
++                pass
++    dispatch_seconds = max(0.0, wall_seconds - kernel_seconds)
++    return {
++        "kernel_seconds": kernel_seconds,
++        "wall_seconds": wall_seconds,
++        "dispatch_seconds": dispatch_seconds,
++    }
++
++
++def _measure_side(repeats: int, warmup: int, launch_fn, launches_per_sample: int = 1) -> dict:
++    """Warmup (W=5 samples, acceptance rule) followed by R measured samples.
++
++    Each sample is the mean of ``launches_per_sample`` back-to-back timed
++    launches.  On WSL2 the GPU power state oscillates at a few-millisecond
++    granularity, so a single-launch sample can exceed the protocol's 3% cv
++    ceiling even when the underlying clock is asserted; the sample mean keeps
++    the R=21 sample count while averaging that platform jitter.  The raw
++    per-launch decomposition (kernel/dispatch) is preserved for every launch.
++    """
++
++    batch = max(1, int(launches_per_sample))
++
++    def sample_once():
++        kernel = 0.0
++        wall = 0.0
++        dispatch = 0.0
++        timed_region = 0.0
++        for _ in range(batch):
++            result = launch_fn()
++            kernel += result["kernel_seconds"]
++            wall += result["wall_seconds"]
++            dispatch += result.get("dispatch_seconds") or 0.0
++            timed_region += result.get("timed_region_wall_seconds") or 0.0
++        return {
++            "kernel_seconds": kernel / batch,
++            "wall_seconds": wall / batch,
++            "dispatch_seconds": dispatch / batch,
++            "timed_region_wall_seconds": timed_region / batch,
++            "launches": batch,
++        }
++
++    attempts = []
++    warmup_last = None
++    samples = []
++    for attempt in range(WARMUP_ATTEMPTS):
++        for _ in range(warmup):
++            warmup_last = sample_once()
++        attempt_samples = [sample_once() for _ in range(repeats)]
++        kernel = [sample["kernel_seconds"] for sample in attempt_samples]
++        first_five = kernel[:5]
++        smallest = min(first_five)
++        acceptance = (
++            abs(warmup_last["kernel_seconds"] - smallest) / smallest if smallest else None
++        )
++        accepted = acceptance is not None and acceptance < WARMUP_ACCEPTANCE
++        attempts.append(
++            {
++                "attempt": attempt + 1,
++                "warmup_samples": warmup,
++                "launches_per_sample": batch,
++                "last_warmup_kernel_seconds": warmup_last["kernel_seconds"],
++                "min_first_five_kernel_seconds": smallest,
++                "relative_gap": acceptance,
++                "accepted": accepted,
++            }
++        )
++        samples = attempt_samples
++        if accepted:
++            break
++    warmup_verdict = "PASS" if attempts[-1]["accepted"] else "INVALID_WARMUP"
++    return {
++        "warmup": {
++            "iterations": warmup,
++            "launches_per_sample": batch,
++            "acceptance_rule": "|last_warmup - min(first 5 measured)| / min(...) < 0.05",
++            "attempts": attempts,
++            "verdict": warmup_verdict,
++        },
++        "samples": samples,
++        "warmup_verdict": warmup_verdict,
++    }
++
++
++def _launch_ours_once(runtime: CudaRuntime, request):
++    _results, timing = runtime.launch_timed(request)
++    if timing.kernel_seconds is None:
++        raise RuntimeError("CUDA launch_timed returned no kernel_seconds: {}".format(timing.timing_error))
++    return {
++        "kernel_seconds": timing.kernel_seconds,
++        "wall_seconds": timing.wall_seconds,
++        "dispatch_seconds": timing.dispatch_seconds,
++        "timed_region_wall_seconds": timing.timed_region_wall_seconds,
++    }
++
++
++def _rate_calibration(driver, gap_seconds: float, rounds: int) -> dict:
++    """Kernel-free host-sleep spans -> cuEvent timer rate vs host wall clock."""
++
++    rates = []
++    spans = []
++    for _ in range(max(1, rounds)):
++        start_event = driver.event_create()
++        stop_event = driver.event_create()
++        try:
++            start_event.record(None)
++            host_started = time.perf_counter()
++            time.sleep(max(0.0, gap_seconds))
++            stop_event.record(None)
++            host_seconds = time.perf_counter() - host_started
++            driver.event_synchronize(stop_event)
++            event_seconds = start_event.elapsed_time_seconds(stop_event)
++        finally:
++            for event in (start_event, stop_event):
++                try:
++                    event.close()
++                except Exception:
++                    pass
++        rate = (host_seconds / event_seconds) if event_seconds else None
++        if rate is not None:
++            rates.append(rate)
++        spans.append(
++            {
++                "gap_seconds": gap_seconds,
++                "host_seconds": host_seconds,
++                "event_seconds": event_seconds,
++                "rate": rate,
++                "kernels_in_span": 0,
++            }
++        )
++    median_rate = statistics.median(rates) if rates else None
++    spread_pct = (
++        (max(rates) - min(rates)) / median_rate * 100.0 if len(rates) > 1 and median_rate else 0.0
++    )
++    return {
++        "method": "kernel-free host sleep inside one event pair; rate = host_wall / event_span",
++        "gap_seconds": gap_seconds,
++        "rounds": max(1, rounds),
++        "rates": rates,
++        "median_rate": median_rate,
++        "rate_offset_pct": ((median_rate - 1.0) * 100.0) if median_rate else None,
++        "spread_pct": spread_pct,
++        "spans": spans,
++    }
++
++
++# ---------------------------------------------------------------------------
++# G1 correctness
++# ---------------------------------------------------------------------------
++
++
++def _reference_matmul_fp64(left, right, m, n, k):
++    """Pure-Python float64 oracle (small shapes only)."""
++
++    output = [0.0] * (m * n)
++    for row in range(m):
++        base_left = row * k
++        base_out = row * n
++        for inner in range(k):
++            left_value = left[base_left + inner]
++            if left_value == 0.0:
++                continue
++            base_right = inner * n
++            for column in range(n):
++                output[base_out + column] += left_value * right[base_right + column]
++    return output
++
++
++def _integer_case_values(m, n, k):
++    left = [float(1 + ((row * 7 + inner * 3) % 6)) for row in range(m) for inner in range(k)]
++    right = [float(1 + ((inner * 5 + column * 2) % 6)) for inner in range(k) for column in range(n)]
++    return left, right
++
++
++def _random_case_values(m, n, k, seed=20260910):
++    import random
++
++    generator = random.Random(seed)
++    left = [generator.uniform(-1.0, 1.0) for _ in range(m * k)]
++    right = [generator.uniform(-1.0, 1.0) for _ in range(k * n)]
++    return left, right
++
++
++def _max_error(observed, expected):
++    max_abs = 0.0
++    max_rel = 0.0
++    for value, reference in zip(observed, expected):
++        difference = abs(value - reference)
++        max_abs = max(max_abs, difference)
++        if reference != 0.0:
++            max_rel = max(max_rel, difference / abs(reference))
++    return max_abs, max_rel
++
++
++def _tolerance(dtype: str):
++    # f32: far above the K*eps accumulation budget for K<=160 and O(1) inputs.
++    # bf16: about two bf16 ulps at O(1..10) result magnitude (final RNE store).
++    if dtype == "bf16":
++        return {"atol": 0.08, "rtol": 0.02}
++    return {"atol": 1.0e-3, "rtol": 1.0e-4}
++
++
++def _within_tolerance(observed, expected, tolerance) -> dict:
++    max_abs, max_rel = _max_error(observed, expected)
++    violations = 0
++    for value, reference in zip(observed, expected):
++        limit = tolerance["atol"] + tolerance["rtol"] * abs(reference)
++        if abs(value - reference) > limit:
++            violations += 1
++    return {
++        "max_abs": max_abs,
++        "max_rel": max_rel,
++        "atol": tolerance["atol"],
++        "rtol": tolerance["rtol"],
++        "violations": violations,
++        "pass": violations == 0,
++    }
++
++
++def _g1_small_shape(runtime: CudaRuntime, cublas: Cublas, dtype: str) -> dict:
++    """Integer-exact and random-tolerance checks against independent oracles."""
++
++    result = {}
++    for label, shape, values_fn, oracle_kind in (
++        ("integer_equivalence", SMALL_INTEGER_SHAPE, _integer_case_values, "exact"),
++        ("random_tolerance", SMALL_FLOAT_SHAPE, _random_case_values, "fp64"),
++    ):
++        m, n, k = shape
++        left, right = values_fn(m, n, k)
++        if dtype == "bf16":
++            left = [_round_to_dtype("bf16", value) for value in left]
++            right = [_round_to_dtype("bf16", value) for value in right]
++        case = _build_case(m, n, k, dtype, name="{}_{}".format(label, dtype))
++        left_ptr = runtime.driver.mem_alloc(len(left) * _itemsize(dtype))
++        right_ptr = runtime.driver.mem_alloc(len(right) * _itemsize(dtype))
++        out_ptr = runtime.driver.mem_alloc(m * n * _itemsize(dtype))
++        try:
++            runtime.driver.memcpy_htod(left_ptr, _pack_values(dtype, left))
++            runtime.driver.memcpy_htod(right_ptr, _pack_values(dtype, right))
++            request = _gpu_request(case, left_ptr, right_ptr, out_ptr)
++            runtime.launch(request)
++            ours = _unpack_values(dtype, runtime.driver.memcpy_dtoh(out_ptr, m * n * _itemsize(dtype)))
++            cublas.call(case, left_ptr, right_ptr, out_ptr)
++            runtime.driver.context_synchronize()
++            theirs = _unpack_values(dtype, runtime.driver.memcpy_dtoh(out_ptr, m * n * _itemsize(dtype)))
++        finally:
++            for pointer in (left_ptr, right_ptr, out_ptr):
++                try:
++                    runtime.driver.mem_free(pointer)
++                except Exception:
++                    pass
++        if oracle_kind == "exact":
++            exact = _reference_matmul_fp64(left, right, m, n, k)
++            expected = [_round_to_dtype(dtype, value) for value in exact]
++            ours_errors = _max_error(ours, expected)
++            theirs_errors = _max_error(theirs, expected)
++            pass_verdict = ours_errors[0] == 0.0 and theirs_errors[0] == 0.0
++            result[label] = {
++                "shape_m_n_k": [m, n, k],
++                "dtype": dtype,
++                "oracle": "exact integer arithmetic (all partial sums <= 2**24, f32-exact)",
++                "max_abs_partial_sum": max(abs(value) for value in exact),
++                "ours_vs_oracle": {"max_abs": ours_errors[0], "max_rel": ours_errors[1], "pass": ours_errors[0] == 0.0},
++                "cublas_vs_oracle": {
++                    "max_abs": theirs_errors[0],
++                    "max_rel": theirs_errors[1],
++                    "pass": theirs_errors[0] == 0.0,
++                },
++                "ours_bitwise_equal_cublas": ours == theirs,
++                "pass": pass_verdict,
++            }
++        else:
++            expected = _reference_matmul_fp64(left, right, m, n, k)
++            tolerance = _tolerance(dtype)
++            ours_check = _within_tolerance(ours, expected, tolerance)
++            theirs_check = _within_tolerance(theirs, expected, tolerance)
++            cross = _max_error(ours, theirs)
++            result[label] = {
++                "shape_m_n_k": [m, n, k],
++                "dtype": dtype,
++                "oracle": "pure-python float64 triple loop",
++                "tolerance": tolerance,
++                "ours_vs_oracle": ours_check,
++                "cublas_vs_oracle": theirs_check,
++                "ours_vs_cublas": {"max_abs": cross[0], "max_rel": cross[1]},
++                "pass": ours_check["pass"] and theirs_check["pass"],
++            }
++    result["status"] = "PASS" if all(entry.get("pass") for key, entry in result.items() if key != "status") else "FAIL"
++    return result
++
++
++def _g1_full_shape_ones(runtime: CudaRuntime, cublas: Cublas, case: dict, left_ptr, right_ptr, out_ptr) -> dict:
++    """Full measured shape: 1.0 x 1.0 -> every output must be exactly K."""
++
++    m, n, k, dtype = case["m"], case["n"], case["k"], case["dtype"]
++    pattern = _ones_pattern(dtype)
++    runtime.driver.memcpy_htod(left_ptr, pattern * (m * k))
++    runtime.driver.memcpy_htod(right_ptr, pattern * (k * n))
++    request = _gpu_request(case, left_ptr, right_ptr, out_ptr)
++    runtime.launch(request)
++    size = m * n * _itemsize(dtype)
++    ours_raw = runtime.driver.memcpy_dtoh(out_ptr, size)
++    cublas.call(case, left_ptr, right_ptr, out_ptr)
++    runtime.driver.context_synchronize()
++    theirs_raw = runtime.driver.memcpy_dtoh(out_ptr, size)
++    expected_word = _float_word(dtype, float(k))
++    expected_raw = expected_word * (m * n)
++
++    def first_mismatch(raw):
++        if raw == expected_raw:
++            return None
++        stride = _itemsize(dtype)
++        for index in range(m * n):
++            if raw[index * stride : (index + 1) * stride] != expected_word:
++                return index
++        return None
++
++    return {
++        "shape_m_n_k": [m, n, k],
++        "dtype": dtype,
++        "inputs": "all ones",
++        "expected_value": float(k),
++        "expected_exact": True,
++        "ours_pass": ours_raw == expected_raw,
++        "cublas_pass": theirs_raw == expected_raw,
++        "ours_first_mismatch_index": first_mismatch(ours_raw),
++        "cublas_first_mismatch_index": first_mismatch(theirs_raw),
++        "output_elements": m * n,
++    }
++
++
++# ---------------------------------------------------------------------------
++# one round
++# ---------------------------------------------------------------------------
++
++
++def _case_key(case: dict, affinity: str) -> dict:
++    return {
++        "op": "matmul",
++        "shape_tuple": [case["m"], case["n"], case["k"]],
++        "dtype": case["dtype"],
++        "isa": case["ptx_target"],
++        "cpu_affinity": affinity,
++    }
++
++
++def _parse_affinity(spec: str):
++    """Parse ``0-5``/``0,1,2`` into a set of CPU ids."""
++
++    result = set()
++    for part in spec.split(","):
++        part = part.strip()
++        if not part:
++            continue
++        if "-" in part:
++            start, end = part.split("-", 1)
++            result.update(range(int(start), int(end) + 1))
++        else:
++            result.add(int(part))
++    return result
++
++
++def run_round(args) -> dict:
++    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++    cases_spec = list(DEFAULT_CASES)
++    if args.cases_json:
++        cases_spec = json.loads(args.cases_json)
++    if args.only_case:
++        wanted = set(args.only_case)
++        cases_spec = [spec for spec in cases_spec if spec["name"] in wanted]
++        if not cases_spec:
++            raise SystemExit("--only-case matched no case: {}".format(sorted(wanted)))
++
++    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else []
++    affinity_label = args.affinity or ",".join(str(cpu) for cpu in affinity)
++    requested_affinity = _parse_affinity(affinity_label) if affinity_label else set(affinity)
++    affinity_matches = set(affinity) == set(requested_affinity)
++
++    fingerprint_before = _nvidia_smi_fingerprint()
++    noise_before = _host_noise_sample()
++    gpu = {
++        "name": (fingerprint_before.get("raw_csv") or "").split(",")[0].strip(),
++        "driver_kmd": fingerprint_before.get("driver_kmd"),
++        "cuda_umd": fingerprint_before.get("cuda_umd"),
++    }
++
++    runtime = CudaRuntime()
++    if not runtime.is_available():
++        raise SystemExit("CUDA device unavailable: {}".format(runtime.availability().to_dict()))
++    runtime._ensure_context()
++    cublas = Cublas()
++
++    environment_freeze = {
++        "uname": " ".join(platform.uname()),
++        "python": sys.version.split()[0],
++        "cpu_model": _cpu_model(),
++        "nproc_online": len(affinity) if affinity else os.cpu_count(),
++        "cpu_affinity": affinity,
++        "cpu_affinity_label": affinity_label,
++        "requested_affinity": sorted(requested_affinity),
++        "affinity_matches_requested": affinity_matches,
++        "virtualization": "wsl2" if "microsoft" in platform.release().lower() else platform.system(),
++        "mem_total_mib": _mem_total_mib(),
++        "gpu_name": gpu["name"],
++        "driver_kmd": gpu["driver_kmd"],
++        "cuda_umd": gpu["cuda_umd"],
++        "cublas_path": cublas.path,
++        "cublas_version_raw": cublas.version_raw,
++        "ptx_target": DEFAULT_PTX_TARGET,
++        "ptx_version": CUDA_PTX_VERSION,
++        "execution_model": "op_by_op_dispatch",
++        "weights_loaded": False,
++    }
++
++    # Build every case up front so lowering/compile time is outside the
++    # measured section and every round validates the same artifacts.
++    built_cases = []
++    for spec in cases_spec:
++        case = _build_case(spec["m"], spec["n"], spec["k"], spec["dtype"], name=spec["name"])
++        case["keys"] = _case_key(case, affinity_label)
++        case["left_ptr"] = runtime.driver.mem_alloc(case["m"] * case["k"] * _itemsize(case["dtype"]))
++        case["right_ptr"] = runtime.driver.mem_alloc(case["k"] * case["n"] * _itemsize(case["dtype"]))
++        case["out_ptr"] = runtime.driver.mem_alloc(case["m"] * case["n"] * _itemsize(case["dtype"]))
++        case["request"] = _gpu_request(case, case["left_ptr"], case["right_ptr"], case["out_ptr"])
++        built_cases.append(case)
++
++    g1 = {
++        "small_shape": {dtype: _g1_small_shape(runtime, cublas, dtype) for dtype in ("float32", "bf16")},
++        "full_shape_ones": {},
++    }
++    for case in built_cases:
++        g1["full_shape_ones"][case["name"]] = _g1_full_shape_ones(
++            runtime, cublas, case, case["left_ptr"], case["right_ptr"], case["out_ptr"]
++        )
++    g1["status"] = (
++        "PASS"
++        if all(entry["status"] == "PASS" for entry in g1["small_shape"].values())
++        and all(
++            entry["ours_pass"] and entry["cublas_pass"] for entry in g1["full_shape_ones"].values()
++        )
++        else "FAIL"
++    )
++
++    # Refill timed buffers with ones so the timed launches never see
++    # uninitialized/denormal data (the ones check above already did this).
++    for case in built_cases:
++        runtime.driver.memcpy_htod(case["left_ptr"], _ones_pattern(case["dtype"]) * (case["m"] * case["k"]))
++        runtime.driver.memcpy_htod(case["right_ptr"], _ones_pattern(case["dtype"]) * (case["k"] * case["n"]))
++
++    # Protocol clock warmup: keep the device busy for >= clock-warmup seconds
++    # before any clock sample is taken, and keep it busy while sampling.
++    largest = max(built_cases, key=lambda entry: entry["m"] * entry["n"] * entry["k"])
++    clock_deadline = time.perf_counter() + max(0.0, args.clock_warmup_seconds)
++    clock_launches = 0
++    while time.perf_counter() < clock_deadline and clock_launches < 200:
++        runtime.launch(largest["request"])
++        clock_launches += 1
++
++    sampler = _ClockSampler(interval=args.clock_interval)
++    sampler.start()
++    case_results = []
++    try:
++        for case in built_cases:
++            ours_side = _measure_side(
++                args.repeats,
++                args.warmup,
++                lambda current=case: _launch_ours_once(runtime, current["request"]),
++                args.launches_per_sample,
++            )
++            cublas_side = _measure_side(
++                args.repeats,
++                args.warmup,
++                lambda current=case: _launch_cublas_timed(
++                    runtime.driver, cublas, current, current["left_ptr"], current["right_ptr"], current["out_ptr"]
++                ),
++                args.launches_per_sample,
++            )
++            case_results.append({"case": case, "ours": ours_side, "cublas": cublas_side})
++    finally:
++        sampler.stop()
++
++    # Timer rate calibration runs after the clock samples: its sleep spans
++    # would otherwise let the device clocks drop.
++    calibration = _rate_calibration(runtime.driver, args.rate_gap_seconds, args.calibration_rounds)
++    event_timer_rate = calibration.get("median_rate")
++
++    clock_values = [sample["clocks_sm_mhz"] for sample in sampler.samples]
++    clock_max = max([sample["clocks_max_sm_mhz"] for sample in sampler.samples] or [0])
++    clock_sm = statistics.median(clock_values) if clock_values else None
++    clock_ratio = (clock_sm / clock_max) if clock_sm and clock_max else None
++    clock_verdict = "VALID" if clock_ratio is not None and clock_ratio >= CLOCK_RATIO_MIN else "INVALID_CLOCK"
++    limits = VARIANCE_LIMITS_LOCKED if clock_verdict == "VALID" else VARIANCE_LIMITS_UNLOCKED
++
++    cases_out = []
++    for result in case_results:
++        case = result["case"]
++        ours_samples = result["ours"]["samples"]
++        cublas_samples = result["cublas"]["samples"]
++        ours_kernel = [sample["kernel_seconds"] for sample in ours_samples]
++        cublas_kernel = [sample["kernel_seconds"] for sample in cublas_samples]
++        ours_disp = _dispersion(ours_kernel)
++        cublas_disp = _dispersion(cublas_kernel)
++        ours_wall = _dispersion([sample["wall_seconds"] for sample in ours_samples])
++        ours_dispatch = _dispersion(
++            [sample["dispatch_seconds"] for sample in ours_samples if sample["dispatch_seconds"] is not None]
++        )
++        cublas_wall = _dispersion([sample["wall_seconds"] for sample in cublas_samples])
++        cublas_dispatch = _dispersion(
++            [sample["dispatch_seconds"] for sample in cublas_samples if sample["dispatch_seconds"] is not None]
++        )
++        ours_corrected = (
++            ours_disp["median"] * event_timer_rate if event_timer_rate and ours_disp.get("median") else None
++        )
++        cublas_corrected = (
++            cublas_disp["median"] * event_timer_rate if event_timer_rate and cublas_disp.get("median") else None
++        )
++        ratio = (
++            ours_corrected / cublas_corrected if ours_corrected and cublas_corrected else None
++        )
++        dispatch_median = ours_dispatch.get("median")
++        dispatch_share = (
++            dispatch_median / ours_wall["median"] if dispatch_median is not None and ours_wall.get("median") else None
++        )
++        dispatch_dominated = (
++            dispatch_median is not None and ours_disp.get("median") is not None and ours_disp["median"] <= dispatch_median
++        )
++        ours_verdict = _variance_verdict(ours_disp, limits)
++        cublas_verdict = _variance_verdict(cublas_disp, limits)
++        flops = 2.0 * case["m"] * case["n"] * case["k"]
++        cases_out.append(
++            {
++                "name": case["name"],
++                "key": case["keys"],
++                "shape_m_n_k": [case["m"], case["n"], case["k"]],
++                "flops": flops,
++                "flop_accounting": "2 * B * M * N * K (B=1)",
++                "measurement": {
++                    "level": "L0_op",
++                    "execution_model": "op_by_op_dispatch",
++                    "r": args.repeats,
++                    "warmup_samples": args.warmup,
++                    "launches_per_sample": args.launches_per_sample,
++                    "total_launches_per_side": args.repeats * args.launches_per_sample,
++                    "sample_kind": "mean of launches_per_sample back-to-back timed launches",
++                },
++                "lowering": {
++                    "lower_seconds": _round(case["lower_seconds"]),
++                    "compile_seconds": _round(case["compile_seconds"]),
++                    "ptx_target": case["ptx_target"],
++                    "ptx_version": case["ptx_version"],
++                    "ptx_bytes": case["ptx_bytes"],
++                    "artifact_bytes": case["artifact_bytes"],
++                    "ptx_digest": case["ptx_digest"],
++                    "plan_digest": case["plan_digest"],
++                    "program_digest": case["program_digest"],
++                    "kernel_count": case["kernel_count"],
++                },
++                "g1": g1["full_shape_ones"][case["name"]],
++                "pypto_x": {
++                    "warmup": result["ours"]["warmup"],
++                    "statistics": {
++                        "kernel_seconds": ours_disp,
++                        "wall_seconds": ours_wall,
++                        "dispatch_seconds": ours_dispatch,
++                        "variance_limits": limits,
++                        "verdict": ours_verdict,
++                    },
++                    "metrics": {
++                        "kernel_seconds_median": ours_disp.get("median"),
++                        "kernel_seconds_corrected_median": ours_corrected,
++                        "wall_seconds_median": ours_wall.get("median"),
++                        "dispatch_seconds_median": dispatch_median,
++                        "dispatch_share_of_wall": dispatch_share,
++                        "dispatch_dominated": dispatch_dominated,
++                        "gflops": (flops / ours_corrected / 1.0e9) if ours_corrected else None,
++                        "gflops_scope": "kernel_only",
++                    },
++                    "samples": {
++                        "kernel_seconds": [_round(value) for value in ours_kernel],
++                        "wall_seconds": [_round(sample["wall_seconds"]) for sample in ours_samples],
++                        "dispatch_seconds": [
++                            _round(sample["dispatch_seconds"]) for sample in ours_samples
++                        ],
++                    },
++                },
++                "cublas": {
++                    "warmup": result["cublas"]["warmup"],
++                    "library": cublas.path,
++                    "version_raw": cublas.version_raw,
++                    "api": "cublasSgemm_v2" if case["dtype"] == "float32" else "cublasGemmEx",
++                    "compute_type": "CUBLAS_COMPUTE_32F" if case["dtype"] == "bf16" else "f32",
++                    "statistics": {
++                        "kernel_seconds": cublas_disp,
++                        "wall_seconds": cublas_wall,
++                        "dispatch_seconds": cublas_dispatch,
++                        "variance_limits": limits,
++                        "verdict": cublas_verdict,
++                    },
++                    "metrics": {
++                        "kernel_seconds_median": cublas_disp.get("median"),
++                        "kernel_seconds_corrected_median": cublas_corrected,
++                        "wall_seconds_median": cublas_wall.get("median"),
++                        "dispatch_seconds_median": cublas_dispatch.get("median"),
++                        "gflops": (flops / cublas_corrected / 1.0e9) if cublas_corrected else None,
++                        "gflops_scope": "kernel_only",
++                    },
++                    "samples": {
++                        "kernel_seconds": [_round(value) for value in cublas_kernel],
++                        "wall_seconds": [_round(sample["wall_seconds"]) for sample in cublas_samples],
++                    },
++                },
++                "ratio": {
++                    "measured_ratio_raw": (
++                        ours_disp["median"] / cublas_disp["median"]
++                        if ours_disp.get("median") and cublas_disp.get("median")
++                        else None
++                    ),
++                    "measured_ratio_corrected": ratio,
++                    "definition": "pypto_x_median / cublas_median (time ratio, lower is better)",
++                },
++                "stability": {
++                    "rounds": 1,
++                    "r": args.repeats,
++                    "cv_max": limits["cv"],
++                    "p95_over_median_max": limits["p95_over_median"],
++                    "pypto_x_verdict": ours_verdict,
++                    "cublas_verdict": cublas_verdict,
++                    "warmup_verdict": result["ours"]["warmup_verdict"],
++                    "verdict": (
++                        "VALID"
++                        if ours_verdict == "VALID"
++                        and cublas_verdict == "VALID"
++                        and result["ours"]["warmup_verdict"] == "PASS"
++                        else "INVALID"
++                    ),
++                },
++            }
++        )
++
++    runtime.close()
++    fingerprint_after = _nvidia_smi_fingerprint()
++    noise_after = _host_noise_sample()
++    finished_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++
++    host_fingerprint = _host_fingerprint(gpu)
++    gpu_evidence = {
++        "name": gpu["name"],
++        "driver_kmd": gpu["driver_kmd"],
++        "cuda_umd": gpu["cuda_umd"],
++        "fingerprint_before": fingerprint_before,
++        "fingerprint_after": fingerprint_after,
++        "compute_processes_before_empty": fingerprint_before["compute_apps_empty"],
++        "compute_processes_after_empty": fingerprint_after["compute_apps_empty"],
++        "clock_samples": sampler.samples,
++        "clocks_sm_mhz_p50_under_load": clock_sm,
++        "clocks_sm_mhz_min_under_load": min(clock_values) if clock_values else None,
++        "clocks_sm_mhz_max_under_load": max(clock_values) if clock_values else None,
++        "clocks_max_sm_mhz": clock_max,
++        "clock_ratio": clock_ratio,
++        "clock_verdict": clock_verdict,
++        "clock_warmup_seconds": args.clock_warmup_seconds,
++        "clock_warmup_launches": clock_launches,
++    }
++    noise_verdict = "VALID"
++    for sample in (noise_before, noise_after):
++        if sample["load1"] is not None and sample["load1"] >= (len(affinity) or os.cpu_count()) * HOST_LOAD_MAX_RATIO:
++            noise_verdict = "ENV_NOISY"
++        if sample["cpu_psi_avg10"] is not None and sample["cpu_psi_avg10"] >= HOST_PSI_MAX_AVG10:
++            noise_verdict = "ENV_NOISY"
++        if sample["mem_available_mib"] is not None and sample["mem_available_mib"] <= 4096:
++            noise_verdict = "ENV_NOISY"
++
++    status = "PASS"
++    if g1["status"] != "PASS" or clock_verdict != "VALID" or noise_verdict != "VALID":
++        status = "FAIL"
++    if not affinity_matches:
++        status = "FAIL"
++    blocking = [
++        entry
++        for entry in cases_out
++        if not entry["pypto_x"]["metrics"]["dispatch_dominated"]
++    ]
++    if not blocking:
++        status = "FAIL"
++    if any(entry["stability"]["verdict"] != "VALID" for entry in blocking):
++        status = "FAIL"
++
++    evidence = {
++        "schema_version": 1,
++        "artifact_kind": "pypto-x.perf-evidence",
++        "evidence_role": "raw_round",
++        "task": TASK,
++        "agent": args.agent,
++        "round": args.round,
++        "started_at_utc": started_at,
++        "finished_at_utc": finished_at,
++        "git": {
++            "repository": "upstream/pypto",
++            "head": args.git_head,
++            "branch": args.git_branch,
++        },
++        "host": {
++            "class": "nvidia-5080-wsl2",
++            "fingerprint": host_fingerprint,
++            "uname": environment_freeze["uname"],
++            "python": environment_freeze["python"],
++            "nproc_online": environment_freeze["nproc_online"],
++            "cpu_affinity": affinity,
++            "cpu_affinity_label": affinity_label,
++            "requested_affinity": sorted(requested_affinity),
++            "affinity_matches_requested": affinity_matches,
++            "cpu_model": environment_freeze["cpu_model"],
++            "virtualization": environment_freeze["virtualization"],
++            "mem_total_mib": environment_freeze["mem_total_mib"],
++            "mem_available_before_mib": noise_before["mem_available_mib"],
++            "mem_available_after_mib": noise_after["mem_available_mib"],
++            "noise": {
++                "samples": [noise_before, noise_after],
++                "load1_max": max(
++                    [
++                        sample["load1"]
++                        for sample in (noise_before, noise_after)
++                        if sample["load1"] is not None
++                    ]
++                    or [0.0]
++                ),
++                "cpu_psi_avg10_max": max(
++                    [
++                        sample["cpu_psi_avg10"]
++                        for sample in (noise_before, noise_after)
++                        if sample["cpu_psi_avg10"] is not None
++                    ]
++                    or [0.0]
++                ),
++                "verdict": noise_verdict,
++            },
++            "gpu": gpu_evidence,
++        },
++        "environment_freeze": environment_freeze,
++        "timer_calibration": calibration,
++        "metrics": {
++            "event_timer_rate": event_timer_rate,
++            "event_timer_rate_offset_pct": calibration.get("rate_offset_pct"),
++            "event_timer_rate_spread_pct": calibration.get("spread_pct"),
++            "platform_flags": (
++                ["wsl2_cuevent_rate_offset"]
++                if event_timer_rate is not None and abs(event_timer_rate - 1.0) * 100.0 > 5.0
++                else []
++            ),
++            "peak_rss_mib": _peak_rss_mib(),
++            "gflops_scope": "kernel_only",
++        },
++        "g1_correctness": g1,
++        "cases": [
++            {key: value for key, value in case.items()}
++            for case in cases_out
++        ],
++        "host_fingerprint": host_fingerprint,
++        "status": status,
++    }
++    return evidence
++
++
++def run_g1_only(args) -> dict:
++    """Deterministic correctness verification only: no timing, no warmup loops.
++
++    This mode exists so G1 can be validated while the measurement window is
++    contended (for example while GamePC is used interactively).  It compiles
++    the selected artifacts, runs the exact-integer / float64-oracle / full-shape
++    ones checks, records the environment fingerprint, and performs **no**
++    clock sampling, rate calibration or timed launch series.
++    """
++
++    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
++    cases_spec = list(DEFAULT_CASES)
++    if args.cases_json:
++        cases_spec = json.loads(args.cases_json)
++    if args.only_case:
++        wanted = set(args.only_case)
++        cases_spec = [spec for spec in cases_spec if spec["name"] in wanted]
++        if not cases_spec:
++            raise SystemExit("--only-case matched no case: {}".format(sorted(wanted)))
++
++    affinity = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else []
++    affinity_label = args.affinity or ",".join(str(cpu) for cpu in affinity)
++    requested_affinity = _parse_affinity(affinity_label) if affinity_label else set(affinity)
++    affinity_matches = set(affinity) == set(requested_affinity)
++
++    fingerprint_before = _nvidia_smi_fingerprint()
++    noise_before = _host_noise_sample()
++    gpu = {
++        "name": (fingerprint_before.get("raw_csv") or "").split(",")[0].strip(),
++        "driver_kmd": fingerprint_before.get("driver_kmd"),
++        "cuda_umd": fingerprint_before.get("cuda_umd"),
++    }
++
++    runtime = CudaRuntime()
++    if not runtime.is_available():
++        raise SystemExit("CUDA device unavailable: {}".format(runtime.availability().to_dict()))
++    runtime._ensure_context()
++    cublas = Cublas()
++
++    environment_freeze = {
++        "uname": " ".join(platform.uname()),
++        "python": sys.version.split()[0],
++        "cpu_model": _cpu_model(),
++        "nproc_online": len(affinity) if affinity else os.cpu_count(),
++        "cpu_affinity": affinity,
++        "cpu_affinity_label": affinity_label,
++        "requested_affinity": sorted(requested_affinity),
++        "affinity_matches_requested": affinity_matches,
++        "virtualization": "wsl2" if "microsoft" in platform.release().lower() else platform.system(),
++        "mem_total_mib": _mem_total_mib(),
++        "gpu_name": gpu["name"],
++        "driver_kmd": gpu["driver_kmd"],
++        "cuda_umd": gpu["cuda_umd"],
++        "cublas_path": cublas.path,
++        "cublas_version_raw": cublas.version_raw,
++        "ptx_target": DEFAULT_PTX_TARGET,
++        "ptx_version": CUDA_PTX_VERSION,
++        "execution_model": "op_by_op_dispatch",
++        "weights_loaded": False,
++    }
++
++    built_cases = []
++    for spec in cases_spec:
++        case = _build_case(spec["m"], spec["n"], spec["k"], spec["dtype"], name=spec["name"])
++        case["keys"] = _case_key(case, affinity_label)
++        case["left_ptr"] = runtime.driver.mem_alloc(case["m"] * case["k"] * _itemsize(case["dtype"]))
++        case["right_ptr"] = runtime.driver.mem_alloc(case["k"] * case["n"] * _itemsize(case["dtype"]))
++        case["out_ptr"] = runtime.driver.mem_alloc(case["m"] * case["n"] * _itemsize(case["dtype"]))
++        built_cases.append(case)
++
++    g1 = {
++        "small_shape": {dtype: _g1_small_shape(runtime, cublas, dtype) for dtype in ("float32", "bf16")},
++        "full_shape_ones": {},
++    }
++    try:
++        for case in built_cases:
++            g1["full_shape_ones"][case["name"]] = _g1_full_shape_ones(
++                runtime, cublas, case, case["left_ptr"], case["right_ptr"], case["out_ptr"]
++            )
++    finally:
++        for case in built_cases:
++            for key in ("left_ptr", "right_ptr", "out_ptr"):
++                try:
++                    runtime.driver.mem_free(case[key])
++                except Exception:
++                    pass
++    runtime.close()
++    g1["status"] = (
++        "PASS"
++        if all(entry["status"] == "PASS" for entry in g1["small_shape"].values())
++        and all(
++            entry["ours_pass"] and entry["cublas_pass"] for entry in g1["full_shape_ones"].values()
++        )
++        else "FAIL"
++    )
++
++    fingerprint_after = _nvidia_smi_fingerprint()
++    noise_after = _host_noise_sample()
++    host_fingerprint = _host_fingerprint(gpu)
++    status = "PASS" if g1["status"] == "PASS" else "FAIL"
++    return {
++        "schema_version": 1,
++        "artifact_kind": "pypto-x.perf-evidence",
++        "evidence_role": "g1_only",
++        "task": TASK,
++        "agent": args.agent,
++        "started_at_utc": started_at,
++        "finished_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++        "git": {
++            "repository": "upstream/pypto",
++            "head": args.git_head,
++            "branch": args.git_branch,
++        },
++        "host": {
++            "class": "nvidia-5080-wsl2",
++            "fingerprint": host_fingerprint,
++            "cpu_affinity": affinity,
++            "affinity_matches_requested": affinity_matches,
++            "gpu": {
++                "name": gpu["name"],
++                "driver_kmd": gpu["driver_kmd"],
++                "cuda_umd": gpu["cuda_umd"],
++                "fingerprint_before": fingerprint_before,
++                "fingerprint_after": fingerprint_after,
++                "compute_processes_before_empty": fingerprint_before["compute_apps_empty"],
++                "compute_processes_after_empty": fingerprint_after["compute_apps_empty"],
++                "note": "contended-window fingerprint; no clock assertion and no timing in this mode",
++            },
++            "noise": {"samples": [noise_before, noise_after]},
++        },
++        "host_fingerprint": host_fingerprint,
++        "environment_freeze": environment_freeze,
++        "timing_performed": False,
++        "g1_correctness": g1,
++        "status": status,
++    }
++
++
++# ---------------------------------------------------------------------------
++# aggregation (candidate_ratio only; no threshold freezing)
++# ---------------------------------------------------------------------------
++
++
++def _case_by_name(round_evidence: dict, name: str):
++    for case in round_evidence.get("cases", []):
++        if case["name"] == name:
++            return case
++    return None
++
++
++def aggregate(args) -> dict:
++    rounds = []
++    for path in args.rounds:
++        rounds.append(json.loads(Path(path).read_text(encoding="utf-8")))
++    if len(rounds) != 3:
++        raise SystemExit("aggregate requires exactly 3 round files")
++    first = rounds[0]
++    names = [case["name"] for case in first["cases"]]
++    ratios_out = []
++    stability_out = []
++    for name in names:
++        per_round = []
++        for index, round_evidence in enumerate(rounds, start=1):
++            case = _case_by_name(round_evidence, name)
++            if case is None:
++                raise SystemExit("round {} is missing case {!r}".format(index, name))
++            per_round.append(
++                {
++                    "round": index,
++                    "pypto_x_kernel_seconds_median": case["pypto_x"]["metrics"]["kernel_seconds_median"],
++                    "pypto_x_kernel_seconds_corrected_median": case["pypto_x"]["metrics"]["kernel_seconds_corrected_median"],
++                    "cublas_kernel_seconds_median": case["cublas"]["metrics"]["kernel_seconds_median"],
++                    "cublas_kernel_seconds_corrected_median": case["cublas"]["metrics"]["kernel_seconds_corrected_median"],
++                    "measured_ratio_raw": case["ratio"]["measured_ratio_raw"],
++                    "measured_ratio_corrected": case["ratio"]["measured_ratio_corrected"],
++                    "pypto_x_cv_over_median": case["pypto_x"]["statistics"]["kernel_seconds"]["cv_over_median"],
++                    "pypto_x_p95_over_median": case["pypto_x"]["statistics"]["kernel_seconds"]["p95_over_median"],
++                    "cublas_cv_over_median": case["cublas"]["statistics"]["kernel_seconds"]["cv_over_median"],
++                    "cublas_p95_over_median": case["cublas"]["statistics"]["kernel_seconds"]["p95_over_median"],
++                    "dispatch_share_of_wall": case["pypto_x"]["metrics"]["dispatch_share_of_wall"],
++                    "dispatch_dominated": case["pypto_x"]["metrics"]["dispatch_dominated"],
++                    "launches_per_sample": case.get("measurement", {}).get("launches_per_sample"),
++                    "stability_verdict": case["stability"]["verdict"],
++                    "g1_pass": bool(case["g1"]["ours_pass"] and case["g1"]["cublas_pass"]),
++                }
++            )
++        medians = [entry["pypto_x_kernel_seconds_corrected_median"] for entry in per_round]
++        cublas_medians = [entry["cublas_kernel_seconds_corrected_median"] for entry in per_round]
++        measured_ratios = [entry["measured_ratio_corrected"] for entry in per_round]
++        candidate_ratio = statistics.median(measured_ratios)
++        median_of_medians = statistics.median(medians)
++        median_spread_ratio = (
++            (max(medians) - min(medians)) / median_of_medians if median_of_medians else None
++        )
++        median_spread_ok = median_spread_ratio is not None and median_spread_ratio <= MEDIAN_SPREAD_LIMIT
++        g1_pass = all(entry["g1_pass"] for entry in per_round)
++        g2_pass = all(entry["stability_verdict"] == "VALID" for entry in per_round) and median_spread_ok
++        dispatch_dominated = all(entry["dispatch_dominated"] for entry in per_round)
++        clock_ok = all(
++            round_evidence["host"]["gpu"]["clock_verdict"] == "VALID" for round_evidence in rounds
++        )
++        noise_ok = all(
++            round_evidence["host"]["noise"]["verdict"] == "VALID" for round_evidence in rounds
++        )
++        gate_eligible = bool(
++            g1_pass
++            and g2_pass
++            and noise_ok
++            and clock_ok
++            and not dispatch_dominated
++            and all(round_evidence["status"] == "PASS" for round_evidence in rounds)
++        )
++        key = first["cases"][names.index(name)]["key"]
++        ratio_entry = {
++            "key": key,
++            "baseline": {
++                "tier": "T1_vendor_gpu_lib",
++                "name": "cublas",
++                "availability": "available",
++                "version_raw": rounds[0]["environment_freeze"].get("cublas_version_raw"),
++                "median": statistics.median(cublas_medians),
++                "median_definition": "median over 3 rounds of cuBLAS kernel_seconds_corrected_median",
++                "ratio": candidate_ratio,
++            },
++            "pypto_x_median": median_of_medians,
++            "cublas_median": statistics.median(cublas_medians),
++            "candidate_ratio": candidate_ratio,
++            "frozen_ratio": None,
++            "approved_by": None,
++            "approved_at": None,
++            "measured_ratios": measured_ratios,
++            "per_round": per_round,
++            "stability": {
++                "rounds": 3,
++                "measured_iterations_per_round": args.repeats,
++                "per_round_verdicts": [entry["stability_verdict"] for entry in per_round],
++                "median_spread_ratio": median_spread_ratio,
++                "median_spread_limit": MEDIAN_SPREAD_LIMIT,
++                "median_spread_ok": median_spread_ok,
++                "verdict": "VALID" if g2_pass else "INVALID",
++            },
++            "dispatch": {
++                "dispatch_seconds_median": statistics.median(
++                    [
++                        _case_by_name(round_evidence, name)["pypto_x"]["metrics"]["dispatch_seconds_median"]
++                        for round_evidence in rounds
++                    ]
++                ),
++                "dispatch_share_of_wall": statistics.median(
++                    [entry["dispatch_share_of_wall"] for entry in per_round]
++                ),
++                "dispatch_dominated": dispatch_dominated,
++                "rule": "dispatch_dominated when kernel_seconds <= dispatch_seconds; such numbers do not enter the ratio gate",
++            },
++            "gate_eligible": gate_eligible,
++        }
++        ratios_out.append(ratio_entry)
++        stability_out.append(
++            {
++                "key": key,
++                "confidence": candidate_ratio,
++                "verdict": ratio_entry["stability"]["verdict"],
++                "median_spread_ratio": median_spread_ratio,
++                "per_round": per_round,
++            }
++        )
++
++    host_consistent = len({round_evidence["host_fingerprint"] for round_evidence in rounds}) == 1
++    head_consistent = len({round_evidence["git"]["head"] for round_evidence in rounds}) == 1
++    affinity_consistent = (
++        len(
++            {
++                tuple(round_evidence.get("host", {}).get("cpu_affinity", []))
++                for round_evidence in rounds
++            }
++        )
++        == 1
++    )
++    if not (host_consistent and head_consistent and affinity_consistent):
++        for entry in ratios_out:
++            entry["gate_eligible"] = False
++    eligible = [entry for entry in ratios_out if entry["gate_eligible"]]
++    primary = (
++        max(eligible, key=lambda entry: entry["key"]["shape_tuple"][0] * entry["key"]["shape_tuple"][1] * entry["key"]["shape_tuple"][2])
++        if eligible
++        else None
++    )
++    top_baseline = (
++        {
++            "tier": primary["baseline"]["tier"],
++            "name": primary["baseline"]["name"],
++            "availability": primary["baseline"]["availability"],
++            "version_raw": primary["baseline"]["version_raw"],
++            "median": primary["baseline"]["median"],
++            "ratio": primary["baseline"]["ratio"],
++            "primary_key": primary["key"],
++        }
++        if primary
++        else {
++            "tier": "T1_vendor_gpu_lib",
++            "name": "cublas",
++            "availability": "available",
++            "version_raw": rounds[0]["environment_freeze"].get("cublas_version_raw"),
++            "median": None,
++            "ratio": None,
++            "primary_key": None,
++        }
++    )
++    evidence = {
++        "schema_version": 1,
++        "artifact_kind": "pypto-x.perf-evidence",
++        "evidence_role": "aggregate_3_rounds",
++        "task": TASK,
++        "agent": args.agent,
++        "started_at_utc": first["started_at_utc"],
++        "finished_at_utc": rounds[-1]["finished_at_utc"],
++        "git": first["git"],
++        "host": first["host"],
++        "host_fingerprint": first["host_fingerprint"],
++        "environment_freeze": first["environment_freeze"],
++        "timer_calibration": {
++            "per_round_event_timer_rate": [
++                round_evidence["metrics"]["event_timer_rate"] for round_evidence in rounds
++            ],
++            "per_round_offset_pct": [
++                round_evidence["metrics"]["event_timer_rate_offset_pct"] for round_evidence in rounds
++            ],
++            "platform_flags": sorted(
++                set(
++                    flag
++                    for round_evidence in rounds
++                    for flag in round_evidence["metrics"]["platform_flags"]
++                )
++            ),
++        },
++        "baseline": top_baseline,
++        "ratios": ratios_out,
++        "stability": {
++            "rounds": 3,
++            "measured_iterations_per_round": args.repeats,
++            "independent_processes": True,
++            "host_fingerprint_consistent": host_consistent,
++            "git_head_consistent": head_consistent,
++            "cpu_affinity_consistent": affinity_consistent,
++            "keys": stability_out,
++        },
++        "dispatch": {
++            "definition": "dispatch_seconds = wall_seconds - kernel_seconds per launch; share = dispatch_median / wall_median",
++            "per_key": [
++                {"key": entry["key"], **entry["dispatch"]} for entry in ratios_out
++            ],
++        },
++        "g1_correctness": first["g1_correctness"],
++        "gate": {
++            "g1": first["g1_correctness"]["status"],
++            "g2": (
++                "PASS"
++                if all(
++                    entry["stability"]["verdict"] == "VALID"
++                    for entry in ratios_out
++                    if not entry["dispatch"]["dispatch_dominated"]
++                )
++                and any(not entry["dispatch"]["dispatch_dominated"] for entry in ratios_out)
++                else "FAIL"
++            ),
++            "relative": "G3_ELIGIBLE" if eligible else "UNGATED",
++            "eligible_keys": [entry["key"] for entry in eligible],
++            "consistency": {
++                "host_fingerprint_consistent": host_consistent,
++                "git_head_consistent": head_consistent,
++                "cpu_affinity_consistent": affinity_consistent,
++            },
++            "ineligible_reasons": {
++                "{}:{}:{}".format(
++                    entry["key"]["op"],
++                    "x".join(str(dim) for dim in entry["key"]["shape_tuple"]),
++                    entry["key"]["dtype"],
++                ): (
++                    []
++                    if entry["gate_eligible"]
++                    else (
++                        (["dispatch_dominated"] if entry["dispatch"]["dispatch_dominated"] else [])
++                        + ([] if entry["stability"]["verdict"] == "VALID" else ["INVALID_G2"])
++                        + ([] if entry["per_round"][0]["g1_pass"] else ["INVALID_G1"])
++                        + ([] if host_consistent else ["HOST_FINGERPRINT_INCONSISTENT"])
++                        + ([] if head_consistent else ["GIT_HEAD_INCONSISTENT"])
++                        + ([] if affinity_consistent else ["AFFINITY_INCONSISTENT"])
++                    )
++                )
++                for entry in ratios_out
++            },
++            "threshold_note": "candidate_ratio only; frozen_ratio/approval belongs to B4 and requires user approval",
++        },
++        "raw_round_files": [str(path) for path in args.rounds],
++        "status": "PASS" if eligible and first["g1_correctness"]["status"] == "PASS" else "FAIL",
++    }
++    return evidence
++
++
++# ---------------------------------------------------------------------------
++# CLI
++# ---------------------------------------------------------------------------
++
++
++def _parse_args(argv):
++    parser = argparse.ArgumentParser(description="CUDA GEMM baseline vs cuBLAS (W8B B3b)")
++    parser.add_argument("--mode", choices=("measure", "aggregate", "g1"), default="measure")
++    parser.add_argument("--round", type=int, default=1)
++    parser.add_argument("--repeats", type=int, default=DEFAULT_REPEATS)
++    parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP)
++    parser.add_argument("--launches-per-sample", type=int, default=5)
++    parser.add_argument("--only-case", action="append", default=[])
++    parser.add_argument("--clock-warmup-seconds", type=float, default=DEFAULT_CLOCK_WARMUP_SECONDS)
++    parser.add_argument("--clock-interval", type=float, default=DEFAULT_CLOCK_INTERVAL)
++    parser.add_argument("--rate-gap-seconds", type=float, default=DEFAULT_RATE_GAP_SECONDS)
++    parser.add_argument("--calibration-rounds", type=int, default=DEFAULT_CALIBRATION_ROUNDS)
++    parser.add_argument("--affinity", default=DEFAULT_AFFINITY)
++    parser.add_argument("--cases-json", default="")
++    parser.add_argument("--json-out", default="")
++    parser.add_argument("--rounds", nargs="*", default=[])
++    parser.add_argument("--git-head", default="unknown")
++    parser.add_argument("--git-branch", default="work/cuda-gemm-baseline")
++    parser.add_argument("--agent", default=DEFAULT_AGENT)
++    return parser.parse_args(argv)
++
++
++def main(argv=None):
++    args = _parse_args(argv)
++    if args.mode == "aggregate":
++        evidence = aggregate(args)
++    elif args.mode == "g1":
++        evidence = run_g1_only(args)
++    else:
++        if args.repeats < 11:
++            raise SystemExit("--repeats must be >= 11 for a dispersion report")
++        evidence = run_round(args)
++    payload = json.dumps(evidence, indent=2, sort_keys=True)
++    if args.json_out:
++        Path(args.json_out).write_text(payload + "\n", encoding="utf-8")
++    print(payload)
++    if args.mode == "aggregate":
++        print(
++            "aggregate gate.relative={} eligible={} status={}".format(
++                evidence["gate"]["relative"],
++                len(evidence["gate"]["eligible_keys"]),
++                evidence["status"],
++            )
++        )
++    elif args.mode == "g1":
++        print(
++            "g1 status={} timing_performed={} cases={}".format(
++                evidence["status"],
++                evidence["timing_performed"],
++                len(evidence["g1_correctness"]["full_shape_ones"]),
++            )
++        )
++    else:
++        print(
++            "round={} status={} g1={} clock_ratio={} rate={}".format(
++                args.round,
++                evidence["status"],
++                evidence["g1_correctness"]["status"],
++                evidence["host"]["gpu"]["clock_ratio"],
++                evidence["metrics"]["event_timer_rate"],
++            )
++        )
++    return 0 if evidence["status"] == "PASS" else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

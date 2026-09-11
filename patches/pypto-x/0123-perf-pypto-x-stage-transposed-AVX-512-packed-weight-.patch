@@ -1,0 +1,135 @@
+From d5082bb1d7070401b87d3efe9961b8ae9fcb121f Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 05:48:31 +0800
+Subject: [PATCH 123/134] perf(pypto-x): stage transposed AVX-512 packed weight
+ tiles
+
+The Qwen3.5 linear weights are bound as (N, K) row-major parameters, so the
+cast/transpose chain exposes a (K, N) right operand whose k axis is contiguous
+while n is strided by K.  Packing that source column-wise touched one cache
+line per 2-byte element (16x amplified traffic on lm_head-sized weights).
+
+Stage a 64x64 tile per (n-block, k-block) instead: reads become 128/256-byte
+contiguous source rows and writes become contiguous packed chunks.  The packed
+layout and every element are unchanged (bitwise verified against the direct
+(K, N) path and against the legacy kernel).
+---
+ python/pypto/compiler/targets/cpu_avx512.py | 85 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+
+diff --git a/python/pypto/compiler/targets/cpu_avx512.py b/python/pypto/compiler/targets/cpu_avx512.py
+index 6087b19c2..b4b5c887d 100644
+--- a/python/pypto/compiler/targets/cpu_avx512.py
++++ b/python/pypto/compiler/targets/cpu_avx512.py
+@@ -673,12 +673,51 @@ static inline size_t ptx_blocks(size_t length, size_t tile) {
+ /* pack kernels                                                       */
+ /* ------------------------------------------------------------------ */
+ 
++/* Transposed-source fast path: the root parameter is (N, K) row-major, so
++ * the k axis is contiguous while the n axis is strided.  Reading the source
++ * column-wise would touch one cache line per element (16x amplified traffic on
++ * the lm_head-sized weights); the tile staged below turns it into contiguous
++ * 128/256-byte reads per source row and contiguous packed writes. */
++static void ptx_pack_matmul_f32_transposed(const float *source, float *packed,
++                                           size_t k, size_t n, size_t source_n_stride) {
++    size_t num_kb = ptx_blocks(k, PTX_PACKED_GEMM_K_TILE);
++    size_t num_nb = ptx_blocks(n, PTX_PACKED_GEMM_N_TILE);
++    float tile[PTX_PACKED_GEMM_K_TILE][PTX_PACKED_GEMM_N_TILE];
++    size_t nb, kb, kk, nn;
++    for (nb = 0; nb < num_nb; ++nb) {
++        size_t nt = n - nb * PTX_PACKED_GEMM_N_TILE;
++        if (nt > PTX_PACKED_GEMM_N_TILE) nt = PTX_PACKED_GEMM_N_TILE;
++        for (kb = 0; kb < num_kb; ++kb) {
++            size_t kt = k - kb * PTX_PACKED_GEMM_K_TILE;
++            float *block = packed + (nb * num_kb + kb) * (size_t)PTX_PACKED_GEMM_K_TILE * PTX_PACKED_GEMM_N_TILE;
++            if (kt > PTX_PACKED_GEMM_K_TILE) kt = PTX_PACKED_GEMM_K_TILE;
++            for (nn = 0; nn < nt; ++nn) {
++                const float *row = source + (nb * PTX_PACKED_GEMM_N_TILE + nn) * source_n_stride
++                                          + kb * PTX_PACKED_GEMM_K_TILE;
++                for (kk = 0; kk < kt; ++kk) tile[kk][nn] = row[kk];
++                for (; kk < PTX_PACKED_GEMM_K_TILE; ++kk) tile[kk][nn] = 0.0f;
++            }
++            for (; nn < PTX_PACKED_GEMM_N_TILE; ++nn) {
++                for (kk = 0; kk < PTX_PACKED_GEMM_K_TILE; ++kk) tile[kk][nn] = 0.0f;
++            }
++            for (kk = 0; kk < PTX_PACKED_GEMM_K_TILE; ++kk) {
++                memcpy(block + kk * PTX_PACKED_GEMM_N_TILE, tile[kk],
++                       PTX_PACKED_GEMM_N_TILE * sizeof(float));
++            }
++        }
++    }
++}
++
+ void ptx_avx512_pack_matmul_f32(const float *source, float *packed,
+                                 size_t k, size_t n,
+                                 size_t source_k_stride, size_t source_n_stride) {
+     size_t num_kb = ptx_blocks(k, PTX_PACKED_GEMM_K_TILE);
+     size_t num_nb = ptx_blocks(n, PTX_PACKED_GEMM_N_TILE);
+     size_t nb, kb, kk, nn;
++    if (source_k_stride == 1 && source_n_stride != 1) {
++        ptx_pack_matmul_f32_transposed(source, packed, k, n, source_n_stride);
++        return;
++    }
+     for (nb = 0; nb < num_nb; ++nb) {
+         size_t nt = n - nb * PTX_PACKED_GEMM_N_TILE;
+         if (nt > PTX_PACKED_GEMM_N_TILE) nt = PTX_PACKED_GEMM_N_TILE;
+@@ -705,6 +744,48 @@ void ptx_avx512_pack_matmul_f32(const float *source, float *packed,
+     }
+ }
+ 
++static void ptx_pack_matmul_bf16_transposed(const void *source, uint16_t *packed,
++                                            size_t k, size_t n,
++                                            size_t source_n_stride, int source_is_f32) {
++    size_t num_kb = ptx_blocks(k, PTX_PACKED_GEMM_K_TILE);
++    size_t num_nb = ptx_blocks(n, PTX_PACKED_GEMM_N_TILE);
++    uint16_t tile[PTX_PACKED_GEMM_K_TILE][PTX_PACKED_GEMM_N_TILE];
++    size_t nb, kb, pair, kk, nn;
++    for (nb = 0; nb < num_nb; ++nb) {
++        size_t nt = n - nb * PTX_PACKED_GEMM_N_TILE;
++        if (nt > PTX_PACKED_GEMM_N_TILE) nt = PTX_PACKED_GEMM_N_TILE;
++        for (kb = 0; kb < num_kb; ++kb) {
++            size_t kt = k - kb * PTX_PACKED_GEMM_K_TILE;
++            uint16_t *block = packed + (nb * num_kb + kb) * (size_t)PTX_PACKED_GEMM_K_TILE * PTX_PACKED_GEMM_N_TILE;
++            if (kt > PTX_PACKED_GEMM_K_TILE) kt = PTX_PACKED_GEMM_K_TILE;
++            for (nn = 0; nn < nt; ++nn) {
++                size_t row_offset = (nb * PTX_PACKED_GEMM_N_TILE + nn) * source_n_stride
++                                    + kb * PTX_PACKED_GEMM_K_TILE;
++                if (source_is_f32) {
++                    const float *row = (const float *)source + row_offset;
++                    for (kk = 0; kk < kt; ++kk) tile[kk][nn] = ptx_f32_to_bf16(row[kk]);
++                } else {
++                    const uint16_t *row = (const uint16_t *)source + row_offset;
++                    for (kk = 0; kk < kt; ++kk) tile[kk][nn] = row[kk];
++                }
++                for (; kk < PTX_PACKED_GEMM_K_TILE; ++kk) tile[kk][nn] = 0;
++            }
++            for (; nn < PTX_PACKED_GEMM_N_TILE; ++nn) {
++                for (kk = 0; kk < PTX_PACKED_GEMM_K_TILE; ++kk) tile[kk][nn] = 0;
++            }
++            for (pair = 0; pair < PTX_PACKED_GEMM_K_TILE / 2; ++pair) {
++                uint16_t *dst = block + pair * 2 * PTX_PACKED_GEMM_N_TILE;
++                uint16_t *lo = tile[2 * pair];
++                uint16_t *hi = tile[2 * pair + 1];
++                for (nn = 0; nn < PTX_PACKED_GEMM_N_TILE; ++nn) {
++                    dst[2 * nn] = lo[nn];
++                    dst[2 * nn + 1] = hi[nn];
++                }
++            }
++        }
++    }
++}
++
+ static void ptx_pack_bf16_impl(const void *source, uint16_t *packed,
+                                size_t k, size_t n,
+                                size_t source_k_stride, size_t source_n_stride,
+@@ -712,6 +793,10 @@ static void ptx_pack_bf16_impl(const void *source, uint16_t *packed,
+     size_t num_kb = ptx_blocks(k, PTX_PACKED_GEMM_K_TILE);
+     size_t num_nb = ptx_blocks(n, PTX_PACKED_GEMM_N_TILE);
+     size_t nb, kb, pair, nn;
++    if (source_k_stride == 1 && source_n_stride != 1) {
++        ptx_pack_matmul_bf16_transposed(source, packed, k, n, source_n_stride, source_is_f32);
++        return;
++    }
+     for (nb = 0; nb < num_nb; ++nb) {
+         size_t nt = n - nb * PTX_PACKED_GEMM_N_TILE;
+         if (nt > PTX_PACKED_GEMM_N_TILE) nt = PTX_PACKED_GEMM_N_TILE;

@@ -1,0 +1,357 @@
+From 378b738a8a8e1a2735456ca0baee22d564e10193 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 10:01:13 +0800
+Subject: [PATCH 132/134] fix(perf): enforce protocol outlier gate and per-side
+ warmup in G2 verdict
+
+D1: _variance_verdict now implements protocol step 6
+(outlier_ratio > 0.10 -> UNSTABLE) before the cv/p95 ceilings, and
+aggregate recomputes each round-case verdict from raw statistics instead of
+trusting the stored verdict.
+
+D9: a case stability verdict now requires cuBLAS warmup PASS as well as
+pypto_x warmup PASS (stability.reasons lists each failed component).
+
+D2: a key enters the ratio gate only when kernel-dominated in every selected
+round (dispatch_dominated_any false); per-round shares/domination are stored.
+
+D8: G2 is enforced on gate-relevant (kernel-dominated) keys and both the
+scope and the excluded dispatch-dominated keys/verdicts are reported.
+
+Aggregate also voids a whole round when any kernel-dominated case in that
+round fails G2, so gate.relative cannot be G3_ELIGIBLE on a partially invalid
+round set. No thresholds are frozen.
+---
+ scripts/smoke/cuda_gemm_baseline_smoke.py | 182 ++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 163 insertions(+), 19 deletions(-)
+
+diff --git a/scripts/smoke/cuda_gemm_baseline_smoke.py b/scripts/smoke/cuda_gemm_baseline_smoke.py
+index 55d64e6bf..fc333f278 100644
+--- a/scripts/smoke/cuda_gemm_baseline_smoke.py
++++ b/scripts/smoke/cuda_gemm_baseline_smoke.py
+@@ -81,6 +81,8 @@ WARMUP_ATTEMPTS = 3
+ # Protocol §3.4 variance ceilings.  ``clock_unlocked`` selects the relaxed row.
+ VARIANCE_LIMITS_LOCKED = {"cv": 0.03, "p95_over_median": 1.15}
+ VARIANCE_LIMITS_UNLOCKED = {"cv": 0.05, "p95_over_median": 1.25}
++# Protocol §3.3 step 6: outlier_ratio above this voids the round (UNSTABLE).
++OUTLIER_RATIO_MAX = 0.10
+ MEDIAN_SPREAD_LIMIT = 0.10
+ CLOCK_RATIO_MIN = 0.9
+ 
+@@ -280,8 +282,16 @@ def _dispersion(values) -> dict:
+ 
+ 
+ def _variance_verdict(stats: dict, limits: dict) -> str:
++    """Protocol §3.3 steps 6-7: outlier gate first, then the cv/p95 gate.
++
++    Step 6 marks ``|x - median| > 3 * 1.4826 * MAD`` and voids the round when
++    ``outlier_ratio > 0.10`` (``UNSTABLE``); step 7 applies the cv/p95 ceilings.
++    """
++
+     if stats.get("n", 0) < 11:
+         return "INSUFFICIENT_SAMPLES"
++    if stats.get("outlier_ratio", 0.0) > OUTLIER_RATIO_MAX:
++        return "UNSTABLE"
+     if stats["cv_over_median"] > limits["cv"] or stats["p95_over_median"] > limits["p95_over_median"]:
+         return "INVALID_VARIANCE"
+     return "VALID"
+@@ -1287,14 +1297,27 @@ def run_round(args) -> dict:
+                     "r": args.repeats,
+                     "cv_max": limits["cv"],
+                     "p95_over_median_max": limits["p95_over_median"],
++                    "outlier_ratio_max": OUTLIER_RATIO_MAX,
+                     "pypto_x_verdict": ours_verdict,
+                     "cublas_verdict": cublas_verdict,
+-                    "warmup_verdict": result["ours"]["warmup_verdict"],
++                    "pypto_x_warmup_verdict": result["ours"]["warmup_verdict"],
++                    "cublas_warmup_verdict": result["cublas"]["warmup_verdict"],
++                    "reasons": [
++                        reason
++                        for reason, failed in (
++                            ("OURS_INVALID_WARMUP", result["ours"]["warmup_verdict"] != "PASS"),
++                            ("CUBLAS_INVALID_WARMUP", result["cublas"]["warmup_verdict"] != "PASS"),
++                            ("OURS_" + ours_verdict, ours_verdict != "VALID"),
++                            ("CUBLAS_" + cublas_verdict, cublas_verdict != "VALID"),
++                        )
++                        if failed
++                    ],
+                     "verdict": (
+                         "VALID"
+                         if ours_verdict == "VALID"
+                         and cublas_verdict == "VALID"
+                         and result["ours"]["warmup_verdict"] == "PASS"
++                        and result["cublas"]["warmup_verdict"] == "PASS"
+                         else "INVALID"
+                     ),
+                 },
+@@ -1585,32 +1608,63 @@ def aggregate(args) -> dict:
+     names = [case["name"] for case in first["cases"]]
+     ratios_out = []
+     stability_out = []
++    per_round_lookup = {}
+     for name in names:
+         per_round = []
+         for index, round_evidence in enumerate(rounds, start=1):
+             case = _case_by_name(round_evidence, name)
+             if case is None:
+                 raise SystemExit("round {} is missing case {!r}".format(index, name))
++            pypto_stats = case["pypto_x"]["statistics"]["kernel_seconds"]
++            cublas_stats = case["cublas"]["statistics"]["kernel_seconds"]
++            clock_verdict = round_evidence["host"]["gpu"]["clock_verdict"]
++            limits = (
++                VARIANCE_LIMITS_LOCKED if clock_verdict == "VALID" else VARIANCE_LIMITS_UNLOCKED
++            )
++            pypto_warmup = case["pypto_x"]["warmup"]["verdict"]
++            cublas_warmup = case["cublas"]["warmup"]["verdict"]
++            pypto_verdict = _variance_verdict(pypto_stats, limits)
++            cublas_verdict = _variance_verdict(cublas_stats, limits)
++            recomputed_verdict = (
++                "VALID"
++                if pypto_verdict == "VALID"
++                and cublas_verdict == "VALID"
++                and pypto_warmup == "PASS"
++                and cublas_warmup == "PASS"
++                else "INVALID"
++            )
+             per_round.append(
+                 {
+                     "round": index,
++                    "round_source": str(getattr(args, "rounds", ["?"])[index - 1]),
++                    "recorded_round_status": round_evidence.get("status"),
++                    "clock_verdict": clock_verdict,
++                    "variance_limits_used": limits,
+                     "pypto_x_kernel_seconds_median": case["pypto_x"]["metrics"]["kernel_seconds_median"],
+                     "pypto_x_kernel_seconds_corrected_median": case["pypto_x"]["metrics"]["kernel_seconds_corrected_median"],
+                     "cublas_kernel_seconds_median": case["cublas"]["metrics"]["kernel_seconds_median"],
+                     "cublas_kernel_seconds_corrected_median": case["cublas"]["metrics"]["kernel_seconds_corrected_median"],
+                     "measured_ratio_raw": case["ratio"]["measured_ratio_raw"],
+                     "measured_ratio_corrected": case["ratio"]["measured_ratio_corrected"],
+-                    "pypto_x_cv_over_median": case["pypto_x"]["statistics"]["kernel_seconds"]["cv_over_median"],
+-                    "pypto_x_p95_over_median": case["pypto_x"]["statistics"]["kernel_seconds"]["p95_over_median"],
+-                    "cublas_cv_over_median": case["cublas"]["statistics"]["kernel_seconds"]["cv_over_median"],
+-                    "cublas_p95_over_median": case["cublas"]["statistics"]["kernel_seconds"]["p95_over_median"],
++                    "pypto_x_cv_over_median": pypto_stats["cv_over_median"],
++                    "pypto_x_p95_over_median": pypto_stats["p95_over_median"],
++                    "pypto_x_outlier_ratio": pypto_stats["outlier_ratio"],
++                    "cublas_cv_over_median": cublas_stats["cv_over_median"],
++                    "cublas_p95_over_median": cublas_stats["p95_over_median"],
++                    "cublas_outlier_ratio": cublas_stats["outlier_ratio"],
++                    "pypto_x_warmup_verdict": pypto_warmup,
++                    "cublas_warmup_verdict": cublas_warmup,
++                    "recomputed_pypto_x_verdict": pypto_verdict,
++                    "recomputed_cublas_verdict": cublas_verdict,
++                    "recomputed_verdict": recomputed_verdict,
++                    "recorded_stability_verdict": case["stability"]["verdict"],
+                     "dispatch_share_of_wall": case["pypto_x"]["metrics"]["dispatch_share_of_wall"],
+                     "dispatch_dominated": case["pypto_x"]["metrics"]["dispatch_dominated"],
+                     "launches_per_sample": case.get("measurement", {}).get("launches_per_sample"),
+-                    "stability_verdict": case["stability"]["verdict"],
+                     "g1_pass": bool(case["g1"]["ours_pass"] and case["g1"]["cublas_pass"]),
+                 }
+             )
++        per_round_lookup[name] = per_round
+         medians = [entry["pypto_x_kernel_seconds_corrected_median"] for entry in per_round]
+         cublas_medians = [entry["cublas_kernel_seconds_corrected_median"] for entry in per_round]
+         measured_ratios = [entry["measured_ratio_corrected"] for entry in per_round]
+@@ -1621,8 +1675,15 @@ def aggregate(args) -> dict:
+         )
+         median_spread_ok = median_spread_ratio is not None and median_spread_ratio <= MEDIAN_SPREAD_LIMIT
+         g1_pass = all(entry["g1_pass"] for entry in per_round)
+-        g2_pass = all(entry["stability_verdict"] == "VALID" for entry in per_round) and median_spread_ok
+-        dispatch_dominated = all(entry["dispatch_dominated"] for entry in per_round)
++        g2_pass = (
++            all(entry["recomputed_verdict"] == "VALID" for entry in per_round) and median_spread_ok
++        )
++        # D2: a key only enters the ratio gate when it is kernel-dominated in
++        # *every* selected round.  ``any`` is the conservative reading of the
++        # task rule ("kernel 短于 dispatch 时该数字不进比例门") and avoids mixing
++        # dispatch-dominated rounds into a ratio.
++        dispatch_dominated_any = any(entry["dispatch_dominated"] for entry in per_round)
++        dispatch_dominated_all = all(entry["dispatch_dominated"] for entry in per_round)
+         clock_ok = all(
+             round_evidence["host"]["gpu"]["clock_verdict"] == "VALID" for round_evidence in rounds
+         )
+@@ -1634,8 +1695,7 @@ def aggregate(args) -> dict:
+             and g2_pass
+             and noise_ok
+             and clock_ok
+-            and not dispatch_dominated
+-            and all(round_evidence["status"] == "PASS" for round_evidence in rounds)
++            and not dispatch_dominated_any
+         )
+         key = first["cases"][names.index(name)]["key"]
+         ratio_entry = {
+@@ -1660,11 +1720,17 @@ def aggregate(args) -> dict:
+             "stability": {
+                 "rounds": 3,
+                 "measured_iterations_per_round": args.repeats,
+-                "per_round_verdicts": [entry["stability_verdict"] for entry in per_round],
++                "per_round_verdicts_recomputed": [entry["recomputed_verdict"] for entry in per_round],
++                "per_round_verdicts_recorded": [entry["recorded_stability_verdict"] for entry in per_round],
++                "outlier_ratio_max": OUTLIER_RATIO_MAX,
+                 "median_spread_ratio": median_spread_ratio,
+                 "median_spread_limit": MEDIAN_SPREAD_LIMIT,
+                 "median_spread_ok": median_spread_ok,
+                 "verdict": "VALID" if g2_pass else "INVALID",
++                "verdict_basis": (
++                    "recomputed from per-round raw statistics: outlier_ratio<=0.10 AND cv/p95 ceilings "
++                    "AND pypto_x/cuBLAS warmup PASS; stored round verdicts are only informational"
++                ),
+             },
+             "dispatch": {
+                 "dispatch_seconds_median": statistics.median(
+@@ -1676,8 +1742,17 @@ def aggregate(args) -> dict:
+                 "dispatch_share_of_wall": statistics.median(
+                     [entry["dispatch_share_of_wall"] for entry in per_round]
+                 ),
+-                "dispatch_dominated": dispatch_dominated,
+-                "rule": "dispatch_dominated when kernel_seconds <= dispatch_seconds; such numbers do not enter the ratio gate",
++                "dispatch_share_per_round": [entry["dispatch_share_of_wall"] for entry in per_round],
++                "dispatch_dominated_per_round": [entry["dispatch_dominated"] for entry in per_round],
++                "dispatch_dominated_any": dispatch_dominated_any,
++                "dispatch_dominated_all": dispatch_dominated_all,
++                "dispatch_dominated": dispatch_dominated_any,
++                "rule": (
++                    "dispatch_dominated when kernel_seconds <= dispatch_seconds.  D2: a key enters the "
++                    "ratio gate only when it is kernel-dominated in every selected round "
++                    "(dispatch_dominated_any == false); any dispatch-dominated round would put a "
++                    "non-kernel time into the ratio, so it is excluded"
++                ),
+             },
+             "gate_eligible": gate_eligible,
+         }
+@@ -1692,6 +1767,41 @@ def aggregate(args) -> dict:
+             }
+         )
+ 
++    # Round-level validity: a round is valid only when every case that is
++    # kernel-dominated in that round passes G2 (outlier/cv/p95/warmup), the
++    # round's clock/noise gates pass and its G1 re-check passed.  Dispatch-
++    # dominated cases are excluded per D8 (their numbers never enter the gate),
++    # but their verdicts stay visible in per_round / gate.dispatch_dominated_keys.
++    round_validity = []
++    for index, round_evidence in enumerate(rounds, start=1):
++        blocking = []
++        for name in names:
++            row = next(entry for entry in per_round_lookup[name] if entry["round"] == index)
++            if not row["dispatch_dominated"] and row["recomputed_verdict"] != "VALID":
++                blocking.append(
++                    {
++                        "case": name,
++                        "recomputed_verdict": row["recomputed_verdict"],
++                        "pypto_x_verdict": row["recomputed_pypto_x_verdict"],
++                        "cublas_verdict": row["recomputed_cublas_verdict"],
++                    }
++                )
++        g1_round_ok = round_evidence.get("g1_correctness", {}).get("status") == "PASS"
++        clock_round_ok = round_evidence["host"]["gpu"]["clock_verdict"] == "VALID"
++        noise_round_ok = round_evidence["host"]["noise"]["verdict"] == "VALID"
++        round_validity.append(
++            {
++                "round": index,
++                "source": str(args.rounds[index - 1]),
++                "g1_pass": g1_round_ok,
++                "clock_verdict": round_evidence["host"]["gpu"]["clock_verdict"],
++                "noise_verdict": round_evidence["host"]["noise"]["verdict"],
++                "blocking_cases": blocking,
++                "valid": bool(g1_round_ok and clock_round_ok and noise_round_ok and not blocking),
++            }
++        )
++    all_rounds_valid = all(entry["valid"] for entry in round_validity)
++
+     host_consistent = len({round_evidence["host_fingerprint"] for round_evidence in rounds}) == 1
+     head_consistent = len({round_evidence["git"]["head"] for round_evidence in rounds}) == 1
+     affinity_consistent = (
+@@ -1703,7 +1813,7 @@ def aggregate(args) -> dict:
+         )
+         == 1
+     )
+-    if not (host_consistent and head_consistent and affinity_consistent):
++    if not (all_rounds_valid and host_consistent and head_consistent and affinity_consistent):
+         for entry in ratios_out:
+             entry["gate_eligible"] = False
+     eligible = [entry for entry in ratios_out if entry["gate_eligible"]]
+@@ -1769,6 +1879,8 @@ def aggregate(args) -> dict:
+             "host_fingerprint_consistent": host_consistent,
+             "git_head_consistent": head_consistent,
+             "cpu_affinity_consistent": affinity_consistent,
++            "all_rounds_valid": all_rounds_valid,
++            "round_validity": round_validity,
+             "keys": stability_out,
+         },
+         "dispatch": {
+@@ -1785,18 +1897,37 @@ def aggregate(args) -> dict:
+                 if all(
+                     entry["stability"]["verdict"] == "VALID"
+                     for entry in ratios_out
+-                    if not entry["dispatch"]["dispatch_dominated"]
++                    if not entry["dispatch"]["dispatch_dominated_any"]
+                 )
+-                and any(not entry["dispatch"]["dispatch_dominated"] for entry in ratios_out)
++                and any(not entry["dispatch"]["dispatch_dominated_any"] for entry in ratios_out)
+                 else "FAIL"
+             ),
+-            "relative": "G3_ELIGIBLE" if eligible else "UNGATED",
++            "g2_scope": (
++                "D8: G2 is enforced on gate-relevant keys only, i.e. keys that are kernel-dominated "
++                "in every selected round.  Dispatch-dominated keys never enter the ratio gate, so their "
++                "own INVALID_G2 (tiny kernels + launch overhead) cannot produce a gateable number; "
++                "their per-round verdicts are still reported verbatim under gate.dispatch_dominated_keys"
++            ),
++            "relative": "G3_ELIGIBLE" if (eligible and all_rounds_valid) else "UNGATED",
++            "all_rounds_valid": all_rounds_valid,
++            "round_validity": round_validity,
+             "eligible_keys": [entry["key"] for entry in eligible],
+             "consistency": {
+                 "host_fingerprint_consistent": host_consistent,
+                 "git_head_consistent": head_consistent,
+                 "cpu_affinity_consistent": affinity_consistent,
+             },
++            "dispatch_dominated_keys": [
++                {
++                    "key": entry["key"],
++                    "dispatch_share_per_round": entry["dispatch"]["dispatch_share_per_round"],
++                    "recomputed_verdicts": [
++                        row["recomputed_verdict"] for row in entry["per_round"]
++                    ],
++                }
++                for entry in ratios_out
++                if entry["dispatch"]["dispatch_dominated_any"]
++            ],
+             "ineligible_reasons": {
+                 "{}:{}:{}".format(
+                     entry["key"]["op"],
+@@ -1806,7 +1937,12 @@ def aggregate(args) -> dict:
+                     []
+                     if entry["gate_eligible"]
+                     else (
+-                        (["dispatch_dominated"] if entry["dispatch"]["dispatch_dominated"] else [])
++                        (
++                            ["dispatch_dominated_in_some_round"]
++                            if entry["dispatch"]["dispatch_dominated_any"]
++                            and not entry["dispatch"]["dispatch_dominated_all"]
++                            else (["dispatch_dominated"] if entry["dispatch"]["dispatch_dominated_any"] else [])
++                        )
+                         + ([] if entry["stability"]["verdict"] == "VALID" else ["INVALID_G2"])
+                         + ([] if entry["per_round"][0]["g1_pass"] else ["INVALID_G1"])
+                         + ([] if host_consistent else ["HOST_FINGERPRINT_INCONSISTENT"])
+@@ -1816,10 +1952,18 @@ def aggregate(args) -> dict:
+                 )
+                 for entry in ratios_out
+             },
++            "outlier_gate": {
++                "rule": "protocol §3.3 step 6: outlier_ratio > 0.10 -> UNSTABLE, round void",
++                "outlier_ratio_max": OUTLIER_RATIO_MAX,
++            },
+             "threshold_note": "candidate_ratio only; frozen_ratio/approval belongs to B4 and requires user approval",
+         },
+         "raw_round_files": [str(path) for path in args.rounds],
+-        "status": "PASS" if eligible and first["g1_correctness"]["status"] == "PASS" else "FAIL",
++        "status": (
++            "PASS"
++            if eligible and all_rounds_valid and first["g1_correctness"]["status"] == "PASS"
++            else "FAIL"
++        ),
+     }
+     return evidence
+ 

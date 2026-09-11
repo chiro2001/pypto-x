@@ -1,0 +1,771 @@
+From 336cead94243eee26f647f5c0d22ffb16b45e9aa Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 08:41:02 +0800
+Subject: [PATCH 130/134] feat(pypto-x): add the vLLM CPU general plugin for
+ packed dense Linear (W8J J2)
+
+Deliver the plugin as a PYTHONPATH-discoverable distribution (no site-packages
+change): vllm.general_plugins entry point + module-level quantization config
+and LinearMethodBase that pre-pack 2D BF16 weights with pack_weight and inject
+linear_prepacked only for shapes enabled by the measured gate table.
+
+- 3D weights (GDN conv1d) go back to the stock UnquantizedLinearMethod;
+- every unsupported shape/dtype/rank/device, packed-weight failure or kernel
+  error falls back to F.linear (fail-open), with a JSONL decision log;
+- gate_table.py is generated from raw/shape-ratio-table.json by
+  scripts/j2_make_gate.py: enabled iff the best PyPTO-X config
+  (6 threads + weight cache) is <=1.0x of vLLM native oneDNN and bitwise
+  identical on the sampled weights. On this host that is 0/12 shapes, so the
+  plugin ships with injection disabled by default and all 114 prefixes
+  fall back to the native path.
+
+Includes focused plugin tests (routing, fail-open, 3D handover, gate override).
+---
+ python/pypto_x_vllm-0.1.0.dist-info/METADATA         |   8 +
+ python/pypto_x_vllm-0.1.0.dist-info/entry_points.txt |   2 +
+ python/pypto_x_vllm/README.zh-CN.md                  |  50 +++++
+ python/pypto_x_vllm/__init__.py                      |  17 ++
+ python/pypto_x_vllm/gate_table.py                    |  60 ++++++
+ python/pypto_x_vllm/plugin.py                        | 404 +++++++++++++++++++++++++++++++++++++++
+ python/tests/framework_torch/test_vllm_plugin.py     | 156 +++++++++++++++
+ 7 files changed, 697 insertions(+)
+
+diff --git a/python/pypto_x_vllm-0.1.0.dist-info/METADATA b/python/pypto_x_vllm-0.1.0.dist-info/METADATA
+new file mode 100644
+index 000000000..c036919b6
+--- /dev/null
++++ b/python/pypto_x_vllm-0.1.0.dist-info/METADATA
+@@ -0,0 +1,8 @@
++Metadata-Version: 2.1
++Name: pypto-x-vllm
++Version: 0.1.0
++Summary: PyPTO-X packed AVX-512 dense Linear plugin for vLLM CPU (W8J J2)
++Home-page: https://github.com/chiro2001/pypto-x
++License: Apache-2.0
++Requires-Python: >=3.10
++Description: Self-contained vLLM general plugin used by the PyPTO-X W8J J2 evidence run. Not published; discovered from PYTHONPATH.
+diff --git a/python/pypto_x_vllm-0.1.0.dist-info/entry_points.txt b/python/pypto_x_vllm-0.1.0.dist-info/entry_points.txt
+new file mode 100644
+index 000000000..78b5b27a6
+--- /dev/null
++++ b/python/pypto_x_vllm-0.1.0.dist-info/entry_points.txt
+@@ -0,0 +1,2 @@
++[vllm.general_plugins]
++pypto_x = pypto_x_vllm.plugin:register
+diff --git a/python/pypto_x_vllm/README.zh-CN.md b/python/pypto_x_vllm/README.zh-CN.md
+new file mode 100644
+index 000000000..3eef35c7a
+--- /dev/null
++++ b/python/pypto_x_vllm/README.zh-CN.md
+@@ -0,0 +1,50 @@
++# PyPTO-X vLLM CPU 插件（W8J J2）
++
++本目录是 vLLM CPU 的 **general plugin**：通过官方 `vllm.general_plugins`
++entry point 注册一个只拦截 `LinearBase`（dense Linear）的量化方法
++`pypto_x`，把 2D BF16 权重交给 PyPTO-X 的 W8B packed/blocked AVX-512
++内核执行；不支持的 shape/dtype/rank/device 一律 fail-open 回
++`torch.nn.functional.linear`。
++
++## 为什么不是 pip 安装
++
++- 不改 vLLM site-packages、不改 vLLM 源码树；
++- 用 `PYTHONPATH` 让 `importlib.metadata`（vLLM 0.29.0 的插件发现机制）
++  在 sys.path 上找到本目录旁的 `pypto_x_vllm-0.1.0.dist-info/`；
++- 卸载 = 从 `PYTHONPATH` 移除 `<worktree>/python`（进程级），无需
++  `pip uninstall`、无残留。
++
++## 运行
++
++```bash
++export PYTHONPATH=<worktree>/python
++export VLLM_PLUGINS=pypto_x          # 可选：白名单
++export PYPTO_X_VLLM_LOG=/path/to/plugin-decisions.jsonl   # 决策日志
++/home/chiro/miniforge3/envs/pypto-x-w8j/bin/python driver.py \
++    --model <本地 Qwen3.5-0.8B 目录> --quantization pypto_x
++```
++
++`register()` 在每个 vLLM 进程（driver / EngineCore / worker）中执行且幂等；
++所有类都在模块顶层（J0 实测：局部类会导致 spawn worker 反序列化
++`VllmConfig` 失败）。
++
++## 注入面
++
++| 阶段 | 行为 |
++|---|---|
++| `PyPTOXQuantConfig.get_quant_method` | 仅 `LinearBase` 返回 `PyPTOXLinearMethod`；其余返回 `None`（Attention/embedding/GDN core 保持原生） |
++| `process_weights_after_loading` | 2D 权重 `torch.ops.pypto_x.pack_weight` 预打包并缓存 handle；3D conv1d 交回父类（保留 vLLM 的 causal-conv 打包）；pack 失败只记录并回退 |
++| `apply` | **性能门禁表**命中的 (dtype, M, K, N) 走 `linear_prepacked`；未命中/被禁用/任何内核异常都回退 `F.linear` |
++
++## 性能门禁
++
++`gate_table.py` 由 `scripts/j2_make_gate.py` 从证据
++`raw/shape-ratio-table.json` 生成：只启用“实测中位 `our/native <= 1.0`
++且采样输出与 vLLM 原生 CPU GEMM **逐位一致**”的 shape。表外的 M（例如不同
++prompt 长度）自动回退，不会盲注入。
++
++## 环境
++
++- `/home/chiro/miniforge3/envs/pypto-x-w8j`（vllm-cpu 0.29.0 / torch 2.13.0+cpu）；
++- 依赖：无新增依赖（只用 torch / vLLM / numpy）；
++- `PYPTO_X_VLLM_ENABLE=0` 可在进程级整体关闭注入（仍加载插件）。
+diff --git a/python/pypto_x_vllm/__init__.py b/python/pypto_x_vllm/__init__.py
+new file mode 100644
+index 000000000..c652ed419
+--- /dev/null
++++ b/python/pypto_x_vllm/__init__.py
+@@ -0,0 +1,17 @@
++"""PyPTO-X vLLM CPU plugin package (W8J J2).
++
++This package is *not* installed into vLLM's site-packages.  It is delivered as
++a self-contained distribution directory (``python/pypto_x_vllm-*.dist-info``)
++so that adding the worktree ``python`` directory to ``PYTHONPATH`` is enough
++for vLLM's ``vllm.general_plugins`` entry-point discovery (vLLM 0.29.0 uses
++``importlib.metadata.entry_points(group=...)``, which scans every ``sys.path``
++entry).  Removing the directory from ``PYTHONPATH`` uninstalls the plugin with
++no side effects on the vLLM source tree or site-packages.
++
++See :mod:`pypto_x_vllm.plugin` for the registered quantization config and the
++per-shape performance gate.
++"""
++
++from __future__ import annotations
++
++__all__ = ["gate_table", "plugin"]
+diff --git a/python/pypto_x_vllm/gate_table.py b/python/pypto_x_vllm/gate_table.py
+new file mode 100644
+index 000000000..7cc5c3a35
+--- /dev/null
++++ b/python/pypto_x_vllm/gate_table.py
+@@ -0,0 +1,60 @@
++"""Shape gate table for the PyPTO-X vLLM CPU plugin (GENERATED).
++
++Generated by scripts/j2_make_gate.py from
++    raw/shape-ratio-table.json
++Do not edit by hand: rerun the measurement and the generator.
++
++Criterion: enabled iff median(our_6T_cache1_ms)/median(native_ms) <= 1.0 and ours_vs_native_bitwise on the sampled weights (our_6T_cache1 = gemm_threads=6 + PYPTO_X_AVX512_WEIGHT_CACHE=1, the best measured PyPTO-X configuration; oneDNN native uses the vLLM 6-thread CPU launch policy).
++Enabled rows: 0 / 12.
++"""
++
++from __future__ import annotations
++
++GATE_TABLE_VERSION = 1
++
++GATE_TABLE_PROVENANCE = {'task': 'w8j-vllm-injection', 'source': 'raw/shape-ratio-table.json', 'tag': 'w8j-j2-shape-gate', 'measured_started_at': '2026-09-11T00:36:36Z', 'measured_finished_at': '2026-09-11T00:36:47Z', 'host': {'platform': 'Linux-7.1.5-arch1-2-x86_64-with-glibc2.44', 'cpu_count': 12, 'affinity': [0, 1, 2, 3, 4, 5], 'torch_threads': 6, 'torch': '2.13.0+cpu', 'numpy': '2.3.5'}, 'env': {'OMP_NUM_THREADS': '6', 'PYPTO_X_TORCH_CACHE_DIR': '/home/chiro/projects/pypto/worktrees/_meta/pypto-x/w8j-vllm-injection/raw/shape-gate-cache'}, 'threshold': 1.0, 'require_bitwise': True, 'criterion': 'enabled iff median(our_6T_cache1_ms)/median(native_ms) <= 1.0 and ours_vs_native_bitwise on the sampled weights (our_6T_cache1 = gemm_threads=6 + PYPTO_X_AVX512_WEIGHT_CACHE=1, the best measured PyPTO-X configuration; oneDNN native uses the vLLM 6-thread CPU launch policy)', 'native_path': 'vllm CPU UnquantizedLinearMethod -> dispatch_cpu_unquantized_gemm (oneDNN create_onednn_mm/onednn_mm on this AMX-less Zen5 host, 6 threads)', 'generated_at': '2026-09-11T00:40:49Z', 'gate_table_version': 1, 'enabled_rows': 0, 'total_rows': 12}
++
++GATE_TABLE = {
++    'torch.bfloat16': {
++        1: {
++            1024: {
++                32: {'enabled': False, 'ratio': 5.8734878468739025, 'ratio_our_1T_default': 10.068942226573272, 'ratio_our_6T_default': 6.202799479531229, 'ratio_our_6T_cache1': 5.8734878468739025, 'native_branch': 'onednn', 'bitwise': True, 'max_abs': 0.0, 'perf_pass': False, 'numeric_pass': True, 'reason': 'ratio_gt_threshold', 'label': 'gdn_in_proj_ba'},
++                5120: {'enabled': False, 'ratio': 8.930159221964983, 'ratio_our_1T_default': 4.741194545492357, 'ratio_our_6T_default': 8.151571806129489, 'ratio_our_6T_cache1': 8.930159221964983, 'native_branch': 'onednn', 'bitwise': True, 'max_abs': 0.0, 'perf_pass': False, 'numeric_pass': True, 'reason': 'ratio_gt_threshold', 'label': 'attn_qkv_proj'},
++                7168: {'enabled': False, 'ratio': 6.1398978793075205, 'ratio_our_1T_default': 4.387975727909229, 'ratio_our_6T_default': 5.977435048045475, 'ratio_our_6T_cache1': 6.1398978793075205, 'native_branch': 'onednn', 'bitwise': False, 'max_abs': 3.814697265625e-06, 'perf_pass': False, 'numeric_pass': False, 'reason': 'ratio_gt_threshold+numeric_not_bitwise', 'label': 'mlp_gate_up_proj'},
++                8192: {'enabled': False, 'ratio': 4.409522281281324, 'ratio_our_1T_default': 3.806529339606947, 'ratio_our_6T_default': 4.445372102393521, 'ratio_our_6T_cache1': 4.409522281281324, 'native_branch': 'onednn', 'bitwise': True, 'max_abs': 0.0, 'perf_pass': False, 'numeric_pass': True, 'reason': 'ratio_gt_threshold', 'label': 'gdn_in_proj_qkvz'},
++            },
++            2048: {
++                1024: {'enabled': False, 'ratio': 13.985298401705668, 'ratio_our_1T_default': 3.6625962597605715, 'ratio_our_6T_default': 14.689120597282486, 'ratio_our_6T_cache1': 13.985298401705668, 'native_branch': 'onednn', 'bitwise': True, 'max_abs': 0.0, 'perf_pass': False, 'numeric_pass': True, 'reason': 'ratio_gt_threshold', 'label': 'gdn_out_proj/attn_o_proj'},
++            },
++            3584: {
++                1024: {'enabled': False, 'ratio': 8.891837807132198, 'ratio_our_1T_default': 3.5490494838359976, 'ratio_our_6T_default': 8.896147925090792, 'ratio_our_6T_cache1': 8.891837807132198, 'native_branch': 'onednn', 'bitwise': True, 'max_abs': 0.0, 'perf_pass': False, 'numeric_pass': True, 'reason': 'ratio_gt_threshold', 'label': 'mlp_down_proj'},
++            },
++        },
++        5: {
++            1024: {
++                32: {'enabled': False, 'ratio': 5.574433599935155, 'ratio_our_1T_default': 6.075627075011792, 'ratio_our_6T_default': 7.948530212450534, 'ratio_our_6T_cache1': 5.574433599935155, 'native_branch': 'onednn', 'bitwise': True, 'max_abs': 0.0, 'perf_pass': False, 'numeric_pass': True, 'reason': 'ratio_gt_threshold', 'label': 'gdn_in_proj_ba'},
++                5120: {'enabled': False, 'ratio': 4.986000549981844, 'ratio_our_1T_default': 7.459527839433973, 'ratio_our_6T_default': 5.997019473464685, 'ratio_our_6T_cache1': 4.986000549981844, 'native_branch': 'onednn', 'bitwise': False, 'max_abs': 7.62939453125e-06, 'perf_pass': False, 'numeric_pass': False, 'reason': 'ratio_gt_threshold+numeric_not_bitwise', 'label': 'attn_qkv_proj'},
++                7168: {'enabled': False, 'ratio': 4.8681119057734366, 'ratio_our_1T_default': 7.596087096154067, 'ratio_our_6T_default': 4.4503668335012865, 'ratio_our_6T_cache1': 4.8681119057734366, 'native_branch': 'onednn', 'bitwise': False, 'max_abs': 1.52587890625e-05, 'perf_pass': False, 'numeric_pass': False, 'reason': 'ratio_gt_threshold+numeric_not_bitwise', 'label': 'mlp_gate_up_proj'},
++                8192: {'enabled': False, 'ratio': 4.203904615889254, 'ratio_our_1T_default': 7.456303352227052, 'ratio_our_6T_default': 4.184009427090836, 'ratio_our_6T_cache1': 4.203904615889254, 'native_branch': 'onednn', 'bitwise': False, 'max_abs': 6.103515625e-05, 'perf_pass': False, 'numeric_pass': False, 'reason': 'ratio_gt_threshold+numeric_not_bitwise', 'label': 'gdn_in_proj_qkvz'},
++            },
++            2048: {
++                1024: {'enabled': False, 'ratio': 8.627139411355211, 'ratio_our_1T_default': 7.114343963928801, 'ratio_our_6T_default': 9.574627684015386, 'ratio_our_6T_cache1': 8.627139411355211, 'native_branch': 'onednn', 'bitwise': False, 'max_abs': 0.0001220703125, 'perf_pass': False, 'numeric_pass': False, 'reason': 'ratio_gt_threshold+numeric_not_bitwise', 'label': 'gdn_out_proj/attn_o_proj'},
++            },
++            3584: {
++                1024: {'enabled': False, 'ratio': 6.524225599324215, 'ratio_our_1T_default': 7.422997275750501, 'ratio_our_6T_default': 7.303743383052676, 'ratio_our_6T_cache1': 6.524225599324215, 'native_branch': 'onednn', 'bitwise': True, 'max_abs': 0.0, 'perf_pass': False, 'numeric_pass': True, 'reason': 'ratio_gt_threshold', 'label': 'mlp_down_proj'},
++            },
++        },
++    },
++}
++
++
++def lookup(dtype: str, m: int, k: int, n: int):
++    """Return the gate row for ``(dtype, M, K, N)`` or ``None``."""
++
++    per_dtype = GATE_TABLE.get(dtype)
++    if not per_dtype:
++        return None
++    per_k = per_dtype.get(int(m), {}).get(int(k))
++    if not per_k:
++        return None
++    return per_k.get(int(n))
+diff --git a/python/pypto_x_vllm/plugin.py b/python/pypto_x_vllm/plugin.py
+new file mode 100644
+index 000000000..8df0473c1
+--- /dev/null
++++ b/python/pypto_x_vllm/plugin.py
+@@ -0,0 +1,404 @@
++"""vLLM CPU general plugin: PyPTO-X packed AVX-512 dense Linear (W8J J2).
++
++Loading channel
++---------------
++``vllm.general_plugins`` entry point (``pypto_x = "pypto_x_vllm.plugin:register"``).
++vLLM 0.29.0 calls ``load_general_plugins()`` in the driver, the EngineCore
++process and every worker, so ``register()`` must be idempotent and every class
++it exposes must be defined at *module* level (J0 measured that defining the
++quantization config inside ``register()`` makes the spawned worker fail with
++``AttributeError: Can't get local object`` while unpickling ``VllmConfig``).
++
++Mechanism
++---------
++``PyPTOXQuantConfig(QuantizationConfig)`` + ``PyPTOXLinearMethod``
++(``LinearMethodBase``) intercept only ``LinearBase`` layers that pass
++``--quantization pypto_x``:
++
++* ``process_weights_after_loading``: 2-D weights are pre-packed once with
++  ``torch.ops.pypto_x.pack_weight`` (W8B 64x64 tile layout) and the handle is
++  cached on the layer.  3-D weights (GDN conv1d) are handed back to the stock
++  ``UnquantizedLinearMethod`` so vLLM's causal-conv packing is untouched.
++* ``apply``: only shapes enabled by the measured gate table are injected
++  (``torch.ops.pypto_x.linear_prepacked``); everything else -- unknown shape,
++  disabled shape, unsupported dtype/rank/device, pack failure, kernel error --
++  falls back to ``torch.nn.functional.linear`` on the still-live BF16 weight.
++* ``get_quant_method`` returns ``None`` for non-Linear layers (Attention,
++  embeddings, GDN core), matching the verified J0 injection probe.
++
++The generated table lives in :mod:`pypto_x_vllm.gate_table`.  Every decision is
++appended to ``$PYPTO_X_VLLM_LOG`` as one JSON line so the evidence driver can
++aggregate per-prefix injection/fallback coverage and reasons.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import threading
++import time
++from typing import Any, Dict, Optional
++
++import torch
++import torch.nn.functional as F
++
++from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
++from vllm.model_executor.layers.quantization import register_quantization_config
++from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
++
++from . import gate_table
++
++QUANTIZATION_NAME = "pypto_x"
++_LOG_ENV = "PYPTO_X_VLLM_LOG"
++_GATE_JSON_ENV = "PYPTO_X_VLLM_GATE_JSON"
++_ENABLE_ENV = "PYPTO_X_VLLM_ENABLE"
++
++_REGISTER_LOCK = threading.RLock()
++_REGISTERED = False
++_TABLE: Optional[Dict[str, Any]] = None
++_TABLE_SOURCE = "embedded"
++_STATS_LOCK = threading.Lock()
++_STATS: Dict[str, int] = {}
++
++
++def _log_path() -> str:
++    return os.environ.get(_LOG_ENV, "")
++
++
++def _log(record: Dict[str, Any]) -> None:
++    """Append one JSON line (single O_APPEND write; safe across processes)."""
++
++    path = _log_path()
++    if not path:
++        return
++    try:
++        record = dict(record)
++        record.setdefault("pid", os.getpid())
++        record.setdefault("time", time.time())
++        line = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
++        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
++        try:
++            os.write(fd, line)
++        finally:
++            os.close(fd)
++    except Exception:
++        # never break the model run because of logging
++        pass
++
++
++def _count(key: str) -> None:
++    with _STATS_LOCK:
++        _STATS[key] = _STATS.get(key, 0) + 1
++
++
++def stats() -> Dict[str, int]:
++    with _STATS_LOCK:
++        return dict(_STATS)
++
++
++def _injection_enabled() -> bool:
++    value = os.environ.get(_ENABLE_ENV, "1").strip().lower()
++    return value not in ("0", "false", "no", "off")
++
++
++def _table_from_json(path: str) -> Dict[str, Any]:
++    """Load an external audit rendering of the gate table.
++
++    JSON keys are ``"<dtype>|<m>|<k>|<n>"``; values are the same row mappings
++    as the embedded table.  A malformed row is ignored (fail-open).
++    """
++
++    with open(path, "r", encoding="utf-8") as handle:
++        raw = json.load(handle)
++    rows = raw.get("gate_table", raw)
++    table: Dict[str, Any] = {}
++    for key, row in rows.items():
++        parts = str(key).split("|")
++        if len(parts) != 4:
++            continue
++        dtype, m, k, n = parts[0], parts[1], parts[2], parts[3]
++        try:
++            table.setdefault(dtype, {}).setdefault(int(m), {}).setdefault(int(k), {})[
++                int(n)
++            ] = dict(row)
++        except (TypeError, ValueError):
++            continue
++    return table
++
++
++def _gate_table() -> Dict[str, Any]:
++    global _TABLE, _TABLE_SOURCE
++    if _TABLE is None:
++        override = os.environ.get(_GATE_JSON_ENV, "").strip()
++        if override:
++            try:
++                _TABLE = _table_from_json(override)
++                _TABLE_SOURCE = "json:" + override
++            except Exception as exc:  # fail-open: an unreadable override disables injection
++                _TABLE = {}
++                _TABLE_SOURCE = "json_error:{}:{}".format(type(exc).__name__, exc)
++        else:
++            _TABLE = gate_table.GATE_TABLE
++            _TABLE_SOURCE = "embedded"
++    return _TABLE
++
++
++def _gate_row(dtype: str, m: int, k: int, n: int) -> Optional[Dict[str, Any]]:
++    if not _injection_enabled():
++        return None
++    table = _gate_table()
++    per_dtype = table.get(dtype)
++    if not per_dtype:
++        return None
++    per_k = per_dtype.get(int(m), {}).get(int(k))
++    if not per_k:
++        return None
++    return per_k.get(int(n))
++
++
++def _fallback(layer: Any, x: torch.Tensor, bias: Optional[torch.Tensor]) -> torch.Tensor:
++    return F.linear(x, layer.weight, bias)
++
++
++class _GateMiss(Exception):
++    """Internal signal: not a kernel failure, just not enabled for this shape."""
++
++
++class PyPTOXLinearMethod(UnquantizedLinearMethod):
++    """Unquantized-weight linear method whose ``apply`` is the PyPTO-X seat."""
++
++    def __init__(self, prefix: str) -> None:
++        super().__init__()
++        self.prefix = prefix
++
++    # -- weight preparation -------------------------------------------
++    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        weight = getattr(layer, "weight", None)
++        if weight is None:
++            return
++        if getattr(weight, "is_meta", False):
++            layer._pypto_x_packed = None
++            layer._pypto_x_pack_error = "meta_weight"
++            _log({"event": "pack_skip", "prefix": self.prefix, "reason": "meta_weight"})
++            return
++        if weight.ndim != 2:
++            # GDN conv1d (3-D) and friends keep vLLM's stock CPU packing.
++            super().process_weights_after_loading(layer)
++            _log(
++                {
++                    "event": "pack_skip",
++                    "prefix": self.prefix,
++                    "reason": "non_2d_weight",
++                    "weight_shape": list(weight.shape),
++                }
++            )
++            return
++        try:
++            if weight.dtype not in (torch.bfloat16, torch.float32):
++                raise ValueError("unsupported dtype {}".format(weight.dtype))
++            handle = torch.ops.pypto_x.pack_weight(weight.detach())
++            layer._pypto_x_packed = handle
++            layer._pypto_x_pack_error = None
++            _count("pack_ok")
++            _log(
++                {
++                    "event": "pack_ok",
++                    "prefix": self.prefix,
++                    "weight_shape": list(weight.shape),
++                    "handle_bytes": int(handle.numel()),
++                    "dtype": str(weight.dtype),
++                    "gate_table_version": gate_table.GATE_TABLE_VERSION,
++                    "gate_table_source": _TABLE_SOURCE,
++                }
++            )
++        except Exception as exc:
++            layer._pypto_x_packed = None
++            layer._pypto_x_pack_error = "{}: {}".format(type(exc).__name__, exc)
++            _count("pack_failed")
++            _log(
++                {
++                    "event": "pack_failed",
++                    "prefix": self.prefix,
++                    "reason": type(exc).__name__,
++                    "error": str(exc)[:300],
++                    "weight_shape": list(weight.shape),
++                }
++            )
++
++    # -- execution -----------------------------------------------------
++    def apply(
++        self,
++        layer: torch.nn.Module,
++        x: torch.Tensor,
++        bias: Optional[torch.Tensor] = None,
++    ) -> torch.Tensor:
++        packed = getattr(layer, "_pypto_x_packed", None)
++        if packed is None:
++            reason = getattr(layer, "_pypto_x_pack_error", None) or "no_packed_weight"
++            _count("fallback_no_packed")
++            _log(
++                {
++                    "event": "apply_fallback",
++                    "prefix": self.prefix,
++                    "reason": "no_packed_weight",
++                    "detail": str(reason)[:200],
++                }
++            )
++            return _fallback(layer, x, bias)
++        try:
++            if x.dim() != 2:
++                raise _GateMiss("rank_{}".format(x.dim()))
++            if x.device.type != "cpu":
++                raise _GateMiss("device_{}".format(x.device.type))
++            if x.dtype not in (torch.bfloat16, torch.float32):
++                raise _GateMiss("dtype_{}".format(str(x.dtype)))
++            m, k = int(x.shape[0]), int(x.shape[1])
++            n = int(layer.weight.shape[0])
++            row = _gate_row(str(x.dtype), m, k, n)
++            if row is None:
++                raise _GateMiss("shape_not_enabled")
++            if not row.get("enabled", False):
++                raise _GateMiss("shape_disabled")
++            out = torch.ops.pypto_x.linear_prepacked(x, packed, bias)
++            _count("inject")
++            _log(
++                {
++                    "event": "apply_inject",
++                    "prefix": self.prefix,
++                    "m": m,
++                    "k": k,
++                    "n": n,
++                    "dtype": str(x.dtype),
++                    "ratio": row.get("ratio"),
++                    "gate_table_version": gate_table.GATE_TABLE_VERSION,
++                }
++            )
++            return out
++        except _GateMiss as miss:
++            _count("fallback_gate")
++            _log(
++                {
++                    "event": "apply_fallback",
++                    "prefix": self.prefix,
++                    "reason": str(miss),
++                    "m": int(x.shape[0]) if x.dim() >= 1 else None,
++                    "k": int(x.shape[-1]) if x.dim() >= 1 else None,
++                    "n": int(layer.weight.shape[0]),
++                    "dtype": str(x.dtype),
++                }
++            )
++            return _fallback(layer, x, bias)
++        except Exception as exc:
++            # Fail-open on any kernel/runtime error: the raw BF16 weight is
++            # still live, so F.linear is semantically exact.
++            _count("fallback_error")
++            _log(
++                {
++                    "event": "apply_fallback",
++                    "prefix": self.prefix,
++                    "reason": "kernel_error",
++                    "error_type": type(exc).__name__,
++                    "error": str(exc)[:300],
++                    "m": int(x.shape[0]) if x.dim() >= 1 else None,
++                    "k": int(x.shape[-1]) if x.dim() >= 1 else None,
++                    "n": int(layer.weight.shape[0]),
++                    "dtype": str(x.dtype),
++                }
++            )
++            return _fallback(layer, x, bias)
++
++
++class PyPTOXQuantConfig(QuantizationConfig):
++    """Quantization config used purely as the dense-Linear injection seat."""
++
++    def __init__(self) -> None:
++        super().__init__()
++
++    def get_name(self):
++        return QUANTIZATION_NAME
++
++    def get_supported_act_dtypes(self):
++        return [torch.bfloat16, torch.float32]
++
++    @classmethod
++    def get_min_capability(cls) -> int:
++        return 0
++
++    @staticmethod
++    def get_config_filenames():
++        return []
++
++    @classmethod
++    def from_config(cls, config):
++        return cls()
++
++    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
++        if isinstance(layer, LinearBase):
++            return PyPTOXLinearMethod(prefix)
++        return None
++
++
++def _ensure_pypto_seam() -> str:
++    """Make ``pypto.framework`` importable from the worktree source tree.
++
++    The repository's ``python/pypto/__init__.py`` is the online-build bootstrap
++    (it needs installed wheel metadata); J1/J2 use the documented torch-suite
++    seam instead: a stub ``pypto`` module whose ``__path__`` points at the
++    source package, so submodules import without executing the bootstrap.
++    Returns the resolved package root for the evidence log.
++    """
++
++    import sys
++    import types
++    from pathlib import Path
++
++    root = Path(__file__).resolve().parents[1] / "pypto"
++    existing = sys.modules.get("pypto")
++    if existing is None:
++        package = types.ModuleType("pypto")
++        package.__path__ = [str(root)]
++        sys.modules["pypto"] = package
++    return str(root)
++
++
++def register() -> None:
++    """``vllm.general_plugins`` entry point; idempotent, per process."""
++
++    global _REGISTERED
++    with _REGISTER_LOCK:
++        if _REGISTERED:
++            return
++        pypto_root = _ensure_pypto_seam()
++        # The measured gate table assumes the same 6-thread packed GEMM as the
++        # vLLM CPU baseline.  ``PYPTO_X_VLLM_GEMM_THREADS`` overrides the
++        # plugin default; an explicit PYPTO_X_AVX512_GEMM_THREADS always wins.
++        os.environ.setdefault(
++            "PYPTO_X_AVX512_GEMM_THREADS",
++            os.environ.get("PYPTO_X_VLLM_GEMM_THREADS", "6"),
++        )
++        import pypto.framework as framework
++
++        framework.register_torch_ops()
++        register_quantization_config(QUANTIZATION_NAME)(PyPTOXQuantConfig)
++        _REGISTERED = True
++        table = _gate_table()
++        _log(
++            {
++                "event": "plugin_register",
++                "quantization": QUANTIZATION_NAME,
++                "torch": torch.__version__,
++                "gate_table_version": gate_table.GATE_TABLE_VERSION,
++                "gate_table_source": _TABLE_SOURCE,
++                "gate_dtypes": sorted(table),
++                "pypto_root": pypto_root,
++            }
++        )
++
++
++__all__ = [
++    "PyPTOXLinearMethod",
++    "PyPTOXQuantConfig",
++    "QUANTIZATION_NAME",
++    "register",
++    "stats",
++]
+diff --git a/python/tests/framework_torch/test_vllm_plugin.py b/python/tests/framework_torch/test_vllm_plugin.py
+new file mode 100644
+index 000000000..c00ec0104
+--- /dev/null
++++ b/python/tests/framework_torch/test_vllm_plugin.py
+@@ -0,0 +1,156 @@
++"""Focused tests for the W8J J2 vLLM CPU plugin (no model load).
++
++These tests exercise the injection seat itself: registration, gate routing,
++fail-open fallback and 3-D weight handover.  They run in the dedicated
++``pypto-x-w8j`` environment (vLLM CPU 0.29.0 + torch 2.13.0+cpu).
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++import sys
++import types
++from unittest import mock
++
++import pytest
++import torch
++import torch.nn.functional as F
++
++PYTHON_ROOT = Path(__file__).resolve().parents[2]
++if str(PYTHON_ROOT) not in sys.path:
++    sys.path.insert(0, str(PYTHON_ROOT))
++if "pypto" not in sys.modules:
++    package = types.ModuleType("pypto")
++    package.__path__ = [str(PYTHON_ROOT / "pypto")]
++    sys.modules["pypto"] = package
++
++import pypto_x_vllm.plugin as plugin  # noqa: E402
++from pypto.framework import torch_ops  # noqa: E402
++from pypto.framework.linear_kernel import LinearKernelCache, reset_linear_kernel_cache  # noqa: E402
++
++
++plugin.register()
++plugin.register()
++torch_ops.register()
++
++
++@pytest.fixture()
++def fresh_caches(tmp_path, monkeypatch):
++    cache = LinearKernelCache(cache_dir=tmp_path / "kernel-cache", disk_cache=True)
++    reset_linear_kernel_cache(cache)
++    torch_ops.reset_weight_pack_cache()
++    torch_ops.reset_fallback_stats()
++    yield cache
++    reset_linear_kernel_cache(LinearKernelCache(cache_dir=tmp_path / "kernel-cache", disk_cache=True))
++    torch_ops.reset_weight_pack_cache()
++    torch_ops.reset_fallback_stats()
++
++
++class _DummyLayer(torch.nn.Module):
++    def __init__(self, weight):
++        super().__init__()
++        self.weight = torch.nn.Parameter(weight, requires_grad=False)
++
++
++def _method(prefix="language_model.model.layers.0.mlp.gate_up_proj"):
++    return plugin.PyPTOXLinearMethod(prefix)
++
++
++def test_quant_config_only_targets_linear_layers():
++    from vllm.model_executor.layers.linear import LinearBase
++
++    config = plugin.PyPTOXQuantConfig()
++    assert config.get_name() == "pypto_x"
++    assert config.get_quant_method(torch.nn.Linear(4, 4), "x") is None
++    assert config.get_quant_method(torch.nn.Embedding(4, 4), "x") is None
++    linear_like = mock.Mock(spec=LinearBase)
++    method = config.get_quant_method(linear_like, "language_model.model.layers.0.mlp.down_proj")
++    assert isinstance(method, plugin.PyPTOXLinearMethod)
++    assert method.prefix == "language_model.model.layers.0.mlp.down_proj"
++
++
++def test_process_weights_after_loading_packs_2d_weight(fresh_caches):
++    weight = torch.randn(3584, 1024, dtype=torch.bfloat16)
++    layer = _DummyLayer(weight)
++    _method().process_weights_after_loading(layer)
++    handle = layer._pypto_x_packed
++    assert isinstance(handle, torch.Tensor)
++    assert handle.dtype == torch.uint8
++    assert handle.numel() > weight.numel()
++    assert layer._pypto_x_pack_error is None
++
++
++def test_apply_injects_only_enabled_shapes(fresh_caches, monkeypatch):
++    m, k, n = 2, 64, 130
++    weight = torch.randn(n, k, dtype=torch.bfloat16)
++    x = torch.randn(m, k, dtype=torch.bfloat16)
++    layer = _DummyLayer(weight)
++    method = _method()
++    method.process_weights_after_loading(layer)
++    reference = torch.ops.pypto_x.linear(x, weight)
++
++    monkeypatch.setattr(plugin, "_TABLE", {})
++    before = plugin.stats().get("inject", 0)
++    out = method.apply(layer, x, None)
++    assert torch.equal(out, F.linear(x, weight))
++    assert plugin.stats().get("inject", 0) == before
++
++    monkeypatch.setattr(
++        plugin,
++        "_TABLE",
++        {"torch.bfloat16": {m: {k: {n: {"enabled": True, "ratio": 0.5}}}}},
++    )
++    out = method.apply(layer, x, None)
++    assert plugin.stats().get("inject", 0) == before + 1
++    assert torch.equal(out, reference)
++    # the injected output must be the packed-plane kernel, not F.linear
++    assert torch.equal(out, torch.ops.pypto_x.linear_prepacked(x, layer._pypto_x_packed))
++
++
++def test_apply_fails_open_on_a_corrupt_handle(fresh_caches, monkeypatch):
++    weight = torch.randn(16, 8, dtype=torch.bfloat16)
++    x = torch.randn(2, 8, dtype=torch.bfloat16)
++    layer = _DummyLayer(weight)
++    method = _method()
++    layer._pypto_x_packed = torch.zeros(8, dtype=torch.uint8)
++    monkeypatch.setattr(
++        plugin,
++        "_TABLE",
++        {"torch.bfloat16": {2: {8: {16: {"enabled": True, "ratio": 0.5}}}}},
++    )
++    before = plugin.stats().get("fallback_error", 0)
++    out = method.apply(layer, x, None)
++    assert torch.equal(out, F.linear(x, weight))
++    assert plugin.stats().get("fallback_error", 0) == before + 1
++
++
++def test_rank3_weight_goes_back_to_the_parent_method(fresh_caches, monkeypatch):
++    weight = torch.randn(5120, 4, 4, dtype=torch.bfloat16)
++    layer = _DummyLayer(weight)
++    called = {"parent": 0}
++
++    def fake_parent(self, target_layer):
++        called["parent"] += 1
++
++    monkeypatch.setattr(plugin.UnquantizedLinearMethod, "process_weights_after_loading", fake_parent)
++    _method().process_weights_after_loading(layer)
++    assert called["parent"] == 1
++    assert not hasattr(layer, "_pypto_x_packed")
++
++
++def test_gate_json_override_and_injection_switch(monkeypatch, tmp_path):
++    table = tmp_path / "gate.json"
++    table.write_text(
++        json.dumps({"gate_table": {"torch.bfloat16|1|8|16": {"enabled": True, "ratio": 0.9}}}),
++        encoding="utf-8",
++    )
++    monkeypatch.setenv(plugin._GATE_JSON_ENV, str(table))
++    monkeypatch.setattr(plugin, "_TABLE", None)
++    row = plugin._gate_row("torch.bfloat16", 1, 8, 16)
++    assert row == {"enabled": True, "ratio": 0.9}
++    monkeypatch.setenv(plugin._ENABLE_ENV, "0")
++    assert plugin._gate_row("torch.bfloat16", 1, 8, 16) is None
++    monkeypatch.delenv(plugin._ENABLE_ENV)
++    monkeypatch.delenv(plugin._GATE_JSON_ENV)
++    monkeypatch.setattr(plugin, "_TABLE", None)

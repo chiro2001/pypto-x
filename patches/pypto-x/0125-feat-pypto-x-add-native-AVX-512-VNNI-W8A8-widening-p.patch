@@ -1,0 +1,2430 @@
+From a3a50b9377aa6c83d9f5a1a7d6a6d024537d10f2 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 06:43:30 +0800
+Subject: [PATCH 125/134] feat(pypto-x): add native AVX-512 VNNI W8A8 widening
+ path
+
+Implement contract 0002 C4 / R6 on the W8B avx512-blocked-gemm base:
+
+- qmatmul_s8s8_s32 is wired through scalar validation -> CPU vector plan ->
+  AVX-512 VNNI lowering -> artifact metadata -> runtime dispatch.  The native
+  kernel uses vpdpbusd (u8 x s8) with an explicit +128 bias of the unsigned
+  right operand and a signed -128 * sum_k(left_row) correction per output row:
+  sum a*b = sum a*(b+128) - 128*sum a.  VPDPBUSD wraps its dword lanes modulo
+  2^32 (it is not the saturating VPDPBUSDS variant) and the frozen scheme
+  bounds the exact output by K*127*127 <= INT32_MAX (Q5), so the corrected
+  wrapped value is bit-exact; a dedicated case covers the worst-case biased
+  intermediate 255*127*K = 4,311,035,640 > INT32_MAX.
+- Capability declaration travels through CapabilitySet
+  (s8s8_s32_vnni_dpbusd) and is gated by the independent CPUID avx512vnni bit.
+  A target without VNNI cannot lower the opcode, and the runtime entry points
+  re-probe and compare the artifact declaration, so there is no widening or
+  BF16 fallback and no silent downgrade.
+- Probe-gated target entry points implement the remaining three opcodes
+  bit-exactly against the C1 goldens: dequantize_s8, single-rounding
+  dequantize_epilogue_bf16 and quantize_per_token_s8 (exact FP64 RNE semantics
+  for Q1/Q2/Q4/Q5/Q6); the Core IR multi-output wiring stays in C7/C8.
+- AVX-512 artifact payload 4 -> 5 and native ABI marker :5 -> :6 (the rebased
+  integration base already carried the W8B blocked-gemm payload 4 / marker :5);
+  old artifacts fail closed at load.  AVX2 payload 3 / marker :4 and the
+  BF16/packed planes are unchanged.
+- 91 new focused tests: capability/probe gate, rank-2/3/4 golden differential,
+  non-multiple-of-8 tails, K upper bound and wraparound compensation cases,
+  the three primitive goldens, fail-closed metadata/capability tampering, and
+  objdump evidence that the shared object really emits vpdpbusd (zero
+  vpdpwssd).
+---
+ python/pypto/backends/cpu/x86/avx512.py                | 587 ++++++++++++++++++++++
+ python/pypto/compiler/targets/cpu_avx512.py            | 416 +++++++++++++++-
+ python/pypto/lowering/cpu/x86/avx512/__init__.py       |  15 +-
+ python/pypto/lowering/cpu/x86/avx512/capabilities.py   |  57 +++
+ python/pypto/lowering/cpu/x86/avx512/lowering.py       |  28 +-
+ python/tests/ut/pypto_x/test_cpu_avx512_packed_gemm.py |   6 +-
+ python/tests/ut/pypto_x/test_w8a8_avx2.py              |  15 +-
+ python/tests/ut/pypto_x/test_w8a8_avx512.py            | 964 +++++++++++++++++++++++++++++++++++++
+ 8 files changed, 2071 insertions(+), 17 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/x86/avx512.py b/python/pypto/backends/cpu/x86/avx512.py
+index 7ec5e3e74..9063009dc 100644
+--- a/python/pypto/backends/cpu/x86/avx512.py
++++ b/python/pypto/backends/cpu/x86/avx512.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ import ctypes
+ from dataclasses import dataclass
+ import hashlib
++import math
+ import os
+ from pathlib import Path
+ from numbers import Integral
+@@ -34,15 +35,21 @@ from pypto.compiler.targets.cpu_avx512 import (
+     PACKED_GEMM_N_TILE,
+     PACKED_KERNEL_VERSION,
+     PACKED_TRANSPOSE_MODE,
++    W8A8_DEQUANTIZE_S8_KERNEL,
++    W8A8_EPILOGUE_KERNEL,
++    W8A8_QMATMUL_MODE,
+     _execution_metadata,
+     broadcast_native_contract,
+     packed_kernel_contract,
+     packed_matmul_dispatch,
+     reduction_gather_symbol,
+     reduction_group_contiguous,
++    w8a8_kernel_contract,
+ )
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation
+ from pypto.lowering.cpu import (
++    W8A8_MAX_ACCUMULATOR_K,
++    W8A8_QMATMUL_OPCODE,
+     canonical_dtype,
+     canonical_operation_name,
+     element_count,
+@@ -119,6 +126,17 @@ class LoadedAvx512Artifact:
+         return self.feature_contract
+ 
+ 
++@dataclass(frozen=True)
++class Avx512QuantizePerTokenResult:
++    """Native AVX-512 ``quantize_per_token_s8`` result (codes + scales + count)."""
++
++    codes: Tuple[int, ...]
++    scales: Tuple[float, ...]
++    saturation_count: int
++    rows: int
++    k: int
++
++
+ _NativeBuffer = _avx2._NativeBuffer
+ _RuntimeValue = _avx2._RuntimeValue
+ _ctype = _avx2._ctype
+@@ -134,6 +152,8 @@ _buffer_raw = _avx2._buffer_raw
+ _buffer_alloc = _avx2._buffer_alloc
+ _write_descriptor = _avx2._write_descriptor
+ _symbol = _avx2._symbol
++_status_symbol = _avx2._status_symbol
++_buffer_pointer = _avx2._buffer_pointer
+ _unravel = _avx2._unravel
+ _contiguous_strides = _avx2._contiguous_strides
+ _find_function = _avx2._find_function
+@@ -508,6 +528,159 @@ def clear_packed_weight_cache() -> None:
+         _PACKED_WEIGHT_CACHE_BYTES = 0
+ 
+ 
++def _w8a8_declared_shape(
++    values: Any, shape: Optional[Sequence[int]], context: str
++) -> Tuple[Tuple[Any, ...], Tuple[int, ...]]:
++    """Flatten a regular nested sequence through the shared AVX2 helpers."""
++
++    try:
++        return _avx2._w8a8_declared_shape(values, shape, context)
++    except _avx2.CpuAvx2RuntimeError as exc:
++        raise CpuAvx512ExecutionError(str(exc)) from exc
++
++
++def _w8a8_int_codes(flat: Sequence[Any], context: str) -> Tuple[int, ...]:
++    try:
++        return _avx2._w8a8_int_codes(flat, context)
++    except _avx2.CpuAvx2RuntimeError as exc:
++        raise CpuAvx512ExecutionError(str(exc)) from exc
++
++
++def _call_w8a8_qmatmul(
++    module: Any,
++    left: _NativeBuffer,
++    right: _NativeBuffer,
++    destination: _NativeBuffer,
++    m: int,
++    k: int,
++    n: int,
++) -> None:
++    """Run the native AVX-512 VNNI s8 x s8 -> s32 kernel.
++
++    The kernel returns ``-1`` when either operand contains the reserved
++    ``-128`` code point; that is a fail-closed scheme violation, not a value
++    that may be clamped silently.
++    """
++
++    function = _status_symbol(
++        module,
++        "ptx_avx512_qmatmul_s8s8_s32",
++        [
++            ctypes.POINTER(ctypes.c_int8),
++            ctypes.POINTER(ctypes.c_int8),
++            ctypes.POINTER(ctypes.c_int32),
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++        ],
++    )
++    status = int(function(left.pointer, right.pointer, destination.pointer, m, k, n))
++    if status != 0:
++        raise CpuAvx512ExecutionError(
++            "AVX-512 {} rejected reserved int8 code -128 (status {})".format(
++                W8A8_QMATMUL_OPCODE, status
++            )
++        )
++
++
++def _call_w8a8_dequantize_s8(
++    module: Any,
++    codes: _NativeBuffer,
++    scales: _NativeBuffer,
++    destination: _NativeBuffer,
++    rows: int,
++    k: int,
++) -> None:
++    function = _status_symbol(
++        module,
++        W8A8_DEQUANTIZE_S8_KERNEL,
++        [
++            ctypes.POINTER(ctypes.c_int8),
++            ctypes.POINTER(ctypes.c_float),
++            ctypes.POINTER(ctypes.c_float),
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++        ],
++    )
++    status = int(function(codes.pointer, scales.pointer, destination.pointer, rows, k))
++    if status == -3:
++        raise CpuAvx512ExecutionError(
++            "AVX-512 dequantize_s8 product overflows binary32; refusing to return inf"
++        )
++    if status != 0:
++        raise CpuAvx512ExecutionError(
++            "AVX-512 dequantize_s8 rejected reserved int8 code -128 (status {})".format(status)
++        )
++
++
++def _call_w8a8_epilogue(
++    module: Any,
++    accumulator: _NativeBuffer,
++    row_scales: _NativeBuffer,
++    column_scales: _NativeBuffer,
++    destination: _NativeBuffer,
++    rows: int,
++    columns: int,
++) -> None:
++    function = _status_symbol(
++        module,
++        W8A8_EPILOGUE_KERNEL,
++        [
++            ctypes.POINTER(ctypes.c_int32),
++            ctypes.POINTER(ctypes.c_float),
++            ctypes.POINTER(ctypes.c_float),
++            ctypes.POINTER(ctypes.c_uint16),
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++        ],
++    )
++    status = int(
++        function(
++            accumulator.pointer,
++            row_scales.pointer,
++            column_scales.pointer,
++            destination.pointer,
++            rows,
++            columns,
++        )
++    )
++    if status != 0:
++        raise CpuAvx512ExecutionError(
++            "AVX-512 dequantize_epilogue_bf16 product overflows binary32; refusing to return inf"
++        )
++
++
++def _call_w8a8_quantize_per_token_s8(
++    module: Any,
++    values: _NativeBuffer,
++    codes: _NativeBuffer,
++    scales: _NativeBuffer,
++    rows: int,
++    k: int,
++) -> int:
++    function = _status_symbol(
++        module,
++        "ptx_avx512_quantize_per_token_s8_f32",
++        [
++            ctypes.POINTER(ctypes.c_float),
++            ctypes.POINTER(ctypes.c_int8),
++            ctypes.POINTER(ctypes.c_float),
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++            ctypes.POINTER(ctypes.c_size_t),
++        ],
++    )
++    saturation = ctypes.c_size_t(0)
++    status = int(
++        function(values.pointer, codes.pointer, scales.pointer, rows, k, ctypes.byref(saturation))
++    )
++    if status != 0:
++        raise CpuAvx512ExecutionError(
++            "AVX-512 quantize_per_token_s8 native kernel rejected the input (status {})".format(status)
++        )
++    return int(saturation.value)
++
++
+ def _call_packed_cast(
+     module: Any,
+     kernel: str,
+@@ -1423,6 +1596,18 @@ class Avx512Runtime:
+             if ref.name not in environment:
+                 raise CpuAvx512ExecutionError("AVX-512 input {!r} is unavailable".format(ref.name))
+             inputs.append(environment[ref.name])
++        w8a8 = w8a8_kernel_contract(operation, plan)
++        if w8a8 is not None:
++            return {
++                "operation": name,
++                "mode": w8a8["mode"],
++                "kernel": w8a8["kernel"],
++                "packed": None,
++                "w8a8": w8a8,
++                "inputs": tuple(inputs),
++                "python_list_elements": 0,
++                "output_ref": operation.outputs[0],
++            }
+         packed = packed_kernel_contract(operation, plan)
+         if packed is not None:
+             return {
+@@ -1524,6 +1709,9 @@ class Avx512Runtime:
+                 )
+                 environment.update(_reference_operation(operation, plan, inputs, context))
+                 return
++            if mode == W8A8_QMATMUL_MODE:
++                environment.update(self._execute_w8a8(decision, operation, plan, module))
++                return
+             if mode in (PACKED_CAST_MODE, PACKED_TRANSPOSE_MODE, PACKED_EMBEDDING_MODE):
+                 environment.update(self._execute_packed(decision, operation, plan, module))
+                 return
+@@ -1605,6 +1793,100 @@ class Avx512Runtime:
+         except Exception as exc:
+             raise CpuAvx512ExecutionError("AVX-512 operation {} failed: {}".format(name, exc)) from exc
+ 
++    def _execute_w8a8(
++        self,
++        decision: Mapping[str, Any],
++        operation: Operation,
++        plan: Any,
++        module: Any,
++    ) -> Mapping[str, _RuntimeValue]:
++        """Run one native W8A8 VNNI kernel on caller-owned buffers.
++
++        The contract comes from :func:`w8a8_kernel_contract`, the same
++        predicate that produced the artifact metadata.  Capability gating is
++        declared through :class:`CapabilitySet`; the VNNI probe already ran in
++        ``launch`` and this method refuses to call the symbol without it.
++        """
++
++        contract = decision["w8a8"]
++        if contract.get("mode") != W8A8_QMATMUL_MODE:
++            raise CpuAvx512ArtifactError(
++                "unsupported AVX-512 W8A8 mode {!r}".format(contract.get("mode"))
++            )
++        if not self.capability.available:
++            raise CpuAvx512UnavailableError(self._status)
++        if self._real_capability is not None and not (
++            self._real_capability.available and self._real_capability.avx512vnni
++        ):
++            raise CpuAvx512UnavailableError(self._status)
++        inputs = list(decision["inputs"])
++        if len(inputs) != 2:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 {} requires two int8 inputs".format(W8A8_QMATMUL_OPCODE)
++            )
++        output_ref = operation.outputs[0]
++        output_dtype = canonical_dtype(output_ref.type.dtype)
++        if output_dtype != "int32":
++            raise CpuAvx512ArtifactError(
++                "AVX-512 {} output must be int32, got {!r}".format(W8A8_QMATMUL_OPCODE, output_dtype)
++            )
++        m = int(contract["m"])
++        k = int(contract["k"])
++        n = int(contract["n"])
++        batch_shape = tuple(int(value) for value in contract.get("batch_shape", ()))
++        if k > W8A8_MAX_ACCUMULATOR_K:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 {} K={} exceeds the INT32 accumulation limit {}".format(
++                    W8A8_QMATMUL_OPCODE, k, W8A8_MAX_ACCUMULATOR_K
++                )
++            )
++        batch_count = 1
++        for dimension in batch_shape:
++            if dimension < 0:
++                raise CpuAvx512ArtifactError("AVX-512 W8A8 batch dimensions must be non-negative")
++            batch_count *= dimension
++        left = inputs[0].buffer
++        right = inputs[1].buffer
++        if left.dtype != "int8" or right.dtype != "int8":
++            raise CpuAvx512ArtifactError("AVX-512 W8A8 qmatmul requires int8 operand buffers")
++        if left.count != batch_count * m * k or right.count != batch_count * k * n:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 {} operand element counts do not match the plan".format(W8A8_QMATMUL_OPCODE)
++            )
++        output = _buffer_alloc("int32", batch_count * m * n, output_ref.name)
++        left_elements = m * k
++        right_elements = k * n
++        output_elements = m * n
++        for batch_index in range(batch_count):
++            _call_w8a8_qmatmul(
++                module,
++                _NativeBuffer(
++                    left.dtype,
++                    left_elements,
++                    _buffer_pointer(left, batch_index * left_elements),
++                    left.owner,
++                    left.direct,
++                ),
++                _NativeBuffer(
++                    right.dtype,
++                    right_elements,
++                    _buffer_pointer(right, batch_index * right_elements),
++                    right.owner,
++                    right.direct,
++                ),
++                _NativeBuffer(
++                    output.dtype,
++                    output_elements,
++                    _buffer_pointer(output, batch_index * output_elements),
++                    output.owner,
++                    output.direct,
++                ),
++                m,
++                k,
++                n,
++            )
++        return {output_ref.name: _RuntimeValue(output_ref.type, output)}
++
+     def _execute_packed(
+         self,
+         decision: Mapping[str, Any],
+@@ -2031,6 +2313,310 @@ class Avx512Runtime:
+             output.pointer[output_index] = result.pointer[0]
+         return output
+ 
++    # ------------------------------------------------------------------
++    # W8A8 VNNI target-specific native entry points (R6 evidence surface).
++    #
++    # These require an ``avx512vnni`` artifact, so the native ABI marker,
++    # payload version and probe-gated CapabilitySet are validated before any
++    # symbol is called.  ``qmatmul_s8s8_s32`` additionally has a full Core IR
++    # path through ``launch`` above.
++    # ------------------------------------------------------------------
++
++    def _require_w8a8_declaration(self, artifact: Artifact, declared: Any) -> None:
++        metadata = mapping_copy(artifact.metadata)
++        required = tuple(metadata.get("required_features", ()))
++        if "avx512vnni" not in required:
++            raise CpuAvx512ArtifactError(
++                "AVX-512 W8A8 entry points require an avx512vnni artifact"
++            )
++        declaration = metadata.get("w8a8_capability")
++        if not isinstance(declaration, Mapping):
++            raise CpuAvx512ArtifactError("AVX-512 artifact has no W8A8 capability declaration")
++        if declaration.get("digest") != declared.fingerprint:
++            raise CpuAvx512ArtifactError("AVX-512 artifact W8A8 capability digest mismatch")
++        if tuple(declaration.get("dtypes", ())) != tuple(declared.dtypes):
++            raise CpuAvx512ArtifactError("AVX-512 artifact W8A8 dtype declaration mismatch")
++        if tuple(declaration.get("matrix_capabilities", ())) != tuple(declared.matrix_capabilities):
++            raise CpuAvx512ArtifactError(
++                "AVX-512 artifact W8A8 matrix capability declaration mismatch"
++            )
++
++    def _load_w8a8(self, artifact: Artifact) -> Tuple[Any, LoadedAvx512Artifact]:
++        capability = self._require_real_capability()
++        declared = _capabilities.avx512_w8a8_capabilities(capability, target=self.name)
++        loaded = self.load(artifact, available_features=capability.features)
++        self._require_w8a8_declaration(loaded.artifact, declared)
++        return declared, loaded
++
++    def w8a8_capability(self, artifact: Artifact) -> Any:
++        """Return the probe-gated W8A8 :class:`CapabilitySet` for an artifact."""
++
++        declared, _ = self._load_w8a8(artifact)
++        return declared
++
++    def run_w8a8_qmatmul(
++        self,
++        artifact: Artifact,
++        left: Any,
++        right: Any,
++        *,
++        left_shape: Optional[Sequence[int]] = None,
++        right_shape: Optional[Sequence[int]] = None,
++    ) -> Tuple[int, ...]:
++        """Run the native AVX-512 VNNI s8 x s8 -> s32 kernel."""
++
++        _, loaded = self._load_w8a8(artifact)
++        left_flat, left_declared = _w8a8_declared_shape(left, left_shape, "qmatmul.left")
++        right_flat, right_declared = _w8a8_declared_shape(right, right_shape, "qmatmul.right")
++        if len(left_declared) != len(right_declared) or len(left_declared) not in (2, 3, 4):
++            raise CpuAvx512ExecutionError(
++                "AVX-512 {} operands must have equal rank 2, 3, or 4".format(W8A8_QMATMUL_OPCODE)
++            )
++        if left_declared[:-2] != right_declared[:-2]:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 {} operands must have identical batch prefixes".format(W8A8_QMATMUL_OPCODE)
++            )
++        if left_declared[-1] != right_declared[-2]:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 {} reduction dimensions do not match".format(W8A8_QMATMUL_OPCODE)
++            )
++        k = left_declared[-1]
++        if k > W8A8_MAX_ACCUMULATOR_K:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 {} K={} exceeds the INT32 accumulation limit {}".format(
++                    W8A8_QMATMUL_OPCODE, k, W8A8_MAX_ACCUMULATOR_K
++                )
++            )
++        left_codes = _w8a8_int_codes(left_flat, "qmatmul.left")
++        right_codes = _w8a8_int_codes(right_flat, "qmatmul.right")
++        m = left_declared[-2]
++        n = right_declared[-1]
++        batch_shape = left_declared[:-2]
++        batch_count = 1
++        for dimension in batch_shape:
++            batch_count *= dimension
++        if len(left_codes) != batch_count * m * k or len(right_codes) != batch_count * k * n:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 {} operand sizes do not match the declared shapes".format(
++                    W8A8_QMATMUL_OPCODE
++                )
++            )
++        left_buffer = _buffer_from_values("int8", left_codes, "qmatmul.left")
++        right_buffer = _buffer_from_values("int8", right_codes, "qmatmul.right")
++        output = _buffer_alloc("int32", batch_count * m * n, "qmatmul.output")
++        left_elements = m * k
++        right_elements = k * n
++        output_elements = m * n
++        for batch_index in range(batch_count):
++            _call_w8a8_qmatmul(
++                loaded.module,
++                _NativeBuffer(
++                    left_buffer.dtype,
++                    left_elements,
++                    _buffer_pointer(left_buffer, batch_index * left_elements),
++                    left_buffer.owner,
++                    left_buffer.direct,
++                ),
++                _NativeBuffer(
++                    right_buffer.dtype,
++                    right_elements,
++                    _buffer_pointer(right_buffer, batch_index * right_elements),
++                    right_buffer.owner,
++                    right_buffer.direct,
++                ),
++                _NativeBuffer(
++                    output.dtype,
++                    output_elements,
++                    _buffer_pointer(output, batch_index * output_elements),
++                    output.owner,
++                    output.direct,
++                ),
++                m,
++                k,
++                n,
++            )
++        return tuple(_buffer_values(output))
++
++    def run_w8a8_dequantize_s8(
++        self,
++        artifact: Artifact,
++        codes: Any,
++        scales: Sequence[float],
++        *,
++        shape: Optional[Sequence[int]] = None,
++    ) -> Tuple[float, ...]:
++        """Run the native AVX-512 ``dequantize_s8`` diagnostic primitive."""
++
++        _, loaded = self._load_w8a8(artifact)
++        flat, declared_shape = _w8a8_declared_shape(codes, shape, "dequantize_s8.codes")
++        if len(declared_shape) < 1:
++            raise CpuAvx512ExecutionError("AVX-512 dequantize_s8 requires at least a 1-D input")
++        k = declared_shape[-1]
++        rows = 1
++        for dimension in declared_shape[:-1]:
++            rows *= dimension
++        if k == 0 or rows == 0:
++            raise CpuAvx512ExecutionError("AVX-512 dequantize_s8 requires non-empty [rows, K]")
++        if len(scales) != rows:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 dequantize_s8 expects {} per-row scales, got {}".format(rows, len(scales))
++            )
++        code_values = _w8a8_int_codes(flat, "dequantize_s8.codes")
++        try:
++            scale_values = tuple(float(scale) for scale in scales)
++        except (TypeError, ValueError) as exc:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 dequantize_s8 scales must be real numbers"
++            ) from exc
++        codes_buffer = _buffer_from_values("int8", code_values, "dequantize_s8.codes")
++        scales_buffer = _buffer_from_values("float32", scale_values, "dequantize_s8.scales")
++        output = _buffer_alloc("float32", rows * k, "dequantize_s8.output")
++        _call_w8a8_dequantize_s8(loaded.module, codes_buffer, scales_buffer, output, rows, k)
++        return tuple(_buffer_values(output))
++
++    def run_w8a8_quantize_per_token_s8(
++        self,
++        artifact: Artifact,
++        values: Any,
++        *,
++        shape: Optional[Sequence[int]] = None,
++        dtype: str = "float32",
++    ) -> Avx512QuantizePerTokenResult:
++        """Run the native AVX-512 dynamic per-token absmax quantizer (Q1-Q6).
++
++        ``dtype`` selects the logical input dtype: ``float32`` passes the
++        values through and ``bf16`` first rounds them to bfloat16 (the native
++        kernel itself always consumes binary32, exactly like the graph's
++        ``bf16 -> fp32`` view before quantization).
++        """
++
++        _, loaded = self._load_w8a8(artifact)
++        normalized_dtype = canonical_dtype(dtype)
++        if normalized_dtype not in ("float32", "bf16"):
++            raise CpuAvx512ExecutionError(
++                "AVX-512 quantize_per_token_s8 requires float32 or bf16 input, got {!r}".format(dtype)
++            )
++        flat, declared_shape = _w8a8_declared_shape(values, shape, "quantize_per_token_s8.values")
++        if len(declared_shape) == 0:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 quantize_per_token_s8 requires at least a 1-D input"
++            )
++        k = declared_shape[-1]
++        rows = 1
++        for dimension in declared_shape[:-1]:
++            rows *= dimension
++        if k == 0 or rows == 0:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 quantize_per_token_s8 requires non-empty [rows, K]"
++            )
++        if k > W8A8_MAX_ACCUMULATOR_K:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 quantize_per_token_s8 K={} exceeds the INT32 accumulation limit {}".format(
++                    k, W8A8_MAX_ACCUMULATOR_K
++                )
++            )
++        numbers = []
++        for index, value in enumerate(flat):
++            if isinstance(value, bool) or not isinstance(value, (int, float)):
++                raise CpuAvx512ExecutionError(
++                    "AVX-512 quantize_per_token_s8.values[{}] must be a real number".format(index)
++                )
++            number = float(value)
++            if math.isnan(number) or math.isinf(number):
++                raise CpuAvx512ExecutionError(
++                    "AVX-512 quantize_per_token_s8.values[{}] is NaN/Inf; "
++                    "refusing to quantize (Q2)".format(index)
++                )
++            # The opcode is defined on a typed tensor: round the input to its
++            # declared dtype first, then quantize the exact stored value.
++            rounded = float(_cast_value(number, normalized_dtype))
++            if math.isnan(rounded) or math.isinf(rounded):
++                raise CpuAvx512ExecutionError(
++                    "AVX-512 quantize_per_token_s8.values[{}] overflows {!r}; "
++                    "refusing to quantize".format(index, normalized_dtype)
++                )
++            numbers.append(rounded)
++        values_buffer = _buffer_from_values("float32", numbers, "quantize_per_token_s8.values")
++        codes = _buffer_alloc("int8", rows * k, "quantize_per_token_s8.codes")
++        scales = _buffer_alloc("float32", rows, "quantize_per_token_s8.scales")
++        saturation = _call_w8a8_quantize_per_token_s8(
++            loaded.module, values_buffer, codes, scales, rows, k
++        )
++        return Avx512QuantizePerTokenResult(
++            tuple(_buffer_raw(codes)),
++            tuple(_buffer_values(scales)),
++            saturation,
++            rows,
++            k,
++        )
++
++    def run_w8a8_dequantize_epilogue_bf16(
++        self,
++        artifact: Artifact,
++        accumulator: Any,
++        row_scales: Sequence[float],
++        column_scales: Sequence[float],
++        *,
++        shape: Optional[Sequence[int]] = None,
++    ) -> Tuple[int, ...]:
++        """Run the native AVX-512 single-rounding BF16 epilogue, returning bits."""
++
++        _, loaded = self._load_w8a8(artifact)
++        flat, declared_shape = _w8a8_declared_shape(
++            accumulator, shape, "dequantize_epilogue_bf16.accumulator"
++        )
++        if len(declared_shape) != 2:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 dequantize_epilogue_bf16 requires a rank-2 int32 accumulator"
++            )
++        rows, columns = declared_shape
++        if rows == 0 or columns == 0:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 dequantize_epilogue_bf16 requires non-empty [m, n]"
++            )
++        if len(row_scales) != rows or len(column_scales) != columns:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 dequantize_epilogue_bf16 scale counts do not match the accumulator shape"
++            )
++        values = []
++        for index, value in enumerate(flat):
++            if isinstance(value, bool) or not isinstance(value, int):
++                raise CpuAvx512ExecutionError(
++                    "AVX-512 dequantize_epilogue_bf16 accumulator[{}] must be an integer".format(
++                        index
++                    )
++                )
++            if value < -(2**31) or value > 2**31 - 1:
++                raise CpuAvx512ExecutionError(
++                    "AVX-512 dequantize_epilogue_bf16 accumulator[{}] outside INT32 range".format(
++                        index
++                    )
++                )
++            values.append(value)
++        try:
++            row_values = tuple(float(scale) for scale in row_scales)
++            column_values = tuple(float(scale) for scale in column_scales)
++        except (TypeError, ValueError) as exc:
++            raise CpuAvx512ExecutionError(
++                "AVX-512 dequantize_epilogue_bf16 scales must be real numbers"
++            ) from exc
++        accumulator_buffer = _buffer_from_values(
++            "int32", values, "epilogue.accumulator"
++        )
++        row_buffer = _buffer_from_values("float32", row_values, "epilogue.row_scales")
++        column_buffer = _buffer_from_values("float32", column_values, "epilogue.column_scales")
++        output = _buffer_alloc("bf16", rows * columns, "epilogue.output")
++        _call_w8a8_epilogue(
++            loaded.module,
++            accumulator_buffer,
++            row_buffer,
++            column_buffer,
++            output,
++            rows,
++            columns,
++        )
++        return tuple(_buffer_raw(output))
++
+     def run_vnni_dot_i8(self, artifact: Artifact, left: Sequence[int], right: Sequence[int]) -> int:
+         """Run the target-specific VNNI primitive (not a public Core op)."""
+ 
+@@ -2077,6 +2663,7 @@ def launch_avx512(
+ __all__ = [
+     "VNNI_INT32_MAX",
+     "VNNI_MAX_SAFE_LENGTH",
++    "Avx512QuantizePerTokenResult",
+     "Avx512Runtime",
+     "CPUAVX512Runtime",
+     "CPUAvx512Runtime",
+diff --git a/python/pypto/compiler/targets/cpu_avx512.py b/python/pypto/compiler/targets/cpu_avx512.py
+index b4b5c887d..7007bd9ab 100644
+--- a/python/pypto/compiler/targets/cpu_avx512.py
++++ b/python/pypto/compiler/targets/cpu_avx512.py
+@@ -15,10 +15,12 @@ from typing import Any, Mapping, Optional
+ from pypto.compiler.api import CompileOptions
+ from pypto.compiler.artifact import ABI_VERSION, Artifact
+ from pypto.core_ir import CoreProgram
+-from pypto.lowering.cpu import canonical_dtype, canonical_operation_name
++from pypto.lowering.cpu import W8A8_QMATMUL_OPCODE, canonical_dtype, canonical_operation_name
+ from pypto.lowering.cpu.x86.avx512 import (
+     AVX512_BACKEND,
+     AVX512_LOWERING_VERSION,
++    AVX512_W8A8_CAPABILITY,
++    W8A8_VNNI_MATRIX_CAPABILITY,
+     Avx512Program,
+     lower_avx512,
+ )
+@@ -26,18 +28,22 @@ from pypto.target import TargetSpec
+ from pypto.target._utils import mapping_copy, sha256_bytes, sha256_text
+ 
+ 
+-# Payload 4 adds the packed/blocked rank-2 matmul plane (weight-derived
++# Payload 4 added the packed/blocked rank-2 matmul plane (weight-derived
+ # parameter chains, f32/bf16/mixed kernels, optional bounded threading).
++# Payload 5 adds the W8A8 VNNI kernels (public ``qmatmul_s8s8_s32`` plus the
++# dequantize/quantize primitives) and the ``w8a8_capability`` declaration.
+ # Payload 3 added the native broadcast kernel and the native reduction group
+ # gather, and moved broadcast out of the host pre-expansion boundary.  Payload
+ # 2 added the packed parameter-scale native kernels (cast / rank-2 transpose /
+ # embedding); payload 1 described those operations as host_reference and is
+-# rejected by the runtime.
+-ARTIFACT_PAYLOAD_VERSION = 4
++# rejected by the runtime.  Older payloads are rejected fail-closed because
++# their execution-mode table cannot describe the new kernels.
++ARTIFACT_PAYLOAD_VERSION = 5
+ DEFAULT_ARTIFACT_FORMAT = "pypto-x.cpu.avx512"
+-#: Native shared-object ABI marker.  ``:5`` adds the packed/blocked matmul
+-#: symbols and their pthread worker entry points.
+-NATIVE_ABI_MARKER = "pypto-x.cpu.avx512:5"
++#: Native shared-object ABI marker.  ``:5`` added the packed/blocked matmul
++#: symbols and their pthread worker entry points; ``:6`` adds the W8A8 VNNI
++#: kernels.
++NATIVE_ABI_MARKER = "pypto-x.cpu.avx512:6"
+ 
+ 
+ _NATIVE_SOURCE = r'''
+@@ -70,7 +76,7 @@ _NATIVE_SOURCE = r'''
+ __attribute__((visibility("default"))) const char *ptx_avx512_variant = PTX_VARIANT;
+ __attribute__((visibility("default"))) const char *ptx_avx512_source_digest = PTX_SOURCE_DIGEST;
+ __attribute__((visibility("default"))) const unsigned int ptx_avx512_feature_mask = PTX_FEATURE_MASK;
+-__attribute__((visibility("default"))) const char *ptx_avx512_abi = "pypto-x.cpu.avx512:5";
++__attribute__((visibility("default"))) const char *ptx_avx512_abi = "pypto-x.cpu.avx512:6";
+ 
+ static inline __m512 ptx_binary_f32(int op, __m512 a, __m512 b) {
+     if (op == 0) return _mm512_add_ps(a, b);
+@@ -1194,6 +1200,292 @@ void ptx_avx512_matmul_packed_bf16_f32(const float *left, const uint16_t *packed
+     if (count <= 1) { ptx_worker_bf16_f32(&task); return; }
+     ptx_run_tasks(count, num_nb, ptx_worker_bf16_f32, &task);
+ }
++
++#if PTX_USE_VNNI
++/* ------------------------------------------------------------------ */
++/* W8A8 VNNI kernels (contract 0002 C4 / R6).                         */
++/*                                                                     */
++/* AVX-512 VNNI has no s8 x s8 dot product: VPDPBUSD consumes an       */
++/* unsigned first operand and a signed second operand.  C4 therefore   */
++/* biases the *right* operand by +128 and removes the bias from every  */
++/* output entry with the exact integer identity                        */
++/*                                                                     */
++/*     sum_k a_k * b_k = sum_k a_k * (b_k + 128) - 128 * sum_k a_k     */
++/*                                                                     */
++/* where a is a signed left-matrix row.  The correction depends only   */
++/* on the signed row sum of the left row (one int32 per output row),   */
++/* never on the right operand's column sums.  VPDPBUSD adds its DWORD  */
++/* lanes modulo 2^32 (it does not saturate); the frozen scheme bounds  */
++/* the exact output by K*127*127 <= INT32_MAX (Q5), so the corrected   */
++/* wrapped value is bit-exact.  -128 is rejected before any math       */
++/* instead of being silently wrapped.                                  */
++/* ------------------------------------------------------------------ */
++
++static inline int32_t ptx_avx512_w8a8_pack4(const int8_t *values) {
++    return (int32_t)((uint32_t)(uint8_t)values[0]
++                     | ((uint32_t)(uint8_t)values[1] << 8)
++                     | ((uint32_t)(uint8_t)values[2] << 16)
++                     | ((uint32_t)(uint8_t)values[3] << 24));
++}
++
++__attribute__((visibility("default")))
++int ptx_avx512_qmatmul_s8s8_s32(const int8_t *restrict left,
++                                const int8_t *restrict right,
++                                int32_t *restrict output,
++                                size_t m, size_t k, size_t n) {
++    size_t element, row, column, index, lane;
++    int32_t lanes[16];
++    const __m512i bias128 = _mm512_set1_epi32(128);
++    for (element = 0; element < m * k; ++element)
++        if (left[element] == INT8_MIN) return -1;
++    for (element = 0; element < k * n; ++element)
++        if (right[element] == INT8_MIN) return -1;
++    for (row = 0; row < m; ++row) {
++        const int8_t *left_row = left + row * k;
++        int32_t *output_row = output + row * n;
++        int64_t row_sum = 0;
++        uint32_t correction;
++        for (index = 0; index < k; ++index) row_sum += left_row[index];
++        correction = (uint32_t)((uint64_t)row_sum * 128U);
++        for (column = 0; column + 16 <= n; column += 16) {
++            __m512i accumulator = _mm512_setzero_si512();
++            size_t step = 0;
++            for (; step + 4 <= k; step += 4) {
++                __m512i a = _mm512_set1_epi32(ptx_avx512_w8a8_pack4(left_row + step));
++                __m512i b0 = _mm512_add_epi32(
++                    _mm512_cvtepi8_epi32(_mm_loadu_si128(
++                        (const __m128i *)(right + (step + 0) * n + column))), bias128);
++                __m512i b1 = _mm512_add_epi32(
++                    _mm512_cvtepi8_epi32(_mm_loadu_si128(
++                        (const __m128i *)(right + (step + 1) * n + column))), bias128);
++                __m512i b2 = _mm512_add_epi32(
++                    _mm512_cvtepi8_epi32(_mm_loadu_si128(
++                        (const __m128i *)(right + (step + 2) * n + column))), bias128);
++                __m512i b3 = _mm512_add_epi32(
++                    _mm512_cvtepi8_epi32(_mm_loadu_si128(
++                        (const __m128i *)(right + (step + 3) * n + column))), bias128);
++                __m512i biased = _mm512_or_si512(
++                    _mm512_or_si512(b0, _mm512_slli_epi32(b1, 8)),
++                    _mm512_or_si512(_mm512_slli_epi32(b2, 16),
++                                    _mm512_slli_epi32(b3, 24)));
++                accumulator = _mm512_dpbusd_epi32(accumulator, biased, a);
++            }
++            _mm512_storeu_si512((void *)lanes, accumulator);
++            for (lane = 0; lane < 16; ++lane) {
++                uint32_t total = (uint32_t)lanes[lane];
++                for (index = step; index < k; ++index)
++                    total += (uint32_t)((int32_t)left_row[index]
++                                        * (int32_t)((int32_t)right[index * n + column + lane] + 128));
++                output_row[column + lane] = (int32_t)(total - correction);
++            }
++        }
++        for (; column < n; ++column) {
++            int32_t total = 0;
++            for (index = 0; index < k; ++index)
++                total += (int32_t)left_row[index] * (int32_t)right[index * n + column];
++            output_row[column] = total;
++        }
++    }
++    return 0;
++}
++
++__attribute__((visibility("default")))
++int ptx_avx512_dequantize_s8_f32(const int8_t *restrict codes,
++                                 const float *restrict scales,
++                                 float *restrict output,
++                                 size_t rows, size_t k) {
++    size_t row, column, element;
++    for (element = 0; element < rows * k; ++element)
++        if (codes[element] == INT8_MIN) return -1;
++    for (row = 0; row < rows; ++row) {
++        const int8_t *code_row = codes + row * k;
++        float *output_row = output + row * k;
++        int finite_scale = isfinite(scales[row]);
++        __m512 scale = _mm512_set1_ps(scales[row]);
++        column = 0;
++        for (; column + 16 <= k; column += 16) {
++            __m128i bytes = _mm_loadu_si128((const __m128i *)(code_row + column));
++            __m512i wide = _mm512_cvtepi8_epi32(bytes);
++            _mm512_storeu_ps(output_row + column,
++                             _mm512_mul_ps(_mm512_cvtepi32_ps(wide), scale));
++        }
++        for (; column < k; ++column)
++            output_row[column] = (float)code_row[column] * scales[row];
++        if (finite_scale) {
++            /* The Python golden raises on binary32 overflow; never return a
++             * silently saturated inf for a finite scale. */
++            for (column = 0; column < k; ++column)
++                if (isinf(output_row[column])) return -3;
++        }
++    }
++    return 0;
++}
++
++static inline uint16_t ptx_avx512_w8a8_f32_to_bf16(float value) {
++    union { uint32_t bits; float value; } converted;
++    converted.value = value;
++    if ((converted.bits & 0x7f800000U) == 0x7f800000U) {
++        uint16_t high = (uint16_t)(converted.bits >> 16);
++        if (converted.bits & 0x007fffffU) return (uint16_t)(high | 0x0040U);
++        return high;
++    }
++    return (uint16_t)((converted.bits + 0x7fffU + ((converted.bits >> 16) & 1U)) >> 16);
++}
++
++__attribute__((visibility("default")))
++int ptx_avx512_dequantize_epilogue_bf16(const int32_t *restrict accumulator,
++                                        const float *restrict row_scales,
++                                        const float *restrict column_scales,
++                                        uint16_t *restrict output,
++                                        size_t rows, size_t columns) {
++    size_t row, column, lane;
++    float products[16];
++    float scaled_lanes[16];
++    for (row = 0; row < rows; ++row) {
++        float row_scale = row_scales[row];
++        int row_finite = isfinite(row_scale);
++        const int32_t *accumulator_row = accumulator + row * columns;
++        uint16_t *output_row = output + row * columns;
++        __m512 scale = _mm512_set1_ps(row_scale);
++        column = 0;
++        for (; column + 16 <= columns; column += 16) {
++            __m512 scales = _mm512_loadu_ps(column_scales + column);
++            __m512 scaled = _mm512_mul_ps(scales, scale);
++            __m512 values = _mm512_cvtepi32_ps(
++                _mm512_loadu_si512((const void *)(accumulator_row + column)));
++            _mm512_storeu_ps(scaled_lanes, scaled);
++            _mm512_storeu_ps(products, _mm512_mul_ps(values, scaled));
++            for (lane = 0; lane < 16; ++lane) {
++                if (row_finite && isfinite(column_scales[column + lane]) &&
++                    (isinf(scaled_lanes[lane]) || isinf(products[lane])))
++                    return -3;  /* binary32 overflow: the golden raises here */
++                output_row[column + lane] = ptx_avx512_w8a8_f32_to_bf16(products[lane]);
++            }
++        }
++        for (; column < columns; ++column) {
++            float column_scale = column_scales[column];
++            float scaled = (float)((double)row_scale * (double)column_scale);
++            float product = (float)accumulator_row[column] * scaled;
++            if (row_finite && isfinite(column_scale) && (isinf(scaled) || isinf(product)))
++                return -3;
++            output_row[column] = ptx_avx512_w8a8_f32_to_bf16(product);
++        }
++    }
++    return 0;
++}
++
++static inline int ptx_avx512_w8a8_rne_double(double value) {
++    double floor_value = floor(value);
++    double fraction = value - floor_value;
++    int64_t base = (int64_t)floor_value;
++    if (fraction > 0.5) base += 1;
++    else if (fraction == 0.5 && (base & 1)) base += 1;
++    return (int)base;
++}
++
++static inline float ptx_avx512_w8a8_row_absmax(const float *values, size_t k) {
++    size_t column = 0, lane;
++    float lanes[16];
++    float result;
++    const __m512i abs_mask = _mm512_set1_epi32(0x7fffffff);
++    __m512 maximum = _mm512_setzero_ps();
++    for (; column + 16 <= k; column += 16) {
++        __m512 value = _mm512_loadu_ps(values + column);
++        __m512i magnitude = _mm512_and_si512(_mm512_castps_si512(value), abs_mask);
++        maximum = _mm512_max_ps(maximum, _mm512_castsi512_ps(magnitude));
++    }
++    _mm512_storeu_ps(lanes, maximum);
++    result = lanes[0];
++    for (lane = 1; lane < 16; ++lane)
++        if (lanes[lane] > result) result = lanes[lane];
++    for (; column < k; ++column) {
++        float value = values[column];
++        float magnitude = value < 0.0f ? -value : value;
++        if (magnitude > result) result = magnitude;
++    }
++    return result;
++}
++
++static inline __m256i ptx_avx512_w8a8_quantize_lane8(__m512d ratio, __m512d half,
++                                                    __m256i one, __m256i minimum,
++                                                    __m256i maximum, size_t *saturation) {
++    __m512d floor_value = _mm512_floor_pd(ratio);
++    __m512d fraction = _mm512_sub_pd(ratio, floor_value);
++    __mmask8 greater = _mm512_cmp_pd_mask(fraction, half, _CMP_GT_OQ);
++    __mmask8 equal = _mm512_cmp_pd_mask(fraction, half, _CMP_EQ_OQ);
++    __m256i base = _mm512_cvttpd_epi32(floor_value);
++    __m256i odd = _mm256_and_si256(base, one);
++    int odd_bits = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(odd, one)));
++    int bump_bits = ((int)greater) | (((int)equal) & odd_bits);
++    __m256i bump = _mm256_setr_epi32(bump_bits & 1, (bump_bits >> 1) & 1,
++                                     (bump_bits >> 2) & 1, (bump_bits >> 3) & 1,
++                                     (bump_bits >> 4) & 1, (bump_bits >> 5) & 1,
++                                     (bump_bits >> 6) & 1, (bump_bits >> 7) & 1);
++    __m256i rounded = _mm256_add_epi32(base, bump);
++    __m256i clamped = _mm256_min_epi32(_mm256_max_epi32(rounded, minimum), maximum);
++    int equal_bits = _mm256_movemask_ps(
++        _mm256_castsi256_ps(_mm256_cmpeq_epi32(rounded, clamped)));
++    *saturation += (size_t)__builtin_popcount((unsigned)(~equal_bits) & 0xFFU);
++    return clamped;
++}
++
++__attribute__((visibility("default")))
++int ptx_avx512_quantize_per_token_s8_f32(const float *restrict values,
++                                         int8_t *restrict codes,
++                                         float *restrict scales,
++                                         size_t rows, size_t k,
++                                         size_t *restrict saturation) {
++    size_t row, column, element, total_saturation = 0;
++    const __m512d half = _mm512_set1_pd(0.5);
++    const __m256i one = _mm256_set1_epi32(1);
++    const __m256i minimum = _mm256_set1_epi32(-127);
++    const __m256i maximum = _mm256_set1_epi32(127);
++    int32_t lanes[8];
++    for (element = 0; element < rows * k; ++element)
++        if (!isfinite(values[element])) return -1;
++    for (row = 0; row < rows; ++row) {
++        const float *row_values = values + row * k;
++        int8_t *row_codes = codes + row * k;
++        float absmax = ptx_avx512_w8a8_row_absmax(row_values, k);
++        if (absmax == 0.0f) {
++            scales[row] = 1.0f;
++            for (column = 0; column < k; ++column) row_codes[column] = 0;
++            continue;
++        }
++        {
++            float scale = (float)((double)absmax / 127.0);
++            __m512d scale_double;
++            if (scale == 0.0f) return -2;
++            scales[row] = scale;
++            scale_double = _mm512_set1_pd((double)scale);
++            column = 0;
++            for (; column + 8 <= k; column += 8) {
++                __m512d ratio = _mm512_div_pd(
++                    _mm512_cvtps_pd(_mm256_loadu_ps(row_values + column)), scale_double);
++                __m256i narrowed = ptx_avx512_w8a8_quantize_lane8(
++                    ratio, half, one, minimum, maximum, &total_saturation);
++                _mm256_storeu_si256((__m256i *)lanes, narrowed);
++                for (element = 0; element < 8; ++element)
++                    row_codes[column + element] = (int8_t)lanes[element];
++            }
++            for (; column < k; ++column) {
++                int code = ptx_avx512_w8a8_rne_double(
++                    (double)row_values[column] / (double)scale);
++                if (code < -127) {
++                    code = -127;
++                    ++total_saturation;
++                } else if (code > 127) {
++                    code = 127;
++                    ++total_saturation;
++                }
++                row_codes[column] = (int8_t)code;
++            }
++        }
++    }
++    *saturation = total_saturation;
++    return 0;
++}
++#endif
+ '''
+ 
+ 
+@@ -1623,6 +1915,72 @@ def packed_matmul_dispatch(target_ir: Avx512Program) -> tuple:
+             legacy[plan.operation_index] = _packed_matmul_reason(function, plan)
+     return packed, legacy
+ 
++#: W8A8 VNNI native kernel plane.  The same predicate feeds artifact metadata
++#: and runtime dispatch, so a declared kernel and the executed kernel can never
++#: disagree.  Version 1 covers the public ``qmatmul_s8s8_s32`` Core IR opcode
++#: (R6); the three dequantize/quantize primitives stay target entry points
++#: until the C7/C8 graph integration.
++W8A8_KERNEL_VERSION = 1
++W8A8_QMATMUL_MODE = "native_avx512_w8a8_qmatmul"
++W8A8_QMATMUL_KERNEL = "ptx_avx512_qmatmul_s8s8_s32"
++W8A8_DEQUANTIZE_S8_KERNEL = "ptx_avx512_dequantize_s8_f32"
++W8A8_EPILOGUE_KERNEL = "ptx_avx512_dequantize_epilogue_bf16"
++W8A8_QUANTIZE_KERNEL = "ptx_avx512_quantize_per_token_s8_f32"
++#: Exact signed-compensation mechanism of the native qmatmul: VNNI's u8 x s8
++#: ``vpdpbusd`` with the right operand biased by +128 and a signed left-row-sum
++#: correction of -128 * sum_k(a).
++W8A8_COMPENSATION = "u8_bias_128_rowsum_correction"
++
++
++def w8a8_kernel_contract(operation: Any, plan: Any) -> Optional[dict]:
++    """Describe the native W8A8 VNNI kernel for one operation, or ``None``.
++
++    Only ``qmatmul_s8s8_s32`` is a public Core IR operation in C4; the
++    dequantize/quantize primitives are exercised through the runtime's
++    target-specific entry points.  ``None`` means this operation is not a
++    native W8A8 kernel and must not be described as one in artifact metadata.
++    """
++
++    if operation is None or plan is None:
++        return None
++    name = canonical_operation_name(operation.name)
++    if name != plan.operation or name != W8A8_QMATMUL_OPCODE:
++        return None
++    if plan.plan_kind != "matmul" or plan.matmul is None:
++        return None
++    if len(operation.inputs) != 2 or len(operation.outputs) != 1:
++        return None
++    left_dtype = canonical_dtype(operation.inputs[0].type.dtype)
++    right_dtype = canonical_dtype(operation.inputs[1].type.dtype)
++    output_dtype = canonical_dtype(operation.outputs[0].type.dtype)
++    if (left_dtype, right_dtype, output_dtype) != ("int8", "int8", "int32"):
++        return None
++    matmul = plan.matmul
++    return {
++        "mode": W8A8_QMATMUL_MODE,
++        "kernel": W8A8_QMATMUL_KERNEL,
++        "left_dtype": left_dtype,
++        "right_dtype": right_dtype,
++        "output_dtype": output_dtype,
++        "m": int(matmul.m),
++        "k": int(matmul.k),
++        "n": int(matmul.n),
++        "batch_shape": tuple(int(value) for value in matmul.batch_shape),
++        "compensation": W8A8_COMPENSATION,
++    }
++
++
++def _w8a8_capability_metadata() -> dict:
++    return {
++        "dtypes": list(AVX512_W8A8_CAPABILITY.dtypes),
++        "matrix_capabilities": list(AVX512_W8A8_CAPABILITY.matrix_capabilities),
++        "digest": AVX512_W8A8_CAPABILITY.fingerprint,
++        "matrix_kind": W8A8_VNNI_MATRIX_CAPABILITY,
++        "isa": "avx512vnni",
++        "compensation": W8A8_COMPENSATION,
++        "kernel_version": W8A8_KERNEL_VERSION,
++    }
++
+ 
+ #: Native broadcast plane.  Broadcast is standard shape expansion (input dim 1
+ #: or equal to the output dim) with the same dtype, expressed to the kernel as
+@@ -1727,6 +2085,8 @@ def _execution_metadata(target_ir: Avx512Program) -> dict:
+     host_operations = []
+     packed_operations = []
+     packed_names = []
++    w8a8_operations = []
++    w8a8_names = []
+     broadcast_operations = []
+     native_helpers = set()
+     core_operations = _core_operations(target_ir)
+@@ -1739,9 +2099,27 @@ def _execution_metadata(target_ir: Avx512Program) -> dict:
+             if 0 <= plan.operation_index < len(core_operations)
+             else None
+         )
++        w8a8 = w8a8_kernel_contract(operation, plan)
+         packed = packed_kernel_contract(operation, plan)
+         broadcast = broadcast_native_contract(operation, plan)
+-        if packed is not None:
++        if w8a8 is not None:
++            mode = w8a8["mode"]
++            if name not in w8a8_names:
++                w8a8_names.append(name)
++            w8a8_operations.append(
++                {
++                    "operation_index": plan.operation_index,
++                    "operation": name,
++                    "mode": mode,
++                    "kernel": w8a8["kernel"],
++                    "m": w8a8["m"],
++                    "k": w8a8["k"],
++                    "n": w8a8["n"],
++                    "batch_shape": list(w8a8["batch_shape"]),
++                    "compensation": w8a8["compensation"],
++                }
++            )
++        elif packed is not None:
+             mode = packed["mode"]
+             if name not in packed_names:
+                 packed_names.append(name)
+@@ -1809,6 +2187,10 @@ def _execution_metadata(target_ir: Avx512Program) -> dict:
+         "packed_kernel_version": PACKED_KERNEL_VERSION,
+         "packed_kernel_operations": packed_names,
+         "packed_operations": packed_operations,
++        "w8a8_kernel_version": W8A8_KERNEL_VERSION,
++        "w8a8_kernel_operations": w8a8_names,
++        "w8a8_operations": w8a8_operations,
++        "w8a8_capability": _w8a8_capability_metadata(),
+         "native_broadcast_mode": BROADCAST_MODE,
+         "native_broadcast_operations": broadcast_operations,
+         "reduction_gather_mode": REDUCTION_GATHER_MODE,
+@@ -1847,7 +2229,9 @@ def _execution_metadata(target_ir: Avx512Program) -> dict:
+                 "mode": "host_batch_loop_rank2_native",
+             }
+             for plan in target_ir.plans
+-            if plan.matmul is not None and plan.matmul.batch_shape
++            if plan.matmul is not None
++            and plan.matmul.batch_shape
++            and plan.operation != W8A8_QMATMUL_OPCODE
+         ],
+         "packed_matmul_mode": PACKED_GEMM_MODE,
+         "packed_matmul_kernel_version": PACKED_GEMM_KERNEL_VERSION,
+@@ -2154,7 +2538,9 @@ class Avx512Compiler:
+             "use_vl": target_ir.use_vl,
+             "use_vnni": target_ir.use_vnni,
+             "use_bf16": target_ir.use_bf16,
+-            "public_core_vnni": False,
++            "public_core_vnni": any(
++                plan.operation == W8A8_QMATMUL_OPCODE for plan in target_ir.plans
++            ),
+             "public_core_bf16": target_ir.use_bf16,
+         }
+         metadata.update(_execution_metadata(target_ir))
+@@ -2224,7 +2610,15 @@ __all__ = [
+     "PACKED_GEMM_N_TILE",
+     "PACKED_KERNEL_VERSION",
+     "PACKED_TRANSPOSE_MODE",
++    "W8A8_COMPENSATION",
++    "W8A8_DEQUANTIZE_S8_KERNEL",
++    "W8A8_EPILOGUE_KERNEL",
++    "W8A8_KERNEL_VERSION",
++    "W8A8_QMATMUL_KERNEL",
++    "W8A8_QMATMUL_MODE",
++    "W8A8_QUANTIZE_KERNEL",
+     "compile_cpu_avx512",
+     "packed_kernel_contract",
+     "packed_matmul_dispatch",
++    "w8a8_kernel_contract",
+ ]
+diff --git a/python/pypto/lowering/cpu/x86/avx512/__init__.py b/python/pypto/lowering/cpu/x86/avx512/__init__.py
+index 50e4858de..e51e1b029 100644
+--- a/python/pypto/lowering/cpu/x86/avx512/__init__.py
++++ b/python/pypto/lowering/cpu/x86/avx512/__init__.py
+@@ -1,6 +1,15 @@
+ """AVX-512 lowering contracts and host capability probing."""
+ 
+-from .capabilities import Avx512Capability, Avx512ProbeError, probe_avx512, probe_avx512_capabilities
++from .capabilities import (
++    AVX512_W8A8_CAPABILITY,
++    AVX512_W8A8_FORBIDDEN_MATRIX_CAPABILITIES,
++    W8A8_VNNI_MATRIX_CAPABILITY,
++    Avx512Capability,
++    Avx512ProbeError,
++    avx512_w8a8_capabilities,
++    probe_avx512,
++    probe_avx512_capabilities,
++)
+ from .lowering import (
+     AVX512_BACKEND,
+     AVX512_LANE_COUNT,
+@@ -18,12 +27,16 @@ __all__ = [
+     "AVX512_LANE_COUNT",
+     "AVX512_LOWERING_VERSION",
+     "AVX512_TAIL_POLICY",
++    "AVX512_W8A8_CAPABILITY",
++    "AVX512_W8A8_FORBIDDEN_MATRIX_CAPABILITIES",
+     "Avx512Capability",
+     "Avx512Error",
+     "Avx512ProbeError",
+     "Avx512Program",
+     "Avx512UnsupportedError",
+     "Avx512ValidationError",
++    "W8A8_VNNI_MATRIX_CAPABILITY",
++    "avx512_w8a8_capabilities",
+     "lower_avx512",
+     "probe_avx512",
+     "probe_avx512_capabilities",
+diff --git a/python/pypto/lowering/cpu/x86/avx512/capabilities.py b/python/pypto/lowering/cpu/x86/avx512/capabilities.py
+index 647cbbb82..2ba157ffb 100644
+--- a/python/pypto/lowering/cpu/x86/avx512/capabilities.py
++++ b/python/pypto/lowering/cpu/x86/avx512/capabilities.py
+@@ -17,6 +17,59 @@ import subprocess
+ import tempfile
+ from typing import Any, Mapping, Optional, Tuple
+ 
++from pypto.target import CapabilitySet
++from pypto.target.errors import UnsupportedCapabilityError
++
++
++#: W8A8 target capability declaration (contract 0002 appendix B).  AVX-512
++#: implements the signed INT8 dot product with the VNNI ``vpdpbusd``
++#: instruction after an explicit u8 bias of the unsigned operand; the matrix
++#: kind names that exact mechanism so a declaration can never be satisfied by
++#: the AVX2 widening path or by a hypothetical ``vpdpwssd`` variant.
++W8A8_VNNI_MATRIX_CAPABILITY = "s8s8_s32_vnni_dpbusd"
++AVX512_W8A8_CAPABILITY = CapabilitySet(
++    dtypes=("int8", "int32", "float32", "bf16"),
++    matrix_capabilities=(W8A8_VNNI_MATRIX_CAPABILITY,),
++)
++#: Matrix kinds that must stay absent from this declaration.  The AVX2
++#: widening kind is a different (non-VNNI) mechanism, and ``dpwssd`` is not
++#: emitted by C4, so declaring either would over-claim the artifact.
++AVX512_W8A8_FORBIDDEN_MATRIX_CAPABILITIES = (
++    "s8s8_s32_widening",
++    "dpwssd",
++    "int8_dot_product",
++)
++
++
++def avx512_w8a8_capabilities(
++    capability: Optional["Avx512Capability"] = None,
++    *,
++    target: Any = None,
++) -> CapabilitySet:
++    """Return the AVX-512 W8A8 declaration after the native probe passes.
++
++    The gate is the same CPUID/XGETBV probe the runtime already uses, plus
++    the independent ``avx512vnni`` CPUID bit.  A missing probe result or a
++    host without VNNI raises :class:`UnsupportedCapabilityError` naming the
++    missing matrix kind; there is deliberately no widening or BF16 fallback
++    inside the W8A8 path (contract 0002 section 6, fail-closed).
++    """
++
++    if capability is None:
++        capability = probe_avx512_capabilities()
++    if not capability.available or not capability.avx512vnni:
++        raise UnsupportedCapabilityError(
++            "matrix_capability", W8A8_VNNI_MATRIX_CAPABILITY, target or "cpu.avx512"
++        )
++    AVX512_W8A8_CAPABILITY.require(
++        "matrix", W8A8_VNNI_MATRIX_CAPABILITY, target or "cpu.avx512"
++    )
++    AVX512_W8A8_CAPABILITY.require("dtype", "int8", target or "cpu.avx512")
++    AVX512_W8A8_CAPABILITY.require("dtype", "int32", target or "cpu.avx512")
++    AVX512_W8A8_CAPABILITY.require("dtype", "float32", target or "cpu.avx512")
++    AVX512_W8A8_CAPABILITY.require("dtype", "bf16", target or "cpu.avx512")
++    return AVX512_W8A8_CAPABILITY
++
+ 
+ _PROBE_SOURCE = r'''
+ #include <stdint.h>
+@@ -445,8 +498,12 @@ probe_avx512 = probe_avx512_capabilities
+ 
+ 
+ __all__ = [
++    "AVX512_W8A8_CAPABILITY",
++    "AVX512_W8A8_FORBIDDEN_MATRIX_CAPABILITIES",
+     "Avx512Capability",
+     "Avx512ProbeError",
++    "W8A8_VNNI_MATRIX_CAPABILITY",
++    "avx512_w8a8_capabilities",
+     "probe_avx512",
+     "probe_avx512_capabilities",
+ ]
+diff --git a/python/pypto/lowering/cpu/x86/avx512/lowering.py b/python/pypto/lowering/cpu/x86/avx512/lowering.py
+index 9e05a6659..c3fb0f548 100644
+--- a/python/pypto/lowering/cpu/x86/avx512/lowering.py
++++ b/python/pypto/lowering/cpu/x86/avx512/lowering.py
+@@ -6,7 +6,7 @@ from dataclasses import dataclass
+ from typing import Any, Mapping, Optional
+ 
+ from pypto.core_ir import CoreProgram
+-from pypto.lowering.cpu import canonical_dtype
++from pypto.lowering.cpu import W8A8_QMATMUL_OPCODE, canonical_dtype, canonical_operation_name
+ from pypto.lowering.cpu.vector import (
+     CpuFeatureSet,
+     CpuVectorProgram,
+@@ -45,6 +45,7 @@ _SUPPORTED_OPERATIONS = frozenset(
+         "reduce_sum", "reduce_max", "reduce_mean", "broadcast", "where",
+         "matmul", "reshape", "view", "transpose", "contiguous", "slice",
+         "split", "concat", "gather", "embedding", "compare", "iota",
++        W8A8_QMATMUL_OPCODE,
+     )
+ )
+ _FLOAT_DTYPES = frozenset(("float32", "bf16"))
+@@ -177,6 +178,18 @@ def _variant_name(options: Mapping[str, bool]) -> str:
+     return "avx512" if not suffix else "avx512-{}".format("-".join(suffix))
+ 
+ 
++def _program_requires_vnni(program: CoreProgram) -> bool:
++    """Return whether any direct-body operation is the W8A8 INT8 qmatmul."""
++
++    for function in program.functions:
++        body = getattr(function, "body", None)
++        operations = getattr(body, "operations", ()) or ()
++        for operation in operations:
++            if canonical_operation_name(operation.name) == W8A8_QMATMUL_OPCODE:
++                return True
++    return False
++
++
+ @dataclass(frozen=True)
+ class Avx512Program:
+     """Validated AVX-512 target IR and shared vector-common plan."""
+@@ -245,6 +258,12 @@ class Avx512Program:
+                         plan.operation
+                     )
+                 )
++            if plan.operation == W8A8_QMATMUL_OPCODE and not self.use_vnni:
++                raise Avx512UnsupportedError(
++                    "AVX-512 {} requires the avx512vnni variant; there is no "
++                    "widening or host-reference fallback for signed INT8 x INT8 "
++                    "-> INT32".format(W8A8_QMATMUL_OPCODE)
++                )
+             plan_dtype = canonical_dtype(plan.dtype)
+             if plan_dtype not in _SUPPORTED_DTYPES:
+                 raise Avx512UnsupportedError(
+@@ -436,6 +455,13 @@ def lower_avx512(
+                 "/".join(name.upper() for name in unsupported_variants)
+             )
+         )
++    if _program_requires_vnni(program) and not options["vnni"]:
++        raise Avx512UnsupportedError(
++            "AVX-512 {} requires the avx512vnni target feature; there is no "
++            "widening or host-reference fallback and no silent BF16 downgrade".format(
++                W8A8_QMATMUL_OPCODE
++            )
++        )
+     selected_tail = tail_policy
+     if selected_tail is None:
+         selected_tail = target.attributes.get("tail_policy", AVX512_TAIL_POLICY.value)
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx512_packed_gemm.py b/python/tests/ut/pypto_x/test_cpu_avx512_packed_gemm.py
+index 18bb092d4..7ab0f3a9a 100644
+--- a/python/tests/ut/pypto_x/test_cpu_avx512_packed_gemm.py
++++ b/python/tests/ut/pypto_x/test_cpu_avx512_packed_gemm.py
+@@ -345,8 +345,10 @@ def test_native_bf16_packed_kernel_uses_vdpbf16(tmp_path):
+ 
+ 
+ def test_packed_artifact_contract_and_legacy_reasons(tmp_path):
+-    assert ARTIFACT_PAYLOAD_VERSION == 4
+-    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx512:5"
++    # C4 (W8A8 VNNI) bumps the AVX-512 artifact contract again: payload 4 -> 5,
++    # marker :5 -> :6; the packed/blocked matmul plane itself is unchanged.
++    assert ARTIFACT_PAYLOAD_VERSION == 5
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx512:6"
+     # Non parameter-derived right operand -> explicit legacy reason.
+     artifact, _ = _run_shapes(
+         ((3, 5, 17),), "float32", _target("avx512f", "fma"), tmp_path / "reason", derive=True
+diff --git a/python/tests/ut/pypto_x/test_w8a8_avx2.py b/python/tests/ut/pypto_x/test_w8a8_avx2.py
+index 69c0fcbcc..7e4263ff2 100644
+--- a/python/tests/ut/pypto_x/test_w8a8_avx2.py
++++ b/python/tests/ut/pypto_x/test_w8a8_avx2.py
+@@ -12,7 +12,8 @@ Scope of this module:
+   probe-gated target entry points;
+ * the compiled shared object emits AVX2 widening instructions and no
+   EVEX/AVX-512 instructions;
+-* the AVX-512 backend still rejects the opcode fail-closed (C4 owns VNNI).
++* the AVX-512 backend rejects the opcode without ``avx512vnni`` and accepts
++  it when the C4 VNNI variant is requested (C4 owns the native kernel).
+ """
+ 
+ from __future__ import annotations
+@@ -381,10 +382,20 @@ def test_qmatmul_dtype_rules_fail_closed():
+         Avx2Compiler().lower(program, AVX2_TARGET)
+ 
+ 
+-def test_qmatmul_avx512_lowering_rejects_the_opcode_fail_closed():
++def test_qmatmul_avx512_lowering_requires_the_vnni_variant():
+     program = _qmatmul_program((2, 3), (3, 4))
++    # Base AVX-512F has no signed INT8 dot product and no widening fallback:
++    # the opcode is rejected fail-closed unless the VNNI variant is requested.
+     with pytest.raises(Avx512UnsupportedError):
+         Avx512Compiler().lower(program, AVX512_TARGET)
++    vnni_target = TargetSpec(
++        "cpu",
++        "x86_64-linux-gnu",
++        features=("avx512f", "avx512vnni"),
++        attributes={"lane_count": 16},
++    )
++    target_ir = Avx512Compiler().lower(program, vnni_target)
++    assert target_ir.use_vnni
+ 
+ 
+ def _tampered_metadata(artifact, **changes):
+diff --git a/python/tests/ut/pypto_x/test_w8a8_avx512.py b/python/tests/ut/pypto_x/test_w8a8_avx512.py
+new file mode 100644
+index 000000000..7fbf922c7
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_w8a8_avx512.py
+@@ -0,0 +1,964 @@
++"""AVX-512 W8A8 VNNI widening path: contract 0002 C4 / R6 evidence.
++
++Scope of this module:
++
++* the AVX-512 capability declaration travels through :class:`CapabilitySet`
++  (``dtypes`` / ``matrix_capabilities``) and is probe-gated on the independent
++  CPUID ``avx512vnni`` bit, fail-closed;
++* the native ``qmatmul_s8s8_s32`` Core IR path is bit-exact with the C1 scalar
++  integer golden, including rank-3/rank-4 batch prefixes, non-multiple-of-8
++  M/N/K tails, the K upper bound and the reserved ``-128`` code point;
++* the u8 x s8 ``vpdpbusd`` sign compensation is exercised on all-negative,
++  mixed-sign and K-tail cases and on a worst case whose biased intermediate
++  sum exceeds INT32 and can only be correct because VPDPBUSD wraps modulo
++  2^32 while the corrected exact result is representable;
++* the native dequantize / single-rounding BF16 epilogue / dynamic per-token
++  quantizer primitives are bit-exact with the C1 goldens through the
++  probe-gated target entry points;
++* the compiled shared object emits real VNNI ``vpdpbusd`` instructions (and
++  never ``vpdpwssd``, which this path does not use).
++"""
++
++from __future__ import annotations
++
++import hashlib
++import math
++from pathlib import Path
++import random
++import re
++import shutil
++import struct
++import subprocess
++
++import numpy as np
++import pytest
++
++from pypto.abi import LaunchRequest
++from pypto.backends.cpu import CpuScalarRuntime, HostTensor
++from pypto.backends.cpu.tensor import _cast_value
++from pypto.backends.cpu.x86 import (
++    Avx2Runtime,
++    Avx512Runtime,
++    CpuAvx512ArtifactError,
++    CpuAvx512ExecutionError,
++    CpuAvx512FeatureMismatchError,
++    CpuAvx512UnavailableError,
++)
++from pypto.compiler import CompileOptions
++from pypto.compiler.targets.cpu import CpuScalarCompiler
++from pypto.compiler.targets.cpu_avx512 import (
++    ARTIFACT_PAYLOAD_VERSION,
++    NATIVE_ABI_MARKER,
++    W8A8_COMPENSATION,
++    W8A8_DEQUANTIZE_S8_KERNEL,
++    W8A8_EPILOGUE_KERNEL,
++    W8A8_KERNEL_VERSION,
++    W8A8_QMATMUL_KERNEL,
++    W8A8_QMATMUL_MODE,
++    W8A8_QUANTIZE_KERNEL,
++    Avx512Compiler,
++    w8a8_kernel_contract,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu import (
++    CpuScalarUnsupportedError,
++    W8A8_MAX_ACCUMULATOR_K,
++    W8A8_QMATMUL_OPCODE,
++)
++from pypto.lowering.cpu.vector import (
++    CpuVectorUnsupportedError,
++    CpuVectorValidationError,
++)
++from pypto.lowering.cpu.x86.avx512 import (
++    AVX512_W8A8_CAPABILITY,
++    AVX512_W8A8_FORBIDDEN_MATRIX_CAPABILITIES,
++    W8A8_VNNI_MATRIX_CAPABILITY,
++    Avx512Capability,
++    Avx512UnsupportedError,
++    avx512_w8a8_capabilities,
++    probe_avx512_capabilities,
++)
++from pypto.lowering.cpu.x86.avx512 import capabilities as capabilities_module
++from pypto.portable.qwen35_w8a8_scheme import (
++    OPCODE_DEQUANTIZE_EPILOGUE_BF16,
++    OPCODE_DEQUANTIZE_S8,
++    OPCODE_QMATMUL_S8S8_S32,
++    OPCODE_QUANTIZE_PER_TOKEN_S8,
++    W8A8QuantizationError,
++    dequantize_epilogue_bf16,
++    dequantize_s8,
++    qmatmul_s8s8_s32,
++    quantize_per_token_s8,
++)
++from pypto.target import TargetSpec, UnsupportedCapabilityError
++
++
++AVX512_VNNI_TARGET = TargetSpec(
++    "cpu",
++    "x86_64-linux-gnu",
++    features=("avx512f", "avx512vnni"),
++    attributes={"lane_count": 16},
++)
++AVX512_BASE_TARGET = TargetSpec(
++    "cpu", "x86_64-linux-gnu", features=("avx512f",), attributes={"lane_count": 16}
++)
++SCALAR_TARGET = TargetSpec("cpu", "x86_64-linux-gnu")
++
++_ARTIFACT_CACHE = {}
++
++
++# --------------------------------------------------------------------------
++# helpers
++# --------------------------------------------------------------------------
++
++
++def _qmatmul_program(left_shape, right_shape, name=W8A8_QMATMUL_OPCODE):
++    left = ValueRef("left", CoreType.tensor("int8", left_shape))
++    right = ValueRef("right", CoreType.tensor("int8", right_shape))
++    output_shape = left_shape[:-2] + (left_shape[-2], right_shape[-1])
++    output = ValueRef("output", CoreType.tensor("int32", output_shape))
++    operation = Operation(name, (left, right), (output,), {})
++    return CoreProgram(
++        functions=(CoreFunction("qmatmul", (left, right), (output,), Region((operation,))),)
++    )
++
++
++def _raw_qmatmul_program(
++    left_shape,
++    right_shape,
++    output_shape,
++    *,
++    left_dtype="int8",
++    right_dtype="int8",
++    output_dtype="int32",
++):
++    left = ValueRef("left", CoreType.tensor(left_dtype, left_shape))
++    right = ValueRef("right", CoreType.tensor(right_dtype, right_shape))
++    output = ValueRef("output", CoreType.tensor(output_dtype, output_shape))
++    operation = Operation(W8A8_QMATMUL_OPCODE, (left, right), (output,), {})
++    return CoreProgram(
++        functions=(CoreFunction("qmatmul", (left, right), (output,), Region((operation,))),)
++    )
++
++
++def _add_program(shape=(17,), dtype="float32"):
++    value_type = CoreType.tensor(dtype, shape)
++    left = ValueRef("left", value_type)
++    right = ValueRef("right", value_type)
++    output = ValueRef("output", value_type)
++    return CoreProgram(
++        functions=(
++            CoreFunction(
++                "add",
++                (left, right),
++                (output,),
++                Region((Operation("add", (left, right), (output,), {}),)),
++            ),
++        )
++    )
++
++
++def _compile_avx512_artifact(program, build_dir, name="w8a8", target=AVX512_VNNI_TARGET):
++    key = (name, program.canonical_json())
++    cached = _ARTIFACT_CACHE.get(key)
++    if cached is None:
++        compiler = Avx512Compiler()
++        target_ir = compiler.lower(program, target)
++        cached = compiler.compile(
++            target_ir,
++            CompileOptions(
++                artifact_format="pypto-x.cpu.avx512",
++                extra={"build_dir": str(Path(build_dir) / name)},
++            ),
++        )
++        _ARTIFACT_CACHE[key] = cached
++    return cached
++
++
++def _avx512_runtime():
++    runtime = Avx512Runtime()
++    if not runtime.is_available():
++        pytest.skip("host lacks AVX-512/ZMM capability: {}".format(runtime.availability().to_dict()))
++    if not runtime.capability.avx512vnni:
++        pytest.skip("host lacks AVX-512 VNNI capability")
++    return runtime
++
++
++def _avx2_runtime():
++    runtime = Avx2Runtime()
++    if not runtime.is_available():
++        pytest.skip("host lacks AVX2/YMM capability")
++    return runtime
++
++
++def _launch(artifact, inputs, outputs, runtime):
++    return runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[value.descriptor(readonly=True) for value in inputs],
++            outputs=[value.descriptor() for value in outputs],
++            scalars={},
++        )
++    )
++
++
++def _flat(value):
++    if isinstance(value, (list, tuple)):
++        result = []
++        for item in value:
++            result.extend(_flat(item))
++        return result
++    return [value]
++
++
++def _f32_round(value):
++    return float(_cast_value(float(value), "float32"))
++
++
++def _f32_bits(value):
++    return struct.unpack("<I", struct.pack("<f", float(value)))[0]
++
++
++def _random_int_codes(shape, rng):
++    return rng.integers(-127, 128, size=shape).tolist()
++
++
++@pytest.fixture(scope="module")
++def build_dir(tmp_path_factory):
++    _avx512_runtime()
++    return tmp_path_factory.mktemp("w8a8-avx512")
++
++
++@pytest.fixture(scope="module")
++def carrier_artifact(build_dir):
++    return _compile_avx512_artifact(
++        _qmatmul_program((2, 3), (3, 4)), build_dir, name="carrier"
++    )
++
++
++@pytest.fixture(scope="module")
++def base_artifact(build_dir):
++    """A valid AVX-512F artifact without VNNI (W8A8 must stay fail-closed)."""
++
++    return _compile_avx512_artifact(
++        _add_program(), build_dir, name="base-no-vnni", target=AVX512_BASE_TARGET
++    )
++
++
++# --------------------------------------------------------------------------
++# capability declaration (CapabilitySet, not loose booleans)
++# --------------------------------------------------------------------------
++
++
++def test_capability_set_declares_dtypes_and_the_vnni_matrix_kind():
++    assert AVX512_W8A8_CAPABILITY.dtypes == ("int8", "int32", "float32", "bf16")
++    assert AVX512_W8A8_CAPABILITY.matrix_capabilities == (W8A8_VNNI_MATRIX_CAPABILITY,)
++    assert W8A8_VNNI_MATRIX_CAPABILITY == "s8s8_s32_vnni_dpbusd"
++    assert AVX512_W8A8_CAPABILITY.supports_dtype("int8")
++    assert AVX512_W8A8_CAPABILITY.supports_dtype("int32")
++    assert not AVX512_W8A8_CAPABILITY.supports_dtype("float16")
++    assert AVX512_W8A8_CAPABILITY.supports_matrix(W8A8_VNNI_MATRIX_CAPABILITY)
++    # The AVX2 widening kind and a vpdpwssd claim must never appear here: C4
++    # emits vpdpbusd with an explicit u8 bias, nothing else.
++    for forbidden in AVX512_W8A8_FORBIDDEN_MATRIX_CAPABILITIES:
++        assert not AVX512_W8A8_CAPABILITY.supports_matrix(forbidden)
++    assert len(AVX512_W8A8_CAPABILITY.fingerprint) == 64
++    assert AVX512_W8A8_CAPABILITY.fingerprint == AVX512_W8A8_CAPABILITY.fingerprint
++
++
++def test_capability_set_is_probe_gated_on_the_real_vnni_bit():
++    good = Avx512Capability.injected_capability(
++        ("avx", "avx512f", "osxsave", "ymm", "opmask", "zmm", "avx512vnni")
++    )
++    assert avx512_w8a8_capabilities(good) is AVX512_W8A8_CAPABILITY
++    bad = Avx512Capability.injected_capability(
++        ("avx", "avx512f", "osxsave", "ymm", "opmask", "zmm")
++    )
++    assert bad.available and not bad.avx512vnni
++    with pytest.raises(UnsupportedCapabilityError) as caught:
++        avx512_w8a8_capabilities(bad)
++    assert W8A8_VNNI_MATRIX_CAPABILITY in str(caught.value)
++
++
++def test_real_probe_publishes_vnni_for_this_host():
++    probe = probe_avx512_capabilities()
++    if not probe.available:
++        pytest.skip("host lacks AVX-512 base capability")
++    if not probe.avx512vnni:
++        pytest.skip("host lacks AVX-512 VNNI")
++    assert "avx512vnni" in probe.features
++    assert avx512_w8a8_capabilities(probe) is AVX512_W8A8_CAPABILITY
++
++
++def test_w8a8_opcode_names_match_the_c1_portable_constants():
++    assert W8A8_QMATMUL_OPCODE == OPCODE_QMATMUL_S8S8_S32
++    assert OPCODE_DEQUANTIZE_S8 == "dequantize_s8"
++    assert OPCODE_DEQUANTIZE_EPILOGUE_BF16 == "dequantize_epilogue_bf16"
++    assert OPCODE_QUANTIZE_PER_TOKEN_S8 == "quantize_per_token_s8"
++    assert W8A8_MAX_ACCUMULATOR_K == 133144
++
++
++# --------------------------------------------------------------------------
++# qmatmul_s8s8_s32: native Core IR path
++# --------------------------------------------------------------------------
++
++
++def test_qmatmul_metadata_declares_the_native_vnni_kernel(build_dir):
++    artifact = _compile_avx512_artifact(
++        _qmatmul_program((2, 3), (3, 4)), build_dir, name="metadata"
++    )
++    assert artifact.metadata["artifact_payload_version"] == ARTIFACT_PAYLOAD_VERSION == 5
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx512:6"
++    assert artifact.metadata["use_vnni"] is True
++    assert "avx512vnni" in tuple(artifact.metadata["required_features"])
++    assert "-mavx512vnni" in tuple(artifact.metadata["compile_command"])
++    assert artifact.metadata["public_core_vnni"] is True
++    assert tuple(artifact.metadata["w8a8_kernel_operations"]) == (W8A8_QMATMUL_OPCODE,)
++    assert artifact.metadata["w8a8_kernel_version"] == W8A8_KERNEL_VERSION == 1
++    declared = artifact.metadata["w8a8_capability"]
++    assert tuple(declared["dtypes"]) == AVX512_W8A8_CAPABILITY.dtypes
++    assert tuple(declared["matrix_capabilities"]) == AVX512_W8A8_CAPABILITY.matrix_capabilities
++    assert declared["digest"] == AVX512_W8A8_CAPABILITY.fingerprint
++    assert declared["isa"] == "avx512vnni"
++    assert declared["compensation"] == W8A8_COMPENSATION
++    entry = artifact.metadata["w8a8_operations"][0]
++    assert entry["mode"] == W8A8_QMATMUL_MODE
++    assert entry["kernel"] == W8A8_QMATMUL_KERNEL == "ptx_avx512_qmatmul_s8s8_s32"
++    assert entry["compensation"] == W8A8_COMPENSATION
++    assert artifact.metadata["execution_modes"][0]["mode"] == W8A8_QMATMUL_MODE
++    # The W8A8 plan is not reported as a packed/blocked float matmul or as a
++    # generic batched matmul fallback.
++    assert tuple(artifact.metadata["batched_matmul_operations"]) == ()
++    if "packed_matmul_operations" in artifact.metadata:
++        assert tuple(artifact.metadata["packed_matmul_operations"]) == ()
++
++
++@pytest.mark.parametrize(
++    "left_shape,right_shape",
++    (
++        ((2, 3), (3, 4)),
++        ((1, 8), (8, 1)),
++        ((3, 8), (8, 9)),
++        ((7, 1), (1, 6)),
++        ((5, 17), (17, 33)),
++        ((4, 31), (31, 3)),
++        ((2, 3, 4), (2, 4, 5)),
++        ((3, 9, 5), (3, 5, 7)),
++        ((1, 2, 8, 4), (1, 2, 4, 3)),
++        ((2, 1, 4, 3), (2, 1, 3, 2)),
++        ((1, 1, 1, 1), (1, 1, 1, 1)),
++    ),
++)
++def test_qmatmul_matches_the_integer_golden_bit_for_bit(left_shape, right_shape, build_dir):
++    rng = np.random.default_rng(20260912)
++    left = _random_int_codes(left_shape, rng)
++    right = _random_int_codes(right_shape, rng)
++    expected = qmatmul_s8s8_s32(left, right)
++    artifact = _compile_avx512_artifact(
++        _qmatmul_program(left_shape, right_shape),
++        build_dir,
++        name="golden-{}-{}".format(left_shape, right_shape),
++    )
++    left_host = HostTensor("int8", left_shape, _flat(left))
++    right_host = HostTensor("int8", right_shape, _flat(right))
++    actual = HostTensor.zeros("int32", expected.shape)
++    _launch(artifact, [left_host, right_host], [actual], _avx512_runtime())
++    assert tuple(int(value) for value in actual.data) == tuple(expected.values)
++
++
++def test_qmatmul_scalar_runtime_matches_the_same_golden():
++    left = [[1, -2, 3], [4, 5, -6]]
++    right = [[-7, 8], [9, -10], [11, 12]]
++    program = _qmatmul_program((2, 3), (3, 2))
++    compiler = CpuScalarCompiler()
++    artifact = compiler.compile(compiler.lower(program, SCALAR_TARGET))
++    expected = qmatmul_s8s8_s32(left, right)
++    left_host = HostTensor("int8", (2, 3), _flat(left))
++    right_host = HostTensor("int8", (3, 2), _flat(right))
++    actual = HostTensor.zeros("int32", (2, 2))
++    _launch(artifact, [left_host, right_host], [actual], CpuScalarRuntime())
++    assert tuple(int(value) for value in actual.data) == tuple(expected.values)
++
++
++def test_qmatmul_k_upper_bound_is_accepted_and_matches_golden(build_dir):
++    k = W8A8_MAX_ACCUMULATOR_K
++    left = [[127] * k]
++    right = [[-127] for _ in range(k)]
++    expected = qmatmul_s8s8_s32(left, right)
++    assert expected.values == (-127 * 127 * k,)
++    artifact = _compile_avx512_artifact(
++        _qmatmul_program((1, k), (k, 1)), build_dir, name="k-limit"
++    )
++    left_host = HostTensor("int8", (1, k), _flat(left))
++    right_host = HostTensor("int8", (k, 1), _flat(right))
++    actual = HostTensor.zeros("int32", (1, 1))
++    _launch(artifact, [left_host, right_host], [actual], _avx512_runtime())
++    assert tuple(int(value) for value in actual.data) == tuple(expected.values)
++
++
++def test_qmatmul_over_k_limit_fails_closed_at_lowering():
++    k = W8A8_MAX_ACCUMULATOR_K + 1
++    program = _qmatmul_program((1, k), (k, 1))
++    with pytest.raises(CpuVectorUnsupportedError):
++        Avx512Compiler().lower(program, AVX512_VNNI_TARGET)
++
++
++def test_qmatmul_without_vnni_target_fails_closed_at_lowering():
++    program = _qmatmul_program((2, 3), (3, 4))
++    with pytest.raises(Avx512UnsupportedError, match="avx512vnni"):
++        Avx512Compiler().lower(program, AVX512_BASE_TARGET)
++
++
++def test_qmatmul_reserved_minus_128_fails_closed(carrier_artifact, build_dir):
++    program = _qmatmul_program((1, 2), (2, 1))
++    runtime = _avx512_runtime()
++    artifact = _compile_avx512_artifact(program, build_dir, name="minus-128")
++    left = HostTensor("int8", (1, 2), [-128, 1])
++    right = HostTensor("int8", (2, 1), [3, 4])
++    actual = HostTensor.zeros("int32", (1, 1))
++    with pytest.raises(CpuAvx512ExecutionError):
++        _launch(artifact, [left, right], [actual], runtime)
++    # The target-specific entry point rejects the code point too.
++    with pytest.raises(CpuAvx512ExecutionError):
++        runtime.run_w8a8_qmatmul(
++            carrier_artifact, [[-128, 1]], [[3], [4]], left_shape=(1, 2), right_shape=(2, 1)
++        )
++    with pytest.raises(CpuAvx512ExecutionError):
++        runtime.run_w8a8_qmatmul(
++            carrier_artifact, [[1, 2]], [[3], [-128]], left_shape=(1, 2), right_shape=(2, 1)
++        )
++
++
++@pytest.mark.parametrize(
++    "left_shape,right_shape,output_shape",
++    (
++        ((3,), (3, 1), (3, 1)),          # rank 1
++        ((2, 3), (4, 2), (2, 2)),        # reduction mismatch
++        ((1, 2, 3), (2, 2, 3), (1, 2, 3)),  # batch prefix mismatch
++        ((2, 3), (3, 4), (2, 5)),        # output shape mismatch
++    ),
++)
++def test_qmatmul_shape_rules_fail_closed(left_shape, right_shape, output_shape):
++    program = _raw_qmatmul_program(left_shape, right_shape, output_shape)
++    with pytest.raises((CpuVectorUnsupportedError, CpuVectorValidationError)):
++        Avx512Compiler().lower(program, AVX512_VNNI_TARGET)
++
++
++def test_other_w8a8_opcodes_stay_unwired_until_c7():
++    # C4 only admits qmatmul_s8s8_s32 into Core IR; the dequantize/quantize
++    # opcodes stay target entry points until the C7/C8 graph integration.
++    source = ValueRef("source", CoreType.tensor("int8", (2, 4)))
++    scales = ValueRef("scales", CoreType.tensor("float32", (2,)))
++    output = ValueRef("output", CoreType.tensor("float32", (2, 4)))
++    operation = Operation(OPCODE_DEQUANTIZE_S8, (source, scales), (output,), {})
++    program = CoreProgram(
++        functions=(
++            CoreFunction("dequantize", (source, scales), (output,), Region((operation,))),
++        )
++    )
++    with pytest.raises((CpuScalarUnsupportedError, CpuVectorUnsupportedError)):
++        Avx512Compiler().lower(program, AVX512_VNNI_TARGET)
++
++
++def test_qmatmul_dtype_rules_fail_closed():
++    program = _raw_qmatmul_program(
++        (2, 3),
++        (3, 4),
++        (2, 4),
++        left_dtype="float32",
++        right_dtype="float32",
++        output_dtype="float32",
++    )
++    with pytest.raises((CpuVectorUnsupportedError, CpuVectorValidationError)):
++        Avx512Compiler().lower(program, AVX512_VNNI_TARGET)
++
++
++# --------------------------------------------------------------------------
++# VPDPBUSD sign compensation: formula, tails, all-negative, wraparound
++# --------------------------------------------------------------------------
++
++
++def _run_entry_point(codes, left_shape, right_shape, carrier_artifact):
++    return _avx512_runtime().run_w8a8_qmatmul(
++        carrier_artifact,
++        codes[0],
++        codes[1],
++        left_shape=left_shape,
++        right_shape=right_shape,
++    )
++
++
++@pytest.mark.parametrize("k", (1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64, 65))
++def test_compensation_all_negative_and_mixed_tails(k, carrier_artifact):
++    # All-negative: bias +128 on the right operand used to be the classic
++    # vpdpbusd failure mode (u8 x s8); the -128 * row_sum correction must make
++    # it exact for any K, including K not divisible by 4 or 16.
++    cases = (
++        ([[-127] * k], [[-127] for _ in range(k)]),
++        ([[-127] * k], [[127] for _ in range(k)]),
++        ([[127 if index % 2 == 0 else -127 for index in range(k)]],
++         [[-127 if index % 2 else 127] for index in range(k)]),
++        ([[-1 if index % 3 == 0 else 1 for index in range(k)]],
++         [[-3 if index % 5 == 0 else 2] for index in range(k)]),
++    )
++    for left, right in cases:
++        expected = qmatmul_s8s8_s32(left, right)
++        actual = _run_entry_point((left, right), (1, k), (k, 1), carrier_artifact)
++        assert actual == tuple(expected.values), (k, left, right)
++
++
++def test_compensation_worst_case_wraps_modulo_2_32(carrier_artifact):
++    """The biased intermediate sum exceeds INT32; only wrap + correction works.
++
++    K = 133144, a = b = 127: the frozen exact result is
++    K * 127 * 127 = 2,147,479,576 <= INT32_MAX, but the VNNI operand sees
++    (b + 128) = 255, so the raw ``vpdpbusd`` accumulation is
++    255 * 127 * K = 4,311,035,640, which is *outside* int32.  A saturating or
++    non-wrapping implementation would return a wrong value here.
++    """
++
++    k = W8A8_MAX_ACCUMULATOR_K
++    biased_intermediate = 255 * 127 * k
++    exact = 127 * 127 * k
++    assert biased_intermediate > 2**31 - 1
++    assert 0 < exact <= 2**31 - 1
++    for left_value, right_value, sign in ((127, 127, 1), (127, -127, -1), (-127, 127, -1)):
++        left = [[left_value] * k]
++        right = [[right_value] for _ in range(k)]
++        expected = qmatmul_s8s8_s32(left, right)
++        assert expected.values == (sign * exact,)
++        actual = _run_entry_point((left, right), (1, k), (k, 1), carrier_artifact)
++        assert actual == tuple(expected.values)
++
++
++def test_compensation_vector_tails_across_m_n_k(carrier_artifact):
++    # M=5 (row tail), N=33 (16-column tail), K=17 (4-wide k tail) at once.
++    rng = random.Random(20260912)
++    left = [[rng.randint(-127, 127) for _ in range(17)] for _ in range(5)]
++    right = [[rng.randint(-127, 127) for _ in range(33)] for _ in range(17)]
++    expected = qmatmul_s8s8_s32(left, right)
++    actual = _run_entry_point((left, right), (5, 17), (17, 33), carrier_artifact)
++    assert actual == tuple(expected.values)
++    # A row whose left row sum is negative and one whose right row is all
++    # negative at the same time, to exercise the correction sign.
++    left = [[-127] * 17 for _ in range(5)]
++    right = [[-127 if column % 2 else 3 for column in range(33)] for _ in range(17)]
++    expected = qmatmul_s8s8_s32(left, right)
++    actual = _run_entry_point((left, right), (5, 17), (17, 33), carrier_artifact)
++    assert actual == tuple(expected.values)
++
++
++def test_compensation_batched_paths(carrier_artifact):
++    left = [[[-127] * 5, [127] * 5], [[0] * 5, [-5] * 5]]
++    right = [[[-127] for _ in range(5)] for _ in range(2)]
++    expected = qmatmul_s8s8_s32(left, right)
++    actual = _run_entry_point((left, right), (2, 2, 5), (2, 5, 1), carrier_artifact)
++    assert actual == tuple(expected.values)
++
++
++# --------------------------------------------------------------------------
++# dequantize_s8 / dequantize_epilogue_bf16 / quantize_per_token_s8 primitives
++# --------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("rows,k", ((1, 1), (3, 7), (4, 8), (5, 17), (2, 33), (4, 64)))
++def test_dequantize_s8_matches_the_golden(rows, k, carrier_artifact):
++    rng = random.Random(20260912 + rows * 31 + k)
++    codes = [rng.randint(-127, 127) for _ in range(rows * k)]
++    scales = [rng.uniform(-2.0, 2.0) for _ in range(rows)]
++    expected = dequantize_s8(codes, scales, shape=(rows, k))
++    actual = _avx512_runtime().run_w8a8_dequantize_s8(
++        carrier_artifact, codes, scales, shape=(rows, k)
++    )
++    assert tuple(float(value) for value in actual) == tuple(expected)
++
++
++def test_dequantize_s8_rejects_the_reserved_minus_128(carrier_artifact):
++    with pytest.raises(CpuAvx512ExecutionError):
++        _avx512_runtime().run_w8a8_dequantize_s8(carrier_artifact, [-128, 1], [1.0])
++
++
++def test_dequantize_s8_signed_zero_and_denormal_scales_match_golden(carrier_artifact):
++    codes = [0, 1, -1, 127, -127]
++    for scale in (-0.0, 0.0, 1.0e-45, -1.0e-45):
++        expected = dequantize_s8(codes, [scale], shape=(1, 5))
++        actual = _avx512_runtime().run_w8a8_dequantize_s8(
++            carrier_artifact, codes, [scale], shape=(1, 5)
++        )
++        assert tuple(float(value) for value in actual) == tuple(expected)
++
++
++def test_dequantize_s8_overflow_fails_closed_like_the_golden(carrier_artifact):
++    with pytest.raises(ValueError):
++        dequantize_s8([2], [3.4028234663852886e38])
++    with pytest.raises(CpuAvx512ExecutionError):
++        _avx512_runtime().run_w8a8_dequantize_s8(
++            carrier_artifact, [2], [3.4028234663852886e38]
++        )
++
++
++def test_dequantize_s8_infinite_scale_passes_through_like_the_golden(carrier_artifact):
++    expected = dequantize_s8([1, 0], [float("inf")], shape=(1, 2))
++    actual = _avx512_runtime().run_w8a8_dequantize_s8(
++        carrier_artifact, [1, 0], [float("inf")], shape=(1, 2)
++    )
++    assert tuple(_f32_bits(value) for value in actual) == tuple(
++        _f32_bits(value) for value in expected
++    )
++
++
++@pytest.mark.parametrize(
++    "rows,columns", ((1, 1), (2, 3), (3, 8), (5, 17), (4, 9), (2, 64), (6, 33))
++)
++def test_epilogue_matches_the_golden_bf16_bits(rows, columns, carrier_artifact):
++    rng = random.Random(777 + rows * 13 + columns)
++    accumulator = [rng.randint(-(2**31), 2**31 - 1) for _ in range(rows * columns)]
++    row_scales = [_f32_round(rng.uniform(-3.0, 3.0)) for _ in range(rows)]
++    column_scales = [_f32_round(rng.uniform(-3.0, 3.0)) for _ in range(columns)]
++    expected = dequantize_epilogue_bf16(
++        accumulator, row_scales, column_scales, shape=(rows, columns)
++    )
++    actual = _avx512_runtime().run_w8a8_dequantize_epilogue_bf16(
++        carrier_artifact, accumulator, row_scales, column_scales, shape=(rows, columns)
++    )
++    assert tuple(actual) == tuple(expected.bf16_bits)
++
++
++def test_epilogue_int32_extremes_match_the_golden_bits(carrier_artifact):
++    accumulator = [[2**31 - 1, -(2**31), 0, -1], [-2147483647, 123456789, -987654321, 42]]
++    row_scales = [0.25, 3.5]
++    column_scales = [1.5, 0.03125, 7.0, -2.0]
++    expected = dequantize_epilogue_bf16(accumulator, row_scales, column_scales)
++    actual = _avx512_runtime().run_w8a8_dequantize_epilogue_bf16(
++        carrier_artifact, accumulator, row_scales, column_scales
++    )
++    assert tuple(actual) == tuple(expected.bf16_bits)
++
++
++def test_epilogue_infinite_scale_passes_through_like_the_golden(carrier_artifact):
++    accumulator = [[1], [0], [2]]
++    row_scales = [float("inf"), float("inf"), float("inf")]
++    expected = dequantize_epilogue_bf16(accumulator, row_scales, [1.0])
++    actual = _avx512_runtime().run_w8a8_dequantize_epilogue_bf16(
++        carrier_artifact, accumulator, row_scales, [1.0]
++    )
++    assert tuple(actual) == tuple(expected.bf16_bits)
++
++
++def test_epilogue_binary32_overflow_fails_closed_like_the_golden(carrier_artifact):
++    with pytest.raises(ValueError):
++        dequantize_epilogue_bf16([[2]], [3.4028234663852886e38], [1.0])
++    with pytest.raises(CpuAvx512ExecutionError):
++        _avx512_runtime().run_w8a8_dequantize_epilogue_bf16(
++            carrier_artifact, [[2]], [3.4028234663852886e38], [1.0]
++        )
++
++
++@pytest.mark.parametrize(
++    "rows,k", ((1, 1), (1, 7), (3, 8), (4, 8), (2, 16), (5, 5), (7, 9), (3, 33), (2, 64))
++)
++def test_quantize_per_token_matches_the_golden(rows, k, carrier_artifact):
++    rng = random.Random(31337 + rows * 17 + k)
++    values = [_f32_round(rng.uniform(-10.0, 10.0)) for _ in range(rows * k)]
++    expected = quantize_per_token_s8(values, shape=(rows, k))
++    actual = _avx512_runtime().run_w8a8_quantize_per_token_s8(
++        carrier_artifact, values, shape=(rows, k)
++    )
++    assert tuple(actual.codes) == tuple(expected.codes)
++    assert tuple(actual.scales) == tuple(expected.scales)
++    assert actual.saturation_count == expected.saturation_count
++    assert (actual.rows, actual.k) == (expected.rows, expected.k)
++
++
++def test_quantize_all_zero_rows_produce_unit_scale_and_zero_codes(carrier_artifact):
++    values = [0.0, -0.0, 0.0, 0.0, 0.0, -0.0]
++    expected = quantize_per_token_s8(values, shape=(2, 3))
++    actual = _avx512_runtime().run_w8a8_quantize_per_token_s8(
++        carrier_artifact, values, shape=(2, 3)
++    )
++    assert tuple(actual.codes) == tuple(expected.codes) == (0,) * 6
++    assert tuple(actual.scales) == tuple(expected.scales) == (1.0, 1.0)
++    assert actual.saturation_count == expected.saturation_count == 0
++    assert not any(math.isnan(value) or math.isinf(value) for value in actual.scales)
++
++
++def test_quantize_rank3_reshapes_to_rows_k(carrier_artifact):
++    values = [[[1.0, -1.0], [0.0, 0.0]], [[2.0, -2.0], [0.5, -0.5]]]
++    expected = quantize_per_token_s8(values)
++    actual = _avx512_runtime().run_w8a8_quantize_per_token_s8(carrier_artifact, values)
++    assert (actual.rows, actual.k) == (expected.rows, expected.k) == (4, 2)
++    assert tuple(actual.codes) == tuple(expected.codes)
++    assert tuple(actual.scales) == tuple(expected.scales)
++
++
++def test_quantize_bf16_dtype_rounds_before_quantizing(carrier_artifact):
++    values = [0.1, -0.2, 1.5, 2.25, 3.0, -3.0]
++    rounded = [float(_cast_value(value, "bf16")) for value in values]
++    expected = quantize_per_token_s8(rounded, shape=(1, 6))
++    actual = _avx512_runtime().run_w8a8_quantize_per_token_s8(
++        carrier_artifact, values, shape=(1, 6), dtype="bf16"
++    )
++    assert tuple(actual.codes) == tuple(expected.codes)
++    assert tuple(actual.scales) == tuple(expected.scales)
++
++
++def test_quantize_fuzz_matches_the_golden(carrier_artifact):
++    rng = random.Random(4242)
++    runtime = _avx512_runtime()
++    for trial in range(200):
++        rows = rng.randint(1, 4)
++        k = rng.randint(1, 33)
++        magnitude = 10.0 ** rng.uniform(-8.0, 8.0)
++        values = [_f32_round(rng.uniform(-magnitude, magnitude)) for _ in range(rows * k)]
++        if trial % 3 == 0:
++            values[rng.randrange(len(values))] = 0.0
++        expected = quantize_per_token_s8(values, shape=(rows, k))
++        actual = runtime.run_w8a8_quantize_per_token_s8(
++            carrier_artifact, values, shape=(rows, k)
++        )
++        assert tuple(actual.codes) == tuple(expected.codes), trial
++        assert tuple(actual.scales) == tuple(expected.scales), trial
++        assert actual.saturation_count == expected.saturation_count, trial
++
++
++def test_quantize_nan_inf_and_overflow_fail_closed(carrier_artifact):
++    runtime = _avx512_runtime()
++    for bad in (float("nan"), float("inf"), float("-inf")):
++        with pytest.raises(CpuAvx512ExecutionError):
++            runtime.run_w8a8_quantize_per_token_s8(
++                carrier_artifact, [1.0, bad], shape=(1, 2)
++            )
++    with pytest.raises(CpuAvx512ExecutionError):
++        runtime.run_w8a8_quantize_per_token_s8(
++            carrier_artifact, [1.0, 1.0e39], shape=(1, 2)
++        )
++
++
++def test_quantize_scale_underflow_fails_closed_like_the_golden(carrier_artifact):
++    value = 1.0e-45  # smallest float32 denormal; absmax/127 rounds to zero
++    with pytest.raises(W8A8QuantizationError):
++        quantize_per_token_s8([value], shape=(1, 1))
++    with pytest.raises(CpuAvx512ExecutionError):
++        _avx512_runtime().run_w8a8_quantize_per_token_s8(
++            carrier_artifact, [value], shape=(1, 1)
++        )
++
++
++def test_quantize_k_limit_fails_closed(carrier_artifact):
++    k = W8A8_MAX_ACCUMULATOR_K + 1
++    with pytest.raises(CpuAvx512ExecutionError):
++        _avx512_runtime().run_w8a8_quantize_per_token_s8(
++            carrier_artifact, [0.0] * k, shape=(1, k)
++        )
++
++
++# --------------------------------------------------------------------------
++# fail-closed entry points, capability gate and metadata tampering
++# --------------------------------------------------------------------------
++
++
++def test_w8a8_entry_points_require_a_vnni_artifact(base_artifact):
++    runtime = _avx512_runtime()
++    with pytest.raises(CpuAvx512ArtifactError):
++        runtime.run_w8a8_dequantize_s8(base_artifact, [1], [1.0])
++    with pytest.raises(CpuAvx512ArtifactError):
++        runtime.run_w8a8_qmatmul(base_artifact, [[1]], [[1]])
++    with pytest.raises(CpuAvx512ArtifactError):
++        runtime.run_w8a8_quantize_per_token_s8(base_artifact, [1.0], shape=(1, 1))
++    with pytest.raises(CpuAvx512ArtifactError):
++        runtime.run_w8a8_dequantize_epilogue_bf16(base_artifact, [[1]], [1.0], [1.0])
++
++
++def test_w8a8_entry_points_fail_closed_without_a_real_vnni_probe(monkeypatch, carrier_artifact):
++    base = Avx512Capability.injected_capability(
++        ("avx", "avx512f", "osxsave", "ymm", "opmask", "zmm")
++    )
++    runtime = Avx512Runtime(capability=base)
++    monkeypatch.setattr(
++        capabilities_module, "probe_avx512_capabilities", lambda *args, **kwargs: base
++    )
++    # The declaration helper itself names the missing matrix capability.
++    with pytest.raises(UnsupportedCapabilityError):
++        avx512_w8a8_capabilities(base)
++    # The probe-gated entry point cannot be bypassed by an injected
++    # capability: it re-probes and fails closed on the VNNI bit.
++    with pytest.raises((UnsupportedCapabilityError, CpuAvx512UnavailableError)):
++        runtime.run_w8a8_qmatmul(carrier_artifact, [[1]], [[1]])
++
++
++def test_launch_without_vnni_fails_closed_without_fallback(monkeypatch, carrier_artifact):
++    base = Avx512Capability.injected_capability(
++        ("avx", "avx512f", "osxsave", "ymm", "opmask", "zmm")
++    )
++    runtime = Avx512Runtime(capability=base)
++    monkeypatch.setattr(
++        capabilities_module, "probe_avx512_capabilities", lambda *args, **kwargs: base
++    )
++    left = HostTensor("int8", (2, 3), [0] * 6)
++    right = HostTensor("int8", (3, 4), [0] * 12)
++    output = HostTensor.zeros("int32", (2, 4))
++    with pytest.raises((CpuAvx512FeatureMismatchError, CpuAvx512UnavailableError)) as error:
++        _launch(carrier_artifact, [left, right], [output], runtime)
++    details = "{}\n{}".format(error.value, getattr(error.value, "status", ""))
++    assert "avx512vnni" in details
++
++
++def _tampered_metadata(artifact, **changes):
++    metadata = {}
++    for key, value in artifact.metadata.items():
++        metadata[key] = dict(value) if isinstance(value, dict) else value
++    metadata.update(changes)
++    return metadata
++
++
++def test_qmatmul_artifact_tampering_fails_closed(carrier_artifact):
++    runtime = _avx512_runtime()
++    original = {key: value for key, value in carrier_artifact.metadata.items()}
++    tampered = _tampered_metadata(carrier_artifact, w8a8_kernel_operations=[])
++    object.__setattr__(carrier_artifact, "metadata", tampered)
++    try:
++        with pytest.raises(CpuAvx512ArtifactError, match="w8a8_kernel_operations"):
++            runtime.load(carrier_artifact)
++    finally:
++        object.__setattr__(carrier_artifact, "metadata", original)
++    declaration = dict(carrier_artifact.metadata["w8a8_capability"])
++    declaration["digest"] = "0" * 64
++    tampered = _tampered_metadata(carrier_artifact, w8a8_capability=declaration)
++    object.__setattr__(carrier_artifact, "metadata", tampered)
++    try:
++        with pytest.raises(CpuAvx512ArtifactError, match="w8a8_capability"):
++            runtime.load(carrier_artifact)
++    finally:
++        object.__setattr__(carrier_artifact, "metadata", original)
++    declaration = dict(carrier_artifact.metadata["w8a8_capability"])
++    declaration["matrix_capabilities"] = ["s8s8_s32_widening"]
++    tampered = _tampered_metadata(carrier_artifact, w8a8_capability=declaration)
++    object.__setattr__(carrier_artifact, "metadata", tampered)
++    try:
++        with pytest.raises(CpuAvx512ArtifactError, match="w8a8_capability"):
++            runtime.load(carrier_artifact)
++    finally:
++        object.__setattr__(carrier_artifact, "metadata", original)
++    tampered = _tampered_metadata(carrier_artifact, artifact_payload_version=4)
++    object.__setattr__(carrier_artifact, "metadata", tampered)
++    try:
++        with pytest.raises(CpuAvx512ArtifactError, match="payload version"):
++            runtime.load(carrier_artifact)
++    finally:
++        object.__setattr__(carrier_artifact, "metadata", original)
++
++
++def test_qmatmul_native_contract_predicate_requires_a_real_plan(carrier_artifact):
++    assert w8a8_kernel_contract(None, None) is None
++    entry = carrier_artifact.metadata["w8a8_operations"][0]
++    assert entry["k"] == 3
++    assert entry["m"] == 2
++    assert entry["n"] == 4
++
++
++def test_non_w8a8_artifact_keeps_the_float_plane(base_artifact):
++    assert base_artifact.metadata["use_vnni"] is False
++    assert base_artifact.metadata["public_core_vnni"] is False
++    assert tuple(base_artifact.metadata["w8a8_kernel_operations"]) == ()
++    assert tuple(base_artifact.metadata["w8a8_operations"]) == ()
++    # The float path is unaffected and still launches natively.
++    left = HostTensor("float32", (17,), [float(index) for index in range(17)])
++    right = HostTensor("float32", (17,), [1.0] * 17)
++    output = HostTensor.zeros("float32", (17,))
++    _launch(base_artifact, [left, right], [output], _avx512_runtime())
++    assert tuple(output.data) == tuple(float(index + 1) for index in range(17))
++
++
++# --------------------------------------------------------------------------
++# disassembly evidence: real VPDPBUSD emission (AVX-512 is EVEX by design)
++# --------------------------------------------------------------------------
++
++
++def _function_disassembly(path, symbol):
++    objdump = shutil.which("objdump")
++    if objdump is None:
++        pytest.skip("objdump is unavailable")
++    result = subprocess.run(
++        [objdump, "-d", "--no-show-raw-insn", str(path)],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        universal_newlines=True,
++        check=False,
++    )
++    body = []
++    current = None
++    for line in result.stdout.splitlines():
++        if line.endswith(">:") and "<" in line:
++            current = line[line.index("<") + 1 : line.rindex(">")]
++            continue
++        if current == symbol:
++            body.append(line)
++    if not body:
++        raise AssertionError("symbol {!r} not found in objdump output".format(symbol))
++    return "\n".join(body)
++
++
++def _function_evex_instruction_count(path, symbol):
++    """Count instructions whose first opcode byte is the EVEX prefix (0x62)."""
++
++    objdump = shutil.which("objdump")
++    if objdump is None:
++        pytest.skip("objdump is unavailable")
++    result = subprocess.run(
++        [objdump, "-d", str(path)],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        universal_newlines=True,
++        check=False,
++    )
++    current = None
++    count = 0
++    for line in result.stdout.splitlines():
++        if line.endswith(">:") and "<" in line:
++            current = line[line.index("<") + 1 : line.rindex(">")]
++            continue
++        if current != symbol:
++            continue
++        match = re.match(r"^\s*[0-9a-f]+:\s+((?:[0-9a-f]{2} ?)+)\s", line)
++        if match and match.group(1).split()[0].lower() == "62":
++            count += 1
++    if current is None:
++        raise AssertionError("symbol {!r} not found in objdump output".format(symbol))
++    return count
++
++
++def test_objdump_qmatmul_emits_vpdpbusd_with_sign_compensation(carrier_artifact):
++    body = _function_disassembly(carrier_artifact.path, W8A8_QMATMUL_KERNEL)
++    # The real VNNI instruction must be present exactly as declared; C4 never
++    # falls back to vpdpwssd or to a scalar widening loop.
++    assert "vpdpbusd" in body
++    assert "vpdpwssd" not in body
++    assert "vpmovsxbd" in body
++    assert "vpslld" in body and "vpord" in body
++    assert "zmm" in body
++    assert _function_evex_instruction_count(carrier_artifact.path, W8A8_QMATMUL_KERNEL) > 0
++
++
++def test_objdump_quantize_uses_zmm_double_precision(carrier_artifact):
++    body = _function_disassembly(carrier_artifact.path, W8A8_QUANTIZE_KERNEL)
++    assert "vdivpd" in body
++    assert "vcvttpd2dq" in body
++    assert "vpminsd" in body and "vpmaxsd" in body
++    assert "zmm" in body
++
++
++def test_objdump_primitives_are_native_avx512(carrier_artifact):
++    dequantize = _function_disassembly(carrier_artifact.path, W8A8_DEQUANTIZE_S8_KERNEL)
++    epilogue = _function_disassembly(carrier_artifact.path, W8A8_EPILOGUE_KERNEL)
++    assert "vpmovsxbd" in dequantize
++    assert "vmulps" in dequantize
++    assert "vcvtdq2ps" in epilogue
++    assert "vmulps" in epilogue
++    for body in (dequantize, epilogue):
++        assert "zmm" in body
++
++
++def test_artifact_native_bytes_digest_matches(carrier_artifact):
++    native_bytes = Path(carrier_artifact.path).read_bytes()
++    assert hashlib.sha256(native_bytes).hexdigest() == carrier_artifact.content_digest
++    assert b"pypto-x.cpu.avx512:6" in native_bytes

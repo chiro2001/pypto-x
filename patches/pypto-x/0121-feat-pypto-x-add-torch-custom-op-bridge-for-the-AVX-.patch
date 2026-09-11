@@ -1,0 +1,2721 @@
+From ac5a44d5491c030e510b50cf8b48516516787fe6 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 03:47:20 +0800
+Subject: [PATCH 121/134] feat(pypto-x): add torch custom-op bridge for the
+ AVX-512 linear kernel (W8J)
+
+J0 established that rebuilding a Core IR graph per call cannot live in an
+inference hot path, so J1 delivers the kernel bridge instead:
+
+- pypto.framework.linear_kernel builds one rank-2 matmul CoreProgram per
+  (dtype, M, K, N, target) and keeps it in an in-process tier plus a
+  cross-process disk sidecar next to the content-addressed AVX-512
+  artifact.  A second call builds nothing; a second process loads the
+  immutable artifact and re-validates it through Avx512Runtime.load with
+  no clang invocation.  Cache key and invalidation rules are explicit
+  (target dict + lowering/payload/ABI/format versions + bridge key
+  version; stale/tampered sidecars fail validation and are rebuilt).
+- pypto.framework.torch_bridge converts torch CPU tensors to runtime
+  buffers with documented copy counts (0 for contiguous inputs, 1 for a
+  contiguous() materialisation) and ownership (the numpy view keeps the
+  torch storage alive).
+- pypto.framework.torch_ops registers torch.ops.pypto_x.linear (fail-open
+  with counters and once-per-reason warnings), linear_strict (fail-closed),
+  pack_weight / linear_prepacked (self-describing uint8 handle; one
+  (N, K) -> (K, N) pack per weight revision) and fake/meta impls.
+- pypto.framework imports neither torch nor numpy: torch stays optional.
+
+Tests: 64 torch-env tests (f32/bf16 correctness including non-square,
+bias, odd tails, non-contiguous inputs; zero-copy accounting; compile and
+weight-pack cache identity/disk reuse; fail-open vs fail-closed matrix;
+meta fake inference and torch.compile tracing; a runtime ABI round-trip
+that launches the compiled artifact with torch-backed numpy handles)
+plus 4 torch-free tests in the system-python suite pinning the
+optional-dependency boundary.
+---
+ python/pypto/framework/__init__.py                              |  83 +++++
+ python/pypto/framework/errors.py                                |  87 +++++
+ python/pypto/framework/linear_kernel.py                         | 548 ++++++++++++++++++++++++++++
+ python/pypto/framework/torch_bridge.py                          | 389 ++++++++++++++++++++
+ python/pypto/framework/torch_ops.py                             | 488 +++++++++++++++++++++++++
+ python/pypto/framework/weight_pack.py                           | 164 +++++++++
+ python/tests/framework_torch/README.md                          |  18 +
+ python/tests/framework_torch/conftest.py                        |  54 +++
+ python/tests/framework_torch/test_torch_linear_cache.py         | 154 ++++++++
+ python/tests/framework_torch/test_torch_linear_correctness.py   | 225 ++++++++++++
+ .../framework_torch/test_torch_linear_failure_semantics.py      | 283 ++++++++++++++
+ python/tests/ut/pypto_x/test_framework_torch_optional.py        | 107 ++++++
+ 12 files changed, 2600 insertions(+)
+
+diff --git a/python/pypto/framework/__init__.py b/python/pypto/framework/__init__.py
+new file mode 100644
+index 000000000..4cc9af413
+--- /dev/null
++++ b/python/pypto/framework/__init__.py
+@@ -0,0 +1,83 @@
++"""PyPTO-X framework adapters (W8J).
++
++This package is the torch-facing boundary of PyPTO-X.  Importing
++``pypto.framework`` never imports torch or numpy: torch is an *optional*
++dependency and stays lazy until the caller explicitly registers the ops::
++
++    import pypto.framework
++    pypto.framework.register_torch_ops()   # imports torch, registers torch.ops.pypto_x.*
++
++What J1 provides:
++
++* :mod:`pypto.framework.linear_kernel` - one compiled AVX-512 matmul Core IR
++  program per ``(dtype, M, K, N, target)`` with an in-process and a
++  cross-process (disk sidecar) cache;
++* :mod:`pypto.framework.torch_bridge` - explicit zero-copy-first CPU tensor
++  conversion with documented copy counts;
++* :mod:`pypto.framework.torch_ops` - ``torch.ops.pypto_x.linear`` fail-open,
++  ``linear_strict`` fail-closed, ``pack_weight``/``linear_prepacked``
++  pre-packed weight path and fake/meta implementations.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++from typing import Any
++
++from .errors import PyPTOXBridgeError, PyPTOXBuildError, PyPTOXUnsupportedError
++from .linear_kernel import (
++    LinearKernelCache,
++    LinearKernelKey,
++    default_cache_dir,
++    linear_kernel_cache,
++    linear_target,
++    normalize_dtype,
++    reset_linear_kernel_cache,
++)
++
++
++def torch_available() -> bool:
++    """Return whether a torch installation is importable (without importing it)."""
++
++    try:
++        return importlib.util.find_spec("torch") is not None
++    except (ImportError, AttributeError, ValueError):
++        return False
++
++
++def register_torch_ops() -> Any:
++    """Import torch and register ``torch.ops.pypto_x.*``; returns the module."""
++
++    if not torch_available():
++        raise PyPTOXBridgeError(
++            "torch is not installed; torch.ops.pypto_x cannot be registered",
++            reason_code="torch_missing",
++        )
++    from . import torch_ops
++
++    return torch_ops
++
++
++def kernel_stats() -> Any:
++    """Return cache/fallback counters; requires the torch bridge to be loaded."""
++
++    from . import torch_ops
++
++    return torch_ops.op_stats()
++
++
++__all__ = [
++    "LinearKernelCache",
++    "LinearKernelKey",
++    "PyPTOXBridgeError",
++    "PyPTOXBuildError",
++    "PyPTOXUnsupportedError",
++    "default_cache_dir",
++    "kernel_stats",
++    "linear_kernel_cache",
++    "linear_target",
++    "normalize_dtype",
++    "register_torch_ops",
++    "reset_linear_kernel_cache",
++    "torch_available",
++]
+diff --git a/python/pypto/framework/errors.py b/python/pypto/framework/errors.py
+new file mode 100644
+index 000000000..caedb6598
+--- /dev/null
++++ b/python/pypto/framework/errors.py
+@@ -0,0 +1,87 @@
++"""Structured errors for the PyPTO-X framework bridge.
++
++The bridge is intentionally explicit about *why* an input was not handled so
++that a framework adapter can either fall back to the vendor kernel (fail-open)
++or surface the failure (fail-closed) without silent numeric behaviour.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Mapping, Optional
++
++
++def _details(value: Optional[Mapping[str, Any]]) -> Mapping[str, Any]:
++    if value is None:
++        return {}
++    if not isinstance(value, Mapping):
++        raise TypeError("error details must be a mapping")
++    return {str(key): value[key] for key in value}
++
++
++class PyPTOXBridgeError(RuntimeError):
++    """Base class for framework bridge failures.
++
++    ``reason_code`` is a stable machine-readable token (snake_case) and
++    ``details`` carries structured context.  Callers must not branch on the
++    human-readable message.
++    """
++
++    def __init__(
++        self,
++        message: str,
++        *,
++        reason_code: str = "bridge_error",
++        details: Optional[Mapping[str, Any]] = None,
++    ) -> None:
++        if not isinstance(reason_code, str) or not reason_code.strip():
++            raise ValueError("reason_code must be a non-empty string")
++        super().__init__(message)
++        self.reason_code = reason_code.strip()
++        self.details = _details(details)
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "error": self.__class__.__name__,
++            "message": str(self),
++            "reason_code": self.reason_code,
++            "details": dict(self.details),
++        }
++
++
++class PyPTOXUnsupportedError(PyPTOXBridgeError):
++    """The input is outside the kernel contract.
++
++    This is the fail-open signal: a caller may safely recompute the same
++    semantics with ``torch.nn.functional.linear``.  It is never raised for a
++    failure that would make the fallback numerically different.
++    """
++
++    def __init__(
++        self,
++        message: str,
++        *,
++        reason_code: str = "unsupported_input",
++        details: Optional[Mapping[str, Any]] = None,
++    ) -> None:
++        super().__init__(message, reason_code=reason_code, details=details)
++
++
++class PyPTOXBuildError(PyPTOXBridgeError):
++    """The kernel could not be built, loaded or verified.
++
++    Build failures are not input-contract failures; silently falling back is
++    still semantically safe, but the condition should be visible in logs and
++    counters.  The fail-closed entry points re-raise this unchanged.
++    """
++
++    def __init__(
++        self,
++        message: str,
++        *,
++        reason_code: str = "kernel_build_failed",
++        details: Optional[Mapping[str, Any]] = None,
++    ) -> None:
++        super().__init__(message, reason_code=reason_code, details=details)
++
++
++__all__ = ["PyPTOXBridgeError", "PyPTOXUnsupportedError", "PyPTOXBuildError"]
+diff --git a/python/pypto/framework/linear_kernel.py b/python/pypto/framework/linear_kernel.py
+new file mode 100644
+index 000000000..19932bfa7
+--- /dev/null
++++ b/python/pypto/framework/linear_kernel.py
+@@ -0,0 +1,548 @@
++"""Compiled single-kernel linear cache for the PyPTO-X AVX-512 backend.
++
++J0 established that rebuilding a Core IR graph per call is not viable inside
++an inference hot path.  This module compiles *one* rank-2 matmul CoreProgram
++per ``(dtype, M, K, N, target)`` tuple, loads it through the public AVX-512
++runtime once, and then exposes a direct native-symbol invocation for that
++kernel.  The cache key and invalidation rules are explicit:
++
++* memory hit  - same process, same key: no Core IR rebuild, no compile;
++* disk hit    - a previous process compiled the same key: the immutable
++  artifact metadata is loaded from a sidecar next to the content-addressed
++  ``.so`` and re-validated by ``Avx512Runtime.load``; no clang invocation;
++* invalidation - the key embeds the AVX-512 lowering version, artifact
++  payload/ABI/format versions, the target dict and a bridge key version.
++  A stale or tampered sidecar fails runtime validation and is rebuilt.
++  ``PYPTO_X_TORCH_CACHE_DIR`` selects the directory; deleting it forces a
++  cold rebuild.
++
++This module deliberately imports no torch and no numpy, so the kernel cache
++can be inspected from the torch-free test suite.
++"""
++
++from __future__ import annotations
++
++from collections import OrderedDict
++from dataclasses import dataclass
++import ctypes
++import hashlib
++import json
++import os
++from pathlib import Path
++import threading
++import tempfile
++from typing import Any, Dict, Mapping, Optional, Tuple
++
++from pypto.backends.cpu.x86 import Avx512Runtime
++from pypto.compiler import CompileOptions
++from pypto.compiler.artifact import ABI_VERSION, ARTIFACT_FORMAT_VERSION, Artifact
++from pypto.compiler.targets.cpu_avx512 import (
++    ARTIFACT_PAYLOAD_VERSION,
++    DEFAULT_ARTIFACT_FORMAT,
++    Avx512Compiler,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu.x86.avx512 import AVX512_LOWERING_VERSION
++from pypto.target import TargetSpec
++
++from .errors import PyPTOXBuildError, PyPTOXUnsupportedError
++
++
++LINEAR_KERNEL_CACHE_VERSION = 1
++_DTYPE_NATIVE_SUFFIX = {"float32": "f32", "bf16": "bf16"}
++_SUPPORTED_DTYPES = ("bf16", "float32")
++_DEFAULT_MAX_ENTRIES = 512
++_SIDECAR_PREFIX = "pypto_x_linear_"
++
++
++def normalize_dtype(dtype: Any) -> str:
++    """Return the canonical bridge dtype name or raise ``Unsupported``."""
++
++    name = dtype if isinstance(dtype, str) else getattr(dtype, "name", str(dtype))
++    value = str(name).strip().lower().replace("torch.", "")
++    if value == "float":
++        value = "float32"
++    if value == "bfloat16":
++        value = "bf16"
++    if value not in _SUPPORTED_DTYPES:
++        raise PyPTOXUnsupportedError(
++            "PyPTO-X linear supports bf16/float32, got {!r}".format(dtype),
++            reason_code="dtype_unsupported",
++            details={"dtype": str(dtype)},
++        )
++    return value
++
++
++def linear_target(dtype: str) -> TargetSpec:
++    """Return the fixed AVX-512 target for one bridge dtype."""
++
++    dtype = normalize_dtype(dtype)
++    features = ["avx512f", "fma"]
++    if dtype == "bf16":
++        features.append("avx512bf16")
++    return TargetSpec(
++        "cpu",
++        "x86_64-linux-gnu",
++        features=tuple(features),
++        attributes={"lane_count": 16},
++    )
++
++
++@dataclass(frozen=True)
++class LinearKernelKey:
++    """Stable cache identity for one compiled single-kernel matmul."""
++
++    dtype: str
++    m: int
++    k: int
++    n: int
++    target: Mapping[str, Any]
++    lowering_version: int = AVX512_LOWERING_VERSION
++    payload_version: int = ARTIFACT_PAYLOAD_VERSION
++    abi_version: str = ABI_VERSION
++    format_version: int = ARTIFACT_FORMAT_VERSION
++    key_version: int = LINEAR_KERNEL_CACHE_VERSION
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "key_version": self.key_version,
++            "op": "linear",
++            "dtype": self.dtype,
++            "m": self.m,
++            "k": self.k,
++            "n": self.n,
++            "target": dict(self.target),
++            "lowering_version": self.lowering_version,
++            "payload_version": self.payload_version,
++            "abi_version": self.abi_version,
++            "format_version": self.format_version,
++        }
++
++    @property
++    def digest(self) -> str:
++        return hashlib.sha256(
++            json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8")
++        ).hexdigest()
++
++    @property
++    def display(self) -> str:
++        return "linear:{dtype}:M{m}:K{k}:N{n}:{target}".format(
++            dtype=self.dtype, m=self.m, k=self.k, n=self.n, target=self.target.get("key", "?")
++        )
++
++
++class LinearKernelEntry:
++    """A loaded AVX-512 matmul artifact plus its direct native entry point."""
++
++    __slots__ = ("key", "artifact", "loaded", "_native", "m", "k", "n", "dtype", "disk_backed")
++
++    def __init__(
++        self,
++        key: LinearKernelKey,
++        artifact: Artifact,
++        loaded: Any,
++        native: Any,
++        *,
++        disk_backed: bool,
++    ) -> None:
++        self.key = key
++        self.artifact = artifact
++        self.loaded = loaded
++        self._native = native
++        self.m = key.m
++        self.k = key.k
++        self.n = key.n
++        self.dtype = key.dtype
++        self.disk_backed = bool(disk_backed)
++
++    @property
++    def native_symbol(self) -> str:
++        return "ptx_avx512_matmul_{}".format(_DTYPE_NATIVE_SUFFIX[self.dtype])
++
++    def invoke(self, left_address: int, right_address: int, output_address: int) -> None:
++        """Call the single native matmul kernel with raw buffer addresses."""
++
++        self._native(
++            int(left_address),
++            int(right_address),
++            int(output_address),
++            self.m,
++            self.k,
++            self.n,
++        )
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "key": self.key.to_dict(),
++            "digest": self.key.digest,
++            "artifact_digest": self.artifact.content_digest,
++            "native_symbol": self.native_symbol,
++            "native_variant": getattr(self.loaded.target_ir, "native_variant", None),
++            "disk_backed": self.disk_backed,
++        }
++
++
++def _matmul_program(dtype: str, m: int, k: int, n: int) -> CoreProgram:
++    left_type = CoreType.tensor(dtype, (m, k))
++    right_type = CoreType.tensor(dtype, (k, n))
++    output_type = CoreType.tensor(dtype, (m, n))
++    left = ValueRef("left", left_type)
++    right = ValueRef("right", right_type)
++    output = ValueRef("output", output_type)
++    function = CoreFunction(
++        "pypto_x_linear",
++        (left, right),
++        (output,),
++        Region((Operation("matmul", (left, right), (output,)),)),
++    )
++    return CoreProgram(functions=(function,))
++
++
++def _resolve_native(loaded: Any, key: LinearKernelKey, artifact: Artifact) -> Any:
++    plans = tuple(getattr(loaded.target_ir, "plans", ()))
++    if len(plans) != 1:
++        raise PyPTOXBuildError(
++            "PyPTO-X linear artifact must contain exactly one plan, got {}".format(len(plans)),
++            reason_code="kernel_plan_mismatch",
++            details={"plans": len(plans)},
++        )
++    plan = plans[0]
++    matmul = getattr(plan, "matmul", None)
++    if getattr(plan, "operation", None) != "matmul" or matmul is None:
++        raise PyPTOXBuildError(
++            "PyPTO-X linear artifact plan is not a rank-2 matmul",
++            reason_code="kernel_plan_mismatch",
++            details={"operation": getattr(plan, "operation", None)},
++        )
++    if tuple(getattr(matmul, "batch_shape", ())):
++        raise PyPTOXBuildError(
++            "PyPTO-X linear kernel does not support batched matmul plans",
++            reason_code="kernel_plan_mismatch",
++            details={"batch_shape": list(getattr(matmul, "batch_shape", ()))},
++        )
++    actual = (int(matmul.m), int(matmul.k), int(matmul.n))
++    if actual != (key.m, key.k, key.n):
++        raise PyPTOXBuildError(
++            "PyPTO-X linear artifact plan shape {} does not match key {}".format(
++                actual, (key.m, key.k, key.n)
++            ),
++            reason_code="kernel_plan_mismatch",
++            details={"plan": actual, "key": [key.m, key.k, key.n]},
++        )
++    if normalize_dtype(getattr(plan, "dtype", None)) != key.dtype:
++        raise PyPTOXBuildError(
++            "PyPTO-X linear artifact plan dtype {!r} does not match key {!r}".format(
++                getattr(plan, "dtype", None), key.dtype
++            ),
++            reason_code="kernel_plan_mismatch",
++            details={"plan_dtype": str(getattr(plan, "dtype", None)), "key_dtype": key.dtype},
++        )
++    symbol = "ptx_avx512_matmul_{}".format(_DTYPE_NATIVE_SUFFIX[key.dtype])
++    try:
++        native = getattr(loaded.module, symbol)
++    except AttributeError as exc:
++        raise PyPTOXBuildError(
++            "PyPTO-X AVX-512 artifact does not export {!r}".format(symbol),
++            reason_code="kernel_symbol_missing",
++            details={"symbol": symbol, "artifact_digest": artifact.content_digest},
++        ) from exc
++    native.argtypes = [
++        ctypes.c_void_p,
++        ctypes.c_void_p,
++        ctypes.c_void_p,
++        ctypes.c_size_t,
++        ctypes.c_size_t,
++        ctypes.c_size_t,
++    ]
++    native.restype = None
++    return native
++
++
++class LinearKernelCache:
++    """Per-process kernel cache with an optional cross-process disk tier."""
++
++    def __init__(
++        self,
++        cache_dir: Optional[Any] = None,
++        *,
++        runtime: Optional[Avx512Runtime] = None,
++        disk_cache: bool = True,
++        max_entries: int = _DEFAULT_MAX_ENTRIES,
++        build_dir: Optional[Any] = None,
++    ) -> None:
++        if max_entries <= 0:
++            raise ValueError("max_entries must be positive")
++        self._lock = threading.RLock()
++        # Hot-path memory tier keyed by (dtype, M, K, N); the content digest is
++        # only computed when the key is cold (json+sha256 costs ~10 us).
++        self._memory: "OrderedDict[Tuple[str, int, int, int], LinearKernelEntry]" = OrderedDict()
++        self._digests: Dict[Tuple[str, int, int, int], str] = {}
++        self._runtime = runtime
++        self._disk_cache = bool(disk_cache)
++        self._cache_dir = Path(os.fspath(cache_dir)).expanduser() if cache_dir is not None else None
++        self._build_dir = Path(os.fspath(build_dir)).expanduser() if build_dir is not None else None
++        self._max_entries = int(max_entries)
++        self._stats: Dict[str, int] = {
++            "kernel_builds": 0,
++            "memory_hits": 0,
++            "disk_hits": 0,
++            "compile_calls": 0,
++            "load_failures": 0,
++            "unsupported": 0,
++        }
++        self._last_disk_error: Optional[str] = None
++
++    # -- configuration -------------------------------------------------
++    @property
++    def cache_dir(self) -> Optional[Path]:
++        if self._cache_dir is None and self._disk_cache:
++            self._cache_dir = default_cache_dir()
++        return self._cache_dir
++
++    @property
++    def disk_cache(self) -> bool:
++        return self._disk_cache
++
++    @property
++    def stats(self) -> Mapping[str, int]:
++        with self._lock:
++            return dict(self._stats)
++
++    def to_dict(self) -> Mapping[str, Any]:
++        with self._lock:
++            return {
++                "cache_dir": str(self.cache_dir) if self.cache_dir is not None else None,
++                "disk_cache": self._disk_cache,
++                "entries": len(self._memory),
++                "max_entries": self._max_entries,
++                "stats": dict(self._stats),
++                "last_disk_error": self._last_disk_error,
++            }
++
++    # -- availability --------------------------------------------------
++    def runtime(self) -> Avx512Runtime:
++        with self._lock:
++            if self._runtime is None:
++                self._runtime = Avx512Runtime()
++            return self._runtime
++
++    def ensure_available(self, dtype: str) -> Avx512Runtime:
++        dtype = normalize_dtype(dtype)
++        runtime = self.runtime()
++        if not runtime.is_available():
++            with self._lock:
++                self._stats["unsupported"] += 1
++            status = runtime.availability()
++            raise PyPTOXUnsupportedError(
++                "PyPTO-X AVX-512 runtime is unavailable: {}".format(status.reason or status.reason_code),
++                reason_code="avx512_unavailable",
++                details=dict(status.to_dict()),
++            )
++        capability = runtime.capability
++        if dtype == "bf16" and not getattr(capability, "avx512bf16", False):
++            with self._lock:
++                self._stats["unsupported"] += 1
++            raise PyPTOXUnsupportedError(
++                "host does not report AVX-512 BF16 (required for the bf16 kernel)",
++                reason_code="avx512bf16_unavailable",
++                details=dict(capability.to_dict()),
++            )
++        if not getattr(capability, "fma", False):
++            with self._lock:
++                self._stats["unsupported"] += 1
++            raise PyPTOXUnsupportedError(
++                "host does not report FMA (required by the AVX-512 kernel variant)",
++                reason_code="fma_unavailable",
++                details=dict(capability.to_dict()),
++            )
++        return runtime
++
++    # -- kernel lookup -------------------------------------------------
++    def key(self, dtype: str, m: int, k: int, n: int) -> LinearKernelKey:
++        dtype = normalize_dtype(dtype)
++        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in (m, k, n)):
++            raise PyPTOXUnsupportedError(
++                "PyPTO-X linear requires positive M/K/N, got ({}, {}, {})".format(m, k, n),
++                reason_code="shape_unsupported",
++                details={"m": m, "k": k, "n": n},
++            )
++        target = linear_target(dtype)
++        return LinearKernelKey(dtype=dtype, m=int(m), k=int(k), n=int(n), target=target.to_dict())
++
++    def _fast_key(self, dtype: str, m: int, k: int, n: int) -> Tuple[str, int, int, int]:
++        dtype = normalize_dtype(dtype)
++        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in (m, k, n)):
++            raise PyPTOXUnsupportedError(
++                "PyPTO-X linear requires positive M/K/N, got ({}, {}, {})".format(m, k, n),
++                reason_code="shape_unsupported",
++                details={"m": m, "k": k, "n": n},
++            )
++        return dtype, int(m), int(k), int(n)
++
++    def get(self, dtype: str, m: int, k: int, n: int) -> LinearKernelEntry:
++        """Return a compiled kernel for ``(dtype, M, K, N)``, building at most once."""
++
++        fast = self._fast_key(dtype, m, k, n)
++        with self._lock:
++            memory = self._memory.get(fast)
++            if memory is not None:
++                self._memory.move_to_end(fast)
++                self._stats["memory_hits"] += 1
++                return memory
++        # Cold path: build the full content-addressed key/digest without the
++        # lock, then re-check under the lock so concurrent callers still build
++        # each kernel at most once per process.
++        key = self.key(*fast)
++        digest = key.digest
++        with self._lock:
++            memory = self._memory.get(fast)
++            if memory is not None:
++                self._memory.move_to_end(fast)
++                self._stats["memory_hits"] += 1
++                return memory
++            runtime = self.ensure_available(key.dtype)
++            entry = self._load_disk(runtime, key, digest)
++            if entry is None:
++                entry = self._compile(runtime, key, digest)
++            self._memory[fast] = entry
++            self._digests[fast] = digest
++            self._memory.move_to_end(fast)
++            while len(self._memory) > self._max_entries:
++                evicted, _ = self._memory.popitem(last=False)
++                self._digests.pop(evicted, None)
++            return entry
++
++    # -- disk tier -----------------------------------------------------
++    def _sidecar(self, digest: str) -> Path:
++        return self.cache_dir / "{}{}.json".format(_SIDECAR_PREFIX, digest[:32])
++
++    def _load_disk(self, runtime: Avx512Runtime, key: LinearKernelKey, digest: str) -> Optional[LinearKernelEntry]:
++        if not self._disk_cache or self.cache_dir is None:
++            return None
++        sidecar = self._sidecar(digest)
++        if not sidecar.is_file():
++            return None
++        try:
++            payload = json.loads(sidecar.read_text(encoding="utf-8"))
++            if payload.get("key") != key.to_dict():
++                raise ValueError("sidecar cache key does not match the requested key")
++            data = payload["artifact"]
++            target = TargetSpec(**dict(data["target"]))
++            artifact = Artifact(
++                format=data["format"],
++                entrypoint=data["entrypoint"],
++                target=target,
++                abi_version=data["abi_version"],
++                path=data["path"],
++                metadata=data["metadata"],
++                format_version=data["format_version"],
++            )
++            loaded = runtime.load(artifact)
++            native = _resolve_native(loaded, key, artifact)
++        except Exception as exc:  # sidecar/artifact is untrusted input: repair by rebuilding
++            self._stats["load_failures"] += 1
++            self._last_disk_error = "{}: {}".format(type(exc).__name__, exc)
++            return None
++        self._stats["disk_hits"] += 1
++        return LinearKernelEntry(key, artifact, loaded, native, disk_backed=True)
++
++    def _write_sidecar(self, key: LinearKernelKey, artifact: Artifact, digest: str) -> None:
++        if not self._disk_cache or self.cache_dir is None:
++            return
++        try:
++            self.cache_dir.mkdir(parents=True, exist_ok=True)
++            sidecar = self._sidecar(digest)
++            temporary = None
++            try:
++                descriptor, temporary = tempfile.mkstemp(
++                    prefix=sidecar.name + ".tmp.", dir=str(self.cache_dir)
++                )
++                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
++                    json.dump({"key": key.to_dict(), "artifact": artifact.to_dict()}, handle, sort_keys=True)
++                    handle.flush()
++                    os.fsync(handle.fileno())
++                os.replace(temporary, sidecar)
++                temporary = None
++            finally:
++                if temporary is not None:
++                    try:
++                        os.unlink(temporary)
++                    except OSError:
++                        pass
++        except Exception as exc:
++            # A read-only cache directory must not break execution.
++            self._last_disk_error = "{}: {}".format(type(exc).__name__, exc)
++
++    # -- build ---------------------------------------------------------
++    def _compile(self, runtime: Avx512Runtime, key: LinearKernelKey, digest: str) -> LinearKernelEntry:
++        self._stats["kernel_builds"] += 1
++        program = _matmul_program(key.dtype, key.m, key.k, key.n)
++        target = TargetSpec(**dict(key.target))
++        compiler = Avx512Compiler()
++        target_ir = compiler.lower(program, target)
++        build_dir = self._build_dir
++        if build_dir is None and self.cache_dir is not None:
++            build_dir = self.cache_dir / "build"
++        if build_dir is None:
++            build_dir = Path(tempfile.mkdtemp(prefix="pypto-x-torch-linear-"))
++        options = CompileOptions(
++            artifact_format=DEFAULT_ARTIFACT_FORMAT,
++            extra={"build_dir": str(build_dir)},
++        )
++        self._stats["compile_calls"] += 1
++        artifact = compiler.compile(target_ir, options)
++        loaded = runtime.load(artifact)
++        native = _resolve_native(loaded, key, artifact)
++        self._write_sidecar(key, artifact, digest)
++        return LinearKernelEntry(key, artifact, loaded, native, disk_backed=False)
++
++    # -- maintenance ---------------------------------------------------
++    def clear(self) -> None:
++        with self._lock:
++            self._memory.clear()
++            self._digests.clear()
++
++
++def default_cache_dir() -> Path:
++    """Return the cross-process cache directory (env override first)."""
++
++    override = os.environ.get("PYPTO_X_TORCH_CACHE_DIR")
++    if override:
++        return Path(override).expanduser()
++    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
++    return Path(base).expanduser() / "pypto_x" / "torch_linear"
++
++
++_DEFAULT_CACHE: Optional[LinearKernelCache] = None
++_DEFAULT_LOCK = threading.Lock()
++
++
++def linear_kernel_cache() -> LinearKernelCache:
++    """Return the process-global kernel cache, creating it lazily."""
++
++    global _DEFAULT_CACHE
++    with _DEFAULT_LOCK:
++        if _DEFAULT_CACHE is None:
++            _DEFAULT_CACHE = LinearKernelCache()
++        return _DEFAULT_CACHE
++
++
++def reset_linear_kernel_cache(cache: Optional[LinearKernelCache] = None) -> None:
++    """Test hook: replace the process-global cache (memory tier is dropped)."""
++
++    global _DEFAULT_CACHE
++    with _DEFAULT_LOCK:
++        _DEFAULT_CACHE = cache
++
++
++__all__ = [
++    "LINEAR_KERNEL_CACHE_VERSION",
++    "LinearKernelCache",
++    "LinearKernelEntry",
++    "LinearKernelKey",
++    "default_cache_dir",
++    "linear_kernel_cache",
++    "linear_target",
++    "normalize_dtype",
++    "reset_linear_kernel_cache",
++]
+diff --git a/python/pypto/framework/torch_bridge.py b/python/pypto/framework/torch_bridge.py
+new file mode 100644
+index 000000000..43d9a1696
+--- /dev/null
++++ b/python/pypto/framework/torch_bridge.py
+@@ -0,0 +1,389 @@
++"""Torch tensor <-> PyPTO-X CPU runtime buffer bridge.
++
++Copy and ownership rules (J1 acceptance requires these to be explicit):
++
++* A C-contiguous CPU tensor of the expected dtype is exposed to the runtime
++  through a numpy view of the *same* storage: 0 copies.  ``tensor.numpy()``
++  (FP32) and ``tensor.view(torch.uint16).numpy()`` (BF16 bits) share memory,
++  and the numpy array keeps the torch tensor alive through its base object, so
++  the runtime may only read the buffer while the descriptor/view is alive.
++* A non-contiguous tensor is materialised once with ``tensor.contiguous()``:
++  exactly 1 copy (``BufferView.copies == 1``); the copy is owned by the bridge
++  and released when the view is released.
++* Outputs are freshly allocated by ``allocate_output``: 1 allocation, 0 input
++  copies.  The returned torch tensor owns the memory.
++* ``packed_tensor_to_view`` parses a packed handle produced by
++  ``pack_weight``; the payload is a zero-copy numpy view of the handle's bytes
++  (the handle tensor must stay alive while the view is used).
++* No implicit dtype casts and no implicit device transfers happen here.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Optional, Tuple
++
++import numpy as np
++import torch
++
++from pypto.abi import TensorDesc
++
++from .errors import PyPTOXBridgeError, PyPTOXUnsupportedError
++from .weight_pack import HEADER_SIZE, PACK_MAGIC, PackedWeight, parse_packed_bytes
++
++
++TORCH_DTYPES = {torch.float32: "float32", torch.bfloat16: "bf16"}
++_DTYPE_TORCH = {value: key for key, value in TORCH_DTYPES.items()}
++
++
++@dataclass
++class BufferPointer:
++    """A validated raw pointer into torch CPU storage.
++
++    The hot path only needs the address; ``tensor`` keeps the storage (or the
++    bridge-owned contiguous copy) alive for the duration of the native call.
++    ``copies`` follows the same accounting as :class:`BufferView`.
++    """
++
++    tensor: torch.Tensor
++    address: int
++    dtype: str
++    shape: Tuple[int, ...]
++    copies: int
++    owns_buffer: bool
++    writable: bool
++
++
++@dataclass
++class BufferView:
++    """A validated tensor view handed to the PyPTO-X runtime.
++
++    ``tensor`` keeps the storage alive, ``array`` is the 0-copy numpy view used
++    as the runtime descriptor handle, and ``copies`` documents how many element
++    copies the bridge had to make (0 for a contiguous input).
++    """
++
++    tensor: torch.Tensor
++    array: np.ndarray
++    dtype: str
++    shape: Tuple[int, ...]
++    copies: int
++    owns_buffer: bool
++    writable: bool
++
++    @property
++    def address(self) -> int:
++        return int(self.array.ctypes.data)
++
++    @property
++    def nbytes(self) -> int:
++        return int(self.array.nbytes)
++
++    @property
++    def itemsize(self) -> int:
++        return int(self.array.dtype.itemsize)
++
++    def descriptor(self) -> TensorDesc:
++        return TensorDesc(
++            self.dtype,
++            self.shape,
++            device="cpu",
++            handle=self.array,
++            readonly=not self.writable,
++        )
++
++
++def dtype_name(tensor: torch.Tensor, *, name: str = "tensor") -> str:
++    """Return the bridge dtype for a torch tensor or raise ``Unsupported``."""
++
++    if not torch.is_tensor(tensor):
++        raise PyPTOXUnsupportedError(
++            "{} must be a torch.Tensor, got {}".format(name, type(tensor).__name__),
++            reason_code="not_a_tensor",
++            details={"name": name, "type": type(tensor).__name__},
++        )
++    try:
++        return TORCH_DTYPES[tensor.dtype]
++    except KeyError as exc:
++        raise PyPTOXUnsupportedError(
++            "{} has unsupported dtype {}".format(name, tensor.dtype),
++            reason_code="dtype_unsupported",
++            details={"name": name, "dtype": str(tensor.dtype)},
++        ) from exc
++
++
++def _check_device(tensor: torch.Tensor, name: str) -> None:
++    if tensor.device.type != "cpu":
++        raise PyPTOXUnsupportedError(
++            "{} must be a CPU tensor, got device {!r}".format(name, str(tensor.device)),
++            reason_code="device_unsupported",
++            details={"name": name, "device": str(tensor.device)},
++        )
++
++
++def _validated_tensor(
++    tensor: torch.Tensor,
++    *,
++    dtype: Optional[str],
++    shape: Optional[Tuple[int, ...]],
++    name: str,
++    allow_copy: bool,
++    writable: bool,
++) -> Tuple[torch.Tensor, str, int]:
++    """Shared bridge validation; returns (source, dtype, copies)."""
++
++    _check_device(tensor, name)
++    actual_dtype = dtype_name(tensor, name=name)
++    if dtype is not None and actual_dtype != dtype:
++        raise PyPTOXUnsupportedError(
++            "{} dtype {} does not match expected {}".format(name, tensor.dtype, dtype),
++            reason_code="dtype_mismatch",
++            details={"name": name, "dtype": str(tensor.dtype), "expected": dtype},
++        )
++    if shape is not None and tuple(tensor.shape) != tuple(shape):
++        raise PyPTOXUnsupportedError(
++            "{} shape {} does not match expected {}".format(name, tuple(tensor.shape), tuple(shape)),
++            reason_code="shape_mismatch",
++            details={"name": name, "shape": list(tensor.shape), "expected": list(shape)},
++        )
++    if tensor.requires_grad:
++        raise PyPTOXUnsupportedError(
++            "{} requires grad; the single-kernel bridge does not define backward".format(name),
++            reason_code="requires_grad",
++            details={"name": name},
++        )
++    copies = 0
++    source = tensor
++    if not source.is_contiguous():
++        if not allow_copy:
++            raise PyPTOXUnsupportedError(
++                "{} is not C-contiguous".format(name),
++                reason_code="non_contiguous",
++                details={"name": name, "strides": list(source.stride())},
++            )
++        source = source.contiguous()
++        copies = 1
++    if writable and not source.is_contiguous():
++        raise PyPTOXBridgeError(
++            "{} is not writable".format(name), reason_code="buffer_not_writable"
++        )
++    return source, actual_dtype, copies
++
++
++def tensor_to_pointer(
++    tensor: torch.Tensor,
++    *,
++    dtype: Optional[str] = None,
++    shape: Optional[Tuple[int, ...]] = None,
++    name: str = "tensor",
++    allow_copy: bool = True,
++    writable: bool = False,
++) -> BufferPointer:
++    """Validate a CPU tensor and return its address without a numpy view.
++
++    This is the hot-path conversion: 0 copies for a contiguous tensor and one
++    ``contiguous()`` copy otherwise.  ``tensor_to_view`` remains the general
++    descriptor-producing bridge.
++    """
++
++    source, actual_dtype, copies = _validated_tensor(
++        tensor,
++        dtype=dtype,
++        shape=shape,
++        name=name,
++        allow_copy=allow_copy,
++        writable=writable,
++    )
++    return BufferPointer(
++        tensor=source,
++        address=int(source.data_ptr()),
++        dtype=actual_dtype if dtype is None else dtype,
++        shape=tuple(source.shape),
++        copies=copies,
++        owns_buffer=copies > 0,
++        writable=bool(writable),
++    )
++
++
++def tensor_to_view(
++    tensor: torch.Tensor,
++    *,
++    dtype: Optional[str] = None,
++    shape: Optional[Tuple[int, ...]] = None,
++    name: str = "tensor",
++    allow_copy: bool = True,
++    writable: bool = False,
++) -> BufferView:
++    """Expose a torch CPU tensor as a runtime buffer with explicit copies."""
++
++    source, actual_dtype, copies = _validated_tensor(
++        tensor,
++        dtype=dtype,
++        shape=shape,
++        name=name,
++        allow_copy=allow_copy,
++        writable=writable,
++    )
++    detached = source.detach()
++    if dtype is None:
++        dtype = actual_dtype
++    try:
++        if dtype == "bf16":
++            array = detached.view(torch.uint16).numpy()
++        else:
++            array = detached.numpy()
++    except (RuntimeError, TypeError, ValueError) as exc:
++        raise PyPTOXUnsupportedError(
++            "{} cannot expose a numpy view: {}".format(name, exc),
++            reason_code="buffer_export_failed",
++            details={"name": name, "dtype": str(tensor.dtype)},
++        ) from exc
++    if not array.flags["C_CONTIGUOUS"]:
++        raise PyPTOXBridgeError(
++            "{} numpy view is not C-contiguous after materialisation".format(name),
++            reason_code="buffer_not_contiguous",
++        )
++    if writable and not array.flags["WRITEABLE"]:
++        raise PyPTOXBridgeError(
++            "{} is not writable but the runtime output requires a writable buffer".format(name),
++            reason_code="buffer_not_writable",
++        )
++    return BufferView(
++        tensor=tensor,
++        array=array,
++        dtype=dtype,
++        shape=tuple(source.shape),
++        copies=copies,
++        owns_buffer=copies > 0,
++        writable=bool(writable),
++    )
++
++
++def allocate_output_address(dtype: str, shape: Tuple[int, ...]) -> Tuple[torch.Tensor, BufferPointer]:
++    """Allocate a fresh output tensor and return it with its raw address."""
++
++    try:
++        torch_dtype = _DTYPE_TORCH[dtype]
++    except KeyError as exc:
++        raise PyPTOXUnsupportedError(
++            "unsupported output dtype {!r}".format(dtype),
++            reason_code="dtype_unsupported",
++            details={"dtype": str(dtype)},
++        ) from exc
++    tensor = torch.empty(tuple(shape), dtype=torch_dtype)
++    return tensor, BufferPointer(
++        tensor=tensor,
++        address=int(tensor.data_ptr()),
++        dtype=dtype,
++        shape=tuple(shape),
++        copies=0,
++        owns_buffer=True,
++        writable=True,
++    )
++
++
++def allocate_output(dtype: str, shape: Tuple[int, ...]) -> Tuple[torch.Tensor, BufferView]:
++    """Allocate a fresh output tensor and return it with its runtime view."""
++
++    tensor, pointer = allocate_output_address(dtype, shape)
++    if dtype == "bf16":
++        array = tensor.view(torch.uint16).numpy()
++    else:
++        array = tensor.numpy()
++    return tensor, BufferView(
++        tensor=tensor,
++        array=array,
++        dtype=dtype,
++        shape=tuple(shape),
++        copies=0,
++        owns_buffer=True,
++        writable=True,
++    )
++
++
++def is_packed_like(tensor: Any) -> bool:
++    """Return whether ``tensor`` has the opaque packed-handle shape (1-D uint8).
++
++    Any such tensor is routed to the packed path and fails closed when its
++    header is invalid; it can never be a meaningful ``F.linear`` weight.
++    """
++
++    return bool(
++        torch.is_tensor(tensor) and tensor.dtype == torch.uint8 and tensor.dim() == 1
++    )
++
++
++def is_packed_handle(tensor: torch.Tensor) -> bool:
++    """Return whether ``tensor`` is a *valid* packed-weight handle produced by us."""
++
++    if not is_packed_like(tensor):
++        return False
++    if tensor.device.type != "cpu" or tensor.numel() < HEADER_SIZE:
++        return False
++    try:
++        head = tensor[:4].numpy().tobytes()
++    except (RuntimeError, TypeError, ValueError):
++        return False
++    return head == PACK_MAGIC
++
++
++def packed_tensor_to_view(tensor: torch.Tensor) -> PackedWeight:
++    """Parse a packed handle tensor into a zero-copy :class:`PackedWeight`."""
++
++    _check_device(tensor, "packed weight")
++    if tensor.dtype != torch.uint8 or tensor.dim() != 1:
++        raise PyPTOXUnsupportedError(
++            "packed weight must be a 1-D uint8 tensor, got {} / rank {}".format(
++                tensor.dtype, tensor.dim()
++            ),
++            reason_code="packed_handle_invalid",
++        )
++    if not tensor.is_contiguous():
++        raise PyPTOXUnsupportedError(
++            "packed weight handle must be C-contiguous",
++            reason_code="packed_handle_invalid",
++        )
++    array = tensor.detach().numpy()
++    try:
++        return parse_packed_bytes(array)
++    except ValueError as exc:
++        raise PyPTOXUnsupportedError(
++            "invalid packed weight handle: {}".format(exc),
++            reason_code="packed_handle_invalid",
++            details={"reason": str(exc), "bytes": int(array.nbytes)},
++        ) from exc
++
++
++def bytes_to_tensor(payload: bytes) -> torch.Tensor:
++    """Wrap ``header + payload`` bytes into a 1-D uint8 torch tensor (1 copy)."""
++
++    if not isinstance(payload, (bytes, bytearray, memoryview)):
++        raise TypeError("payload must be bytes-like")
++    buffer = bytearray(payload)
++    return torch.frombuffer(buffer, dtype=torch.uint8)
++
++
++def pack_view_to_tensor(view: BufferView, k: int, n: int) -> torch.Tensor:
++    """Pack a ``(N, K)`` weight view and return a uint8 handle tensor."""
++
++    from .weight_pack import pack_view
++
++    packed = pack_view(view.array, k=k, n=n, dtype=view.dtype)
++    return bytes_to_tensor(packed.to_bytes())
++
++
++__all__ = [
++    "BufferPointer",
++    "BufferView",
++    "TORCH_DTYPES",
++    "allocate_output",
++    "allocate_output_address",
++    "bytes_to_tensor",
++    "dtype_name",
++    "is_packed_handle",
++    "is_packed_like",
++    "pack_view_to_tensor",
++    "packed_tensor_to_view",
++    "tensor_to_pointer",
++    "tensor_to_view",
++]
+diff --git a/python/pypto/framework/torch_ops.py b/python/pypto/framework/torch_ops.py
+new file mode 100644
+index 000000000..93c716a39
+--- /dev/null
++++ b/python/pypto/framework/torch_ops.py
+@@ -0,0 +1,488 @@
++"""``torch.ops.pypto_x`` single-kernel linear bridge (CPU).
++
++Public ops (registered on import, idempotent):
++
++* ``torch.ops.pypto_x.linear(x, weight, bias=None)`` - fail-open: on any
++  unsupported input or unavailable kernel it records a fallback event and
++  returns ``torch.nn.functional.linear`` semantics.  A ``RuntimeWarning`` is
++  emitted once per reason unless ``PYPTO_X_TORCH_FALLBACK_WARNINGS=0``.
++* ``torch.ops.pypto_x.linear_strict(x, weight, bias=None)`` - fail-closed:
++  raises ``PyPTOXUnsupportedError`` / ``PyPTOXBuildError`` unchanged.
++* ``torch.ops.pypto_x.pack_weight(weight)`` - fail-closed one-time BF16/FP32
++  weight pre-pack into a self-describing 1-D uint8 handle.
++* ``torch.ops.pypto_x.linear_prepacked(x, packed, bias=None)`` - fail-closed
++  kernel call with a handle produced by ``pack_weight``.
++
++``linear`` covers exactly rank-2 CPU tensors of dtype BF16/FP32 with matching
++activation/weight/bias dtype; anything else (rank != 2, float64, int32,
++requires_grad, M/K/N <= 0, packed handles on the wrong path) is explicit.
++Fake implementations are registered for ``linear``/``linear_strict``/
++``pack_weight`` so ``meta`` shape inference and ``torch.compile`` tracing see
++correct metadata; packed handles cannot be traced because the K/N values live
++in the handle bytes rather than in tensor metadata.
++"""
++
++from __future__ import annotations
++
++import os
++import threading
++from typing import Any, Dict, Mapping, Optional, Tuple
++import warnings
++import weakref
++
++import torch
++
++from .errors import PyPTOXBridgeError, PyPTOXUnsupportedError
++from .linear_kernel import linear_kernel_cache
++from .torch_bridge import (
++    TORCH_DTYPES,
++    allocate_output_address,
++    dtype_name,
++    is_packed_like,
++    pack_view_to_tensor,
++    packed_tensor_to_view,
++    tensor_to_pointer,
++    tensor_to_view,
++)
++from .weight_pack import PackedWeight, pack_view, packed_size_bytes
++
++
++# --------------------------------------------------------------------------- #
++# fallback observability
++# --------------------------------------------------------------------------- #
++_FALLBACK_LOCK = threading.Lock()
++_FALLBACK_STATS: Dict[str, int] = {}
++_FALLBACK_WARNED = set()
++
++
++def _warnings_enabled() -> bool:
++    value = os.environ.get("PYPTO_X_TORCH_FALLBACK_WARNINGS", "1").strip().lower()
++    return value not in ("0", "false", "no", "off")
++
++
++def _record_fallback(operation: str, error: Exception) -> None:
++    reason = getattr(error, "reason_code", "unknown")
++    key = "{}:{}".format(operation, reason)
++    with _FALLBACK_LOCK:
++        _FALLBACK_STATS[key] = _FALLBACK_STATS.get(key, 0) + 1
++        first = key not in _FALLBACK_WARNED
++        if first:
++            _FALLBACK_WARNED.add(key)
++    if first and _warnings_enabled():
++        warnings.warn(
++            "pypto_x.{} fell back to the torch reference ({}): {}".format(
++                operation, reason, error
++            ),
++            RuntimeWarning,
++            stacklevel=3,
++        )
++
++
++def fallback_stats() -> Mapping[str, Any]:
++    """Return a snapshot of fail-open fallback events keyed by op:reason."""
++
++    with _FALLBACK_LOCK:
++        events = dict(_FALLBACK_STATS)
++    return {"events": events, "total": sum(events.values())}
++
++
++def reset_fallback_stats() -> None:
++    with _FALLBACK_LOCK:
++        _FALLBACK_STATS.clear()
++        _FALLBACK_WARNED.clear()
++
++
++# --------------------------------------------------------------------------- #
++# weight pack cache (identity + torch version counter)
++# --------------------------------------------------------------------------- #
++def _tensor_version(tensor: torch.Tensor) -> Optional[int]:
++    return getattr(tensor, "_version", None)
++
++
++class _WeightPackEntry:
++    __slots__ = ("ref", "version", "shape", "dtype", "packed")
++
++    def __init__(self, ref, version, shape, dtype, packed):
++        self.ref = ref
++        self.version = version
++        self.shape = shape
++        self.dtype = dtype
++        self.packed = packed
++
++
++class _WeightPackCache:
++    def __init__(self) -> None:
++        self._lock = threading.RLock()
++        self._entries: Dict[int, _WeightPackEntry] = {}
++        self._stats = {"pack_builds": 0, "pack_hits": 0}
++
++    def _drop(self, ident: int, ref) -> None:
++        with self._lock:
++            entry = self._entries.get(ident)
++            if entry is not None and entry.ref is ref:
++                self._entries.pop(ident, None)
++
++    def stats(self) -> Mapping[str, int]:
++        with self._lock:
++            return dict(self._stats)
++
++    def lookup(self, weight: torch.Tensor, dtype: str, k: int, n: int) -> Optional[PackedWeight]:
++        """Return the packed weight for this exact tensor revision, if cached."""
++
++        ident = id(weight)
++        version = _tensor_version(weight)
++        with self._lock:
++            entry = self._entries.get(ident)
++            if (
++                entry is not None
++                and entry.ref() is weight
++                and entry.version == version
++                and entry.shape == (n, k)
++                and entry.dtype == dtype
++            ):
++                self._stats["pack_hits"] += 1
++                return entry.packed
++        return None
++
++    def store(
++        self, weight: torch.Tensor, dtype: str, k: int, n: int, packed: PackedWeight
++    ) -> PackedWeight:
++        """Cache a freshly packed weight keyed by identity + torch version."""
++
++        ident = id(weight)
++        ref = weakref.ref(weight, lambda dead, ident=ident: self._drop(ident, dead))
++        with self._lock:
++            self._entries[ident] = _WeightPackEntry(
++                ref, _tensor_version(weight), (n, k), dtype, packed
++            )
++            self._stats["pack_builds"] += 1
++        return packed
++
++
++_WEIGHT_CACHE = _WeightPackCache()
++
++
++# --------------------------------------------------------------------------- #
++# contract checks and execution
++# --------------------------------------------------------------------------- #
++def _require_tensor(tensor: Any, name: str) -> torch.Tensor:
++    if not torch.is_tensor(tensor):
++        raise PyPTOXUnsupportedError(
++            "{} must be a torch.Tensor, got {}".format(name, type(tensor).__name__),
++            reason_code="not_a_tensor",
++            details={"name": name},
++        )
++    return tensor
++
++
++def _require_rank(tensor: torch.Tensor, rank: int, name: str) -> None:
++    if tensor.dim() != rank:
++        raise PyPTOXUnsupportedError(
++            "{} must be rank {}, got rank {}".format(name, rank, tensor.dim()),
++            reason_code="rank_unsupported",
++            details={"name": name, "rank": tensor.dim(), "expected_rank": rank},
++        )
++
++
++def _require_device(tensor: torch.Tensor, name: str) -> None:
++    if tensor.device.type != "cpu":
++        raise PyPTOXUnsupportedError(
++            "{} must be a CPU tensor, got {!r}".format(name, str(tensor.device)),
++            reason_code="device_unsupported",
++            details={"name": name, "device": str(tensor.device)},
++        )
++
++
++def _check_bias(bias: Optional[torch.Tensor], n: int, dtype: str) -> None:
++    if bias is None:
++        return
++    _require_tensor(bias, "bias")
++    _require_device(bias, "bias")
++    _require_rank(bias, 1, "bias")
++    if bias.requires_grad:
++        raise PyPTOXUnsupportedError(
++            "bias requires grad; the single-kernel bridge does not define backward",
++            reason_code="requires_grad",
++            details={"name": "bias"},
++        )
++    bias_dtype = dtype_name(bias, name="bias")
++    if bias_dtype != dtype:
++        raise PyPTOXUnsupportedError(
++            "bias dtype {} does not match activation/weight dtype {}".format(bias.dtype, dtype),
++            reason_code="bias_dtype_mismatch",
++            details={"bias_dtype": str(bias.dtype), "dtype": dtype},
++        )
++    if int(bias.shape[0]) != n:
++        raise PyPTOXUnsupportedError(
++            "bias shape {} does not match output features {}".format(tuple(bias.shape), n),
++            reason_code="bias_shape_mismatch",
++            details={"bias_shape": list(bias.shape), "n": n},
++        )
++
++
++def _weight_contract(x: torch.Tensor, weight: torch.Tensor) -> Tuple[int, int, int, str]:
++    _require_tensor(x, "x")
++    _require_tensor(weight, "weight")
++    _require_device(x, "x")
++    _require_device(weight, "weight")
++    _require_rank(x, 2, "x")
++    _require_rank(weight, 2, "weight")
++    dtype = dtype_name(x, name="x")
++    weight_dtype = dtype_name(weight, name="weight")
++    if weight_dtype != dtype:
++        raise PyPTOXUnsupportedError(
++            "weight dtype {} does not match activation dtype {}".format(weight.dtype, x.dtype),
++            reason_code="dtype_mismatch",
++            details={"x_dtype": str(x.dtype), "weight_dtype": str(weight.dtype)},
++        )
++    m, k = int(x.shape[0]), int(x.shape[1])
++    n, weight_k = int(weight.shape[0]), int(weight.shape[1])
++    if k != weight_k:
++        raise PyPTOXUnsupportedError(
++            "activation K {} does not match weight K {}".format(k, weight_k),
++            reason_code="shape_mismatch",
++            details={"x_shape": list(x.shape), "weight_shape": list(weight.shape)},
++        )
++    if m <= 0 or k <= 0 or n <= 0:
++        raise PyPTOXUnsupportedError(
++            "PyPTO-X linear requires positive M/K/N, got ({}, {}, {})".format(m, k, n),
++            reason_code="shape_unsupported",
++            details={"m": m, "k": k, "n": n},
++        )
++    return m, k, n, dtype
++
++
++def _run_kernel(
++    x: torch.Tensor,
++    m: int,
++    k: int,
++    n: int,
++    dtype: str,
++    right_address: int,
++    bias: Optional[torch.Tensor],
++) -> torch.Tensor:
++    # Fast path: validate and take the activation address without a numpy view;
++    # the entry lookup is a dict hit keyed by (dtype, M, K, N).
++    left = tensor_to_pointer(x, dtype=dtype, shape=(m, k), name="x")
++    output, output_pointer = allocate_output_address(dtype, (m, n))
++    entry = linear_kernel_cache().get(dtype, m, k, n)
++    entry.invoke(left.address, int(right_address), output_pointer.address)
++    if bias is not None:
++        output.add_(bias)
++    return output
++
++
++def _linear_from_weight_impl(
++    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
++) -> torch.Tensor:
++    m, k, n, dtype = _weight_contract(x, weight)
++    _check_bias(bias, n, dtype)
++    packed = _WEIGHT_CACHE.lookup(weight, dtype, k, n)
++    if packed is None:
++        weight_view = tensor_to_view(weight, dtype=dtype, shape=(n, k), name="weight")
++        packed = _WEIGHT_CACHE.store(
++            weight, dtype, k, n, pack_view(weight_view.array, k=k, n=n, dtype=dtype)
++        )
++    return _run_kernel(x, m, k, n, dtype, packed.address, bias)
++
++
++def _packed_contract(x: torch.Tensor, packed: PackedWeight) -> Tuple[int, int, int, str]:
++    _require_tensor(x, "x")
++    _require_device(x, "x")
++    _require_rank(x, 2, "x")
++    dtype = dtype_name(x, name="x")
++    if packed.dtype != dtype:
++        raise PyPTOXUnsupportedError(
++            "packed weight dtype {} does not match activation dtype {}".format(packed.dtype, x.dtype),
++            reason_code="dtype_mismatch",
++            details={"packed_dtype": packed.dtype, "x_dtype": str(x.dtype)},
++        )
++    m, k = int(x.shape[0]), int(x.shape[1])
++    if k != packed.k:
++        raise PyPTOXUnsupportedError(
++            "activation K {} does not match packed K {}".format(k, packed.k),
++            reason_code="shape_mismatch",
++            details={"x_shape": list(x.shape), "packed_k": packed.k},
++        )
++    if m <= 0 or packed.n <= 0 or packed.k <= 0:
++        raise PyPTOXUnsupportedError(
++            "PyPTO-X linear requires positive M/K/N",
++            reason_code="shape_unsupported",
++            details={"m": m, "k": packed.k, "n": packed.n},
++        )
++    return m, packed.k, packed.n, dtype
++
++
++def _linear_from_packed_impl(
++    x: torch.Tensor, packed: PackedWeight, bias: Optional[torch.Tensor]
++) -> torch.Tensor:
++    m, k, n, dtype = _packed_contract(x, packed)
++    _check_bias(bias, n, dtype)
++    return _run_kernel(x, m, k, n, dtype, packed.address, bias)
++
++
++def _linear_entry(
++    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
++) -> torch.Tensor:
++    if is_packed_like(weight):
++        return _linear_from_packed_impl(x, packed_tensor_to_view(weight), bias)
++    return _linear_from_weight_impl(x, weight, bias)
++
++
++def _linear_impl(
++    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
++) -> torch.Tensor:
++    """Fail-open single-kernel linear (see module docstring)."""
++
++    try:
++        return _linear_entry(x, weight, bias)
++    except PyPTOXBridgeError as exc:
++        if is_packed_like(weight):
++            # An opaque packed handle has no meaningful torch fallback: fail
++            # closed instead of surfacing an unrelated F.linear error.
++            raise
++        _record_fallback("linear", exc)
++        return torch.nn.functional.linear(x, weight, bias)
++
++
++def _linear_strict_impl(
++    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
++) -> torch.Tensor:
++    """Fail-closed single-kernel linear (see module docstring)."""
++
++    return _linear_entry(x, weight, bias)
++
++
++def _pack_weight_impl(weight: torch.Tensor) -> torch.Tensor:
++    _require_tensor(weight, "weight")
++    _require_device(weight, "weight")
++    _require_rank(weight, 2, "weight")
++    dtype = dtype_name(weight, name="weight")
++    n, k = int(weight.shape[0]), int(weight.shape[1])
++    if n <= 0 or k <= 0:
++        raise PyPTOXUnsupportedError(
++            "pack_weight requires positive N/K",
++            reason_code="shape_unsupported",
++            details={"n": n, "k": k},
++        )
++    if weight.requires_grad:
++        raise PyPTOXUnsupportedError(
++            "pack_weight does not support tensors that require grad",
++            reason_code="requires_grad",
++        )
++    view = tensor_to_view(weight, dtype=dtype, shape=(n, k), name="weight")
++    return pack_view_to_tensor(view, k=k, n=n)
++
++
++def _linear_prepacked_impl(
++    x: torch.Tensor, packed: torch.Tensor, bias: Optional[torch.Tensor] = None
++) -> torch.Tensor:
++    """Fail-closed linear against a handle produced by ``pack_weight``."""
++
++    return _linear_from_packed_impl(x, packed_tensor_to_view(packed), bias)
++
++
++# --------------------------------------------------------------------------- #
++# fake/meta implementations
++# --------------------------------------------------------------------------- #
++def _fake_binary_shape(x: torch.Tensor, weight: torch.Tensor) -> Tuple[int, int]:
++    if x.dim() != 2 or weight.dim() != 2:
++        raise RuntimeError("pypto_x linear fake requires rank-2 x and weight")
++    if weight.dtype == torch.uint8:
++        raise NotImplementedError(
++            "pypto_x packed weight handles are not traceable; use a plain weight tensor"
++        )
++    return int(x.shape[0]), int(weight.shape[0])
++
++
++def _linear_fake(
++    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] = None
++) -> torch.Tensor:
++    m, n = _fake_binary_shape(x, weight)
++    return x.new_empty((m, n))
++
++
++def _pack_weight_fake(weight: torch.Tensor) -> torch.Tensor:
++    if weight.dim() != 2:
++        raise RuntimeError("pypto_x pack_weight fake requires a rank-2 weight")
++    dtype = TORCH_DTYPES.get(weight.dtype)
++    if dtype is None:
++        raise RuntimeError("pypto_x pack_weight fake received unsupported dtype {}".format(weight.dtype))
++    return weight.new_empty((packed_size_bytes(weight.shape[1], weight.shape[0], dtype),), dtype=torch.uint8)
++
++
++def _linear_prepacked_fake(
++    x: torch.Tensor, packed: torch.Tensor, bias: Optional[torch.Tensor] = None
++) -> torch.Tensor:
++    raise NotImplementedError(
++        "pypto_x packed weight handles cannot be traced: K/N live in the handle bytes"
++    )
++
++
++# --------------------------------------------------------------------------- #
++# registration
++# --------------------------------------------------------------------------- #
++_REGISTER_LOCK = threading.RLock()
++_REGISTERED = False
++
++def _define(name: str, fn: Any) -> None:
++    try:
++        torch.library.custom_op(name, fn, mutates_args=(), device_types="cpu")
++    except (RuntimeError, ValueError) as exc:
++        if not hasattr(torch.ops.pypto_x, name.split("::", 1)[1]):
++            raise
++        # Another import of this module (test reload, plugin re-registration)
++        # already defined the op; registration must stay idempotent.
++        del exc
++
++
++def _fake_define(name: str, fn: Any) -> None:
++    torch.library.register_fake(name, fn)
++
++
++def register() -> None:
++    """Register the ``pypto_x`` torch ops exactly once per process."""
++
++    global _REGISTERED
++    with _REGISTER_LOCK:
++        if _REGISTERED:
++            return
++        _define("pypto_x::linear", _linear_impl)
++        _define("pypto_x::linear_strict", _linear_strict_impl)
++        _define("pypto_x::pack_weight", _pack_weight_impl)
++        _define("pypto_x::linear_prepacked", _linear_prepacked_impl)
++        _fake_define("pypto_x::linear", _linear_fake)
++        _fake_define("pypto_x::linear_strict", _linear_fake)
++        _fake_define("pypto_x::pack_weight", _pack_weight_fake)
++        _fake_define("pypto_x::linear_prepacked", _linear_prepacked_fake)
++        _REGISTERED = True
++
++
++def reset_weight_pack_cache() -> None:
++    """Test hook: drop all cached packed weights."""
++
++    global _WEIGHT_CACHE
++    _WEIGHT_CACHE = _WeightPackCache()
++
++
++def op_stats() -> Mapping[str, Any]:
++    """Return kernel + weight-pack + fallback counters for evidence/tests."""
++
++    from .linear_kernel import linear_kernel_cache
++
++    return {
++        "kernel_cache": linear_kernel_cache().to_dict(),
++        "weight_pack": _WEIGHT_CACHE.stats(),
++        "fallbacks": fallback_stats(),
++    }
++
++
++register()
++
++__all__ = [
++    "fallback_stats",
++    "op_stats",
++    "register",
++    "reset_fallback_stats",
++    "reset_weight_pack_cache",
++]
+diff --git a/python/pypto/framework/weight_pack.py b/python/pypto/framework/weight_pack.py
+new file mode 100644
+index 000000000..03f038727
+--- /dev/null
++++ b/python/pypto/framework/weight_pack.py
+@@ -0,0 +1,164 @@
++"""Weight pre-packing for the single-kernel PyPTO-X linear bridge.
++
++The AVX-512 matmul kernel consumes the right operand as a rank-2 ``(K, N)``
++row-major buffer.  ``torch.nn.functional.linear`` stores the weight as
++``(N, K)``, so a static weight needs a one-time transpose (and, for the BF16
++kernel, a one-time BF16 bit copy) instead of doing it inside the per-call hot
++path.  The packed buffer is self-describing: a fixed 32-byte little-endian
++header carries magic/version/dtype/K/N, followed by the payload, so a packed
++handle can be cached on a framework layer and validated on every use.
++
++Layout (all little-endian)::
++
++    offset  size  field
++    0       4     magic  b"PXLP"
++    4       2     pack_version (u16)
++    6       1     dtype id   (0 = float32, 1 = bf16)
++    7       1     flags      (reserved, must be 0)
++    8       8     reserved   (0)
++    16      8     K (u64)
++    24      8     N (u64)
++    32      ...   payload, C-contiguous (K, N) row-major
++
++The payload is a raw byte copy of the kernel operand: ``uint16`` bits for
++BF16 and ``float32`` for FP32.  Packing copies exactly ``K * N * itemsize``
++bytes; the header is O(1).
++
++Copy accounting: :func:`pack_view` performs exactly one element copy (the
++``(N, K) -> (K, N)`` materialisation).  Returning a torch handle from
++``pack_weight`` serialises that payload into the handle tensor, which is a
++second byte copy at *pack* time only (never in the call hot path).
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++import struct
++from typing import Any
++
++import numpy as np
++
++
++PACK_MAGIC = b"PXLP"
++PACK_VERSION = 1
++HEADER_SIZE = 32
++_HEADER = struct.Struct("<4sHBB8xQQ")
++_DTYPE_IDS = {"float32": 0, "bf16": 1}
++_ID_DTYPES = {value: key for key, value in _DTYPE_IDS.items()}
++_NUMPY_DTYPES = {"float32": np.float32, "bf16": np.uint16}
++
++
++@dataclass(frozen=True)
++class PackedWeight:
++    """A validated packed weight: header fields plus a C-contiguous payload."""
++
++    dtype: str
++    k: int
++    n: int
++    payload: np.ndarray
++    copies: int = 0
++
++    @property
++    def itemsize(self) -> int:
++        return int(self.payload.dtype.itemsize)
++
++    @property
++    def payload_bytes(self) -> int:
++        return int(self.payload.nbytes)
++
++    @property
++    def address(self) -> int:
++        return int(self.payload.ctypes.data)
++
++    def header_bytes(self) -> bytes:
++        return _HEADER.pack(
++            PACK_MAGIC,
++            PACK_VERSION,
++            _DTYPE_IDS[self.dtype],
++            0,
++            int(self.k),
++            int(self.n),
++        )
++
++    def to_bytes(self) -> bytes:
++        """Return ``header + payload`` as one immutable byte string."""
++
++        return self.header_bytes() + self.payload.tobytes()
++
++
++def pack_view(view: Any, k: int, n: int, dtype: str) -> PackedWeight:
++    """Pack a ``(N, K)`` weight view into the kernel's ``(K, N)`` layout.
++
++    ``view`` must be a C-contiguous numpy array of ``uint16`` (BF16) or
++    ``float32`` (FP32).  Exactly one element copy is performed; the returned
++    object owns the payload.
++    """
++
++    if dtype not in _DTYPE_IDS:
++        raise ValueError("unsupported packed weight dtype {!r}".format(dtype))
++    array = np.asarray(view)
++    expected = _NUMPY_DTYPES[dtype]
++    if array.dtype != expected:
++        raise ValueError(
++            "packed weight view dtype {} does not match {}".format(array.dtype, dtype)
++        )
++    if array.ndim != 2 or array.shape != (n, k):
++        raise ValueError(
++            "packed weight view shape {} does not match (N, K) = ({}, {})".format(
++                array.shape, n, k
++            )
++        )
++    if not array.flags["C_CONTIGUOUS"]:
++        raise ValueError("packed weight view must be C-contiguous")
++    payload = np.ascontiguousarray(array.T)
++    return PackedWeight(dtype=dtype, k=int(k), n=int(n), payload=payload, copies=1)
++
++
++def parse_packed_bytes(buffer: Any) -> PackedWeight:
++    """Parse ``header + payload`` bytes into a zero-copy :class:`PackedWeight`."""
++
++    raw = memoryview(buffer)
++    if raw.ndim != 1 or raw.itemsize != 1:
++        raise ValueError("packed weight buffer must be a flat byte buffer")
++    if raw.nbytes < HEADER_SIZE:
++        raise ValueError("packed weight buffer is shorter than the header")
++    magic, version, dtype_id, flags, k, n = _HEADER.unpack_from(raw, 0)
++    if magic != PACK_MAGIC:
++        raise ValueError("packed weight magic does not match")
++    if version != PACK_VERSION:
++        raise ValueError("unsupported packed weight version {}".format(version))
++    if flags != 0:
++        raise ValueError("packed weight flags must be zero")
++    try:
++        dtype = _ID_DTYPES[int(dtype_id)]
++    except KeyError as exc:
++        raise ValueError("unsupported packed weight dtype id {}".format(dtype_id)) from exc
++    if k <= 0 or n <= 0:
++        raise ValueError("packed weight K and N must be positive")
++    itemsize = np.dtype(_NUMPY_DTYPES[dtype]).itemsize
++    expected = HEADER_SIZE + int(k) * int(n) * itemsize
++    if raw.nbytes != expected:
++        raise ValueError(
++            "packed weight size {} does not match expected {}".format(raw.nbytes, expected)
++        )
++    payload = np.frombuffer(raw, dtype=_NUMPY_DTYPES[dtype], count=int(k) * int(n), offset=HEADER_SIZE)
++    payload = payload.reshape(int(k), int(n))
++    return PackedWeight(dtype=dtype, k=int(k), n=int(n), payload=payload, copies=0)
++
++
++def packed_size_bytes(k: int, n: int, dtype: str) -> int:
++    """Return the exact packed byte size for ``header + (K, N)`` payload."""
++
++    itemsize = np.dtype(_NUMPY_DTYPES[dtype]).itemsize
++    return HEADER_SIZE + int(k) * int(n) * itemsize
++
++
++__all__ = [
++    "HEADER_SIZE",
++    "PACK_MAGIC",
++    "PACK_VERSION",
++    "PackedWeight",
++    "pack_view",
++    "packed_size_bytes",
++    "parse_packed_bytes",
++]
+diff --git a/python/tests/framework_torch/README.md b/python/tests/framework_torch/README.md
+new file mode 100644
+index 000000000..d3a062960
+--- /dev/null
++++ b/python/tests/framework_torch/README.md
+@@ -0,0 +1,18 @@
++# Torch bridge tests (W8J J1)
++
++These tests need torch and therefore run in the dedicated environment, not in
++the system-python suite:
++
++```bash
++/home/chiro/miniforge3/envs/pypto-x-w8j/bin/python -m pytest -q \
++  --confcutdir=python/tests/framework_torch python/tests/framework_torch
++```
++
++`--confcutdir` is required: the repository-root `conftest.py` registers
++pytest-xdist hooks that are intentionally absent from the lightweight torch
++environment.
++
++The suite is deliberately outside `python/tests/ut`, so the main
++`python/tests/ut/pypto_x` collection (815 tests at base `26a444b8`) is
++unaffected.  The torch-free optional-dependency checks live in
++`python/tests/ut/pypto_x/test_framework_torch_optional.py`.
+diff --git a/python/tests/framework_torch/conftest.py b/python/tests/framework_torch/conftest.py
+new file mode 100644
+index 000000000..9f6fa0bda
+--- /dev/null
++++ b/python/tests/framework_torch/conftest.py
+@@ -0,0 +1,54 @@
++"""Shared setup for the torch-dependent J1 bridge tests.
++
++The main PyPTO-X suite is torch-free: it imports ``pypto`` through a stub
++package so the upstream ``pypto/__init__.py`` online-build bootstrap (which
++needs wheel metadata) is not executed.  This suite uses the same seam and is
++run with the dedicated ``pypto-x-w8j`` conda environment; it is intentionally
++outside ``python/tests/ut`` so the system-python suite keeps its exact
++collection baseline.
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++import sys
++import types
++
++import pytest
++
++PYTHON_ROOT = Path(__file__).resolve().parents[2]
++if "pypto" not in sys.modules:
++    package = types.ModuleType("pypto")
++    package.__path__ = [str(PYTHON_ROOT / "pypto")]
++    sys.modules["pypto"] = package
++
++import torch  # noqa: E402  (must come after the stub package is installed)
++
++import pypto.framework as framework  # noqa: E402
++from pypto.framework import torch_ops  # noqa: E402
++from pypto.framework.linear_kernel import LinearKernelCache, reset_linear_kernel_cache  # noqa: E402
++
++framework.register_torch_ops()
++
++
++@pytest.fixture()
++def fresh_caches(tmp_path, monkeypatch):
++    """Isolate kernel cache, weight-pack cache and fallback counters."""
++
++    monkeypatch.setenv("PYPTO_X_TORCH_FALLBACK_WARNINGS", "1")
++    cache_dir = tmp_path / "kernel-cache"
++    cache = LinearKernelCache(cache_dir=cache_dir, disk_cache=True)
++    reset_linear_kernel_cache(cache)
++    torch_ops.reset_weight_pack_cache()
++    torch_ops.reset_fallback_stats()
++    yield cache
++    # Leave a fresh, isolated cache behind so a later test never inherits
++    # kernels or counters from this one.
++    reset_linear_kernel_cache(LinearKernelCache(cache_dir=cache_dir, disk_cache=True))
++    torch_ops.reset_weight_pack_cache()
++    torch_ops.reset_fallback_stats()
++
++
++@pytest.fixture()
++def device():
++    return torch.device("cpu")
+diff --git a/python/tests/framework_torch/test_torch_linear_cache.py b/python/tests/framework_torch/test_torch_linear_cache.py
+new file mode 100644
+index 000000000..43df59bb6
+--- /dev/null
++++ b/python/tests/framework_torch/test_torch_linear_cache.py
+@@ -0,0 +1,154 @@
++"""J1 compile/weight-pack cache evidence tests.
++
++The contract is: one Core IR program build and one clang invocation per
++``(dtype, M, K, N, target)``; a second call in the same process is a memory
++hit; a fresh process with the same ``PYPTO_X_TORCH_CACHE_DIR`` is a disk hit
++(no rebuild, no clang); a mutated weight is re-packed because the torch
++version counter changed.
++"""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++import torch
++
++from pypto.framework import torch_ops
++from pypto.framework.linear_kernel import LinearKernelCache, linear_kernel_cache, reset_linear_kernel_cache
++
++
++BF16 = torch.bfloat16
++
++
++def _call(m=2, k=4, n=5, dtype=BF16):
++    x = torch.randn(m, k, dtype=dtype)
++    weight = torch.randn(n, k, dtype=dtype)
++    return torch.ops.pypto_x.linear(x, weight), x, weight
++
++
++def test_same_shape_builds_and_compiles_once(fresh_caches):
++    _call()
++    first = fresh_caches.stats
++    assert first["kernel_builds"] == 1
++    assert first["compile_calls"] == 1
++    assert first["disk_hits"] == 0
++
++    _call()
++    _call()
++    second = fresh_caches.stats
++    assert second["kernel_builds"] == 1
++    assert second["compile_calls"] == 1
++    assert second["memory_hits"] == 2
++
++
++def test_new_shape_builds_again_but_never_rebuilds_the_same_shape(fresh_caches):
++    _call(k=4, n=5)
++    _call(k=4, n=6)
++    _call(k=4, n=5)
++    stats = fresh_caches.stats
++    assert stats["kernel_builds"] == 2
++    assert stats["compile_calls"] == 2
++    assert stats["memory_hits"] == 1
++
++
++def test_disk_cache_is_reused_across_cache_instances(fresh_caches):
++    _call(m=3, k=8, n=7)
++    assert fresh_caches.stats["kernel_builds"] == 1
++
++    # A fresh instance has an empty memory tier but the same cache directory,
++    # which is what a new worker process sees.
++    second = LinearKernelCache(cache_dir=fresh_caches.cache_dir, disk_cache=True)
++    reset_linear_kernel_cache(second)
++    _call(m=3, k=8, n=7)
++    stats = second.stats
++    assert stats["kernel_builds"] == 0
++    assert stats["compile_calls"] == 0
++    assert stats["disk_hits"] == 1
++    assert stats["load_failures"] == 0
++
++
++def test_disk_sidecar_records_the_kernel_key(fresh_caches):
++    _call(m=1, k=2, n=3)
++    key = fresh_caches.key("bf16", 1, 2, 3)
++    sidecar = fresh_caches.cache_dir / ("pypto_x_linear_{}.json".format(key.digest[:32]))
++    payload = json.loads(sidecar.read_text(encoding="utf-8"))
++    assert payload["key"] == key.to_dict()
++    assert payload["artifact"]["entrypoint"] == "pypto_x_linear"
++    assert payload["artifact"]["metadata"]["native_variant"] == "avx512-fma-bf16"
++
++
++def test_stale_or_tampered_sidecar_is_rebuilt_not_trusted(fresh_caches):
++    _call(m=1, k=2, n=3)
++    key = fresh_caches.key("bf16", 1, 2, 3)
++    sidecar = fresh_caches.cache_dir / ("pypto_x_linear_{}.json".format(key.digest[:32]))
++    sidecar.write_text("{not json", encoding="utf-8")
++
++    second = LinearKernelCache(cache_dir=fresh_caches.cache_dir, disk_cache=True)
++    reset_linear_kernel_cache(second)
++    got, _, _ = _call(m=1, k=2, n=3)
++    assert got.shape == (1, 3)
++    stats = second.stats
++    assert stats["load_failures"] == 1
++    assert stats["kernel_builds"] == 1
++    assert stats["compile_calls"] == 1
++
++
++def test_key_identity_is_stable_and_input_sensitive(fresh_caches):
++    cache = LinearKernelCache(cache_dir=None, disk_cache=False)
++    base = cache.key("bf16", 4, 8, 16)
++    assert base.digest == cache.key("bf16", 4, 8, 16).digest
++    assert base.digest != cache.key("float32", 4, 8, 16).digest
++    assert base.digest != cache.key("bf16", 5, 8, 16).digest
++    assert base.digest != cache.key("bf16", 4, 9, 16).digest
++    assert base.digest != cache.key("bf16", 4, 8, 17).digest
++    assert base.to_dict()["target"]["features"] != cache.key("float32", 4, 8, 16).to_dict()["target"]["features"]
++    with pytest.raises(Exception) as info:
++        cache.key("float64", 1, 2, 3)
++    assert getattr(info.value, "reason_code", None) == "dtype_unsupported"
++
++
++def test_weight_pack_is_cached_by_identity_and_invalidated_by_version(fresh_caches):
++    x = torch.randn(2, 4, dtype=BF16)
++    weight = torch.randn(5, 4, dtype=BF16)
++    torch.ops.pypto_x.linear(x, weight)
++    torch.ops.pypto_x.linear(x, weight)
++    stats = torch_ops.op_stats()["weight_pack"]
++    assert stats["pack_builds"] == 1
++    assert stats["pack_hits"] == 1
++
++    with torch.no_grad():
++        weight.add_(1.0)
++    got = torch.ops.pypto_x.linear(x, weight)
++    ref = torch.nn.functional.linear(x, weight)
++    assert torch.equal(got, ref)
++    stats = torch_ops.op_stats()["weight_pack"]
++    assert stats["pack_builds"] == 2
++
++
++def test_explicit_packed_handle_bypasses_the_weight_cache(fresh_caches):
++    x = torch.randn(2, 4, dtype=BF16)
++    weight = torch.randn(5, 4, dtype=BF16)
++    packed = torch.ops.pypto_x.pack_weight(weight)
++    before = torch_ops.op_stats()["weight_pack"]
++    for _ in range(3):
++        torch.ops.pypto_x.linear_prepacked(x, packed)
++    after = torch_ops.op_stats()["weight_pack"]
++    assert before == after
++
++
++def test_kernel_cache_clear_keeps_the_compiled_artifact_usable(fresh_caches):
++    got, x, weight = _call()
++    entry = linear_kernel_cache().get("bf16", 2, 4, 5)
++    fresh_caches.clear()
++    assert fresh_caches.stats["kernel_builds"] == 1
++    # entry is immutable and remains usable after the cache was cleared
++    from pypto.framework.torch_bridge import allocate_output, tensor_to_view
++    from pypto.framework.weight_pack import pack_view
++
++    left = tensor_to_view(x, dtype="bf16", shape=(2, 4), name="x")
++    weight_view = tensor_to_view(weight, dtype="bf16", shape=(5, 4), name="weight")
++    packed = pack_view(weight_view.array, k=4, n=5, dtype="bf16")
++    output, output_view = allocate_output("bf16", (2, 5))
++    entry.invoke(left.address, packed.address, output_view.address)
++    assert torch.equal(output, got)
+diff --git a/python/tests/framework_torch/test_torch_linear_correctness.py b/python/tests/framework_torch/test_torch_linear_correctness.py
+new file mode 100644
+index 000000000..ddadf0712
+--- /dev/null
++++ b/python/tests/framework_torch/test_torch_linear_correctness.py
+@@ -0,0 +1,225 @@
++"""J1 correctness: torch.ops.pypto_x.linear/linear_prepacked vs F.linear.
++
++Tolerance policy (self-documented, measured on the AVX-512 host):
++
++* float32: the bridge compares against the float64 gold and requires
++  ``max|ours - gold| <= 1e-5 * max(1, |gold|max)``; against ``F.linear``
++  (float32) the requirement is ``max|ours - ref| <= 1e-5``.  Measured
++  differences are <= 2.0e-7 for K <= 1024/3584 shapes, i.e. a few fp32 ulps.
++* bfloat16: ``gold`` is the float64 reference.  One bf16 rounding unit at
++  scale s is ``2**-8 * s``.  The bridge allows 2 LSB against gold and 4 LSB
++  against ``F.linear`` because the bias is added after the kernel's bf16
++  output rounding (torch/oneDNN fuses bias into the fp32 accumulator).
++  Without bias the measured difference vs F.linear is bitwise zero for most
++  shapes and <= 2.4e-4 for the largest tested one.
++"""
++
++from __future__ import annotations
++
++import numpy as np
++import pytest
++import torch
++
++from pypto.framework import PyPTOXUnsupportedError, torch_ops
++from pypto.framework.torch_bridge import allocate_output, tensor_to_view
++
++
++DTYPES = (torch.float32, torch.bfloat16)
++SHAPES = ((1, 2, 3), (3, 5, 4), (4, 17, 19), (2, 33, 7), (1, 128, 64))
++BF16_LSB = 2.0 ** -8.0
++
++
++def _rand(dtype, shape, generator, scale):
++    return (torch.randn(*shape, generator=generator) * scale).to(dtype)
++
++
++def _max_abs(left, right):
++    return (left.float() - right.float()).abs().max().item()
++
++
++def _bps(dtype):
++    return torch.bfloat16 if dtype == "bf16" else torch.float32
++
++
++@pytest.mark.parametrize("dtype", DTYPES, ids=("f32", "bf16"))
++@pytest.mark.parametrize("shape", SHAPES, ids=lambda s: "{}x{}x{}".format(*s))
++@pytest.mark.parametrize("with_bias", (False, True), ids=("nobias", "bias"))
++def test_linear_matches_functional(dtype, shape, with_bias, fresh_caches):
++    m, k, n = shape
++    generator = torch.Generator().manual_seed(20260911 + m * 31 + k * 7 + n)
++    x = _rand(dtype, (m, k), generator, 1.0 / k ** 0.5)
++    weight = _rand(dtype, (n, k), generator, 1.0 / k ** 0.5)
++    bias = _rand(dtype, (n,), generator, 0.1) if with_bias else None
++
++    got = torch.ops.pypto_x.linear(x, weight, bias)
++    ref = torch.nn.functional.linear(x, weight, bias)
++    gold = torch.nn.functional.linear(
++        x.double(), weight.double(), None if bias is None else bias.double()
++    )
++
++    assert got.shape == (m, n)
++    assert got.dtype == x.dtype
++    ours_gold = _max_abs(got, gold)
++    ref_gold = _max_abs(ref, gold)
++    scale = max(1.0, gold.abs().max().item())
++    if dtype == torch.float32:
++        assert ours_gold <= 1e-5 * scale
++        assert _max_abs(got, ref) <= 1e-5
++        assert ref_gold <= 1e-5 * scale
++    else:
++        assert ours_gold <= 2.0 * BF16_LSB * scale
++        assert _max_abs(got, ref) <= 4.0 * BF16_LSB * scale
++        assert ref_gold <= 2.0 * BF16_LSB * scale
++
++
++@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16), ids=("f32", "bf16"))
++def test_packed_weight_path_is_equivalent(dtype, fresh_caches):
++    m, k, n = 3, 40, 33
++    generator = torch.Generator().manual_seed(99)
++    x = _rand(dtype, (m, k), generator, 1.0 / k ** 0.5)
++    weight = _rand(dtype, (n, k), generator, 1.0 / k ** 0.5)
++    bias = _rand(dtype, (n,), generator, 0.1)
++
++    packed = torch.ops.pypto_x.pack_weight(weight)
++    itemsize = 4 if dtype == torch.float32 else 2
++    assert packed.dtype == torch.uint8
++    assert packed.dim() == 1
++    assert packed.numel() == 32 + k * n * itemsize
++
++    prepacked = torch.ops.pypto_x.linear_prepacked(x, packed, bias)
++    direct = torch.ops.pypto_x.linear(x, weight, bias)
++    ref = torch.nn.functional.linear(x, weight, bias)
++    assert torch.equal(prepacked, direct)
++    if dtype == torch.float32:
++        assert _max_abs(prepacked, ref) <= 1e-5
++    else:
++        assert _max_abs(prepacked, ref) <= 4.0 * BF16_LSB * max(1.0, ref.abs().max().item())
++
++
++def test_bridge_is_zero_copy_for_contiguous_inputs(fresh_caches):
++    x = torch.randn(4, 8, dtype=torch.float32)
++    view = tensor_to_view(x, dtype="float32", shape=(4, 8), name="x")
++    assert view.copies == 0
++    assert view.address == x.data_ptr()
++    assert not view.owns_buffer
++
++    weight = torch.randn(16, 8, dtype=torch.bfloat16)
++    bits = tensor_to_view(weight, dtype="bf16", shape=(16, 8), name="weight")
++    assert bits.copies == 0
++    assert bits.address == weight.data_ptr()
++    # BF16 is exposed as a raw uint16 view of the same storage.
++    assert bits.array.dtype == np.uint16
++    assert bits.nbytes == weight.numel() * 2
++
++
++def test_bridge_copies_non_contiguous_inputs_once(fresh_caches):
++    base = torch.randn(16, 8, dtype=torch.float32)
++    transposed = base.t()
++    assert not transposed.is_contiguous()
++    view = tensor_to_view(transposed, dtype="float32", shape=(8, 16), name="x")
++    assert view.copies == 1
++    assert view.owns_buffer
++    assert view.address != transposed.data_ptr()
++    assert np.array_equal(view.array, transposed.contiguous().numpy())
++
++
++def test_output_allocation_owns_memory(fresh_caches):
++    tensor, view = allocate_output("bf16", (2, 5))
++    assert tensor.dtype == torch.bfloat16
++    assert view.copies == 0
++    assert view.owns_buffer
++    assert view.writable
++    assert view.address == tensor.data_ptr()
++
++
++def test_meta_fake_inference_has_no_kernel_call(fresh_caches):
++    x = torch.empty(3, 7, dtype=torch.bfloat16, device="meta")
++    weight = torch.empty(5, 7, dtype=torch.bfloat16, device="meta")
++    bias = torch.empty(5, dtype=torch.bfloat16, device="meta")
++    out = torch.ops.pypto_x.linear(x, weight, bias)
++    assert out.shape == (3, 5)
++    assert out.dtype == torch.bfloat16
++    assert out.device.type == "meta"
++    stats = fresh_caches.stats
++    assert stats["kernel_builds"] == 0
++    assert stats["compile_calls"] == 0
++
++    strict = torch.ops.pypto_x.linear_strict(x, weight)
++    assert strict.shape == (3, 5)
++
++
++def test_strict_unsupported_raises_with_reason(fresh_caches):
++    x = torch.randn(2, 4, dtype=torch.float64)
++    weight = torch.randn(5, 4, dtype=torch.float64)
++    with pytest.raises(PyPTOXUnsupportedError) as info:
++        torch.ops.pypto_x.linear_strict(x, weight)
++    assert info.value.reason_code == "dtype_unsupported"
++    assert fresh_caches.stats["kernel_builds"] == 0
++    assert torch_ops.fallback_stats()["total"] == 0
++
++
++def test_non_contiguous_activation_and_weight_are_supported(fresh_caches):
++    base_x = torch.randn(16, 8, dtype=torch.float32)
++    x = base_x.t()  # (8, 16), non-contiguous
++    base_w = torch.randn(16, 6, dtype=torch.float32)
++    weight = base_w.t()  # (6, 16), non-contiguous
++    assert not x.is_contiguous() and not weight.is_contiguous()
++
++    got = torch.ops.pypto_x.linear(x, weight)
++    ref = torch.nn.functional.linear(x, weight)
++    assert got.shape == (8, 6)
++    assert _max_abs(got, ref) <= 1e-5
++    # the second call reuses the packed contiguous weight copy
++    again = torch.ops.pypto_x.linear(x, weight)
++    assert torch.equal(got, again)
++
++
++def test_torch_compile_traces_through_fake_impl(fresh_caches):
++    def fn(x, weight):
++        return torch.ops.pypto_x.linear(x, weight) + 1.0
++
++    compiled = torch.compile(fn, fullgraph=True, backend="eager")
++    x = torch.randn(2, 4, dtype=torch.bfloat16)
++    weight = torch.randn(5, 4, dtype=torch.bfloat16)
++    out = compiled(x, weight)
++    eager = torch.ops.pypto_x.linear(x, weight) + 1.0
++    assert torch.equal(out, eager)
++
++
++def test_runtime_descriptor_launch_consumes_zero_copy_torch_buffers(fresh_caches):
++    """Exercise the full PyPTO-X runtime ABI with torch-backed numpy handles.
++
++    This is the descriptor path behind tensor_to_view: torch storage -> numpy
++    view -> TensorDesc(handle=...) -> Avx512Runtime.launch; no copy is made on
++    either side and the runtime writes directly into the torch output tensor.
++    """
++
++    from pypto.abi import LaunchRequest, TensorDesc
++    from pypto.backends.cpu.x86 import Avx512Runtime
++    from pypto.framework.linear_kernel import linear_kernel_cache
++    from pypto.framework.weight_pack import pack_view
++
++    m, k, n = 2, 3, 5
++    x = torch.randn(m, k, dtype=torch.bfloat16)
++    weight = torch.randn(n, k, dtype=torch.bfloat16)
++    output = torch.empty(m, n, dtype=torch.bfloat16)
++
++    left = tensor_to_view(x, dtype="bf16", shape=(m, k), name="x")
++    weight_view = tensor_to_view(weight, dtype="bf16", shape=(n, k), name="weight")
++    packed = pack_view(weight_view.array, k=k, n=n, dtype="bf16")
++    right = TensorDesc(
++        "bf16", (k, n), device="cpu", handle=packed.payload, readonly=True
++    )
++    output_view = tensor_to_view(output, dtype="bf16", shape=(m, n), name="output", writable=True)
++    assert output_view.address == output.data_ptr()
++
++    entry = linear_kernel_cache().get("bf16", m, k, n)
++    Avx512Runtime().launch(
++        LaunchRequest(
++            entry.artifact,
++            inputs=[left.descriptor(), right],
++            outputs=[output_view.descriptor()],
++        )
++    )
++    reference = torch.nn.functional.linear(x, weight)
++    assert _max_abs(output, reference) <= 4.0 * BF16_LSB * max(1.0, reference.abs().max().item())
+diff --git a/python/tests/framework_torch/test_torch_linear_failure_semantics.py b/python/tests/framework_torch/test_torch_linear_failure_semantics.py
+new file mode 100644
+index 000000000..f655822ca
+--- /dev/null
++++ b/python/tests/framework_torch/test_torch_linear_failure_semantics.py
+@@ -0,0 +1,283 @@
++"""J1 failure semantics: fail-open vs fail-closed must both be explicit.
++
++* ``torch.ops.pypto_x.linear`` is fail-open.  Any unsupported input raises a
++  structured ``PyPTOXUnsupportedError`` internally, is recorded in the
++  process fallback counters, warns once per reason, and recomputes the exact
++  reference with ``F.linear``.  The only exception is an opaque packed-weight
++  handle (1-D uint8): there is no meaningful torch fallback for it, so it
++  fails closed with ``packed_handle_invalid``.
++* ``torch.ops.pypto_x.linear_strict`` never falls back: the structured error
++  propagates and the fallback counters stay untouched.
++"""
++
++from __future__ import annotations
++
++import warnings
++
++import pytest
++import torch
++
++from pypto.framework import (
++    PyPTOXBridgeError,
++    PyPTOXBuildError,
++    PyPTOXUnsupportedError,
++    torch_ops,
++)
++from pypto.framework.linear_kernel import linear_kernel_cache
++
++
++BF16 = torch.bfloat16
++
++
++def _fallback_events():
++    return dict(torch_ops.fallback_stats()["events"])
++
++
++@pytest.mark.parametrize(
++    "build,reason",
++    (
++        (lambda: (torch.randn(2, 4, dtype=torch.float64), torch.randn(5, 4, dtype=torch.float64), None),
++         "dtype_unsupported"),
++        (lambda: (torch.ones(2, 4, dtype=torch.int32), torch.ones(5, 4, dtype=torch.int32), None),
++         "dtype_unsupported"),
++        (lambda: (torch.randn(2, 3, 4, dtype=BF16), torch.randn(5, 4, dtype=BF16), None),
++         "rank_unsupported"),
++        (lambda: (torch.randn(4, dtype=BF16), torch.randn(5, 4, dtype=BF16), None),
++         "rank_unsupported"),
++        (lambda: (torch.randn(2, 4, dtype=BF16), torch.randn(5, 4, dtype=torch.float32), None),
++         "dtype_mismatch"),
++        (lambda: (torch.randn(2, 4, dtype=BF16), torch.randn(5, 6, dtype=BF16), None),
++         "shape_mismatch"),
++        (lambda: (torch.randn(0, 4, dtype=BF16), torch.randn(5, 4, dtype=BF16), None),
++         "shape_unsupported"),
++        (lambda: (torch.randn(2, 4, dtype=BF16), torch.randn(5, 4, dtype=BF16), torch.randn(4, dtype=BF16)),
++         "bias_shape_mismatch"),
++        (lambda: (torch.randn(2, 4, dtype=BF16), torch.randn(5, 4, dtype=BF16), torch.randn(5, dtype=torch.float32)),
++         "bias_dtype_mismatch"),
++        (lambda: (torch.randn(2, 4, dtype=BF16, requires_grad=True), torch.randn(5, 4, dtype=BF16), None),
++         "requires_grad"),
++        (lambda: (torch.randn(2, 4, dtype=BF16), torch.randn(5, 4, dtype=BF16, requires_grad=True), None),
++         "requires_grad"),
++        (lambda: (torch.randn(2, 4, dtype=BF16), torch.randn(5, 4, dtype=BF16),
++                  torch.randn(5, dtype=BF16, requires_grad=True)),
++         "requires_grad"),
++    ),
++    ids=(
++        "f64", "int32", "rank3_x", "rank1_x", "dtype_mismatch", "k_mismatch",
++        "zero_m", "bias_shape", "bias_dtype", "x_grad", "weight_grad", "bias_grad",
++    ),
++)
++def test_fail_open_matches_reference_and_records_reason(build, reason, fresh_caches):
++    x, weight, bias = build()
++    # Some unsupported inputs (e.g. mixed dtypes) are rejected by torch itself,
++    # so the fail-open contract is "same outcome as a caller-side F.linear
++    # fallback", which may also be an exception.  A fallback event must still
++    # be recorded in every case: nothing is silent.
++    reference = None
++    reference_error = None
++    try:
++        reference = torch.nn.functional.linear(x, weight, bias)
++    except Exception as exc:  # noqa: BLE001 - the reference failure is the expectation
++        reference_error = exc
++
++    with pytest.warns(RuntimeWarning, match=reason):
++        try:
++            got = torch.ops.pypto_x.linear(x, weight, bias)
++            raised = None
++        except Exception as exc:  # noqa: BLE001 - asserted against the reference below
++            raised = exc
++
++    if reference_error is None:
++        assert raised is None
++        assert torch.equal(got, reference)
++    else:
++        assert raised is not None
++        assert type(raised) is type(reference_error)
++    events = _fallback_events()
++    assert events.get("linear:" + reason) == 1
++    assert fresh_caches.stats["kernel_builds"] == 0
++
++
++def test_fail_open_warns_once_per_reason_but_keeps_counting(fresh_caches):
++    x = torch.randn(2, 4, dtype=torch.float64)
++    weight = torch.randn(5, 4, dtype=torch.float64)
++    with pytest.warns(RuntimeWarning):
++        torch.ops.pypto_x.linear(x, weight)
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always")
++        torch.ops.pypto_x.linear(x, weight)
++        assert not any(item.category is RuntimeWarning for item in caught)
++    assert _fallback_events()["linear:dtype_unsupported"] == 2
++
++
++def test_fail_open_can_silence_warnings_without_hiding_counters(fresh_caches, monkeypatch):
++    monkeypatch.setenv("PYPTO_X_TORCH_FALLBACK_WARNINGS", "0")
++    x = torch.randn(2, 4, dtype=torch.float64)
++    weight = torch.randn(5, 4, dtype=torch.float64)
++    with warnings.catch_warnings(record=True) as caught:
++        warnings.simplefilter("always")
++        got = torch.ops.pypto_x.linear(x, weight)
++        assert not any(item.category is RuntimeWarning for item in caught)
++    assert torch.equal(got, torch.nn.functional.linear(x, weight))
++    assert _fallback_events()["linear:dtype_unsupported"] == 1
++
++
++@pytest.mark.parametrize(
++    "build,reason",
++    (
++        (lambda: (torch.randn(2, 4, dtype=torch.float64), torch.randn(5, 4, dtype=torch.float64), None),
++         "dtype_unsupported"),
++        (lambda: (torch.randn(2, 3, 4, dtype=BF16), torch.randn(5, 4, dtype=BF16), None),
++         "rank_unsupported"),
++        (lambda: (torch.randn(2, 4, dtype=BF16), torch.randn(5, 6, dtype=BF16), None),
++         "shape_mismatch"),
++    ),
++    ids=("dtype", "rank", "shape"),
++)
++def test_fail_closed_raises_structured_error(build, reason, fresh_caches):
++    x, weight, bias = build()
++    with pytest.raises(PyPTOXUnsupportedError) as info:
++        torch.ops.pypto_x.linear_strict(x, weight, bias)
++    assert info.value.reason_code == reason
++    assert info.value.to_dict()["reason_code"] == reason
++    # strict mode never records a fallback and never builds a kernel
++    assert torch_ops.fallback_stats()["total"] == 0
++    assert fresh_caches.stats["kernel_builds"] == 0
++
++
++def test_build_failure_falls_back_open_but_strict_raises(fresh_caches, monkeypatch):
++    cache = linear_kernel_cache()
++
++    def _explode(*args, **kwargs):
++        raise PyPTOXBuildError("simulated clang failure", reason_code="compile_failed")
++
++    monkeypatch.setattr(cache, "get", _explode)
++    x = torch.randn(2, 4, dtype=BF16)
++    weight = torch.randn(5, 4, dtype=BF16)
++    with pytest.warns(RuntimeWarning, match="compile_failed"):
++        got = torch.ops.pypto_x.linear(x, weight)
++    assert torch.equal(got, torch.nn.functional.linear(x, weight))
++    assert _fallback_events()["linear:compile_failed"] == 1
++
++    with pytest.raises(PyPTOXBuildError) as info:
++        torch.ops.pypto_x.linear_strict(x, weight)
++    assert info.value.reason_code == "compile_failed"
++
++
++def test_corrupt_packed_handle_fails_closed_even_in_fail_open_op(fresh_caches):
++    x = torch.randn(2, 4, dtype=BF16)
++    corrupt = torch.zeros(40, dtype=torch.uint8)
++    with pytest.raises(PyPTOXUnsupportedError) as info:
++        torch.ops.pypto_x.linear(x, corrupt)
++    assert info.value.reason_code == "packed_handle_invalid"
++    assert torch_ops.fallback_stats()["total"] == 0
++
++    packed = torch.ops.pypto_x.pack_weight(torch.randn(5, 4, dtype=BF16))
++    broken = packed.clone()
++    broken[4] = 9  # corrupt the pack version (header offset 4)
++    with pytest.raises(PyPTOXUnsupportedError) as info2:
++        torch.ops.pypto_x.linear_prepacked(x, broken)
++    assert info2.value.reason_code == "packed_handle_invalid"
++
++
++def test_pack_weight_unsupported_inputs_fail_closed(fresh_caches):
++    with pytest.raises(PyPTOXUnsupportedError) as info:
++        torch.ops.pypto_x.pack_weight(torch.randn(4, 8, dtype=torch.float64))
++    assert info.value.reason_code == "dtype_unsupported"
++    with pytest.raises(PyPTOXUnsupportedError) as info2:
++        torch.ops.pypto_x.pack_weight(torch.randn(8, dtype=BF16))
++    assert info2.value.reason_code == "rank_unsupported"
++
++
++def test_non_cpu_device_is_not_silently_remapped(fresh_caches):
++    if not torch.cuda.is_available():
++        pytest.skip("no CUDA device on this host")
++    x = torch.randn(2, 4, dtype=BF16, device="cuda")
++    weight = torch.randn(5, 4, dtype=BF16, device="cuda")
++    with pytest.raises(Exception):
++        torch.ops.pypto_x.linear(x, weight)
++
++
++def _injected_runtime(*features):
++    from pypto.backends.cpu.x86 import Avx512Runtime
++    from pypto.lowering.cpu.x86.avx512 import Avx512Capability
++
++    capability = Avx512Capability.injected_capability(tuple(features))
++    return Avx512Runtime(capability=capability)
++
++
++BASE_FEATURES = ("avx", "avx512f", "osxsave", "ymm", "opmask", "zmm", "fma")
++
++
++def test_avx512_unavailable_falls_back_open_and_strict_raises(tmp_path, monkeypatch):
++    from pypto.framework.linear_kernel import LinearKernelCache, reset_linear_kernel_cache
++
++    cache = LinearKernelCache(cache_dir=tmp_path / "unavailable", runtime=_injected_runtime())
++    reset_linear_kernel_cache(cache)
++    x = torch.randn(2, 4, dtype=BF16)
++    weight = torch.randn(5, 4, dtype=BF16)
++    with pytest.warns(RuntimeWarning, match="avx512_unavailable"):
++        got = torch.ops.pypto_x.linear(x, weight)
++    assert torch.equal(got, torch.nn.functional.linear(x, weight))
++    with pytest.raises(PyPTOXUnsupportedError) as info:
++        torch.ops.pypto_x.linear_strict(x, weight)
++    assert info.value.reason_code == "avx512_unavailable"
++    assert cache.stats["kernel_builds"] == 0
++
++
++def test_missing_bf16_capability_only_falls_back_for_bf16(tmp_path):
++    from pypto.framework.linear_kernel import LinearKernelCache, reset_linear_kernel_cache
++
++    cache = LinearKernelCache(
++        cache_dir=tmp_path / "nobf16",
++        runtime=_injected_runtime(*BASE_FEATURES),
++    )
++    reset_linear_kernel_cache(cache)
++    x_bf16 = torch.randn(2, 4, dtype=BF16)
++    w_bf16 = torch.randn(5, 4, dtype=BF16)
++    with pytest.warns(RuntimeWarning, match="avx512bf16_unavailable"):
++        got = torch.ops.pypto_x.linear(x_bf16, w_bf16)
++    assert torch.equal(got, torch.nn.functional.linear(x_bf16, w_bf16))
++
++    x = torch.randn(2, 4, dtype=torch.float32)
++    weight = torch.randn(5, 4, dtype=torch.float32)
++    result = torch.ops.pypto_x.linear(x, weight)
++    assert torch.allclose(result, torch.nn.functional.linear(x, weight), rtol=1e-5, atol=1e-5)
++    assert cache.stats["kernel_builds"] == 1
++
++
++def test_op_without_avx512bf16_is_never_silently_wrong(tmp_path):
++    """Fail-open must not mix a bf16 kernel into an f32/bf16 mismatch path."""
++
++    from pypto.framework.linear_kernel import LinearKernelCache, reset_linear_kernel_cache
++
++    cache = LinearKernelCache(
++        cache_dir=tmp_path / "nobf16b",
++        runtime=_injected_runtime(*BASE_FEATURES),
++    )
++    reset_linear_kernel_cache(cache)
++    x = torch.randn(2, 4, dtype=BF16)
++    weight = torch.randn(5, 4, dtype=BF16)
++    strict_error = None
++    try:
++        torch.ops.pypto_x.linear_strict(x, weight)
++    except PyPTOXUnsupportedError as exc:
++        strict_error = exc
++    assert strict_error is not None
++    assert strict_error.reason_code == "avx512bf16_unavailable"
++
++
++def test_missing_fma_capability_falls_back(tmp_path):
++    from pypto.framework.linear_kernel import LinearKernelCache, reset_linear_kernel_cache
++
++    cache = LinearKernelCache(
++        cache_dir=tmp_path / "nofma",
++        runtime=_injected_runtime("avx", "avx512f", "osxsave", "ymm", "opmask", "zmm"),
++    )
++    reset_linear_kernel_cache(cache)
++    x = torch.randn(2, 4, dtype=torch.float32)
++    weight = torch.randn(5, 4, dtype=torch.float32)
++    with pytest.warns(RuntimeWarning, match="fma_unavailable"):
++        got = torch.ops.pypto_x.linear(x, weight)
++    assert torch.equal(got, torch.nn.functional.linear(x, weight))
++    assert cache.stats["kernel_builds"] == 0
+diff --git a/python/tests/ut/pypto_x/test_framework_torch_optional.py b/python/tests/ut/pypto_x/test_framework_torch_optional.py
+new file mode 100644
+index 000000000..fc9bb82aa
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_framework_torch_optional.py
+@@ -0,0 +1,107 @@
++"""J1 torch-free contract: ``pypto.framework`` must import without torch.
++
++The torch custom-op suite lives outside ``python/tests/ut`` because it needs
++the dedicated ``pypto-x-w8j`` environment.  These tests pin the optional
++dependency boundary and the torch-free cache-key rules inside the normal
++system-python suite.
++"""
++
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++import sys
++import types
++
++import pytest
++
++
++def _imports():
++    package_root = Path(__file__).parents[3] / "pypto"
++    saved = {
++        name: module
++        for name, module in sys.modules.items()
++        if name == "pypto" or name.startswith("pypto.")
++    }
++    for name in list(saved):
++        del sys.modules[name]
++    package = types.ModuleType("pypto")
++    package.__path__ = [str(package_root)]
++    sys.modules["pypto"] = package
++    try:
++        import pypto.framework as framework
++        from pypto.framework.errors import PyPTOXUnsupportedError
++        from pypto.framework.linear_kernel import LinearKernelCache, linear_target, normalize_dtype
++        return locals()
++    finally:
++        for name in list(sys.modules):
++            if name == "pypto" or name.startswith("pypto."):
++                del sys.modules[name]
++        sys.modules.update(saved)
++
++
++_C = _imports()
++framework = _C["framework"]
++PyPTOXUnsupportedError = _C["PyPTOXUnsupportedError"]
++LinearKernelCache = _C["LinearKernelCache"]
++linear_target = _C["linear_target"]
++normalize_dtype = _C["normalize_dtype"]
++
++
++def test_framework_import_does_not_import_torch():
++    torch_was_loaded = "torch" in sys.modules
++    saved = {
++        name: module
++        for name, module in sys.modules.items()
++        if name == "pypto" or name.startswith("pypto.")
++    }
++    for name in list(saved):
++        del sys.modules[name]
++    package = types.ModuleType("pypto")
++    package.__path__ = [str(Path(__file__).parents[3] / "pypto")]
++    sys.modules["pypto"] = package
++    try:
++        import pypto.framework  # noqa: F401
++
++        assert ("torch" in sys.modules) is torch_was_loaded
++    finally:
++        for name in list(sys.modules):
++            if name == "pypto" or name.startswith("pypto."):
++                del sys.modules[name]
++        sys.modules.update(saved)
++
++
++def test_register_torch_ops_without_torch_is_a_structured_error():
++    if importlib.util.find_spec("torch") is not None:
++        pytest.skip("torch is installed in this interpreter; laziness is tested in the torch suite")
++    with pytest.raises(framework.PyPTOXBridgeError) as info:
++        framework.register_torch_ops()
++    assert info.value.reason_code == "torch_missing"
++    assert framework.torch_available() is False
++
++
++def test_dtype_normalisation_and_target_features():
++    assert normalize_dtype("bfloat16") == "bf16"
++    assert normalize_dtype("float32") == "float32"
++    with pytest.raises(PyPTOXUnsupportedError) as info:
++        normalize_dtype("float64")
++    assert info.value.reason_code == "dtype_unsupported"
++
++    bf16 = linear_target("bf16")
++    f32 = linear_target("float32")
++    assert bf16.kind == "cpu"
++    assert bf16.triple.startswith("x86_64")
++    assert "avx512bf16" in bf16.features
++    assert "avx512bf16" not in f32.features
++    assert bf16.features != f32.features
++
++
++def test_kernel_cache_key_is_stable_and_input_sensitive():
++    cache = LinearKernelCache(cache_dir=None, disk_cache=False)
++    base = cache.key("bf16", 2, 6, 10)
++    assert base.digest == cache.key("bf16", 2, 6, 10).digest
++    assert base.digest != cache.key("bf16", 2, 6, 11).digest
++    assert base.digest != cache.key("float32", 2, 6, 10).digest
++    with pytest.raises(PyPTOXUnsupportedError) as info:
++        cache.key("bf16", 0, 6, 10)
++    assert info.value.reason_code == "shape_unsupported"

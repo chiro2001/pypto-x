@@ -1,0 +1,1697 @@
+From 27346193039e8b67f0a203315637a796fe2fe745 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 08:25:39 +0800
+Subject: [PATCH 128/134] feat(pypto-x): execute the torch linear bridge on the
+ packed plane (W8J J1.1)
+
+Switch pypto/framework from the legacy ptx_avx512_matmul_<dtype> symbol to the
+W8B packed/blocked plane: the weight handle is now the native 64x64 tile
+payload produced by ptx_avx512_pack_matmul_{f32,bf16} and the hot path calls
+ptx_avx512_matmul_packed_{f32,bf16}.
+
+- weight_pack: handle v2 (layout id, tile element count), native packer is the
+  single source of truth for the layout; numpy stays out of the import path.
+- linear_kernel: require exactly one packed matmul contract in the artifact,
+  cross-check the recomputed contract against artifact metadata, and execute
+  the same contract's gemm/pack kernels. declared_plane == executed_plane ==
+  packed is an invariant. The cache key gains the packed contract envelope and
+  key_version=2, so J1 legacy-plane sidecars are a natural miss.
+- torch_ops: pack_weight writes the native tile payload directly into the
+  handle; linear_prepacked parses and runs it.
+- tests: plane pin => packed, packed==legacy bitwise matrix, native tile
+  layout reference, J1 sidecar natural miss, tile constants pinned to the
+  compiler/runtime.
+---
+ python/pypto/framework/__init__.py                            |  15 +-
+ python/pypto/framework/linear_kernel.py                       | 527 ++++++++++++++++++++++++++----
+ python/pypto/framework/torch_bridge.py                        |  35 +-
+ python/pypto/framework/torch_ops.py                           |  63 +++-
+ python/pypto/framework/weight_pack.py                         | 264 +++++++++------
+ python/tests/framework_torch/test_torch_linear_cache.py       |  86 ++++-
+ python/tests/framework_torch/test_torch_linear_correctness.py | 130 +++++++-
+ python/tests/ut/pypto_x/test_framework_torch_optional.py      |  28 ++
+ 8 files changed, 929 insertions(+), 219 deletions(-)
+
+diff --git a/python/pypto/framework/__init__.py b/python/pypto/framework/__init__.py
+index 4cc9af413..a97f94a5d 100644
+--- a/python/pypto/framework/__init__.py
++++ b/python/pypto/framework/__init__.py
+@@ -7,11 +7,16 @@ dependency and stays lazy until the caller explicitly registers the ops::
+     import pypto.framework
+     pypto.framework.register_torch_ops()   # imports torch, registers torch.ops.pypto_x.*
+ 
+-What J1 provides:
+-
+-* :mod:`pypto.framework.linear_kernel` - one compiled AVX-512 matmul Core IR
+-  program per ``(dtype, M, K, N, target)`` with an in-process and a
+-  cross-process (disk sidecar) cache;
++What J1.1 provides:
++
++* :mod:`pypto.framework.linear_kernel` - one compiled AVX-512 packed-matmul
++  Core IR program per ``(dtype, M, K, N, target)`` with an in-process and a
++  cross-process (disk sidecar) cache.  The executed kernel is the W8B
++  packed/blocked plane (``ptx_avx512_matmul_packed_*``) and the cache key
++  embeds the packed contract version, so J1 legacy-plane sidecars are never
++  reused;
++* :mod:`pypto.framework.weight_pack` - self-describing W8B 64x64 tile
++  packed-weight handle format (native ``ptx_avx512_pack_matmul_*`` payload);
+ * :mod:`pypto.framework.torch_bridge` - explicit zero-copy-first CPU tensor
+   conversion with documented copy counts;
+ * :mod:`pypto.framework.torch_ops` - ``torch.ops.pypto_x.linear`` fail-open,
+diff --git a/python/pypto/framework/linear_kernel.py b/python/pypto/framework/linear_kernel.py
+index 01a4a10c5..a994e6b94 100644
+--- a/python/pypto/framework/linear_kernel.py
++++ b/python/pypto/framework/linear_kernel.py
+@@ -3,18 +3,26 @@
+ J0 established that rebuilding a Core IR graph per call is not viable inside
+ an inference hot path.  This module compiles *one* rank-2 matmul CoreProgram
+ per ``(dtype, M, K, N, target)`` tuple, loads it through the public AVX-512
+-runtime once, and then exposes a direct native-symbol invocation for that
+-kernel.  The cache key and invalidation rules are explicit:
++runtime once, and then exposes a direct native invocation for that kernel.
++
++J1.1 switch: the linear kernel executes the W8B **packed/blocked** plane
++(``ptx_avx512_pack_matmul_{f32,bf16}`` + ``ptx_avx512_matmul_packed_*``) and
++pre-packs the static right operand instead of feeding the legacy
++``ptx_avx512_matmul_<dtype>`` symbol a plain ``(K, N)`` transpose.  The
++artifact plan, the recomputed packed dispatch and the executed symbol are
++cross-checked at load time, so ``declared_plane == executed_plane == packed``
++is an invariant rather than a report field.  The cache key embeds the packed
++contract version, so J1 (legacy-plane) sidecars are a natural miss.
+ 
+ * memory hit  - same process, same key: no Core IR rebuild, no compile;
+ * disk hit    - a previous process compiled the same key: the immutable
+   artifact metadata is loaded from a sidecar next to the content-addressed
+   ``.so`` and re-validated by ``Avx512Runtime.load``; no clang invocation;
+ * invalidation - the key embeds the AVX-512 lowering version, artifact
+-  payload/ABI/format versions, the target dict and a bridge key version.
+-  A stale or tampered sidecar fails runtime validation and is rebuilt.
+-  ``PYPTO_X_TORCH_CACHE_DIR`` selects the directory; deleting it forces a
+-  cold rebuild.
++  payload/ABI/format versions, the packed contract version, the target dict
++  and a bridge key version.  A stale or tampered sidecar fails runtime
++  validation and is rebuilt.  ``PYPTO_X_TORCH_CACHE_DIR`` selects the
++  directory; deleting it forces a cold rebuild.
+ 
+ This module deliberately imports no torch and no numpy, so the kernel cache
+ can be inspected from the torch-free test suite.
+@@ -23,7 +31,7 @@ can be inspected from the torch-free test suite.
+ from __future__ import annotations
+ 
+ from collections import OrderedDict
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ import ctypes
+ import errno
+ import hashlib
+@@ -36,13 +44,27 @@ import tempfile
+ import time
+ from typing import Any, Dict, Mapping, Optional, Tuple
+ 
+-from pypto.backends.cpu.x86 import Avx512Runtime
+-from pypto.backends.cpu.x86.avx512 import CpuAvx512RuntimeError
++from pypto.backends.cpu.x86.avx512 import (
++    Avx512Runtime,
++    CpuAvx512RuntimeError,
++    _NativeBuffer,
++    _call_packed_matmul,
++    _call_packed_matmul_pack,
++    _ctype,
++    _pointer,
++    _resolve_gemm_threads,
++    packed_matmul_pack_elements,
++)
+ from pypto.compiler import CompileOptions
+ from pypto.compiler.artifact import ABI_VERSION, ARTIFACT_FORMAT_VERSION, Artifact
+ from pypto.compiler.targets.cpu_avx512 import (
+     ARTIFACT_PAYLOAD_VERSION,
+     DEFAULT_ARTIFACT_FORMAT,
++    PACKED_GEMM_KERNEL_VERSION,
++    PACKED_GEMM_K_TILE,
++    PACKED_GEMM_LAYOUT_VERSION,
++    PACKED_GEMM_MODE,
++    PACKED_GEMM_N_TILE,
+     Avx512CompileError,
+     Avx512Compiler,
+     packed_matmul_dispatch,
+@@ -52,15 +74,46 @@ from pypto.lowering.cpu.x86.avx512 import AVX512_LOWERING_VERSION
+ from pypto.target import TargetSpec
+ 
+ from .errors import PyPTOXBridgeError, PyPTOXBuildError, PyPTOXUnsupportedError
++from .weight_pack import (
++    PACK_LAYOUT_AVX512_TILE64,
++    PACK_VERSION as WEIGHT_PACK_FORMAT_VERSION,
++    PackedWeight,
++    layout_elements,
++    wrap_packed_payload,
++)
+ 
+ 
+-LINEAR_KERNEL_CACHE_VERSION = 1
+-_DTYPE_NATIVE_SUFFIX = {"float32": "f32", "bf16": "bf16"}
++#: Bumped to 2 by the J1.1 packed-plane switch: the key gained the packed
++#: contract envelope and the execution plane changed.  J1 sidecars use
++#: ``key_version=1`` and can never be a disk hit.
++LINEAR_KERNEL_CACHE_VERSION = 2
++#: Bridge-side packed contract envelope version (independent of the compiler's
++#: PACKED_GEMM_KERNEL_VERSION/LAYOUT_VERSION, which are embedded as well).
++PACKED_CONTRACT_VERSION = 1
+ _SUPPORTED_DTYPES = ("bf16", "float32")
+ _DEFAULT_MAX_ENTRIES = 512
+ _SIDECAR_PREFIX = "pypto_x_linear_"
+ 
+ 
++def packed_contract_versions() -> Dict[str, Any]:
++    """Return the version envelope that identifies the packed execution plane.
++
++    Every field that can change the packed payload layout, the pack kernel, the
++    GEMM kernel or the accumulation contract is part of the kernel cache key.
++    """
++
++    return {
++        "bridge_version": PACKED_CONTRACT_VERSION,
++        "weight_format_version": WEIGHT_PACK_FORMAT_VERSION,
++        "weight_layout": PACK_LAYOUT_AVX512_TILE64,
++        "mode": PACKED_GEMM_MODE,
++        "compiler_kernel_version": PACKED_GEMM_KERNEL_VERSION,
++        "compiler_layout_version": PACKED_GEMM_LAYOUT_VERSION,
++        "k_tile": PACKED_GEMM_K_TILE,
++        "n_tile": PACKED_GEMM_N_TILE,
++    }
++
++
+ def normalize_dtype(dtype: Any) -> str:
+     """Return the canonical bridge dtype name or raise ``Unsupported``."""
+ 
+@@ -108,6 +161,7 @@ class LinearKernelKey:
+     abi_version: str = ABI_VERSION
+     format_version: int = ARTIFACT_FORMAT_VERSION
+     key_version: int = LINEAR_KERNEL_CACHE_VERSION
++    packed_contract_version: Mapping[str, Any] = field(default_factory=packed_contract_versions)
+ 
+     def to_dict(self) -> Dict[str, Any]:
+         return {
+@@ -122,6 +176,7 @@ class LinearKernelKey:
+             "payload_version": self.payload_version,
+             "abi_version": self.abi_version,
+             "format_version": self.format_version,
++            "packed_contract": dict(self.packed_contract_version),
+         }
+ 
+     @property
+@@ -138,11 +193,11 @@ class LinearKernelKey:
+ 
+ 
+ class LinearKernelEntry:
+-    """A loaded AVX-512 matmul artifact plus its direct native entry point."""
++    """A loaded AVX-512 packed-matmul artifact plus its native entry points."""
+ 
+     __slots__ = (
+-        "key", "artifact", "loaded", "_native", "m", "k", "n", "dtype",
+-        "disk_backed", "declared_plane",
++        "key", "artifact", "loaded", "m", "k", "n", "dtype",
++        "disk_backed", "packed_contract", "_gemm_threads",
+     )
+ 
+     def __init__(
+@@ -150,44 +205,92 @@ class LinearKernelEntry:
+         key: LinearKernelKey,
+         artifact: Artifact,
+         loaded: Any,
+-        native: Any,
++        packed_contract: Mapping[str, Any],
+         *,
+         disk_backed: bool,
+-        declared_plane: str = "legacy",
++        gemm_threads: int,
+     ) -> None:
+         self.key = key
+         self.artifact = artifact
+         self.loaded = loaded
+-        self._native = native
+         self.m = key.m
+         self.k = key.k
+         self.n = key.n
+         self.dtype = key.dtype
+         self.disk_backed = bool(disk_backed)
+-        # The artifact payload 4 packed plane is declared by the plan; this
+-        # bridge executes the legacy ZMM symbol for the plan dtype.  Keep the
+-        # divergence explicit in the entry metadata (and in the report) so a
+-        # future switch to the packed plane is visible instead of silent.
+-        self.declared_plane = str(declared_plane)
++        self.packed_contract = dict(packed_contract)
++        self._gemm_threads = int(gemm_threads)
+ 
++    # -- declared / executed plane -------------------------------------
+     @property
+-    def native_symbol(self) -> str:
+-        return "ptx_avx512_matmul_{}".format(_DTYPE_NATIVE_SUFFIX[self.dtype])
++    def declared_plane(self) -> str:
++        """The plane the immutable artifact plan declares."""
++
++        return "packed"
+ 
+     @property
+     def executed_plane(self) -> str:
+-        return "legacy_avx512_zmm"
++        """The plane this entry actually calls (cross-checked at load)."""
++
++        return "packed"
++
++    @property
++    def native_symbol(self) -> str:
++        return "ptx_avx512_{}".format(self.packed_contract["gemm_kernel"])
++
++    @property
++    def pack_symbol(self) -> str:
++        return "ptx_avx512_{}".format(self.packed_contract["pack_kernel"])
++
++    @property
++    def gemm_kernel(self) -> str:
++        return str(self.packed_contract["gemm_kernel"])
++
++    @property
++    def pack_kernel(self) -> str:
++        return str(self.packed_contract["pack_kernel"])
++
++    @property
++    def packed_dtype(self) -> str:
++        return str(self.packed_contract["pack_dtype"])
+ 
+-    def invoke(self, left_address: int, right_address: int, output_address: int) -> None:
+-        """Call the single native matmul kernel with raw buffer addresses."""
++    @property
++    def gemm_threads(self) -> int:
++        return self._gemm_threads
++
++    @property
++    def packed_elements(self) -> int:
++        return packed_matmul_pack_elements(self.k, self.n)
++
++    def invoke(self, left_address: int, packed_address: int, output_address: int) -> None:
++        """Run the packed GEMM on raw buffer addresses (no dispatch overhead)."""
+ 
+-        self._native(
+-            int(left_address),
+-            int(right_address),
+-            int(output_address),
++        if int(self.packed_elements) != layout_elements(
++            self.k, self.n, PACK_LAYOUT_AVX512_TILE64
++        ):
++            raise PyPTOXBuildError(
++                "packed payload element count disagrees with the native pack contract",
++                reason_code="packed_contract_mismatch",
++                details={
++                    "native_elements": int(self.packed_elements),
++                    "bridge_elements": int(layout_elements(self.k, self.n)),
++                },
++            )
++        left = _native_buffer(self.dtype, self.m * self.k, left_address)
++        packed = _native_buffer(self.packed_dtype, self.packed_elements, packed_address)
++        output = _native_buffer(self.dtype, self.m * self.n, output_address)
++        _call_packed_matmul(
++            self.loaded.module,
++            self.gemm_kernel,
++            self.dtype,
++            self.packed_dtype,
++            left,
++            packed,
++            output,
+             self.m,
+             self.k,
+             self.n,
++            self._gemm_threads,
+         )
+ 
+     def to_dict(self) -> Mapping[str, Any]:
+@@ -196,6 +299,13 @@ class LinearKernelEntry:
+             "digest": self.key.digest,
+             "artifact_digest": self.artifact.content_digest,
+             "native_symbol": self.native_symbol,
++            "pack_symbol": self.pack_symbol,
++            "gemm_kernel": self.gemm_kernel,
++            "pack_kernel": self.pack_kernel,
++            "packed_dtype": self.packed_dtype,
++            "packed_elements": int(self.packed_elements),
++            "gemm_threads": self._gemm_threads,
++            "packed_contract": dict(self.packed_contract),
+             "native_variant": getattr(self.loaded.target_ir, "native_variant", None),
+             "declared_plane": self.declared_plane,
+             "executed_plane": self.executed_plane,
+@@ -233,6 +343,19 @@ def _sha256_file(path: Path) -> Optional[str]:
+         return None
+ 
+ 
++def _native_buffer(dtype: str, count: int, address: int) -> _NativeBuffer:
++    """Wrap a raw integer address as a runtime ``_NativeBuffer`` (no copy)."""
++
++    if int(count) < 0:
++        raise PyPTOXBuildError(
++            "native buffer count must not be negative",
++            reason_code="packed_contract_mismatch",
++            details={"count": int(count)},
++        )
++    pointer = ctypes.cast(ctypes.c_void_p(int(address)), _pointer(dtype))
++    return _NativeBuffer(dtype, int(count), pointer, None, True)
++
++
+ def _matmul_program(dtype: str, m: int, k: int, n: int) -> CoreProgram:
+     left_type = CoreType.tensor(dtype, (m, k))
+     right_type = CoreType.tensor(dtype, (k, n))
+@@ -249,7 +372,162 @@ def _matmul_program(dtype: str, m: int, k: int, n: int) -> CoreProgram:
+     return CoreProgram(functions=(function,))
+ 
+ 
+-def _resolve_native(loaded: Any, key: LinearKernelKey, artifact: Artifact) -> Any:
++def _require_packed_contract(
++    target_ir: Any, metadata: Mapping[str, Any], key: LinearKernelKey
++) -> Dict[str, Any]:
++    """Return the one packed matmul contract, or fail closed.
++
++    The contract is recomputed from the immutable lowered program with the same
++    predicate that wrote ``artifact.metadata``; the two are then compared field
++    by field, so a declared packed plan can never silently execute a legacy
++    kernel or a different GEMM kernel.
++    """
++
++    try:
++        packed, legacy = packed_matmul_dispatch(target_ir)
++    except Exception as exc:  # predicate failure is a build/load error, not a fallback
++        raise PyPTOXBuildError(
++            "PyPTO-X linear artifact packed dispatch failed: {}".format(exc),
++            reason_code="packed_contract_missing",
++            details={"exception": type(exc).__name__},
++        ) from exc
++    if len(packed) != 1 or legacy:
++        raise PyPTOXBuildError(
++            "PyPTO-X linear artifact must declare exactly one packed rank-2 matmul",
++            reason_code="packed_contract_missing",
++            details={
++                "packed_plans": sorted(int(index) for index in packed),
++                "legacy_plans": sorted(int(index) for index in legacy),
++            },
++        )
++    contract = dict(next(iter(packed.values())))
++    if int(contract.get("operation_index", -1)) != 0:
++        raise PyPTOXBuildError(
++            "PyPTO-X linear packed contract is not operation 0",
++            reason_code="packed_contract_mismatch",
++            details={"operation_index": contract.get("operation_index")},
++        )
++    if contract.get("mode") != PACKED_GEMM_MODE:
++        raise PyPTOXBuildError(
++            "PyPTO-X linear packed contract mode {!r} is not {!r}".format(
++                contract.get("mode"), PACKED_GEMM_MODE
++            ),
++            reason_code="packed_contract_mismatch",
++            details={"mode": contract.get("mode")},
++        )
++    if (int(contract.get("k_tile", 0)), int(contract.get("n_tile", 0))) != (
++        PACKED_GEMM_K_TILE,
++        PACKED_GEMM_N_TILE,
++    ):
++        raise PyPTOXBuildError(
++            "PyPTO-X linear packed contract tile {} is not the bridge layout {}x{}".format(
++                (contract.get("k_tile"), contract.get("n_tile")),
++                PACKED_GEMM_K_TILE,
++                PACKED_GEMM_N_TILE,
++            ),
++            reason_code="packed_contract_mismatch",
++            details={
++                "k_tile": contract.get("k_tile"),
++                "n_tile": contract.get("n_tile"),
++                "bridge_k_tile": PACKED_GEMM_K_TILE,
++                "bridge_n_tile": PACKED_GEMM_N_TILE,
++            },
++        )
++    if int(contract.get("layout_version", -1)) != PACKED_GEMM_LAYOUT_VERSION:
++        raise PyPTOXBuildError(
++            "PyPTO-X linear packed contract layout version {} is not {}".format(
++                contract.get("layout_version"), PACKED_GEMM_LAYOUT_VERSION
++            ),
++            reason_code="packed_contract_mismatch",
++            details={"layout_version": contract.get("layout_version")},
++        )
++    if (
++        contract.get("dtype") != key.dtype
++        or contract.get("source_dtype") != key.dtype
++        or contract.get("pack_dtype") != key.dtype
++    ):
++        raise PyPTOXBuildError(
++            "PyPTO-X linear packed contract dtypes {!r}/{!r}/{!r} do not match {!r}".format(
++                contract.get("dtype"), contract.get("source_dtype"), contract.get("pack_dtype"),
++                key.dtype,
++            ),
++            reason_code="packed_contract_mismatch",
++            details={
++                "dtype": contract.get("dtype"),
++                "source_dtype": contract.get("source_dtype"),
++                "pack_dtype": contract.get("pack_dtype"),
++                "key_dtype": key.dtype,
++            },
++        )
++    if (int(contract.get("m", 0)), int(contract.get("k", 0)), int(contract.get("n", 0))) != (
++        key.m, key.k, key.n
++    ):
++        raise PyPTOXBuildError(
++            "PyPTO-X linear packed contract shape {} does not match key {}".format(
++                (contract.get("m"), contract.get("k"), contract.get("n")),
++                (key.m, key.k, key.n),
++            ),
++            reason_code="packed_contract_mismatch",
++        )
++
++    declared = metadata.get("packed_matmul_operations")
++    if declared is None:
++        raise PyPTOXBuildError(
++            "PyPTO-X linear artifact metadata has no packed_matmul_operations entry",
++            reason_code="packed_contract_missing",
++        )
++    declared_list = [dict(entry) for entry in declared]
++    if len(declared_list) != 1:
++        raise PyPTOXBuildError(
++            "PyPTO-X linear artifact metadata declares {} packed matmuls, expected 1".format(
++                len(declared_list)
++            ),
++            reason_code="packed_contract_mismatch",
++            details={"declared": len(declared_list)},
++        )
++    declared_contract = declared_list[0]
++    for name in ("mode", "gemm_kernel", "pack_kernel", "pack_dtype", "source_dtype", "dtype"):
++        if declared_contract.get(name) != contract.get(name):
++            raise PyPTOXBuildError(
++                "PyPTO-X linear packed contract {!r} disagrees with artifact metadata".format(name),
++                reason_code="packed_contract_mismatch",
++                details={
++                    "field": name,
++                    "artifact": declared_contract.get(name),
++                    "program": contract.get(name),
++                },
++            )
++    if metadata.get("packed_matmul_mode") not in (None, PACKED_GEMM_MODE):
++        raise PyPTOXBuildError(
++            "PyPTO-X linear artifact metadata packed mode is not {!r}".format(PACKED_GEMM_MODE),
++            reason_code="packed_contract_mismatch",
++            details={"packed_matmul_mode": metadata.get("packed_matmul_mode")},
++        )
++    for metadata_name, value in (
++        ("packed_matmul_k_tile", PACKED_GEMM_K_TILE),
++        ("packed_matmul_n_tile", PACKED_GEMM_N_TILE),
++        ("packed_matmul_layout_version", PACKED_GEMM_LAYOUT_VERSION),
++        ("packed_matmul_kernel_version", PACKED_GEMM_KERNEL_VERSION),
++    ):
++        declared_value = metadata.get(metadata_name)
++        if declared_value is None:
++            continue
++        if int(declared_value) != int(value):
++            raise PyPTOXBuildError(
++                "PyPTO-X linear artifact metadata {}={!r} does not match {!r}".format(
++                    metadata_name, declared_value, value
++                ),
++                reason_code="packed_contract_mismatch",
++                details={"metadata": metadata_name, "artifact": declared_value, "expected": value},
++            )
++    return contract
++
++
++def _resolve_native(
++    loaded: Any, key: LinearKernelKey, artifact: Artifact
++) -> Dict[str, Any]:
++    """Validate the single-plan artifact and return its packed contract."""
++
+     plans = tuple(getattr(loaded.target_ir, "plans", ()))
+     if len(plans) != 1:
+         raise PyPTOXBuildError(
+@@ -288,30 +566,19 @@ def _resolve_native(loaded: Any, key: LinearKernelKey, artifact: Artifact) -> An
+             reason_code="kernel_plan_mismatch",
+             details={"plan_dtype": str(getattr(plan, "dtype", None)), "key_dtype": key.dtype},
+         )
+-    symbol = "ptx_avx512_matmul_{}".format(_DTYPE_NATIVE_SUFFIX[key.dtype])
+-    try:
+-        native = getattr(loaded.module, symbol)
+-    except AttributeError as exc:
+-        raise PyPTOXBuildError(
+-            "PyPTO-X AVX-512 artifact does not export {!r}".format(symbol),
+-            reason_code="kernel_symbol_missing",
+-            details={"symbol": symbol, "artifact_digest": artifact.content_digest},
+-        ) from exc
+-    native.argtypes = [
+-        ctypes.c_void_p,
+-        ctypes.c_void_p,
+-        ctypes.c_void_p,
+-        ctypes.c_size_t,
+-        ctypes.c_size_t,
+-        ctypes.c_size_t,
+-    ]
+-    native.restype = None
+-    try:
+-        packed, _legacy = packed_matmul_dispatch(loaded.target_ir)
+-        declared = "packed" if packed else "legacy"
+-    except Exception:  # metadata/diagnostic only: never fail the build here
+-        declared = "unknown"
+-    return native, declared
++    metadata = dict(artifact.metadata)
++    contract = _require_packed_contract(loaded.target_ir, metadata, key)
++    for symbol in (
++        "ptx_avx512_{}".format(contract["gemm_kernel"]),
++        "ptx_avx512_{}".format(contract["pack_kernel"]),
++    ):
++        if not hasattr(loaded.module, symbol):
++            raise PyPTOXBuildError(
++                "PyPTO-X AVX-512 artifact does not export {!r}".format(symbol),
++                reason_code="kernel_symbol_missing",
++                details={"symbol": symbol, "artifact_digest": artifact.content_digest},
++            )
++    return contract
+ 
+ 
+ class LinearKernelCache:
+@@ -326,6 +593,7 @@ class LinearKernelCache:
+         max_entries: int = _DEFAULT_MAX_ENTRIES,
+         build_dir: Optional[Any] = None,
+         clang: Optional[str] = None,
++        gemm_threads: Optional[int] = None,
+     ) -> None:
+         if max_entries <= 0:
+             raise ValueError("max_entries must be positive")
+@@ -340,6 +608,8 @@ class LinearKernelCache:
+         self._build_dir = Path(os.fspath(build_dir)).expanduser() if build_dir is not None else None
+         self._clang = str(clang) if clang is not None else None
+         self._max_entries = int(max_entries)
++        self._gemm_threads_override = gemm_threads
++        self._gemm_threads_resolved: Optional[int] = None
+         self._stats: Dict[str, int] = {
+             "kernel_builds": 0,
+             "memory_hits": 0,
+@@ -349,6 +619,7 @@ class LinearKernelCache:
+             "quarantined": 0,
+             "build_failures": 0,
+             "unsupported": 0,
++            "weight_packs": 0,
+         }
+         self._last_disk_error: Optional[str] = None
+ 
+@@ -363,12 +634,28 @@ class LinearKernelCache:
+     def disk_cache(self) -> bool:
+         return self._disk_cache
+ 
++    def _resolve_threads(self) -> int:
++        """Resolve and cache the bounded packed-GEMM thread count."""
++
++        with self._lock:
++            if self._gemm_threads_resolved is None:
++                self._gemm_threads_resolved = _resolve_gemm_threads(self._gemm_threads_override)
++            return self._gemm_threads_resolved
++
++    @property
++    def gemm_threads(self) -> int:
++        return self._resolve_threads()
++
+     @property
+     def stats(self) -> Mapping[str, int]:
+         with self._lock:
+             return dict(self._stats)
+ 
+     def to_dict(self) -> Mapping[str, Any]:
++        try:
++            gemm_threads: Optional[int] = self._resolve_threads()
++        except Exception:
++            gemm_threads = None
+         with self._lock:
+             return {
+                 "cache_dir": str(self.cache_dir) if self.cache_dir is not None else None,
+@@ -376,6 +663,7 @@ class LinearKernelCache:
+                 "entries": len(self._memory),
+                 "max_entries": self._max_entries,
+                 "clang": self._clang,
++                "gemm_threads": gemm_threads,
+                 "stats": dict(self._stats),
+                 "last_disk_error": self._last_disk_error,
+             }
+@@ -473,6 +761,121 @@ class LinearKernelCache:
+                 self._digests.pop(evicted, None)
+             return entry
+ 
++    # -- weight packing (W8B packed plane) -----------------------------
++    def pack_contract(self, dtype: str) -> Mapping[str, Any]:
++        """Return the packed contract of the dtype's native pack module."""
++
++        return dict(self.get(normalize_dtype(dtype), 1, 1, 1).packed_contract)
++
++    def pack_into(
++        self,
++        dtype: str,
++        k: int,
++        n: int,
++        *,
++        source_address: int,
++        destination_address: int,
++        source_k_stride: Optional[int] = None,
++        source_n_stride: Optional[int] = None,
++    ) -> int:
++        """Pack a ``(N, K)`` or ``(K, N)`` source into a caller buffer.
++
++        The native pack module is the smallest compiled artifact of the same
++        dtype (the pack kernel is a shared target entry point, independent of
++        M), so packing does not need a shape-specific GEMM artifact.  Returns
++        the packed element count.
++        """
++
++        dtype = normalize_dtype(dtype)
++        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in (k, n)):
++            raise PyPTOXUnsupportedError(
++                "PyPTO-X weight pack requires positive K/N, got ({}, {})".format(k, n),
++                reason_code="shape_unsupported",
++                details={"k": k, "n": n},
++            )
++        if source_k_stride is None and source_n_stride is None:
++            # A C-contiguous (K, N) source.
++            source_k_stride, source_n_stride = int(n), 1
++        elif source_k_stride is None or source_n_stride is None:
++            raise PyPTOXUnsupportedError(
++                "PyPTO-X weight pack needs both source strides or neither",
++                reason_code="shape_unsupported",
++                details={"source_k_stride": source_k_stride, "source_n_stride": source_n_stride},
++            )
++        else:
++            for name, value in (("source_k_stride", source_k_stride), ("source_n_stride", source_n_stride)):
++                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
++                    raise PyPTOXUnsupportedError(
++                        "PyPTO-X weight pack {} must be a positive integer".format(name),
++                        reason_code="shape_unsupported",
++                        details={name: value},
++                    )
++        entry = self.get(dtype, 1, 1, 1)
++        contract = entry.packed_contract
++        source_dtype = normalize_dtype(contract["source_dtype"])
++        packed_dtype = normalize_dtype(contract["pack_dtype"])
++        if source_dtype != dtype or packed_dtype != dtype:
++            raise PyPTOXBuildError(
++                "PyPTO-X pack module dtypes {!r}/{!r} do not match {!r}".format(
++                    source_dtype, packed_dtype, dtype
++                ),
++                reason_code="packed_contract_mismatch",
++                details={"source_dtype": source_dtype, "pack_dtype": packed_dtype, "dtype": dtype},
++            )
++        count = int(packed_matmul_pack_elements(k, n))
++        if count != int(layout_elements(k, n, PACK_LAYOUT_AVX512_TILE64)):
++            raise PyPTOXBuildError(
++                "PyPTO-X native pack element count {} disagrees with the bridge layout {}".format(
++                    count, layout_elements(k, n, PACK_LAYOUT_AVX512_TILE64)
++                ),
++                reason_code="packed_contract_mismatch",
++                details={"native": count, "bridge": int(layout_elements(k, n, PACK_LAYOUT_AVX512_TILE64))},
++            )
++        source = _native_buffer(source_dtype, int(k) * int(n), source_address)
++        packed = _native_buffer(packed_dtype, count, destination_address)
++        _call_packed_matmul_pack(
++            entry.loaded.module,
++            entry.pack_kernel,
++            source,
++            packed,
++            int(k),
++            int(n),
++            int(source_k_stride),
++            int(source_n_stride),
++        )
++        with self._lock:
++            self._stats["weight_packs"] += 1
++        return count
++
++    def pack_payload(
++        self,
++        dtype: str,
++        k: int,
++        n: int,
++        source_address: int,
++        *,
++        source_k_stride: Optional[int] = None,
++        source_n_stride: Optional[int] = None,
++    ) -> PackedWeight:
++        """Native-pack a source into a fresh ``PackedWeight`` payload."""
++
++        dtype = normalize_dtype(dtype)
++        packed_dtype = normalize_dtype(self.get(dtype, 1, 1, 1).packed_contract["pack_dtype"])
++        count = int(packed_matmul_pack_elements(k, n))
++        buffer = (_ctype(packed_dtype) * count)()
++        self.pack_into(
++            dtype,
++            k,
++            n,
++            source_address=source_address,
++            destination_address=int(ctypes.addressof(buffer)),
++            source_k_stride=source_k_stride,
++            source_n_stride=source_n_stride,
++        )
++        return wrap_packed_payload(
++            buffer, k, n, dtype, PACK_LAYOUT_AVX512_TILE64, native=True
++        )
++
+     # -- disk tier -----------------------------------------------------
+     def _sidecar(self, digest: str) -> Path:
+         return self.cache_dir / "{}{}.json".format(_SIDECAR_PREFIX, digest[:32])
+@@ -503,7 +906,7 @@ class LinearKernelCache:
+                 format_version=data["format_version"],
+             )
+             loaded = runtime.load(artifact)
+-            native, declared_plane = _resolve_native(loaded, key, artifact)
++            contract = _resolve_native(loaded, key, artifact)
+         except Exception as exc:  # sidecar/artifact is untrusted input: repair by rebuilding
+             self._stats["load_failures"] += 1
+             self._last_disk_error = "{}: {}".format(type(exc).__name__, exc)
+@@ -516,7 +919,8 @@ class LinearKernelCache:
+             return None
+         self._stats["disk_hits"] += 1
+         return LinearKernelEntry(
+-            key, artifact, loaded, native, disk_backed=True, declared_plane=declared_plane
++            key, artifact, loaded, contract,
++            disk_backed=True, gemm_threads=self._resolve_threads(),
+         )
+ 
+     def _write_sidecar(self, key: LinearKernelKey, artifact: Artifact, digest: str) -> None:
+@@ -630,7 +1034,7 @@ class LinearKernelCache:
+             self._stats["compile_calls"] += 1
+             artifact = compiler.compile(target_ir, options)
+             loaded = runtime.load(artifact)
+-            native, declared_plane = _resolve_native(loaded, key, artifact)
++            contract = _resolve_native(loaded, key, artifact)
+         except PyPTOXBridgeError:
+             raise
+         except Exception as exc:
+@@ -651,7 +1055,8 @@ class LinearKernelCache:
+             ) from exc
+         self._write_sidecar(key, artifact, digest)
+         return LinearKernelEntry(
+-            key, artifact, loaded, native, disk_backed=False, declared_plane=declared_plane
++            key, artifact, loaded, contract,
++            disk_backed=False, gemm_threads=self._resolve_threads(),
+         )
+ 
+     # -- maintenance ---------------------------------------------------
+@@ -695,6 +1100,7 @@ def reset_linear_kernel_cache(cache: Optional[LinearKernelCache] = None) -> None
+ 
+ __all__ = [
+     "LINEAR_KERNEL_CACHE_VERSION",
++    "PACKED_CONTRACT_VERSION",
+     "LinearKernelCache",
+     "build_failure_reason",
+     "LinearKernelEntry",
+@@ -703,5 +1109,6 @@ __all__ = [
+     "linear_kernel_cache",
+     "linear_target",
+     "normalize_dtype",
++    "packed_contract_versions",
+     "reset_linear_kernel_cache",
+ ]
+diff --git a/python/pypto/framework/torch_bridge.py b/python/pypto/framework/torch_bridge.py
+index 18f527e66..eac68db7e 100644
+--- a/python/pypto/framework/torch_bridge.py
++++ b/python/pypto/framework/torch_bridge.py
+@@ -14,11 +14,10 @@ Copy and ownership rules (J1 acceptance requires these to be explicit):
+   copies.  The returned torch tensor owns the memory.
+ * ``packed_tensor_to_view`` parses a packed handle produced by
+   ``pack_weight``; the payload is a zero-copy numpy view of the handle's bytes
+-  (the handle tensor must stay alive while the view is used).
+-* ``pack_view_to_tensor`` (used by ``pack_weight``) copies the transposed
+-  ``(N, K) -> (K, N)`` payload directly into the newly allocated handle
+-  tensor: exactly 1 payload copy, no intermediate bytes object.
+-* No implicit dtype casts and no implicit device transfers happen here.
++  (the handle tensor must stay alive while the view is used).  The J1.1 handle
++  payload is the W8B 64x64 tile layout written by the native pack kernel, not
++  a plain ``(K, N)`` transpose.
++* no implicit dtype casts and no implicit device transfers happen here.
+ """
+ 
+ from __future__ import annotations
+@@ -36,9 +35,6 @@ from .weight_pack import (
+     HEADER_SIZE,
+     PACK_MAGIC,
+     PackedWeight,
+-    header_bytes_for,
+-    numpy_dtype,
+-    packed_size_bytes,
+     parse_packed_bytes,
+ )
+ 
+@@ -374,28 +370,6 @@ def bytes_to_tensor(payload: bytes) -> torch.Tensor:
+     return torch.frombuffer(buffer, dtype=torch.uint8)
+ 
+ 
+-def pack_view_to_tensor(view: BufferView, k: int, n: int) -> torch.Tensor:
+-    """Pack a ``(N, K)`` weight view into a uint8 handle tensor.
+-
+-    The transposed payload is copied **directly into the handle tensor** with
+-    one ``np.copyto``; there is no intermediate bytes object.  This is the
+-    only payload copy performed by ``pack_weight``.
+-    """
+-
+-    size = packed_size_bytes(k, n, view.dtype)
+-    handle = torch.empty(size, dtype=torch.uint8)
+-    array = handle.numpy()
+-    array[:HEADER_SIZE] = np.frombuffer(header_bytes_for(k, n, view.dtype), dtype=np.uint8)
+-    destination = np.frombuffer(
+-        array.data,
+-        dtype=numpy_dtype(view.dtype),
+-        count=int(k) * int(n),
+-        offset=HEADER_SIZE,
+-    ).reshape(int(k), int(n))
+-    np.copyto(destination, view.array.T)
+-    return handle
+-
+-
+ __all__ = [
+     "BufferPointer",
+     "BufferView",
+@@ -406,7 +380,6 @@ __all__ = [
+     "dtype_name",
+     "is_packed_handle",
+     "is_packed_like",
+-    "pack_view_to_tensor",
+     "packed_tensor_to_view",
+     "tensor_to_pointer",
+     "tensor_to_view",
+diff --git a/python/pypto/framework/torch_ops.py b/python/pypto/framework/torch_ops.py
+index 5d4350aca..6d5f70a3c 100644
+--- a/python/pypto/framework/torch_ops.py
++++ b/python/pypto/framework/torch_ops.py
+@@ -11,13 +11,17 @@ Public ops (registered on import, idempotent):
+   raises ``PyPTOXUnsupportedError`` with a structured ``reason_code`` (build
+   failures are the ``PyPTOXBuildError`` subclass).
+ * ``torch.ops.pypto_x.pack_weight(weight)`` - fail-closed one-time BF16/FP32
+-  weight pre-pack into a self-describing 1-D uint8 handle.
++  weight pre-pack into a self-describing 1-D uint8 handle (W8B 64x64 tile
++  layout written by the native ``ptx_avx512_pack_matmul_*`` kernel).
+ * ``torch.ops.pypto_x.linear_prepacked(x, packed, bias=None)`` - fail-closed
+-  kernel call with a handle produced by ``pack_weight``.
++  packed-plane kernel call with a handle produced by ``pack_weight``.
+ 
+ ``linear`` covers exactly rank-2 CPU tensors of dtype BF16/FP32 with matching
+ activation/weight/bias dtype; anything else (rank != 2, float64, int32,
+ requires_grad, M/K/N <= 0, packed handles on the wrong path) is explicit.
++The executed kernel is the W8B packed/blocked plane
++(``ptx_avx512_matmul_packed_*``); ``declared_plane == executed_plane ==
++"packed"`` is enforced at artifact load time.
+ 
+ Autograd is out of scope (J1 is an inference bridge): a ``requires_grad``
+ input takes the fail-open path and the forward matches ``F.linear``.  Torch
+@@ -39,6 +43,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
+ import warnings
+ import weakref
+ 
++import numpy as np
+ import torch
+ 
+ from pypto.backends.cpu.x86.avx512 import CpuAvx512RuntimeError
+@@ -51,12 +56,18 @@ from .torch_bridge import (
+     allocate_output_address,
+     dtype_name,
+     is_packed_like,
+-    pack_view_to_tensor,
+     packed_tensor_to_view,
+     tensor_to_pointer,
+     tensor_to_view,
+ )
+-from .weight_pack import PackedWeight, pack_view, packed_size_bytes
++from .weight_pack import (
++    HEADER_SIZE,
++    PACK_LAYOUT_AVX512_TILE64,
++    PackedWeight,
++    header_bytes_for,
++    layout_elements,
++    packed_size_bytes,
++)
+ 
+ 
+ # --------------------------------------------------------------------------- #
+@@ -312,8 +323,17 @@ def _linear_from_weight_impl(
+     packed = _WEIGHT_CACHE.lookup(weight, dtype, k, n)
+     if packed is None:
+         weight_view = tensor_to_view(weight, dtype=dtype, shape=(n, k), name="weight")
++        # The native W8B pack kernel reads the C-contiguous (N, K) weight with
++        # k contiguous (source_k_stride=1, source_n_stride=K); no explicit
++        # transpose materialisation happens on this path.
+         packed = _WEIGHT_CACHE.store(
+-            weight, dtype, k, n, pack_view(weight_view.array, k=k, n=n, dtype=dtype)
++            weight,
++            dtype,
++            k,
++            n,
++            linear_kernel_cache().pack_payload(
++                dtype, k, n, weight_view.address, source_k_stride=1, source_n_stride=k
++            ),
+         )
+     return _run_kernel(x, m, k, n, dtype, packed.address, bias)
+ 
+@@ -329,6 +349,22 @@ def _packed_contract(x: torch.Tensor, packed: PackedWeight) -> Tuple[int, int, i
+             reason_code="dtype_mismatch",
+             details={"packed_dtype": packed.dtype, "x_dtype": str(x.dtype)},
+         )
++    if packed.layout != PACK_LAYOUT_AVX512_TILE64:
++        raise PyPTOXUnsupportedError(
++            "packed weight layout {} is not the AVX-512 tile layout {}".format(
++                packed.layout, PACK_LAYOUT_AVX512_TILE64
++            ),
++            reason_code="packed_handle_invalid",
++            details={"layout": packed.layout, "expected_layout": PACK_LAYOUT_AVX512_TILE64},
++        )
++    if int(packed.elements) != int(layout_elements(packed.k, packed.n, packed.layout)):
++        raise PyPTOXUnsupportedError(
++            "packed weight payload element count {} does not match layout for ({}, {})".format(
++                packed.elements, packed.k, packed.n
++            ),
++            reason_code="packed_handle_invalid",
++            details={"elements": int(packed.elements), "k": packed.k, "n": packed.n},
++        )
+     m, k = int(x.shape[0]), int(x.shape[1])
+     if k != packed.k:
+         raise PyPTOXUnsupportedError(
+@@ -418,7 +454,22 @@ def _pack_weight_impl(weight: torch.Tensor) -> torch.Tensor:
+             reason_code="requires_grad",
+         )
+     view = tensor_to_view(weight, dtype=dtype, shape=(n, k), name="weight")
+-    return pack_view_to_tensor(view, k=k, n=n)
++    size = packed_size_bytes(k, n, dtype)
++    handle = torch.empty(size, dtype=torch.uint8)
++    array = handle.numpy()
++    array[:HEADER_SIZE] = np.frombuffer(header_bytes_for(k, n, dtype), dtype=np.uint8)
++    # Pack the C-contiguous (N, K) weight directly into the handle payload;
++    # this is the only payload copy made by pack_weight.
++    linear_kernel_cache().pack_into(
++        dtype,
++        k,
++        n,
++        source_address=view.address,
++        destination_address=int(handle.data_ptr()) + HEADER_SIZE,
++        source_k_stride=1,
++        source_n_stride=k,
++    )
++    return handle
+ 
+ 
+ def _linear_prepacked_impl(
+diff --git a/python/pypto/framework/weight_pack.py b/python/pypto/framework/weight_pack.py
+index 3f3234047..bda570f2f 100644
+--- a/python/pypto/framework/weight_pack.py
++++ b/python/pypto/framework/weight_pack.py
+@@ -1,35 +1,33 @@
+-"""Weight pre-packing for the single-kernel PyPTO-X linear bridge.
++"""Weight pre-packing for the single-kernel PyPTO-X linear bridge (J1.1).
+ 
+-The AVX-512 matmul kernel consumes the right operand as a rank-2 ``(K, N)``
+-row-major buffer.  ``torch.nn.functional.linear`` stores the weight as
+-``(N, K)``, so a static weight needs a one-time transpose (and, for the BF16
+-kernel, a one-time BF16 bit copy) instead of doing it inside the per-call hot
+-path.  The packed buffer is self-describing: a fixed 32-byte little-endian
+-header carries magic/version/dtype/K/N, followed by the payload, so a packed
+-handle can be cached on a framework layer and validated on every use.
++J1 stored a plain ``(K, N)`` row-major transpose of the torch weight.  J1.1
++switches the bridge to the W8B **packed/blocked** AVX-512 plane, so the
++payload is no longer a plain matrix: it is the tile layout produced by the
++native ``ptx_avx512_pack_matmul_{f32,bf16}`` kernel (64x64 K/N tiles,
++row-major inside a tile).  The native packer is the single source of truth for
++the layout; this module only describes the self-describing handle format and
++computes sizes.
+ 
+-Layout (all little-endian)::
++Self-describing handle layout (all little-endian, 32-byte header)::
+ 
+     offset  size  field
+     0       4     magic  b"PXLP"
+-    4       2     pack_version (u16)
++    4       2     pack_version (u16, currently 2)
+     6       1     dtype id   (0 = float32, 1 = bf16)
+-    7       1     flags      (reserved, must be 0)
++    7       1     layout id  (1 = avx512 64x64 tile layout)
+     8       8     reserved   (0)
+     16      8     K (u64)
+     24      8     N (u64)
+-    32      ...   payload, C-contiguous (K, N) row-major
+-
+-The payload is a raw byte copy of the kernel operand: ``uint16`` bits for
+-BF16 and ``float32`` for FP32.  Packing copies exactly ``K * N * itemsize``
+-bytes; the header is O(1).
+-
+-Copy accounting: one-time packing performs exactly one payload element copy.
+-:func:`pack_view` materialises ``(N, K) -> (K, N)`` into its own buffer;
+-:func:`pypto.framework.torch_bridge.pack_view_to_tensor` instead copies the
+-transposed payload *directly into the returned handle tensor* (single
+-``np.copyto``), so ``pack_weight`` also performs exactly one payload copy.
+-No copy happens in the per-call hot path.
++    32      ...   tile-packed payload (elements as
++                  ``ceil(K/64) * ceil(N/64) * 64 * 64``, dtype itemsize)
++
++``PackedWeight.payload`` is either a numpy view (when parsed from a handle's
++bytes) or a ctypes array (when produced directly by the native packer in the
++kernel bridge).  ``address`` is valid for both containers.
++
++This module deliberately keeps numpy out of the import path: numpy is imported
++lazily by the helper that has to create a numpy view, and the tile constants
++are plain integers so the torch-free kernel bridge can share them.
+ """
+ 
+ from __future__ import annotations
+@@ -38,46 +36,67 @@ from dataclasses import dataclass
+ import struct
+ from typing import Any
+ 
+-import numpy as np
+-
++import ctypes
+ 
+ PACK_MAGIC = b"PXLP"
+-PACK_VERSION = 1
++#: 2 switches the payload from the J1 row-major transpose to the W8B tile
++#: layout; a 1.x handle can never be mistaken for a 2.x one.
++PACK_VERSION = 2
++#: Payload layout identifiers.  Only the W8B AVX-512 tile layout exists today.
++PACK_LAYOUT_AVX512_TILE64 = 1
++_KNOWN_LAYOUTS = (PACK_LAYOUT_AVX512_TILE64,)
++
++#: Must match ``PACKED_GEMM_K_TILE`` / ``PACKED_GEMM_N_TILE`` in
++#: ``pypto.compiler.targets.cpu_avx512``; a test pins the two together.
++PACKED_GEMM_K_TILE = 64
++PACKED_GEMM_N_TILE = 64
++
+ HEADER_SIZE = 32
++# magic, version, dtype id, layout id, 8 reserved bytes, K, N
+ _HEADER = struct.Struct("<4sHBB8xQQ")
+ _DTYPE_IDS = {"float32": 0, "bf16": 1}
+ _ID_DTYPES = {value: key for key, value in _DTYPE_IDS.items()}
+-_NUMPY_DTYPES = {"float32": np.float32, "bf16": np.uint16}
++_DTYPE_ITEMSIZE = {"float32": 4, "bf16": 2}
+ 
+ 
+ @dataclass(frozen=True)
+ class PackedWeight:
+-    """A validated packed weight: header fields plus a C-contiguous payload."""
++    """A validated packed weight: header fields plus a packed payload."""
+ 
+     dtype: str
+     k: int
+     n: int
+-    payload: np.ndarray
++    payload: Any
++    layout: int = PACK_LAYOUT_AVX512_TILE64
+     copies: int = 0
++    native: bool = False
+ 
+     @property
+     def itemsize(self) -> int:
+-        return int(self.payload.dtype.itemsize)
++        return _DTYPE_ITEMSIZE[self.dtype]
++
++    @property
++    def elements(self) -> int:
++        return layout_elements(self.k, self.n, self.layout)
+ 
+     @property
+     def payload_bytes(self) -> int:
+-        return int(self.payload.nbytes)
++        return int(self.elements) * self.itemsize
+ 
+     @property
+     def address(self) -> int:
+-        return int(self.payload.ctypes.data)
++        payload = self.payload
++        numpy_like = getattr(payload, "ctypes", None)
++        if numpy_like is not None:
++            return int(numpy_like.data)
++        return int(ctypes.addressof(payload))
+ 
+     def header_bytes(self) -> bytes:
+         return _HEADER.pack(
+             PACK_MAGIC,
+             PACK_VERSION,
+             _DTYPE_IDS[self.dtype],
+-            0,
++            int(self.layout),
+             int(self.k),
+             int(self.n),
+         )
+@@ -85,105 +104,166 @@ class PackedWeight:
+     def to_bytes(self) -> bytes:
+         """Return ``header + payload`` as one immutable byte string."""
+ 
+-        return self.header_bytes() + self.payload.tobytes()
++        raw = ctypes.string_at(self.address, self.payload_bytes)
++        return self.header_bytes() + raw
++
++
++def _blocks(length: int, tile: int) -> int:
++    if length <= 0:
++        return 0
++    return (int(length) + tile - 1) // tile
+ 
+ 
+-def pack_view(view: Any, k: int, n: int, dtype: str) -> PackedWeight:
+-    """Pack a ``(N, K)`` weight view into the kernel's ``(K, N)`` layout.
++def layout_elements(k: int, n: int, layout: int = PACK_LAYOUT_AVX512_TILE64) -> int:
++    """Return the packed element count for ``(k, n)`` in ``layout``."""
++
++    if layout != PACK_LAYOUT_AVX512_TILE64:
++        raise ValueError("unsupported packed layout id {!r}".format(layout))
++    if int(k) <= 0 or int(n) <= 0:
++        raise ValueError("packed weight K and N must be positive")
++    return (
++        _blocks(int(k), PACKED_GEMM_K_TILE)
++        * _blocks(int(n), PACKED_GEMM_N_TILE)
++        * PACKED_GEMM_K_TILE
++        * PACKED_GEMM_N_TILE
++    )
++
++
++def packed_size_bytes(
++    k: int, n: int, dtype: str, layout: int = PACK_LAYOUT_AVX512_TILE64
++) -> int:
++    """Return the exact handle size for ``header + packed (K, N)``."""
++
++    try:
++        itemsize = _DTYPE_ITEMSIZE[dtype]
++    except KeyError as exc:
++        raise ValueError("unsupported packed weight dtype {!r}".format(dtype)) from exc
++    return HEADER_SIZE + layout_elements(k, n, layout) * itemsize
+ 
+-    ``view`` must be a C-contiguous numpy array of ``uint16`` (BF16) or
+-    ``float32`` (FP32).  Exactly one element copy is performed; the returned
+-    object owns the payload.
++
++def numpy_dtype(dtype: str) -> Any:
++    """Return the raw numpy container dtype for a packed payload."""
++
++    import numpy as np
++
++    try:
++        return {"float32": np.float32, "bf16": np.uint16}[dtype]
++    except KeyError as exc:
++        raise ValueError("unsupported packed weight dtype {!r}".format(dtype)) from exc
++
++
++def header_bytes_for(
++    k: int, n: int, dtype: str, layout: int = PACK_LAYOUT_AVX512_TILE64
++) -> bytes:
++    """Return the self-describing header bytes for a packed payload."""
++
++    if int(k) <= 0 or int(n) <= 0:
++        raise ValueError("packed weight K and N must be positive")
++    try:
++        dtype_id = _DTYPE_IDS[dtype]
++    except KeyError as exc:
++        raise ValueError("unsupported packed weight dtype {!r}".format(dtype)) from exc
++    if layout not in _KNOWN_LAYOUTS:
++        raise ValueError("unsupported packed layout id {!r}".format(layout))
++    return _HEADER.pack(PACK_MAGIC, PACK_VERSION, dtype_id, int(layout), int(k), int(n))
++
++
++def wrap_packed_payload(
++    payload: Any,
++    k: int,
++    n: int,
++    dtype: str,
++    layout: int = PACK_LAYOUT_AVX512_TILE64,
++    *,
++    native: bool = True,
++) -> PackedWeight:
++    """Validate a native-produced packed payload and wrap it.
++
++    ``payload`` must be a C-contiguous array of ``layout_elements(k, n)``
++    elements (numpy or ctypes).  This is the only constructor used by the
++    kernel bridge for payloads written by ``ptx_avx512_pack_matmul_*``.
+     """
+ 
+-    if dtype not in _DTYPE_IDS:
++    expected = layout_elements(k, n, layout)
++    itemsize = _DTYPE_ITEMSIZE.get(dtype)
++    if itemsize is None:
+         raise ValueError("unsupported packed weight dtype {!r}".format(dtype))
+-    array = np.asarray(view)
+-    expected = _NUMPY_DTYPES[dtype]
+-    if array.dtype != expected:
+-        raise ValueError(
+-            "packed weight view dtype {} does not match {}".format(array.dtype, dtype)
+-        )
+-    if array.ndim != 2 or array.shape != (n, k):
+-        raise ValueError(
+-            "packed weight view shape {} does not match (N, K) = ({}, {})".format(
+-                array.shape, n, k
++    numpy_like = getattr(payload, "ctypes", None)
++    if numpy_like is not None:
++        if not payload.flags["C_CONTIGUOUS"]:
++            raise ValueError("packed payload must be C-contiguous")
++        if int(payload.size) != expected:
++            raise ValueError(
++                "packed payload has {} elements, expected {}".format(int(payload.size), expected)
+             )
+-        )
+-    if not array.flags["C_CONTIGUOUS"]:
+-        raise ValueError("packed weight view must be C-contiguous")
+-    payload = np.ascontiguousarray(array.T)
+-    return PackedWeight(dtype=dtype, k=int(k), n=int(n), payload=payload, copies=1)
++        if int(payload.dtype.itemsize) != itemsize:
++            raise ValueError(
++                "packed payload dtype {} does not match {}".format(payload.dtype, dtype)
++            )
++    else:
++        try:
++            length = len(payload)
++        except TypeError as exc:
++            raise ValueError("packed payload must be a sized buffer") from exc
++        if int(length) != expected:
++            raise ValueError(
++                "packed payload has {} elements, expected {}".format(int(length), expected)
++            )
++    return PackedWeight(dtype=dtype, k=int(k), n=int(n), payload=payload, layout=layout, native=native)
+ 
+ 
+ def parse_packed_bytes(buffer: Any) -> PackedWeight:
+     """Parse ``header + payload`` bytes into a zero-copy :class:`PackedWeight`."""
+ 
++    import numpy as np
++
+     raw = memoryview(buffer)
+     if raw.ndim != 1 or raw.itemsize != 1:
+         raise ValueError("packed weight buffer must be a flat byte buffer")
+     if raw.nbytes < HEADER_SIZE:
+         raise ValueError("packed weight buffer is shorter than the header")
+-    magic, version, dtype_id, flags, k, n = _HEADER.unpack_from(raw, 0)
++    magic, version, dtype_id, layout, k, n = _HEADER.unpack_from(raw, 0)
+     if magic != PACK_MAGIC:
+         raise ValueError("packed weight magic does not match")
+     if version != PACK_VERSION:
+         raise ValueError("unsupported packed weight version {}".format(version))
+-    if flags != 0:
+-        raise ValueError("packed weight flags must be zero")
++    if layout not in _KNOWN_LAYOUTS:
++        raise ValueError("unsupported packed layout id {}".format(layout))
+     try:
+         dtype = _ID_DTYPES[int(dtype_id)]
+     except KeyError as exc:
+         raise ValueError("unsupported packed weight dtype id {}".format(dtype_id)) from exc
+     if k <= 0 or n <= 0:
+         raise ValueError("packed weight K and N must be positive")
+-    itemsize = np.dtype(_NUMPY_DTYPES[dtype]).itemsize
+-    expected = HEADER_SIZE + int(k) * int(n) * itemsize
++    itemsize = _DTYPE_ITEMSIZE[dtype]
++    expected = HEADER_SIZE + layout_elements(int(k), int(n), int(layout)) * itemsize
+     if raw.nbytes != expected:
+         raise ValueError(
+             "packed weight size {} does not match expected {}".format(raw.nbytes, expected)
+         )
+-    payload = np.frombuffer(raw, dtype=_NUMPY_DTYPES[dtype], count=int(k) * int(n), offset=HEADER_SIZE)
+-    payload = payload.reshape(int(k), int(n))
+-    return PackedWeight(dtype=dtype, k=int(k), n=int(n), payload=payload, copies=0)
+-
+-
+-def packed_size_bytes(k: int, n: int, dtype: str) -> int:
+-    """Return the exact packed byte size for ``header + (K, N)`` payload."""
+-
+-    itemsize = np.dtype(_NUMPY_DTYPES[dtype]).itemsize
+-    return HEADER_SIZE + int(k) * int(n) * itemsize
+-
+-
+-def numpy_dtype(dtype: str) -> Any:
+-    """Return the raw numpy container dtype for a packed payload."""
+-
+-    try:
+-        return _NUMPY_DTYPES[dtype]
+-    except KeyError as exc:
+-        raise ValueError("unsupported packed weight dtype {!r}".format(dtype)) from exc
+-
+-
+-def header_bytes_for(k: int, n: int, dtype: str) -> bytes:
+-    """Return the self-describing header bytes for a packed payload."""
+-
+-    if k <= 0 or n <= 0:
+-        raise ValueError("packed weight K and N must be positive")
+-    try:
+-        dtype_id = _DTYPE_IDS[dtype]
+-    except KeyError as exc:
+-        raise ValueError("unsupported packed weight dtype {!r}".format(dtype)) from exc
+-    return _HEADER.pack(PACK_MAGIC, PACK_VERSION, dtype_id, 0, int(k), int(n))
++    payload = np.frombuffer(
++        raw,
++        dtype=np.uint16 if dtype == "bf16" else np.float32,
++        count=layout_elements(int(k), int(n), int(layout)),
++        offset=HEADER_SIZE,
++    )
++    return PackedWeight(
++        dtype=dtype, k=int(k), n=int(n), payload=payload, layout=int(layout), native=False
++    )
+ 
+ 
+ __all__ = [
+     "HEADER_SIZE",
++    "PACKED_GEMM_K_TILE",
++    "PACKED_GEMM_N_TILE",
++    "PACK_LAYOUT_AVX512_TILE64",
+     "PACK_MAGIC",
+     "PACK_VERSION",
+     "PackedWeight",
+     "header_bytes_for",
++    "layout_elements",
+     "numpy_dtype",
+-    "pack_view",
+     "packed_size_bytes",
+     "parse_packed_bytes",
++    "wrap_packed_payload",
+ ]
+diff --git a/python/tests/framework_torch/test_torch_linear_cache.py b/python/tests/framework_torch/test_torch_linear_cache.py
+index 4fdc81d0c..6c74d3e7a 100644
+--- a/python/tests/framework_torch/test_torch_linear_cache.py
++++ b/python/tests/framework_torch/test_torch_linear_cache.py
+@@ -143,17 +143,56 @@ def test_kernel_cache_clear_keeps_the_compiled_artifact_usable(fresh_caches):
+     fresh_caches.clear()
+     assert fresh_caches.stats["kernel_builds"] == 1
+     # entry is immutable and remains usable after the cache was cleared
+-    from pypto.framework.torch_bridge import allocate_output, tensor_to_view
+-    from pypto.framework.weight_pack import pack_view
++    from pypto.framework.torch_bridge import (
++        allocate_output,
++        packed_tensor_to_view,
++        tensor_to_view,
++    )
+ 
+     left = tensor_to_view(x, dtype="bf16", shape=(2, 4), name="x")
+-    weight_view = tensor_to_view(weight, dtype="bf16", shape=(5, 4), name="weight")
+-    packed = pack_view(weight_view.array, k=4, n=5, dtype="bf16")
++    packed = packed_tensor_to_view(torch.ops.pypto_x.pack_weight(weight))
+     output, output_view = allocate_output("bf16", (2, 5))
+     entry.invoke(left.address, packed.address, output_view.address)
+     assert torch.equal(output, got)
+ 
+ 
++def test_old_j1_legacy_sidecar_is_a_natural_miss(fresh_caches):
++    """A J1 (key_version=1) sidecar must never be selected by the J1.1 key."""
++
++    import hashlib
++
++    _call(m=1, k=2, n=3)
++    key = fresh_caches.key("bf16", 1, 2, 3)
++    sidecar = fresh_caches.cache_dir / ("pypto_x_linear_{}.json".format(key.digest[:32]))
++    payload = json.loads(sidecar.read_text(encoding="utf-8"))
++    # Recreate the J1 key shape: same shape/target/artifact payload versions,
++    # but key_version=1 and no packed_contract envelope.
++    j1_key = dict(payload["key"])
++    j1_key["key_version"] = 1
++    j1_key.pop("packed_contract", None)
++    j1_digest = hashlib.sha256(
++        json.dumps(j1_key, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    ).hexdigest()
++    assert j1_digest != key.digest
++    j1_sidecar = fresh_caches.cache_dir / ("pypto_x_linear_{}.json".format(j1_digest[:32]))
++    j1_sidecar.write_text(
++        json.dumps({"key": j1_key, "artifact": payload["artifact"]}, sort_keys=True),
++        encoding="utf-8",
++    )
++    sidecar.unlink()
++
++    second = LinearKernelCache(cache_dir=fresh_caches.cache_dir, disk_cache=True)
++    reset_linear_kernel_cache(second)
++    got, x, weight = _call(m=1, k=2, n=3)
++    assert torch.equal(got, torch.nn.functional.linear(x, weight))
++    stats = second.stats
++    assert stats["disk_hits"] == 0
++    assert stats["load_failures"] == 0
++    assert stats["kernel_builds"] == 1
++    assert j1_sidecar.is_file()  # never read, never rewritten
++
++
++
+ def test_corrupt_content_addressed_so_is_quarantined_and_rebuilt(fresh_caches):
+     """V8J-D2: a rewritten content-addressed .so must self-heal.
+ 
+@@ -254,18 +293,35 @@ def test_corrupt_so_without_sidecar_is_quarantined_by_the_build_audit(fresh_cach
+     assert so_path.is_file()
+ 
+ 
+-def test_entry_exposes_declared_packed_plane_and_executed_legacy_plane(fresh_caches):
+-    """Payload 4 declares the packed plane; this J1 bridge still calls legacy.
+-
+-    The divergence is deliberate for the fix round (the verifier validated the
+-    legacy numerics) and is exposed in the entry metadata so switching to the
+-    packed plane later is an explicit, testable change rather than a silent one.
+-    """
++def test_entry_declares_and_executes_the_packed_plane(fresh_caches):
++    """J1.1: declaration and execution are both the W8B packed plane."""
+ 
+     _call(m=1, k=2, n=3)
+     entry = linear_kernel_cache().get("bf16", 1, 2, 3)
+     assert entry.declared_plane == "packed"
+-    assert entry.executed_plane == "legacy_avx512_zmm"
+-    assert entry.to_dict()["declared_plane"] == "packed"
+-    assert entry.to_dict()["executed_plane"] == "legacy_avx512_zmm"
+-    assert entry.to_dict()["native_symbol"] == "ptx_avx512_matmul_bf16"
++    assert entry.executed_plane == "packed"
++    assert entry.native_symbol == "ptx_avx512_matmul_packed_bf16"
++    assert entry.pack_symbol == "ptx_avx512_pack_matmul_bf16"
++    assert entry.packed_dtype == "bf16"
++    assert entry.native_symbol != "ptx_avx512_matmul_bf16"
++    payload = entry.to_dict()
++    assert payload["declared_plane"] == "packed"
++    assert payload["executed_plane"] == "packed"
++    assert payload["native_symbol"] == "ptx_avx512_matmul_packed_bf16"
++    assert payload["pack_symbol"] == "ptx_avx512_pack_matmul_bf16"
++    assert payload["packed_contract"]["mode"] == "native_avx512_packed_matmul"
++    assert payload["packed_contract"]["k_tile"] == 64
++    assert payload["packed_contract"]["n_tile"] == 64
++
++
++def test_every_dtype_shares_the_same_pack_and_gemm_kernel_pair(fresh_caches):
++    """The pack kernel must not depend on the per-M kernel identity."""
++
++    first = linear_kernel_cache().get("bf16", 1, 2, 3)
++    second = linear_kernel_cache().get("bf16", 5, 130, 70)
++    assert (first.pack_kernel, first.gemm_kernel) == (second.pack_kernel, second.gemm_kernel)
++    pack_contract = fresh_caches.pack_contract("bf16")
++    assert pack_contract["pack_kernel"] == first.pack_kernel
++    assert pack_contract["gemm_kernel"] == first.gemm_kernel
++    assert pack_contract == first.packed_contract
++
+diff --git a/python/tests/framework_torch/test_torch_linear_correctness.py b/python/tests/framework_torch/test_torch_linear_correctness.py
+index af8390f29..354e04123 100644
+--- a/python/tests/framework_torch/test_torch_linear_correctness.py
++++ b/python/tests/framework_torch/test_torch_linear_correctness.py
+@@ -24,7 +24,9 @@ import pytest
+ import torch
+ 
+ from pypto.framework import PyPTOXUnsupportedError, torch_ops
++from pypto.framework.linear_kernel import linear_kernel_cache
+ from pypto.framework.torch_bridge import allocate_output, tensor_to_view
++from pypto.framework.weight_pack import packed_size_bytes
+ 
+ 
+ DTYPES = (torch.float32, torch.bfloat16)
+@@ -84,10 +86,9 @@ def test_packed_weight_path_is_equivalent(dtype, fresh_caches):
+     bias = _rand(dtype, (n,), generator, 0.1)
+ 
+     packed = torch.ops.pypto_x.pack_weight(weight)
+-    itemsize = 4 if dtype == torch.float32 else 2
+     assert packed.dtype == torch.uint8
+     assert packed.dim() == 1
+-    assert packed.numel() == 32 + k * n * itemsize
++    assert packed.numel() == packed_size_bytes(k, n, "float32" if dtype == torch.float32 else "bf16")
+ 
+     prepacked = torch.ops.pypto_x.linear_prepacked(x, packed, bias)
+     direct = torch.ops.pypto_x.linear(x, weight, bias)
+@@ -195,12 +196,16 @@ def test_runtime_descriptor_launch_consumes_zero_copy_torch_buffers(fresh_caches
+     This is the descriptor path behind tensor_to_view: torch storage -> numpy
+     view -> TensorDesc(handle=...) -> Avx512Runtime.launch; no copy is made on
+     either side and the runtime writes directly into the torch output tensor.
++    The runtime now packs the parameter-derived right operand itself (W8B
++    packed plane), so the descriptor carries the plain row-major ``(K, N)``
++    weight; the bridge's own fast path packs explicitly instead.
+     """
+ 
++    import numpy as np
++
+     from pypto.abi import LaunchRequest, TensorDesc
+     from pypto.backends.cpu.x86 import Avx512Runtime
+     from pypto.framework.linear_kernel import linear_kernel_cache
+-    from pypto.framework.weight_pack import pack_view
+ 
+     m, k, n = 2, 3, 5
+     x = torch.randn(m, k, dtype=torch.bfloat16)
+@@ -209,14 +214,18 @@ def test_runtime_descriptor_launch_consumes_zero_copy_torch_buffers(fresh_caches
+ 
+     left = tensor_to_view(x, dtype="bf16", shape=(m, k), name="x")
+     weight_view = tensor_to_view(weight, dtype="bf16", shape=(n, k), name="weight")
+-    packed = pack_view(weight_view.array, k=k, n=n, dtype="bf16")
+     right = TensorDesc(
+-        "bf16", (k, n), device="cpu", handle=packed.payload, readonly=True
++        "bf16",
++        (k, n),
++        device="cpu",
++        handle=np.ascontiguousarray(weight_view.array.T),
++        readonly=True,
+     )
+     output_view = tensor_to_view(output, dtype="bf16", shape=(m, n), name="output", writable=True)
+     assert output_view.address == output.data_ptr()
+ 
+     entry = linear_kernel_cache().get("bf16", m, k, n)
++    assert entry.executed_plane == "packed"
+     Avx512Runtime().launch(
+         LaunchRequest(
+             entry.artifact,
+@@ -276,10 +285,24 @@ def test_bf16_packed_path_matches_direct_at_large_k(fresh_caches):
+     )
+ 
+ 
+-def test_pack_weight_performs_exactly_one_payload_copy(fresh_caches, monkeypatch):
++def test_pack_weight_uses_the_native_tile_layout(fresh_caches, monkeypatch):
++    """pack_weight writes the W8B 64x64 tile layout, without a numpy copy.
++
++    The reference below is an independent numpy transcription of the native
++    pack kernel's tile contract (``block[kk][nn] = W[nn_global, kk_global]``);
++    it is deliberately not imported from the bridge.
++    """
++
+     import numpy as np
+ 
+-    from pypto.framework.weight_pack import parse_packed_bytes
++    from pypto.framework.weight_pack import (
++        HEADER_SIZE,
++        PACK_LAYOUT_AVX512_TILE64,
++        PACK_VERSION,
++        layout_elements,
++        packed_size_bytes,
++        parse_packed_bytes,
++    )
+ 
+     calls = []
+     original_copyto = np.copyto
+@@ -289,10 +312,97 @@ def test_pack_weight_performs_exactly_one_payload_copy(fresh_caches, monkeypatch
+         return original_copyto(destination, source, *args, **kwargs)
+ 
+     monkeypatch.setattr(np, "copyto", counting_copyto)
+-    weight = torch.randn(17, 130, dtype=torch.bfloat16)
++    n, k = 130, 17
++    weight = torch.randn(n, k, dtype=torch.bfloat16)
+     handle = torch.ops.pypto_x.pack_weight(weight)
+-    assert len(calls) == 1
++    assert len(calls) == 0
++    assert handle.numel() == packed_size_bytes(k, n, "bf16")
++    assert handle.numel() == HEADER_SIZE + layout_elements(k, n) * 2
+ 
+     parsed = parse_packed_bytes(handle.numpy())
+-    reference = weight.t().contiguous().view(torch.uint16).numpy()
++    assert parsed.layout == PACK_LAYOUT_AVX512_TILE64
++    assert PACK_VERSION == 2
++    bits = weight.contiguous().view(torch.uint16).numpy()
++    reference = np.zeros(layout_elements(k, n), dtype=np.uint16)
++    num_kb = (k + 63) // 64
++    num_nb = (n + 63) // 64
++    for nb in range(num_nb):
++        for kb in range(num_kb):
++            block = reference[(nb * num_kb + kb) * 64 * 64 : (nb * num_kb + kb + 1) * 64 * 64]
++            block = block.reshape(64, 64)
++            for kk in range(64):
++                kk_global = kb * 64 + kk
++                if kk_global >= k:
++                    break
++                for nn in range(64):
++                    nn_global = nb * 64 + nn
++                    if nn_global >= n:
++                        break
++                    block[kk, nn] = bits[nn_global, kk_global]
+     assert np.array_equal(parsed.payload, reference)
++    # The tile payload is padded to whole 64x64 blocks, so it cannot be the
++    # plain (K, N) transpose J1 stored (17 * 130 = 2210 vs 3 * 64 * 64).
++    assert parsed.payload.size > k * n
++
++
++def _legacy_matmul(entry, x, weight):
++    """Run the legacy J1 ZMM kernel on the same module (test-only reference)."""
++
++    import ctypes
++
++    import numpy as np
++
++    from pypto.backends.cpu.x86.avx512 import _NativeBuffer, _call_matmul, _pointer
++
++    m, k = int(x.shape[0]), int(x.shape[1])
++    n = int(weight.shape[0])
++    weight_view = (
++        weight.contiguous().view(torch.uint16).numpy()
++    )
++    plain = np.ascontiguousarray(weight_view.T)
++    output = torch.empty(m, n, dtype=torch.bfloat16)
++    left = _NativeBuffer(
++        "bf16", m * k, ctypes.cast(ctypes.c_void_p(x.data_ptr()), _pointer("bf16")), None, True
++    )
++    right = _NativeBuffer(
++        "bf16", k * n, ctypes.cast(ctypes.c_void_p(int(plain.ctypes.data)), _pointer("bf16")), None, True
++    )
++    destination = _NativeBuffer(
++        "bf16", m * n, ctypes.cast(ctypes.c_void_p(output.data_ptr()), _pointer("bf16")), None, True
++    )
++    _call_matmul(entry.loaded.module, "bf16", left, right, destination, m, k, n)
++    return output
++
++
++@pytest.mark.parametrize(
++    "shape",
++    ((2, 65, 129), (5, 130, 70), (1, 1024, 512), (5, 1024, 8192)),
++    ids=lambda s: "{}x{}x{}".format(*s),
++)
++def test_packed_plane_is_bitwise_identical_to_the_legacy_kernel(shape, fresh_caches):
++    """W8B switches the plane, not the math: packed == legacy bit for bit."""
++
++    m, k, n = shape
++    generator = torch.Generator().manual_seed(20260912 + m * 31 + k * 7 + n)
++    x = _rand(torch.bfloat16, (m, k), generator, 1.0 / k ** 0.5)
++    weight = _rand(torch.bfloat16, (n, k), generator, 1.0 / k ** 0.5)
++    packed = torch.ops.pypto_x.linear(x, weight)
++    entry = linear_kernel_cache().get("bf16", m, k, n)
++    legacy = _legacy_matmul(entry, x, weight)
++    assert torch.equal(packed, legacy), (packed.float() - legacy.float()).abs().max().item()
++
++
++def test_bridge_tile_constants_match_the_native_pack_contract():
++    """The bridge's handle layout must be the compiler/runtime tile layout."""
++
++    from pypto.backends.cpu.x86.avx512 import packed_matmul_pack_elements
++    from pypto.compiler.targets.cpu_avx512 import (
++        PACKED_GEMM_K_TILE,
++        PACKED_GEMM_N_TILE,
++    )
++    from pypto.framework import weight_pack
++
++    assert weight_pack.PACKED_GEMM_K_TILE == PACKED_GEMM_K_TILE
++    assert weight_pack.PACKED_GEMM_N_TILE == PACKED_GEMM_N_TILE
++    for k, n in ((1, 1), (63, 65), (64, 64), (130, 70), (1024, 8192)):
++        assert weight_pack.layout_elements(k, n) == packed_matmul_pack_elements(k, n)
+diff --git a/python/tests/ut/pypto_x/test_framework_torch_optional.py b/python/tests/ut/pypto_x/test_framework_torch_optional.py
+index fc9bb82aa..8f481c3e3 100644
+--- a/python/tests/ut/pypto_x/test_framework_torch_optional.py
++++ b/python/tests/ut/pypto_x/test_framework_torch_optional.py
+@@ -105,3 +105,31 @@ def test_kernel_cache_key_is_stable_and_input_sensitive():
+     with pytest.raises(PyPTOXUnsupportedError) as info:
+         cache.key("bf16", 0, 6, 10)
+     assert info.value.reason_code == "shape_unsupported"
++
++
++def test_kernel_cache_key_embeds_the_packed_contract_version():
++    """J1.1: the packed contract is part of the cache identity."""
++
++    cache = LinearKernelCache(cache_dir=None, disk_cache=False)
++    payload = cache.key("bf16", 2, 6, 10).to_dict()
++    assert payload["key_version"] == 2
++    contract = payload["packed_contract"]
++    assert contract["mode"] == "native_avx512_packed_matmul"
++    assert contract["weight_format_version"] == 2
++    assert contract["weight_layout"] == 1
++    assert contract["k_tile"] == 64
++    assert contract["n_tile"] == 64
++    assert contract["compiler_kernel_version"] >= 1
++    assert contract["compiler_layout_version"] >= 1
++    # A different packed contract envelope must change the digest.
++    from pypto.framework.linear_kernel import LinearKernelKey
++
++    other = LinearKernelKey(
++        dtype="bf16",
++        m=2,
++        k=6,
++        n=10,
++        target=cache.key("bf16", 2, 6, 10).target,
++        packed_contract_version=dict(contract, bridge_version=contract["bridge_version"] + 1),
++    )
++    assert other.digest != cache.key("bf16", 2, 6, 10).digest

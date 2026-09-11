@@ -1,0 +1,305 @@
+From 4d6e801258d55e8f3fccd32a5b5a8b7ff1982cdf Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 08:41:02 +0800
+Subject: [PATCH 129/134] fix(pypto-x): count the per-dtype pack module apart
+ from shape kernels (W8J J1.1)
+
+The J1.1 bridge needs one native pack module per dtype to pre-pack weights
+before any shape kernel exists. Build it through the same disk tier but keep
+kernel_builds/compile_calls/disk_hits meaning "one per (dtype, M, K, N)" by
+counting the pack module under pack_module_* keys.
+
+The bf16 tile payload also interleaves k pairs for _mm512_dpbf16_ps; document
+the exact layout and fix the test reference accordingly. Self-heal tests now
+accept that the shared per-variant .so may be repaired by the pack module load
+first.
+---
+ python/pypto/framework/linear_kernel.py                         | 66 +++++++++++++++++++++++++----
+ python/pypto/framework/weight_pack.py                           | 16 +++++--
+ python/tests/framework_torch/test_torch_linear_cache.py         | 42 +++++++++++++++---
+ python/tests/framework_torch/test_torch_linear_correctness.py   | 21 ++++-----
+ .../framework_torch/test_torch_linear_failure_semantics.py      |  4 +-
+ 5 files changed, 121 insertions(+), 28 deletions(-)
+
+diff --git a/python/pypto/framework/linear_kernel.py b/python/pypto/framework/linear_kernel.py
+index a994e6b94..daaf2b2de 100644
+--- a/python/pypto/framework/linear_kernel.py
++++ b/python/pypto/framework/linear_kernel.py
+@@ -610,6 +610,10 @@ class LinearKernelCache:
+         self._max_entries = int(max_entries)
+         self._gemm_threads_override = gemm_threads
+         self._gemm_threads_resolved: Optional[int] = None
++        # The pack kernel is a shared target entry point, so one tiny per-dtype
++        # artifact is enough to pack any (K, N).  Its builds/hits are counted
++        # separately so ``kernel_builds`` keeps its J1 "one per shape" meaning.
++        self._pack_entries: Dict[str, LinearKernelEntry] = {}
+         self._stats: Dict[str, int] = {
+             "kernel_builds": 0,
+             "memory_hits": 0,
+@@ -620,6 +624,9 @@ class LinearKernelCache:
+             "build_failures": 0,
+             "unsupported": 0,
+             "weight_packs": 0,
++            "pack_module_builds": 0,
++            "pack_module_compiles": 0,
++            "pack_module_disk_hits": 0,
+         }
+         self._last_disk_error: Optional[str] = None
+ 
+@@ -762,10 +769,30 @@ class LinearKernelCache:
+             return entry
+ 
+     # -- weight packing (W8B packed plane) -----------------------------
++    def _pack_entry(self, dtype: str) -> LinearKernelEntry:
++        """Return the per-dtype native pack module (built once, cached apart)."""
++
++        dtype = normalize_dtype(dtype)
++        entry = self._pack_entries.get(dtype)
++        if entry is not None:
++            return entry
++        key = self.key(dtype, 1, 1, 1)
++        digest = key.digest
++        with self._lock:
++            entry = self._pack_entries.get(dtype)
++            if entry is not None:
++                return entry
++            runtime = self.ensure_available(dtype)
++            entry = self._load_disk(runtime, key, digest, kind="pack")
++            if entry is None:
++                entry = self._compile(runtime, key, digest, kind="pack")
++            self._pack_entries[dtype] = entry
++            return entry
++
+     def pack_contract(self, dtype: str) -> Mapping[str, Any]:
+         """Return the packed contract of the dtype's native pack module."""
+ 
+-        return dict(self.get(normalize_dtype(dtype), 1, 1, 1).packed_contract)
++        return dict(self._pack_entry(dtype).packed_contract)
+ 
+     def pack_into(
+         self,
+@@ -810,7 +837,7 @@ class LinearKernelCache:
+                         reason_code="shape_unsupported",
+                         details={name: value},
+                     )
+-        entry = self.get(dtype, 1, 1, 1)
++        entry = self._pack_entry(dtype)
+         contract = entry.packed_contract
+         source_dtype = normalize_dtype(contract["source_dtype"])
+         packed_dtype = normalize_dtype(contract["pack_dtype"])
+@@ -860,7 +887,7 @@ class LinearKernelCache:
+         """Native-pack a source into a fresh ``PackedWeight`` payload."""
+ 
+         dtype = normalize_dtype(dtype)
+-        packed_dtype = normalize_dtype(self.get(dtype, 1, 1, 1).packed_contract["pack_dtype"])
++        packed_dtype = normalize_dtype(self._pack_entry(dtype).packed_contract["pack_dtype"])
+         count = int(packed_matmul_pack_elements(k, n))
+         buffer = (_ctype(packed_dtype) * count)()
+         self.pack_into(
+@@ -880,7 +907,14 @@ class LinearKernelCache:
+     def _sidecar(self, digest: str) -> Path:
+         return self.cache_dir / "{}{}.json".format(_SIDECAR_PREFIX, digest[:32])
+ 
+-    def _load_disk(self, runtime: Avx512Runtime, key: LinearKernelKey, digest: str) -> Optional[LinearKernelEntry]:
++    def _load_disk(
++        self,
++        runtime: Avx512Runtime,
++        key: LinearKernelKey,
++        digest: str,
++        *,
++        kind: str = "kernel",
++    ) -> Optional[LinearKernelEntry]:
+         if not self._disk_cache or self.cache_dir is None:
+             return None
+         sidecar = self._sidecar(digest)
+@@ -917,7 +951,10 @@ class LinearKernelCache:
+             self._quarantine_corrupt(artifact_path, expected_digest)
+             self._audit_artifacts()
+             return None
+-        self._stats["disk_hits"] += 1
++        if kind == "pack":
++            self._stats["pack_module_disk_hits"] += 1
++        else:
++            self._stats["disk_hits"] += 1
+         return LinearKernelEntry(
+             key, artifact, loaded, contract,
+             disk_backed=True, gemm_threads=self._resolve_threads(),
+@@ -1009,8 +1046,18 @@ class LinearKernelCache:
+         return repaired
+ 
+     # -- build ---------------------------------------------------------
+-    def _compile(self, runtime: Avx512Runtime, key: LinearKernelKey, digest: str) -> LinearKernelEntry:
+-        self._stats["kernel_builds"] += 1
++    def _compile(
++        self,
++        runtime: Avx512Runtime,
++        key: LinearKernelKey,
++        digest: str,
++        *,
++        kind: str = "kernel",
++    ) -> LinearKernelEntry:
++        if kind == "pack":
++            self._stats["pack_module_builds"] += 1
++        else:
++            self._stats["kernel_builds"] += 1
+         try:
+             # Content-addressed artifacts are immutable; if one was truncated
+             # or rewritten, isolate it before clang refuses the same-digest path.
+@@ -1031,7 +1078,10 @@ class LinearKernelCache:
+                 artifact_format=DEFAULT_ARTIFACT_FORMAT,
+                 extra=extra,
+             )
+-            self._stats["compile_calls"] += 1
++            if kind == "pack":
++                self._stats["pack_module_compiles"] += 1
++            else:
++                self._stats["compile_calls"] += 1
+             artifact = compiler.compile(target_ir, options)
+             loaded = runtime.load(artifact)
+             contract = _resolve_native(loaded, key, artifact)
+diff --git a/python/pypto/framework/weight_pack.py b/python/pypto/framework/weight_pack.py
+index bda570f2f..12f100e67 100644
+--- a/python/pypto/framework/weight_pack.py
++++ b/python/pypto/framework/weight_pack.py
+@@ -3,10 +3,18 @@
+ J1 stored a plain ``(K, N)`` row-major transpose of the torch weight.  J1.1
+ switches the bridge to the W8B **packed/blocked** AVX-512 plane, so the
+ payload is no longer a plain matrix: it is the tile layout produced by the
+-native ``ptx_avx512_pack_matmul_{f32,bf16}`` kernel (64x64 K/N tiles,
+-row-major inside a tile).  The native packer is the single source of truth for
+-the layout; this module only describes the self-describing handle format and
+-computes sizes.
++native ``ptx_avx512_pack_matmul_{f32,bf16}`` kernel (64x64 K/N tiles).  The
++native packer is the single source of truth for the layout; this module only
++describes the self-describing handle format and computes sizes.
++
++Tile layout (blocks ordered by N block, then K block):
++
++* f32: each block is a plain row-major ``[K_TILE][N_TILE]`` tile;
++* bf16: each block stores VDPBF16PS *k pairs*: for ``pair`` in ``0..31`` and
++  column ``nn``, ``block[pair*128 + 2*nn] = W[n_global, 2*pair]`` and
++  ``block[pair*128 + 2*nn + 1] = W[n_global, 2*pair + 1]`` (so a 32-bit
++  group feeds one bf16 pair into ``_mm512_dpbf16_ps``), with zero padding
++  for out-of-range K/N.
+ 
+ Self-describing handle layout (all little-endian, 32-byte header)::
+ 
+diff --git a/python/tests/framework_torch/test_torch_linear_cache.py b/python/tests/framework_torch/test_torch_linear_cache.py
+index 6c74d3e7a..ac31082cc 100644
+--- a/python/tests/framework_torch/test_torch_linear_cache.py
++++ b/python/tests/framework_torch/test_torch_linear_cache.py
+@@ -227,8 +227,11 @@ def test_corrupt_content_addressed_so_is_quarantined_and_rebuilt(fresh_caches):
+     stats = second.stats
+     assert stats["load_failures"] == 1
+     assert stats["quarantined"] >= 1
+-    assert stats["kernel_builds"] == 1
+-    assert stats["compile_calls"] == 1
++    # The native variant .so is shared by the pack module and every shape
++    # kernel of the same dtype, so whichever load sees the corrupt inode first
++    # rebuilds it (pack module here); the other becomes a normal disk hit.
++    assert stats["kernel_builds"] + stats["pack_module_builds"] == 1
++    assert stats["compile_calls"] + stats["pack_module_compiles"] == 1
+     assert so_path.is_file()
+     assert list(so_path.parent.glob(so_path.name + ".corrupt-*"))
+ 
+@@ -239,6 +242,7 @@ def test_corrupt_content_addressed_so_is_quarantined_and_rebuilt(fresh_caches):
+     assert torch.equal(again, torch.nn.functional.linear(x3, weight3))
+     stats = third.stats
+     assert stats["disk_hits"] == 1
++    assert stats["pack_module_disk_hits"] == 1
+     assert stats["kernel_builds"] == 0
+     assert stats["quarantined"] == 0
+ 
+@@ -314,6 +318,25 @@ def test_entry_declares_and_executes_the_packed_plane(fresh_caches):
+     assert payload["packed_contract"]["n_tile"] == 64
+ 
+ 
++def test_pack_module_is_built_once_and_counted_separately(fresh_caches):
++    """One tiny per-dtype pack artifact backs every weight pack of that dtype."""
++
++    _call(m=1, k=4, n=5)
++    stats = fresh_caches.stats
++    assert stats["kernel_builds"] == 1
++    assert stats["pack_module_builds"] == 1
++    assert stats["pack_module_compiles"] == 1
++
++    _call(m=2, k=4, n=5)
++    _call(m=3, k=7, n=9)
++    stats = fresh_caches.stats
++    assert stats["kernel_builds"] == 3
++    assert stats["compile_calls"] == 3
++    assert stats["pack_module_builds"] == 1
++    assert stats["pack_module_compiles"] == 1
++    assert stats["weight_packs"] == 3
++
++
+ def test_every_dtype_shares_the_same_pack_and_gemm_kernel_pair(fresh_caches):
+     """The pack kernel must not depend on the per-M kernel identity."""
+ 
+@@ -321,7 +344,16 @@ def test_every_dtype_shares_the_same_pack_and_gemm_kernel_pair(fresh_caches):
+     second = linear_kernel_cache().get("bf16", 5, 130, 70)
+     assert (first.pack_kernel, first.gemm_kernel) == (second.pack_kernel, second.gemm_kernel)
+     pack_contract = fresh_caches.pack_contract("bf16")
+-    assert pack_contract["pack_kernel"] == first.pack_kernel
+-    assert pack_contract["gemm_kernel"] == first.gemm_kernel
+-    assert pack_contract == first.packed_contract
++    for field in (
++        "mode",
++        "gemm_kernel",
++        "pack_kernel",
++        "pack_dtype",
++        "source_dtype",
++        "dtype",
++        "k_tile",
++        "n_tile",
++        "layout_version",
++    ):
++        assert pack_contract[field] == first.packed_contract[field]
+ 
+diff --git a/python/tests/framework_torch/test_torch_linear_correctness.py b/python/tests/framework_torch/test_torch_linear_correctness.py
+index 354e04123..7bd818713 100644
+--- a/python/tests/framework_torch/test_torch_linear_correctness.py
++++ b/python/tests/framework_torch/test_torch_linear_correctness.py
+@@ -329,16 +329,17 @@ def test_pack_weight_uses_the_native_tile_layout(fresh_caches, monkeypatch):
+     for nb in range(num_nb):
+         for kb in range(num_kb):
+             block = reference[(nb * num_kb + kb) * 64 * 64 : (nb * num_kb + kb + 1) * 64 * 64]
+-            block = block.reshape(64, 64)
+-            for kk in range(64):
+-                kk_global = kb * 64 + kk
+-                if kk_global >= k:
+-                    break
+-                for nn in range(64):
+-                    nn_global = nb * 64 + nn
+-                    if nn_global >= n:
+-                        break
+-                    block[kk, nn] = bits[nn_global, kk_global]
++            nt = min(64, n - nb * 64)
++            kt = min(64, k - kb * 64)
++            # bf16 blocks interleave k pairs for _mm512_dpbf16_ps: the 32-bit
++            # group (2*nn, 2*nn+1) holds W[nn, k_even] / W[nn, k_odd].
++            for pair in range(32):
++                k_even, k_odd = 2 * pair, 2 * pair + 1
++                for nn in range(nt):
++                    if k_even < kt:
++                        block[pair * 128 + 2 * nn] = bits[nb * 64 + nn, kb * 64 + k_even]
++                    if k_odd < kt:
++                        block[pair * 128 + 2 * nn + 1] = bits[nb * 64 + nn, kb * 64 + k_odd]
+     assert np.array_equal(parsed.payload, reference)
+     # The tile payload is padded to whole 64x64 blocks, so it cannot be the
+     # plain (K, N) transpose J1 stored (17 * 130 = 2210 vs 3 * 64 * 64).
+diff --git a/python/tests/framework_torch/test_torch_linear_failure_semantics.py b/python/tests/framework_torch/test_torch_linear_failure_semantics.py
+index 3bce7d534..6e47d9083 100644
+--- a/python/tests/framework_torch/test_torch_linear_failure_semantics.py
++++ b/python/tests/framework_torch/test_torch_linear_failure_semantics.py
+@@ -337,7 +337,9 @@ def test_fake_clang_failure_falls_back_with_compile_reason(tmp_path, fresh_cache
+     assert torch.equal(got, torch.nn.functional.linear(x, weight))
+     assert _fallback_events()["linear:compile_failed"] == 1
+     assert cache.stats["build_failures"] == 1
+-    assert cache.stats["compile_calls"] == 1
++    # The first build attempt is the per-dtype pack module (J1.1), so the fake
++    # clang failure is attributed there; the fallback itself is unchanged.
++    assert cache.stats["compile_calls"] + cache.stats["pack_module_compiles"] == 1
+ 
+     with pytest.raises(PyPTOXUnsupportedError) as info:
+         torch.ops.pypto_x.linear_strict(x, weight)

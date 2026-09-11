@@ -1,0 +1,360 @@
+From 227506c862e1a5de5be17f59f6f1c45ca75b26e9 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 10:57:51 +0800
+Subject: [PATCH 134/134] fix(perf): apply ERR-0004 outlier floor and close
+ R2-D2 round validity
+
+ERR-0004 (user-approved 2026-09-11): step 6 now marks
+|x - median| > max(3 * 1.4826 * MAD, floor) with
+floor = max(1 us, 0.02 * median); outlier_ratio > 0.10 -> UNSTABLE is
+unchanged and still evaluated before the cv/p95 gate.
+
+aggregate recomputes case statistics, verdicts and ratios directly from the
+stored raw sample arrays plus each round's in-run event_timer_rate, so old
+rounds can be regraded under the amended protocol without re-measuring.
+
+R2-D2: round_validity now includes affinity_matches_requested and the
+recorded round status; gate.consistency/status/status_basis reflect both.
+An explicit --allow-superseded-recorded-status flag permits regrading rounds
+recorded under an older protocol revision, while all other round-validity
+checks (G1/clock/noise/affinity/blocking-case G2) stay enforced.
+---
+ scripts/smoke/cuda_gemm_baseline_smoke.py | 194 ++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 174 insertions(+), 20 deletions(-)
+
+diff --git a/scripts/smoke/cuda_gemm_baseline_smoke.py b/scripts/smoke/cuda_gemm_baseline_smoke.py
+index e3fe74479..b9b291011 100644
+--- a/scripts/smoke/cuda_gemm_baseline_smoke.py
++++ b/scripts/smoke/cuda_gemm_baseline_smoke.py
+@@ -82,7 +82,12 @@ WARMUP_ATTEMPTS = 3
+ VARIANCE_LIMITS_LOCKED = {"cv": 0.03, "p95_over_median": 1.15}
+ VARIANCE_LIMITS_UNLOCKED = {"cv": 0.05, "p95_over_median": 1.25}
+ # Protocol §3.3 step 6: outlier_ratio above this voids the round (UNSTABLE).
++# ERR-0004 (2026-09-11) adds a floor to the marking threshold:
++#   mark if |x - median| > max(3 * 1.4826 * MAD, floor)
++#   floor = max(1 us, 0.02 * median)
+ OUTLIER_RATIO_MAX = 0.10
++OUTLIER_FLOOR_MIN_SECONDS = 1.0e-6
++OUTLIER_FLOOR_MEDIAN_FRACTION = 0.02
+ MEDIAN_SPREAD_LIMIT = 0.10
+ CLOCK_RATIO_MIN = 0.9
+ 
+@@ -247,7 +252,14 @@ def _percentile_nearest_rank(values, fraction):
+ 
+ 
+ def _dispersion(values) -> dict:
+-    """Protocol §3.3 statistics: min/median/p95(nearest-rank)/max/stdev/cv."""
++    """Protocol §3.3 statistics: min/median/p95(nearest-rank)/max/stdev/cv.
++
++    Step 6 (ERR-0004, 2026-09-11): an outlier is marked when
++    ``|x - median| > max(3 * 1.4826 * MAD, floor)`` with
++    ``floor = max(1 µs, 0.02 * median)``.  The floor keeps microsecond timer
++    jitter on WSL2 from being classified as contamination while a real
++    (>2%) excursion is still marked.
++    """
+ 
+     if not values:
+         return {"n": 0}
+@@ -258,10 +270,10 @@ def _dispersion(values) -> dict:
+     mad = (
+         statistics.median([abs(value - median) for value in ordered]) if len(ordered) > 1 else 0.0
+     )
+-    outlier_threshold = 3.0 * 1.4826 * mad
+-    outliers = (
+-        sum(1 for value in ordered if abs(value - median) > outlier_threshold) if mad > 0.0 else 0
+-    )
++    floor = max(OUTLIER_FLOOR_MIN_SECONDS, OUTLIER_FLOOR_MEDIAN_FRACTION * median)
++    mad_component = 3.0 * 1.4826 * mad
++    outlier_threshold = max(mad_component, floor)
++    outliers = sum(1 for value in ordered if abs(value - median) > outlier_threshold)
+     return {
+         "n": len(ordered),
+         "min": ordered[0],
+@@ -276,6 +288,10 @@ def _dispersion(values) -> dict:
+         "cv_method": "stdev/median (perf protocol §3.3)",
+         "p95_over_median": (p95 / median) if median else 0.0,
+         "mad": mad,
++        "outlier_rule": "|x - median| > max(3 * 1.4826 * MAD, floor); floor = max(1 us, 0.02 * median)",
++        "outlier_threshold": outlier_threshold,
++        "outlier_threshold_mad_component": mad_component,
++        "outlier_floor": floor,
+         "outliers_marked": outliers,
+         "outlier_ratio": (outliers / len(ordered)) if ordered else 0.0,
+     }
+@@ -284,7 +300,8 @@ def _dispersion(values) -> dict:
+ def _variance_verdict(stats: dict, limits: dict) -> str:
+     """Protocol §3.3 steps 6-7: outlier gate first, then the cv/p95 gate.
+ 
+-    Step 6 marks ``|x - median| > 3 * 1.4826 * MAD`` and voids the round when
++    Step 6 (ERR-0004) marks ``|x - median| > max(3 * 1.4826 * MAD, floor)`` with
++    ``floor = max(1 µs, 0.02 * median)`` and voids the round when
+     ``outlier_ratio > 0.10`` (``UNSTABLE``); step 7 applies the cv/p95 ceilings.
+     """
+ 
+@@ -1615,8 +1632,25 @@ def aggregate(args) -> dict:
+             case = _case_by_name(round_evidence, name)
+             if case is None:
+                 raise SystemExit("round {} is missing case {!r}".format(index, name))
+-            pypto_stats = case["pypto_x"]["statistics"]["kernel_seconds"]
+-            cublas_stats = case["cublas"]["statistics"]["kernel_seconds"]
++            # ERR-0004: the amended outlier rule must be applied to the raw
++            # samples, not to the outlier_ratio computed by whatever harness
++            # revision produced the round.  Recompute whenever the samples are
++            # present; fall back to the stored statistics only when they are
++            # not (with an explicit source marker).
++            pypto_samples = case.get("pypto_x", {}).get("samples", {}).get("kernel_seconds")
++            cublas_samples = case.get("cublas", {}).get("samples", {}).get("kernel_seconds")
++            if pypto_samples:
++                pypto_stats = _dispersion(pypto_samples)
++                pypto_stats_source = "recomputed_from_samples"
++            else:
++                pypto_stats = case["pypto_x"]["statistics"]["kernel_seconds"]
++                pypto_stats_source = "stored_statistics_no_samples"
++            if cublas_samples:
++                cublas_stats = _dispersion(cublas_samples)
++                cublas_stats_source = "recomputed_from_samples"
++            else:
++                cublas_stats = case["cublas"]["statistics"]["kernel_seconds"]
++                cublas_stats_source = "stored_statistics_no_samples"
+             clock_verdict = round_evidence["host"]["gpu"]["clock_verdict"]
+             limits = (
+                 VARIANCE_LIMITS_LOCKED if clock_verdict == "VALID" else VARIANCE_LIMITS_UNLOCKED
+@@ -1633,6 +1667,27 @@ def aggregate(args) -> dict:
+                 and cublas_warmup == "PASS"
+                 else "INVALID"
+             )
++            # Ratios are re-derived from the recomputed sample medians and the
++            # round's in-run event_timer_rate whenever possible, so a regrade
++            # never depends on a stored verdict/metric produced under an older
++            # protocol revision.
++            round_rate = round_evidence.get("metrics", {}).get("event_timer_rate")
++            if pypto_samples and cublas_samples and round_rate:
++                pypto_raw_median = pypto_stats["median"]
++                cublas_raw_median = cublas_stats["median"]
++                pypto_corrected_median = pypto_raw_median * round_rate
++                cublas_corrected_median = cublas_raw_median * round_rate
++                measured_ratio_raw = pypto_raw_median / cublas_raw_median
++                measured_ratio_corrected = measured_ratio_raw
++                ratio_source = "recomputed_from_samples_and_round_rate"
++            else:
++                pypto_raw_median = case["pypto_x"]["metrics"]["kernel_seconds_median"]
++                cublas_raw_median = case["cublas"]["metrics"]["kernel_seconds_median"]
++                pypto_corrected_median = case["pypto_x"]["metrics"]["kernel_seconds_corrected_median"]
++                cublas_corrected_median = case["cublas"]["metrics"]["kernel_seconds_corrected_median"]
++                measured_ratio_raw = case["ratio"]["measured_ratio_raw"]
++                measured_ratio_corrected = case["ratio"]["measured_ratio_corrected"]
++                ratio_source = "stored_metrics_no_samples"
+             per_round.append(
+                 {
+                     "round": index,
+@@ -1640,18 +1695,31 @@ def aggregate(args) -> dict:
+                     "recorded_round_status": round_evidence.get("status"),
+                     "clock_verdict": clock_verdict,
+                     "variance_limits_used": limits,
+-                    "pypto_x_kernel_seconds_median": case["pypto_x"]["metrics"]["kernel_seconds_median"],
+-                    "pypto_x_kernel_seconds_corrected_median": case["pypto_x"]["metrics"]["kernel_seconds_corrected_median"],
+-                    "cublas_kernel_seconds_median": case["cublas"]["metrics"]["kernel_seconds_median"],
+-                    "cublas_kernel_seconds_corrected_median": case["cublas"]["metrics"]["kernel_seconds_corrected_median"],
+-                    "measured_ratio_raw": case["ratio"]["measured_ratio_raw"],
+-                    "measured_ratio_corrected": case["ratio"]["measured_ratio_corrected"],
++                    "statistics_source": {
++                        "pypto_x": pypto_stats_source,
++                        "cublas": cublas_stats_source,
++                        "ratio": ratio_source,
++                    },
++                    "outlier_rule": pypto_stats.get("outlier_rule"),
++                    "pypto_x_outlier_threshold": pypto_stats.get("outlier_threshold"),
++                    "cublas_outlier_threshold": cublas_stats.get("outlier_threshold"),
++                    "pypto_x_kernel_seconds_median": pypto_raw_median,
++                    "pypto_x_kernel_seconds_corrected_median": pypto_corrected_median,
++                    "cublas_kernel_seconds_median": cublas_raw_median,
++                    "cublas_kernel_seconds_corrected_median": cublas_corrected_median,
++                    "measured_ratio_raw": measured_ratio_raw,
++                    "measured_ratio_corrected": measured_ratio_corrected,
++                    "recorded_pypto_x_kernel_seconds_median": case["pypto_x"]["metrics"]["kernel_seconds_median"],
++                    "recorded_cublas_kernel_seconds_median": case["cublas"]["metrics"]["kernel_seconds_median"],
++                    "recorded_measured_ratio_corrected": case["ratio"]["measured_ratio_corrected"],
+                     "pypto_x_cv_over_median": pypto_stats["cv_over_median"],
+                     "pypto_x_p95_over_median": pypto_stats["p95_over_median"],
+                     "pypto_x_outlier_ratio": pypto_stats["outlier_ratio"],
++                    "pypto_x_outliers_marked": pypto_stats.get("outliers_marked"),
+                     "cublas_cv_over_median": cublas_stats["cv_over_median"],
+                     "cublas_p95_over_median": cublas_stats["p95_over_median"],
+                     "cublas_outlier_ratio": cublas_stats["outlier_ratio"],
++                    "cublas_outliers_marked": cublas_stats.get("outliers_marked"),
+                     "pypto_x_warmup_verdict": pypto_warmup,
+                     "cublas_warmup_verdict": cublas_warmup,
+                     "recomputed_pypto_x_verdict": pypto_verdict,
+@@ -1769,9 +1837,13 @@ def aggregate(args) -> dict:
+ 
+     # Round-level validity: a round is valid only when every case that is
+     # kernel-dominated in that round passes G2 (outlier/cv/p95/warmup), the
+-    # round's clock/noise gates pass and its G1 re-check passed.  Dispatch-
+-    # dominated cases are excluded per D8 (their numbers never enter the gate),
+-    # but their verdicts stay visible in per_round / gate.dispatch_dominated_keys.
++    # round's clock/noise gates pass, its G1 re-check passed, the process
++    # actually ran on the requested CPU affinity and (unless the caller
++    # explicitly regrades rounds recorded under an older protocol revision)
++    # the recorded round status was PASS.  R2-D2: affinity and recorded status
++    # are part of round validity, so a consistently forged affinity mismatch
++    # can no longer pass.
++    allow_superseded_recorded_status = bool(getattr(args, "allow_superseded_recorded_status", False))
+     round_validity = []
+     for index, round_evidence in enumerate(rounds, start=1):
+         blocking = []
+@@ -1789,6 +1861,11 @@ def aggregate(args) -> dict:
+         g1_round_ok = round_evidence.get("g1_correctness", {}).get("status") == "PASS"
+         clock_round_ok = round_evidence["host"]["gpu"]["clock_verdict"] == "VALID"
+         noise_round_ok = round_evidence["host"]["noise"]["verdict"] == "VALID"
++        affinity_round_ok = bool(
++            round_evidence.get("host", {}).get("affinity_matches_requested", False)
++        )
++        recorded_status_pass = round_evidence.get("status") == "PASS"
++        recorded_status_ok = recorded_status_pass or allow_superseded_recorded_status
+         round_validity.append(
+             {
+                 "round": index,
+@@ -1796,8 +1873,21 @@ def aggregate(args) -> dict:
+                 "g1_pass": g1_round_ok,
+                 "clock_verdict": round_evidence["host"]["gpu"]["clock_verdict"],
+                 "noise_verdict": round_evidence["host"]["noise"]["verdict"],
++                "affinity_matches_requested": affinity_round_ok,
++                "recorded_round_status": round_evidence.get("status"),
++                "recorded_status_pass": recorded_status_pass,
++                "recorded_status_superseded_by_regrade": bool(
++                    allow_superseded_recorded_status and not recorded_status_pass
++                ),
+                 "blocking_cases": blocking,
+-                "valid": bool(g1_round_ok and clock_round_ok and noise_round_ok and not blocking),
++                "valid": bool(
++                    g1_round_ok
++                    and clock_round_ok
++                    and noise_round_ok
++                    and affinity_round_ok
++                    and recorded_status_ok
++                    and not blocking
++                ),
+             }
+         )
+     all_rounds_valid = all(entry["valid"] for entry in round_validity)
+@@ -1817,11 +1907,15 @@ def aggregate(args) -> dict:
+         entry["launches_per_sample"] for name in names for entry in per_round_lookup[name]
+     }
+     launches_per_sample_consistent = len(launches_per_sample_values) == 1
++    affinity_matches_requested_all = all(
++        entry["affinity_matches_requested"] for entry in round_validity
++    )
+     if not (
+         all_rounds_valid
+         and host_consistent
+         and head_consistent
+         and affinity_consistent
++        and affinity_matches_requested_all
+         and launches_per_sample_consistent
+     ):
+         for entry in ratios_out:
+@@ -1927,6 +2021,7 @@ def aggregate(args) -> dict:
+                 "git_head_consistent": head_consistent,
+                 "cpu_affinity_consistent": affinity_consistent,
+                 "launches_per_sample_consistent": launches_per_sample_consistent,
++                "affinity_matches_requested_all": affinity_matches_requested_all,
+             },
+             "dispatch_dominated_keys": [
+                 {
+@@ -1959,18 +2054,50 @@ def aggregate(args) -> dict:
+                         + ([] if host_consistent else ["HOST_FINGERPRINT_INCONSISTENT"])
+                         + ([] if head_consistent else ["GIT_HEAD_INCONSISTENT"])
+                         + ([] if affinity_consistent else ["AFFINITY_INCONSISTENT"])
++                        + (
++                            []
++                            if affinity_matches_requested_all
++                            else ["AFFINITY_MISMATCH_REQUESTED"]
++                        )
+                         + (
+                             []
+                             if launches_per_sample_consistent
+                             else ["LAUNCHES_PER_SAMPLE_INCONSISTENT"]
+                         )
++                        + (
++                            []
++                            if all(
++                                entry["recorded_status_pass"]
++                                for entry in round_validity
++                                if not entry["recorded_status_superseded_by_regrade"]
++                            )
++                            else ["RECORDED_ROUND_STATUS_FAIL"]
++                        )
+                     )
+                 )
+                 for entry in ratios_out
+             },
+             "outlier_gate": {
+-                "rule": "protocol §3.3 step 6: outlier_ratio > 0.10 -> UNSTABLE, round void",
++                "rule": (
++                    "protocol §3.3 step 6 (ERR-0004, 2026-09-11): mark "
++                    "|x - median| > max(3 * 1.4826 * MAD, floor) with "
++                    "floor = max(1 us, 0.02 * median); outlier_ratio > 0.10 -> UNSTABLE, round void"
++                ),
+                 "outlier_ratio_max": OUTLIER_RATIO_MAX,
++                "outlier_floor_min_seconds": OUTLIER_FLOOR_MIN_SECONDS,
++                "outlier_floor_median_fraction": OUTLIER_FLOOR_MEDIAN_FRACTION,
++            },
++            "regrade": {
++                "allow_superseded_recorded_status": allow_superseded_recorded_status,
++                "note": (
++                    "when true, a round whose recorded status was produced under an older protocol "
++                    "revision may be regraded from its raw samples; all other round-validity checks "
++                    "(G1/clock/noise/affinity/blocking-case G2) are still enforced"
++                ),
++                "statistics_source_note": (
++                    "case verdicts and ratios are recomputed from the raw sample arrays and the "
++                    "round's in-run event_timer_rate whenever the round JSON contains them"
++                ),
+             },
+             "measurement_method": {
+                 "launches_per_sample_consistent": launches_per_sample_consistent,
+@@ -1984,9 +2111,28 @@ def aggregate(args) -> dict:
+         "raw_round_files": [str(path) for path in args.rounds],
+         "status": (
+             "PASS"
+-            if eligible and all_rounds_valid and first["g1_correctness"]["status"] == "PASS"
++            if (
++                eligible
++                and all_rounds_valid
++                and host_consistent
++                and head_consistent
++                and affinity_consistent
++                and affinity_matches_requested_all
++                and launches_per_sample_consistent
++                and first["g1_correctness"]["status"] == "PASS"
++            )
+             else "FAIL"
+         ),
++        "status_basis": {
++            "eligible_keys_nonempty": bool(eligible),
++            "all_rounds_valid": all_rounds_valid,
++            "host_fingerprint_consistent": host_consistent,
++            "git_head_consistent": head_consistent,
++            "cpu_affinity_consistent": affinity_consistent,
++            "affinity_matches_requested_all": affinity_matches_requested_all,
++            "launches_per_sample_consistent": launches_per_sample_consistent,
++            "g1_status": first["g1_correctness"]["status"],
++        },
+     }
+     return evidence
+ 
+@@ -2012,6 +2158,14 @@ def _parse_args(argv):
+     parser.add_argument("--cases-json", default="")
+     parser.add_argument("--json-out", default="")
+     parser.add_argument("--rounds", nargs="*", default=[])
++    parser.add_argument(
++        "--allow-superseded-recorded-status",
++        action="store_true",
++        help=(
++            "aggregate-only: allow regrading rounds whose recorded status came from an older "
++            "protocol revision (all other round-validity checks still apply)"
++        ),
++    )
+     parser.add_argument("--git-head", default="unknown")
+     parser.add_argument("--git-branch", default="work/cuda-gemm-baseline")
+     parser.add_argument("--agent", default=DEFAULT_AGENT)
