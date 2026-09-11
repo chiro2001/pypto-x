@@ -172,7 +172,13 @@ GamePC 192.168.101.5  WSL2 24 线程 / 30 GiB（宿主 61.4 GiB）/ RTX 5080 16 
 鲲鹏 920B ECS       2 vCPU / 2.5 GiB / SVE=1 VL=32、SVE2=0；约定串行；QEMU 只作功能验证
                     **2026-09-11 已按用户指示释放**（实例+系统盘+EIP 删除，计费停止）；释放前 /root 工作目录
                     已归档 ../worktrees/_meta/pypto-x/ecs920b-release-archive-20260911/（758 文件 / 9.8 MB，条目核对一致）；
-                    需用时以 ~/tools/ecs-920B/create.sh + setup-access.sh 重建 → **重建前 920B 线任务（B2 等）不发射**
+                    需用时以 ~/tools/ecs-920B/create.sh + setup-access.sh 重建
+A3（用户借用共享机） 鲲鹏 920B CPU（aarch64，**SVE VL=32 原生**，含 svebf16/svei8mm）+ 昇腾 910C NPU（CANN 9.1.0；
+                    容器内 torch 2.10 / torch_npu 2.10 / vllm 0.27.1）；640 核 / 2 TB / /home 13 TB
+                    **2026-09-11 借入，用于替代已释放的 920B ECS（SVE 原生腿）并承接 Ascend 线**
+                    纪律：CPU 固定最后一个 NUMA node；**NPU 只用 chip7**（其余留给用户量化任务）；
+                    只写 home 与自己创建的容器；不改宿主配置、不碰他人容器/进程；共享机 → 安静使用（少量核、短任务）
+                    访问方式与端点在本地私有侧，不进仓；**这是共享机，不设卡锁（用户明确指示）**
 昇腾 A2(910B3)      容器 256 vCPU / 2 TB / 1×910B3（64 GB HBM）/ CANN 9.0.0 / driver 25.2.0
                     **2026-09-11 起暂停（用户指示）**：机时预算 100 h、已用 ~6 h，暂停不消耗机时且文件保留；
                     待用户通知恢复 → **恢复前 A2 任务一律不发射**（E4/E5、W8H/W8I 后续范围、stable CANN 9.2.0-beta.2
