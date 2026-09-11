@@ -12,7 +12,7 @@
 
 > 本文是设计指导，不代表接口已经实现，也不宣称本文中的示例 API 当前可直接导入。实现前应先把 schema、解析规则和报告格式冻结；本文不要求本次运行测试。
 
-> **版本说明**：§1–§12 为外部评审稿原文；**§13 现为 v2（外部 Agent 2026-09-12 审理后建议稿）**——
+> **版本说明**：§1–§12 为外部评审基线；本轮审理对 §3、§5、§6、§7、§8 和 §14.3 增加了交叉约束说明；**§13 现为 v2（外部 Agent 2026-09-12 审理后建议稿）**——
 > v1 由项目方追加，v2 由外部 Agent 重写（五族 → P1–P8 primitive + Composite/State + artifact/target 层，并修正了 v1 的三处问题：
 > `allow_view` 的授权语义、性能数字缺 `UNGATED`、分类不完备）。§13.9 是项目方对审理方 5 个待确认项的逐条回执。
 
@@ -110,8 +110,9 @@ op_contract:
     - k_a == k_b
     - batch_dims_broadcastable
   layout_rules:
-    view_allowed: false
-    aliasing: no_output_input_alias
+    input_view: capability_checked
+    output_aliasing: must_not_alias_input
+    materialization: provider_or_policy_checked
   numeric:
     bf16: {accumulation: f32, rounding: rne}
     s8: {accumulation: s32, zero_point: declared, saturation: declared}
@@ -122,7 +123,7 @@ op_contract:
 
 `accumulation`、`rounding`、`saturation`、zero point、scale 粒度、空维度和 NaN/Inf 行为属于 L0 语义，不能变成普通用户旋钮。若这些字段需要改变，应创建新的 contract/opcode 和版本，而不是复用同一个 `matmul` 名字。
 
-> **注意**：上面这段 schema 只是 `matmul` 一个族的样板。本项目真实图里 matmul 只占约 7% 的算子数，**五个算子族各自的契约必备字段差异很大**（例如搬运类最关键的 alias/stride 规则、量化 primitive 的累加宽度与饱和策略，都没有出现在上面的样板里）。逐族清单见 **§13**。
+> **注意**：上面这段 schema 只是 `matmul` 一个族的样板。本项目真实图里 matmul 只占约 7% 的算子数，**不同 primitive 族的契约必备字段差异很大**（例如搬运类最关键的 alias/stride 规则、量化 primitive 的累加宽度与饱和策略，都没有出现在上面的样板里）。逐族清单见 **§13**。
 
 ### 3.2 `ExecutionPolicy`：用户要什么
 
@@ -155,14 +156,21 @@ execution_policy:
     power_cap_watts: null
     frequency_policy: auto         # auto | locked | bounded
     thermal_policy: nominal
+    parallelism:                    # deployment-level；不进入 OpContract
+      worker_count: 1
+      worker_index: 0
+      intra_op_threads: auto
+      oversubscription_policy: reject
+      cpu_affinity: auto
   placement:
     device: auto
-    allow_copy: true
+    allow_transfer_copy: true
     transfer: auto
   layout:
     preferred: preserve_input
-    allow_view: false
-    allow_copy: true
+    view_mode: forbid          # stable: forbid | prefer；require 仅 internal
+    allow_materialize_copy: true
+    max_copy_bytes: null
   optimization:
     allow_fusion: true
     dispatch_budget: null       # 约束/诊断，不是性能承诺
@@ -175,11 +183,15 @@ execution_policy:
 
 | 档位 | 面向谁 | 示例 | 稳定性 |
 |---|---|---|---|
-| `stable` | 普通用户、模型作者 | `profile`、`target`、`numeric.requirement`、`deterministic`、`max_workspace_bytes`、`fallback`、`allow_fusion` | 走兼容承诺和变更记录 |
+| `stable` | 普通用户、模型作者 | `profile`、`target`、`numeric.requirement`、`deterministic`、`max_workspace_bytes`、`fallback`、`view_mode=forbid/prefer`、`allow_materialize_copy`、`allow_fusion` | 走兼容承诺和变更记录 |
 | `tuning` | 性能工程师 | `profile_id`、固定线程上限、provider pin、已登记的 shape bucket | 必须有证据、版本和可重放制品 |
 | `internal` | target/provider 实现者 | ISA、tile、microkernel、寄存器/共享内存布局、CCE Pipe 参数 | 不进入公共稳定 API |
 
 `provider=vendor` 可以作为稳定的意图，但 `provider=oneDNN:某个 microkernel` 不应成为稳定接口。用户要固定某个库时，应固定 provider ID 和版本，而不是固定库内部符号。
+
+`view_mode` 是约束/偏好，不是 alias 授权：contract 的 `view_obligation`、liveness、写覆盖和 owner/lifetime proof 优先于 policy。`prefer` 只影响候选排序；`require` 在 proof 未接入前仅供 internal 调试使用，无法证明时必须 fail-closed。旧的 `allow_view` 只作为兼容输入，不能把 `must_not_alias` 改成 `may_alias`。
+
+同理，`allow_materialize_copy` 只是“允许候选考虑 layout 物化”的上限条件；contract 若要求保留 storage alias，或 `max_copy_bytes`/lifetime 不满足，resolver 仍必须拒绝 copy。`allow_transfer_copy` 只控制设备/内存空间搬运，不能替代 layout 的物化约束。
 
 ### 3.3 `Capability` 与 `Provider`：平台能做什么
 
@@ -221,6 +233,8 @@ explain(...)  -> ProviderExplanation
 
 实现上，`CapabilitySnapshot` 是现有 `TargetSpec` / `CapabilitySet` 的可序列化、带证据的用户侧视图，不另造一套互不兼容的 target registry；快照可以包含 probe 时间和原始特征，但 digest 只纳入规范化字段。
 
+每个 provider 的 capability fragment 还必须声明适用前置条件和可解析的 policy 字段，至少包括：`stride_class`（如 `contiguous_only`）、`slice_step_domain`、`supported_view_modes`、`alias_proof` 状态、`policy_applicability`、以及 numeric `exactness/reduction_order_id`。这些是候选过滤事实，不是用户可以自行放宽的旋钮。
+
 ### 3.4 `ExecutionPlan` / `Artifact`：最终怎么做
 
 解析器根据 contract、policy 和 capability 生成不可变计划。计划至少包含：
@@ -239,6 +253,13 @@ execution_plan:
     - {id: vendor:onednn, state: selected, score: ...}
     - {id: portable, state: declared_fallback, reason: contingency}
   numeric_guarantee: {...}
+  policy_applicability: {status: validated, rejected_fields: []}
+  layout_decision:
+    requested_view_mode: not_applicable
+    resolved_view_mode: not_applicable
+    alias_proof_digest: null
+    layout_copy_bytes: null
+    transfer_bytes: null
   fallback_chain: [vendor:onednn, portable]
   artifact: {format_version: ..., digest: ...}
 ```
@@ -412,8 +433,9 @@ op 显式约束 > region 约束 > graph 约束 > deployment profile
 1. `OpContract` 版本和 shape/layout/dtype 规则；
 2. capability 的真实支持范围；
 3. numeric/determinism/error budget；
-4. provider、placement、workspace、线程和编译时间上限；
-5. fallback 和 provider allow/deny 规则。
+4. effect、alias、state、owner/lifetime 和 synchronization 规则；
+5. provider、placement、workspace、线程和编译时间上限；
+6. fallback、provider allow/deny 和 policy applicability 规则。
 
 不满足时返回结构化错误，至少包含 `field`、`requested`、`available`、`reason`、`suggested_policy` 和 `capability_digest`。
 
@@ -429,6 +451,8 @@ op 显式约束 > region 约束 > graph 约束 > deployment profile
 | `RESOURCE_BUDGET_EXCEEDED` | workspace、内存、线程或编译预算超限 | 选择满足上限的候选，否则失败 |
 | `ARTIFACT_MISMATCH` | digest、ABI、版本或 capability snapshot 不一致 | fail-closed |
 | `FALLBACK_DISALLOWED` | 请求的降级未被 policy 声明 | fail-closed |
+| `POLICY_FIELD_NOT_APPLICABLE` | policy 字段不属于该 contract/族，或 provider 未声明其适用性 | fail-closed |
+| `ALIAS_PROOF_UNAVAILABLE` | 请求 view/alias，但缺少 liveness、owner 或写覆盖证明 | fail-closed；不得偷偷改成 view |
 
 ### 5.2 自动选择模式
 
@@ -483,6 +507,7 @@ fallback_events:
 - 默认 `max_steps=1`；复杂链必须由 policy 明确声明；
 - provider 不可用时，只有仍满足同一 numeric requirement 的 portable 候选可以自动接替；
 - 不得自动把 `portable` 换成低精度、非确定性或更宽误差路径；
+- view→copy 不是普通 provider fallback：只有 contract 允许 materialize、`layout.allow_materialize_copy=true` 且 `max_copy_bytes` 满足时才能选择，并必须记录 `resolved_view_mode=materialized`、`layout_copy_bytes` 和 alias decision；`view_mode=require` 缺 proof 时直接失败；
 - `allow_numeric_downgrade=true` 只能由显式用户策略开启，并要求给出 `ErrorBudget`，否则 fail-closed；
 - 编译时已冻结的 artifact 在运行时缺库时默认失败；只有 artifact 内含已声明的 fallback 且 policy 允许，才可执行回退；
 - 每次降级都进入报告、日志和计数器，不得只打印一次容易丢失的 warning。
@@ -501,6 +526,8 @@ numeric_guarantee:
   reference: portable_reference_v1
   accumulation: f32
   rounding: rne
+  reduction_order_id: declared_order_v1
+  exactness_basis: contract_and_order
   deterministic: true
   error_budget:
     scope: op
@@ -525,6 +552,12 @@ numeric_guarantee:
 
 vendor GEMM 仍可作为各平台默认性能实现，但它必须声明对应类别和误差证据；不能因为算子名字相同就继承 portable 的位级主张。
 
+`exact` 是逐 opcode、逐 contract 判断，不是整个算子族的标签。当前 W8A8 v1 的建议表达为：
+`qmatmul_s8s8_s32` 在固定整数 contract 下 `exact`；`quantize_per_token_s8` 在固定
+RNE/absmax/码值域/归约顺序下 `exact`；`dequantize_epilogue_bf16` 只有相对于声明的
+“先形成一次 `s_a*s_w`，再与 accumulator 相乘”及单次 RNE 顺序才是 `exact`，换乘法顺序的 vendor 路径必须是
+`deterministic_bounded`，不能继承位级主张。
+
 `profile=portable` 的含义是“只使用可移植主干并以它作参考”，不是无条件承诺所有硬件、所有 reduction 顺序都逐位相同；是否达到 `portable_bitwise` 仍由 contract、wire/ABI 和实际报告共同证明。
 
 ### 6.2 误差预算的边界
@@ -539,7 +572,7 @@ vendor GEMM 仍可作为各平台默认性能实现，但它必须声明对应�
 `deterministic=true` 不等于 `portable_bitwise`。它表示在给定 target、provider、版本、线程和随机源下可重复。报告应同时列出：
 
 ```text
-numeric_class / deterministic / accumulation / reduction_order / seed / thread_policy
+numeric_class / exactness_basis / reduction_order_id / deterministic / accumulation / seed / thread_policy
 ```
 
 ---
@@ -553,19 +586,19 @@ numeric_class / deterministic / accumulation / reduction_order / seed / thread_p
 建议使用：
 
 ```yaml
-layout_policy:
+layout:
   preferred: preserve_input
   allowed: [contiguous, blocked]
-  allow_view: false
-  allow_copy: true
+  view_mode: forbid          # stable: forbid | prefer；require 仅 internal
+  allow_materialize_copy: true
   max_copy_bytes: null
 ```
 
-`view` 只有在别名、stride、写后读和生命周期证明通过时才可解析为零拷贝；否则必须生成显式 copy 并在计划中可见。不能用 `layout_policy=view` 绕过 Core IR 的 alias/effect 契约。
+`view` 只有在别名、stride、写后读和生命周期证明通过时才可解析为零拷贝；否则必须生成显式 copy 并在计划中可见。`view_mode=prefer` 只影响候选排序，`require` 在 proof 未接入前不属于 stable API。不能用 policy 绕过 Core IR 的 alias/effect 契约。
 
 ### 7.2 Placement 与搬运
 
-`placement` 应在 graph/region 级优先表达：设备、内存空间、是否允许 HtoD/DtoH/跨设备 copy、是否允许 host staging。算子 provider 只能在父级允许的 placement 中选路。这样可避免每个 op 分别“选 CUDA”而图中间隐式发生不可见搬运。
+`placement` 应在 graph/region 级优先表达：设备、内存空间、是否允许 HtoD/DtoH/跨设备 copy、是否允许 host staging。`allow_transfer_copy` 只控制这些搬运，不控制 layout materialization。算子 provider 只能在父级允许的 placement 中选路。这样可避免每个 op 分别“选 CUDA”而图中间隐式发生不可见搬运。
 
 ### 7.3 资源约束
 
@@ -608,8 +641,20 @@ execution_report:
   guarantees:
     numeric_class: deterministic_bounded
     precision_class: bounded_tolerance   # 兼容旧报告；由 numeric_class 展开
+    scheme_digest: null
+    exactness_basis: contract_and_order
+    reduction_order_id: declared_order_v1
     deterministic: true
     error_budget: {...}
+  policy_applicability:
+    status: validated
+    rejected_fields: []
+  layout_decision:
+    requested_view_mode: not_applicable
+    resolved_view_mode: not_applicable
+    alias_proof_digest: null
+    layout_copy_bytes: null
+    transfer_bytes: null
   resolution:
     candidates: [...]
     fallback_events: []
@@ -632,6 +677,22 @@ execution_report:
     reason: host_no_cpufreq
   capability:
     snapshot_digest: sha256:...
+  resources:
+    parallelism: {worker_count: 1, worker_index: 0, intra_op_threads: 1,
+                  oversubscription_policy: reject, cpu_affinity: auto}
+  coverage:
+    logical_operation_counts: {...}
+    provider_invocation_counts: {...}
+    artifact_preparation_counts: {...}
+    epilogue_counts: {...}
+    counting_profile:
+      precision: ...
+      graph_digest: ...
+      domains:
+        logical_operation_counts: {included_in_graph_total: true, parent_opcode: null}
+        provider_invocation_counts: {included_in_graph_total: false, parent_opcode: null}
+        artifact_preparation_counts: {included_in_graph_total: false, parent_opcode: null}
+        epilogue_counts: {included_in_graph_total: false, parent_opcode: null}
 ```
 
 `kernel_seconds` 在 CUDA cuEvent 计时尚未落地或计时范围不满足协议时必须为 `null`，不能用 wall time 冒充。报告应同时保留 `requested_policy` 和 `resolved_policy`，否则用户无法发现自动选择或降级。
@@ -928,7 +989,7 @@ P6 不得与只读 P5 共用“表只读”假设。
 - NaN/Inf、zero row、scale underflow；
 - accumulation width、K 上限和 overflow；
 - logical quantized layout；
-- binding/wire schema version。
+- logical binding schema reference；physical wire/artifact version 另行记录。
 
 物理 VNNI/SDOT/dp4a/tensor-core packing、tile 和 kernel ABI 属于 provider/artifact，
 不属于公共 Core IR 的量化语义。`pack_weight_s8` 是 ingestion/artifact 操作，不是
@@ -978,7 +1039,7 @@ effectful/reserved 或 target-private namespace，不伪装成 P1–P8 的 porta
 
 | 族/层 | 可表达的意图 | 不可表达的内容 |
 |---|---|---|
-| P2 | `view_mode=forbid/prefer/require`、`max_copy_bytes` | 通过 policy 授权 alias、改 stride/shape/写覆盖语义 |
+| P2 | stable `view_mode=forbid/prefer`、internal `require`、`max_copy_bytes` | 通过 policy 授权 alias、改 stride/shape/写覆盖语义 |
 | P3 | provider、workspace、线程上限、numeric requirement | ISA、microkernel、accumulation/rounding 变更 |
 | P4/P1 | deterministic、region fusion preference、资源上限 | 改 reduction order 或舍入次数 |
 | P5/P6 | placement、residency preference、资源上限 | 越界、duplicate update、atomic 语义 |
@@ -1060,7 +1121,7 @@ P8 额外报告：
 - P4：identity、axis、order、NaN/tie；
 - P5/P6：bounds、duplicate update、effect/atomicity；
 - P7：padding、window、state transition；
-- P8：scheme、code domain、scale、accum width、saturation、logical wire；
+- P8：scheme、code domain、scale、accum width、saturation、logical binding schema；physical wire 属于 artifact/provider 版本；
 - Composite：可观察的 decomposition、rounding/state barrier 或 required primitive digest。
 
 物理 packing/kernel 变化但逻辑 contract 不变时，升 provider/kernel/artifact 版本，不改
@@ -1094,7 +1155,7 @@ P8 额外报告：
 | 2 | `sort/topk/random/collective` 是否纳入当前公共 API？ | **全部列为 reserved**：不在公共 API、不在 capability 的 supported 集合内；出现在图上必须 fail-closed。经典 PyPTO 审计中的这些条目属于"未来需要覆盖"的历史清单 | 当前 MVP 图只用 26 个 operation key（见 §13.1 的证据文件） |
 | 3 | §13 证据基线用哪个 commit？ | **统计绑定三元组**：`graph_digest 456ab519…d786e` + precision profile `BF16/T=5` + evidence `verify-w8a-decay-fix/raw/s3_aligned.json`；文档修订对应 integration HEAD `c2ec98f3c`。W8A8 图另立 profile 统计，不与 BF16 混算 | 本次核对：五组之和精确 6728、无未归类项 |
 | 4 | `view_mode=require` 是否作为公共 stable API？ | **暂不**：B6 实测视图别名 hard-off、liveness proof 未接入，此时 `require` 必然失败，公开它只会变成陷阱。现阶段公共 stable 只保留 `forbid` / `prefer`，`require` 记为 internal，待 proof schema 接入后再提级 | `verify-b6-layout-native` §5：`layout_view_alias_mode="disabled"`、3 个 env 开关无效、执行器总分配独立 destination |
-| 5 | W8A8 各 primitive 的 exact/bounded 划分与 scale 归约顺序是否已冻结？ | **v1 方案已冻结**，逐 opcode 划分为：`qmatmul_s8s8_s32` = `exact`（int32 累加，且无饱和时与整数和恒等）；`quantize_per_token_s8` = `exact`（RNE + absmax + 码值域 `[-127,127]`，拒 `-128`）；`dequantize_epilogue_bf16` = **相对契约声明的单次 RNE 序为 exact、相对其它乘序为 bounded**；scale 归约顺序冻结为 `acc × fp32(s_a × s_w)`（**一次乘**）。vendor 融合路径若为两次乘（如 AOCL `_sym_quant`）只能记 `deterministic_bounded`，不得继承位级主张 | 契约 `docs/20-planning/0002-…`（FROZEN）；C5/C6 验收的逐位证据；AOCL LPGEMM 源码级语义发现（AOCL `(acc×s_w)×s_a` 两次乘） |
+| 5 | W8A8 各 primitive 的 exact/bounded 划分与 scale 归约顺序是否已冻结？ | **v1 方案已冻结**，逐 opcode 划分为：`qmatmul_s8s8_s32` = `exact`（int32 累加，且无饱和时与整数和恒等）；`quantize_per_token_s8` = `exact`（RNE + absmax + 码值域 `[-127,127]`，拒 `-128`）；`dequantize_epilogue_bf16` = **相对契约声明的单次 RNE 序为 exact、相对其它乘序为 bounded**；scale 归约顺序冻结为“先形成一次 `s_a*s_w`，再与 accumulator 相乘”。机器报告必须同时写 `scheme_digest`、`reduction_order_id`、`exactness_basis`；vendor 融合路径若为两次 accumulator-scale 乘法（如 AOCL `_sym_quant`）只能记 `deterministic_bounded`，不得继承位级主张 | 契约 `docs/20-planning/0002-…`（FROZEN）；C5/C6 验收的逐位证据；AOCL LPGEMM 源码级语义发现（AOCL `(acc×s_w)×s_a` 两次乘） |
 
 **同时采纳的三处修正**（v1 → v2）：
 
@@ -1120,7 +1181,7 @@ P8 额外报告：
 | A-1 | **L5/L6 的语料与阈值** | 契约 §5.2 的 L4–L6 阈值是暂定值，`D5` 明确需用户确认；决定 Q6 能否启动，也决定能否对外声称"W8A8 精度达标" | 先只做 L4（logits）；L5 用现有 token 链做弱化版并显式标注覆盖不足；L6 待语料与阈值 |
 | A-2 | **`view_mode=require` 何时提级为公共 stable** | 当前 view alias 为 hard-off（liveness proof 未接入），公开 `require` 必然失败 | 先保持 internal，待 proof schema 接入（与 A-4 相关）后再提级 |
 | A-3 | **W8A8 v1 之外是否立项新量化方案** | 新 scheme/码制/scale 粒度按 §13.7 必须新建 contract 版本，不许复用 `w8a8-linear.v1` | 等单算子框架与真实工业框架对比之后再议（用户 2026-09-12） |
-| A-4 | **图执行层：自研还是外包**（决定 N4 的存废） | 现状是我们自己的 Python 逐 op 循环；B6 后 prefill launch 24 s 中 op 仅 4.5 s，**残差 19.4 s（81%）**，且与算子内容无关。若外包给框架（PyTorch/vLLM 的 executor），残差变成框架的问题；若保留自研，必须先分解再优化 | 先做**三档计时分解**（低成本的诊断），用数据支撑"自研 vs 外包"；重复的元数据重建（每次 launch 把整个程序 `from_dict`+`canonical_json`+`sha256` 做两遍）无论走哪条路都应修 |
+| A-4 | **图执行层：自研还是外包**（决定 N4 的存废） | 现状是我们自己的 Python 逐 op 循环；B6 后 prefill launch 约 24 s 中 op 约 4.5 s，残差约 19.4 s（约 81%）。这些数字来自本机 KVM、无 cpufreq、非静默窗口，**永久 `UNGATED`**，只能作为诊断线索，不能解释为与算子内容无关或跨平台结论。若外包给框架（PyTorch/vLLM 的 executor），残差变成框架的问题；若保留自研，必须先分解再优化 | 先做**三档计时分解**（低成本的诊断），用数据支撑"自研 vs 外包"；“每次 launch 重复 `from_dict`+`canonical_json`+`sha256`”目前是待 profile 证实的假设，确认后无论走哪条路都应修；证据来自 `verify-b6-layout-native/brief.zh-CN.md §7` |
 | A-5 | **W8J 注入门政策** | 现行门是"必须追平 oneDNN 才允许注入"，导致注入被禁；vendor GEMM 决策后背景已变（W8J 转 W8A8） | 改为**按 provider/精度分层声明 + 显式 opt-in + 诚实标注倍数**，而不是一刀切禁止 |
 
 ### 14.2 (B) 需要外部评审复核的设计悬置
@@ -1133,3 +1194,20 @@ P8 额外报告：
 | B-4 | `OpDefinition` registry 与 op-bench（`0007`）共用 | 两者必须是**同一个 registry**；U1 首切片正在建它 | registry 的 schema 应由谁定义（Core IR 侧还是 execution 侧）？版本升级谁有否决权？ |
 | B-5 | 模型级验收的挂接点 | 0006 是 op/graph 作用域，而我们的验收是**模型级**（L4/L5/L6、band、near-tie、token 链） | 是否应在 `ExecutionReport` 之上定义 `ModelReport`？两者字段如何避免重复与冲突？ |
 | B-6 | 进程级并行（A3 的现实） | 0006 把线程收归 graph/region 资源上限 + provider 内部调度；但 A3 实测正确姿势是 **16–20 进程 × 每进程 8 线程**，超线程为负收益 | policy 是否需要表达"我是 N 个并行 worker 之一"以避免线程超订？放在哪个字段？ |
+
+### 14.3 本轮外部审理增补（2026-09-12）
+
+以下是对 §14.1/§14.2 的设计建议；不替用户关闭 A 类裁决项。
+
+| 项 | 外部审理建议 | 应落到哪里 |
+|---|---|---|
+| A-4 图执行层 | 先做三档诊断：`plan/metadata`、`dispatch`、`provider/kernel/transfer`；每档保留 host、commit、协议和 `UNGATED`。元数据 `from_dict/canonical_json/sha256` 重建属于执行基础设施优化，不应写入某个算子 contract | `ExecutionReport.timing`、runtime profile；不改 `OpContract` |
+| A-5 注入门 | 按 provider × precision × guarantee 分层，显式 opt-in，并保留倍率/边界；禁止把“未追平 vendor”写成“不允许观察” | provider registry、deployment policy、report |
+| B-1 连续输入 | 在 capability 中使用结构化前置条件：`stride_class=contiguous_only`、`slice_step_domain=positive`、`rank_max`、`layout_descriptor_version`；resolver 以 capability 过滤，不能把它们写成所有平台 L0 | `CapabilityFragment.preconditions` |
+| B-2 W8A8 统计 | 同时输出四个不相加的计数域：`logical_operation_counts`、`provider_invocation_counts`、`artifact_preparation_counts`、`epilogue_counts`；每项带 `included_in_graph_total` 与 `parent_opcode`，避免 packed/epilogue 双计数 | `ExecutionReport.coverage` / op-bench schema |
+| B-3 exactness | 引入机器可比较的 `scheme_digest`、`reduction_order_id`、`exactness_basis`；provider 若顺序不同只能得到 `deterministic_bounded` | `NumericGuarantee`、provider manifest |
+| B-4 registry 治理 | Core IR 侧拥有 canonical opcode、属性 schema、contract digest 和 verifier；execution 侧只注册 provider/cost model。contract-breaking 变更需架构锁 + 独立验收；新增 provider 不应升级 Core IR schema | `OpDefinition` registry governance |
+| B-5 模型级验收 | 增加轻量 `ModelReport` 外壳，引用一个或多个 `ExecutionReport`，只放 L4–L6、gold digest、token chain、near-tie、state 有限性等模型字段；不复制 op/provider 字段 | `ModelReport {execution_report_refs, model_gates}` |
+| B-6 进程并行 | 增加 deployment-level `parallelism`：`worker_count`、`worker_index`、`intra_op_threads`、`oversubscription_policy`、`cpu_affinity`；不放入 OpContract，也不让 per-op policy 改写它 | `ExecutionPolicy.resources.parallelism`、host report |
+
+`view_mode=require`、新量化 scheme、L5/L6 阈值和自研/外包执行层仍保持 §14.1 的用户裁决状态；本节只冻结可审计的数据形状和边界，不替用户做产品选择。
