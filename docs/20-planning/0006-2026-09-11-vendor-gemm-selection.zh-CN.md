@@ -134,7 +134,9 @@ bf16 默认 = oneDNN；AOCL bf16 第二（0.76x）；自有 bridge 兜底
 |---|---|
 | **Ascend** | `aclnnQuantMatmulV4/V5` 是文档上最贴合我们契约的候选（per-channel + per-token 运行时 scale、int32 bias 在 x1@x2 后、bf16 输出）；**NPU 属用户，未实测** |
 | **aarch64** | KleidiAI（`qai8dxp×qsi8cxp`，int32 累加有 `smmla` 源码证据、per-row×per-channel 原生、纯 C 无线程）**最可行，但未实测**；oneDNN-ACL 的 per-token 是否被真正消费未证；**ArmPL 在 EULA 澄清前不得列入**；KML 需注册同意 EULA；OpenBLAS-aarch64 无 int8 GEMM |
-| **NVIDIA sm_120** | **红灯（文档级）**：cuBLASLt 明文"int8 + 任何 scale 会返回错误"、int8 组合无 epilogue、CUTLASS SM120 无 int8 行 → **vendor int8 在该平台不可用**，C6 的自有 dp4a 内核是**唯一现实路径**；建议做一次存在性实测 |
+| **NVIDIA sm_120** | **红灯（已由 Q4 实测确认，措辞已修正）**：cuBLASLt 的 **`A/B_SCALE` 指针** → `INVALID_VALUE(7)`（scaleType 32I/32F 均如此）；**int8 + scale → BF16 或 +bias epilogue** → `NOT_SUPPORTED(15)`。
+**修正**：不是"vendor int8 不可用"，而是**"int8 + scale 融合"不可用**——**plain int8 GEMM（`GemmEx` 32I、Lt 不带 scale）是 SUPPORTED 的**。
+含义：C6 的自有 dp4a 内核仍是该平台**唯一能一次做完 int8 + 我们 epilogue** 的路径；若要吃 vendor int8，必须自己拆成"GEMM + 单独 epilogue"两趟。证据：`_meta/pypto-x/c8-axis-b-probe/` |
 | **AMD gfx1036** | 文档级不可达（ROCm 支持矩阵无 gfx1036、Tensile 直接 unsupported） |
 
 ### 8.6 本轮的边界与红旗
