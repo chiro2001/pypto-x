@@ -1,6 +1,6 @@
 # PyPTO-X 接手文档
 
-状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q7_Q8_Q8B_N4_C6TIMING_DONE_LAUNCH_CACHE_DONE_CUDA_QUANTIZE_DONE_C8_Q5_BLOCKED_ON_SVE_INT8_Q10_MERGED_VERIFYING_SVE_LIVENESS_MERGED_A3_LEG_PENDING_Q9_IN_FLIGHT_U1_MERGED_VERIFY_FAIL_REFIXING_INTEGRATION_HEALTHY_D1_D2_REPAIRED_VERIFYING_W8A8_V2_M1_DONE_A3_OUTAGE_OPEN`
+状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q7_Q8_Q8B_N4_C6TIMING_DONE_LAUNCH_CACHE_DONE_CUDA_QUANTIZE_DONE_C8_Q5_BLOCKED_ON_SVE_INT8_Q10_MERGED_VERIFYING_SVE_LIVENESS_MERGED_A3_LEG_PENDING_Q9_IN_FLIGHT_U1_REFIX_MERGED_AS_8360A9AEE_REVERIFYING_INTEGRATION_HEALTHY_D1_D2_REPAIRED_VERIFYING_W8A8_V2_M1_DONE_A3_OUTAGE_OPEN`
 
 最后更新：2026-09-12 04:50 CST（Asia/Shanghai；**0040 波次进行中**：**integration 体检判 HEALTHY**（受检 `7e2aea514`，1394/1387/7/0/0，rc=0，759 s，+190/−3 收集差全部溯源），并查出 **D-1**（C6 harness 被 cherry-pick 顺序回退）与 **D-2**（`pack_ours_logits.py` 未定义名）——两者已修复并合入（tip `77981213e`，含新增 6 条静态守卫测试），独立验收在跑、规则 8 全量需在新 tip 重跑｜**U1 首切片验收判 FAIL**（3 条阻断：target fail-open / `policy_from_dict` 吞 `schema_version` / `output` 别名覆盖输入），回修中｜Q10（SVE256 int8 layout）与 liveness 均已合入：Q10 A3 原生 43/43（断线前）、liveness 本地三套件全绿、A3 侧确认待恢复｜C6 计时与 launch-artifact-cache 收口（quantize 重写后位级 58/58、中位 24×；prefill −38.2%、decode −32.1%）｜**A3 自 ~19:12Z 起不可达（20:33Z 复核仍 BLOCKED）**｜控制仓最近一次 push 仍为 7857ae6、补丁 144）
 
@@ -28,7 +28,7 @@
    a) **先读 lock 的 `waves.W8.in_flight_2026_09_11_batch2`**——它才是权威的在跑清单；当前（2026-09-12 04:50 CST）在跑：
       `verify-c6-harness-preflight-fold`（D-1/D-2 独立验收 + 新 tip 规则 8 全量）｜`verify-sve256-int8-layout`（Q10 复验）｜
       `op-bench-framework`(Q9，等 local 锁)｜`c7-decode-gap-localization`（oracle swap 等 3–5 min 锁窗）｜
-      `u1-matmul-policy-slice` 回修 + `verify-u1-matmul-policy-slice` 复验｜`sve256-liveness-release`（A3 leg 待恢复）；
+      `verify-u1-matmul-policy-slice` 复验（回修 `dce9be581` 已合入 `8360a9aee`）｜`avx2-layout-native`（本批外，AVX2 原生 layout）｜`sve256-liveness-release`（A3 leg 待恢复）；
       已结束：`integration-health-check`（HEALTHY，受检 `7e2aea514`）。
    b) **0040 本批已收口的主要结论**（引用时以 lock/ERRATA 为准，不要凭记忆）：
       · **集成体检 HEALTHY**（2026-09-12，`docs`/lock 有全量证据目录 `worktrees/_meta/pypto-x/integration-health-check`）：
