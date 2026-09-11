@@ -36,6 +36,19 @@
       · **W8A8 v2（路线 c）**：M1 设计完成（`docs/20-planning/0010-…`），**c1 四后端 kernel 零改动**；重基线 4–7 h；**M4 必须等本批收口**。
    c) **待用户裁决（7 项，见 `pending_user_decisions_2026_09_11`）**：L4 是否含 decode 口径（**最靠前**）｜B4 阈值冻结（已推迟）｜L5/L6 语料与阈值（决策包在 `0005 §10`，三句话）｜`view_mode=require` 提级｜W8A8 v1 之外的新量化方案｜W8J 注入门政策｜A3 chip7/NPU 放行（E 线 N5）。
    d) **尚未开始但已就绪**：Q5 重跑（需 Q10 + liveness 合入；6 config 并行、A3 上约 20–40 min 墙钟）｜U2（接第一个 vendor provider，需 U1 验收过）｜W8A8 v2 M2（**等 Q10 落地后**，因为两者都改 SVE256 的 int8 通路）｜C8 的 L5/L6。
+4.9 **0040 波次中新立的四条流程**（都是踩坑换来的，勿再犯）：
+   · **批量合并 + 单次全量**：当多个任务"只差自己那次全量 pytest"时，**先把它们的提交合入 integration**，
+     再由 `integration-health-check` 在合并后的 tip 上跑**一次**全量；各任务仍 own 自己的聚焦证据，
+     但必须**引用共享全量并注明 commit**，不得写成"我自己跑了全量"。原因：5 个任务各跑 11 分钟全量会在
+     无公平队列的锁上互相饿死（实测每次都差 30–90 s 撞车）。
+   · **不要用"范围字符串替换"编辑 `development_lock.yaml`**（父 agent 三次踩坑：删范围连坐、切出重复键、
+     把 wave 级键塞进 in-flight）。正确做法：改前记录键集 → 定向替换 → 改后比对键集，缺失即报错。
+   · **cherry-pick 收尾**：`GIT_EDITOR=true git cherry-pick --continue`，**不要**用 `git commit` 手动收尾
+     （sequencer 会挂着，之后任何 `--abort` 都会回退分支——ERR-0008 就是这么丢掉 Q3 的 4 个提交的）；
+     合入后**必须**用 tree/patch-id 相等核验等价性（cherry-pick 产生新 SHA，`merge-base --is-ancestor` 不适用）。
+   · **A3 合并出行**：A3 恢复后把 Q5 重跑、Q9 的 A3 leg、liveness 的 A3 确认**合并成一趟**（同用 host CPU 320–639、
+     同 schema 输出），不要各排一次机时；A3 不可达时一律标 `PENDING_A3_OUTAGE`，不得用 QEMU 冒充原生。
+
 5. 并发与资源：平台无 subagent 并发上限（旧文档的 ≤3 属自设假设，ERR-0005 已更正）；重任务一律经 scripts/resource/run_local_heavy.sh（返回 75/69 就等待重试，
    禁止绕过）；**等锁时挂后台或长 timeout，不要在前台循环空转**（会耗尽 agent 回合，S1 曾因此中断一次）；
    A2/920B/A3 都是共享资源，约定安静使用。
