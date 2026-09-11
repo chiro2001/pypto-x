@@ -39,7 +39,7 @@
    - 后处理 `BIAS / SCALE / MATRIX_ADD`（最多 8 个、可排序），前置 `RELU / PRELU / GELU_TANH / GELU_ERF`。
 4. **对本项目的意义**：`s8s8` 免符号补偿（VNNI 家族是 `u8s8`，补偿会改数值语义）；`_sym_quant` + `SCALE` 后处理有望直接承载我们的 per-channel/per-token scale 与 epilogue。
 
-**因此 x86 leg 必须包含两条获取路径**：(a) AMD 官方 AOCL release；(b) 自行构建 `amd/blis` 的 addon（本地需确认 GCC ≥ 11.2）。并必须核对：`_sym_quant` 的 scale 语义、累加宽度、饱和策略、以及与 portable 路径的逐位一致性。
+**因此 x86 leg 的 AOCL 获取方式（用户 2026-09-11 决定）**：**从源码构建，显式选择 Zen4 配置**（本机为 Zen4 ES 样片，不允许运行期探测去猜 Zen5/其他 arch）；conda-forge 包因不含 LPGEMM 而弃用。构建后必须核对：`_sym_quant` 的 scale 语义、累加宽度、饱和策略、与 portable 路径的逐位一致性，以及构建出的 zen4 内核确实被运行时选中（而非退回 generic）。
 | aarch64 鲲鹏 920B（SVE VL=32，svebf16 + svei8mm） | **oneDNN aarch64**（ACL/ SVE 后端）、**KleidiAI** 微内核、ArmPL、华为 KML/BoostKit、OpenBLAS-aarch64 | 同左；另需确认 ArmPL/KML 在鲲鹏上的**可得性与许可**、以及能否在 A3 上无需 root 安装 |
 | NVIDIA RTX 5080（sm_120） | cuBLAS / **cuBLASLt**（SCALE 模式）、CUTLASS（自定义 epilogue） | 能否表达"per-channel 权重 scale + per-token 激活 scale + bf16 输出"的 epilogue；sm_120 支持矩阵 |
 | AMD gfx1036 | hipBLASLt / rocBLAS(Tensile) | **静态记录即可**（我们的 AMD 运行态仍 BLOCKED_DEVICE，不实测） |
