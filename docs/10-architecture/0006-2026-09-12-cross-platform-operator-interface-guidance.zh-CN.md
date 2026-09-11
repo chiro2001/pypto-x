@@ -1106,3 +1106,30 @@ P8 额外报告：
 
 - `view_mode=require` 何时提级为公共 stable API（取决于 liveness proof 的接入时机与形态）；
 - W8A8 v1 之外的量化方案（新 scheme/新码制/新 scale 粒度）是否立项，以及届时是否新建 contract 版本而非复用 `w8a8-linear.v1`。
+
+---
+
+## 14. 悬置项清单（供下一轮外部评审；项目方 2026-09-12 追加）
+
+> 本节只列**尚未冻结**的事项，分两类：**(A) 需要项目方/用户裁决的口径**（外部评审可给建议但不能替项目决定）；**(B) 需要外部评审复核的设计悬置**（项目方已给倾向，等评审意见后再冻结）。
+
+### 14.1 (A) 需要项目方/用户裁决的口径
+
+| # | 事项 | 现状与影响 | 项目方倾向 |
+|---|---|---|---|
+| A-1 | **L5/L6 的语料与阈值** | 契约 §5.2 的 L4–L6 阈值是暂定值，`D5` 明确需用户确认；决定 Q6 能否启动，也决定能否对外声称"W8A8 精度达标" | 先只做 L4（logits）；L5 用现有 token 链做弱化版并显式标注覆盖不足；L6 待语料与阈值 |
+| A-2 | **`view_mode=require` 何时提级为公共 stable** | 当前 view alias 为 hard-off（liveness proof 未接入），公开 `require` 必然失败 | 先保持 internal，待 proof schema 接入（与 A-4 相关）后再提级 |
+| A-3 | **W8A8 v1 之外是否立项新量化方案** | 新 scheme/码制/scale 粒度按 §13.7 必须新建 contract 版本，不许复用 `w8a8-linear.v1` | 等单算子框架与真实工业框架对比之后再议（用户 2026-09-12） |
+| A-4 | **图执行层：自研还是外包**（决定 N4 的存废） | 现状是我们自己的 Python 逐 op 循环；B6 后 prefill launch 24 s 中 op 仅 4.5 s，**残差 19.4 s（81%）**，且与算子内容无关。若外包给框架（PyTorch/vLLM 的 executor），残差变成框架的问题；若保留自研，必须先分解再优化 | 先做**三档计时分解**（低成本的诊断），用数据支撑"自研 vs 外包"；重复的元数据重建（每次 launch 把整个程序 `from_dict`+`canonical_json`+`sha256` 做两遍）无论走哪条路都应修 |
+| A-5 | **W8J 注入门政策** | 现行门是"必须追平 oneDNN 才允许注入"，导致注入被禁；vendor GEMM 决策后背景已变（W8J 转 W8A8） | 改为**按 provider/精度分层声明 + 显式 opt-in + 诚实标注倍数**，而不是一刀切禁止 |
+
+### 14.2 (B) 需要外部评审复核的设计悬置
+
+| # | 悬置项 | 项目方已给的处理 | 希望评审回答 |
+|---|---|---|---|
+| B-1 | §13.9 第 1 答："源 strides 连续 / slice step 为正"是 **provider 前置条件**而非 L0 语义 | 依据：`LayoutPlan` 校验 + `abi/descriptors.py` 的 contiguous 检查 | 这个划分是否成立？若成立，capability 里应如何表达"仅支持连续输入"？ |
+| B-2 | §13.9 第 3 答：统计绑定 `graph_digest + profile + evidence path` | 已给出 BF16/T=5 的 6728 精确直方图 | W8A8 profile 的直方图应包含哪些计数（packed 前/后、含/不含 epilogue）？ |
+| B-3 | §13.9 第 5 答：W8A8 的 exact/bounded 逐 opcode 划分 | `qmatmul`=exact（int32）、`quantize`=exact（RNE+码域）、`epilogue`=相对契约声明的单次 RNE 序为 exact、相对其它乘序为 bounded | 这个"相对性"表述是否可被机器校验？是否应引入显式的**归约顺序 ID**？ |
+| B-4 | `OpDefinition` registry 与 op-bench（`0007`）共用 | 两者必须是**同一个 registry**；U1 首切片正在建它 | registry 的 schema 应由谁定义（Core IR 侧还是 execution 侧）？版本升级谁有否决权？ |
+| B-5 | 模型级验收的挂接点 | 0006 是 op/graph 作用域，而我们的验收是**模型级**（L4/L5/L6、band、near-tie、token 链） | 是否应在 `ExecutionReport` 之上定义 `ModelReport`？两者字段如何避免重复与冲突？ |
+| B-6 | 进程级并行（A3 的现实） | 0006 把线程收归 graph/region 资源上限 + provider 内部调度；但 A3 实测正确姿势是 **16–20 进程 × 每进程 8 线程**，超线程为负收益 | policy 是否需要表达"我是 N 个并行 worker 之一"以避免线程超订？放在哪个字段？ |
