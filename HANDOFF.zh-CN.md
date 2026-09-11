@@ -25,18 +25,21 @@
    不把静态 lowering 说成真机 PASS；不把 A2 的限定式关闭说成"PyPTO Ascend 后端已通"；
    不推公开仓/不改历史/不发权重证据，除非用户当次明确指示。
 4. 用户说"继续"时的默认动作（按优先级）：
-   a) 0039 批次（2026-09-11 下半场）：**A3 共享机接入**（原生 SVE256 + 昇腾 910C；chip7 独占、node7 CPU、只写 home）；
-      Ascend 线 **N1 自检 / N2 PTO-ISA bring-up（tassign on chip7）/ N3 vllm-ascend Qwen3.5-0.8B 基线（token 链与 gold 一致）
-      / N4 IR→PTO 最小桥（Core IR→PTO C++ 真机逐位一致）**；**B2 SVE 四类原生化**（QEMU/原生 50/50 sha 一致）；
-      **W8A8 lm_head 双 packing（556 全开可用）**；B3c（dispatch 占 41–49%）；C5（SVE W8A8）与 C6（CUDA W8A8）在途。
-      详见 `docs/00-handoffs/0039-2026-09-11-a3-onboarding-ascend-bridge-sve-w8a8.zh-CN.md`。
-   b) **在途任务与恢复**（见 lock `waves.W8.in_flight_2026_09_11_batch2`）：
-      C5 验收（verify-qwen35-w8a8-sve256）｜B3c 验收（verify-local-perf-l0-l1）｜C6 实现（qwen35-w8a8-gpu-kernels）
-      ｜**N5 已按用户要求暂停**（NPU 被用户量化占用；A3 残留 `~/pypto-x-a3/e4s2/`，恢复时注意改用 `/home` 路径 + 修 `CMAKE_PREFIX_PATH`）
-   c) **待用户裁决（4 项）**：B4 阈值冻结（需批准）｜C8 的 L4 阈值口径（决定 C7/C8 能否启动）｜
-      内核性能投入（W8J 注入 4.71–14.47× 慢于 oneDNN）｜**U/P 两条新线是否立项**（用户接口 / 用户侧性能控制，提案见 lock）
-   d) 下一批硬优化候选（B3c 结论）：**reshape 8.34 s / slice 7.37 s / transpose 7.27 s（全 host_reference）** +
-      **dispatch 开销 41–49%**；A2 暂停、920B 已释放、A3 的 NPU 归用户——三者都需用户通知才动。
+   a) **当前波次（0040，2026-09-12）已收口的四件事**：C5（SVE256 W8A8 widening）、B3c（本机 L0/L1 性能分解）、
+      C6（CUDA W8A8 dp4a 内核，121 checks/0 FAIL 真机）、B6（AVX-512 layout 原生化）**四项验收全部 PASS_WITH_BOUNDARIES**；
+      A3 接入 + Q1 准备完成；C8 参照 gold（Q2）产出且 **scale 交叉校验 150/150 张量、399,360 元素逐位一致**。
+   b) **在途任务**（见 lock `waves.W8.in_flight_2026_09_11_batch2`，平台无并发上限，按资源锁排队）：
+      Q3 AVX-512 的 L4 比较（分段取锁）｜Q4 轴B独立栈探针｜Q5 SVE256 整网 L4（A3；被 int8 layout 缺口阻塞，
+      正在出 bf16 诊断 + 解封选项）｜U1 用户接口首切片｜Q8 vendor GEMM 选型（AOCL 等收尾窗口）｜
+      FIX 导入修复（KF-1）｜N4.0 dispatch 残差分解 + 元数据重建去重。
+   c) **待用户裁决（7 项，见 lock `pending_user_decisions_2026_09_11`）**：B4 阈值冻结（**已决定推迟**到单算子框架 +
+      真实工业框架对比之后）｜L5/L6 语料与阈值｜`view_mode=require` 提级｜W8A8 v1 之外的量化方案｜
+      W8J 注入门政策｜A3 chip7/NPU 放行（E 线 N5，用户说快放行）｜N4 的项目范围（取决于"自研 executor vs 外包框架"）。
+   d) **关键决策已采纳（勿再重开）**：GEMM 一律用各平台最优 vendor 算子（我们自己的内核保留为 portable/位级基准）；
+      W8J 价值主张转 W8A8；A2/920B 退役、由 A3 替代；A3 授予 cpus 320–639（≤20 进程 × 8 线程，不碰 HT）。
+   e) **已知的技术缺口（已登记，勿当新发现）**：SVE256 不支持 int8 layout → W8A8 整网在 SVE256 上 lowering 即失败
+      （Q5 阻塞、Q10 待立项）｜AOCL/LPGEMM 的 int8 在 K≥2048 上**不是整数精确**（CF-1，块间 f32 累加）｜
+      rank-2 `perm(1,0)` transpose 走既有 packed 面且 sNaN 不 quiet（既有行为）｜view alias hard-off（liveness proof 未接入）。
 5. 并发与资源：平台无 subagent 并发上限（旧文档的 ≤3 属自设假设，ERR-0005 已更正）；重任务一律经 scripts/resource/run_local_heavy.sh（返回 75/69 就等待重试，
    禁止绕过）；**等锁时挂后台或长 timeout，不要在前台循环空转**（会耗尽 agent 回合，S1 曾因此中断一次）；
    A2/920B/A3 都是共享资源，约定安静使用。
