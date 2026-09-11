@@ -12,7 +12,9 @@
 
 > 本文是设计指导，不代表接口已经实现，也不宣称本文中的示例 API 当前可直接导入。实现前应先把 schema、解析规则和报告格式冻结；本文不要求本次运行测试。
 
-> **版本说明**：§1–§12 为外部评审稿原文；**§13 为 PyPTO-X 项目于 2026-09-12 追加的补充材料**（算子分类与各族的契约字段差异），作为下一轮评审输入。评审时请把 §13 视为待优化对象，其余章节的结论以原文为准。
+> **版本说明**：§1–§12 为外部评审稿原文；**§13 现为 v2（外部 Agent 2026-09-12 审理后建议稿）**——
+> v1 由项目方追加，v2 由外部 Agent 重写（五族 → P1–P8 primitive + Composite/State + artifact/target 层，并修正了 v1 的三处问题：
+> `allow_view` 的授权语义、性能数字缺 `UNGATED`、分类不完备）。§13.9 是项目方对审理方 5 个待确认项的逐条回执。
 
 ---
 
@@ -783,94 +785,324 @@ provider 可以注册能力、候选和 lowering，但不能：
 
 ---
 
-## 13. 算子分类与各族的契约字段差异（**项目补充，待评审**）
+## 13. 算子族、复合层与契约字段（审理后建议稿 v2）
 
-> 本节由 PyPTO-X 项目于 2026-09-12 追加，目的是把 §3 的四类对象落到**真实的算子族**上。所有数量与状态都来自本项目已验收或已冻结的实测，不是设计推测。
+> 本节把 §3 的四类对象落到真实算子族，同时区分 primitive、composite、artifact 和 target-private 层。
+> `[事实]` 表示已有图/代码/证据；其余规范性文字是设计要求。
+> 本节的统计必须绑定 `graph_digest`、`precision profile`、integration HEAD 和 evidence 路径，不能只写一个脱离 profile 的总数。
 
-### 13.1 为什么必须有这一节
+### 13.1 统计口径与覆盖边界
 
-§3.1 的 `OpContract` 示例只写了 `matmul`。但本项目真实模型（Qwen3.5-0.8B，T=5 prefill，6728 个算子，AVX-512 后端）的构成是：
+[事实] Qwen3.5-0.8B 的 T=5 BF16 图为 6728 个 operation。按 canonical `by_operation` 重新归类后：
 
-| 算子族 | 代表算子 | 算子数 | 占比 |
+| primitive 族 | 代表操作 | 数量 | 占比 |
 |---|---|---:|---:|
-| 逐元素/转换 | cast 1484、mul 747、broadcast 494、add 398、silu/exp/where | ~3300 | **~49%** |
-| 搬运/重排 | transpose 889、reshape 776、slice 696、concat 84、split 24 | ~2470 | **~37%** |
-| 矩阵乘 | matmul | 469 | **~7%** |
-| 规约 | reduce_sum / reduce_mean / reduce_max | ~130 | ~2% |
-| 索引 | embedding / gather | 1（表为 248320×1024） | ~0% |
-| 量化 primitive | qmatmul_s8s8_s32 / quantize_per_token_s8 / dequantize_s8 / dequantize_epilogue_bf16 | 未量化跑时为 0 | — |
+| P1 逐元素 / 类型 / 控制生成 | cast、add/sub/mul/div/neg、exp/rsqrt/sigmoid/silu/softplus、broadcast/where、compare/iota/constant | 3662 | 54.43% |
+| P2 view / layout / materialize | reshape、slice、transpose、concat、split | 2469 | 36.70% |
+| P3 收缩 / 线性代数 | matmul | 469 | 6.97% |
+| P4 reduction / scan | reduce_sum、reduce_mean、reduce_max | 127 | 1.89% |
+| P5 只读索引 | embedding（本图无 gather 调用） | 1 | 0.01% |
+| **合计** |  | **6728** | **100%** |
 
-**结论**：matmul 是"花算力"的，但不是"花时间/花算子数"的。若照 matmul 的样板硬套到别的族，最容易漏掉的是**搬运类的别名（aliasing）规则**——而这恰好是历史上最容易出正确性事故的地方（本项目为此专门把零拷贝视图别名默认关闭，并要求生命周期证明）。因此 `OpContract` 必须是**按族定义必备字段**的分类体系。
+证据：`graph_digest 456ab519c9b9bc7f281103b4a327f14b4112d6751acf30c00cd612f40d6d786e`（T=5 BF16）、
+`verify-w8a-decay-fix/raw/s3_aligned.json` 的 `op_summary.by_operation`（五组之和精确等于 6728，无未归类项）。
+W8A8 图必须使用独立 profile 统计：`qmatmul_s8s8_s32`、`quantize_per_token_s8`、
+`dequantize_epilogue_bf16` 的数量不能混入 BF16 图的 matmul 或 P1 统计。
 
-### 13.2 各族的契约必备字段
+本节不把所有 PyPTO 操作声称为当前 MVP 已支持。scatter/update、sort/topk、
+random、collective、distributed 和 target-private hardware op 先列为 reserved 或
+unsupported，并在 capability 中明确状态。
 
-| 族 | `OpContract` 必备字段（L0，不可被 policy 改写） |
-|---|---|
-| **A 矩阵乘** | 输入输出 dtype 组合；`accumulation`；`rounding`；`saturation`；量化时的 zero-point / scale 粒度；K 尾与非 8/16 倍数处理；空轴；NaN/Inf；`aliasing: no_output_input_alias`；`effects: pure` |
-| **B 搬运/重排** | 输入输出 shape 规则；**源 strides 必须行主连续**（本项目既有约束）；`permutation` 合法域；`slice_starts/slice_steps` 合法域（步长必须为正）；**view/alias 规则与写覆盖禁令**；空轴与退化 shape；dtype 覆盖范围（未覆盖的必须显式登记） |
-| **C 逐元素/规约** | 广播规则；归约轴与 keepdims；**融合边界与融合后舍入次数**；NaN/Inf 传播规则；dtype 提升表；`effects` |
-| **D 索引/查表** | 表布局与行宽；**越界索引语义（本项目为 fail-closed）**；表的只读性与别名；表生命周期与常驻策略；输出顺序 |
-| **E 量化 primitive** | 码值区间（本项目为 `[-127,127]`，**拒绝 `-128`**）；舍入模式（RNE）；scale 的粒度与 dtype；**`accum_width = int32`**；饱和策略与饱和计数口径；packed wire layout 版本；NaN/Inf/下溢处理 |
+### 13.2 Primitive 族与必备 contract 字段
 
-### 13.3 各族的"允许用户表达什么"（policy 侧）
+#### P1：逐元素、类型转换、布尔/形状生成
 
-| 族 | 允许作为用户意图的表达 | 禁止进入 policy 的东西 |
+包括 cast、broadcast、where、compare、iota、constant、基本算术和逐元素数学函数。
+
+必备字段：
+
+- 输入输出 shape 与 broadcast 规则；
+- dtype promotion、scalar promotion 和输出 dtype；
+- rounding、saturation、NaN/Inf、domain error；
+- exp/rsqrt 等数学函数的有限性和误差类别；
+- predicate/boolean 语义；
+- constant/iota 的来源、范围、step 和溢出规则；
+- `effects`。
+
+#### P2：view、shape/layout 与 materialization
+
+包括 reshape、view、slice、transpose、contiguous、split、concat。
+
+必备字段：
+
+- 逻辑 shape、axis/permutation、slice starts/stops/steps；
+- byte offset、element/byte strides、base storage identity；
+- `view_obligation: must_alias | may_alias | must_not_alias`；
+- readonly、写覆盖和 byte-range overlap；
+- owner/lifetime/completion contract；
+- 是否允许 materialize，以及 materialize 后是否仍必须保留 alias；
+- descriptor/wire version、copy bytes 和 workspace；
+- provider 支持的 stride/layout 子集。
+
+当前 CPU/provider 的 contiguous、正 step、rank 上限等限制应登记为 capability/precondition；
+只有明确要冻结为公共语义时，才升为 contract 字段。
+
+#### P3：收缩/线性代数
+
+包括 matmul、linear、batched matmul 和带 `QuantizedTensorDesc` 的 qmatmul。
+
+必备字段：
+
+- batch、M/N/K、transpose、layout 和 broadcast 规则；
+- accumulation dtype、reduction order、determinism；
+- K tail、非对齐、empty/zero-work；
+- overflow/headroom；
+- bias/epilogue 和舍入边界；
+- 输入输出 alias/effect；
+- 对量化变体的 scheme reference。
+
+`qmatmul_s8s8_s32` 属于 P3；量化描述符不把它改造成 E 族操作。
+
+#### P4：reduction 与 scan
+
+必备字段：
+
+- axes 归一化、keepdims、输出 shape；
+- empty identity；
+- accumulation dtype、overflow/headroom；
+- reduction order 与 deterministic mode；
+- NaN 传播、max/min tie 规则；
+- scan 的初值、方向和状态。
+
+融合只能在 CompositeContract 中声明；primitive reduction 的 contract 不被一个
+`allow_fusion` 开关重写。
+
+#### P5：只读索引、查表与搜索
+
+包括 gather、embedding，并为 sort/topk/search 预留字段。
+
+必备字段：
+
+- index dtype、shape、broadcast、negative index；
+- 越界语义和检查时机；
+- table layout、row width、readonly；
+- table owner/lifetime/placement/residency；
+- 输出顺序、稳定性和 tie 规则；
+- 是否允许 zero-copy/view。
+
+#### P6：索引写入与 effectful update（当前 MVP 预留）
+
+包括 scatter、scatter_add、index_add、index_put、atomic update。
+
+必备字段：
+
+- effect、destination alias 和写入 byte range；
+- duplicate index 的顺序、atomicity 和 reduction mode；
+- bounds/failure 行为；
+- 部分写入是否允许；
+- synchronization、stream 和 completion lifetime。
+
+P6 不得与只读 P5 共用“表只读”假设。
+
+#### P7：窗口、stencil、卷积（当前 Qwen 以 composite/state 形式使用）
+
+包括 conv1d、depthwise causal convolution 和未来的 2D/3D convolution。
+
+必备字段：
+
+- kernel、stride、dilation、padding、groups；
+- 输入/权重 layout；
+- boundary/padding value；
+- accumulation、output dtype 和 epilogue；
+- causal/state 输入输出及 reset/initial state；
+- empty/short sequence 行为。
+
+#### P8：量化、反量化与量化 epilogue
+
+必备字段：
+
+- `scheme_id`；
+- signedness、bits、保留码值；
+- scale/zero-point 的粒度、dtype、来源和关联；
+- RNE、saturation、saturation count；
+- NaN/Inf、zero row、scale underflow；
+- accumulation width、K 上限和 overflow；
+- logical quantized layout；
+- binding/wire schema version。
+
+物理 VNNI/SDOT/dp4a/tensor-core packing、tile 和 kernel ABI 属于 provider/artifact，
+不属于公共 Core IR 的量化语义。`pack_weight_s8` 是 ingestion/artifact 操作，不是
+Core opcode。
+
+### 13.3 State、composite 与 reserved contract
+
+状态不是一个可由普通 policy 临时打开的优化选项。凡是涉及 KV cache、GDR state、
+conv state 或流式 decode，都必须有 `StateContract`：
+
+- state shape/dtype/layout；
+- initial/reset/checkpoint；
+- transition；
+- owner/lifetime；
+- read/write/alias；
+- prefill/decode 边界；
+- asynchronous completion。
+
+`CompositeContract` 是 region-level contract，不是 primitive opcode，也不是
+ExecutionPlan 的替代物。它至少包含：
+
+- 输入输出语义；
+- builder/expansion digest；
+- required primitive opcode + contract digest；
+- rounding/state/alias semantic barriers；
+- 允许的 fusion/rewrite；
+- region-level numeric guarantee。
+
+RMSNorm、Softmax、RoPE、attention、GDR、SwiGLU、`qlinear_w8a8` 及其 split/gate
+变体首先属于 CompositeContract。只有具备独立冻结语义、native symbol、portable
+reference 和证据后，才可升级为公共 opcode。
+
+random、collective、distributed、barrier 和 Ascend/CCE physical op 先保留为
+effectful/reserved 或 target-private namespace，不伪装成 P1–P8 的 portable primitive。
+
+### 13.4 Policy 适用域
+
+跨族公共 policy 只包含：
+
+- `numeric.requirement`、`error_budget`；
+- `deterministic`；
+- `provider.mode`、`fallback`；
+- graph/region 资源上限；
+- placement、transfer、observability。
+
+族特定字段必须经过 contract applicability 校验：
+
+| 族/层 | 可表达的意图 | 不可表达的内容 |
 |---|---|---|
-| A 矩阵乘 | `provider.mode`（portable / vendor / auto / required）、`resources.max_threads` 上限、`numeric.requirement`、`error_budget`（只允许更严） | `isa_path`、`microkernel`、`blocking`、库内符号、逐 op 线程数 |
-| B 搬运/重排 | `layout.allow_view`、`layout.allow_copy`、`max_copy_bytes` | 任何改变 shape/stride/别名语义的字段；`allow_view` 只能**收紧**，不能放宽契约 |
-| C 逐元素/规约 | `optimization.allow_fusion`、dtype 相关约束、内存预算 | 改变舍入次数或归约顺序的开关（那是新 contract） |
-| D 索引/查表 | 内存预算、表常驻策略、placement | 越界行为（属 L0） |
-| E 量化 primitive | 只有：`provider.mode`（`portable` / `required`）与"必须位级一致"的声明 | **任何放宽**：不许改码制、scale 粒度、累加宽度、饱和策略 |
+| P2 | `view_mode=forbid/prefer/require`、`max_copy_bytes` | 通过 policy 授权 alias、改 stride/shape/写覆盖语义 |
+| P3 | provider、workspace、线程上限、numeric requirement | ISA、microkernel、accumulation/rounding 变更 |
+| P4/P1 | deterministic、region fusion preference、资源上限 | 改 reduction order 或舍入次数 |
+| P5/P6 | placement、residency preference、资源上限 | 越界、duplicate update、atomic 语义 |
+| P8 | provider 选择和 exact/bounded requirement | 改码制、scale 粒度、累加宽度、饱和策略 |
+| CompositeContract | allow/prefer/forbid fusion | 把假融合变成公共 opcode |
 
-### 13.4 各族的报告必须回答的问题
+`view_mode=require` 是硬要求而不是授权；resolver 没有 alias/liveness/lifetime proof
+时必须返回 `CAPABILITY_UNAVAILABLE` 或 `POLICY_CONFLICT`。不适用字段必须返回
+`POLICY_FIELD_NOT_APPLICABLE`，不得静默忽略。
 
-| 族 | `ExecutionReport` 必须回答 |
-|---|---|
-| A 矩阵乘 | 用了哪个 provider / 库 / 版本；线程策略；精度类别；是否降级；dispatch 与 kernel 时间 |
-| B 搬运/重排 | **是否零拷贝（视图）**；若拷贝，拷了多少字节；是否触发写覆盖保护；descriptor digest |
-| C 逐元素/规约 | 是否融合、融合边界在哪；dispatch 次数；是否仍有 host fallback |
-| D 索引/查表 | 是否零拷贝；表是否常驻；峰值内存 |
-| E 量化 primitive | `packing_id`、`accum_width`、`scale_granularity`、kernel ABI、**饱和计数**、wire 版本、是否 fail-closed |
+### 13.5 单一真源与 Core IR 映射
 
-### 13.5 各族"最容易骗人"的地方（应成为报告检查项）
-
-| 族 | 典型的"谎" |
-|---|---|
-| A | 偷偷换了 provider / 线程数变了但报告不说 |
-| B | **声称是视图，实际在拷贝** |
-| C | 融合后舍入次数变了，却仍挂着"语义未变" |
-| D | 悄悄把零拷贝变成拷贝（大表时代价巨大） |
-| E | 失败后回退成 BF16/W8A16 假装成功 |
-
-### 13.6 各族"必须升契约版本"的触发条件
-
-| 族 | 触发 |
-|---|---|
-| A | 累加精度、舍入、饱和、量化方案、K 尾处理改变 |
-| B | 别名或 stride 规则、view 语义改变 |
-| C | 融合边界或舍入次数、归约顺序语义改变 |
-| D | 表布局、越界语义改变 |
-| E | 码制、scale 粒度、累加宽度、饱和策略、wire layout 改变 |
-
-### 13.7 落地顺序（按"收益 ÷ 风险"）
+建立 canonical `OpDefinition` registry：
 
 ```text
-竖切仍只做 matmul(A)：打通 policy → resolver → plan → report 一条线
-但 schema 必须为五族留位（留空，不许用 matmul 的字段占死）
-
-推进顺序：
-  1) 搬运/重排(B)      —— 本项目已实测收益最大（原生后 10.5 ms/call → 0.022 ms/call）
-  2) 量化 primitive(E) —— W8A8 主线；且必须位级一致，没有讨价空间
-  3) 逐元素/规约(C)    —— 等单算子测试框架（0007）的实测数据再决定是否动融合
-  4) 索引(D)           —— 只有 embedding 一个大表，单独立项
-持续: A 由 vendor 选型（0006 主体 / Q8）推进
+OpDefinition
+├── canonical opcode
+├── contract version/digest
+├── operand/result predicates
+├── attribute schema
+├── shape/effect/alias verifier
+├── numeric contract reference
+├── reference implementation
+└── allowed provider references
 ```
 
-### 13.8 请评审者重点回答的问题
+Core IR 的 `CoreType`、SSA、Region、Effect 和 canonical serialization 仍是结构真源；
+`Operation` 只引用 canonical opcode 和规范化 attributes。`OpContract` 是
+`OpDefinition` 的用户/报告视图，不另维护一套手写类型系统。
 
-1. **分类是否遗漏或应合并**？（本项目的 cast/where 归入 C；是否需要单列"复合算子"一类，例如 `qlinear_w8a8`、QKV split、SwiGLU 这类 builder/composite？）
-2. **13.3 的"允许意图"是否过多或过少**？特别是 B 族的 `allow_view`：应由 policy 表达，还是必须由契约强制、policy 只能收紧？
-3. **五族的必备字段是否有遗漏**？请特别检查 B 族（别名/生命周期）与 E 族（饱和与累加）。
-4. **`OpContract` 与既有 Core IR opcode 的映射如何登记**，才能避免"双份真源"（本项目要求单一真源，契约是既有 opcode 的规范视图，而不是第二套类型系统）？
-5. **复合算子（builder/composite）**在四类对象模型里应处于什么位置——是 contract 的一种、还是 plan 的一种表达？
-6. **跨族的一致性**：同一个 `ExecutionPolicy` 施加到五个族时，语义是否仍然自洽（例如"不允许 vendor"对 A 有意义、对 E 几乎无意义）？是否需要在 policy 里按族收敛字段？
+provider capability、artifact、op-bench 和 composite expansion 都引用同一个
+`opcode + contract_version + contract_digest`。未知公共 opcode、未知 contract
+版本或 digest 不匹配时 fail-closed。
+
+### 13.6 ExecutionReport 与反欺骗检查
+
+所有族都必须报告：
+
+- requested/resolved policy；
+- opcode/composite contract id、version、digest；
+- target/capability/provider/library 版本；
+- artifact/lowering/runner/wire/kernel ABI；
+- numeric guarantee、determinism 和 fallback events；
+- dispatch/op/transfer/kernel 时间及 `UNGATED` 状态。
+
+P2 额外报告：
+
+- requested/resolved `view_mode`；
+- storage alias 与 name alias 分开；
+- source/destination storage、byte range；
+- alias proof digest、owner/lifetime；
+- copy bytes、descriptor digest、实际 kernel/mode。
+
+P8 额外报告：
+
+- scheme、packing_id（provider/artifact 层）；
+- accum_width、scale_granularity；
+- saturation count、reserved code rejection；
+- logical wire version、kernel ABI；
+- exact/bounded precision basis。
+
+典型反欺骗检查：
+
+- “view”但 source/destination pointer 不同；
+- policy 要求 copy 但报告无 copy bytes；
+- provider/library/thread 变化而 plan digest 不变；
+- fusion 改变舍入次数却仍沿用 primitive contract；
+- quantization 失败后静默回退 BF16/W8A16；
+- static-only、host-reference 或 blocked-device 被报告为运行 PASS；
+- `UNGATED` 数字被写成跨平台加速比。
+
+### 13.7 版本与落地顺序
+
+以下变化必须升 contract 或相关 wire/ABI 版本：
+
+- P1：dtype promotion、domain、NaN/Inf、rounding；
+- P2：shape/stride/offset、alias/view/materialization、owner/lifetime；
+- P3：accumulation、reduction order、epilogue、tail/empty；
+- P4：identity、axis、order、NaN/tie；
+- P5/P6：bounds、duplicate update、effect/atomicity；
+- P7：padding、window、state transition；
+- P8：scheme、code domain、scale、accum width、saturation、logical wire；
+- Composite：可观察的 decomposition、rounding/state barrier 或 required primitive digest。
+
+物理 packing/kernel 变化但逻辑 contract 不变时，升 provider/kernel/artifact 版本，不改
+公共 opcode 语义。binding/wire schema 也必须与 logical contract 分开版本。
+
+落地顺序：
+
+1. 用 exact profile-specific histogram 修正 §13.1；
+2. 以现有 op-bench registry 建立 `OpDefinition` 单一真源；
+3. 先完成 matmul 的 resolver/plan/report 竖切；
+4. P2 layout 继续 hard-off view alias，先接入 proof schema，再考虑启用；
+5. 拆分 pointwise/reduction/index-read/index-write；
+6. 接入 W8A8 P8，逐 opcode 声明 exact/bounded；
+7. 最后接入 composite/state/streaming contract；
+8. 所有性能数字保留 host、commit、协议和 `UNGATED` 标记，不写成权威加速比。
+
+### 13.8 对外部评审问题的最终裁决
+
+1. 五族不作为最终平级分类；采用 P1–P8 primitive + CompositeContract + artifact/target 层。
+2. B 的 view 不由 `allow_view` 授权；contract 规定 alias obligation，policy 只能禁止、偏好或要求并等待 proof。
+3. B 增加 storage/offset/stride/overlap/owner/lifetime/completion；E 增加 scheme、underflow、overflow、scope 和 exactness 字段。
+4. `OpDefinition` registry 是唯一语义真源；`OpContract` 是规范视图，Core IR 保留结构语义。
+5. builder/composite 是 region-level contract；ExecutionPlan 只记录其解析后的实现和实际融合。
+6. ExecutionPolicy 采用公共字段 + applicability 校验；不适用字段显式失败，不能静默忽略。
+
+### 13.9 项目方回执：对审理方 5 个待确认项的逐条答复（2026-09-12）
+
+| # | 问题 | 项目方答复 | 依据 |
+|---|---|---|---|
+| 1 | “源 strides 必须行主连续、slice step 必须为正”是公共 contract 还是 CPU provider 限制？ | **是 lowering/provider 前置条件，不是 L0 语义**。它属于既有 `LayoutPlan` 校验与 runtime descriptor 约束；跨平台公共契约里只登记 shape/permutation/slice 的语义合法域，contiguous/step/rank 上限记入 capability precondition | `lowering/cpu/vector/plan.py` 的 `LayoutPlan` 要求 `source_strides == 连续 strides`；`abi/descriptors.py` 的 contiguous 检查 |
+| 2 | `sort/topk/random/collective` 是否纳入当前公共 API？ | **全部列为 reserved**：不在公共 API、不在 capability 的 supported 集合内；出现在图上必须 fail-closed。经典 PyPTO 审计中的这些条目属于"未来需要覆盖"的历史清单 | 当前 MVP 图只用 26 个 operation key（见 §13.1 的证据文件） |
+| 3 | §13 证据基线用哪个 commit？ | **统计绑定三元组**：`graph_digest 456ab519…d786e` + precision profile `BF16/T=5` + evidence `verify-w8a-decay-fix/raw/s3_aligned.json`；文档修订对应 integration HEAD `c2ec98f3c`。W8A8 图另立 profile 统计，不与 BF16 混算 | 本次核对：五组之和精确 6728、无未归类项 |
+| 4 | `view_mode=require` 是否作为公共 stable API？ | **暂不**：B6 实测视图别名 hard-off、liveness proof 未接入，此时 `require` 必然失败，公开它只会变成陷阱。现阶段公共 stable 只保留 `forbid` / `prefer`，`require` 记为 internal，待 proof schema 接入后再提级 | `verify-b6-layout-native` §5：`layout_view_alias_mode="disabled"`、3 个 env 开关无效、执行器总分配独立 destination |
+| 5 | W8A8 各 primitive 的 exact/bounded 划分与 scale 归约顺序是否已冻结？ | **v1 方案已冻结**，逐 opcode 划分为：`qmatmul_s8s8_s32` = `exact`（int32 累加，且无饱和时与整数和恒等）；`quantize_per_token_s8` = `exact`（RNE + absmax + 码值域 `[-127,127]`，拒 `-128`）；`dequantize_epilogue_bf16` = **相对契约声明的单次 RNE 序为 exact、相对其它乘序为 bounded**；scale 归约顺序冻结为 `acc × fp32(s_a × s_w)`（**一次乘**）。vendor 融合路径若为两次乘（如 AOCL `_sym_quant`）只能记 `deterministic_bounded`，不得继承位级主张 | 契约 `docs/20-planning/0002-…`（FROZEN）；C5/C6 验收的逐位证据；AOCL LPGEMM 源码级语义发现（AOCL `(acc×s_w)×s_a` 两次乘） |
+
+**同时采纳的三处修正**（v1 → v2）：
+
+1. `allow_view: true` 的"授权"语义删除，改为三态 `view_mode: forbid | prefer | require` + `max_copy_bytes`，并明确"policy 不得把 contract 的 `must_not_alias` 改成 `may_alias`"；
+2. §13.7 的性能引用补上完整边界：**本机 12 vCPU KVM、无 cpufreq、非静默窗口 → 永久 `UNGATED`**，只能报中位与离散度，**不得写成跨平台加速比结论**；引用时必须带 host、commit、协议与证据路径；
+3. 分类从五族平级改为 **P1–P8 primitive + CompositeContract + StateContract + artifact/target 层**，并为 P6/P7 与非 Qwen 族显式标注 reserved/unsupported，避免读者误以为已覆盖全部 PyPTO。
+
+**仍待用户裁决的两项**（不属于本次审理范围）：
+
+- `view_mode=require` 何时提级为公共 stable API（取决于 liveness proof 的接入时机与形态）；
+- W8A8 v1 之外的量化方案（新 scheme/新码制/新 scale 粒度）是否立项，以及届时是否新建 contract 版本而非复用 `w8a8-linear.v1`。
