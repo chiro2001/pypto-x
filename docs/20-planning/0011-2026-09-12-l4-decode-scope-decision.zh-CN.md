@@ -35,7 +35,12 @@
 | **B（重定义后重判，推荐与 A 并用）** | decode 门改用与 max_abs 同量级的口径，例如 **误差范数比 ≤ max(参照自身比, 1.25)** 或 **相对参照自身 cosine 的退化 ≤ δ**；随后重跑一次 C8 decode 判定 | 一次 C8 decode 重判（~分钟级，需 local 锁；A3 不可用时用 AVX-512 腿） | 新门应写成契约里**可复算**的公式，不用"感觉合理"的常数 |
 | **C（维持现门）** | decode 维持 6/6 FAIL；需要先把 56% 的 compute 缺口下钻到算子，再决定是否改实现 | 增量诊断 +（可能的）实现修复 | 只有在你需要"现门必须过"时才走这条路 |
 
-**C7 下钻实验结果（2026-09-12 05:38Z，已跑完）**：把 zh/default decode step2 的输入 state 固定为 gold、逐段对比中间张量后，缺口是**分布式**的——layer 输出相对 L2 从 layer_00 的 0.054 逐层增长到 layer_23 的 0.213（无跳变）；四个 block 段（input→input_norm、input_norm→token_mixer、post_attention_norm→mlp、mlp→output_residual）的中位相对 L2 都在 0.144–0.150；**top-5 段的平方份额只有 8.9%**，没有支配性算子/段。首次可测偏差出现在 `layer_00_branch_output`（rel_l2 0.0147、cosine 0.99990）。
+**C7 下钻实验结果（2026-09-12 05:45Z，已完成）**：把 zh/default decode step2 的输入 state 固定为 gold 后（736/736 张量配对、0 missing，两侧 `input_norm` 在 bf16 舍入后逐位一致，HF logits 与 gold row3 逐位相等）：
+
+- **首因可下钻到算子**：第一个非零差异是 `layer_00_in_proj_qkv_output`（rel_l2 0.266%），机制经图 def-use 核对为——我们的 per-token 激活量化看到的是 **未做 bf16 舍入的 fp32 RMSNorm 输出**（`cast` 是 fp32→fp32 空 cast），而 HF `RMSNorm` 返回 bf16；输入差 0.161% 经量化放大到 0.266%。该机制在 default scope 的所有量化线性上同样成立。
+- **但总量放大是分布式**：layer_00_output 5.39% → L1 11.44% → L3 13.64% → … → L23 21.25%；6 个 segment 的更新差异中位 14.3–15.0%；**top-5 segment 平方占比仅 5.95%**。
+- 固定 state 后 logits 仍 cos 0.978992（floor 0.990819），即**单步计算**的 cosine 亏损就是整个 floor 允许亏损的 2.3 倍。
+- 未闭环的最后一环：int8 codes/scale 未在两侧直接对比（机制由 def-use + 0.161%→0.266% 链条支撑），补测一次单锁窗即可。
 
 **父 agent 建议：A + B。** 理由：A 让 C8 的 L4 判定立刻有结论、不阻塞后续（Q5 重跑/W8A8 v2），
 B 把 decode 事实保留为可复算的门（不放过真实缺口），而 C 在拿到"哪几个算子在 decode 上贡献 56%"之前
