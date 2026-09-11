@@ -6,6 +6,8 @@
 
 状态：`DRAFT_FOR_EXTERNAL_REVIEW`
 
+后续优化指导见 [`0006-2026-09-12-cross-platform-operator-interface-guidance.zh-CN.md`](0006-2026-09-12-cross-platform-operator-interface-guidance.zh-CN.md)；本文保留为本轮设计的原始评审输入，不作为已冻结实现契约。
+
 用途：本文把「一套代码适配多平台」与「每平台各自最优」这对矛盾，收敛成一套**可冻结、可验收、可扩展**的用户侧算子接口设计。**本文自包含**——读者无需本项目的会话上下文即可评审。
 
 ---

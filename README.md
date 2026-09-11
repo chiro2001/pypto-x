@@ -62,6 +62,8 @@ decode (4 步)       11751 → 13 → 198 → 760 逐步与官方 gold 一致（
 - [Qwen3.5-0.8B BF16/W8A8 MVP](docs/20-planning/0001-2026-09-07-qwen35-08b-bf16-w8a8-mvp.zh-CN.md)与[首期 W8A8-linear 契约](docs/20-planning/0002-2026-09-10-qwen35-w8a8-linear-contract.zh-CN.md)。
 - [W8 并行执行路线图（资源与并发）](docs/20-planning/0003-2026-09-10-w8-parallel-roadmap.zh-CN.md)：波次、锁占用预算、并发上限、验收冻结流程。
 - W1–W3 契约：[Core/Target ABI](docs/10-architecture/0001-2026-09-07-w1-core-target-contract.zh-CN.md)、[bridge/scalar/Ascend](docs/10-architecture/0002-2026-09-07-w2-bridge-scalar-ascend-contract.zh-CN.md)、[portable bootstrap](docs/10-architecture/0003-2026-09-07-portable-bootstrap-contract.zh-CN.md)、[x86 vector](docs/10-architecture/0004-2026-09-07-w3-x86-vector-contract.zh-CN.md)。
+- [用户侧算子接口设计草案（trunk + knobs）](docs/10-architecture/0005-2026-09-11-user-side-operator-interface.zh-CN.md)（历史评审稿）。
+- [跨平台算子用户接口指导（Contract + Policy + Capability）](docs/10-architecture/0006-2026-09-12-cross-platform-operator-interface-guidance.zh-CN.md)：用户意图、能力协商、执行计划、降级与 35 个环境变量迁移。
 
 **规范与流程**
 
