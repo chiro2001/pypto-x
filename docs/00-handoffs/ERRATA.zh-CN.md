@@ -240,3 +240,31 @@ driver 盘点 `raw/evidence_inventory.json`）。
 
 **证据**：`_meta/pypto-x/verify-qwen35-w8a8-scheme-binding/{validation-verifier.json}`（VD-3 明细）；
 契约 `docs/20-planning/0002-2026-09-10-qwen35-w8a8-linear-contract.zh-CN.md` §3.1/§3.4。
+
+## ERR-0004（2026-09-11）：性能协议 §3.3 第 6 步 MAD 离群门在 WSL2 上不可复现
+
+**状态**：协议已修订——`docs/PERF_MEASUREMENT_PROTOCOL.zh-CN.md` §3.3 第 6 步与
+`configs/perf_protocol.proposed.yaml` 的 `outlier_rule` 均已更新（用户 2026-09-11 批准方案 a）。
+
+**发现问题**：W8B B3b 的独立复验（`verify-cuda-gemm-baseline-r2`，agent `7de9f7c4`）按协议字面执行
+G2 有效性判定时，**2 个 campaign / 8 轮尝试 → 5 轮作废、0 个 3 连有效轮**；
+实现方自己的 K=10 campaign 也有 3 个 eligible 序列恰好停在 `2/21 = 0.0952`（离作废线只差一个样本）。
+
+**根因**：原判据 `|x − median| > 3 × 1.4826 × MAD` **无下限**。实测被作废序列的 MAD 仅占中位数
+0.06–0.83%，门限低至 0.28–3.7%，于是**偏离中位 0.3–6% 的 3–6 个样本**即触发
+`outlier_ratio > 0.10 → UNSTABLE`。典型反例：某序列 `cv = 0.0023`、`p95/median = 1.0014`
+（统计上极稳）仍被判无效。即 MAD 在该平台度量的是**计时器微秒级抖动**，不是分布污染。
+
+**影响**：B3b 的 candidate_ratio **数值本身稳定**（实现方 vs 复验方偏差 ≤0.68%），
+但"按门判为有效"不可复现 → **B4 阈值冻结暂缓**（修订后需在静默窗口重跑/重聚合）。
+
+**修订**：第 6 步改为 `|x − median| > max(3 × 1.4826 × MAD, floor)`，其中
+`floor = max(1 µs, 0.02 × median)`；`outlier_ratio > 0.10 → UNSTABLE` 不变。
+真污染（如 cuEvent rate 偏移 +8~10%）仍会被标记。
+
+**不受影响**：cv / p95 方差门（3.4）、clock/noise/双侧 warmup 判据、`frozen_ratio` 需用户批准的规则、
+G1/G3 定义、既有 CPU 侧（local_kvm_no_cpufreq）与 A2/920B 相关口径。
+
+**证据**：`_meta/pypto-x/verify-cuda-gemm-baseline-r2/{brief.zh-CN.md,validation.json,verify_verdict.json,raw/}`
+（8 个轮次原件全部保留，含 5 个作废轮与两个真实 harness UNGATED 聚合）；
+实现方记录 `_meta/pypto-x/cuda-gemm-baseline/d1-rerun/{brief.zh-CN.md,raw/{k5,round1..3}.json}`。

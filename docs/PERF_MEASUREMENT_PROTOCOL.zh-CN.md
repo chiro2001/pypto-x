@@ -357,13 +357,24 @@ memory_bound: <bool>                          # AI < 10 FLOP/byte 时为 true
 4. measured       : R = 21 次（L0 microbench R = 51）
 5. 统计量         : min, median, p95(nearest-rank, 不插值), max,
                     stdev (sample, n-1), cv = stdev/median, p95_over_median
-6. 异常值         : 不剔除。标记 |x - median| > 3 * 1.4826 * MAD
+6. 异常值         : 不剔除。标记 |x - median| > max(3 * 1.4826 * MAD, floor)
+                    其中 floor = max(1 µs, 0.02 * median)
                     若 outlier_ratio > 0.10 → status = UNSTABLE
 7. 方差门禁       : 见 3.4
 ```
 
 **R 的取值理由**：中位数在 R≥11 已稳定；p95 在 R=21 时对应第 20 位，
 分位误差可接受。R < 11 一律 `gate_eligible=false`。
+
+**修订记录（2026-09-11，ERR-0004）**：第 6 步原为 `|x - median| > 3 * 1.4826 * MAD`
+（无下限）。在 B3b（CUDA GEMM vs cuBLAS）实测中发现该判据在 WSL2 上**不可复现**：
+被作废序列的 MAD 仅占中位数 0.06–0.83%，使门限低至 0.28–3.7%，于是偏离中位
+0.3–6% 的 3–6 个样本即触发 `UNSTABLE`；典型反例是一组 `cv = 0.0023`、
+`p95/median = 1.0014` 的统计上极稳序列仍被判无效（独立复验 2 campaign / 8 轮 →
+5 轮作废、0 个有效 campaign；实现方数据亦停在 2/21 边缘）。根因是 MAD 在该平台上
+度量的是**计时器微秒级抖动**而非分布污染。修订引入下限 `max(1 µs, 2% × median)`，
+使判据只在偏差具备物理意义时才标记异常；真正的污染（如 cuEvent rate 偏移 +8~10%）
+仍会被标记。证据：`_meta/pypto-x/verify-cuda-gemm-baseline-r2/{brief.zh-CN.md,raw/}`。
 
 ### 3.4 方差上限（**超过即判无效**）
 
