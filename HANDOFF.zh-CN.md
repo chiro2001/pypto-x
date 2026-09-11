@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED_W8C_C1_C2_VERIFIED_W8B_B5_REDUCE_BROADCAST_VERIFIED_W8B_B3A_CUDA_EVENT_TIMING_VERIFIED_W8B_B1_AVX2_PACKED_VERIFIED_W8B_AVX512_BLOCKED_GEMM_VERIFIED_W8B_B3B_R3_PASS_W8C_C3_C4_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_ERR_0004_A3_ONBOARDED_ASCEND_N1_N4_PASS_W8B_B2_SVE_VERIFIED_W8C_LMHEAD_556_VERIFIED_C5_B3C_VERIFY_IN_FLIGHT_C6_IN_FLIGHT_N5_PAUSED`
+状态：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED_W8C_C1_C2_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_VERIFIED_W8B_B6_LAYOUT_NATIVE_VERIFIED_W8C_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_ERR_0004_ERR_0005_KF_0001_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_C8_Q1_Q2_DONE_Q3_Q4_Q5_IN_FLIGHT_U_LINE_STARTED_N4_IN_FLIGHT`
 
-最后更新：2026-09-11 22:50 CST（Asia/Shanghai；0039 批次：A3 接入 + Ascend N1–N4 + B2 SVE 四类 + lm_head 556；C5/B3c 验收与 C6 在途；U/P 两线提案待决）
+最后更新：2026-09-12 01:30 CST（Asia/Shanghai；**0040 波次**：C5/B3c/C6/B6 四项验收全部 PASS_WITH_BOUNDARIES 收口；A3 接入与 Q1 准备完成；C8 参照 gold（Q2）产出且 scale 交叉校验逐位一致；**vendor GEMM 决策采纳**（GEMM 用各平台最优库、W8J 转 W8A8、AOCL/LPGEMM 源码构建）；**用户接口线 U1 首切片启动**；**ERR-0005** 更正并发上限；**KF-1** 既有失败已派修；控制仓已 push 到 7857ae6、补丁 144）
 
 > **零记忆恢复（上下文压缩后）**：按顺序读 本文件 §0 → `docs/00-handoffs/ERRATA.zh-CN.md` → `docs/00-handoffs/0039-2026-09-11-a3-onboarding-ascend-bridge-sve-w8a8.zh-CN.md` → `configs/development_lock.yaml` 的 `waves.W8.in_flight_2026_09_11_batch2` 与 `pending_user_decisions_2026_09_11`。
 
@@ -122,10 +122,10 @@ chat(T=18)  PASS（修订判据）严格 argmax 17/18（唯一 mismatch row 14�
 ```text
 控制仓/公开主仓   /home/chiro/projects/pypto/pypto_x   origin = chiro2001/pypto-x（公开）
 私有备份          ../pypto_x_private_bkp（archive 分支含第三方离线副本；main 跟随公开）
-现有 HEAD         origin/main = 7a064ab（0038 已 push）；本地 main 另有 **8 个 0039 批次提交未 push**
+现有 HEAD         origin/main = **7857ae6**（0040 已 push：41 个提交）；本地 main 与 origin 同步
 实现主仓          upstream/pypto @ 34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad（只读）
-集成分支          port/pypto-x-integration @ bef73643b（含 B1/C3/C4/J1/J1fix/J1.1/J2/GEMM/W8A8 图路径/B3b/B2/lm_head 556/C5/B3c）
-补丁集            patches/pypto-x/ 134 个（base 34475e0d8；**0039 新增提交尚未重新导出**，收口时跑 export_patches.sh）
+集成分支          port/pypto-x-integration @ **c2ec98f3c**（在 bef73643b 之上：C6 CUDA W8A8 → B6 AVX-512 layout 原生化 05a0b92a7 → C8/Q2 W8A8 参照 gold）
+补丁集            patches/pypto-x/ **144 个**（base 34475e0d8；已随 7857ae6 推送）
 任务 worktree     ../worktrees/pypto-x/<task>；证据 ../worktrees/_meta/pypto-x/<task>/
 ```
 
