@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q7_Q8_Q8B_N4_C6TIMING_DONE_C8_Q5_BLOCKED_ON_SVE_INT8_Q10_IN_FLIGHT_Q9_IN_FLIGHT_U1_MERGED_VERIFYING_SVE_LIVENESS_LAUNCH_CACHE_CUDA_QUANTIZE_IN_FLIGHT_W8A8_V2_M1_DONE`
+状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q7_Q8_Q8B_N4_C6TIMING_DONE_LAUNCH_CACHE_DONE_CUDA_QUANTIZE_DONE_C8_Q5_BLOCKED_ON_SVE_INT8_Q10_MERGED_VERIFYING_SVE_LIVENESS_MERGED_A3_LEG_PENDING_Q9_IN_FLIGHT_U1_MERGED_VERIFY_FAIL_REFIXING_INTEGRATION_HEALTHY_D1_D2_REPAIRED_VERIFYING_W8A8_V2_M1_DONE_A3_OUTAGE_OPEN`
 
-最后更新：2026-09-12 03:35 CST（Asia/Shanghai；**0040 波次进行中**：C5/B3c/C6/B6 验收收口｜C8 的 Q1–Q4 完成（参照 gold 逐位 scale 一致、AVX-512 主判定 6/6 PASS）、**Q5 被 SVE256 int8 缺口阻塞**｜vendor GEMM 选型 Q8/Q8b 完成（AOCL 位级包络、KleidiAI int8 精确、sm_120 措辞三次收窄）｜N4.0 推翻 B3c 的 dispatch 归因（ERR-0006）｜C6 计时给出"quantize 占 85–92%"｜U1 首切片合入待验收｜KF-1 修复+验收完成｜W8A8 v2（消除源头 int8 转置）M1 设计完成｜**ERR-0005..0008** 四条勘误；控制仓最近一次 push 为 7857ae6、补丁 144（此后新增提交待收口时再推））
+最后更新：2026-09-12 04:50 CST（Asia/Shanghai；**0040 波次进行中**：**integration 体检判 HEALTHY**（受检 `7e2aea514`，1394/1387/7/0/0，rc=0，759 s，+190/−3 收集差全部溯源），并查出 **D-1**（C6 harness 被 cherry-pick 顺序回退）与 **D-2**（`pack_ours_logits.py` 未定义名）——两者已修复并合入（tip `77981213e`，含新增 6 条静态守卫测试），独立验收在跑、规则 8 全量需在新 tip 重跑｜**U1 首切片验收判 FAIL**（3 条阻断：target fail-open / `policy_from_dict` 吞 `schema_version` / `output` 别名覆盖输入），回修中｜Q10（SVE256 int8 layout）与 liveness 均已合入：Q10 A3 原生 43/43（断线前）、liveness 本地三套件全绿、A3 侧确认待恢复｜C6 计时与 launch-artifact-cache 收口（quantize 重写后位级 58/58、中位 24×；prefill −38.2%、decode −32.1%）｜**A3 自 ~19:12Z 起不可达（20:33Z 复核仍 BLOCKED）**｜控制仓最近一次 push 仍为 7857ae6、补丁 144）
 
 > **零记忆恢复（上下文压缩后）**：按顺序读 本文件 §0 → `docs/00-handoffs/ERRATA.zh-CN.md` → `docs/00-handoffs/0039-2026-09-11-a3-onboarding-ascend-bridge-sve-w8a8.zh-CN.md` → `configs/development_lock.yaml` 的 `waves.W8.in_flight_2026_09_11_batch2` 与 `pending_user_decisions_2026_09_11`。
 
@@ -25,17 +25,32 @@
    不把静态 lowering 说成真机 PASS；不把 A2 的限定式关闭说成"PyPTO Ascend 后端已通"；
    不推公开仓/不改历史/不发权重证据，除非用户当次明确指示。
 4. 用户说"继续"时的默认动作（按优先级）：
-   a) **先读 lock 的 `waves.W8.in_flight_2026_09_11_batch2`**——它才是权威的在跑清单；当前（2026-09-12 03:35 CST）在跑：
-      `op-bench-framework`(Q9)｜`sve256-int8-layout`(Q10)｜`sve256-liveness-release`｜`launch-artifact-cache`｜
-      `cuda-quantize-rewrite`｜`verify-u1-matmul-policy-slice`｜`integration-health-check`；C7 只差 4–6 min 锁窗补 gold state。
+   a) **先读 lock 的 `waves.W8.in_flight_2026_09_11_batch2`**——它才是权威的在跑清单；当前（2026-09-12 04:50 CST）在跑：
+      `verify-c6-harness-preflight-fold`（D-1/D-2 独立验收 + 新 tip 规则 8 全量）｜`verify-sve256-int8-layout`（Q10 复验）｜
+      `op-bench-framework`(Q9，等 local 锁)｜`c7-decode-gap-localization`（oracle swap 等 3–5 min 锁窗）｜
+      `u1-matmul-policy-slice` 回修 + `verify-u1-matmul-policy-slice` 复验｜`sve256-liveness-release`（A3 leg 待恢复）；
+      已结束：`integration-health-check`（HEALTHY，受检 `7e2aea514`）。
    b) **0040 本批已收口的主要结论**（引用时以 lock/ERRATA 为准，不要凭记忆）：
-      · **ERR-0006**：B3c 的"41–49% 逐 op 派发"是残差误读——实为**每 launch 的 artifact 校验/重复 lowering/ELF decode**（loop 胶水仅 0.003 ms/op）；N4.0 的去重已入（prefill −26%）；
-      · **C8 主判定**：对 W8A8 参照 gold 的 prefill 口径 **6/6 PASS**（chat 2 个 near-tie flip 单列）；**decode 口径 6/6 FAIL（仅 cosine）**，C7 诊断为"小幅真实缺口 + cosine 门与 max_abs 门不一致（差 50–170×）+ 参照自身 1–2% 不确定"，**待用户裁 L4 口径**；
-      · **Vendor GEMM**：x86 默认自有 kernel（位级）、AOCL 为 opt-in 提速档（`int32_f32block_bounded`，K≤1024 精确）；aarch64 primary=KleidiAI（int32 精确、`lhs_zero_point=1` 陷阱）、oneDNN+ACL 要 `[K,N]`+stride(0)==1；sm_120 融合 int8 不可用但 `GemmEx int8→s32` 可用且精确；
-      · **C6 计时**：`quantize_per_token_s8` 占完整 op 的 **84.7–92.2%**（每元素 f64 除法），换 vendor 只值 6% → 已派 quantize 重写；
+      · **集成体检 HEALTHY**（2026-09-12，`docs`/lock 有全量证据目录 `worktrees/_meta/pypto-x/integration-health-check`）：
+        `7e2aea514` 上 1394 collected / 1387 passed / 7 skipped（7 条 CUDA driver unavailable）/ 0 failed / 0 error，rc=0，
+        758.99 s；收集数 +190/−3 逐项溯源（新文件全部有来源，消失的 3 个是 Q10 版本改名）；发现 **D-1**（见下）与 **D-2**。
+      · **D-1/D-2（已修，待验收）**：`scripts/perf/c6_timing_harness.py` 被 cherry-pick 顺序回退（修复提交先落、功能提交
+        后落整份覆盖），丢掉 GPU preflight 与 `dispatch_overhead` 的 TimingProxy 修复（`runtime_proxy.collect()` 必抛
+        `AttributeError` 被吞成 error dict）→ 已把 `c6a97dc80` 的 delta fold 回 tip（`77981213e`，保留 R6 的
+        `count = m * int(CUDA_W8A8_BLOCK)`）并加 6 条静态 AST 守卫（修复前文件 4/6 红）；`pack_ours_logits.py:66` 的
+        未定义名同批修复；**规则 8 全量必须在新 tip 重跑**。
+      · **ERR-0006**：B3c 的"41–49% 逐 op 派发"是残差误读——实为**每 launch 的 artifact 校验/重复 lowering/ELF decode**（loop 胶水仅 0.003 ms/op）；N4.0 去重 + launch-artifact-cache 已入（prefill 18.094→**11.745 s**，−38.2%；decode 8.078 s，−32.1%；同 artifact 重复 launch 0.63 s）。
+      · **C8 主判定**：对 W8A8 参照 gold 的 prefill 口径 **6/6 PASS**（chat 2 个 near-tie flip 单列）；**decode 口径 6/6 FAIL（仅 cosine）**，C7 诊断为"小幅真实缺口 + cosine 门与 max_abs 门不一致（差 50–170×）+ 参照自身 1–2% 不确定"，**待用户裁 L4 口径**；C7 另给出 1440 格 state 逐位比较 + row0 单独口径。
+      · **Vendor GEMM**：x86 默认自有 kernel（位级）、AOCL 为 opt-in 提速档（`int32_f32block_bounded`，K≤1024 精确）；aarch64 primary=KleidiAI（int32 精确、`lhs_zero_point=1` 陷阱）、oneDNN+ACL 要 `[K,N]`+stride(0)==1；sm_120 融合 int8 不可用但 `GemmEx int8→s32` 可用且精确。
+      · **C6 计时已收口且前提已变**：原判定 `quantize_per_token_s8` 占完整 op 的 84.7–92.2%（每元素 f64 除法）；重写后
+        289–1034 µs → **11.2–22.2 µs（中位 24×，位级 58/58）**，瓶颈转为 `qmatmul` 25–87 µs，vendor 两趟 GEMM
+        （快 2.1–4.6×）重新有意义（全部 UNGATED，GPU 被机主占用）。
       · **W8A8 v2（路线 c）**：M1 设计完成（`docs/20-planning/0010-…`），**c1 四后端 kernel 零改动**；重基线 4–7 h；**M4 必须等本批收口**。
+      · **U1 验收 FAIL（3 条阻断，回修中）**：target fail-open（非宿主 triple 被伪造成 CPU capability 后照跑）、
+        `policy_from_dict` 静默吞 `schema_version`（999/1.5/"1"/缺失全收）、`output` 与输入同 storage 时静默覆盖数据；
+        复验入口 `worktrees/_meta/pypto-x/verify-u1-matmul-policy-slice/work/repro_blockers.py`（修复后应 rc=0）。
    c) **待用户裁决（7 项，见 `pending_user_decisions_2026_09_11`）**：L4 是否含 decode 口径（**最靠前**）｜B4 阈值冻结（已推迟）｜L5/L6 语料与阈值（决策包在 `0005 §10`，三句话）｜`view_mode=require` 提级｜W8A8 v1 之外的新量化方案｜W8J 注入门政策｜A3 chip7/NPU 放行（E 线 N5）。
-   d) **尚未开始但已就绪**：Q5 重跑（需 Q10 + liveness 合入；6 config 并行、A3 上约 20–40 min 墙钟）｜U2（接第一个 vendor provider，需 U1 验收过）｜W8A8 v2 M2（**等 Q10 落地后**，因为两者都改 SVE256 的 int8 通路）｜C8 的 L5/L6。
+   d) **尚未开始但已就绪**：Q5 重跑（需 Q10 + liveness 合入 + **A3 恢复**；6 config 并行、A3 上约 20–40 min 墙钟）｜U2（接第一个 vendor provider，需 U1 复验过）｜W8A8 v2 M2（**等 Q10 验收落地**，因为两者都改 SVE256 的 int8 通路）｜C8 的 L5/L6。**A3 自 ~19:12Z 起不可达**（jump host 正常，仅 `192.168.45.21:22` 不通；A3 相关 leg 一律 `PENDING_A3_OUTAGE`，恢复后合并成一趟做）。
 4.9 **0040 波次中新立的五条流程**（都是踩坑换来的，勿再犯）：
    · **批量合并 + 单次全量**：当多个任务"只差自己那次全量 pytest"时，**先把它们的提交合入 integration**，
      再由 `integration-health-check` 在合并后的 tip 上跑**一次**全量；各任务仍 own 自己的聚焦证据，
