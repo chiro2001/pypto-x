@@ -232,7 +232,7 @@ input_ids int64
 
 - zero-point **不占 region**（策略常量 0）。
 - 权重行主序、`in` 连续（使 `s8` 可以用 64 字节对齐的行起点直接喂 dot 指令）。
-- region 数从 368（320 参数 + 48 state，`development_lock.yaml:1031`）变为：默认 **368 − 150 + 150*2 = 518**；条件全开（含 36 个小通道层与 lm_head）为 **368 + 187 = 555**。
+- region 数从 368（320 参数 + 48 state，`development_lock.yaml:1031`）变为：默认 **368 − 150 + 150*2 = 518**；186 个线性层全开为 **368 − 186 + 186*2 = 554**；再开启 tied lm_head 双 packing（§3.4，+2 region）为 **554 + 2 = 556**（ERR-0003：旧稿 555 为文档笔误）。
 - 新增版本号：`PACKED_LAYOUT_VERSION` 1 → **2**（`runtime_binding.py:30`）。旧 v1 布局必须 `reject_and_recompile`（沿用 M1E/M1F/M1H 的 fail-closed 先例，`development_lock.yaml:786,888`）。
 
 ### 3.2 binding schema 扩展
