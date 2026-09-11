@@ -1,0 +1,3962 @@
+From 195ace3eb8a521950c72ffc62f0349aed6c7ac04 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Fri, 11 Sep 2026 22:51:55 +0800
+Subject: [PATCH 142/144] feat(cuda): add native W8A8 dp4a integer kernel plane
+ (C6/R6)
+
+Implement contract 0002 C6 / R6 for the CUDA backend as a separate,
+probe-gated integer plane next to the unchanged float/bf16 PTX target:
+
+- qmatmul_s8s8_s32 emits a native dp4a.s32.s32 main loop (SASS
+  IDP.4A.S8.S8 on sm_120) with an explicit widening K tail
+  (cvt.s32.s8 + mad.lo.s32); rank2/3/4, identical batch prefixes,
+  K <= 133144 and reserved -128 handling match the C1 scalar golden.
+- quantize_per_token_s8, dequantize_s8 and
+  dequantize_epilogue_bf16 are native target entry points bit-exact
+  with the C1 goldens (Q1-Q6): per-row absmax, double-precision ratio
+  with cvt.rni RNE, clamp/saturation count, explicit integer bf16 RNE,
+  NaN/Inf, scale underflow and binary32 overflow fail closed.
+- the capability declaration is a CapabilitySet (dtypes int8/int32/
+  float32/bf16, matrix kind s8s8_s32_dp4a); the real Driver API probe
+  derives dp4a (sm>=61) and reports imma (sm>=75) without claiming it.
+  Nothing hardcodes sm_120; a missing driver or an insufficient device
+  fails closed with UnsupportedCapabilityError, never a BF16 fallback.
+- three-layer artifact gate: payload version 3 (the float CUDA plane
+  stays at 2), the pypto-x.cuda.w8a8:1 marker in PTX and metadata, and
+  kernel version 1; every decode re-renders the PTX, recomputes all
+  digests and re-probes the device/capability digest, so old payloads,
+  tampered metadata and cross-plane artifacts fail closed.
+- 56 focused tests cover the four opcodes against the portable golden
+  through a deterministic fake driver, PTX structure/marker checks,
+  capability gating (sm_50/60/70/74 injected), K over-limit, zero-size
+  rejection, -128 rejection and artifact tampering.
+- cuda_w8a8_device_validation.py is a weight-free RTX 5080 driver: the
+  first run exposed two PTX address bugs (qmatmul tail right offset and
+  the quantize codes row base) that the fake-driver contract tests
+  could not see; both are fixed, pinned by a PTX-text regression test,
+  and the final real-device run reports 53 checks / 0 mismatch.
+- no model-level precision='w8a8-linear' path, no graph-contract change
+  and no cuda.py (BF16) modification; AMD static lowering is not part of
+  this commit (registered as not done in the evidence brief).
+---
+ python/pypto/backends/cuda/__init__.py                 |    9 +-
+ python/pypto/backends/cuda/capabilities.py             |   82 +++
+ python/pypto/backends/cuda/runtime.py                  |  484 +++++++++++++-
+ python/pypto/compiler/targets/__init__.py              |   34 +
+ python/pypto/compiler/targets/cuda_w8a8.py             | 1290 ++++++++++++++++++++++++++++++++++++
+ python/pypto/lowering/gpu/__init__.py                  |    1 +
+ python/pypto/lowering/gpu/cuda_w8a8.py                 |  265 ++++++++
+ python/tests/ut/pypto_x/cuda_w8a8_device_validation.py |  593 +++++++++++++++++
+ python/tests/ut/pypto_x/test_w8a8_cuda.py              | 1021 ++++++++++++++++++++++++++++
+ 9 files changed, 3776 insertions(+), 3 deletions(-)
+
+diff --git a/python/pypto/backends/cuda/__init__.py b/python/pypto/backends/cuda/__init__.py
+index 35ac458f7..fc7e10319 100644
+--- a/python/pypto/backends/cuda/__init__.py
++++ b/python/pypto/backends/cuda/__init__.py
+@@ -10,6 +10,7 @@ from .driver import (
+     CudaEvent,
+     CudaModule,
+ )
++from .capabilities import probe_cuda_w8a8_availability, probe_cuda_w8a8_device
+ from .runtime import (
+     CudaArtifactError,
+     CudaBackend,
+@@ -18,6 +19,10 @@ from .runtime import (
+     CudaLaunchTiming,
+     CudaRuntime,
+     CudaRuntimeError,
++    CudaW8A8ArtifactError,
++    CudaW8A8ExecutionError,
++    CudaW8A8QuantizeResult,
++    CudaW8A8RuntimeError,
+     LoadedCudaArtifact,
+     launch,
+ )
+@@ -25,5 +30,7 @@ from .runtime import (
+ __all__ = [
+     "CUDA_SUCCESS", "CudaArtifactError", "CudaBackend", "CudaContext", "CudaDeviceInfo", "CudaDriver",
+     "CudaDriverError", "CudaDriverRuntime", "CudaDriverUnavailable", "CudaEvent", "CudaExecutionError",
+-    "CudaLaunchTiming", "CudaModule", "CudaRuntime", "CudaRuntimeError", "LoadedCudaArtifact", "launch",
++    "CudaLaunchTiming", "CudaModule", "CudaRuntime", "CudaRuntimeError", "CudaW8A8ArtifactError",
++    "CudaW8A8ExecutionError", "CudaW8A8QuantizeResult", "CudaW8A8RuntimeError", "LoadedCudaArtifact",
++    "launch", "probe_cuda_w8a8_availability", "probe_cuda_w8a8_device",
+ ]
+diff --git a/python/pypto/backends/cuda/capabilities.py b/python/pypto/backends/cuda/capabilities.py
+new file mode 100644
+index 000000000..84418864b
+--- /dev/null
++++ b/python/pypto/backends/cuda/capabilities.py
+@@ -0,0 +1,82 @@
++"""Real CUDA device probe for the W8A8 integer plane (contract 0002 C6).
++
++The probe always goes through the CUDA Driver API (the same header-free
++adapter the runtime uses) and never reads a hardcoded table of device names
++or compute capabilities.  A missing driver, a failed device query or a device
++without ``dp4a`` is reported as :class:`CudaW8A8UnavailableError` /
++:class:`~pypto.target.UnsupportedCapabilityError`; there is no BF16 fallback
++inside the W8A8 path.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Optional
++
++from pypto.lowering.gpu.cuda_w8a8 import CudaW8A8Device, CudaW8A8UnavailableError
++
++
++def _field(value: Any, name: str, default: Any = None) -> Any:
++    if isinstance(value, dict):
++        return value.get(name, default)
++    return getattr(value, name, default)
++
++
++def probe_cuda_w8a8_device(driver: Any = None, device_index: int = 0) -> CudaW8A8Device:
++    """Query the real device compute capability through the Driver API.
++
++    ``driver`` may be a :class:`pypto.backends.cuda.driver.CudaDriver` or any
++    test double exposing the same ``device_info(index)`` method.  Passing
++    ``None`` constructs the real Driver adapter; if the driver library is not
++    present the probe fails closed.
++    """
++
++    if driver is None:
++        from .driver import CudaDriver, CudaDriverUnavailable
++
++        try:
++            driver = CudaDriver()
++        except CudaDriverUnavailable as exc:
++            raise CudaW8A8UnavailableError(
++                "CUDA W8A8 device probe failed: {}".format(exc)
++            ) from exc
++    try:
++        info = driver.device_info(int(device_index))
++    except Exception as exc:
++        raise CudaW8A8UnavailableError(
++            "CUDA W8A8 device probe failed: {}".format(exc)
++        ) from exc
++    major = _field(info, "major")
++    minor = _field(info, "minor")
++    if major is None or minor is None:
++        raise CudaW8A8UnavailableError(
++            "CUDA W8A8 device probe returned no compute capability"
++        )
++    return CudaW8A8Device(
++        index=_field(info, "index", device_index),
++        name=_field(info, "name", "unknown"),
++        major=major,
++        minor=minor,
++        total_memory=_field(info, "total_memory", 0),
++        source="cuda_driver_device_info",
++    )
++
++
++def probe_cuda_w8a8_availability(driver: Any = None, device_index: int = 0) -> Optional[str]:
++    """Return ``None`` when the probe passes, else a fail-closed reason."""
++
++    try:
++        device = probe_cuda_w8a8_device(driver, device_index)
++    except CudaW8A8UnavailableError as exc:
++        return str(exc)
++    if not device.dp4a:
++        return "device {} ({}) lacks dp4a (sm_{} < sm_{})".format(
++            device.name, device.compute_capability, device.sm, 61
++        )
++    if not device.supports_w8a8_module:
++        return "device {} (sm_{}) cannot load the CUDA W8A8 sm_75 module".format(
++            device.name, device.sm
++        )
++    return None
++
++
++__all__ = ["probe_cuda_w8a8_availability", "probe_cuda_w8a8_device"]
+diff --git a/python/pypto/backends/cuda/runtime.py b/python/pypto/backends/cuda/runtime.py
+index 151314c63..794af84e1 100644
+--- a/python/pypto/backends/cuda/runtime.py
++++ b/python/pypto/backends/cuda/runtime.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import ctypes
+ import struct
+ import time
++from contextlib import contextmanager
+ from dataclasses import dataclass
+ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+ 
+@@ -17,8 +18,29 @@ from pypto.compiler.targets.cuda import (
+     CudaProgram,
+     _decode_cuda_artifact,
+ )
++from pypto.compiler.targets.cuda_w8a8 import (
++    CUDA_W8A8_BLOCK,
++    CUDA_W8A8_PTX_TARGET,
++    CudaW8A8ArtifactError as _CudaW8A8TargetArtifactError,
++    CudaW8A8Program,
++    decode_cuda_w8a8_artifact,
++)
+ from pypto.core_ir import CoreFunction, CoreType
+-from pypto.lowering.cpu import canonical_dtype, element_count, flatten_values, static_shape
++from pypto.lowering.cpu import (
++    W8A8_DEQUANTIZE_OPCODE,
++    W8A8_EPILOGUE_OPCODE,
++    W8A8_MAX_ACCUMULATOR_K,
++    W8A8_QMATMUL_OPCODE,
++    W8A8_QUANTIZE_OPCODE,
++    canonical_dtype,
++    element_count,
++    flatten_values,
++    static_shape,
++)
++from pypto.lowering.gpu.cuda_w8a8 import (
++    CudaW8A8UnavailableError,
++    verify_cuda_w8a8_capability_metadata,
++)
+ 
+ from .driver import CudaContext, CudaDriver, CudaDriverError, CudaDriverUnavailable
+ 
+@@ -35,6 +57,18 @@ class CudaExecutionError(CudaRuntimeError):
+     """Request, memory, launch or result-copy failure."""
+ 
+ 
++class CudaW8A8RuntimeError(CudaRuntimeError):
++    """Base CUDA W8A8 runtime error."""
++
++
++class CudaW8A8ArtifactError(CudaW8A8RuntimeError):
++    """The artifact is not a native, probed CUDA W8A8 artifact."""
++
++
++class CudaW8A8ExecutionError(CudaW8A8RuntimeError):
++    """W8A8 argument validation, launch or result-copy failure."""
++
++
+ @dataclass(frozen=True)
+ class LoadedCudaArtifact:
+     artifact: Artifact
+@@ -86,6 +120,29 @@ class CudaLaunchTiming:
+         }
+ 
+ 
++@dataclass(frozen=True)
++class CudaW8A8QuantizeResult:
++    """Result of the native CUDA per-token quantizer (Q1-Q6)."""
++
++    codes: Tuple[int, ...]
++    scales: Tuple[float, ...]
++    saturation_count: int
++    rows: int
++    k: int
++    dtype: str = "float32"
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "opcode": W8A8_QUANTIZE_OPCODE,
++            "rows": self.rows,
++            "k": self.k,
++            "codes": list(self.codes),
++            "scales": list(self.scales),
++            "saturation_count": self.saturation_count,
++            "dtype": self.dtype,
++        }
++
++
+ @dataclass
+ class _Allocation:
+     pointer: int
+@@ -193,6 +250,80 @@ def _itemsize(dtype: str) -> int:
+         raise CudaExecutionError("unsupported CUDA dtype {!r}".format(dtype)) from exc
+ 
+ 
++# ---------------------------------------------------------------------------
++# CUDA W8A8 argument marshalling (C6)
++# ---------------------------------------------------------------------------
++
++
++def _w8a8_flat(values: Any, context: str) -> list:
++    """Flatten a nested/standard sequence with the shared Core IR helper."""
++
++    if isinstance(values, (str, bytes, bytearray, Mapping)):
++        raise CudaW8A8ExecutionError("{} must be a numeric sequence".format(context))
++    if hasattr(values, "data") and isinstance(getattr(values, "data"), (list, tuple)):
++        values = values.data
++    flat = list(flatten_values(values))
++    if not flat:
++        raise CudaW8A8ExecutionError("{} must not be empty".format(context))
++    return flat
++
++
++def _w8a8_int_codes(values: Sequence[Any], context: str) -> list:
++    codes = []
++    for index, value in enumerate(values):
++        if isinstance(value, bool) or not isinstance(value, int):
++            raise CudaW8A8ExecutionError(
++                "{}[{}] must be an integer int8 code".format(context, index)
++            )
++        if value < -127 or value > 127:
++            raise CudaW8A8ExecutionError(
++                "{}[{}]={} outside [-127, 127]; the reserved -128 code point is refused "
++                "(contract 0002 section 1.1)".format(context, index, value)
++            )
++        codes.append(value)
++    return codes
++
++
++def _w8a8_real_values(values: Sequence[Any], context: str) -> list:
++    result = []
++    for index, value in enumerate(values):
++        if isinstance(value, bool) or not isinstance(value, (int, float)):
++            raise CudaW8A8ExecutionError("{}[{}] must be a real number".format(context, index))
++        number = float(value)
++        try:
++            result.append(struct.unpack("<f", struct.pack("<f", number))[0])
++        except (OverflowError, TypeError, ValueError) as exc:
++            raise CudaW8A8ExecutionError(
++                "{}[{}] cannot be represented as float32".format(context, index)
++            ) from exc
++    return result
++
++
++def _w8a8_scales(values: Any, expected: int, context: str) -> list:
++    flat = _w8a8_flat(values, context)
++    if len(flat) != expected:
++        raise CudaW8A8ExecutionError(
++            "{} expects {} scales, got {}".format(context, expected, len(flat))
++        )
++    return _w8a8_real_values(flat, context)
++
++
++def _w8a8_bf16_to_f32(values: Sequence[Any], context: str) -> list:
++    result = []
++    for index, value in enumerate(values):
++        if isinstance(value, bool) or not isinstance(value, (int, float)):
++            raise CudaW8A8ExecutionError("{}[{}] must be a real number".format(context, index))
++        number = float(value)
++        try:
++            bits = _bf16_bits(number)
++        except (OverflowError, TypeError, ValueError) as exc:
++            raise CudaW8A8ExecutionError(
++                "{}[{}] cannot be rounded to bfloat16".format(context, index)
++            ) from exc
++        result.append(struct.unpack("<f", struct.pack("<I", bits << 16))[0])
++    return result
++
++
+ def _is_tensor(value_type: CoreType) -> bool:
+     return value_type.kind in ("tensor", "view", "tile")
+ 
+@@ -659,6 +790,354 @@ class CudaRuntime:
+                 except Exception:
+                     pass
+ 
++    # ------------------------------------------------------------------
++    # CUDA W8A8 target entry points (contract 0002 C6)
++    # ------------------------------------------------------------------
++
++    def probe_w8a8_device(self) -> Dict[str, Any]:
++        """Return the real device facts used by the W8A8 capability gate."""
++
++        return dict(self._probe_w8a8_device().to_dict())
++
++    def _probe_w8a8_device(self):
++        if self.driver is None:
++            raise CudaW8A8UnavailableError(
++                self._driver_error or "CUDA Driver API unavailable for the W8A8 plane"
++            )
++        from .capabilities import probe_cuda_w8a8_device
++
++        return probe_cuda_w8a8_device(self.driver, self.device_index)
++
++    def _load_w8a8(self, artifact: Any) -> CudaW8A8Program:
++        try:
++            loaded = decode_cuda_w8a8_artifact(artifact)
++        except _CudaW8A8TargetArtifactError as exc:
++            raise CudaW8A8ArtifactError(str(exc)) from exc
++        except Exception as exc:
++            raise CudaW8A8ArtifactError(
++                "CUDA W8A8 artifact validation failed: {}".format(exc)
++            ) from exc
++        if loaded.ptx_target != CUDA_W8A8_PTX_TARGET:
++            raise CudaW8A8ArtifactError(
++                "CUDA W8A8 artifact PTX target {!r} is not {!r}".format(
++                    loaded.ptx_target, CUDA_W8A8_PTX_TARGET
++                )
++            )
++        probed = self._probe_w8a8_device()
++        try:
++            verify_cuda_w8a8_capability_metadata(loaded.capability, probed)
++        except CudaW8A8UnavailableError as exc:
++            raise CudaW8A8ArtifactError(
++                "CUDA W8A8 capability metadata does not match the real probe: {}".format(exc)
++            ) from exc
++        min_sm = loaded.capability.get("min_sm")
++        if isinstance(min_sm, bool) or not isinstance(min_sm, int):
++            raise CudaW8A8ArtifactError("CUDA W8A8 artifact has no valid min_sm gate")
++        if probed.sm < min_sm:
++            raise CudaW8A8UnavailableError(
++                "probed device {} (sm_{}) is below the artifact requirement sm_{}".format(
++                    probed.name, probed.sm, min_sm
++                )
++            )
++        if not probed.dp4a or not probed.supports_w8a8_module:
++            raise CudaW8A8UnavailableError(
++                "probed device {} (sm_{}) lacks the dp4a W8A8 capability".format(
++                    probed.name, probed.sm
++                )
++            )
++        return loaded
++
++    @staticmethod
++    def _w8a8_plan(loaded: CudaW8A8Program, opcode: str):
++        try:
++            return loaded.operation_by_opcode(opcode)
++        except Exception as exc:
++            raise CudaW8A8ExecutionError(
++                "artifact has no compiled {!r} operation".format(opcode)
++            ) from exc
++
++    @staticmethod
++    def _w8a8_requested_shape(provided: Any, compiled: Sequence[int], context: str) -> Tuple[int, ...]:
++        if provided is None:
++            return tuple(int(dimension) for dimension in compiled)
++        if isinstance(provided, (str, bytes, bytearray)) or not isinstance(provided, (list, tuple)):
++            raise CudaW8A8ExecutionError("{} must be a shape sequence".format(context))
++        shape = []
++        for index, dimension in enumerate(provided):
++            if isinstance(dimension, bool) or not isinstance(dimension, int) or dimension < 0:
++                raise CudaW8A8ExecutionError(
++                    "{}[{}] must be a non-negative integer".format(context, index)
++                )
++            shape.append(int(dimension))
++        shape = tuple(shape)
++        if shape != tuple(int(dimension) for dimension in compiled):
++            raise CudaW8A8ExecutionError(
++                "{} {} does not match the compiled W8A8 plan {}".format(
++                    context, shape, tuple(compiled)
++                )
++            )
++        return shape
++
++    @contextmanager
++    def _w8a8_allocations(self, sizes: Sequence[int]):
++        self._ensure_context()
++        pointers = []
++        try:
++            for size in sizes:
++                pointers.append(self.driver.mem_alloc(max(1, int(size))))
++            yield tuple(pointers)
++        finally:
++            for pointer in reversed(pointers):
++                try:
++                    self.driver.mem_free(pointer)
++                except Exception:
++                    pass
++
++    def _w8a8_launch(self, loaded: CudaW8A8Program, kernel: str, parameters: Sequence[Any], count: int) -> None:
++        if count <= 0:
++            raise CudaW8A8ExecutionError("CUDA W8A8 kernel {} has an empty launch domain".format(kernel))
++        block = CUDA_W8A8_BLOCK
++        grid = ((count + block - 1) // block, 1, 1)
++        self._ensure_context()
++        module = None
++        try:
++            module = self.driver.module_load_data(loaded.ptx)
++            handle = module.get_function(kernel)
++            self.driver.launch_kernel(handle, grid, (block, 1, 1), list(parameters), None, 0)
++            self.driver.context_synchronize()
++        except CudaW8A8RuntimeError:
++            raise
++        except Exception as exc:
++            raise CudaW8A8ExecutionError(
++                "CUDA W8A8 kernel {} launch failed: {}".format(kernel, exc)
++            ) from exc
++        finally:
++            if module is not None:
++                try:
++                    module.close()
++                except Exception:
++                    pass
++
++    def run_w8a8_qmatmul(
++        self,
++        artifact: Any,
++        left: Any,
++        right: Any,
++        *,
++        left_shape: Optional[Sequence[int]] = None,
++        right_shape: Optional[Sequence[int]] = None,
++    ) -> Tuple[int, ...]:
++        """Run the native ``qmatmul_s8s8_s32`` dp4a kernel (R6)."""
++
++        loaded = self._load_w8a8(artifact)
++        plan = self._w8a8_plan(loaded, W8A8_QMATMUL_OPCODE)
++        self._w8a8_requested_shape(left_shape, plan.left_shape, "qmatmul.left_shape")
++        self._w8a8_requested_shape(right_shape, plan.right_shape, "qmatmul.right_shape")
++        if plan.k > W8A8_MAX_ACCUMULATOR_K:
++            raise CudaW8A8ExecutionError(
++                "CUDA {} K={} exceeds the INT32 accumulation limit {}".format(
++                    W8A8_QMATMUL_OPCODE, plan.k, W8A8_MAX_ACCUMULATOR_K
++                )
++            )
++        left_flat = _w8a8_flat(left, "qmatmul.left")
++        right_flat = _w8a8_flat(right, "qmatmul.right")
++        if len(left_flat) != element_count(plan.left_shape):
++            raise CudaW8A8ExecutionError("qmatmul.left storage length does not match its shape")
++        if len(right_flat) != element_count(plan.right_shape):
++            raise CudaW8A8ExecutionError("qmatmul.right storage length does not match its shape")
++        left_codes = _w8a8_int_codes(left_flat, "qmatmul.left")
++        right_codes = _w8a8_int_codes(right_flat, "qmatmul.right")
++        batch_count = 1
++        for dimension in plan.batch_shape:
++            batch_count *= int(dimension)
++        total = batch_count * plan.m * plan.n
++        if total == 0:
++            # The C1 golden rejects zero-size operands ("shape ... does not
++            # match 0 flattened elements"), so an empty launch domain is
++            # fail-closed instead of being silently treated as empty output.
++            raise CudaW8A8ExecutionError(
++                "CUDA {} has an empty launch domain; the C1 golden rejects "
++                "zero-size operands".format(W8A8_QMATMUL_OPCODE)
++            )
++        left_bytes = _pack("int8", left_codes)
++        right_bytes = _pack("int8", right_codes)
++        with self._w8a8_allocations(
++            (len(left_bytes), len(right_bytes), total * 4)
++        ) as (left_pointer, right_pointer, output_pointer):
++            self.driver.memcpy_htod(left_pointer, left_bytes)
++            self.driver.memcpy_htod(right_pointer, right_bytes)
++            self._w8a8_launch(
++                loaded,
++                plan.kernel,
++                (left_pointer, right_pointer, output_pointer),
++                total,
++            )
++            raw = self.driver.memcpy_dtoh(output_pointer, total * 4)
++        return tuple(int(value) for value in _unpack("int32", raw))
++
++    def run_w8a8_dequantize_s8(
++        self,
++        artifact: Any,
++        codes: Any,
++        scales: Sequence[float],
++        *,
++        shape: Optional[Sequence[int]] = None,
++    ) -> Tuple[float, ...]:
++        """Run the native CUDA ``dequantize_s8`` diagnostic primitive."""
++
++        loaded = self._load_w8a8(artifact)
++        plan = self._w8a8_plan(loaded, W8A8_DEQUANTIZE_OPCODE)
++        self._w8a8_requested_shape(shape, plan.codes_shape, "dequantize_s8.shape")
++        codes_flat = _w8a8_flat(codes, "dequantize_s8.codes")
++        if len(codes_flat) != element_count(plan.codes_shape):
++            raise CudaW8A8ExecutionError("dequantize_s8.codes storage length does not match its shape")
++        code_values = _w8a8_int_codes(codes_flat, "dequantize_s8.codes")
++        scale_values = _w8a8_scales(scales, plan.rows, "dequantize_s8.scales")
++        total = plan.rows * plan.k
++        with self._w8a8_allocations((total, plan.rows * 4, total * 4)) as (
++            codes_pointer,
++            scales_pointer,
++            output_pointer,
++        ):
++            self.driver.memcpy_htod(codes_pointer, _pack("int8", code_values))
++            self.driver.memcpy_htod(scales_pointer, _pack("float32", scale_values))
++            self._w8a8_launch(
++                loaded,
++                plan.kernel,
++                (codes_pointer, scales_pointer, output_pointer),
++                total,
++            )
++            raw = self.driver.memcpy_dtoh(output_pointer, total * 4)
++        return tuple(float(value) for value in _unpack("float32", raw))
++
++    def run_w8a8_quantize_per_token_s8(
++        self,
++        artifact: Any,
++        values: Any,
++        *,
++        shape: Optional[Sequence[int]] = None,
++        dtype: str = "float32",
++    ) -> CudaW8A8QuantizeResult:
++        """Run the native CUDA dynamic per-token quantizer (Q1-Q6)."""
++
++        loaded = self._load_w8a8(artifact)
++        plan = self._w8a8_plan(loaded, W8A8_QUANTIZE_OPCODE)
++        self._w8a8_requested_shape(shape, plan.input_shape, "quantize_per_token_s8.shape")
++        normalized_dtype = canonical_dtype(dtype)
++        if normalized_dtype not in ("float32", "bf16"):
++            raise CudaW8A8ExecutionError(
++                "CUDA quantize_per_token_s8 requires float32 or bf16 input, got {!r}".format(dtype)
++            )
++        if plan.k > W8A8_MAX_ACCUMULATOR_K:
++            raise CudaW8A8ExecutionError(
++                "CUDA {} K={} exceeds the INT32 accumulation limit {}".format(
++                    W8A8_QUANTIZE_OPCODE, plan.k, W8A8_MAX_ACCUMULATOR_K
++                )
++            )
++        flat = _w8a8_flat(values, "quantize_per_token_s8.values")
++        if len(flat) != element_count(plan.input_shape):
++            raise CudaW8A8ExecutionError(
++                "quantize_per_token_s8.values storage length does not match its shape"
++            )
++        if normalized_dtype == "bf16":
++            f32_values = _w8a8_bf16_to_f32(flat, "quantize_per_token_s8.values")
++        else:
++            f32_values = _w8a8_real_values(flat, "quantize_per_token_s8.values")
++        total = plan.rows * plan.k
++        zero_status = b"\0" * (plan.rows * 4)
++        with self._w8a8_allocations(
++            (total * 4, total, plan.rows * 4, plan.rows * 4, plan.rows * 4)
++        ) as (values_pointer, codes_pointer, scales_pointer, saturation_pointer, status_pointer):
++            self.driver.memcpy_htod(values_pointer, _pack("float32", f32_values))
++            self.driver.memcpy_htod(status_pointer, zero_status)
++            self._w8a8_launch(
++                loaded,
++                plan.kernel,
++                (values_pointer, codes_pointer, scales_pointer, saturation_pointer, status_pointer),
++                plan.rows,
++            )
++            status = _unpack("int32", self.driver.memcpy_dtoh(status_pointer, plan.rows * 4))
++            if any(int(value) != 0 for value in status):
++                codes = set(int(value) for value in status)
++                if 1 in codes:
++                    raise CudaW8A8ExecutionError(
++                        "CUDA quantize_per_token_s8 input contains NaN/Inf; refusing to "
++                        "produce an artifact (Q2)"
++                    )
++                raise CudaW8A8ExecutionError(
++                    "CUDA quantize_per_token_s8 hit a non-zero float32 scale underflow; "
++                    "refusing to quantize (contract 0002 section 6)"
++                )
++            raw_codes = self.driver.memcpy_dtoh(codes_pointer, total)
++            raw_scales = self.driver.memcpy_dtoh(scales_pointer, plan.rows * 4)
++            raw_saturation = self.driver.memcpy_dtoh(saturation_pointer, plan.rows * 4)
++        saturation = sum(int(value) for value in _unpack("int32", raw_saturation))
++        return CudaW8A8QuantizeResult(
++            codes=tuple(int(value) for value in _unpack("int8", raw_codes)),
++            scales=tuple(float(value) for value in _unpack("float32", raw_scales)),
++            saturation_count=saturation,
++            rows=plan.rows,
++            k=plan.k,
++            dtype=normalized_dtype,
++        )
++
++    def run_w8a8_dequantize_epilogue_bf16(
++        self,
++        artifact: Any,
++        accumulator: Any,
++        row_scales: Sequence[float],
++        column_scales: Sequence[float],
++        *,
++        shape: Optional[Sequence[int]] = None,
++    ) -> Tuple[int, ...]:
++        """Run the native CUDA single-rounding BF16 epilogue, returning bits."""
++
++        loaded = self._load_w8a8(artifact)
++        plan = self._w8a8_plan(loaded, W8A8_EPILOGUE_OPCODE)
++        self._w8a8_requested_shape(shape, plan.accumulator_shape, "dequantize_epilogue_bf16.shape")
++        accumulator_flat = _w8a8_flat(accumulator, "dequantize_epilogue_bf16.accumulator")
++        if len(accumulator_flat) != plan.rows * plan.columns:
++            raise CudaW8A8ExecutionError(
++                "dequantize_epilogue_bf16.accumulator storage length does not match its shape"
++            )
++        accumulators = []
++        for index, value in enumerate(accumulator_flat):
++            if isinstance(value, bool) or not isinstance(value, int):
++                raise CudaW8A8ExecutionError(
++                    "dequantize_epilogue_bf16.accumulator[{}] must be an integer".format(index)
++                )
++            if value < -(2**31) or value > 2**31 - 1:
++                raise CudaW8A8ExecutionError(
++                    "dequantize_epilogue_bf16.accumulator[{}] outside INT32 range".format(index)
++                )
++            accumulators.append(value)
++        row_scale_values = _w8a8_scales(row_scales, plan.rows, "dequantize_epilogue_bf16.row_scales")
++        column_scale_values = _w8a8_scales(
++            column_scales, plan.columns, "dequantize_epilogue_bf16.column_scales"
++        )
++        total = plan.rows * plan.columns
++        with self._w8a8_allocations(
++            (total * 4, plan.rows * 4, plan.columns * 4, total * 2, 4)
++        ) as (accumulator_pointer, row_pointer, column_pointer, output_pointer, status_pointer):
++            self.driver.memcpy_htod(accumulator_pointer, _pack("int32", accumulators))
++            self.driver.memcpy_htod(row_pointer, _pack("float32", row_scale_values))
++            self.driver.memcpy_htod(column_pointer, _pack("float32", column_scale_values))
++            self.driver.memcpy_htod(status_pointer, b"\0\0\0\0")
++            self._w8a8_launch(
++                loaded,
++                plan.kernel,
++                (accumulator_pointer, row_pointer, column_pointer, output_pointer, status_pointer),
++                total,
++            )
++            status = _unpack("int32", self.driver.memcpy_dtoh(status_pointer, 4))
++            if status and int(status[0]) != 0:
++                raise CudaW8A8ExecutionError(
++                    "CUDA dequantize_epilogue_bf16 product overflows binary32; refusing to "
++                    "round (fail-closed, contract 0002 section 6)"
++                )
++            raw = self.driver.memcpy_dtoh(output_pointer, total * 2)
++        return tuple(int(value) for value in _unpack("uint16", raw))
++
+     def _prepare_input(self, descriptor: TensorDesc, value_type: CoreType, allocations: list) -> int:
+         pointer = _pointer(_storage(descriptor))
+         if pointer is not None:
+@@ -761,5 +1240,6 @@ def launch(request: Any) -> Tuple[Any, ...]:
+ 
+ __all__ = [
+     "CudaArtifactError", "CudaBackend", "CudaDriverRuntime", "CudaExecutionError", "CudaRuntime",
+-    "CudaLaunchTiming", "CudaRuntimeError", "LoadedCudaArtifact", "launch",
++    "CudaLaunchTiming", "CudaRuntimeError", "CudaW8A8ArtifactError", "CudaW8A8ExecutionError",
++    "CudaW8A8QuantizeResult", "CudaW8A8RuntimeError", "LoadedCudaArtifact", "launch",
+ ]
+diff --git a/python/pypto/compiler/targets/__init__.py b/python/pypto/compiler/targets/__init__.py
+index 612fae5e5..ef4e8b6c6 100644
+--- a/python/pypto/compiler/targets/__init__.py
++++ b/python/pypto/compiler/targets/__init__.py
+@@ -26,6 +26,24 @@ from .cuda import (
+     compile_cuda_ptx,
+     render_ptx,
+ )
++from .cuda_w8a8 import (
++    CUDA_W8A8_ARTIFACT_FORMAT,
++    CUDA_W8A8_BACKEND,
++    CUDA_W8A8_KERNEL_VERSION,
++    CUDA_W8A8_MARKER,
++    CUDA_W8A8_PAYLOAD_VERSION,
++    CudaW8A8ArtifactError,
++    CudaW8A8Compiler,
++    CudaW8A8Error,
++    CudaW8A8OperationPlan,
++    CudaW8A8Program,
++    CudaW8A8UnsupportedError,
++    CudaW8A8ValidationError,
++    compile_cuda_w8a8,
++    decode_cuda_w8a8_artifact,
++    render_w8a8_ptx,
++    w8a8_artifact_is_native,
++)
+ from .hip import (
+     AMDGPU_ARTIFACT_FORMAT,
+     AMDGPU_BACKEND,
+@@ -66,6 +84,22 @@ __all__ = [
+     "CudaProgram",
+     "compile_cuda_ptx",
+     "render_ptx",
++    "CUDA_W8A8_ARTIFACT_FORMAT",
++    "CUDA_W8A8_BACKEND",
++    "CUDA_W8A8_KERNEL_VERSION",
++    "CUDA_W8A8_MARKER",
++    "CUDA_W8A8_PAYLOAD_VERSION",
++    "CudaW8A8ArtifactError",
++    "CudaW8A8Compiler",
++    "CudaW8A8Error",
++    "CudaW8A8OperationPlan",
++    "CudaW8A8Program",
++    "CudaW8A8UnsupportedError",
++    "CudaW8A8ValidationError",
++    "compile_cuda_w8a8",
++    "decode_cuda_w8a8_artifact",
++    "render_w8a8_ptx",
++    "w8a8_artifact_is_native",
+     "AMDGPU_ARTIFACT_FORMAT",
+     "AMDGPU_BACKEND",
+     "AMDGPU_LLVM_IR_VERSION",
+diff --git a/python/pypto/compiler/targets/cuda_w8a8.py b/python/pypto/compiler/targets/cuda_w8a8.py
+new file mode 100644
+index 000000000..ab53817be
+--- /dev/null
++++ b/python/pypto/compiler/targets/cuda_w8a8.py
+@@ -0,0 +1,1290 @@
++"""CUDA W8A8 integer kernel plane (contract 0002 C6 / R6).
++
++This module is deliberately separate from :mod:`pypto.compiler.targets.cuda`
++(the float/bf16 CUDA plane).  The W8A8 plane consumes only the four frozen C1
++opcodes and emits a dedicated PTX correctness kernel per operation:
++
++* ``qmatmul_s8s8_s32``            native ``dp4a.s32.s32`` main loop with an
++                                  explicit widening (``cvt.s32.s8`` +
++                                  ``mad.lo.s32``) K tail;
++* ``quantize_per_token_s8``       per-row absmax, double-precision division,
++                                  RNE ties-to-even, clamp/saturation count,
++                                  NaN/Inf and scale-underflow fail-closed;
++* ``dequantize_s8``               int8 x fp32 -> fp32;
++* ``dequantize_epilogue_bf16``    single-rounding fp32 epilogue with the
++                                  project's RNE bf16 bit rule implemented
++                                  explicitly (so NaN payloads match).
++
++Three independent gates protect the artifact (mirroring C3/C4/C5):
++
++1. **payload version** ``CUDA_W8A8_PAYLOAD_VERSION == 3``; the float CUDA
++   plane is payload 2 and can never be reinterpreted as W8A8 (and vice
++   versa);
++2. **PTX marker** ``pypto-x.cuda.w8a8:1`` embedded in the PTX text and in the
++   metadata, re-rendered and re-checked on every decode;
++3. **kernel version** ``CUDA_W8A8_KERNEL_VERSION == 1`` carried in both
++   payload and metadata.
++
++The capability gate is a real device probe (see
++:mod:`pypto.backends.cuda.capabilities`); this module only accepts a probed
++:class:`~pypto.lowering.gpu.cuda_w8a8.CudaW8A8Device`.  No BF16 fallback
++exists inside the W8A8 path.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import re
++from dataclasses import dataclass
++from typing import Any, Mapping, Optional, Sequence, Tuple
++
++from pypto.compiler.api import CompileOptions
++from pypto.compiler.artifact import ABI_VERSION, Artifact
++from pypto.core_ir import CoreProgram, CoreType, Operation, ValueRef
++from pypto.lowering.cpu import (
++    CpuScalarError,
++    W8A8_DEQUANTIZE_OPCODE,
++    W8A8_EPILOGUE_OPCODE,
++    W8A8_MAX_ACCUMULATOR_K,
++    W8A8_QMATMUL_OPCODE,
++    W8A8_QUANTIZE_OPCODE,
++    canonical_dtype,
++    canonical_operation_name,
++    element_count,
++    static_shape,
++    validate_program,
++)
++from pypto.lowering.gpu.cuda_w8a8 import (
++    CUDA_W8A8_CAPABILITY,
++    CUDA_W8A8_COMPENSATION,
++    CUDA_W8A8_FORBIDDEN_MATRIX_CAPABILITIES,
++    CUDA_W8A8_MATRIX_CAPABILITY,
++    CudaW8A8Device,
++    CudaW8A8UnavailableError,
++    cuda_w8a8_capabilities,
++    cuda_w8a8_capability_metadata,
++)
++from pypto.target import TargetSpec
++from pypto.target._utils import frozen_mapping, mapping_copy, sha256_text
++
++from .cuda import (
++    CUDA_PTX_VERSION,
++    _SUPPORTED_PTX_VERSIONS,
++    _validate_ptx_target,
++    _validate_ptx_version,
++)
++
++
++CUDA_W8A8_BACKEND = "cuda.ptx.w8a8"
++CUDA_W8A8_ARTIFACT_FORMAT = "pypto-x.cuda.w8a8.ptx"
++#: Layer 1: payload version.  The float CUDA plane is payload 2; W8A8 is 3.
++CUDA_W8A8_PAYLOAD_VERSION = 3
++#: Layer 2: human- and machine-readable marker embedded in PTX and metadata.
++CUDA_W8A8_MARKER = "pypto-x.cuda.w8a8:1"
++#: Layer 3: W8A8 kernel contract version.
++CUDA_W8A8_KERNEL_VERSION = 1
++CUDA_W8A8_LOWERING_VERSION = 1
++CUDA_W8A8_PLAN_VERSION = 1
++#: The W8A8 module targets the CUDA 13.x toolkit floor (Turing, sm_75), which
++#: is also the smallest target that supports ``dp4a`` in that toolchain.
++CUDA_W8A8_PTX_TARGET = "sm_75"
++#: Block size for the W8A8 kernels (one-dimensional launch).
++CUDA_W8A8_BLOCK = 128
++
++W8A8_QMATMUL_MODE = "native_cuda_w8a8_qmatmul_dp4a"
++W8A8_QUANTIZE_MODE = "native_cuda_w8a8_quantize_per_token_s8"
++W8A8_DEQUANTIZE_MODE = "native_cuda_w8a8_dequantize_s8"
++W8A8_EPILOGUE_MODE = "native_cuda_w8a8_epilogue_bf16"
++W8A8_MODES = frozenset((W8A8_QMATMUL_MODE, W8A8_QUANTIZE_MODE, W8A8_DEQUANTIZE_MODE, W8A8_EPILOGUE_MODE))
++
++_KERNEL_SUFFIX = {
++    W8A8_QMATMUL_OPCODE: "qmatmul_s8s8_s32",
++    W8A8_QUANTIZE_OPCODE: "quantize_per_token_s8",
++    W8A8_DEQUANTIZE_OPCODE: "dequantize_s8",
++    W8A8_EPILOGUE_OPCODE: "dequantize_epilogue_bf16",
++}
++_MODE_BY_OPCODE = {
++    W8A8_QMATMUL_OPCODE: W8A8_QMATMUL_MODE,
++    W8A8_QUANTIZE_OPCODE: W8A8_QUANTIZE_MODE,
++    W8A8_DEQUANTIZE_OPCODE: W8A8_DEQUANTIZE_MODE,
++    W8A8_EPILOGUE_OPCODE: W8A8_EPILOGUE_MODE,
++}
++_PTX_MARKER_LINE = "// pypto-x.cuda.w8a8 marker: {}".format(CUDA_W8A8_MARKER)
++_PTX_KERNEL_VERSION_LINE = "// pypto-x.cuda.w8a8 kernel version: {}".format(CUDA_W8A8_KERNEL_VERSION)
++_ENTRY_NAME_RE = re.compile(r"^\.visible \.entry ([A-Za-z_][A-Za-z0-9_]*)\(", re.MULTILINE)
++
++
++class CudaW8A8Error(ValueError):
++    """Base error for the CUDA W8A8 target plane."""
++
++
++class CudaW8A8ValidationError(CudaW8A8Error):
++    """A Core IR program is outside the frozen W8A8 contract."""
++
++
++class CudaW8A8UnsupportedError(CudaW8A8Error):
++    """The program is valid Core IR but not lowerable by the CUDA W8A8 plane."""
++
++
++class CudaW8A8ArtifactError(CudaW8A8Error):
++    """A malformed, tampered or incompatible W8A8 artifact."""
++
++
++def _plain(value: Any) -> Any:
++    if isinstance(value, Mapping):
++        return {key: _plain(item) for key, item in value.items()}
++    if isinstance(value, (tuple, list)):
++        return [_plain(item) for item in value]
++    return value
++
++
++def _shape_product(shape: Sequence[int]) -> int:
++    result = 1
++    for dimension in shape:
++        result *= int(dimension)
++    return result
++
++
++@dataclass(frozen=True)
++class CudaW8A8OperationPlan:
++    """One validated W8A8 operation and the static shapes it was compiled for."""
++
++    operation_index: int
++    operation: str
++    kernel: str
++    mode: str
++    input_names: Tuple[str, ...]
++    output_names: Tuple[str, ...]
++    left_dtype: str = ""
++    right_dtype: str = ""
++    output_dtype: str = ""
++    input_dtype: str = ""
++    codes_dtype: str = ""
++    scales_dtype: str = ""
++    accumulator_dtype: str = ""
++    row_scales_dtype: str = ""
++    column_scales_dtype: str = ""
++    m: int = 0
++    k: int = 0
++    n: int = 0
++    rows: int = 0
++    columns: int = 0
++    batch_shape: Tuple[int, ...] = ()
++    left_shape: Tuple[int, ...] = ()
++    right_shape: Tuple[int, ...] = ()
++    output_shape: Tuple[int, ...] = ()
++    input_shape: Tuple[int, ...] = ()
++    codes_shape: Tuple[int, ...] = ()
++    scales_shape: Tuple[int, ...] = ()
++    accumulator_shape: Tuple[int, ...] = ()
++    row_scales_shape: Tuple[int, ...] = ()
++    column_scales_shape: Tuple[int, ...] = ()
++    output_names_order: Tuple[str, ...] = ()
++    compensation: str = ""
++
++    def to_dict(self) -> Mapping[str, Any]:
++        result: dict = {}
++        for name in self.__dataclass_fields__:
++            value = getattr(self, name)
++            if isinstance(value, tuple):
++                value = list(value)
++            result[name] = value
++        return result
++
++    @classmethod
++    def from_dict(cls, value: Any) -> "CudaW8A8OperationPlan":
++        if not isinstance(value, Mapping):
++            raise CudaW8A8ArtifactError("W8A8 plan entry must be an object")
++        expected = set(cls.__dataclass_fields__)
++        if set(value) != expected:
++            raise CudaW8A8ArtifactError("W8A8 plan entry has unknown or missing fields")
++        fields = {}
++        for name in expected:
++            item = value[name]
++            if name in (
++                "input_names",
++                "output_names",
++                "output_names_order",
++                "batch_shape",
++                "left_shape",
++                "right_shape",
++                "output_shape",
++                "input_shape",
++                "codes_shape",
++                "scales_shape",
++                "accumulator_shape",
++                "row_scales_shape",
++                "column_scales_shape",
++            ):
++                if not isinstance(item, (list, tuple)):
++                    raise CudaW8A8ArtifactError("W8A8 plan entry {!r} must be a sequence".format(name))
++                item = tuple(int(part) if isinstance(part, int) and not isinstance(part, bool) else part for part in item)
++            elif name in ("operation_index", "m", "k", "n", "rows", "columns"):
++                if isinstance(item, bool) or not isinstance(item, int):
++                    raise CudaW8A8ArtifactError("W8A8 plan entry {!r} must be an integer".format(name))
++            elif name in ("operation", "kernel", "mode", "compensation") or name.endswith("_dtype"):
++                if not isinstance(item, str):
++                    raise CudaW8A8ArtifactError("W8A8 plan entry {!r} must be a string".format(name))
++            fields[name] = item
++        plan = cls(**fields)
++        return plan.validate()
++
++    def validate(self) -> "CudaW8A8OperationPlan":
++        if self.operation not in _MODE_BY_OPCODE:
++            raise CudaW8A8ArtifactError("unknown W8A8 operation {!r}".format(self.operation))
++        if self.mode != _MODE_BY_OPCODE[self.operation]:
++            raise CudaW8A8ArtifactError("W8A8 plan mode does not match the operation")
++        if not self.kernel.startswith("px_w8a8_op{}_".format(self.operation_index)):
++            raise CudaW8A8ArtifactError("W8A8 kernel symbol does not match the operation index")
++        if self.compensation != CUDA_W8A8_COMPENSATION:
++            raise CudaW8A8ArtifactError("W8A8 plan compensation token mismatch")
++        if len(self.input_names) == 0 or len(self.output_names) == 0:
++            raise CudaW8A8ArtifactError("W8A8 plan entry requires input and output names")
++        return self
++
++
++def _operation_bindings(operation: Operation) -> Tuple[Mapping[str, Any], ...]:
++    bindings = []
++    for ref in operation.inputs:
++        bindings.append(
++            {
++                "name": ref.name,
++                "kind": "tensor",
++                "dtype": canonical_dtype(ref.type.dtype),
++                "role": "input",
++            }
++        )
++    for ref in operation.outputs:
++        bindings.append(
++            {
++                "name": ref.name,
++                "kind": "tensor",
++                "dtype": canonical_dtype(ref.type.dtype),
++                "role": "output",
++            }
++        )
++    return tuple(bindings)
++
++
++def _tensor(name: str, dtype: str, shape: Sequence[int]) -> ValueRef:
++    return ValueRef(name, CoreType.tensor(dtype, tuple(int(dimension) for dimension in shape)))
++
++
++def _plan_for_operation(program: CoreProgram, operation: Operation, index: int) -> CudaW8A8OperationPlan:
++    name = canonical_operation_name(operation.name)
++    if name not in _MODE_BY_OPCODE:
++        raise CudaW8A8UnsupportedError(
++            "CUDA W8A8 plane does not implement operation {!r}".format(operation.name)
++        )
++    kernel = "px_w8a8_op{}_{}".format(index, _KERNEL_SUFFIX[name])
++    input_names = tuple(ref.name for ref in operation.inputs)
++    output_names = tuple(ref.name for ref in operation.outputs)
++    common = {
++        "operation_index": index,
++        "operation": name,
++        "kernel": kernel,
++        "mode": _MODE_BY_OPCODE[name],
++        "input_names": input_names,
++        "output_names": output_names,
++        "compensation": CUDA_W8A8_COMPENSATION,
++    }
++    if name == W8A8_QMATMUL_OPCODE:
++        left_shape = static_shape(operation.inputs[0].type, "w8a8 qmatmul left")
++        right_shape = static_shape(operation.inputs[1].type, "w8a8 qmatmul right")
++        output_shape = static_shape(operation.outputs[0].type, "w8a8 qmatmul output")
++        m, k = left_shape[-2], left_shape[-1]
++        n = right_shape[-1]
++        return CudaW8A8OperationPlan(
++            **common,
++            left_dtype=canonical_dtype(operation.inputs[0].type.dtype),
++            right_dtype=canonical_dtype(operation.inputs[1].type.dtype),
++            output_dtype=canonical_dtype(operation.outputs[0].type.dtype),
++            m=int(m),
++            k=int(k),
++            n=int(n),
++            batch_shape=tuple(int(dimension) for dimension in left_shape[:-2]),
++            left_shape=tuple(int(dimension) for dimension in left_shape),
++            right_shape=tuple(int(dimension) for dimension in right_shape),
++            output_shape=tuple(int(dimension) for dimension in output_shape),
++        )
++    if name == W8A8_QUANTIZE_OPCODE:
++        input_shape = static_shape(operation.inputs[0].type, "w8a8 quantize input")
++        codes_shape = static_shape(operation.outputs[0].type, "w8a8 quantize codes")
++        scales_shape = static_shape(operation.outputs[1].type, "w8a8 quantize scales")
++        rows, k = input_shape
++        return CudaW8A8OperationPlan(
++            **common,
++            input_dtype=canonical_dtype(operation.inputs[0].type.dtype),
++            codes_dtype=canonical_dtype(operation.outputs[0].type.dtype),
++            scales_dtype=canonical_dtype(operation.outputs[1].type.dtype),
++            rows=int(rows),
++            k=int(k),
++            input_shape=tuple(int(dimension) for dimension in input_shape),
++            codes_shape=tuple(int(dimension) for dimension in codes_shape),
++            scales_shape=tuple(int(dimension) for dimension in scales_shape),
++        )
++    if name == W8A8_DEQUANTIZE_OPCODE:
++        codes_shape = static_shape(operation.inputs[0].type, "w8a8 dequantize codes")
++        scales_shape = static_shape(operation.inputs[1].type, "w8a8 dequantize scales")
++        output_shape = static_shape(operation.outputs[0].type, "w8a8 dequantize output")
++        k = codes_shape[-1]
++        rows = element_count(codes_shape[:-1]) if len(codes_shape) > 1 else 1
++        return CudaW8A8OperationPlan(
++            **common,
++            codes_dtype=canonical_dtype(operation.inputs[0].type.dtype),
++            scales_dtype=canonical_dtype(operation.inputs[1].type.dtype),
++            output_dtype=canonical_dtype(operation.outputs[0].type.dtype),
++            rows=int(rows),
++            k=int(k),
++            codes_shape=tuple(int(dimension) for dimension in codes_shape),
++            scales_shape=tuple(int(dimension) for dimension in scales_shape),
++            output_shape=tuple(int(dimension) for dimension in output_shape),
++        )
++    # dequantize_epilogue_bf16
++    accumulator_shape = static_shape(operation.inputs[0].type, "w8a8 epilogue accumulator")
++    row_scales_shape = static_shape(operation.inputs[1].type, "w8a8 epilogue row scales")
++    column_scales_shape = static_shape(operation.inputs[2].type, "w8a8 epilogue column scales")
++    output_shape = static_shape(operation.outputs[0].type, "w8a8 epilogue output")
++    rows, columns = accumulator_shape
++    return CudaW8A8OperationPlan(
++        **common,
++        accumulator_dtype=canonical_dtype(operation.inputs[0].type.dtype),
++        row_scales_dtype=canonical_dtype(operation.inputs[1].type.dtype),
++        column_scales_dtype=canonical_dtype(operation.inputs[2].type.dtype),
++        output_dtype=canonical_dtype(operation.outputs[0].type.dtype),
++        rows=int(rows),
++        columns=int(columns),
++        accumulator_shape=tuple(int(dimension) for dimension in accumulator_shape),
++        row_scales_shape=tuple(int(dimension) for dimension in row_scales_shape),
++        column_scales_shape=tuple(int(dimension) for dimension in column_scales_shape),
++        output_shape=tuple(int(dimension) for dimension in output_shape),
++    )
++
++
++def _plan_digest(operations: Sequence[CudaW8A8OperationPlan]) -> str:
++    payload = [operation.to_dict() for operation in operations]
++    return sha256_text(payload)
++
++
++# ---------------------------------------------------------------------------
++# PTX rendering
++# ---------------------------------------------------------------------------
++
++_PREAMBLE = """    .reg .pred %p<16>;
++    .reg .b32 %r<64>;
++    .reg .b64 %rd<64>;
++    .reg .f32 %f<32>;
++    .reg .f64 %fd<32>;
++    .reg .b16 %rs<8>;"""
++
++_THREAD_INDEX = """    mov.u32 %r0, %ctaid.x;
++    mov.u32 %r1, %ntid.x;
++    mov.u32 %r2, %tid.x;
++    mad.lo.u32 %r3, %r0, %r1, %r2;
++    cvt.u64.u32 %rd0, %r3;"""
++
++
++def _render_kernel_header(kernel: str, params: int) -> str:
++    lines = [".visible .entry {}(".format(kernel)]
++    declarations = ["    .param .u64 p{}".format(index) for index in range(params)]
++    lines.append(",\n".join(declarations))
++    lines.append(") {")
++    lines.append(_PREAMBLE)
++    lines.append(_THREAD_INDEX)
++    return "\n".join(lines)
++
++
++def _render_qmatmul(plan: CudaW8A8OperationPlan) -> str:
++    m, k, n = plan.m, plan.k, plan.n
++    batch = _shape_product(plan.batch_shape)
++    total = batch * m * n
++    k4 = k // 4
++    tail = k % 4
++    lines = [_render_kernel_header(plan.kernel, 3)]
++    lines.append("    ld.param.u64 %rd1, [p0];")
++    lines.append("    ld.param.u64 %rd2, [p1];")
++    lines.append("    ld.param.u64 %rd3, [p2];")
++    lines.append("    setp.ge.u64 %p0, %rd0, {};".format(total))
++    lines.append("    @%p0 bra DONE;")
++    lines.append("    mov.u64 %rd10, {};".format(m * n))
++    lines.append("    div.u64 %rd5, %rd0, %rd10;")
++    lines.append("    rem.u64 %rd11, %rd0, %rd10;")
++    lines.append("    mov.u64 %rd12, {};".format(n))
++    lines.append("    div.u64 %rd6, %rd11, %rd12;")
++    lines.append("    rem.u64 %rd7, %rd11, %rd12;")
++    # left row base = (batch * m + row) * k
++    lines.append("    mov.u64 %rd13, {};".format(m))
++    lines.append("    mul.lo.u64 %rd14, %rd5, %rd13;")
++    lines.append("    add.u64 %rd14, %rd14, %rd6;")
++    lines.append("    mov.u64 %rd15, {};".format(k))
++    lines.append("    mul.lo.u64 %rd14, %rd14, %rd15;")
++    lines.append("    add.u64 %rd8, %rd1, %rd14;")
++    # right column base = batch * k * n + col
++    lines.append("    mov.u64 %rd16, {};".format(k * n))
++    lines.append("    mul.lo.u64 %rd17, %rd5, %rd16;")
++    lines.append("    add.u64 %rd17, %rd17, %rd7;")
++    lines.append("    add.u64 %rd9, %rd2, %rd17;")
++    lines.append("    mov.u32 %r4, 0;")
++    lines.append("    mov.u64 %rd20, 0;")
++    lines.append("    mov.u64 %rd21, {};".format(k4))
++    lines.append("    mov.u64 %rd22, {};".format(4 * n))
++    lines.append("MAIN:")
++    lines.append("    setp.ge.u64 %p1, %rd20, %rd21;")
++    lines.append("    @%p1 bra TAIL;")
++    lines.append("    mul.lo.u64 %rd23, %rd20, 4;")
++    lines.append("    add.u64 %rd24, %rd8, %rd23;")
++    lines.append("    mul.lo.u64 %rd25, %rd20, %rd22;")
++    lines.append("    add.u64 %rd26, %rd9, %rd25;")
++    for index, offset in enumerate((0, 1, 2, 3)):
++        lines.append("    ld.global.u8 %r{}, [%rd24+{}];".format(10 + index, offset))
++    for index, offset in ((1, 8), (2, 16), (3, 24)):
++        lines.append("    shl.b32 %r{}, %r{}, {};".format(10 + index, 10 + index, offset))
++        lines.append("    or.b32 %r10, %r10, %r{};".format(10 + index))
++    for index, offset in enumerate((0, n, 2 * n, 3 * n)):
++        lines.append("    ld.global.u8 %r{}, [%rd26+{}];".format(20 + index, offset))
++    for index, offset in ((1, 8), (2, 16), (3, 24)):
++        lines.append("    shl.b32 %r{}, %r{}, {};".format(20 + index, 20 + index, offset))
++        lines.append("    or.b32 %r20, %r20, %r{};".format(20 + index))
++    lines.append("    dp4a.s32.s32 %r4, %r10, %r20, %r4;")
++    lines.append("    add.u64 %rd20, %rd20, 1;")
++    lines.append("    bra MAIN;")
++    lines.append("TAIL:")
++    for index in range(tail):
++        left_offset = k4 * 4 + index
++        right_offset = (k4 * 4 + index) * n
++        lines.append("    ld.global.s8 %r30, [%rd8+{}];".format(left_offset))
++        lines.append("    cvt.s32.s8 %r31, %r30;")
++        lines.append("    ld.global.s8 %r32, [%rd9+{}];".format(right_offset))
++        lines.append("    cvt.s32.s8 %r33, %r32;")
++        lines.append("    mad.lo.s32 %r4, %r31, %r33, %r4;")
++    lines.append("    mul.lo.u64 %rd27, %rd0, 4;")
++    lines.append("    add.u64 %rd28, %rd3, %rd27;")
++    lines.append("    st.global.u32 [%rd28], %r4;")
++    lines.append("DONE:")
++    lines.append("    ret;")
++    lines.append("}")
++    return "\n".join(lines)
++
++
++def _render_dequantize(plan: CudaW8A8OperationPlan) -> str:
++    rows, k = plan.rows, plan.k
++    total = rows * k
++    lines = [_render_kernel_header(plan.kernel, 3)]
++    lines.append("    ld.param.u64 %rd1, [p0];")
++    lines.append("    ld.param.u64 %rd2, [p1];")
++    lines.append("    ld.param.u64 %rd3, [p2];")
++    lines.append("    setp.ge.u64 %p0, %rd0, {};".format(total))
++    lines.append("    @%p0 bra DONE;")
++    lines.append("    mov.u64 %rd10, {};".format(k))
++    lines.append("    div.u64 %rd6, %rd0, %rd10;")
++    lines.append("    add.u64 %rd11, %rd1, %rd0;")
++    lines.append("    ld.global.s8 %r10, [%rd11];")
++    lines.append("    cvt.s32.s8 %r11, %r10;")
++    lines.append("    cvt.rn.f32.s32 %f0, %r11;")
++    lines.append("    mul.lo.u64 %rd12, %rd6, 4;")
++    lines.append("    add.u64 %rd13, %rd2, %rd12;")
++    lines.append("    ld.global.f32 %f1, [%rd13];")
++    lines.append("    mul.rn.f32 %f2, %f0, %f1;")
++    lines.append("    mul.lo.u64 %rd14, %rd0, 4;")
++    lines.append("    add.u64 %rd15, %rd3, %rd14;")
++    lines.append("    st.global.f32 [%rd15], %f2;")
++    lines.append("DONE:")
++    lines.append("    ret;")
++    lines.append("}")
++    return "\n".join(lines)
++
++
++def _render_epilogue(plan: CudaW8A8OperationPlan) -> str:
++    rows, columns = plan.rows, plan.columns
++    total = rows * columns
++    lines = [_render_kernel_header(plan.kernel, 5)]
++    lines.append("    ld.param.u64 %rd1, [p0];")
++    lines.append("    ld.param.u64 %rd2, [p1];")
++    lines.append("    ld.param.u64 %rd3, [p2];")
++    lines.append("    ld.param.u64 %rd4, [p3];")
++    lines.append("    ld.param.u64 %rd5, [p4];")
++    lines.append("    setp.ge.u64 %p0, %rd0, {};".format(total))
++    lines.append("    @%p0 bra DONE;")
++    lines.append("    mov.u64 %rd10, {};".format(columns))
++    lines.append("    div.u64 %rd6, %rd0, %rd10;")
++    lines.append("    rem.u64 %rd7, %rd0, %rd10;")
++    lines.append("    mul.lo.u64 %rd11, %rd0, 4;")
++    lines.append("    add.u64 %rd12, %rd1, %rd11;")
++    lines.append("    ld.global.s32 %r10, [%rd12];")
++    lines.append("    cvt.rn.f32.s32 %f0, %r10;")
++    lines.append("    mul.lo.u64 %rd13, %rd6, 4;")
++    lines.append("    add.u64 %rd14, %rd2, %rd13;")
++    lines.append("    ld.global.f32 %f1, [%rd14];")
++    lines.append("    mul.lo.u64 %rd15, %rd7, 4;")
++    lines.append("    add.u64 %rd16, %rd3, %rd15;")
++    lines.append("    ld.global.f32 %f2, [%rd16];")
++    lines.append("    mul.rn.f32 %f3, %f1, %f2;")
++    lines.append("    mul.rn.f32 %f4, %f0, %f3;")
++    # Overflow fail-closed flag: only a finite-operand product that becomes
++    # infinite is an error; infinite/NaN scales pass through like the golden.
++    lines.append("    testp.infinite.f32 %p1, %f4;")
++    lines.append("    testp.infinite.f32 %p2, %f1;")
++    lines.append("    testp.infinite.f32 %p3, %f2;")
++    lines.append("    or.pred %p2, %p2, %p3;")
++    lines.append("    and.pred %p1, %p1, !%p2;")
++    lines.append("    @%p1 st.global.u32 [%rd5], 1;")
++    # Explicit RNE bf16 conversion (matches portable bf16_rne_bits, including
++    # NaN quieting and the exponent-all-ones special case).
++    lines.append("    mov.b32 %r12, %f4;")
++    lines.append("    and.b32 %r13, %r12, 0x7F800000;")
++    lines.append("    setp.eq.u32 %p4, %r13, 0x7F800000;")
++    lines.append("    @%p4 bra NANPATH;")
++    lines.append("    shr.u32 %r14, %r12, 16;")
++    lines.append("    and.b32 %r14, %r14, 1;")
++    lines.append("    add.u32 %r15, %r12, 0x7FFF;")
++    lines.append("    add.u32 %r15, %r15, %r14;")
++    lines.append("    shr.u32 %r16, %r15, 16;")
++    lines.append("    and.b32 %r16, %r16, 0xFFFF;")
++    lines.append("    bra BF16DONE;")
++    lines.append("NANPATH:")
++    lines.append("    shr.u32 %r17, %r12, 16;")
++    lines.append("    and.b32 %r18, %r12, 0x007FFFFF;")
++    lines.append("    setp.eq.u32 %p5, %r18, 0;")
++    lines.append("    @%p5 bra NANZERO;")
++    lines.append("    or.b32 %r16, %r17, 0x0040;")
++    lines.append("    bra BF16DONE;")
++    lines.append("NANZERO:")
++    lines.append("    mov.u32 %r16, %r17;")
++    lines.append("BF16DONE:")
++    lines.append("    mul.lo.u64 %rd17, %rd0, 2;")
++    lines.append("    add.u64 %rd18, %rd4, %rd17;")
++    lines.append("    st.global.u16 [%rd18], %r16;")
++    lines.append("DONE:")
++    lines.append("    ret;")
++    lines.append("}")
++    return "\n".join(lines)
++
++
++def _render_quantize(plan: CudaW8A8OperationPlan) -> str:
++    rows, k = plan.rows, plan.k
++    lines = [_render_kernel_header(plan.kernel, 5)]
++    lines.append("    ld.param.u64 %rd1, [p0];")
++    lines.append("    ld.param.u64 %rd2, [p1];")
++    lines.append("    ld.param.u64 %rd3, [p2];")
++    lines.append("    ld.param.u64 %rd4, [p3];")
++    lines.append("    ld.param.u64 %rd5, [p4];")
++    lines.append("    setp.ge.u64 %p0, %rd0, {};".format(rows))
++    lines.append("    @%p0 bra DONE;")
++    # Row base addresses.
++    lines.append("    mov.u64 %rd10, {};".format(k))
++    lines.append("    mul.lo.u64 %rd11, %rd0, %rd10;")
++    lines.append("    mul.lo.u64 %rd11, %rd11, 4;")
++    lines.append("    add.u64 %rd12, %rd1, %rd11;")
++    # codes row base: row * k int8 elements (NOT row bytes).
++    lines.append("    mul.lo.u64 %rd13, %rd0, %rd10;")
++    lines.append("    add.u64 %rd13, %rd2, %rd13;")
++    lines.append("    mul.lo.u64 %rd14, %rd0, 4;")
++    lines.append("    add.u64 %rd15, %rd3, %rd14;")
++    lines.append("    add.u64 %rd16, %rd4, %rd14;")
++    lines.append("    add.u64 %rd17, %rd5, %rd14;")
++    # Pass 1: absmax + NaN/Inf detection.
++    lines.append("    mov.f32 %f0, 0f00000000;")
++    lines.append("    mov.u64 %rd20, 0;")
++    lines.append("    mov.u32 %r20, 0;")
++    lines.append("    mov.u64 %rd21, {};".format(k))
++    lines.append("ABSLOOP:")
++    lines.append("    setp.ge.u64 %p1, %rd20, %rd21;")
++    lines.append("    @%p1 bra ABSDONE;")
++    lines.append("    mul.lo.u64 %rd22, %rd20, 4;")
++    lines.append("    add.u64 %rd23, %rd12, %rd22;")
++    lines.append("    ld.global.f32 %f1, [%rd23];")
++    lines.append("    testp.finite.f32 %p2, %f1;")
++    lines.append("    not.pred %p2, %p2;")
++    lines.append("    @%p2 mov.u32 %r20, 1;")
++    lines.append("    abs.f32 %f2, %f1;")
++    lines.append("    max.f32 %f0, %f0, %f2;")
++    lines.append("    add.u64 %rd20, %rd20, 1;")
++    lines.append("    bra ABSLOOP;")
++    lines.append("ABSDONE:")
++    lines.append("    setp.ne.u32 %p3, %r20, 0;")
++    lines.append("    @%p3 bra BAD;")
++    lines.append("    setp.eq.f32 %p4, %f0, 0f00000000;")
++    lines.append("    @%p4 bra ZEROROW;")
++    lines.append("    div.rn.f32 %f3, %f0, 0f42FE0000;")
++    lines.append("    setp.eq.f32 %p5, %f3, 0f00000000;")
++    lines.append("    @%p5 bra UNDERFLOW;")
++    lines.append("    st.global.f32 [%rd15], %f3;")
++    # Pass 2: double-precision ratio + RNE ties-to-even + clamp/saturation.
++    lines.append("    mov.u64 %rd20, 0;")
++    lines.append("    mov.u32 %r21, 0;")
++    lines.append("    cvt.f64.f32 %fd1, %f3;")
++    lines.append("QUANTLOOP:")
++    lines.append("    setp.ge.u64 %p1, %rd20, %rd21;")
++    lines.append("    @%p1 bra QUANTDONE;")
++    lines.append("    mul.lo.u64 %rd22, %rd20, 4;")
++    lines.append("    add.u64 %rd23, %rd12, %rd22;")
++    lines.append("    ld.global.f32 %f1, [%rd23];")
++    lines.append("    cvt.f64.f32 %fd0, %f1;")
++    lines.append("    div.rn.f64 %fd2, %fd0, %fd1;")
++    lines.append("    min.f64 %fd2, %fd2, 0d4069000000000000;")
++    lines.append("    max.f64 %fd2, %fd2, 0dC069000000000000;")
++    lines.append("    cvt.rni.s32.f64 %r30, %fd2;")
++    lines.append("    setp.gt.s32 %p2, %r30, 127;")
++    lines.append("    setp.lt.s32 %p3, %r30, -127;")
++    lines.append("    @%p2 add.u32 %r21, %r21, 1;")
++    lines.append("    @%p3 add.u32 %r21, %r21, 1;")
++    lines.append("    min.s32 %r30, %r30, 127;")
++    lines.append("    max.s32 %r30, %r30, -127;")
++    lines.append("    add.u64 %rd24, %rd13, %rd20;")
++    lines.append("    st.global.u8 [%rd24], %r30;")
++    lines.append("    add.u64 %rd20, %rd20, 1;")
++    lines.append("    bra QUANTLOOP;")
++    lines.append("QUANTDONE:")
++    lines.append("    st.global.u32 [%rd16], %r21;")
++    lines.append("    bra DONE;")
++    # All-zero row: scale 1.0, codes 0, saturation 0.
++    lines.append("ZEROROW:")
++    lines.append("    st.global.f32 [%rd15], 0f3F800000;")
++    lines.append("    mov.u64 %rd20, 0;")
++    lines.append("ZEROLOOP:")
++    lines.append("    setp.ge.u64 %p1, %rd20, %rd21;")
++    lines.append("    @%p1 bra ZERODONE;")
++    lines.append("    add.u64 %rd24, %rd13, %rd20;")
++    lines.append("    st.global.u8 [%rd24], 0;")
++    lines.append("    add.u64 %rd20, %rd20, 1;")
++    lines.append("    bra ZEROLOOP;")
++    lines.append("ZERODONE:")
++    lines.append("    st.global.u32 [%rd16], 0;")
++    lines.append("    bra DONE;")
++    lines.append("BAD:")
++    lines.append("    st.global.u32 [%rd17], 1;")
++    lines.append("    bra DONE;")
++    lines.append("UNDERFLOW:")
++    lines.append("    st.global.u32 [%rd17], 2;")
++    lines.append("DONE:")
++    lines.append("    ret;")
++    lines.append("}")
++    return "\n".join(lines)
++
++
++_RENDERERS = {
++    W8A8_QMATMUL_OPCODE: _render_qmatmul,
++    W8A8_QUANTIZE_OPCODE: _render_quantize,
++    W8A8_DEQUANTIZE_OPCODE: _render_dequantize,
++    W8A8_EPILOGUE_OPCODE: _render_epilogue,
++}
++
++
++def render_w8a8_ptx(
++    operations: Sequence[CudaW8A8OperationPlan],
++    ptx_target: str = CUDA_W8A8_PTX_TARGET,
++    ptx_version: str = CUDA_PTX_VERSION,
++) -> str:
++    """Render deterministic W8A8 PTX for validated operation plans."""
++
++    ptx_target = _validate_ptx_target(ptx_target)
++    ptx_version = _validate_ptx_version(ptx_version)
++    if ptx_version not in _SUPPORTED_PTX_VERSIONS:
++        raise CudaW8A8Error(
++            "unsupported W8A8 PTX version {!r}; supported: {}".format(
++                ptx_version, ", ".join(sorted(_SUPPORTED_PTX_VERSIONS))
++            )
++        )
++    blocks = []
++    for operation in operations:
++        renderer = _RENDERERS.get(operation.operation)
++        if renderer is None:
++            raise CudaW8A8UnsupportedError(
++                "no CUDA W8A8 PTX renderer for {!r}".format(operation.operation)
++            )
++        blocks.append(renderer(operation))
++    header = (
++        ".version {}\n.target {}\n.address_size 64\n\n"
++        "{}\n{}\n\n".format(ptx_version, ptx_target, _PTX_MARKER_LINE, _PTX_KERNEL_VERSION_LINE)
++    )
++    return header + "\n\n".join(blocks) + "\n"
++
++
++# ---------------------------------------------------------------------------
++# Validated target IR and artifact
++# ---------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class CudaW8A8Program:
++    """CUDA W8A8 target IR: immutable PTX plus its probed capability record."""
++
++    program: CoreProgram
++    target: TargetSpec
++    ptx: str
++    ptx_target: str
++    ptx_version: str
++    device: Mapping[str, Any]
++    capability: Mapping[str, Any]
++    operations: Tuple[CudaW8A8OperationPlan, ...]
++    bindings: Tuple[Tuple[Mapping[str, Any], ...], ...]
++
++    @property
++    def entrypoint(self) -> str:
++        return self.program.functions[0].name
++
++    @property
++    def plan_digest(self) -> str:
++        return _plan_digest(self.operations)
++
++    def operation_by_opcode(self, opcode: str) -> CudaW8A8OperationPlan:
++        for operation in self.operations:
++            if operation.operation == opcode:
++                return operation
++        raise CudaW8A8UnsupportedError(
++            "artifact does not contain a compiled {!r} operation".format(opcode)
++        )
++
++    def validate(self) -> "CudaW8A8Program":
++        _validate_ptx_target(self.ptx_target)
++        _validate_ptx_version(self.ptx_version)
++        if self.ptx_target != CUDA_W8A8_PTX_TARGET:
++            raise CudaW8A8ArtifactError("W8A8 PTX target must be {!r}".format(CUDA_W8A8_PTX_TARGET))
++        if self.ptx_version not in _SUPPORTED_PTX_VERSIONS:
++            raise CudaW8A8ArtifactError("unsupported W8A8 PTX version")
++        if _PTX_MARKER_LINE not in self.ptx or _PTX_KERNEL_VERSION_LINE not in self.ptx:
++            raise CudaW8A8ArtifactError("W8A8 PTX marker/kernel version is missing")
++        expected_ptx = render_w8a8_ptx(self.operations, self.ptx_target, self.ptx_version)
++        if self.ptx != expected_ptx:
++            raise CudaW8A8ArtifactError("W8A8 PTX does not match the canonical plan")
++        entry_names = _ENTRY_NAME_RE.findall(self.ptx)
++        expected_names = [operation.kernel for operation in self.operations]
++        if entry_names != expected_names:
++            raise CudaW8A8ArtifactError("W8A8 PTX entry names do not match the plan")
++        if self.capability.get("matrix_kind") != CUDA_W8A8_MATRIX_CAPABILITY:
++            raise CudaW8A8ArtifactError("W8A8 artifact declares an unexpected matrix kind")
++        if self.capability.get("digest") != CUDA_W8A8_CAPABILITY.fingerprint:
++            raise CudaW8A8ArtifactError("W8A8 artifact capability digest mismatch")
++        if self.capability.get("kernel_version") not in (None, CUDA_W8A8_KERNEL_VERSION):
++            raise CudaW8A8ArtifactError("W8A8 artifact capability kernel version mismatch")
++        if self.capability.get("compensation") != CUDA_W8A8_COMPENSATION:
++            raise CudaW8A8ArtifactError("W8A8 artifact compensation token mismatch")
++        declared_matrix = tuple(self.capability.get("matrix_capabilities", ()))
++        if declared_matrix != (CUDA_W8A8_MATRIX_CAPABILITY,):
++            raise CudaW8A8ArtifactError("W8A8 capability must declare exactly the dp4a matrix kind")
++        for forbidden in CUDA_W8A8_FORBIDDEN_MATRIX_CAPABILITIES:
++            if forbidden in declared_matrix:
++                raise CudaW8A8ArtifactError(
++                    "W8A8 capability declares a forbidden matrix kind {!r}".format(forbidden)
++                )
++        # Re-derive the plan from the Core IR to keep plan and program aligned.
++        function = self.program.functions[0]
++        rebuilt = tuple(
++            _plan_for_operation(self.program, operation, index)
++            for index, operation in enumerate(function.body.operations)
++        )
++        if rebuilt != self.operations:
++            raise CudaW8A8ArtifactError("W8A8 plan does not match the Core IR program")
++        if self.bindings != tuple(_operation_bindings(operation) for operation in function.body.operations):
++            raise CudaW8A8ArtifactError("W8A8 bindings do not match the Core IR program")
++        return self
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "cuda_w8a8_lowering_version": CUDA_W8A8_LOWERING_VERSION,
++            "cuda_w8a8_plan_version": CUDA_W8A8_PLAN_VERSION,
++            "ptx_target": self.ptx_target,
++            "ptx_version": self.ptx_version,
++            "device": mapping_copy(self.device),
++            "capability": mapping_copy(self.capability),
++            "operations": [operation.to_dict() for operation in self.operations],
++            "ptx_digest": hashlib.sha256(self.ptx.encode("utf-8")).hexdigest(),
++            "plan_digest": self.plan_digest,
++            "bindings": [[mapping_copy(binding) for binding in group] for group in self.bindings],
++        }
++
++
++class CudaW8A8Compiler:
++    """Compiler facade for the CUDA W8A8 integer kernel plane.
++
++    A real device probe is mandatory: either a probe-derived ``device`` or a
++    ``driver`` from which the probe is taken.  Without one, lowering fails
++    closed with :class:`CudaW8A8UnavailableError` instead of emitting an
++    artifact for an assumed device.
++    """
++
++    name = CUDA_W8A8_BACKEND
++
++    def __init__(
++        self,
++        driver: Any = None,
++        device_index: int = 0,
++        device: Any = None,
++        ptx_version: str = CUDA_PTX_VERSION,
++    ) -> None:
++        _validate_ptx_version(ptx_version)
++        self.driver = driver
++        self.device_index = int(device_index)
++        self.device = device
++        self.ptx_version = ptx_version
++
++    def probe_device(self) -> CudaW8A8Device:
++        if self.device is not None:
++            if isinstance(self.device, CudaW8A8Device):
++                return self.device
++            return CudaW8A8Device(
++                index=getattr(self.device, "index", 0),
++                name=getattr(self.device, "name", "unknown"),
++                major=getattr(self.device, "major"),
++                minor=getattr(self.device, "minor"),
++                total_memory=getattr(self.device, "total_memory", 0),
++            )
++        if self.driver is None:
++            raise CudaW8A8UnavailableError(
++                "CUDA W8A8 lowering requires a real probed device (driver or device info)"
++            )
++        # Function-level import keeps the compiler -> backend import direction
++        # one-way and avoids an import cycle with pypto.backends.cuda.
++        from pypto.backends.cuda.capabilities import probe_cuda_w8a8_device
++
++        return probe_cuda_w8a8_device(self.driver, self.device_index)
++
++    def lower(self, program: CoreProgram, target: TargetSpec) -> CudaW8A8Program:
++        if not isinstance(program, CoreProgram):
++            raise TypeError("CUDA W8A8 lower() requires CoreProgram")
++        if not isinstance(target, TargetSpec):
++            raise TypeError("CUDA W8A8 lower() requires TargetSpec")
++        if target.kind != "gpu":
++            raise CudaW8A8UnsupportedError(
++                "CUDA W8A8 lowering requires a 'gpu' TargetSpec, got {!r}".format(target.kind)
++            )
++        try:
++            validate_program(program)
++        except CpuScalarError as exc:
++            raise CudaW8A8ValidationError("Core program is outside the W8A8 contract: {}".format(exc)) from exc
++        device = self.probe_device()
++        capabilities = cuda_w8a8_capabilities(device, target=target.key)
++        functions = {function.name: function for function in program.functions}
++        entrypoint = target.attributes.get("entrypoint", program.functions[0].name)
++        if not isinstance(entrypoint, str) or entrypoint not in functions:
++            raise CudaW8A8UnsupportedError("CUDA W8A8 entrypoint {!r} is not in the CoreProgram".format(entrypoint))
++        if functions[entrypoint] is not program.functions[0]:
++            raise CudaW8A8UnsupportedError("CUDA W8A8 artifact supports a single entrypoint function")
++        function = functions[entrypoint]
++        operations = tuple(
++            _plan_for_operation(program, operation, index)
++            for index, operation in enumerate(function.body.operations)
++        )
++        for operation in operations:
++            if operation.operation == W8A8_QMATMUL_OPCODE:
++                if operation.k > W8A8_MAX_ACCUMULATOR_K:
++                    raise CudaW8A8UnsupportedError(
++                        "CUDA {} K={} exceeds the INT32 accumulation limit {} (Q5)".format(
++                            W8A8_QMATMUL_OPCODE, operation.k, W8A8_MAX_ACCUMULATOR_K
++                        )
++                    )
++                if operation.m == 0 or operation.n == 0 or operation.k == 0 or any(
++                    dimension == 0 for dimension in operation.batch_shape
++                ):
++                    # The C1 golden cannot represent zero-size operands; refuse
++                    # rather than inventing an empty-output convention.
++                    raise CudaW8A8UnsupportedError(
++                        "CUDA {} rejects zero-size operands {} x {}".format(
++                            W8A8_QMATMUL_OPCODE, operation.left_shape, operation.right_shape
++                        )
++                    )
++        ptx = render_w8a8_ptx(operations, CUDA_W8A8_PTX_TARGET, self.ptx_version)
++        capability = cuda_w8a8_capability_metadata(device, target=target.key)
++        capability = dict(capability)
++        capability["kernel_version"] = CUDA_W8A8_KERNEL_VERSION
++        capability["hardware_dp4a"] = device.dp4a
++        capability["hardware_imma_s8"] = device.imma_s8
++        capability["capabilities"] = {
++            "dtypes": list(capabilities.dtypes),
++            "matrix_capabilities": list(capabilities.matrix_capabilities),
++            "digest": capabilities.fingerprint,
++        }
++        bindings = tuple(_operation_bindings(operation) for operation in function.body.operations)
++        return CudaW8A8Program(
++            program=program,
++            target=target,
++            ptx=ptx,
++            ptx_target=CUDA_W8A8_PTX_TARGET,
++            ptx_version=self.ptx_version,
++            device=frozen_mapping(device.to_dict()),
++            capability=frozen_mapping(capability),
++            operations=operations,
++            bindings=bindings,
++        )
++
++    def compile(self, target_ir: CudaW8A8Program, options: Optional[CompileOptions] = None) -> Artifact:
++        if not isinstance(target_ir, CudaW8A8Program):
++            raise TypeError("CUDA W8A8 compile() requires CudaW8A8Program from lower()")
++        if options is not None and not isinstance(options, CompileOptions):
++            raise TypeError("options must be CompileOptions")
++        target_ir.validate()
++        program_json = target_ir.program.canonical_json()
++        program_data = json.loads(program_json)
++        program_digest = hashlib.sha256(program_json.encode("utf-8")).hexdigest()
++        target_data = target_ir.target.to_dict()
++        ptx_digest = hashlib.sha256(target_ir.ptx.encode("utf-8")).hexdigest()
++        plan_data = [operation.to_dict() for operation in target_ir.operations]
++        plan_digest = _plan_digest(target_ir.operations)
++        envelope = {
++            "artifact_payload_version": CUDA_W8A8_PAYLOAD_VERSION,
++            "backend": CUDA_W8A8_BACKEND,
++            "cuda_w8a8_marker": CUDA_W8A8_MARKER,
++            "cuda_w8a8_kernel_version": CUDA_W8A8_KERNEL_VERSION,
++            "cuda_w8a8_lowering_version": CUDA_W8A8_LOWERING_VERSION,
++            "cuda_w8a8_plan_version": CUDA_W8A8_PLAN_VERSION,
++            "entrypoint": target_ir.entrypoint,
++            "target": target_data,
++            "program": program_data,
++            "program_digest": program_digest,
++            "plan": plan_data,
++            "plan_digest": plan_digest,
++            "ptx": target_ir.ptx,
++            "ptx_digest": ptx_digest,
++            "ptx_target": target_ir.ptx_target,
++            "ptx_version": target_ir.ptx_version,
++            "device": _plain(target_ir.device),
++            "capability": _plain(target_ir.capability),
++            "bindings": _plain(target_ir.bindings),
++        }
++        if options is not None:
++            envelope["compile_options"] = {
++                "artifact_format": options.artifact_format,
++                "abi_version": options.abi_version,
++                "metadata": _plain(options.metadata),
++                "extra": _plain(options.extra),
++            }
++        payload = json.dumps(
++            envelope, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
++        ).encode("utf-8")
++        payload_digest = hashlib.sha256(payload).hexdigest()
++        metadata = {
++            "backend": CUDA_W8A8_BACKEND,
++            "artifact_payload_version": CUDA_W8A8_PAYLOAD_VERSION,
++            "cuda_w8a8_marker": CUDA_W8A8_MARKER,
++            "cuda_w8a8_kernel_version": CUDA_W8A8_KERNEL_VERSION,
++            "cuda_w8a8_lowering_version": CUDA_W8A8_LOWERING_VERSION,
++            "cuda_w8a8_plan_version": CUDA_W8A8_PLAN_VERSION,
++            "entrypoint": target_ir.entrypoint,
++            "program_digest": program_digest,
++            "plan_digest": plan_digest,
++            "ptx_digest": ptx_digest,
++            "payload_digest": payload_digest,
++            "target_digest": sha256_text(target_data),
++            "ptx_target": target_ir.ptx_target,
++            "ptx_version": target_ir.ptx_version,
++            "device": _plain(target_ir.device),
++            "capability": _plain(target_ir.capability),
++            "bindings": _plain(target_ir.bindings),
++            "dtypes": sorted(
++                set(
++                    dtype
++                    for operation in target_ir.operations
++                    for dtype in (
++                        operation.left_dtype,
++                        operation.right_dtype,
++                        operation.input_dtype,
++                        operation.codes_dtype,
++                        operation.scales_dtype,
++                        operation.accumulator_dtype,
++                        operation.row_scales_dtype,
++                        operation.column_scales_dtype,
++                        operation.output_dtype,
++                    )
++                    if dtype
++                )
++            ),
++            "w8a8_kernel_operations": [operation.operation for operation in target_ir.operations],
++            "w8a8_operations": plan_data,
++        }
++        if options is not None:
++            option_metadata = _plain(options.metadata)
++            reserved = set(metadata).intersection(option_metadata)
++            if reserved:
++                raise ValueError(
++                    "compile option metadata uses reserved CUDA W8A8 keys: {}".format(
++                        ", ".join(sorted(reserved))
++                    )
++                )
++            metadata.update(option_metadata)
++            metadata["compile_options"] = envelope["compile_options"]
++            artifact_format = options.artifact_format
++            abi_version = options.abi_version
++        else:
++            artifact_format = CUDA_W8A8_ARTIFACT_FORMAT
++            abi_version = ABI_VERSION
++        artifact = Artifact(
++            format=artifact_format,
++            entrypoint=target_ir.entrypoint,
++            target=target_ir.target,
++            abi_version=abi_version,
++            payload=payload,
++            metadata=metadata,
++        )
++        artifact.validate()
++        return artifact
++
++
++def compile_cuda_w8a8(
++    program: CoreProgram, target: TargetSpec, options: Optional[CompileOptions] = None, **kwargs: Any
++) -> Artifact:
++    compiler = CudaW8A8Compiler(**kwargs)
++    return compiler.compile(compiler.lower(program, target), options)
++
++
++def _required_envelope() -> set:
++    return {
++        "artifact_payload_version",
++        "backend",
++        "cuda_w8a8_marker",
++        "cuda_w8a8_kernel_version",
++        "cuda_w8a8_lowering_version",
++        "cuda_w8a8_plan_version",
++        "entrypoint",
++        "target",
++        "program",
++        "program_digest",
++        "plan",
++        "plan_digest",
++        "ptx",
++        "ptx_digest",
++        "ptx_target",
++        "ptx_version",
++        "device",
++        "capability",
++        "bindings",
++    }
++
++
++def decode_cuda_w8a8_artifact(artifact: Artifact) -> CudaW8A8Program:
++    """Strictly decode and re-derive every CUDA W8A8 artifact field."""
++
++    if not isinstance(artifact, Artifact):
++        raise CudaW8A8ArtifactError("CUDA W8A8 runtime requires Artifact")
++    try:
++        artifact.validate()
++    except Exception as exc:
++        raise CudaW8A8ArtifactError("artifact validation failed: {}".format(exc)) from exc
++    if artifact.payload is None:
++        raise CudaW8A8ArtifactError("CUDA W8A8 artifact requires an inline payload")
++    try:
++        decoded = json.loads(bytes(artifact.payload).decode("utf-8"))
++    except Exception as exc:
++        raise CudaW8A8ArtifactError("CUDA W8A8 payload is not UTF-8 JSON") from exc
++    if (
++        not isinstance(decoded, dict)
++        or set(decoded) - (_required_envelope() | {"compile_options"})
++        or not _required_envelope().issubset(decoded)
++    ):
++        raise CudaW8A8ArtifactError("CUDA W8A8 payload has unknown or missing fields")
++    canonical = json.dumps(
++        decoded, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
++    ).encode("utf-8")
++    if canonical != bytes(artifact.payload):
++        raise CudaW8A8ArtifactError("CUDA W8A8 payload is not canonical JSON")
++    metadata = mapping_copy(artifact.metadata)
++    required_metadata = {
++        "backend",
++        "artifact_payload_version",
++        "cuda_w8a8_marker",
++        "cuda_w8a8_kernel_version",
++        "cuda_w8a8_lowering_version",
++        "cuda_w8a8_plan_version",
++        "entrypoint",
++        "program_digest",
++        "plan_digest",
++        "ptx_digest",
++        "payload_digest",
++        "target_digest",
++        "ptx_target",
++        "ptx_version",
++        "device",
++        "capability",
++        "bindings",
++        "dtypes",
++        "w8a8_kernel_operations",
++        "w8a8_operations",
++    }
++    if not required_metadata.issubset(metadata):
++        raise CudaW8A8ArtifactError("CUDA W8A8 artifact metadata is missing required fields")
++    option_metadata = {}
++    if "compile_options" in decoded:
++        options = decoded["compile_options"]
++        if not isinstance(options, dict) or set(options) != {
++            "artifact_format",
++            "abi_version",
++            "metadata",
++            "extra",
++        }:
++            raise CudaW8A8ArtifactError("CUDA W8A8 compile options are malformed")
++        if not isinstance(options["metadata"], dict) or not isinstance(options["extra"], dict):
++            raise CudaW8A8ArtifactError("CUDA W8A8 compile option metadata/extra must be objects")
++        option_metadata = options["metadata"]
++    allowed_metadata = required_metadata | {"compile_options"} | set(option_metadata)
++    if set(metadata) - allowed_metadata:
++        raise CudaW8A8ArtifactError("CUDA W8A8 artifact metadata has unknown fields")
++    for key, value in option_metadata.items():
++        if metadata.get(key) != value:
++            raise CudaW8A8ArtifactError("CUDA W8A8 option metadata does not match payload")
++    payload_digest = hashlib.sha256(bytes(artifact.payload)).hexdigest()
++    if metadata.get("payload_digest") != payload_digest or artifact.content_digest != payload_digest:
++        raise CudaW8A8ArtifactError("CUDA W8A8 payload digest mismatch")
++    if decoded["backend"] != CUDA_W8A8_BACKEND or metadata["backend"] != CUDA_W8A8_BACKEND:
++        raise CudaW8A8ArtifactError("CUDA W8A8 backend mismatch")
++    if (
++        decoded["artifact_payload_version"] != CUDA_W8A8_PAYLOAD_VERSION
++        or metadata["artifact_payload_version"] != CUDA_W8A8_PAYLOAD_VERSION
++    ):
++        raise CudaW8A8ArtifactError("unsupported CUDA W8A8 artifact payload version")
++    if (
++        decoded["cuda_w8a8_kernel_version"] != CUDA_W8A8_KERNEL_VERSION
++        or metadata["cuda_w8a8_kernel_version"] != CUDA_W8A8_KERNEL_VERSION
++    ):
++        raise CudaW8A8ArtifactError("unsupported CUDA W8A8 kernel version")
++    if (
++        decoded["cuda_w8a8_marker"] != CUDA_W8A8_MARKER
++        or metadata["cuda_w8a8_marker"] != CUDA_W8A8_MARKER
++    ):
++        raise CudaW8A8ArtifactError("CUDA W8A8 marker mismatch")
++    if (
++        decoded["cuda_w8a8_lowering_version"] != CUDA_W8A8_LOWERING_VERSION
++        or metadata["cuda_w8a8_lowering_version"] != CUDA_W8A8_LOWERING_VERSION
++    ):
++        raise CudaW8A8ArtifactError("unsupported CUDA W8A8 lowering version")
++    if (
++        decoded["cuda_w8a8_plan_version"] != CUDA_W8A8_PLAN_VERSION
++        or metadata["cuda_w8a8_plan_version"] != CUDA_W8A8_PLAN_VERSION
++    ):
++        raise CudaW8A8ArtifactError("unsupported CUDA W8A8 plan version")
++    if decoded["target"] != artifact.target.to_dict() or metadata["target_digest"] != sha256_text(decoded["target"]):
++        raise CudaW8A8ArtifactError("CUDA W8A8 artifact target mismatch")
++    if decoded["entrypoint"] != artifact.entrypoint or metadata["entrypoint"] != artifact.entrypoint:
++        raise CudaW8A8ArtifactError("CUDA W8A8 artifact entrypoint mismatch")
++    if metadata["w8a8_operations"] != decoded["plan"]:
++        raise CudaW8A8ArtifactError("CUDA W8A8 plan metadata mismatch")
++    if list(metadata["w8a8_kernel_operations"]) != [
++        entry["operation"] for entry in decoded["plan"]
++    ]:
++        raise CudaW8A8ArtifactError("CUDA W8A8 kernel operation metadata mismatch")
++    operations = tuple(CudaW8A8OperationPlan.from_dict(entry) for entry in decoded["plan"])
++    plan_digest = _plan_digest(operations)
++    if decoded["plan_digest"] != plan_digest or metadata["plan_digest"] != plan_digest:
++        raise CudaW8A8ArtifactError("CUDA W8A8 plan digest mismatch")
++    program = CoreProgram.from_dict(decoded["program"])
++    program_json = program.canonical_json()
++    program_digest = hashlib.sha256(program_json.encode("utf-8")).hexdigest()
++    if (
++        decoded["program"] != program.to_dict()
++        or decoded["program_digest"] != program_digest
++        or metadata["program_digest"] != program_digest
++    ):
++        raise CudaW8A8ArtifactError("CUDA W8A8 program digest mismatch")
++    ptx = decoded["ptx"]
++    if not isinstance(ptx, str):
++        raise CudaW8A8ArtifactError("CUDA W8A8 payload PTX must be a string")
++    ptx_digest = hashlib.sha256(ptx.encode("utf-8")).hexdigest()
++    if decoded["ptx_digest"] != ptx_digest or metadata["ptx_digest"] != ptx_digest:
++        raise CudaW8A8ArtifactError("CUDA W8A8 PTX digest mismatch")
++    try:
++        expected_ptx = render_w8a8_ptx(operations, decoded["ptx_target"], decoded["ptx_version"])
++    except CudaW8A8Error as exc:
++        raise CudaW8A8ArtifactError("CUDA W8A8 PTX header is invalid: {}".format(exc)) from exc
++    if ptx != expected_ptx:
++        raise CudaW8A8ArtifactError("CUDA W8A8 PTX does not match the canonical plan")
++    expected_bindings = tuple(_operation_bindings(operation) for operation in program.functions[0].body.operations)
++    decoded_bindings = tuple(
++        tuple(frozen_mapping(binding) for binding in group) for group in decoded["bindings"]
++    )
++    if decoded_bindings != expected_bindings:
++        raise CudaW8A8ArtifactError("CUDA W8A8 kernel bindings do not match Core IR")
++    if (
++        metadata["ptx_target"] != decoded["ptx_target"]
++        or metadata["ptx_version"] != decoded["ptx_version"]
++        or decoded["ptx_target"] != CUDA_W8A8_PTX_TARGET
++    ):
++        raise CudaW8A8ArtifactError("CUDA W8A8 PTX target metadata mismatch")
++    if metadata["device"] != decoded["device"] or metadata["capability"] != decoded["capability"]:
++        raise CudaW8A8ArtifactError("CUDA W8A8 device/capability metadata mismatch")
++    if metadata["dtypes"] != sorted(
++        set(
++            dtype
++            for operation in operations
++            for dtype in (
++                operation.left_dtype,
++                operation.right_dtype,
++                operation.input_dtype,
++                operation.codes_dtype,
++                operation.scales_dtype,
++                operation.accumulator_dtype,
++                operation.row_scales_dtype,
++                operation.column_scales_dtype,
++                operation.output_dtype,
++            )
++            if dtype
++        )
++    ):
++        raise CudaW8A8ArtifactError("CUDA W8A8 dtype metadata mismatch")
++    if "compile_options" in decoded:
++        options = decoded["compile_options"]
++        if (
++            metadata.get("compile_options") != options
++            or artifact.format != options["artifact_format"]
++            or artifact.abi_version != options["abi_version"]
++        ):
++            raise CudaW8A8ArtifactError("CUDA W8A8 artifact format/ABI options mismatch")
++    elif artifact.format != CUDA_W8A8_ARTIFACT_FORMAT or artifact.abi_version != ABI_VERSION:
++        raise CudaW8A8ArtifactError("CUDA W8A8 artifact format/ABI mismatch")
++    decoded_program = CudaW8A8Program(
++        program,
++        artifact.target,
++        ptx,
++        decoded["ptx_target"],
++        decoded["ptx_version"],
++        frozen_mapping(decoded["device"]),
++        frozen_mapping(decoded["capability"]),
++        operations,
++        decoded_bindings,
++    )
++    try:
++        decoded_program.validate()
++    except CudaW8A8Error as exc:
++        raise CudaW8A8ArtifactError("CUDA W8A8 target IR validation failed: {}".format(exc)) from exc
++    return decoded_program
++
++
++def w8a8_artifact_is_native(artifact: Any) -> bool:
++    """Return whether ``artifact`` is a CUDA W8A8 artifact by marker/backend."""
++
++    if not isinstance(artifact, Artifact):
++        return False
++    metadata = artifact.metadata if isinstance(artifact.metadata, Mapping) else {}
++    return (
++        metadata.get("backend") == CUDA_W8A8_BACKEND
++        and metadata.get("cuda_w8a8_marker") == CUDA_W8A8_MARKER
++        and metadata.get("artifact_payload_version") == CUDA_W8A8_PAYLOAD_VERSION
++        and metadata.get("cuda_w8a8_kernel_version") == CUDA_W8A8_KERNEL_VERSION
++    )
++
++
++__all__ = [
++    "CUDA_W8A8_ARTIFACT_FORMAT",
++    "CUDA_W8A8_BACKEND",
++    "CUDA_W8A8_BLOCK",
++    "CUDA_W8A8_KERNEL_VERSION",
++    "CUDA_W8A8_LOWERING_VERSION",
++    "CUDA_W8A8_MARKER",
++    "CUDA_W8A8_PAYLOAD_VERSION",
++    "CUDA_W8A8_PLAN_VERSION",
++    "CUDA_W8A8_PTX_TARGET",
++    "CudaW8A8ArtifactError",
++    "CudaW8A8Compiler",
++    "CudaW8A8Error",
++    "CudaW8A8OperationPlan",
++    "CudaW8A8Program",
++    "CudaW8A8UnsupportedError",
++    "CudaW8A8ValidationError",
++    "W8A8_DEQUANTIZE_MODE",
++    "W8A8_EPILOGUE_MODE",
++    "W8A8_MODES",
++    "W8A8_QMATMUL_MODE",
++    "W8A8_QUANTIZE_MODE",
++    "compile_cuda_w8a8",
++    "decode_cuda_w8a8_artifact",
++    "render_w8a8_ptx",
++    "w8a8_artifact_is_native",
++]
+diff --git a/python/pypto/lowering/gpu/__init__.py b/python/pypto/lowering/gpu/__init__.py
+index fc78395b6..d64e5fe66 100644
+--- a/python/pypto/lowering/gpu/__init__.py
++++ b/python/pypto/lowering/gpu/__init__.py
+@@ -1,3 +1,4 @@
+ """Vendor-neutral GPU lowering contracts."""
+ 
++from .cuda_w8a8 import *
+ from .plan import *
+diff --git a/python/pypto/lowering/gpu/cuda_w8a8.py b/python/pypto/lowering/gpu/cuda_w8a8.py
+new file mode 100644
+index 000000000..a0a05d23b
+--- /dev/null
++++ b/python/pypto/lowering/gpu/cuda_w8a8.py
+@@ -0,0 +1,265 @@
++"""NVIDIA CUDA W8A8 capability probing for PyPTO-X (contract 0002 C6 / R6).
++
++The CUDA W8A8 plane is gated by a *real* device probe.  The probe reads the
++device compute capability through the CUDA Driver API (see
++:mod:`pypto.backends.cuda.capabilities`) and derives whether the native signed
++byte dot-product instruction ``dp4a`` (PTX ``dp4a.s32.s32``, SASS
++``IDP.4A.S8.S8``) can be emitted.  Nothing here assumes ``sm_120`` or any other
++compute capability: the capability kind is computed from the probed
++``major``/``minor`` pair, and an unavailable or insufficient device raises
++:class:`~pypto.target.UnsupportedCapabilityError` naming the missing matrix
++kind.  There is no ``bf16`` fallback inside the W8A8 path (contract section 6).
++
++Integer matrix-multiply extensions that are *probed but deliberately unused*
++by C6 (``imma_s8`` / ``mma.m16n8k32``) are reported so the evidence can
++distinguish "not available" from "available but not used", exactly like the
++SVE256 C5 probe reports ``sve2``/``i8mm`` without claiming them.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any, Mapping
++
++from pypto.target import CapabilitySet as _CapabilitySet
++from pypto.target import UnsupportedCapabilityError as _UnsupportedCapabilityError
++
++
++#: Matrix kind actually emitted by C6: packed signed-byte dot product
++#: (``dp4a.s32.s32``) with an int32 accumulator.
++CUDA_W8A8_MATRIX_CAPABILITY = "s8s8_s32_dp4a"
++#: ISA token copied into artifact metadata (stable, machine-checkable).
++CUDA_W8A8_ISA = "dp4a.s32.s32"
++#: The K tail (K % 4) and any scalar path use explicit widening
++#: (``cvt.s32.s8`` + ``mad.lo.s32``); this is an implementation detail of the
++#: same kernel, not a second matrix capability.
++CUDA_W8A8_COMPENSATION = "none_signed_dp4a_no_zero_point"
++
++#: ``dp4a`` was introduced with compute capability 6.1 (PTX ISA: sm_61+).
++CUDA_W8A8_DP4A_MIN_SM = 61
++#: ``mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32`` requires sm_75+
++#: (contract 0002 section 4 M4-d).  C6 probes it and deliberately does not
++#: emit it.
++CUDA_W8A8_IMMA_MIN_SM = 75
++#: The C6 PTX module is emitted with ``.target sm_75`` (the CUDA 13.x toolkit
++#: floor) so a driver JIT for any supported Turing-or-newer device can load
++#: it.  ``dp4a`` itself only needs sm_61, so the probe-derived requirement is
++#: ``dp4a and sm >= 75``; a device that cannot load this module fails closed
++#: rather than falling back to a different precision.
++CUDA_W8A8_MIN_PTX_TARGET_SM = 75
++
++#: Matrix kinds that must stay absent from the C6 declaration.  C6 emits a
++#: signed ``dp4a`` plane only; it never claims a widening matrix kind, VNNI,
++#: imma/mma or any dot-product extension.
++CUDA_W8A8_FORBIDDEN_MATRIX_CAPABILITIES = (
++    "s8s8_s32_widening",
++    "s8s8_s32_vnni_dpbusd",
++    "imma_m16n8k32",
++    "mma_s8",
++    "int8_dot_product",
++)
++
++#: Probe-gated W8A8 declaration for the CUDA target.  The matrix kind names
++#: the concrete native mechanism (packed s8 ``dp4a`` with an int32
++#: accumulator); dtypes cover the four C6 opcodes (int8 codes, int32
++#: accumulator, fp32 scales, bf16 epilogue output).
++CUDA_W8A8_CAPABILITY = _CapabilitySet(
++    dtypes=("int8", "int32", "float32", "bf16"),
++    matrix_capabilities=(CUDA_W8A8_MATRIX_CAPABILITY,),
++)
++
++
++class CudaW8A8UnavailableError(RuntimeError):
++    """The CUDA W8A8 plane cannot be used on this host/device (fail-closed)."""
++
++
++def _as_int(value: Any, field: str) -> int:
++    if isinstance(value, bool):
++        raise CudaW8A8UnavailableError("{} must be an integer compute capability component".format(field))
++    try:
++        return int(value)
++    except (TypeError, ValueError) as exc:
++        raise CudaW8A8UnavailableError("{} is not an integer".format(field)) from exc
++
++
++@dataclass(frozen=True)
++class CudaW8A8Device:
++    """Structured result of the real CUDA device probe.
++
++    ``major``/``minor`` are the compute capability components reported by the
++    Driver API.  ``dp4a`` and ``imma_s8`` are *derived* from them; no artifact
++    hardcodes a device name or an ``sm_120`` availability guess.
++    """
++
++    index: int
++    name: str
++    major: int
++    minor: int
++    total_memory: int = 0
++    source: str = "cuda_driver_device_info"
++
++    def __post_init__(self) -> None:
++        object.__setattr__(self, "index", _as_int(self.index, "device.index"))
++        object.__setattr__(self, "major", _as_int(self.major, "device.major"))
++        object.__setattr__(self, "minor", _as_int(self.minor, "device.minor"))
++        if self.major < 0 or self.minor < 0:
++            raise CudaW8A8UnavailableError("compute capability components must be non-negative")
++        if not isinstance(self.name, str):
++            object.__setattr__(self, "name", str(self.name))
++        object.__setattr__(self, "total_memory", _as_int(self.total_memory, "device.total_memory"))
++
++    @property
++    def sm(self) -> int:
++        """Compute capability as ``major * 10 + minor`` (for example 61, 120)."""
++
++        return self.major * 10 + self.minor
++
++    @property
++    def compute_capability(self) -> str:
++        return "{}.{}".format(self.major, self.minor)
++
++    @property
++    def dp4a(self) -> bool:
++        """Whether ``dp4a.s32.s32`` (s8 x s8 -> s32) is available."""
++
++        return self.sm >= CUDA_W8A8_DP4A_MIN_SM
++
++    @property
++    def imma_s8(self) -> bool:
++        """Whether ``mma.m16n8k32`` with s8 inputs is available (unused by C6)."""
++
++        return self.sm >= CUDA_W8A8_IMMA_MIN_SM
++
++    @property
++    def supports_w8a8_module(self) -> bool:
++        """Whether the probed device can load the C6 ``sm_75`` PTX module."""
++
++        return self.sm >= CUDA_W8A8_MIN_PTX_TARGET_SM
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return {
++            "index": self.index,
++            "name": self.name,
++            "compute_capability": self.compute_capability,
++            "major": self.major,
++            "minor": self.minor,
++            "sm": self.sm,
++            "total_memory": self.total_memory,
++            "dp4a": self.dp4a,
++            "imma_s8": self.imma_s8,
++            "supports_w8a8_module": self.supports_w8a8_module,
++            "source": self.source,
++        }
++
++
++def _coerce_device(device: Any) -> CudaW8A8Device:
++    if isinstance(device, CudaW8A8Device):
++        return device
++    if isinstance(device, Mapping):
++        return CudaW8A8Device(
++            index=device.get("index", 0),
++            name=device.get("name", "unknown"),
++            major=device.get("major"),
++            minor=device.get("minor"),
++            total_memory=device.get("total_memory", 0),
++            source=device.get("source", "injected_device_mapping"),
++        )
++    if hasattr(device, "major") and hasattr(device, "minor"):
++        return CudaW8A8Device(
++            index=getattr(device, "index", 0),
++            name=getattr(device, "name", "unknown"),
++            major=getattr(device, "major"),
++            minor=getattr(device, "minor"),
++            total_memory=getattr(device, "total_memory", 0),
++            source="driver_device_info",
++        )
++    raise CudaW8A8UnavailableError(
++        "CUDA W8A8 requires a real probed device (got {!r})".format(type(device).__name__)
++    )
++
++
++def cuda_w8a8_capabilities(
++    device: Any,
++    *,
++    target: Any = None,
++) -> _CapabilitySet:
++    """Return the probe-gated CUDA W8A8 declaration.
++
++    This is the single gate used by the compiler, the artifact metadata and
++    the runtime entry points.  A missing device, a device without ``dp4a`` or
++    a device that cannot load the C6 PTX module raises
++    :class:`UnsupportedCapabilityError` naming the missing matrix kind; no
++    BF16 fallback exists inside the W8A8 path (contract 0002 section 6).
++    """
++
++    target_name = target if target is not None else "cuda.ptx.w8a8"
++    if device is None:
++        raise _UnsupportedCapabilityError("matrix_capability", CUDA_W8A8_MATRIX_CAPABILITY, target_name)
++    try:
++        probed = _coerce_device(device)
++    except CudaW8A8UnavailableError:
++        raise
++    if not probed.dp4a or not probed.supports_w8a8_module:
++        raise _UnsupportedCapabilityError(
++            "matrix_capability", CUDA_W8A8_MATRIX_CAPABILITY, target_name
++        )
++    CUDA_W8A8_CAPABILITY.require("matrix", CUDA_W8A8_MATRIX_CAPABILITY, target_name)
++    for dtype in ("int8", "int32", "float32", "bf16"):
++        CUDA_W8A8_CAPABILITY.require("dtype", dtype, target_name)
++    return CUDA_W8A8_CAPABILITY
++
++
++def cuda_w8a8_capability_metadata(device: Any, *, target: Any = None) -> Mapping[str, Any]:
++    """Canonical artifact metadata block for the probed W8A8 capability."""
++
++    probed = _coerce_device(device)
++    declaration = cuda_w8a8_capabilities(probed, target=target)
++    return {
++        "dtypes": list(declaration.dtypes),
++        "matrix_capabilities": list(declaration.matrix_capabilities),
++        "digest": declaration.fingerprint,
++        "matrix_kind": CUDA_W8A8_MATRIX_CAPABILITY,
++        "isa": CUDA_W8A8_ISA,
++        "compensation": CUDA_W8A8_COMPENSATION,
++        "min_sm": CUDA_W8A8_MIN_PTX_TARGET_SM,
++        "dp4a": probed.dp4a,
++        "imma_s8": probed.imma_s8,
++        "forbidden_matrix_capabilities": list(CUDA_W8A8_FORBIDDEN_MATRIX_CAPABILITIES),
++    }
++
++
++def verify_cuda_w8a8_capability_metadata(declared: Any, device: Any, *, target: Any = None) -> Mapping[str, Any]:
++    """Fail-closed check that artifact metadata matches a fresh real probe."""
++
++    if not isinstance(declared, Mapping):
++        raise CudaW8A8UnavailableError("CUDA W8A8 capability metadata is missing")
++    expected = cuda_w8a8_capability_metadata(device, target=target)
++    for key in ("dtypes", "matrix_capabilities", "digest", "matrix_kind", "isa"):
++        actual_value = declared.get(key)
++        expected_value = expected[key]
++        if isinstance(expected_value, (list, tuple)):
++            matches = list(actual_value) == list(expected_value)
++        else:
++            matches = actual_value == expected_value
++        if not matches:
++            raise CudaW8A8UnavailableError(
++                "CUDA W8A8 capability metadata {!r} does not match the real probe".format(key)
++            )
++    return expected
++
++
++__all__ = [
++    "CUDA_W8A8_CAPABILITY",
++    "CUDA_W8A8_COMPENSATION",
++    "CUDA_W8A8_DP4A_MIN_SM",
++    "CUDA_W8A8_FORBIDDEN_MATRIX_CAPABILITIES",
++    "CUDA_W8A8_IMMA_MIN_SM",
++    "CUDA_W8A8_ISA",
++    "CUDA_W8A8_MATRIX_CAPABILITY",
++    "CUDA_W8A8_MIN_PTX_TARGET_SM",
++    "CudaW8A8Device",
++    "CudaW8A8UnavailableError",
++    "cuda_w8a8_capabilities",
++    "cuda_w8a8_capability_metadata",
++    "verify_cuda_w8a8_capability_metadata",
++]
+diff --git a/python/tests/ut/pypto_x/cuda_w8a8_device_validation.py b/python/tests/ut/pypto_x/cuda_w8a8_device_validation.py
+new file mode 100644
+index 000000000..8f143defa
+--- /dev/null
++++ b/python/tests/ut/pypto_x/cuda_w8a8_device_validation.py
+@@ -0,0 +1,593 @@
++"""Weight-free CUDA W8A8 device validation driver (contract 0002 C6 / R6).
++
++Run on the RTX 5080 (GamePC/WSL2):
++
++    PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=python python3 \
++        python/tests/ut/pypto_x/cuda_w8a8_device_validation.py
++
++The driver compiles the four frozen C1 opcodes through ``CudaW8A8Compiler``
++with the *real* Driver API probe, executes the PTX kernels on the device and
++compares every result against the portable C1 golden bit-for-bit (NaN payloads
++are compared with the same NaN-equivalence rule the C3/C4/C5 evidence uses).
++It prints one JSON report to stdout and exits non-zero on any mismatch.
++"""
++
++from __future__ import annotations
++
++import json
++import random
++import struct
++import sys
++
++from pypto.backends.cuda import (
++    CudaDriver,
++    CudaRuntime,
++    CudaW8A8ExecutionError,
++)
++from pypto.compiler.targets.cuda_w8a8 import CudaW8A8Compiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.portable.qwen35_w8a8_scheme import (
++    dequantize_epilogue_bf16,
++    dequantize_s8,
++    qmatmul_s8s8_s32,
++    quantize_per_token_s8,
++)
++from pypto.target import TargetSpec
++
++
++TARGET = TargetSpec("gpu", "gpu-neutral")
++
++
++def _program(parameters, returns, operations, name="main"):
++    return CoreProgram(
++        functions=(CoreFunction(name, tuple(parameters), tuple(returns), Region(tuple(operations))),)
++    )
++
++
++def _tensor(name, dtype, shape):
++    return ValueRef(name, CoreType.tensor(dtype, shape))
++
++
++def _qmatmul_program(left_shape, right_shape):
++    left = _tensor("left", "int8", left_shape)
++    right = _tensor("right", "int8", right_shape)
++    output = _tensor("output", "int32", left_shape[:-2] + (left_shape[-2], right_shape[-1]))
++    return _program((left, right), (output,), (Operation("qmatmul_s8s8_s32", (left, right), (output,)),))
++
++
++def _dequantize_program(shape, rows):
++    codes = _tensor("codes", "int8", shape)
++    scales = _tensor("scales", "float32", (rows,))
++    output = _tensor("output", "float32", shape)
++    return _program((codes, scales), (output,), (Operation("dequantize_s8", (codes, scales), (output,)),))
++
++
++def _epilogue_program(shape):
++    rows, columns = shape
++    accumulator = _tensor("accumulator", "int32", shape)
++    row_scales = _tensor("row_scales", "float32", (rows,))
++    column_scales = _tensor("column_scales", "float32", (columns,))
++    output = _tensor("output", "bf16", shape)
++    return _program(
++        (accumulator, row_scales, column_scales),
++        (output,),
++        (Operation("dequantize_epilogue_bf16", (accumulator, row_scales, column_scales), (output,)),),
++    )
++
++
++def _quantize_program(shape, dtype="float32"):
++    values = _tensor("values", dtype, shape)
++    codes = _tensor("codes", "int8", shape)
++    scales = _tensor("scales", "float32", (shape[0],))
++    return _program((values,), (codes, scales), (Operation("quantize_per_token_s8", (values,), (codes, scales)),))
++
++
++def _f32(value):
++    return struct.unpack("<f", struct.pack("<f", float(value)))[0]
++
++
++def _f32_bits(value):
++    return struct.pack("<f", value)
++
++
++def _is_f32_nan(value) -> bool:
++    bits = struct.unpack("<I", _f32_bits(value))[0]
++    return (bits & 0x7F800000) == 0x7F800000 and bool(bits & 0x007FFFFF)
++
++
++def _f32_equal(left, right) -> bool:
++    if _f32_bits(left) == _f32_bits(right):
++        return True
++    return _is_f32_nan(left) and _is_f32_nan(right)
++
++
++def _is_bf16_nan(bits: int) -> bool:
++    return (bits & 0x7F80) == 0x7F80 and bool(bits & 0x007F)
++
++
++def _bf16_bits_equal(left: int, right: int) -> bool:
++    if left == right:
++        return True
++    return _is_bf16_nan(left) and _is_bf16_nan(right)
++
++
++def _count(shape):
++    result = 1
++    for dimension in shape:
++        result *= int(dimension)
++    return result
++
++
++class Validator:
++    def __init__(self, compiler, runtime):
++        self.compiler = compiler
++        self.runtime = runtime
++        self.checks = []
++        self.mismatches = []
++
++    def _compile(self, program):
++        target_ir = self.compiler.lower(program, TARGET)
++        return self.compiler.compile(target_ir), target_ir
++
++    def check(self, name, function):
++        try:
++            detail = function()
++        except Exception as exc:  # expected-failure checks raise ValueError
++            self.mismatches.append({"check": name, "error": "{}: {}".format(type(exc).__name__, exc)})
++            return False
++        self.checks.append({"check": name, "detail": detail})
++        return True
++
++    def expect_error(self, name, function, expected, match=None):
++        try:
++            function()
++        except Exception as exc:
++            message = "{}: {}".format(type(exc).__name__, exc)
++            ok = isinstance(exc, expected) and (match is None or match in message)
++            self.checks.append(
++                {
++                    "check": name,
++                    "detail": "expected {} ({})".format(expected.__name__, message),
++                    "passed": ok,
++                }
++            )
++            if not ok:
++                self.mismatches.append({"check": name, "unexpected_error": message})
++            return ok
++        self.mismatches.append({"check": name, "error": "expected {}, nothing raised".format(expected.__name__)})
++        return False
++
++    # -- qmatmul ---------------------------------------------------------
++    def qmatmul_case(self, name, left_shape, right_shape, left, right):
++        artifact, target_ir = self._compile(_qmatmul_program(left_shape, right_shape))
++        expected = qmatmul_s8s8_s32(
++            left, right, left_shape=left_shape, right_shape=right_shape
++        )
++        actual = self.runtime.run_w8a8_qmatmul(
++            artifact, left, right, left_shape=left_shape, right_shape=right_shape
++        )
++        if tuple(actual) != tuple(expected.values):
++            self.mismatches.append(
++                {
++                    "check": name,
++                    "expected": list(expected.values)[:16],
++                    "actual": list(actual)[:16],
++                }
++            )
++            return False
++        self.checks.append(
++            {
++                "check": name,
++                "detail": "{} values bit-exact, k={}".format(len(actual), left_shape[-1]),
++            }
++        )
++        return True
++
++    # -- dequantize ------------------------------------------------------
++    def dequantize_case(self, name, shape, codes, scales):
++        artifact, _ = self._compile(_dequantize_program(shape, _count(shape[:-1]) if len(shape) > 1 else 1))
++        expected = dequantize_s8(codes, [_f32(value) for value in scales], shape=shape)
++        actual = self.runtime.run_w8a8_dequantize_s8(artifact, codes, scales, shape=shape)
++        if len(actual) != len(expected) or not all(
++            _f32_equal(a, b) for a, b in zip(actual, expected)
++        ):
++            self.mismatches.append({"check": name, "expected": list(expected)[:16], "actual": list(actual)[:16]})
++            return False
++        self.checks.append({"check": name, "detail": "{} values match (NaN-equivalent)".format(len(actual))})
++        return True
++
++    # -- epilogue --------------------------------------------------------
++    def epilogue_case(self, name, shape, accumulator, row_scales, column_scales):
++        artifact, _ = self._compile(_epilogue_program(shape))
++        rows, columns = shape
++        expected = dequantize_epilogue_bf16(
++            accumulator,
++            [_f32(value) for value in row_scales],
++            [_f32(value) for value in column_scales],
++            shape=shape,
++        )
++        actual = self.runtime.run_w8a8_dequantize_epilogue_bf16(
++            artifact, accumulator, row_scales, column_scales, shape=shape
++        )
++        if len(actual) != len(expected.bf16_bits) or not all(
++            _bf16_bits_equal(a, b) for a, b in zip(actual, expected.bf16_bits)
++        ):
++            self.mismatches.append(
++                {
++                    "check": name,
++                    "expected": list(expected.bf16_bits)[:16],
++                    "actual": list(actual)[:16],
++                }
++            )
++            return False
++        self.checks.append({"check": name, "detail": "{} bf16 values match".format(len(actual))})
++        return True
++
++    # -- quantize --------------------------------------------------------
++    def quantize_case(self, name, shape, values, dtype="float32"):
++        artifact, _ = self._compile(_quantize_program(shape, dtype=dtype))
++        if dtype == "bf16":
++            rounded = [_f32_from_bf16(_bf16_bits(value)) for value in values]
++        else:
++            rounded = [_f32(value) for value in values]
++        expected = quantize_per_token_s8(rounded, shape=shape)
++        actual = self.runtime.run_w8a8_quantize_per_token_s8(artifact, values, shape=shape, dtype=dtype)
++        if (
++            tuple(actual.codes) != tuple(expected.codes)
++            or not all(_f32_equal(a, b) for a, b in zip(actual.scales, expected.scales))
++            or actual.saturation_count != expected.saturation_count
++        ):
++            self.mismatches.append(
++                {
++                    "check": name,
++                    "expected_codes": list(expected.codes)[:16],
++                    "actual_codes": list(actual.codes)[:16],
++                    "expected_scales": list(expected.scales),
++                    "actual_scales": list(actual.scales),
++                }
++            )
++            return False
++        self.checks.append(
++            {
++                "check": name,
++                "detail": "{}x{} codes+scales+sat({}) match".format(shape[0], shape[1], actual.saturation_count),
++            }
++        )
++        return True
++
++
++def _bf16_bits(value):
++    raw = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++    upper = raw >> 16
++    lower = raw & 0xFFFF
++    if lower > 0x8000 or (lower == 0x8000 and (upper & 1)):
++        upper += 1
++    return upper & 0xFFFF
++
++
++def _f32_from_bf16(bits):
++    return struct.unpack("<f", struct.pack("<I", bits << 16))[0]
++
++
++def main():
++    driver = CudaDriver()
++    info = driver.device_info()
++    compiler = CudaW8A8Compiler(driver=driver)
++    runtime = CudaRuntime(driver=driver)
++    probe = runtime.probe_w8a8_device()
++    validator = Validator(compiler, runtime)
++    rng = random.Random(20260911)
++
++    # a) qmatmul: rank 2/3/4, batch prefixes, tails, extremes, K bound.
++    validator.qmatmul_case(
++        "qmatmul_rank2_basic",
++        (2, 3),
++        (3, 4),
++        [rng.randint(-127, 127) for _ in range(6)],
++        [rng.randint(-127, 127) for _ in range(12)],
++    )
++    validator.qmatmul_case(
++        "qmatmul_rank3_batch",
++        (2, 2, 3),
++        (2, 3, 4),
++        [rng.randint(-127, 127) for _ in range(12)],
++        [rng.randint(-127, 127) for _ in range(24)],
++    )
++    validator.qmatmul_case(
++        "qmatmul_rank4_batch",
++        (2, 1, 4, 5),
++        (2, 1, 5, 6),
++        [rng.randint(-127, 127) for _ in range(40)],
++        [rng.randint(-127, 127) for _ in range(60)],
++    )
++    validator.qmatmul_case(
++        "qmatmul_k_tail_7",
++        (3, 7),
++        (7, 5),
++        [rng.randint(-127, 127) for _ in range(21)],
++        [rng.randint(-127, 127) for _ in range(35)],
++    )
++    validator.qmatmul_case(
++        "qmatmul_k_tail_9_m1n1",
++        (1, 9),
++        (9, 1),
++        [rng.randint(-127, 127) for _ in range(9)],
++        [rng.randint(-127, 127) for _ in range(9)],
++    )
++    validator.qmatmul_case(
++        "qmatmul_signed_extremes",
++        (2, 4),
++        (4, 3),
++        [127, -127, 127, -127, -127, 127, -127, 127],
++        [127, -127, 0, -127, 127, 0, 127, 127, -127, -127, 127, 0],
++    )
++    # K upper bound: every product is 127*127, so the int32 accumulator ends
++    # one step below INT32_MAX (133144*16129 = 2,147,466,376).
++    k = 133144
++    validator.qmatmul_case(
++        "qmatmul_k_upper_bound_int32_extreme",
++        (1, k),
++        (k, 1),
++        [127] * k,
++        [127] * k,
++    )
++    validator.qmatmul_case(
++        "qmatmul_k_upper_bound_int32_negative_extreme",
++        (1, k),
++        (k, 1),
++        [-127] * k,
++        [127] * k,
++    )
++    validator.expect_error(
++        "qmatmul_reserved_minus_128",
++        lambda: runtime.run_w8a8_qmatmul(
++            _compile_only(compiler, _qmatmul_program((1, 2), (2, 1))), [-128, 1], [3, 4]
++        ),
++        CudaW8A8ExecutionError,
++        match="reserved -128",
++    )
++
++    # b) dequantize_s8.
++    validator.dequantize_case(
++        "dequantize_rank2",
++        (3, 5),
++        [rng.randint(-127, 127) for _ in range(15)],
++        [rng.uniform(-2.0, 2.0) for _ in range(3)],
++    )
++    validator.dequantize_case(
++        "dequantize_rank3",
++        (2, 3, 4),
++        [rng.randint(-127, 127) for _ in range(24)],
++        [rng.uniform(-2.0, 2.0) for _ in range(6)],
++    )
++    validator.dequantize_case(
++        "dequantize_special_scales",
++        (2, 3),
++        [-127, 0, 127, 1, -1, 5],
++        [0.0, float("inf")],
++    )
++
++    # c) epilogue.
++    validator.epilogue_case(
++        "epilogue_random",
++        (3, 5),
++        [rng.randint(-(2**31), 2**31 - 1) for _ in range(15)],
++        [rng.uniform(1e-3, 1.0) for _ in range(3)],
++        [rng.uniform(1e-3, 1.0) for _ in range(5)],
++    )
++    validator.epilogue_case(
++        "epilogue_int32_extremes_special_scales",
++        (3, 4),
++        [-(2**31), 2**31 - 1, 0, 1, -1, 123456789, -(2**31), 2**31 - 1, 7, -7, 0, 0],
++        [float("inf"), 1e-3, float("nan")],
++        [0.5, 1.5, 2.5, 3.5],
++    )
++    validator.expect_error(
++        "epilogue_binary32_overflow",
++        lambda: runtime.run_w8a8_dequantize_epilogue_bf16(
++            _compile_only(compiler, _epilogue_program((1, 4))),
++            [2**31 - 1] * 4,
++            [3.0e38],
++            [3.0e38] * 4,
++        ),
++        CudaW8A8ExecutionError,
++        match="overflow",
++    )
++
++    # d) quantize_per_token_s8.
++    validator.quantize_case(
++        "quantize_random_49",
++        (4, 9),
++        [rng.uniform(-100.0, 100.0) for _ in range(36)],
++    )
++    validator.quantize_case(
++        "quantize_random_316",
++        (3, 16),
++        [rng.uniform(-100.0, 100.0) for _ in range(48)],
++    )
++    validator.quantize_case(
++        "quantize_random_27",
++        (2, 7),
++        [rng.uniform(-100.0, 100.0) for _ in range(14)],
++    )
++    validator.quantize_case(
++        "quantize_all_zero_and_rne_ties",
++        (5, 2),
++        [0.0, 0.0, 0.5, 127.0, 1.5, 127.0, -0.5, 127.0, 2.5, 127.0],
++    )
++    validator.quantize_case(
++        "quantize_saturation",
++        (2, 4),
++        [127.0, 126.9, -127.0, -126.9, 3.4e38, 1.0, -3.4e38, 1.0],
++    )
++    validator.quantize_case(
++        "quantize_bf16_input",
++        (1, 3),
++        [1.0009765625, 2.001953125, -3.0],
++        dtype="bf16",
++    )
++    validator.quantize_case(
++        "quantize_k_133144",
++        (1, 133144),
++        [float((index % 255) - 127) for index in range(133144)],
++    )
++    validator.expect_error(
++        "quantize_nan_inf",
++        lambda: runtime.run_w8a8_quantize_per_token_s8(
++            _compile_only(compiler, _quantize_program((2, 3))),
++            [1.0, 2.0, 3.0, 4.0, float("nan"), 6.0],
++        ),
++        CudaW8A8ExecutionError,
++        match="NaN/Inf",
++    )
++    validator.expect_error(
++        "quantize_scale_underflow",
++        lambda: runtime.run_w8a8_quantize_per_token_s8(
++            _compile_only(compiler, _quantize_program((2, 3))),
++            [1.0e-45, 0.0, 0.0, 1.0, 1.0, 1.0],
++        ),
++        CudaW8A8ExecutionError,
++        match="underflow",
++    )
++
++    # e) deterministic fuzz across tails, non-multiple-of-8/16 shapes and
++    # batch ranks, followed by a mixed four-opcode artifact.
++    fuzz_shapes = [
++        ((1, 1), (1, 1)),
++        ((1, 2), (2, 3)),
++        ((3, 4), (4, 2)),
++        ((5, 5), (5, 5)),
++        ((7, 8), (8, 9)),
++        ((9, 15), (15, 17)),
++        ((16, 17), (17, 16)),
++        ((2, 3, 5), (2, 5, 7)),
++        ((2, 2, 7, 4), (2, 2, 4, 5)),
++        ((1, 1, 1, 9), (1, 1, 9, 3)),
++    ]
++    fuzz_shapes.extend(
++        (
++            ((64, 33), (33, 64)),
++            ((130, 9), (9, 5)),
++        )
++    )
++    for index, (left_shape, right_shape) in enumerate(fuzz_shapes):
++        left = [rng.randint(-127, 127) for _ in range(_count(left_shape))]
++        right = [rng.randint(-127, 127) for _ in range(_count(right_shape))]
++        validator.qmatmul_case("qmatmul_fuzz_{}".format(index), left_shape, right_shape, left, right)
++    for index, shape in enumerate(((1, 1), (7, 1), (1, 17), (5, 33), (40, 33), (2, 3, 5))):
++        rows = _count(shape[:-1])
++        codes = [rng.randint(-127, 127) for _ in range(_count(shape))]
++        scales = [rng.choice((0.0, -0.0, 1.0e-45, 1.0e-3, 2.0, 1.0e30)) for _ in range(rows)]
++        validator.dequantize_case("dequantize_fuzz_{}".format(index), shape, codes, scales)
++    for index, shape in enumerate(((1, 1), (2, 17), (5, 1), (3, 8), (37, 21))):
++        rows, columns = shape
++        validator.epilogue_case(
++            "epilogue_fuzz_{}".format(index),
++            shape,
++            [rng.randint(-(2**31), 2**31 - 1) for _ in range(rows * columns)],
++            [rng.choice((0.0, -0.0, 1.0e-45, 1.0e-3, 0.5)) for _ in range(rows)],
++            [rng.choice((0.0, -0.0, 1.0e-45, 1.0e-3, 2.0)) for _ in range(columns)],
++        )
++    for index, shape in enumerate(((1, 1), (7, 1), (1, 17), (5, 33), (200, 5))):
++        values = [rng.uniform(-100.0, 100.0) for _ in range(_count(shape))]
++        validator.quantize_case("quantize_fuzz_{}".format(index), shape, values)
++
++    # Mixed artifact: one CoreProgram containing all four opcodes; each target
++    # entry point must select its own compiled kernel from the same artifact.
++    mixed_values = _tensor("values", "float32", (2, 4))
++    mixed_codes = _tensor("codes", "int8", (2, 4))
++    mixed_scales = _tensor("scales", "float32", (2,))
++    mixed_dequant = _tensor("dequantized", "float32", (2, 4))
++    mixed_left = _tensor("left", "int8", (2, 4))
++    mixed_right = _tensor("right", "int8", (4, 3))
++    mixed_output = _tensor("output", "int32", (2, 3))
++    mixed_accumulator = _tensor("accumulator", "int32", (2, 3))
++    mixed_row = _tensor("row", "float32", (2,))
++    mixed_col = _tensor("col", "float32", (3,))
++    mixed_bf16 = _tensor("bf16", "bf16", (2, 3))
++    mixed_program = _program(
++        (mixed_values, mixed_left, mixed_right, mixed_accumulator, mixed_row, mixed_col),
++        (mixed_codes, mixed_scales, mixed_dequant, mixed_output, mixed_bf16),
++        (
++            Operation("quantize_per_token_s8", (mixed_values,), (mixed_codes, mixed_scales)),
++            Operation("dequantize_s8", (mixed_codes, mixed_scales), (mixed_dequant,)),
++            Operation("qmatmul_s8s8_s32", (mixed_left, mixed_right), (mixed_output,)),
++            Operation(
++                "dequantize_epilogue_bf16",
++                (mixed_accumulator, mixed_row, mixed_col),
++                (mixed_bf16,),
++            ),
++        ),
++    )
++    mixed_artifact = _compile_only(compiler, mixed_program)
++    mixed_values_host = [rng.uniform(-50.0, 50.0) for _ in range(8)]
++    mixed_left_host = [rng.randint(-127, 127) for _ in range(8)]
++    mixed_right_host = [rng.randint(-127, 127) for _ in range(12)]
++    mixed_accumulator_host = [rng.randint(-100000, 100000) for _ in range(6)]
++    mixed_row_host = [0.5, 1.5]
++    mixed_col_host = [0.25, 0.5, 0.75]
++    mixed_quant = runtime.run_w8a8_quantize_per_token_s8(
++        mixed_artifact, mixed_values_host, shape=(2, 4)
++    )
++    expected_quant = quantize_per_token_s8([_f32(value) for value in mixed_values_host], shape=(2, 4))
++    mixed_dequantized = runtime.run_w8a8_dequantize_s8(
++        mixed_artifact, mixed_quant.codes, mixed_quant.scales, shape=(2, 4)
++    )
++    expected_dequantized = dequantize_s8(
++        expected_quant.codes, list(expected_quant.scales), shape=(2, 4)
++    )
++    mixed_matmul = runtime.run_w8a8_qmatmul(mixed_artifact, mixed_left_host, mixed_right_host)
++    expected_matmul = qmatmul_s8s8_s32(
++        mixed_left_host, mixed_right_host, left_shape=(2, 4), right_shape=(4, 3)
++    )
++    mixed_epilogue = runtime.run_w8a8_dequantize_epilogue_bf16(
++        mixed_artifact, mixed_accumulator_host, mixed_row_host, mixed_col_host
++    )
++    expected_epilogue = dequantize_epilogue_bf16(
++        mixed_accumulator_host, mixed_row_host, mixed_col_host, shape=(2, 3)
++    )
++    if (
++        tuple(mixed_quant.codes) == tuple(expected_quant.codes)
++        and all(_f32_equal(a, b) for a, b in zip(mixed_quant.scales, expected_quant.scales))
++        and all(_f32_equal(a, b) for a, b in zip(mixed_dequantized, expected_dequantized))
++        and tuple(mixed_matmul) == tuple(expected_matmul.values)
++        and all(_bf16_bits_equal(a, b) for a, b in zip(mixed_epilogue, expected_epilogue.bf16_bits))
++    ):
++        validator.checks.append(
++            {"check": "mixed_four_opcode_artifact", "detail": "all four target entry points match"}
++        )
++    else:
++        validator.mismatches.append(
++            {
++                "check": "mixed_four_opcode_artifact",
++                "expected": {
++                    "codes": list(expected_quant.codes),
++                    "matmul": list(expected_matmul.values),
++                    "epilogue": list(expected_epilogue.bf16_bits),
++                },
++                "actual": {
++                    "codes": list(mixed_quant.codes),
++                    "matmul": list(mixed_matmul),
++                    "epilogue": list(mixed_epilogue),
++                },
++            }
++        )
++
++    report = {
++        "device": info.to_dict() if hasattr(info, "to_dict") else info,
++        "w8a8_probe": probe,
++        "checks": validator.checks,
++        "mismatches": validator.mismatches,
++        "status": "PASS" if not validator.mismatches else "FAIL",
++    }
++    print(json.dumps(report, indent=2, ensure_ascii=False))
++    return 0 if not validator.mismatches else 1
++
++
++def _compile_only(compiler, program):
++    target_ir = compiler.lower(program, TARGET)
++    return compiler.compile(target_ir)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/python/tests/ut/pypto_x/test_w8a8_cuda.py b/python/tests/ut/pypto_x/test_w8a8_cuda.py
+new file mode 100644
+index 000000000..5ebaffb0b
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_w8a8_cuda.py
+@@ -0,0 +1,1021 @@
++"""CUDA W8A8 integer kernel plane: contract 0002 C6 / R6 evidence (local leg).
++
++Scope of this module:
++
++* the four frozen C1 opcodes lower through the CUDA W8A8 target plane and the
++  emitted PTX carries the native ``dp4a.s32.s32`` main loop plus the explicit
++  widening K tail, the payload/marker/kernel-version gates and no ``sm_120``
++  hardcoding;
++* capability declarations travel through ``CapabilitySet`` and are gated by a
++  real Driver API device probe; injected low-capability devices and missing
++  drivers fail closed;
++* every runtime target entry point matches the C1 portable integer golden
++  bit-for-bit through the runtime marshalling layer (a deterministic fake
++  driver executes the kernels with the portable golden on the host; the real
++  RTX 5080 device leg is ``cuda_w8a8_device_validation.py``);
++* artifact tampering, old payload versions and cross-plane artifacts fail
++  closed.
++
++The local fake driver never pretends to be hardware: it records the launch and
++executes the same portable golden the kernels implement, so it pins argument
++marshalling, shape validation and runtime gating.  The on-device script pins
++the actual PTX/SASS semantics.
++"""
++
++from __future__ import annotations
++
++import copy
++import hashlib
++import json
++import random
++import struct
++
++import pytest
++
++from pypto.backends.cuda import (
++    CudaArtifactError,
++    CudaRuntime,
++    CudaW8A8ArtifactError,
++    CudaW8A8ExecutionError,
++    CudaW8A8QuantizeResult,
++    probe_cuda_w8a8_availability,
++)
++from pypto.compiler.api import CompileOptions
++from pypto.compiler.artifact import Artifact
++from pypto.compiler.targets.cuda import CudaPtxCompiler
++from pypto.compiler.targets.cuda_w8a8 import (
++    CUDA_W8A8_ARTIFACT_FORMAT,
++    CUDA_W8A8_BACKEND,
++    CUDA_W8A8_KERNEL_VERSION,
++    CUDA_W8A8_MARKER,
++    CUDA_W8A8_PAYLOAD_VERSION,
++    CUDA_W8A8_PTX_TARGET,
++    CudaW8A8Compiler,
++    CudaW8A8UnavailableError,
++    CudaW8A8UnsupportedError,
++    CudaW8A8ValidationError,
++    decode_cuda_w8a8_artifact,
++    render_w8a8_ptx,
++    w8a8_artifact_is_native,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu import (
++    W8A8_DEQUANTIZE_OPCODE,
++    W8A8_EPILOGUE_OPCODE,
++    W8A8_MAX_ACCUMULATOR_K,
++    W8A8_QMATMUL_OPCODE,
++    W8A8_QUANTIZE_OPCODE,
++)
++from pypto.lowering.gpu.cuda_w8a8 import (
++    CUDA_W8A8_CAPABILITY,
++    CUDA_W8A8_FORBIDDEN_MATRIX_CAPABILITIES,
++    CUDA_W8A8_MATRIX_CAPABILITY,
++    CUDA_W8A8_MIN_PTX_TARGET_SM,
++    CudaW8A8Device,
++    cuda_w8a8_capabilities,
++)
++from pypto.portable.qwen35_w8a8_scheme import (
++    OPCODE_DEQUANTIZE_EPILOGUE_BF16,
++    OPCODE_DEQUANTIZE_S8,
++    OPCODE_QMATMUL_S8S8_S32,
++    OPCODE_QUANTIZE_PER_TOKEN_S8,
++    W8A8QuantizationError,
++    W8A8SchemeError,
++    dequantize_epilogue_bf16,
++    dequantize_s8,
++    qmatmul_s8s8_s32,
++    quantize_per_token_s8,
++)
++from pypto.target import TargetSpec, UnsupportedCapabilityError
++
++
++TARGET = TargetSpec("gpu", "gpu-neutral")
++DEVICE_SM120 = CudaW8A8Device(0, "fake-sm120", 12, 0)
++
++
++def _program(parameters, returns, operations, name="main"):
++    return CoreProgram(
++        functions=(CoreFunction(name, tuple(parameters), tuple(returns), Region(tuple(operations))),)
++    )
++
++
++def _tensor(name, dtype, shape):
++    return ValueRef(name, CoreType.tensor(dtype, shape))
++
++
++def _qmatmul_program(left_shape, right_shape, output_shape=None):
++    left = _tensor("left", "int8", left_shape)
++    right = _tensor("right", "int8", right_shape)
++    if output_shape is None:
++        output_shape = left_shape[:-2] + (left_shape[-2], right_shape[-1])
++    output = _tensor("output", "int32", output_shape)
++    return _program(
++        (left, right),
++        (output,),
++        (Operation(W8A8_QMATMUL_OPCODE, (left, right), (output,)),),
++    )
++
++
++def _dequantize_program(codes_shape, rows):
++    codes = _tensor("codes", "int8", codes_shape)
++    scales = _tensor("scales", "float32", (rows,))
++    output = _tensor("output", "float32", codes_shape)
++    return _program(
++        (codes, scales),
++        (output,),
++        (Operation(W8A8_DEQUANTIZE_OPCODE, (codes, scales), (output,)),),
++    )
++
++
++def _epilogue_program(shape):
++    rows, columns = shape
++    accumulator = _tensor("accumulator", "int32", shape)
++    row_scales = _tensor("row_scales", "float32", (rows,))
++    column_scales = _tensor("column_scales", "float32", (columns,))
++    output = _tensor("output", "bf16", shape)
++    return _program(
++        (accumulator, row_scales, column_scales),
++        (output,),
++        (
++            Operation(
++                W8A8_EPILOGUE_OPCODE,
++                (accumulator, row_scales, column_scales),
++                (output,),
++            ),
++        ),
++    )
++
++
++def _quantize_program(shape, dtype="float32"):
++    values = _tensor("values", dtype, shape)
++    codes = _tensor("codes", "int8", shape)
++    scales = _tensor("scales", "float32", (shape[0],))
++    return _program(
++        (values,),
++        (codes, scales),
++        (Operation(W8A8_QUANTIZE_OPCODE, (values,), (codes, scales)),),
++    )
++
++
++def _compile(program, device=DEVICE_SM120, options=None):
++    compiler = CudaW8A8Compiler(device=device)
++    target_ir = compiler.lower(program, TARGET)
++    artifact = compiler.compile(target_ir, options)
++    return artifact, target_ir
++
++
++def _flat(values):
++    if isinstance(values, (list, tuple)):
++        result = []
++        for item in values:
++            result.extend(_flat(item))
++        return result
++    return [values]
++
++
++# ---------------------------------------------------------------------------
++# Deterministic fake driver: executes the portable golden on the host
++# ---------------------------------------------------------------------------
++
++
++class _FakeDeviceInfo:
++    def __init__(self, index, name, major, minor, total_memory=16 * 1024**3):
++        self.index = index
++        self.name = name
++        self.major = major
++        self.minor = minor
++        self.total_memory = total_memory
++
++    def to_dict(self):
++        return {
++            "index": self.index,
++            "name": self.name,
++            "compute_capability": "{}.{}".format(self.major, self.minor),
++            "major": self.major,
++            "minor": self.minor,
++            "total_memory": self.total_memory,
++        }
++
++
++class _FakeModule:
++    def __init__(self, name):
++        self.name = name
++        self.info_log = "fake jit info"
++        self.error_log = ""
++        self._closed = False
++
++    def get_function(self, name):
++        if self._closed:
++            raise RuntimeError("module is closed")
++        return name
++
++    def close(self):
++        self._closed = True
++
++
++class FakeCudaDriver:
++    """Small Driver API double that executes kernels with portable goldens."""
++
++    def __init__(self, major=12, minor=0, name="fake-sm120", fail_device_info=False):
++        self.major = major
++        self.minor = minor
++        self.name = name
++        self.fail_device_info = fail_device_info
++        self.buffers = {}
++        self.next_pointer = 0x100000
++        self.module_loads = 0
++        self.launches = []
++        self.active_operation = None
++        self.context_creates = 0
++        self.synchronizes = 0
++
++    # Driver API surface -------------------------------------------------
++    def device_info(self, index=0):
++        if self.fail_device_info:
++            raise RuntimeError("device probe refused")
++        return _FakeDeviceInfo(index, self.name, self.major, self.minor)
++
++    def context_create(self, index=0):
++        self.context_creates += 1
++        return _FakeContext()
++
++    def context_synchronize(self):
++        self.synchronizes += 1
++
++    def events_available(self):
++        return False
++
++    def module_load_data(self, ptx):
++        self.module_loads += 1
++        return _FakeModule(ptx)
++
++    def mem_alloc(self, size):
++        size = max(1, int(size))
++        pointer = self.next_pointer
++        self.next_pointer += max(16, size)
++        self.buffers[pointer] = bytearray(size)
++        return pointer
++
++    def mem_free(self, pointer):
++        self.buffers.pop(int(pointer), None)
++
++    def _resolve(self, address):
++        address = int(address)
++        for base, buffer in self.buffers.items():
++            if base <= address < base + len(buffer):
++                return buffer, address - base
++        raise KeyError("fake CUDA address is not allocated: {}".format(address))
++
++    def memcpy_htod(self, pointer, data):
++        raw = bytes(data)
++        buffer, offset = self._resolve(pointer)
++        if offset + len(raw) > len(buffer):
++            raise RuntimeError("fake CUDA host-to-device copy exceeds allocation")
++        buffer[offset : offset + len(raw)] = raw
++
++    def memcpy_dtoh(self, pointer, size):
++        buffer, offset = self._resolve(pointer)
++        return bytes(buffer[offset : offset + int(size)])
++
++    def launch_kernel(self, function, grid, block, parameters, stream=None, shared_memory=0):
++        operation = self.active_operation
++        if operation is None:
++            raise AssertionError("fake driver needs active_operation for {}" .format(function))
++        pointers = [int(parameter) for parameter in parameters]
++        self.launches.append((function, tuple(grid), tuple(block), pointers))
++        if operation.operation == W8A8_QMATMUL_OPCODE:
++            self._emulate_qmatmul(operation, pointers)
++        elif operation.operation == W8A8_DEQUANTIZE_OPCODE:
++            self._emulate_dequantize(operation, pointers)
++        elif operation.operation == W8A8_EPILOGUE_OPCODE:
++            self._emulate_epilogue(operation, pointers)
++        elif operation.operation == W8A8_QUANTIZE_OPCODE:
++            self._emulate_quantize(operation, pointers)
++        else:  # pragma: no cover - guarded by the compiler
++            raise AssertionError("unsupported fake kernel {}".format(operation.operation))
++
++    # Emulation ----------------------------------------------------------
++    _FORMAT_ITEMSIZE = {"b": 1, "H": 2, "i": 4, "f": 4}
++
++    def _read(self, pointer, count, fmt):
++        raw = self.memcpy_dtoh(pointer, count * self._FORMAT_ITEMSIZE[fmt])
++        return struct.unpack("<{}{}".format(count, fmt), raw)
++
++    def _write(self, pointer, fmt, values):
++        raw = struct.pack("<{}".format(fmt), *values)
++        buffer, offset = self._resolve(pointer)
++        buffer[offset : offset + len(raw)] = raw
++
++    def _emulate_qmatmul(self, operation, pointers):
++        left = list(self._read(pointers[0], _count(operation.left_shape), "b"))
++        right = list(self._read(pointers[1], _count(operation.right_shape), "b"))
++        result = qmatmul_s8s8_s32(
++            left,
++            right,
++            left_shape=operation.left_shape,
++            right_shape=operation.right_shape,
++        )
++        self._write(pointers[2], "{}i".format(len(result.values)), result.values)
++
++    def _emulate_dequantize(self, operation, pointers):
++        total = _count(operation.codes_shape)
++        codes = list(self._read(pointers[0], total, "b"))
++        scales = list(self._read(pointers[1], operation.rows, "f"))
++        values = dequantize_s8(codes, scales, shape=operation.codes_shape)
++        self._write(pointers[2], "{}f".format(total), values)
++
++    def _emulate_epilogue(self, operation, pointers):
++        total = operation.rows * operation.columns
++        accumulator = list(self._read(pointers[0], total, "i"))
++        row_scales = list(self._read(pointers[1], operation.rows, "f"))
++        column_scales = list(self._read(pointers[2], operation.columns, "f"))
++        try:
++            result = dequantize_epilogue_bf16(
++                accumulator, row_scales, column_scales, shape=operation.accumulator_shape
++            )
++        except W8A8SchemeError:
++            self._write(pointers[4], "i", (1,))
++            return
++        self._write(pointers[3], "{}H".format(total), result.bf16_bits)
++
++    def _emulate_quantize(self, operation, pointers):
++        rows, k = operation.rows, operation.k
++        total = rows * k
++        values = list(self._read(pointers[0], total, "f"))
++        codes = [0] * total
++        scales = [1.0] * rows
++        saturation = 0
++        for row in range(rows):
++            row_values = values[row * k : (row + 1) * k]
++            try:
++                result = quantize_per_token_s8(row_values, shape=(1, k))
++            except W8A8QuantizationError as exc:
++                self._write(pointers[4] + row * 4, "i", (1 if "NaN/Inf" in str(exc) else 2,))
++                continue
++            codes[row * k : (row + 1) * k] = list(result.codes)
++            scales[row] = result.scales[0]
++            saturation += result.saturation_count
++        self._write(pointers[1], "{}b".format(total), codes)
++        self._write(pointers[2], "{}f".format(rows), scales)
++        self._write(pointers[3], "{}i".format(rows), [saturation] + [0] * (rows - 1))
++
++
++class _FakeContext:
++    def __init__(self):
++        self._closed = False
++
++    def close(self):
++        self._closed = True
++
++
++def _count(shape):
++    result = 1
++    for dimension in shape:
++        result *= int(dimension)
++    return result
++
++
++
++
++def _device(major, minor, name=None):
++    return CudaW8A8Device(0, name or "fake-sm{}{}".format(major, minor), major, minor)
++
++
++# ---------------------------------------------------------------------------
++# Capability declaration and probe gating
++# ---------------------------------------------------------------------------
++
++
++def test_capability_set_declares_dtypes_and_the_dp4a_matrix_kind():
++    assert CUDA_W8A8_CAPABILITY.dtypes == ("int8", "int32", "float32", "bf16")
++    assert CUDA_W8A8_CAPABILITY.matrix_capabilities == (CUDA_W8A8_MATRIX_CAPABILITY,)
++    assert CUDA_W8A8_MATRIX_CAPABILITY == "s8s8_s32_dp4a"
++    assert CUDA_W8A8_CAPABILITY.supports_dtype("int8")
++    assert CUDA_W8A8_CAPABILITY.supports_dtype("int32")
++    assert not CUDA_W8A8_CAPABILITY.supports_dtype("float16")
++    assert CUDA_W8A8_CAPABILITY.supports_matrix(CUDA_W8A8_MATRIX_CAPABILITY)
++    for forbidden in CUDA_W8A8_FORBIDDEN_MATRIX_CAPABILITIES:
++        assert not CUDA_W8A8_CAPABILITY.supports_matrix(forbidden)
++    assert len(CUDA_W8A8_CAPABILITY.fingerprint) == 64
++
++
++@pytest.mark.parametrize("major,minor", ((5, 0), (6, 0), (7, 0), (7, 4)))
++def test_capability_gate_rejects_devices_without_the_native_dot_instruction(major, minor):
++    device = _device(major, minor)
++    if device.dp4a and device.supports_w8a8_module:
++        pytest.fail("unexpected capability for sm_{}_{}".format(major, minor))
++    with pytest.raises(UnsupportedCapabilityError) as caught:
++        cuda_w8a8_capabilities(device)
++    assert CUDA_W8A8_MATRIX_CAPABILITY in str(caught.value)
++
++
++def test_capability_gate_accepts_dp4a_devices_at_or_above_the_toolkit_floor():
++    for major, minor in ((7, 5), (8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (12, 0)):
++        device = _device(major, minor)
++        assert cuda_w8a8_capabilities(device) is CUDA_W8A8_CAPABILITY
++        assert device.sm >= CUDA_W8A8_MIN_PTX_TARGET_SM
++
++
++def test_capability_gate_requires_a_real_device():
++    with pytest.raises(UnsupportedCapabilityError):
++        cuda_w8a8_capabilities(None)
++    with pytest.raises(CudaW8A8UnavailableError):
++        CudaW8A8Compiler().lower(_qmatmul_program((2, 3), (3, 4)), TARGET)
++
++
++def test_probe_reports_imma_separately_but_the_declaration_does_not_claim_it():
++    device = _device(12, 0)
++    assert device.dp4a is True
++    assert device.imma_s8 is True
++    assert not CUDA_W8A8_CAPABILITY.supports_matrix("imma_m16n8k32")
++    low = _device(7, 5)
++    assert low.dp4a is True and low.imma_s8 is True
++
++
++def test_probe_availability_reports_missing_driver_and_low_device():
++    class _NoDevice:
++        def device_info(self, index=0):
++            raise RuntimeError("no cuda device")
++
++    assert "device probe failed" in probe_cuda_w8a8_availability(_NoDevice())
++    assert probe_cuda_w8a8_availability(FakeCudaDriver(12, 0)) is None
++    reason = probe_cuda_w8a8_availability(FakeCudaDriver(6, 0))
++    assert "dp4a" in reason
++
++
++def test_opcode_names_match_the_c1_portable_constants():
++    assert W8A8_QMATMUL_OPCODE == OPCODE_QMATMUL_S8S8_S32
++    assert W8A8_QUANTIZE_OPCODE == OPCODE_QUANTIZE_PER_TOKEN_S8
++    assert W8A8_DEQUANTIZE_OPCODE == OPCODE_DEQUANTIZE_S8
++    assert W8A8_EPILOGUE_OPCODE == OPCODE_DEQUANTIZE_EPILOGUE_BF16
++    assert W8A8_MAX_ACCUMULATOR_K == 133144
++
++
++# ---------------------------------------------------------------------------
++# Artifact/PTX metadata
++# ---------------------------------------------------------------------------
++
++
++def test_qmatmul_artifact_declares_the_native_dp4a_kernel():
++    artifact, target_ir = _compile(_qmatmul_program((2, 3), (3, 4)))
++    assert artifact.format == CUDA_W8A8_ARTIFACT_FORMAT
++    assert artifact.metadata["backend"] == CUDA_W8A8_BACKEND
++    assert artifact.metadata["artifact_payload_version"] == CUDA_W8A8_PAYLOAD_VERSION == 3
++    assert artifact.metadata["cuda_w8a8_kernel_version"] == CUDA_W8A8_KERNEL_VERSION == 1
++    assert artifact.metadata["cuda_w8a8_marker"] == CUDA_W8A8_MARKER
++    assert w8a8_artifact_is_native(artifact)
++    declared = artifact.metadata["capability"]
++    assert declared["matrix_kind"] == CUDA_W8A8_MATRIX_CAPABILITY
++    assert declared["isa"] == "dp4a.s32.s32"
++    assert declared["digest"] == CUDA_W8A8_CAPABILITY.fingerprint
++    assert declared["kernel_version"] == CUDA_W8A8_KERNEL_VERSION
++    assert declared["min_sm"] == CUDA_W8A8_MIN_PTX_TARGET_SM
++    assert declared["hardware_dp4a"] is True
++    assert declared["hardware_imma_s8"] is True
++    assert tuple(artifact.metadata["w8a8_kernel_operations"]) == (W8A8_QMATMUL_OPCODE,)
++    entry = artifact.metadata["w8a8_operations"][0]
++    assert (entry["m"], entry["k"], entry["n"]) == (2, 3, 4)
++    assert list(entry["batch_shape"]) == []
++    assert entry["compensation"] == "none_signed_dp4a_no_zero_point"
++    # PTX carries dp4a plus the widening tail, the marker and the sm_75 target.
++    ptx = target_ir.ptx
++    assert CUDA_W8A8_MARKER in ptx
++    assert "dp4a.s32.s32" in ptx
++    assert "cvt.s32.s8" in ptx and "mad.lo.s32" in ptx
++    assert ".target sm_75" in ptx
++    assert "sm_120" not in ptx
++    assert ".entry px_w8a8_op0_qmatmul_s8s8_s32" in ptx
++
++
++def test_qmatmul_ptx_rendering_is_deterministic_and_matches_the_plan():
++    artifact, target_ir = _compile(_qmatmul_program((2, 7), (7, 3)))
++    assert target_ir.ptx == render_w8a8_ptx(target_ir.operations, CUDA_W8A8_PTX_TARGET, "8.0")
++    decoded = decode_cuda_w8a8_artifact(artifact)
++    assert decoded.ptx == target_ir.ptx
++    assert decoded.operations == target_ir.operations
++
++
++def test_ptx_tail_and_codes_row_base_arithmetic_is_pinned():
++    """Pin the two PTX address bugs the first RTX 5080 run exposed.
++
++    * qmatmul's widening K tail must use ``(k4*4 + j) * n`` for the right
++      operand, not ``j * n``;
++    * the quantize kernel's int8 codes row base must be ``row * k`` bytes,
++      not ``row`` bytes.
++    """
++
++    _, qmatmul_ir = _compile(_qmatmul_program((2, 7), (7, 3)))
++    for left_offset in (4, 5, 6):
++        assert "ld.global.s8 %r30, [%rd8+{}];".format(left_offset) in qmatmul_ir.ptx
++    for right_offset in (12, 15, 18):
++        assert "ld.global.s8 %r32, [%rd9+{}];".format(right_offset) in qmatmul_ir.ptx
++    _, quantize_ir = _compile(_quantize_program((3, 5)))
++    assert "mul.lo.u64 %rd13, %rd0, %rd10;" in quantize_ir.ptx
++
++
++def test_all_four_opcodes_lower_into_one_artifact():
++    values = _tensor("values", "float32", (2, 4))
++    codes = _tensor("codes", "int8", (2, 4))
++    scales = _tensor("scales", "float32", (2,))
++    quantize = Operation(W8A8_QUANTIZE_OPCODE, (values,), (codes, scales))
++    dequantize_out = _tensor("dequantized", "float32", (2, 4))
++    dequantize = Operation(W8A8_DEQUANTIZE_OPCODE, (codes, scales), (dequantize_out,))
++    program = _program(
++        (values,),
++        (codes, scales, dequantize_out),
++        (quantize, dequantize),
++    )
++    artifact, target_ir = _compile(program)
++    assert tuple(artifact.metadata["w8a8_kernel_operations"]) == (
++        W8A8_QUANTIZE_OPCODE,
++        W8A8_DEQUANTIZE_OPCODE,
++    )
++    assert len(target_ir.operations) == 2
++    assert ".entry px_w8a8_op0_quantize_per_token_s8" in target_ir.ptx
++    assert ".entry px_w8a8_op1_dequantize_s8" in target_ir.ptx
++
++
++def test_compile_options_are_recorded_and_reserved_keys_rejected():
++    artifact, _ = _compile(
++        _qmatmul_program((2, 3), (3, 4)),
++        options=CompileOptions(metadata={"w8a8_note": "c6"}),
++    )
++    assert artifact.metadata["w8a8_note"] == "c6"
++    with pytest.raises(ValueError):
++        _compile(
++            _qmatmul_program((2, 3), (3, 4)),
++            options=CompileOptions(metadata={"backend": "tampered"}),
++        )
++
++
++# ---------------------------------------------------------------------------
++# qmatmul_s8s8_s32: native differential against the C1 integer golden
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "left_shape,right_shape",
++    (
++        ((2, 3), (3, 4)),
++        ((1, 1), (1, 1)),
++        ((3, 7), (7, 5)),
++        ((2, 2, 3), (2, 3, 4)),
++        ((2, 1, 4, 5), (2, 1, 5, 6)),
++        ((1, 8), (8, 1)),
++        ((2, 9), (9, 3)),
++    ),
++)
++def test_qmatmul_matches_the_integer_golden_bit_for_bit(left_shape, right_shape, monkeypatch):
++    artifact, target_ir = _compile(_qmatmul_program(left_shape, right_shape))
++    rows = 1
++    for dimension in left_shape:
++        rows *= dimension
++    columns = 1
++    for dimension in right_shape:
++        columns *= dimension
++    rng = random.Random(20260911)
++    left = [rng.randint(-127, 127) for _ in range(rows)]
++    right = [rng.randint(-127, 127) for _ in range(columns)]
++    expected = qmatmul_s8s8_s32(left, right, left_shape=left_shape, right_shape=right_shape)
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    actual = CudaRuntime(driver=driver).run_w8a8_qmatmul(
++        artifact, left, right, left_shape=left_shape, right_shape=right_shape
++    )
++    assert tuple(actual) == tuple(expected.values)
++    function, grid, block, pointers = driver.launches[-1]
++    assert function == target_ir.operations[0].kernel
++    assert block == (128, 1, 1)
++    assert len(pointers) == 3
++    assert driver.module_loads == 1
++
++
++def test_qmatmul_zero_size_operands_fail_closed_at_lowering():
++    with pytest.raises(CudaW8A8UnsupportedError, match="zero-size"):
++        CudaW8A8Compiler(device=DEVICE_SM120).lower(
++            _qmatmul_program((0, 3), (3, 4)), TARGET
++        )
++
++
++def test_qmatmul_signed_extremes_and_zero_accumulators():
++    left_shape, right_shape = (2, 4), (4, 3)
++    left = [127, -127, 127, -127, -127, 127, -127, 127]
++    right = [127, -127, 0, -127, 127, 0, 127, 127, -127, -127, 127, 0]
++    expected = qmatmul_s8s8_s32(left, right, left_shape=left_shape, right_shape=right_shape)
++    artifact, target_ir = _compile(_qmatmul_program(left_shape, right_shape))
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    actual = CudaRuntime(driver=driver).run_w8a8_qmatmul(artifact, left, right)
++    assert tuple(actual) == tuple(expected.values)
++    assert actual[0] == 127 * 127 + 127 * 127 + 127 * 127 + 127 * 127
++
++
++def test_qmatmul_k_upper_bound_is_exact_and_over_limit_fails_closed():
++    k = W8A8_MAX_ACCUMULATOR_K
++    artifact, target_ir = _compile(_qmatmul_program((1, k), (k, 1)))
++    left = [127] * k
++    right = [-127] * k
++    expected = qmatmul_s8s8_s32(left, right, left_shape=(1, k), right_shape=(k, 1))
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    actual = CudaRuntime(driver=driver).run_w8a8_qmatmul(artifact, left, right)
++    assert tuple(actual) == tuple(expected.values)
++    with pytest.raises(CudaW8A8ValidationError):
++        CudaW8A8Compiler(device=DEVICE_SM120).lower(
++            _qmatmul_program((1, k + 1), (k + 1, 1)), TARGET
++        )
++
++
++@pytest.mark.parametrize(
++    "left_shape,right_shape,output_shape",
++    (
++        ((3,), (3, 1), (3, 1)),
++        ((2, 3), (4, 2), (2, 2)),
++        ((1, 2, 3), (2, 2, 3), (1, 2, 3)),
++        ((2, 3), (3, 4), (2, 5)),
++    ),
++)
++def test_qmatmul_shape_rules_fail_closed(left_shape, right_shape, output_shape):
++    with pytest.raises(CudaW8A8ValidationError):
++        CudaW8A8Compiler(device=DEVICE_SM120).lower(
++            _qmatmul_program(left_shape, right_shape, output_shape), TARGET
++        )
++
++
++def test_qmatmul_reserved_minus_128_fails_closed_before_launch():
++    artifact, target_ir = _compile(_qmatmul_program((1, 2), (2, 1)))
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    runtime = CudaRuntime(driver=driver)
++    with pytest.raises(CudaW8A8ExecutionError, match="reserved -128"):
++        runtime.run_w8a8_qmatmul(artifact, [-128, 1], [3, 4])
++    with pytest.raises(CudaW8A8ExecutionError, match="reserved -128"):
++        runtime.run_w8a8_qmatmul(artifact, [[1, 2]], [[3], [-128]])
++    assert driver.launches == []
++
++
++def test_qmatmul_shape_mismatch_and_storage_length_fail_closed():
++    artifact, target_ir = _compile(_qmatmul_program((2, 3), (3, 4)))
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    runtime = CudaRuntime(driver=driver)
++    with pytest.raises(CudaW8A8ExecutionError, match="compiled W8A8 plan"):
++        runtime.run_w8a8_qmatmul(artifact, [0] * 6, [0] * 12, left_shape=(3, 2))
++    with pytest.raises(CudaW8A8ExecutionError, match="storage length"):
++        runtime.run_w8a8_qmatmul(artifact, [0] * 5, [0] * 12)
++    assert driver.launches == []
++
++
++# ---------------------------------------------------------------------------
++# dequantize_s8 / dequantize_epilogue_bf16 / quantize_per_token_s8
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("shape,rows", (((3, 5), 3), ((2, 3, 4), 6), ((7,), 1)))
++def test_dequantize_s8_matches_the_golden_bits(shape, rows):
++    artifact, target_ir = _compile(_dequantize_program(shape, rows))
++    total = _count(shape)
++    rng = random.Random(7)
++    codes = [rng.randint(-127, 127) for _ in range(total)]
++    scales = [rng.uniform(-2.0, 2.0) for _ in range(rows)]
++    f32_scales = [struct.unpack("<f", struct.pack("<f", value))[0] for value in scales]
++    expected = dequantize_s8(codes, f32_scales, shape=shape)
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    actual = CudaRuntime(driver=driver).run_w8a8_dequantize_s8(
++        artifact, codes, scales, shape=shape
++    )
++    assert tuple(actual) == tuple(expected)
++
++
++def test_dequantize_s8_special_scales_and_reserved_code():
++    shape, rows = (2, 3), 2
++    artifact, target_ir = _compile(_dequantize_program(shape, rows))
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    runtime = CudaRuntime(driver=driver)
++    codes = [-127, 0, 127, 1, -1, 5]
++    scales = [0.0, float("inf")]
++    expected = dequantize_s8(codes, scales, shape=shape)
++    assert tuple(runtime.run_w8a8_dequantize_s8(artifact, codes, scales)) == tuple(expected)
++    with pytest.raises(CudaW8A8ExecutionError, match="reserved -128"):
++        runtime.run_w8a8_dequantize_s8(artifact, [-128] + [0] * 5, scales)
++
++
++@pytest.mark.parametrize("shape", ((3, 5), (1, 1), (2, 7)))
++def test_epilogue_matches_the_golden_bf16_bits(shape):
++    artifact, target_ir = _compile(_epilogue_program(shape))
++    rows, columns = shape
++    rng = random.Random(11)
++    accumulator = [rng.randint(-(2**31), 2**31 - 1) for _ in range(rows * columns)]
++    row_scales = [rng.uniform(1e-3, 1.0) for _ in range(rows)]
++    column_scales = [rng.uniform(1e-3, 1.0) for _ in range(columns)]
++    f32_row = [struct.unpack("<f", struct.pack("<f", value))[0] for value in row_scales]
++    f32_column = [struct.unpack("<f", struct.pack("<f", value))[0] for value in column_scales]
++    expected = dequantize_epilogue_bf16(
++        accumulator, f32_row, f32_column, shape=shape
++    )
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    actual = CudaRuntime(driver=driver).run_w8a8_dequantize_epilogue_bf16(
++        artifact, accumulator, row_scales, column_scales, shape=shape
++    )
++    assert tuple(actual) == tuple(expected.bf16_bits)
++
++
++def test_epilogue_int32_extremes_and_infinite_scales():
++    shape = (2, 3)
++    artifact, target_ir = _compile(_epilogue_program(shape))
++    accumulator = [-(2**31), 2**31 - 1, 0, 1, -1, 123456789]
++    row_scales = [float("inf"), 0.5]
++    column_scales = [1.0, -1.0, float("nan")]
++    expected = dequantize_epilogue_bf16(
++        accumulator, row_scales, column_scales, shape=shape
++    )
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    actual = CudaRuntime(driver=driver).run_w8a8_dequantize_epilogue_bf16(
++        artifact, accumulator, row_scales, column_scales
++    )
++    assert tuple(actual) == tuple(expected.bf16_bits)
++
++
++def test_epilogue_binary32_overflow_fails_closed_like_the_golden():
++    shape = (1, 2)
++    artifact, target_ir = _compile(_epilogue_program(shape))
++    accumulator = [2**31 - 1, 1]
++    row_scales = [3.0e38]
++    column_scales = [3.0e38, 1.0]
++    with pytest.raises(W8A8SchemeError):
++        dequantize_epilogue_bf16(accumulator, row_scales, column_scales, shape=shape)
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    runtime = CudaRuntime(driver=driver)
++    with pytest.raises(CudaW8A8ExecutionError, match="overflow"):
++        runtime.run_w8a8_dequantize_epilogue_bf16(
++            artifact, accumulator, row_scales, column_scales
++        )
++    with pytest.raises(CudaW8A8ExecutionError, match="INT32"):
++        runtime.run_w8a8_dequantize_epilogue_bf16(
++            artifact, [2**31] * 2, row_scales, column_scales[:2]
++        )
++
++
++@pytest.mark.parametrize("shape", ((4, 9), (1, 1), (3, 16), (2, 7)))
++def test_quantize_per_token_matches_the_golden(shape):
++    artifact, target_ir = _compile(_quantize_program(shape))
++    rows, k = shape
++    rng = random.Random(13)
++    values = [rng.uniform(-100.0, 100.0) for _ in range(rows * k)]
++    f32_values = [struct.unpack("<f", struct.pack("<f", value))[0] for value in values]
++    expected = quantize_per_token_s8(f32_values, shape=shape)
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    result = CudaRuntime(driver=driver).run_w8a8_quantize_per_token_s8(
++        artifact, values, shape=shape
++    )
++    assert isinstance(result, CudaW8A8QuantizeResult)
++    assert tuple(result.codes) == tuple(expected.codes)
++    assert tuple(result.scales) == tuple(expected.scales)
++    assert result.saturation_count == expected.saturation_count
++
++
++def test_quantize_all_zero_rows_and_rne_ties():
++    # Rows 1-4 use absmax=127.0 so the float32 scale is exactly 1.0 and the
++    # ratios hit exact RNE ties: rne(0.5)=0, rne(1.5)=2, rne(-0.5)=0,
++    # rne(2.5)=2 (ties-to-even), each row also containing the 127.0 code.
++    shape = (5, 2)
++    values = [0.0, 0.0, 0.5, 127.0, 1.5, 127.0, -0.5, 127.0, 2.5, 127.0]
++    f32_values = [struct.unpack("<f", struct.pack("<f", value))[0] for value in values]
++    expected = quantize_per_token_s8(f32_values, shape=shape)
++    artifact, target_ir = _compile(_quantize_program(shape))
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    result = CudaRuntime(driver=driver).run_w8a8_quantize_per_token_s8(artifact, values)
++    assert tuple(result.codes) == tuple(expected.codes)
++    assert tuple(result.scales) == tuple(expected.scales)
++    assert result.codes[:2] == (0, 0)
++    assert result.scales[0] == 1.0
++    assert result.codes[2:10] == (0, 127, 2, 127, 0, 127, 2, 127)
++
++
++def test_quantize_saturation_is_reported_not_silently_clamped():
++    shape = (1, 3)
++    values = [127.0, -127.0, 0.0]
++    expected = quantize_per_token_s8(values, shape=shape)
++    artifact, target_ir = _compile(_quantize_program(shape))
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    result = CudaRuntime(driver=driver).run_w8a8_quantize_per_token_s8(artifact, values)
++    assert tuple(result.codes) == tuple(expected.codes)
++    assert result.saturation_count == expected.saturation_count == 0
++
++
++def test_quantize_nan_inf_and_scale_underflow_fail_closed():
++    shape = (2, 3)
++    artifact, target_ir = _compile(_quantize_program(shape))
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    runtime = CudaRuntime(driver=driver)
++    with pytest.raises(CudaW8A8ExecutionError, match="NaN/Inf"):
++        runtime.run_w8a8_quantize_per_token_s8(artifact, [1.0, 2.0, 3.0, 4.0, float("nan"), 6.0])
++    with pytest.raises(CudaW8A8ExecutionError, match="NaN/Inf"):
++        runtime.run_w8a8_quantize_per_token_s8(artifact, [1.0, 2.0, 3.0, 4.0, float("inf"), 6.0])
++    underflow = [1.0e-45, 0.0, 0.0, 1.0, 1.0, 1.0]
++    with pytest.raises(CudaW8A8ExecutionError, match="underflow"):
++        runtime.run_w8a8_quantize_per_token_s8(artifact, underflow)
++
++
++def test_quantize_bf16_input_rounds_before_quantizing():
++    shape = (1, 3)
++    raw = [1.0009765625, 2.001953125, -3.0]
++    rounded = [
++        struct.unpack("<f", struct.pack("<I", _bf16_bits(value) << 16))[0] for value in raw
++    ]
++    expected = quantize_per_token_s8(rounded, shape=shape)
++    artifact, target_ir = _compile(_quantize_program(shape, dtype="bf16"))
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    result = CudaRuntime(driver=driver).run_w8a8_quantize_per_token_s8(
++        artifact, raw, dtype="bf16"
++    )
++    assert tuple(result.codes) == tuple(expected.codes)
++    assert tuple(result.scales) == tuple(expected.scales)
++    assert result.dtype == "bf16"
++    with pytest.raises(CudaW8A8ExecutionError):
++        CudaRuntime(driver=driver).run_w8a8_quantize_per_token_s8(artifact, raw, dtype="int8")
++
++
++def _bf16_bits(value):
++    raw = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++    upper = raw >> 16
++    lower = raw & 0xFFFF
++    if lower > 0x8000 or (lower == 0x8000 and (upper & 1)):
++        upper += 1
++    return upper & 0xFFFF
++
++
++# ---------------------------------------------------------------------------
++# Fail-closed gates: payload/marker/kernel version, capability, cross-plane
++# ---------------------------------------------------------------------------
++
++
++def _resigned(artifact, mutate):
++    decoded = json.loads(bytes(artifact.payload).decode("utf-8"))
++    mutate(decoded)
++    payload = json.dumps(
++        decoded, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
++    ).encode("utf-8")
++    metadata = dict(artifact.metadata)
++    metadata["payload_digest"] = hashlib.sha256(payload).hexdigest()
++    if "artifact_payload_version" in decoded:
++        metadata["artifact_payload_version"] = decoded["artifact_payload_version"]
++    if "cuda_w8a8_kernel_version" in decoded:
++        metadata["cuda_w8a8_kernel_version"] = decoded["cuda_w8a8_kernel_version"]
++    if "cuda_w8a8_marker" in decoded:
++        metadata["cuda_w8a8_marker"] = decoded["cuda_w8a8_marker"]
++    if "capability" in decoded:
++        metadata["capability"] = copy.deepcopy(decoded["capability"])
++    if "plan" in decoded:
++        metadata["w8a8_operations"] = copy.deepcopy(decoded["plan"])
++    if "ptx_digest" in decoded:
++        metadata["ptx_digest"] = decoded["ptx_digest"]
++    if "plan_digest" in decoded:
++        metadata["plan_digest"] = decoded["plan_digest"]
++    return Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        payload=payload,
++        metadata=metadata,
++    )
++
++
++def _tamper_entry(artifact):
++    driver = FakeCudaDriver()
++    target_ir = decode_cuda_w8a8_artifact(artifact)
++    driver.active_operation = target_ir.operations[0]
++    return CudaRuntime(driver=driver)
++
++
++def test_artifact_payload_kernel_and_marker_versions_fail_closed():
++    artifact, _ = _compile(_qmatmul_program((2, 3), (3, 4)))
++    runtime = _tamper_entry(artifact)
++    with pytest.raises(CudaW8A8ArtifactError, match="payload version"):
++        runtime.run_w8a8_qmatmul(
++            _resigned(artifact, lambda d: d.__setitem__("artifact_payload_version", 2)),
++            [0] * 6,
++            [0] * 12,
++        )
++    with pytest.raises(CudaW8A8ArtifactError, match="kernel version"):
++        runtime.run_w8a8_qmatmul(
++            _resigned(artifact, lambda d: d.__setitem__("cuda_w8a8_kernel_version", 2)),
++            [0] * 6,
++            [0] * 12,
++        )
++    with pytest.raises(CudaW8A8ArtifactError, match="marker"):
++        runtime.run_w8a8_qmatmul(
++            _resigned(artifact, lambda d: d.__setitem__("cuda_w8a8_marker", "pypto-x.cuda.w8a8:0")),
++            [0] * 6,
++            [0] * 12,
++        )
++
++
++def test_artifact_metadata_only_tamper_fails_closed():
++    artifact, _ = _compile(_qmatmul_program((2, 3), (3, 4)))
++    metadata = dict(artifact.metadata)
++    metadata["cuda_w8a8_marker"] = "pypto-x.cuda.w8a8:0"
++    tampered = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        payload=artifact.payload,
++        metadata=metadata,
++    )
++    runtime = _tamper_entry(artifact)
++    with pytest.raises(CudaW8A8ArtifactError):
++        runtime.run_w8a8_qmatmul(tampered, [0] * 6, [0] * 12)
++
++
++def test_artifact_capability_plan_and_ptx_tamper_fails_closed():
++    artifact, _ = _compile(_qmatmul_program((2, 3), (3, 4)))
++    runtime = _tamper_entry(artifact)
++
++    def flip_capability(decoded):
++        decoded["capability"]["digest"] = "0" * 64
++
++    with pytest.raises(CudaW8A8ArtifactError):
++        runtime.run_w8a8_qmatmul(_resigned(artifact, flip_capability), [0] * 6, [0] * 12)
++
++    def flip_matrix(decoded):
++        decoded["capability"]["matrix_capabilities"] = ["s8s8_s32_vnni_dpbusd"]
++
++    with pytest.raises(CudaW8A8ArtifactError):
++        runtime.run_w8a8_qmatmul(_resigned(artifact, flip_matrix), [0] * 6, [0] * 12)
++
++    def flip_plan(decoded):
++        decoded["plan"][0]["k"] = 5
++
++    with pytest.raises(CudaW8A8ArtifactError):
++        runtime.run_w8a8_qmatmul(_resigned(artifact, flip_plan), [0] * 6, [0] * 12)
++
++    def flip_ptx(decoded):
++        decoded["ptx"] = decoded["ptx"].replace("dp4a.s32.s32", "mad.lo.s32")
++        decoded["ptx_digest"] = hashlib.sha256(decoded["ptx"].encode("utf-8")).hexdigest()
++
++    with pytest.raises(CudaW8A8ArtifactError):
++        runtime.run_w8a8_qmatmul(_resigned(artifact, flip_ptx), [0] * 6, [0] * 12)
++
++
++def test_low_capability_device_rejects_a_compiled_artifact():
++    artifact, target_ir = _compile(_qmatmul_program((2, 3), (3, 4)))
++    low_driver = FakeCudaDriver(6, 0, name="fake-sm60")
++    low_driver.active_operation = target_ir.operations[0]
++    with pytest.raises((UnsupportedCapabilityError, CudaW8A8UnavailableError)):
++        CudaRuntime(driver=low_driver).run_w8a8_qmatmul(artifact, [0] * 6, [0] * 12)
++
++
++def test_probe_failure_rejects_entry_points_before_any_launch():
++    artifact, target_ir = _compile(_qmatmul_program((2, 3), (3, 4)))
++    driver = FakeCudaDriver(fail_device_info=True)
++    driver.active_operation = target_ir.operations[0]
++    with pytest.raises(CudaW8A8UnavailableError):
++        CudaRuntime(driver=driver).run_w8a8_qmatmul(artifact, [0] * 6, [0] * 12)
++    assert driver.launches == []
++
++
++def test_cross_plane_artifacts_fail_closed():
++    # A float CUDA artifact must not be executed by the W8A8 entry points.
++    value = _tensor("value", "float32", (4,))
++    output = _tensor("output", "float32", (4,))
++    float_program = _program((value,), (output,), (Operation("identity", (value,), (output,)),))
++    float_compiler = CudaPtxCompiler()
++    float_artifact = float_compiler.compile(float_compiler.lower(float_program, TARGET))
++    assert float_artifact.metadata["artifact_payload_version"] == 2
++    runtime = CudaRuntime(driver=FakeCudaDriver())
++    with pytest.raises(CudaW8A8ArtifactError):
++        runtime.run_w8a8_qmatmul(float_artifact, [0] * 6, [0] * 12)
++    with pytest.raises(CudaW8A8ArtifactError):
++        runtime.run_w8a8_dequantize_s8(float_artifact, [0] * 6, [1.0])
++    # ...and a W8A8 artifact is rejected by the float-path loader.
++    artifact, target_ir = _compile(_qmatmul_program((2, 3), (3, 4)))
++    with pytest.raises(CudaArtifactError):
++        runtime.load(artifact)
++
++
++def test_unsupported_operation_fails_closed_at_lowering():
++    value = _tensor("value", "float32", (4,))
++    output = _tensor("output", "float32", (4,))
++    program = _program((value,), (output,), (Operation("add", (value, value), (output,)),))
++    with pytest.raises(CudaW8A8UnsupportedError):
++        CudaW8A8Compiler(device=DEVICE_SM120).lower(program, TARGET)
++
++
++def test_w8a8_target_plane_is_separate_from_the_float_build():
++    artifact, target_ir = _compile(_qmatmul_program((2, 3), (3, 4)))
++    assert artifact.metadata["backend"] == CUDA_W8A8_BACKEND
++    assert artifact.metadata["backend"] != "cuda.ptx"
++    assert artifact.metadata["cuda_w8a8_kernel_version"] == 1
++    assert "cuda_lowering_version" not in artifact.metadata
