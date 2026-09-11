@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`W8A_BF16_WEIGHTED_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_ASCEND_A2_ACCEPTANCE_PASS_W8H_W8I_VERIFIED_W8C_C1_C2_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_VERIFIED_W8B_B6_LAYOUT_NATIVE_VERIFIED_W8C_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_ERR_0004_ERR_0005_KF_0001_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_C8_Q1_Q2_DONE_Q3_Q4_Q5_IN_FLIGHT_U_LINE_STARTED_N4_IN_FLIGHT`
+状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q7_Q8_Q8B_N4_C6TIMING_DONE_C8_Q5_BLOCKED_ON_SVE_INT8_Q10_IN_FLIGHT_Q9_IN_FLIGHT_U1_MERGED_VERIFYING_SVE_LIVENESS_LAUNCH_CACHE_CUDA_QUANTIZE_IN_FLIGHT_W8A8_V2_M1_DONE`
 
-最后更新：2026-09-12 01:30 CST（Asia/Shanghai；**0040 波次**：C5/B3c/C6/B6 四项验收全部 PASS_WITH_BOUNDARIES 收口；A3 接入与 Q1 准备完成；C8 参照 gold（Q2）产出且 scale 交叉校验逐位一致；**vendor GEMM 决策采纳**（GEMM 用各平台最优库、W8J 转 W8A8、AOCL/LPGEMM 源码构建）；**用户接口线 U1 首切片启动**；**ERR-0005** 更正并发上限；**KF-1** 既有失败已派修；控制仓已 push 到 7857ae6、补丁 144）
+最后更新：2026-09-12 03:35 CST（Asia/Shanghai；**0040 波次进行中**：C5/B3c/C6/B6 验收收口｜C8 的 Q1–Q4 完成（参照 gold 逐位 scale 一致、AVX-512 主判定 6/6 PASS）、**Q5 被 SVE256 int8 缺口阻塞**｜vendor GEMM 选型 Q8/Q8b 完成（AOCL 位级包络、KleidiAI int8 精确、sm_120 措辞三次收窄）｜N4.0 推翻 B3c 的 dispatch 归因（ERR-0006）｜C6 计时给出"quantize 占 85–92%"｜U1 首切片合入待验收｜KF-1 修复+验收完成｜W8A8 v2（消除源头 int8 转置）M1 设计完成｜**ERR-0005..0008** 四条勘误；控制仓最近一次 push 为 7857ae6、补丁 144（此后新增提交待收口时再推））
 
 > **零记忆恢复（上下文压缩后）**：按顺序读 本文件 §0 → `docs/00-handoffs/ERRATA.zh-CN.md` → `docs/00-handoffs/0039-2026-09-11-a3-onboarding-ascend-bridge-sve-w8a8.zh-CN.md` → `configs/development_lock.yaml` 的 `waves.W8.in_flight_2026_09_11_batch2` 与 `pending_user_decisions_2026_09_11`。
 
@@ -25,21 +25,17 @@
    不把静态 lowering 说成真机 PASS；不把 A2 的限定式关闭说成"PyPTO Ascend 后端已通"；
    不推公开仓/不改历史/不发权重证据，除非用户当次明确指示。
 4. 用户说"继续"时的默认动作（按优先级）：
-   a) **当前波次（0040，2026-09-12）已收口的四件事**：C5（SVE256 W8A8 widening）、B3c（本机 L0/L1 性能分解）、
-      C6（CUDA W8A8 dp4a 内核，121 checks/0 FAIL 真机）、B6（AVX-512 layout 原生化）**四项验收全部 PASS_WITH_BOUNDARIES**；
-      A3 接入 + Q1 准备完成；C8 参照 gold（Q2）产出且 **scale 交叉校验 150/150 张量、399,360 元素逐位一致**。
-   b) **在途任务**（见 lock `waves.W8.in_flight_2026_09_11_batch2`，平台无并发上限，按资源锁排队）：
-      Q3 AVX-512 的 L4 比较（分段取锁）｜Q4 轴B独立栈探针｜Q5 SVE256 整网 L4（A3；被 int8 layout 缺口阻塞，
-      正在出 bf16 诊断 + 解封选项）｜U1 用户接口首切片｜Q8 vendor GEMM 选型（AOCL 等收尾窗口）｜
-      FIX 导入修复（KF-1）｜N4.0 dispatch 残差分解 + 元数据重建去重。
-   c) **待用户裁决（7 项，见 lock `pending_user_decisions_2026_09_11`）**：B4 阈值冻结（**已决定推迟**到单算子框架 +
-      真实工业框架对比之后）｜L5/L6 语料与阈值｜`view_mode=require` 提级｜W8A8 v1 之外的量化方案｜
-      W8J 注入门政策｜A3 chip7/NPU 放行（E 线 N5，用户说快放行）｜N4 的项目范围（取决于"自研 executor vs 外包框架"）。
-   d) **关键决策已采纳（勿再重开）**：GEMM 一律用各平台最优 vendor 算子（我们自己的内核保留为 portable/位级基准）；
-      W8J 价值主张转 W8A8；A2/920B 退役、由 A3 替代；A3 授予 cpus 320–639（≤20 进程 × 8 线程，不碰 HT）。
-   e) **已知的技术缺口（已登记，勿当新发现）**：SVE256 不支持 int8 layout → W8A8 整网在 SVE256 上 lowering 即失败
-      （Q5 阻塞、Q10 待立项）｜AOCL/LPGEMM 的 int8 在 K≥2048 上**不是整数精确**（CF-1，块间 f32 累加）｜
-      rank-2 `perm(1,0)` transpose 走既有 packed 面且 sNaN 不 quiet（既有行为）｜view alias hard-off（liveness proof 未接入）。
+   a) **先读 lock 的 `waves.W8.in_flight_2026_09_11_batch2`**——它才是权威的在跑清单；当前（2026-09-12 03:35 CST）在跑：
+      `op-bench-framework`(Q9)｜`sve256-int8-layout`(Q10)｜`sve256-liveness-release`｜`launch-artifact-cache`｜
+      `cuda-quantize-rewrite`｜`verify-u1-matmul-policy-slice`｜`integration-health-check`；C7 只差 4–6 min 锁窗补 gold state。
+   b) **0040 本批已收口的主要结论**（引用时以 lock/ERRATA 为准，不要凭记忆）：
+      · **ERR-0006**：B3c 的"41–49% 逐 op 派发"是残差误读——实为**每 launch 的 artifact 校验/重复 lowering/ELF decode**（loop 胶水仅 0.003 ms/op）；N4.0 的去重已入（prefill −26%）；
+      · **C8 主判定**：对 W8A8 参照 gold 的 prefill 口径 **6/6 PASS**（chat 2 个 near-tie flip 单列）；**decode 口径 6/6 FAIL（仅 cosine）**，C7 诊断为"小幅真实缺口 + cosine 门与 max_abs 门不一致（差 50–170×）+ 参照自身 1–2% 不确定"，**待用户裁 L4 口径**；
+      · **Vendor GEMM**：x86 默认自有 kernel（位级）、AOCL 为 opt-in 提速档（`int32_f32block_bounded`，K≤1024 精确）；aarch64 primary=KleidiAI（int32 精确、`lhs_zero_point=1` 陷阱）、oneDNN+ACL 要 `[K,N]`+stride(0)==1；sm_120 融合 int8 不可用但 `GemmEx int8→s32` 可用且精确；
+      · **C6 计时**：`quantize_per_token_s8` 占完整 op 的 **84.7–92.2%**（每元素 f64 除法），换 vendor 只值 6% → 已派 quantize 重写；
+      · **W8A8 v2（路线 c）**：M1 设计完成（`docs/20-planning/0010-…`），**c1 四后端 kernel 零改动**；重基线 4–7 h；**M4 必须等本批收口**。
+   c) **待用户裁决（7 项，见 `pending_user_decisions_2026_09_11`）**：L4 是否含 decode 口径（**最靠前**）｜B4 阈值冻结（已推迟）｜L5/L6 语料与阈值（决策包在 `0005 §10`，三句话）｜`view_mode=require` 提级｜W8A8 v1 之外的新量化方案｜W8J 注入门政策｜A3 chip7/NPU 放行（E 线 N5）。
+   d) **尚未开始但已就绪**：Q5 重跑（需 Q10 + liveness 合入；6 config 并行、A3 上约 20–40 min 墙钟）｜U2（接第一个 vendor provider，需 U1 验收过）｜W8A8 v2 M2（**等 Q10 落地后**，因为两者都改 SVE256 的 int8 通路）｜C8 的 L5/L6。
 5. 并发与资源：平台无 subagent 并发上限（旧文档的 ≤3 属自设假设，ERR-0005 已更正）；重任务一律经 scripts/resource/run_local_heavy.sh（返回 75/69 就等待重试，
    禁止绕过）；**等锁时挂后台或长 timeout，不要在前台循环空转**（会耗尽 agent 回合，S1 曾因此中断一次）；
    A2/920B/A3 都是共享资源，约定安静使用。
