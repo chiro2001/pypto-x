@@ -24,7 +24,22 @@
 
 | 平台 | 候选 | 关注点 |
 |---|---|---|
-| x86_64（本机 12 vCPU，AVX-512+VNNI，无 AMX） | oneDNN v3.x（vLLM CPU 现用）、**libxsmm**（JIT，小 m 友好）、MKL/oneMKL、BLIS、OpenBLAS、FBGEMM/QNNPACK（torch 侧） | bf16 / int8(s8s8 vs u8s8) / 运行时 per-channel scale / int32 累加 / 输出 bf16 / 线程与亲和控制 / 小 m 开销 |
+| x86_64（本机 12 vCPU，**Zen4 ES 样片** family 25 model 116，AVX-512 + VNNI + AVX512-BF16，无 AVX512-FP16、无 AMX） | oneDNN v3.x（vLLM CPU 现用）、**AOCL/LPGEMM**（见 §2.1）、**ZenDNN**、**libxsmm**（JIT，小 m 友好）、MKL/oneMKL、OpenBLAS、FBGEMM/QNNPACK（torch 侧） | bf16 / int8(s8s8 vs u8s8) / 运行时 per-channel scale / int32 累加 / 输出 bf16 / 线程与亲和控制 / 小 m 开销 |
+
+### 2.1 x86 leg 追加候选：AMD AOCL / LPGEMM（2026-09-11 实测发现）
+
+**探测结论（父 agent 现场核实，非文档引用）**
+
+1. **便捷路径不含 W8A8**：conda-forge `aocl-blas 5.2` 可无 root 安装，但产物是纯 BLIS（`libblis-mt.so.5.2.0`）——符号表 `aocl_gemm_*` 计数 **0**、头文件 lpgemm 计数 **0**，即**未编译 LPGEMM**。
+2. **LPGEMM 是 AMD BLIS 分支的 addon**（`addon/aocl_gemm/`，编译要求 GCC ≥ 11.2 或 Clang ≥ 12），文件级证据：`aocl_gemm_s8s8s32obf16.c`、`aocl_gemm_u8s8s32os32.c`、`aocl_gemm_bf16bf16f32obf16.c`、`aocl_gemm_bf16s4f32of32.c`、`aocl_batch_gemm_*`、含 `JIT/` 子目录。
+3. **导出 API 与我们契约高度对齐**（`aocl_gemm_interface_apis.h`）：
+   - `AOCL_GEMM_MATMUL(int8,int8,bfloat16,int32, s8s8s32obf16)` → **s8×s8 → int32 累加 → bf16 输出**；
+   - `... s8s8s32obf16_sym_quant` → **对称量化专用变体**（对应我们的 per-channel 对称方案）；
+   - `AOCL_GEMM_REORDER(...)` → 权重预打包（对应我们的 pack cache）；
+   - 后处理 `BIAS / SCALE / MATRIX_ADD`（最多 8 个、可排序），前置 `RELU / PRELU / GELU_TANH / GELU_ERF`。
+4. **对本项目的意义**：`s8s8` 免符号补偿（VNNI 家族是 `u8s8`，补偿会改数值语义）；`_sym_quant` + `SCALE` 后处理有望直接承载我们的 per-channel/per-token scale 与 epilogue。
+
+**因此 x86 leg 必须包含两条获取路径**：(a) AMD 官方 AOCL release；(b) 自行构建 `amd/blis` 的 addon（本地需确认 GCC ≥ 11.2）。并必须核对：`_sym_quant` 的 scale 语义、累加宽度、饱和策略、以及与 portable 路径的逐位一致性。
 | aarch64 鲲鹏 920B（SVE VL=32，svebf16 + svei8mm） | **oneDNN aarch64**（ACL/ SVE 后端）、**KleidiAI** 微内核、ArmPL、华为 KML/BoostKit、OpenBLAS-aarch64 | 同左；另需确认 ArmPL/KML 在鲲鹏上的**可得性与许可**、以及能否在 A3 上无需 root 安装 |
 | NVIDIA RTX 5080（sm_120） | cuBLAS / **cuBLASLt**（SCALE 模式）、CUTLASS（自定义 epilogue） | 能否表达"per-channel 权重 scale + per-token 激活 scale + bf16 输出"的 epilogue；sm_120 支持矩阵 |
 | AMD gfx1036 | hipBLASLt / rocBLAS(Tensile) | **静态记录即可**（我们的 AMD 运行态仍 BLOCKED_DEVICE，不实测） |
