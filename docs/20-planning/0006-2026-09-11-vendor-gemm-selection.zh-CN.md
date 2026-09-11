@@ -68,3 +68,78 @@
 - 本选型**不改变**我们对外的位级主张：位级一致性仍只对 `portable` 路径声称；vendor 路径的可复现性来自**版本钉死**，不是来自"数学上必然"。
 - AMD 与 Ascend 两格若只有文档证据，必须显式标注"未实测"，不得混进结论表当作已核实。
 - 选型的性能数字必须与既有 W8J 基准同口径（同线程数、同 warmup、同取数方式），否则不可比。
+
+---
+
+## 8. 实测结果（2026-09-12，Q8 交付；本机 x86 Zen4 ES）
+
+### 8.1 LPGEMM 构建与"显式 Zen4"验证
+
+```text
+源码      github.com/amd/blis tag 5.3.2 = 25cad99a6840855ade0a49871197f48ee0e1d317
+构建      经典 ./configure（CMake 需 Fortran，本机无）+ 显式 zen4 + --disable-blis-arch-type
+          + --int-size=64 --blas-int-size=32 + OpenMP
+产物      libblis-mt.so.5.3.2，sha256 c7d74a3129c80129b0b560868bdbf7ad822c3777b96f64a0ba1aa7bee3063dad（17,498,040 B）
+符号      27 个 aocl_gemm_* 导出；1832 条 vpdpbusd；21 个 LPGEMM zen4 kernel .o
+运行期    bli_arch_query_id = 10 / bli_arch_string = "zen4"   ← 非 generic、非运行期猜测
+```
+
+### 8.2 两条路的位级结论（**本选型最重要的结果**）
+
+| | 路 A：`s8s8s32os32`（int32 出）+ 我们自己的 epilogue | 路 B：fused `s8s8s32obf16_sym_quant` |
+|---|---|---|
+| 机制 | 块内（KC=2048）精确 int32，**块间 binary32 链式累加** | 单组时与我们的 epilogue 结构等价；f32 顺序为两次乘 + 组间累加 |
+| 位级结论 | **不是无条件逐位一致** | 10862 元素 **0 mismatch**，但**不同构** |
+| 分类 | `int32_f32block_bounded`（`bitwise` 仅当 provider=portable/自有 kernel 或 **k ≤ 1024**） | `deterministic_bounded` / `fp32_1ulp_epilogue` |
+| 边界 | `K % 4 != 0` 时 reorder API 返回缓冲区大小 0 → **fail-closed** | 同左 |
+
+偏差包络（最坏码值分布，实测）：`K=512/1024 → 0`｜`2048 → ≤1`｜**`3584 → ≤4`**｜`5099 → ≤6`｜`16696 → ≤33`｜`133144 → 22`｜**`133145 → 回绕到 −2147471616 且无报错`**。
+实现方模型（块内精确 int32 → 块间 f32 → mod 2³²）在 31 用例中 25 个逐位吻合（含回绕），6 个 mixed 用例差 2–5 → **机制已定位、细节未钉死**（如实登记为模型解释力边界）。
+
+**三条必须由我们守的硬约束**（各带可复现探针）：
+
+1. **`-128`**：LPGEMM 静默接受（算出 −512、无错误），我们的 kernel 返回 −1 → 码值校验必须在适配层；
+2. **K 上界**：`accum_k_limit = 133144`，越界**回绕无保护** → K 上限必须继续由我们守；
+3. **per-row SCALE 被 parser 明文拒绝**（stderr 报错、输出缓冲区未动）→ 这就是"路 A + 自己 epilogue（或单组 sym_quant）"的设计理由。
+
+### 8.3 12 形状四路实测（**UNGATED**，同 W8J 口径：affinity 0–5、6 线程、rounds=5、iters 200/100、seed 20260912）
+
+几何平均相对 oneDNN bf16 基线：
+
+```text
+aocl_int8_symquant   0.57x   ← 最快
+aocl_int8_packed     0.61x
+aocl_bf16_packed     0.76x
+ours_bf16            6.72x
+ours_int8_qmatmul   24.5x
+ours_epilogue_only   0.16x   （仅 dequant epilogue，非完整 GEMM，不可与上面直接比）
+```
+
+**"位级的价格"：2.5×（m=1,n=32）… 533×（m=5,n=8192）。**
+
+⚠ 质量声明：`m=5,k=2048,n=1024` 的 AOCL int8 三列被窗口噪声污染（矩阵 3.34–3.42 ms vs 两次复测 0.0139/0.018 ms），已标注；其它单元格跨次波动 1.3–1.6×。**本矩阵不得用于门槛**。
+
+### 8.4 推荐阶梯（x86）
+
+```text
+W8A8 默认 = 我们自己的 kernel（位级、单线程）
+     AOCL  = 显式 opt-in 的提速档，登记 tolerance_class=int32_f32block_bounded + 该形状实测界
+     理由：W8A8 契约的对外主张就是 int32 逐位；默认必须位级，否则"整数域无误差"会在 K≥2048 静默失效
+bf16 默认 = oneDNN；AOCL bf16 第二（0.76x）；自有 bridge 兜底
+```
+
+### 8.5 非 x86 的平台结论（**全部为文档级，未实测**）
+
+| 平台 | 结论 |
+|---|---|
+| **Ascend** | `aclnnQuantMatmulV4/V5` 是文档上最贴合我们契约的候选（per-channel + per-token 运行时 scale、int32 bias 在 x1@x2 后、bf16 输出）；**NPU 属用户，未实测** |
+| **aarch64** | KleidiAI（`qai8dxp×qsi8cxp`，int32 累加有 `smmla` 源码证据、per-row×per-channel 原生、纯 C 无线程）**最可行，但未实测**；oneDNN-ACL 的 per-token 是否被真正消费未证；**ArmPL 在 EULA 澄清前不得列入**；KML 需注册同意 EULA；OpenBLAS-aarch64 无 int8 GEMM |
+| **NVIDIA sm_120** | **红灯（文档级）**：cuBLASLt 明文"int8 + 任何 scale 会返回错误"、int8 组合无 epilogue、CUTLASS SM120 无 int8 行 → **vendor int8 在该平台不可用**，C6 的自有 dp4a 内核是**唯一现实路径**；建议做一次存在性实测 |
+| **AMD gfx1036** | 文档级不可达（ROCm 支持矩阵无 gfx1036、Tensile 直接 unsupported） |
+
+### 8.6 本轮的边界与红旗
+
+- 结论**只限定于 AOCL-BLIS 5.3.2 / 显式 Zen4 / 已测 K 值**；其它 tag、其它 config、其它库均未测；
+- `libxsmm` 按"**可得但需独立 JIT 绑定任务**"上报（2.x 只暴露 `libxsmm_dispatch_gemm` JIT 入口），**未凑数**；
+- 锁竞争导致构建窗口丢过一次（报告步骤 SIGPIPE），已用独立报告生成器修复并复现；
+- 矩阵有一个污染单元格 + 跨次波动 → **不得用于门槛**；性能数字一律 `UNGATED`。
