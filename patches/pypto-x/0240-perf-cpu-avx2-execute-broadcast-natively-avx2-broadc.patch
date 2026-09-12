@@ -1,0 +1,1483 @@
+From 27a0cb47786888834e15fdcf683c185e031a66b0 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 16:57:40 +0800
+Subject: [PATCH 240/250] perf(cpu-avx2): execute broadcast natively
+ (avx2-broadcast-native)
+
+The AVX2 backend had no native broadcast plane: every broadcast plan was
+declared host_reference and executed through the vector-common Python
+reference, which was the single largest remaining fallback surface of the
+Qwen3.5-0.8B AVX2 prefill path (~39 s of ~109 s at T=5, 494 calls).
+
+Port the verified AVX-512 reference design:
+
+- cpu_avx2.py: emit ptx_avx2_broadcast_f32/bf16.  The contract predicate
+  (broadcast_native_contract) accepts standard same-dtype expansion with
+  input dim 1 or equal to the output dim, one tensor/scalar input, rank <=
+  16, and expresses it as per-output-axis input strides.  The runtime and
+  the artifact metadata share the predicate, and every non-native broadcast
+  carries an explicit native_broadcast_fallback_operations reason.
+- backends/cpu/x86/avx2.py: dispatch the native kernel and validate the
+  contract, input count, rank and output count before the call.
+- f32/bf16 lanes use integer bit quieting so signaling-NaN payloads match
+  the host reference's Python-float round trip byte for byte; finite,
+  subnormal, infinity, zero and quiet-NaN patterns are unchanged.
+- broadcast leaves host_preexpanded_operations (now only where) and is
+  declared through native_broadcast_mode / native_broadcast_operations /
+  native_helper_symbols.
+- Wire/compat: ARTIFACT_PAYLOAD_VERSION 5 -> 6 and NATIVE_ABI_MARKER /
+  ptx_avx2_abi pypto-x.cpu.avx2:6 -> :7.  Stale payload/ABI artifacts are
+  rejected fail-closed; the emitted source digest changes, so the
+  content-addressed cache cannot silently reuse a pre-broadcast object.
+  AVX2_LOWERING_VERSION stays 2 because the vector plan wire is unchanged
+  (same version-chain shape as the AVX-512 B6 / AVX2 PXLD-v2 waves).
+
+Tests: new test_cpu_avx2_broadcast.py covers Qwen3.5 broadcast shapes plus
+rank 0/1..5/16, identity, scalar source, odd/tail and empty axes, f32/bf16
+bitwise differentials against a pure stdlib oracle and the real
+host-reference path, non-native dtype (int8..uint64/bool) and rank>16
+fallback declarations, mixed-dtype/dimension predicate rejection,
+non-contiguous descriptor rejection, declared==dispatched kernel spy,
+payload/ABI/metadata tamper rejection and an nm symbol guard.  Existing
+payload/ABI assertions were bumped to 6/:7.
+---
+ python/pypto/backends/cpu/x86/avx2.py              |  96 +++++
+ python/pypto/compiler/targets/cpu_avx2.py          | 234 +++++++++++-
+ python/tests/ut/pypto_x/test_cpu_avx2_broadcast.py | 844 +++++++++++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_cpu_avx2_layout.py    |  16 +-
+ python/tests/ut/pypto_x/test_cpu_avx2_packed.py    |  17 +-
+ python/tests/ut/pypto_x/test_qwen35_avx2_parity.py |  10 +-
+ python/tests/ut/pypto_x/test_w8a8_avx2.py          |   6 +-
+ 7 files changed, 1196 insertions(+), 27 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/x86/avx2.py b/python/pypto/backends/cpu/x86/avx2.py
+index d5763734e..10674c1c3 100644
+--- a/python/pypto/backends/cpu/x86/avx2.py
++++ b/python/pypto/backends/cpu/x86/avx2.py
+@@ -21,6 +21,7 @@ from pypto.abi import Availability, LaunchRequest, TensorDesc
+ from pypto.compiler.artifact import ABI_VERSION, Artifact
+ from pypto.compiler.targets.cpu_avx2 import (
+     ARTIFACT_PAYLOAD_VERSION,
++    BROADCAST_MAX_RANK,
+     DEFAULT_ARTIFACT_FORMAT,
+     NATIVE_ABI_MARKER,
+     NATIVE_CONCAT_MODE,
+@@ -37,6 +38,7 @@ from pypto.compiler.targets.cpu_avx2 import (
+     W8A8_QMATMUL_MODE,
+     W8A8_QUANTIZE_MODE,
+     _execution_metadata,
++    broadcast_native_contract,
+     layout_native_contract,
+     layout_native_fallback_reason,
+     packed_kernel_contract,
+@@ -605,6 +607,34 @@ def _call_reduce(module: Any, name: str, dtype: str, source: _NativeBuffer, dest
+     function(source.pointer, destination.pointer, source.count)
+ 
+ 
++def _call_broadcast(
++    module: Any,
++    dtype: str,
++    source: _NativeBuffer,
++    destination: _NativeBuffer,
++    input_strides: Sequence[int],
++    output_shape: Sequence[int],
++    rank: int,
++) -> None:
++    """Invoke the generated native broadcast kernel for one plan."""
++
++    function = _symbol(
++        module,
++        "ptx_avx2_broadcast_{}".format(_native_suffix(dtype)),
++        [
++            _pointer(dtype),
++            _pointer(dtype),
++            ctypes.POINTER(ctypes.c_int64),
++            ctypes.POINTER(ctypes.c_size_t),
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++        ],
++    )
++    strides = (ctypes.c_int64 * rank)(*input_strides)
++    shape = (ctypes.c_size_t * rank)(*output_shape)
++    function(source.pointer, destination.pointer, strides, shape, rank, destination.count)
++
++
+ def _call_matmul(
+     module: Any,
+     dtype: str,
+@@ -1839,6 +1869,10 @@ class Avx2Runtime:
+         if packed is not None:
+             environment.update(self._execute_packed(packed, operation, plan, inputs, module))
+             return
++        broadcast = broadcast_native_contract(operation, plan)
++        if broadcast is not None:
++            environment.update(self._execute_broadcast(broadcast, operation, plan, inputs, module))
++            return
+         layout = layout_native_contract(operation, plan)
+         if layout is not None:
+             mode = layout["mode"]
+@@ -1997,6 +2031,68 @@ class Avx2Runtime:
+         _LAYOUT_NATIVE_STATS["kernel_calls"] += 1
+         return {outputs[0].name: _RuntimeValue(outputs[0].type, destination)}
+ 
++    def _execute_broadcast(
++        self,
++        contract: Mapping[str, Any],
++        operation: Operation,
++        plan: Any,
++        inputs: Sequence[_RuntimeValue],
++        module: Any,
++    ) -> Mapping[str, _RuntimeValue]:
++        """Run one ``broadcast`` with the generated native kernel.
++
++        ``input_strides``/``output_shape`` describe the standard broadcast
++        mapping; the native kernel writes the destination buffer directly, so
++        the host never materializes a Python element list.  The contract is
++        produced by the same predicate that built the artifact metadata and
++        the load path re-validates the whole execution table, so a native
++        broadcast artifact can never silently fall back here (and a fallback
++        artifact never declares this mode).
++        """
++
++        outputs = list(operation.outputs)
++        if len(inputs) != 1 or len(outputs) != 1:
++            raise CpuAvx2ArtifactError("AVX2 native broadcast requires exactly one input and output")
++        if broadcast_native_contract(operation, plan) is None:
++            raise CpuAvx2ArtifactError("AVX2 native broadcast contract disappeared at dispatch")
++        output_ref = outputs[0]
++        dtype = canonical_dtype(output_ref.type.dtype)
++        if canonical_dtype(inputs[0].type.dtype) != dtype:
++            raise CpuAvx2ArtifactError(
++                "AVX2 native broadcast input dtype disagrees with the output"
++            )
++        try:
++            input_shape = tuple(int(dimension) for dimension in contract["input_shape"])
++            output_shape = tuple(int(dimension) for dimension in contract["output_shape"])
++            input_strides = tuple(int(stride) for stride in contract["input_strides"])
++            rank = int(contract["rank"])
++        except (KeyError, TypeError, ValueError) as exc:
++            raise CpuAvx2ArtifactError(
++                "AVX2 native broadcast contract metadata is malformed"
++            ) from exc
++        if rank != len(output_shape) or len(input_strides) != rank:
++            raise CpuAvx2ArtifactError("AVX2 native broadcast rank metadata is inconsistent")
++        if rank > BROADCAST_MAX_RANK:
++            raise CpuAvx2ArtifactError(
++                "AVX2 native broadcast rank {} exceeds the native maximum {}".format(
++                    rank, BROADCAST_MAX_RANK
++                )
++            )
++        expected_input = element_count(input_shape)
++        source = inputs[0].buffer
++        if source.count != expected_input:
++            raise CpuAvx2ExecutionError(
++                "AVX2 native broadcast input count {} does not match shape {}".format(
++                    source.count, list(input_shape)
++                )
++            )
++        count = element_count(output_shape)
++        if count != int(plan.element_count):
++            raise CpuAvx2ArtifactError("AVX2 native broadcast output count disagrees with the plan")
++        destination = _buffer_alloc(dtype, count, output_ref.name)
++        _call_broadcast(module, dtype, source, destination, input_strides, output_shape, rank)
++        return {output_ref.name: _RuntimeValue(output_ref.type, destination)}
++
+     def _split_geometry(self, split: Any, output_index: int) -> Tuple[int, int, int, int, int]:
+         axis = int(split.axis)
+         outer = 1
+diff --git a/python/pypto/compiler/targets/cpu_avx2.py b/python/pypto/compiler/targets/cpu_avx2.py
+index 038f6c2f5..88c24d71a 100644
+--- a/python/pypto/compiler/targets/cpu_avx2.py
++++ b/python/pypto/compiler/targets/cpu_avx2.py
+@@ -44,14 +44,18 @@ from pypto.target._utils import mapping_copy, sha256_bytes, sha256_text
+ # packed transpose.  Payload 5 adds the descriptor-driven native layout /
+ # split / concat plane (reshape/view/contiguous/transpose/slice for
+ # f32/bf16/int8); payload 4 described every one of those operations as
+-# host_reference.  Old payloads are rejected fail-closed because their
+-# execution-mode table cannot describe the new native plane.
+-ARTIFACT_PAYLOAD_VERSION = 5
++# host_reference.  Payload 6 adds the native broadcast plane for f32/bf16 and
++# moves broadcast out of the host pre-expansion boundary; payload 5 declared
++# every broadcast plan as host_reference.  Old payloads are rejected
++# fail-closed because their execution-mode table cannot describe the new
++# native plane.
++ARTIFACT_PAYLOAD_VERSION = 6
+ DEFAULT_ARTIFACT_FORMAT = "pypto-x.cpu.avx2"
+ #: Native shared-object ABI marker.  ``:4`` added the W8A8 widening kernels;
+ #: ``:5`` adds the quantize/epilogue kernels and the int8 transpose; ``:6``
+-#: adds the PXLD-v2 native layout / split / concat kernels.
+-NATIVE_ABI_MARKER = "pypto-x.cpu.avx2:6"
++#: adds the PXLD-v2 native layout / split / concat kernels; ``:7`` adds the
++#: native f32/bf16 broadcast kernels.
++NATIVE_ABI_MARKER = "pypto-x.cpu.avx2:7"
+ 
+ 
+ _NATIVE_SOURCE = r'''
+@@ -77,7 +81,7 @@ _NATIVE_SOURCE = r'''
+ __attribute__((visibility("default"))) const char *ptx_avx2_variant = PTX_VARIANT;
+ __attribute__((visibility("default"))) const char *ptx_avx2_source_digest = PTX_SOURCE_DIGEST;
+ __attribute__((visibility("default"))) const unsigned int ptx_avx2_feature_mask = PTX_FEATURE_MASK;
+-__attribute__((visibility("default"))) const char *ptx_avx2_abi = "pypto-x.cpu.avx2:6";
++__attribute__((visibility("default"))) const char *ptx_avx2_abi = "pypto-x.cpu.avx2:7";
+ 
+ static inline __m256 ptx_binary_f32(int op, __m256 a, __m256 b) {
+     if (op == 0) return _mm256_add_ps(a, b);
+@@ -1112,6 +1116,71 @@ PTX_AVX2_SPLIT_ENTRY(i8, int8_t, ptx_avx2_layout_copy_i8)
+ PTX_AVX2_CONCAT_ENTRY(f32, float, ptx_avx2_layout_copy_f32)
+ PTX_AVX2_CONCAT_ENTRY(bf16, uint16_t, ptx_avx2_layout_copy_bf16)
+ PTX_AVX2_CONCAT_ENTRY(i8, int8_t, ptx_avx2_layout_copy_i8)
++
++/* -------------------------------------------------------------------------
++ * Native broadcast plane (artifact payload version 6).
++ *
++ * ``input_strides`` and ``output_shape`` are written in the *output* rank:
++ * the stride of each output axis is the element stride of the input axis it
++ * maps to, or zero when the axis is new or singleton.  The kernel walks the
++ * output in row-major order and carries the source index with an odometer, so
++ * the host never materializes a per-element Python list.  The integer-lane
++ * quieting matches the host reference, which round-trips every element
++ * through a Python float and therefore quiets a signaling NaN (finite,
++ * subnormal, infinity, zero and quiet-NaN bit patterns stay identical).
++ * ---------------------------------------------------------------------- */
++#define PTX_AVX2_BROADCAST_MAX_RANK 16U
++
++__attribute__((visibility("default")))
++void ptx_avx2_broadcast_f32(const float *input, float *output,
++                            const int64_t *input_strides,
++                            const size_t *output_shape,
++                            size_t rank, size_t output_count) {
++    size_t coords[PTX_AVX2_BROADCAST_MAX_RANK];
++    size_t axis, index;
++    int64_t source = 0;
++    uint32_t bits;
++    if (rank > PTX_AVX2_BROADCAST_MAX_RANK) return;
++    for (axis = 0; axis < rank; ++axis) coords[axis] = 0;
++    for (index = 0; index < output_count; ++index) {
++        memcpy(&bits, input + source, sizeof(bits));
++        bits = ptx_avx2_layout_quiet_nan_f32(bits);
++        memcpy(output + index, &bits, sizeof(bits));
++        for (axis = rank; axis > 0; --axis) {
++            size_t last = axis - 1;
++            coords[last] += 1;
++            source += input_strides[last];
++            if (coords[last] < output_shape[last]) break;
++            source -= (int64_t)output_shape[last] * input_strides[last];
++            coords[last] = 0;
++        }
++    }
++}
++
++__attribute__((visibility("default")))
++void ptx_avx2_broadcast_bf16(const uint16_t *input, uint16_t *output,
++                             const int64_t *input_strides,
++                             const size_t *output_shape,
++                             size_t rank, size_t output_count) {
++    size_t coords[PTX_AVX2_BROADCAST_MAX_RANK];
++    size_t axis, index;
++    int64_t source = 0;
++    uint16_t bits;
++    if (rank > PTX_AVX2_BROADCAST_MAX_RANK) return;
++    for (axis = 0; axis < rank; ++axis) coords[axis] = 0;
++    for (index = 0; index < output_count; ++index) {
++        bits = input[source];
++        output[index] = ptx_avx2_layout_quiet_nan_bf16(bits);
++        for (axis = rank; axis > 0; --axis) {
++            size_t last = axis - 1;
++            coords[last] += 1;
++            source += input_strides[last];
++            if (coords[last] < output_shape[last]) break;
++            source -= (int64_t)output_shape[last] * input_strides[last];
++            coords[last] = 0;
++        }
++    }
++}
+ '''
+ 
+ 
+@@ -1326,6 +1395,122 @@ def packed_kernel_contract(operation: Any, plan: Any) -> Optional[dict]:
+     return None
+ 
+ 
++#: Native broadcast plane (artifact payload version 6).  Broadcast is
++#: standard shape expansion (input dim 1 or equal to the output dim) with one
++#: input and the same f32/bf16 output dtype; it is expressed to the kernel as
++#: per-output-axis input strides.  The runtime dispatch and the artifact
++#: metadata share the two predicates below, so a declared kernel is exactly
++#: the kernel the executor runs and every non-native plan carries an explicit
++#: host-reference reason.
++BROADCAST_MODE = "native_avx2_broadcast"
++BROADCAST_MAX_RANK = 16
++
++
++def _contiguous_element_strides(shape):
++    strides = [1] * len(shape)
++    running = 1
++    for index in range(len(shape) - 1, -1, -1):
++        strides[index] = running
++        running *= shape[index]
++    return tuple(strides)
++
++
++def _broadcast_decision(operation: Any, plan: Any):
++    """Return ``(contract, fallback_reason)`` for one broadcast plan.
++
++    Exactly one element of the pair is non-``None`` for a broadcast plan and
++    both are ``None`` for every other operation.  The reason string is the
++    artifact's explicit declaration for a plan that must keep using the
++    vector-common host reference.
++    """
++
++    if operation is None or plan is None:
++        return None, None
++    if canonical_operation_name(operation.name) != "broadcast":
++        return None, None
++    if len(operation.inputs) != 1:
++        return None, "broadcast requires exactly one input"
++    try:
++        output_shape = tuple(int(dimension) for dimension in plan.shape)
++    except (TypeError, ValueError):
++        return None, "broadcast output shape is not statically known"
++    if any(dimension < 0 for dimension in output_shape):
++        return None, "broadcast output shape contains a negative dimension"
++    if len(output_shape) > BROADCAST_MAX_RANK:
++        return None, "output rank {} exceeds the native AVX2 broadcast max rank {}".format(
++            len(output_shape), BROADCAST_MAX_RANK
++        )
++    output_dtype = canonical_dtype(plan.dtype)
++    if output_dtype not in _PACKED_DTYPES:
++        return None, "dtype {} is not in the native AVX2 broadcast dtype set (float32/bf16)".format(
++            output_dtype
++        )
++    input_type = operation.inputs[0].type
++    try:
++        input_dtype = canonical_dtype(input_type.dtype)
++    except (TypeError, ValueError):
++        return None, "broadcast input dtype is not statically known"
++    if input_dtype != output_dtype:
++        return None, "mixed input/output dtypes ({}, {}) are not native AVX2 broadcast".format(
++            input_dtype, output_dtype
++        )
++    if input_type.kind == "scalar":
++        input_shape = ()
++    elif input_type.kind in _PACKED_TENSOR_KINDS:
++        try:
++            input_shape = tuple(int(dimension) for dimension in input_type.shape)
++        except (TypeError, ValueError):
++            return None, "broadcast input shape is not statically known"
++        if any(dimension < 0 for dimension in input_shape):
++            return None, "broadcast input shape contains a negative dimension"
++    else:
++        return None, "input kind {!r} is not a native AVX2 broadcast tensor/scalar".format(
++            input_type.kind
++        )
++    rank_delta = len(output_shape) - len(input_shape)
++    if rank_delta < 0:
++        return None, "input rank {} exceeds output rank {}".format(
++            len(input_shape), len(output_shape)
++        )
++    contiguous = _contiguous_element_strides(input_shape)
++    input_strides = [0] * rank_delta
++    for axis, dimension in enumerate(input_shape):
++        output_dimension = output_shape[rank_delta + axis]
++        if dimension == 1:
++            input_strides.append(0)
++        elif dimension == output_dimension:
++            input_strides.append(contiguous[axis])
++        else:
++            return None, (
++                "input dimension {} on axis {} is neither 1 nor equal to output dimension {}".format(
++                    dimension, axis, output_dimension
++                )
++            )
++    return (
++        {
++            "mode": BROADCAST_MODE,
++            "kernel": "broadcast_{}".format(_packed_suffix(output_dtype)),
++            "input_shape": input_shape,
++            "output_shape": output_shape,
++            "input_strides": tuple(input_strides),
++            "rank": len(output_shape),
++        },
++        None,
++    )
++
++
++def broadcast_native_contract(operation: Any, plan: Any) -> Optional[dict]:
++    """Describe the native broadcast kernel for one plan, or ``None``."""
++
++    return _broadcast_decision(operation, plan)[0]
++
++
++def broadcast_native_fallback_reason(operation: Any, plan: Any) -> Optional[str]:
++    """Return why one broadcast plan stays on the host reference, or ``None``."""
++
++    return _broadcast_decision(operation, plan)[1]
++
++
+ #: Native layout / split / concat descriptor plane (artifact payload version
+ #: 5).  The runtime and the artifact metadata share the two predicates below,
+ #: so a declared native layout kernel is exactly the kernel the executor runs.
+@@ -1652,6 +1837,8 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+     packed_names = []
+     w8a8_operations = []
+     w8a8_names = []
++    broadcast_operations = []
++    broadcast_fallbacks = []
+     layout_native_operations = []
+     layout_native_fallbacks = []
+     native_helpers = set()
+@@ -1666,6 +1853,7 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+         )
+         w8a8 = w8a8_kernel_contract(operation, plan)
+         packed = packed_kernel_contract(operation, plan)
++        broadcast = broadcast_native_contract(operation, plan)
+         layout = layout_native_contract(operation, plan)
+         if w8a8 is not None:
+             mode = w8a8["mode"]
+@@ -1686,6 +1874,22 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+                     "target_dtype": packed["target_dtype"],
+                 }
+             )
++        elif broadcast is not None:
++            mode = broadcast["mode"]
++            if name not in native_operations:
++                native_operations.append(name)
++            broadcast_operations.append(
++                {
++                    "operation_index": plan.operation_index,
++                    "operation": name,
++                    "mode": mode,
++                    "kernel": broadcast["kernel"],
++                    "rank": broadcast["rank"],
++                    "input_shape": list(broadcast["input_shape"]),
++                    "output_shape": list(broadcast["output_shape"]),
++                }
++            )
++            native_helpers.add("ptx_avx2_{}".format(broadcast["kernel"]))
+         elif layout is not None:
+             mode = layout["mode"]
+             if name not in native_operations:
+@@ -1727,6 +1931,15 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+                         "reason": layout_reason,
+                     }
+                 )
++            broadcast_reason = broadcast_native_fallback_reason(operation, plan)
++            if broadcast_reason is not None:
++                broadcast_fallbacks.append(
++                    {
++                        "operation_index": plan.operation_index,
++                        "operation": name,
++                        "reason": broadcast_reason,
++                    }
++                )
+         operations.append({"operation_index": plan.operation_index, "operation": name, "mode": mode})
+     return {
+         "execution_modes": operations,
+@@ -1739,9 +1952,12 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+         "w8a8_kernel_operations": w8a8_names,
+         "w8a8_operations": w8a8_operations,
+         "w8a8_capability": _w8a8_capability_metadata(),
++        "native_broadcast_mode": BROADCAST_MODE,
++        "native_broadcast_operations": broadcast_operations,
++        "native_broadcast_fallback_operations": broadcast_fallbacks,
+         "native_helper_symbols": sorted(native_helpers),
+         "host_preexpanded_operations": [
+-            name for name in ("broadcast", "where")
++            name for name in ("where",)
+             if any(plan.operation == name for plan in target_ir.plans)
+         ],
+         "position_control_operations": position_operations,
+@@ -2108,6 +2324,8 @@ __all__ = [
+     "AVX2_BACKEND",
+     "Avx2CompileError",
+     "Avx2Compiler",
++    "BROADCAST_MAX_RANK",
++    "BROADCAST_MODE",
+     "CPUAVX2Compiler",
+     "CPUAvx2Compiler",
+     "DEFAULT_ARTIFACT_FORMAT",
+@@ -2126,6 +2344,8 @@ __all__ = [
+     "W8A8_QMATMUL_MODE",
+     "W8A8_QUANTIZE_KERNEL",
+     "W8A8_QUANTIZE_MODE",
++    "broadcast_native_contract",
++    "broadcast_native_fallback_reason",
+     "compile_cpu_avx2",
+     "packed_kernel_contract",
+     "w8a8_kernel_contract",
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx2_broadcast.py b/python/tests/ut/pypto_x/test_cpu_avx2_broadcast.py
+new file mode 100644
+index 000000000..e42b2c8b9
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cpu_avx2_broadcast.py
+@@ -0,0 +1,844 @@
++"""AVX2 native broadcast execution plane (avx2-broadcast-native).
++
++The native kernel expands a contiguous f32/bf16 source into an output buffer
++described by per-output-axis input strides.  Every native execution is
++compared *bitwise* (full output buffer sha256) against an independent pure
++stdlib oracle implemented in this file; the oracle models the frozen CPU
++semantic contract (same-dtype broadcast plus the host reference's Python-float
++round trip, which quiets a signaling NaN) and never imports the implementation
++under test.  ``test_native_matches_the_vector_common_reference`` is a
++secondary cross-check that runs the real ``_reference_operation`` host path on
++the same raw bits.
++
++The plan predicate is shared by artifact metadata and runtime dispatch, so
++the fail-closed cases (unsupported dtype, rank above the native maximum,
++malformed broadcast shapes) are asserted at both the metadata and execution
++level.  Mixed input/output dtype is rejected earlier by vector-common
++validation; the predicate still carries an explicit reason for that shape of
++input (defense in depth).
++"""
++
++from __future__ import annotations
++
++import ctypes
++import hashlib
++from pathlib import Path
++import shutil
++import struct
++import subprocess
++import types
++
++import pytest
++
++from pypto.abi import LaunchRequest, TensorDesc
++from pypto.backends.cpu import HostTensor
++from pypto.backends.cpu.x86 import (
++    Avx2Runtime,
++    CpuAvx2ArtifactError,
++    CpuAvx2ExecutionError,
++)
++from pypto.backends.cpu.x86 import avx2 as avx2_runtime
++from pypto.compiler import Artifact, CompileOptions
++from pypto.compiler.targets.cpu_avx2 import (
++    ARTIFACT_PAYLOAD_VERSION,
++    BROADCAST_MAX_RANK,
++    BROADCAST_MODE,
++    NATIVE_ABI_MARKER,
++    Avx2Compiler,
++    broadcast_native_contract,
++    broadcast_native_fallback_reason,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu import element_count
++from pypto.lowering.cpu.vector import CpuVectorValidationError
++from pypto.target import TargetSpec
++
++
++AVX2_TARGET = TargetSpec(
++    "cpu", "x86_64-linux-gnu", features=("avx2",), attributes={"lane_count": 8}
++)
++_CTYPES = {
++    "float32": ctypes.c_float,
++    "bf16": ctypes.c_uint16,
++    "int8": ctypes.c_int8,
++    "uint8": ctypes.c_uint8,
++    "int16": ctypes.c_int16,
++    "uint16": ctypes.c_uint16,
++    "int32": ctypes.c_int32,
++    "uint32": ctypes.c_uint32,
++    "int64": ctypes.c_int64,
++    "uint64": ctypes.c_uint64,
++    "bool": ctypes.c_bool,
++}
++_WIDTH = {
++    "float32": 4,
++    "bf16": 2,
++    "int8": 1,
++    "uint8": 1,
++    "int16": 2,
++    "uint16": 2,
++    "int32": 4,
++    "uint32": 4,
++    "int64": 8,
++    "uint64": 8,
++    "bool": 1,
++}
++_SIGNED = frozenset(("int8", "int16", "int32", "int64"))
++#: Every non-f32/bf16 broadcast dtype the AVX2 lowering admits must stay on
++#: the vector-common host reference and say so explicitly in the artifact.
++_FALLBACK_DTYPES = (
++    "int8",
++    "uint8",
++    "int16",
++    "uint16",
++    "int32",
++    "uint32",
++    "int64",
++    "uint64",
++    "bool",
++)
++_F32_SPECIAL = (
++    0x7F800001,  # signaling NaN, positive payload 1
++    0xFF800001,  # signaling NaN, negative payload 1
++    0x7F812345,
++    0xFF812345,
++    0x7FC00001,  # quiet NaN with payload
++    0xFFC12345,
++    0x7F800000,  # +inf
++    0xFF800000,  # -inf
++    0x00000001,  # subnormal
++    0x80000001,
++    0x7F7FFFFF,  # max finite
++    0x3F800000,
++    0xBF800000,
++    0x41200000,
++    0x00000000,
++)
++_BF16_SPECIAL = (
++    0x7F81,  # signaling NaN
++    0xFF81,
++    0x7FA1,
++    0xFFA1,
++    0x7FC1,  # quiet NaN
++    0xFFC1,
++    0x7F80,  # +inf
++    0xFF80,
++    0x0001,  # subnormal
++    0x8001,
++    0x7F7F,
++    0x3F80,
++    0xBF80,
++    0x4120,
++    0x0000,
++)
++
++#: Qwen3.5-0.8B AVX2 broadcast shapes (from ``build_qwen35_text_decoder_graph``
++#: at T=1/decode past=5 and T=5 prefill) plus edge shapes: identity broadcast,
++#: rank-1 to rank-4 expansion, rank-2..rank-5, odd/tail widths, empty axes and
++#: the rank-16 maximum.
++_NATIVE_CASES = (
++    ("float32", (), ()),
++    ("float32", (2, 1, 3), (2, 4, 3)),
++    ("float32", (1, 2, 1, 3), (4, 2, 5, 3)),
++    ("float32", (1,), (2, 3)),
++    ("float32", (4, 3), (5, 4, 3)),
++    ("float32", (2, 3), (2, 3)),
++    ("float32", (128,), (1, 5, 16, 128)),
++    ("float32", (16,), (1, 5, 16)),
++    ("float32", (1024,), (1, 5, 1024)),
++    ("float32", (3,), (2, 3, 4, 3)),
++    ("float32", (1, 5, 16, 1), (1, 5, 16, 128)),
++    ("float32", (1, 5, 1), (1, 5, 1024)),
++    ("float32", (1, 16, 1, 1), (1, 16, 128, 128)),
++    ("float32", (1, 16, 1, 1), (1, 16, 1, 128)),
++    ("float32", (1, 6144, 1), (1, 6144, 5)),
++    ("float32", (1, 6144, 1), (1, 6144, 1)),
++    ("float32", (1, 8, 5, 1), (1, 8, 5, 5)),
++    ("float32", (1, 2, 5, 1), (1, 2, 5, 256)),
++    ("float32", (256,), (1, 2, 5, 256)),
++    ("float32", (5, 1), (5, 9)),
++    ("float32", (3, 1, 2), (3, 4, 2)),
++    ("float32", (1, 1, 1, 1, 5), (2, 3, 4, 1, 5)),
++    ("float32", (1,) * 15 + (3,), (2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3)),
++    ("bf16", (128,), (1, 5, 16, 128)),
++    ("bf16", (), (2,)),
++    ("bf16", (1, 3, 1), (1, 3, 7)),
++    ("bf16", (7,), (3, 7)),
++    ("bf16", (1, 1, 3), (1, 4, 3)),
++)
++_ODD_CASES = (
++    ("float32", (2, 0, 1), (2, 0, 3), 0),
++    ("float32", (0,), (0,), 0),
++)
++
++
++def _runtime():
++    runtime = Avx2Runtime()
++    if not runtime.is_available():
++        pytest.skip("host lacks AVX2/YMM capability: {}".format(runtime.availability().to_dict()))
++    return runtime
++
++
++def _compile(program, tmp_path, name):
++    compiler = Avx2Compiler()
++    target_ir = compiler.lower(program, AVX2_TARGET)
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format="pypto-x.cpu.avx2", extra={"build_dir": str(tmp_path / name)}
++        ),
++    )
++    return target_ir, artifact
++
++
++def _broadcast_program(
++    dtype,
++    input_shape,
++    output_shape,
++    output_dtype=None,
++    scalar=False,
++):
++    if scalar:
++        input_type = CoreType.scalar(dtype)
++        input_ref = ValueRef("source", input_type)
++    else:
++        input_type = CoreType.tensor(dtype, tuple(input_shape))
++        input_ref = ValueRef("source", input_type)
++    output_type = CoreType.tensor(output_dtype or dtype, tuple(output_shape))
++    output_ref = ValueRef("output", output_type)
++    operation = Operation(
++        "broadcast", (input_ref,), (output_ref,), {"shape": list(output_shape)}
++    )
++    return CoreProgram(
++        functions=(CoreFunction("bcast", (input_ref,), (output_ref,), Region((operation,))),)
++    )
++
++
++def _raw_array(dtype, bits):
++    array = (_CTYPES[dtype] * len(bits))()
++    if dtype == "float32":
++        for index, value in enumerate(bits):
++            ctypes.memmove(
++                ctypes.addressof(array) + 4 * index,
++                struct.pack("<I", int(value) & 0xFFFFFFFF),
++                4,
++            )
++    else:
++        for index, value in enumerate(bits):
++            array[index] = value
++    return array
++
++
++def _descriptor(dtype, shape, array, readonly=False, strides=None):
++    return TensorDesc(
++        dtype,
++        shape,
++        strides=strides,
++        device="cpu",
++        address=ctypes.addressof(array),
++        readonly=readonly,
++    )
++
++
++def _launch_raw(artifact, inputs, outputs, runtime, scalars=None):
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[_descriptor(dtype, shape, array, True) for dtype, shape, array in inputs],
++            outputs=[_descriptor(dtype, shape, array) for dtype, shape, array in outputs],
++            scalars=scalars or {},
++        )
++    )
++
++
++def _native_buffer(dtype, bits):
++    array = _raw_array(dtype, bits)
++    return avx2_runtime._NativeBuffer(
++        dtype,
++        len(bits),
++        ctypes.cast(array, avx2_runtime._pointer(dtype)),
++        array,
++        True,
++    )
++
++
++def _buffer_bytes(buffer):
++    if not buffer.count:
++        return b""
++    itemsize = ctypes.sizeof(avx2_runtime._ctype(buffer.dtype))
++    return ctypes.string_at(ctypes.cast(buffer.pointer, ctypes.c_void_p), buffer.count * itemsize)
++
++
++def _buffer_sha256(array):
++    return hashlib.sha256(
++        ctypes.string_at(ctypes.addressof(array), ctypes.sizeof(array))
++    ).hexdigest()
++
++
++def _oracle_sha256(dtype, bits):
++    width = _WIDTH[dtype]
++    signed = dtype in _SIGNED
++    payload = b"".join(
++        int(bits[index]).to_bytes(width, "little", signed=signed)
++        for index in range(len(bits))
++    )
++    return hashlib.sha256(payload).hexdigest()
++
++
++def _pattern_bits(dtype, count, seed=1):
++    if dtype == "float32":
++        special = _F32_SPECIAL
++        return [
++            special[index] if index < len(special)
++            else ((seed * 2654435761 + index * 2246822519) & 0xFFFFFFFF)
++            for index in range(count)
++        ]
++    if dtype == "bf16":
++        special = _BF16_SPECIAL
++        return [
++            special[index] if index < len(special)
++            else ((seed * 40503 + index * 16411) & 0xFFFF)
++            for index in range(count)
++        ]
++    if dtype == "bool":
++        return [index % 2 for index in range(count)]
++    if dtype.startswith("uint"):
++        return [((seed * 37 + index * 91) % 31) for index in range(count)]
++    return [((seed * 37 + index * 91) % 31) - 15 for index in range(count)]
++
++
++def _unravel(index, shape):
++    coordinates = [0] * len(shape)
++    for axis in range(len(shape) - 1, -1, -1):
++        dimension = shape[axis]
++        if dimension:
++            coordinates[axis] = index % dimension
++            index //= dimension
++        else:
++            coordinates[axis] = 0
++    return tuple(coordinates)
++
++
++def _ravel(coordinates, shape):
++    index = 0
++    for coordinate, dimension in zip(coordinates, shape):
++        index = index * dimension + (coordinate if dimension else 0)
++    return index
++
++
++def _quiet_f32(bits):
++    if (
++        (bits & 0x7F800000) == 0x7F800000
++        and (bits & 0x007FFFFF) != 0
++        and (bits & 0x00400000) == 0
++    ):
++        bits |= 0x00400000
++    return bits
++
++
++def _quiet_bf16(bits):
++    if (
++        (bits & 0x7F80) == 0x7F80
++        and (bits & 0x007F) != 0
++        and (bits & 0x0040) == 0
++    ):
++        bits |= 0x0040
++    return bits
++
++
++def _oracle_broadcast(dtype, input_shape, output_shape, bits):
++    """Pure stdlib oracle for the frozen same-dtype broadcast contract."""
++
++    output_count = element_count(output_shape)
++    if not input_shape:
++        source_index = lambda _index: 0  # noqa: E731 - small local oracle
++    else:
++        rank_delta = len(output_shape) - len(input_shape)
++        input_count = element_count(input_shape)
++        assert len(bits) == input_count
++
++        def source_index(output_index):
++            coordinates = _unravel(output_index, output_shape)
++            source_coordinates = [
++                0 if dimension == 1 else coordinates[rank_delta + axis]
++                for axis, dimension in enumerate(input_shape)
++            ]
++            return _ravel(source_coordinates, input_shape)
++
++    result = []
++    for output_index in range(output_count):
++        value = int(bits[source_index(output_index)])
++        if dtype == "float32":
++            value = _quiet_f32(value)
++        elif dtype == "bf16":
++            value = _quiet_bf16(value)
++        result.append(value)
++    return result
++
++
++def _reference_bytes(program, target_ir, dtype, bits, scalar=None):
++    """Run the real vector-common host reference on exact raw bits."""
++
++    operation = program.functions[0].body.operations[0]
++    if scalar is None:
++        value = avx2_runtime._RuntimeValue(
++            program.functions[0].parameters[0].type, _native_buffer(dtype, bits)
++        )
++    else:
++        value = avx2_runtime._RuntimeValue(
++            program.functions[0].parameters[0].type,
++            _native_buffer(dtype, [scalar]),
++        )
++    result = avx2_runtime._reference_operation(
++        operation, target_ir.plans[0], [value], "AVX2 broadcast reference"
++    )
++    return _buffer_bytes(result["output"].buffer)
++
++
++def _compile_native_case(dtype, input_shape, output_shape, tmp_path, name):
++    program = _broadcast_program(dtype, input_shape, output_shape)
++    target_ir, artifact = _compile(program, tmp_path, name)
++    contract = broadcast_native_contract(
++        program.functions[0].body.operations[0], target_ir.plans[0]
++    )
++    assert contract is not None
++    metadata = artifact.metadata
++    assert metadata["native_broadcast_mode"] == BROADCAST_MODE
++    assert metadata["execution_modes"][0]["mode"] == BROADCAST_MODE
++    assert tuple(metadata["native_operations"]) == ("broadcast",)
++    assert metadata["host_reference_operations"] == ()
++    assert tuple(metadata["host_preexpanded_operations"]) == ()
++    assert tuple(metadata["native_broadcast_fallback_operations"]) == ()
++    entry = dict(metadata["native_broadcast_operations"][0])
++    assert entry["operation_index"] == 0
++    assert entry["operation"] == "broadcast"
++    assert entry["mode"] == BROADCAST_MODE
++    assert entry["kernel"] == contract["kernel"]
++    assert tuple(entry["input_shape"]) == tuple(input_shape)
++    assert tuple(entry["output_shape"]) == tuple(output_shape)
++    assert "ptx_avx2_{}".format(contract["kernel"]) in tuple(metadata["native_helper_symbols"])
++    return program, target_ir, artifact, contract
++
++
++@pytest.mark.parametrize("dtype,input_shape,output_shape", _NATIVE_CASES)
++def test_native_broadcast_is_bit_exact_against_the_stdlib_oracle(
++    dtype, input_shape, output_shape, tmp_path
++):
++    program, target_ir, artifact, contract = _compile_native_case(
++        dtype,
++        input_shape,
++        output_shape,
++        tmp_path,
++        "case-{}-{}".format(dtype, len(input_shape)),
++    )
++    input_count = element_count(input_shape)
++    bits = _pattern_bits(dtype, input_count, seed=7)
++    output_count = element_count(output_shape)
++    source = _raw_array(dtype, bits)
++    output = _raw_array(dtype, [0] * output_count)
++    _launch_raw(
++        artifact,
++        [(dtype, input_shape, source)],
++        [(dtype, output_shape, output)],
++        _runtime(),
++    )
++    expected = _oracle_broadcast(dtype, input_shape, output_shape, bits)
++    assert _buffer_sha256(output) == _oracle_sha256(dtype, expected)
++    # Secondary differential on the same raw bits: the real host reference.
++    assert _buffer_sha256(output) == hashlib.sha256(
++        _reference_bytes(program, target_ir, dtype, bits)
++    ).hexdigest()
++
++
++@pytest.mark.parametrize("dtype,input_shape,output_shape,count", _ODD_CASES)
++def test_empty_broadcast_outputs_are_native_and_safe(dtype, input_shape, output_shape, count, tmp_path):
++    program, target_ir, artifact, contract = _compile_native_case(
++        dtype, input_shape, output_shape, tmp_path, "empty-{}".format(len(output_shape))
++    )
++    source = HostTensor(dtype, input_shape, [])
++    output = HostTensor.zeros(dtype, output_shape)
++    runtime = _runtime()
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[source.descriptor(readonly=True)],
++            outputs=[output.descriptor()],
++        )
++    )
++    assert output.flat() == ()
++    assert element_count(output_shape) == count
++    assert contract["rank"] == len(output_shape)
++
++
++def test_bf16_broadcast_bit_exactness_includes_snan_quieting(tmp_path):
++    """Pin the bf16 sNaN semantics independently of the generic case table."""
++
++    dtype, input_shape, output_shape = "bf16", (1, 3, 1), (1, 3, 7)
++    program, target_ir, artifact, _contract = _compile_native_case(
++        dtype, input_shape, output_shape, tmp_path, "bf16-snan"
++    )
++    bits = [0x7F81, 0xFF81, 0x7FC1]
++    output = _raw_array(dtype, [0] * element_count(output_shape))
++    _launch_raw(
++        artifact,
++        [(dtype, input_shape, _raw_array(dtype, bits))],
++        [(dtype, output_shape, output)],
++        _runtime(),
++    )
++    expected = _oracle_broadcast(dtype, input_shape, output_shape, bits)
++    assert _buffer_sha256(output) == _oracle_sha256(dtype, expected)
++    assert tuple(expected[:7]) == (0x7FC1,) * 7
++    assert expected[7] == 0xFFC1
++    assert expected[14] == 0x7FC1
++    assert _buffer_sha256(output) == hashlib.sha256(
++        _reference_bytes(program, target_ir, dtype, bits)
++    ).hexdigest()
++
++
++def test_scalar_source_broadcast_is_native_and_bit_exact(tmp_path):
++    program = _broadcast_program("float32", (), (1, 5), scalar=True)
++    target_ir, artifact = _compile(program, tmp_path, "scalar")
++    contract = broadcast_native_contract(
++        program.functions[0].body.operations[0], target_ir.plans[0]
++    )
++    assert contract is not None
++    assert contract["input_shape"] == ()
++    assert contract["input_strides"] == (0, 0)
++    assert artifact.metadata["execution_modes"][0]["mode"] == BROADCAST_MODE
++    output = HostTensor.zeros("float32", (1, 5))
++    _runtime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[],
++            outputs=[output.descriptor()],
++            scalars={"source": 2.5},
++        )
++    )
++    assert output.flat() == (2.5,) * 5
++
++
++def test_declared_kernel_is_the_dispatched_kernel_spy(tmp_path, monkeypatch):
++    runtime = _runtime()
++    calls = []
++    original = avx2_runtime._call_broadcast
++
++    def spy(module, dtype, source, destination, input_strides, output_shape, rank):
++        calls.append(
++            (dtype, tuple(input_strides), tuple(output_shape), rank, destination.count)
++        )
++        return original(module, dtype, source, destination, input_strides, output_shape, rank)
++
++    monkeypatch.setattr(avx2_runtime, "_call_broadcast", spy)
++    for dtype, input_shape, output_shape, kernel, strides in (
++        ("float32", (1, 5, 1), (1, 5, 8), "broadcast_f32", (0, 1, 0)),
++        ("bf16", (1, 3), (1, 3), "broadcast_bf16", (0, 1)),
++    ):
++        program = _broadcast_program(dtype, input_shape, output_shape)
++        target_ir, artifact = _compile(program, tmp_path, "spy-{}".format(dtype))
++        contract = broadcast_native_contract(
++            program.functions[0].body.operations[0], target_ir.plans[0]
++        )
++        assert contract is not None and contract["kernel"] == kernel
++        entry = dict(artifact.metadata["native_broadcast_operations"][0])
++        assert entry["kernel"] == kernel
++        bits = _pattern_bits(dtype, element_count(input_shape), seed=11)
++        output = _raw_array(dtype, [0] * element_count(output_shape))
++        _launch_raw(
++            artifact,
++            [(dtype, input_shape, _raw_array(dtype, bits))],
++            [(dtype, output_shape, output)],
++            runtime,
++        )
++        assert _buffer_sha256(output) == _oracle_sha256(
++            dtype, _oracle_broadcast(dtype, input_shape, output_shape, bits)
++        )
++        assert calls[-1][1] == strides
++        assert calls[-1][2] == tuple(output_shape)
++    assert [call[0] for call in calls] == ["float32", "bf16"]
++    assert [call[1] for call in calls] == [(0, 1, 0), (0, 1)]
++    assert calls[0][2:] == ((1, 5, 8), 3, 40)
++    assert calls[1][2:] == ((1, 3), 2, 3)
++
++
++@pytest.mark.parametrize("dtype", _FALLBACK_DTYPES)
++def test_non_native_dtypes_fall_back_to_the_host_reference(dtype, tmp_path):
++    runtime = _runtime()
++    input_shape = (3,)
++    output_shape = (2, 3)
++    program = _broadcast_program(dtype, input_shape, output_shape)
++    target_ir, artifact = _compile(program, tmp_path, "fallback-{}".format(dtype))
++    operation = program.functions[0].body.operations[0]
++    plan = target_ir.plans[0]
++    assert broadcast_native_contract(operation, plan) is None
++    reason = broadcast_native_fallback_reason(operation, plan)
++    assert reason == (
++        "dtype {} is not in the native AVX2 broadcast dtype set (float32/bf16)".format(dtype)
++    )
++    assert artifact.metadata["execution_modes"][0]["mode"] == "host_reference"
++    assert tuple(artifact.metadata["native_broadcast_operations"]) == ()
++    assert tuple(artifact.metadata["host_reference_operations"]) == ("broadcast",)
++    # ``host_preexpanded_operations`` only tracks the remaining pre-expansion
++    # op (where); the broadcast fallback is declared by the per-plan mode plus
++    # the explicit fallback entry below.
++    assert tuple(artifact.metadata["host_preexpanded_operations"]) == ()
++    fallback = dict(artifact.metadata["native_broadcast_fallback_operations"][0])
++    assert fallback["operation_index"] == 0
++    assert fallback["operation"] == "broadcast"
++    assert fallback["reason"] == reason
++    assert artifact.metadata["native_helper_symbols"] == ()
++    bits = _pattern_bits(dtype, element_count(input_shape), seed=5)
++    output = _raw_array(dtype, [0] * element_count(output_shape))
++    _launch_raw(
++        artifact,
++        [(dtype, input_shape, _raw_array(dtype, bits))],
++        [(dtype, output_shape, output)],
++        runtime,
++    )
++    assert _buffer_sha256(output) == _oracle_sha256(
++        dtype, _oracle_broadcast(dtype, input_shape, output_shape, bits)
++    )
++    assert _buffer_sha256(output) == hashlib.sha256(
++        _reference_bytes(program, target_ir, dtype, bits)
++    ).hexdigest()
++
++
++def test_rank_above_the_native_maximum_falls_back_with_an_explicit_reason(tmp_path):
++    runtime = _runtime()
++    rank = BROADCAST_MAX_RANK + 1
++    input_shape = (1,) * (rank - 1) + (1,)
++    output_shape = (1,) * (rank - 1) + (2,)
++    program = _broadcast_program("float32", input_shape, output_shape)
++    target_ir, artifact = _compile(program, tmp_path, "rank17")
++    operation = program.functions[0].body.operations[0]
++    plan = target_ir.plans[0]
++    assert broadcast_native_contract(operation, plan) is None
++    reason = broadcast_native_fallback_reason(operation, plan)
++    assert reason == "output rank 17 exceeds the native AVX2 broadcast max rank 16"
++    assert artifact.metadata["execution_modes"][0]["mode"] == "host_reference"
++    fallback = dict(artifact.metadata["native_broadcast_fallback_operations"][0])
++    assert fallback["reason"] == reason
++    source = HostTensor("float32", input_shape, [1.0])
++    output = HostTensor.zeros("float32", output_shape)
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[source.descriptor(readonly=True)],
++            outputs=[output.descriptor()],
++        )
++    )
++    assert output.flat() == (1.0, 1.0)
++
++
++def test_float16_broadcast_is_rejected_before_codegen():
++    """float16 is outside the AVX2 reference dtype contract entirely."""
++
++    from pypto.lowering.cpu.x86.avx2 import Avx2UnsupportedError
++
++    program = _broadcast_program("float16", (1, 3), (1, 3))
++    with pytest.raises(Avx2UnsupportedError, match="float16"):
++        Avx2Compiler().lower(program, AVX2_TARGET)
++
++
++def test_wrong_dimension_and_mixed_dtype_predicates_fail_closed():
++    """The predicate itself must never claim a non-broadcastable plan."""
++
++    def fake_operation(input_kind, input_dtype, input_shape):
++        return types.SimpleNamespace(
++            name="broadcast",
++            inputs=(
++                types.SimpleNamespace(
++                    type=types.SimpleNamespace(
++                        kind=input_kind, dtype=input_dtype, shape=input_shape
++                    )
++                ),
++            ),
++        )
++
++    plan = types.SimpleNamespace(shape=(2, 4), dtype="float32", element_count=8)
++    operation = fake_operation("tensor", "float32", (2, 3))
++    assert broadcast_native_contract(operation, plan) is None
++    assert broadcast_native_fallback_reason(operation, plan) == (
++        "input dimension 3 on axis 1 is neither 1 nor equal to output dimension 4"
++    )
++
++    operation = fake_operation("tensor", "bf16", (2, 1))
++    assert broadcast_native_contract(operation, plan) is None
++    assert broadcast_native_fallback_reason(operation, plan) == (
++        "mixed input/output dtypes (bf16, float32) are not native AVX2 broadcast"
++    )
++
++    operation = fake_operation("tile", "float32", (2, 4, 4))
++    plan = types.SimpleNamespace(shape=(2, 4), dtype="float32", element_count=8)
++    assert broadcast_native_contract(operation, plan) is None
++    assert broadcast_native_fallback_reason(operation, plan) == (
++        "input rank 3 exceeds output rank 2"
++    )
++
++    # A mixed-dtype broadcast is rejected by vector-common validation before
++    # the backend predicate is ever consulted (fail-closed at compile time).
++    mixed = _broadcast_program("float32", (1, 3), (1, 3), output_dtype="bf16")
++    with pytest.raises(CpuVectorValidationError, match="dtypes must match"):
++        Avx2Compiler().lower(mixed, AVX2_TARGET)
++
++
++def test_non_contiguous_descriptor_is_rejected_before_dispatch(tmp_path):
++    program = _broadcast_program("float32", (1, 5, 1), (1, 5, 8))
++    _target_ir, artifact = _compile(program, tmp_path, "strided")
++    source = _raw_array("float32", [1.0] * 5)
++    output = _raw_array("float32", [0.0] * 40)
++    # Non-contiguous strides are rejected by the existing launch gate; the
++    # native kernel itself consumes the plan's contiguous-stride mapping.
++    strided = TensorDesc(
++        "float32", (1, 5, 1), strides=(8, 2, 1), device="cpu", address=ctypes.addressof(source)
++    )
++    with pytest.raises(CpuAvx2ExecutionError, match="contiguous"):
++        _runtime().launch(
++            LaunchRequest(
++                artifact,
++                inputs=[strided],
++                outputs=[_descriptor("float32", (1, 5, 8), output)],
++            )
++        )
++
++
++def test_qwen35_decode_and_prefill_broadcast_plans_are_all_native():
++    """Every broadcast in the Qwen3.5 AVX2 T=1/T=5 graphs must be native."""
++
++    from pypto.portable.qwen35 import build_qwen35_text_decoder_graph
++
++    for steps, past_length, expected in ((1, 5, 350), (5, 0, 494)):
++        program = build_qwen35_text_decoder_graph(
++            1, steps, past_length=past_length, shape_profile="model", precision="bf16"
++        )
++        target_ir = Avx2Compiler().lower(program, AVX2_TARGET)
++        operations = program.functions[0].body.operations
++        broadcast_count = 0
++        native_count = 0
++        for operation, plan in zip(operations, target_ir.plans):
++            if operation.name != "broadcast":
++                continue
++            broadcast_count += 1
++            if broadcast_native_contract(operation, plan) is not None:
++                native_count += 1
++            else:
++                raise AssertionError(
++                    "Qwen3.5 broadcast {} -> {} fell back: {}".format(
++                        operation.inputs[0].type.shape,
++                        operation.outputs[0].type.shape,
++                        broadcast_native_fallback_reason(operation, plan),
++                    )
++                )
++        assert broadcast_count == expected
++        assert native_count == expected
++
++
++def test_metadata_and_runtime_share_the_broadcast_predicate():
++    """Static guard: one predicate object produces metadata and dispatch."""
++
++    from pypto.compiler.targets import cpu_avx2 as compiler_module
++
++    assert avx2_runtime.broadcast_native_contract is compiler_module.broadcast_native_contract
++    assert avx2_runtime.broadcast_native_contract is broadcast_native_contract
++
++
++def test_payload_version_and_abi_marker_are_bumped(tmp_path):
++    assert ARTIFACT_PAYLOAD_VERSION == 6
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:7"
++    program = _broadcast_program("float32", (1, 5, 1), (1, 5, 8))
++    _target_ir, artifact = _compile(program, tmp_path, "marker")
++    assert artifact.metadata["artifact_payload_version"] == 6
++    assert artifact.metadata["native_broadcast_mode"] == BROADCAST_MODE
++    native_bytes = Path(artifact.path).read_bytes()
++    assert b"pypto-x.cpu.avx2:7" in native_bytes
++    assert b"pypto-x.cpu.avx2:6" not in native_bytes
++
++
++def test_payload_version_participates_in_the_artifact_cache_key(tmp_path):
++    """A pre-broadcast payload can never hash-collide with the new plane."""
++
++    program = _broadcast_program("float32", (1, 5, 1), (1, 5, 8))
++    _target_ir, artifact = _compile(program, tmp_path, "cache-key")
++    current_key = artifact.cache_key
++    metadata = dict(artifact.metadata)
++    metadata["artifact_payload_version"] = 5
++    object.__setattr__(artifact, "metadata", metadata)
++    assert artifact.cache_key != current_key
++
++
++def test_native_object_exports_both_broadcast_entrypoints(tmp_path):
++    """Static guard: the emitted object carries the declared kernel symbols."""
++
++    nm = shutil.which("nm")
++    if nm is None:
++        pytest.skip("nm is not available")
++    program = _broadcast_program("float32", (1, 5, 1), (1, 5, 8))
++    _target_ir, artifact = _compile(program, tmp_path, "symbols")
++    result = subprocess.run(
++        [nm, "-D", "--defined-only", artifact.path],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        universal_newlines=True,
++        check=False,
++    )
++    assert result.returncode == 0, result.stdout
++    assert "ptx_avx2_broadcast_f32" in result.stdout
++    assert "ptx_avx2_broadcast_bf16" in result.stdout
++    assert "ptx_avx2_abi" in result.stdout
++
++
++def test_stale_payload_and_metadata_tampering_fail_closed(tmp_path):
++    runtime = _runtime()
++    program = _broadcast_program("float32", (1, 5, 1), (1, 5, 8))
++    _target_ir, artifact = _compile(program, tmp_path, "stale")
++    original = dict(artifact.metadata)
++    for tamper in (5, 7):
++        metadata = dict(original)
++        metadata["artifact_payload_version"] = tamper
++        object.__setattr__(artifact, "metadata", metadata)
++        with pytest.raises(CpuAvx2ArtifactError, match="payload version"):
++            runtime.load(artifact)
++    for key, value in (
++        ("native_broadcast_mode", "host_reference"),
++        ("native_broadcast_operations", ()),
++        ("native_broadcast_fallback_operations", ({"operation": "broadcast"},)),
++        ("host_preexpanded_operations", ("broadcast",)),
++    ):
++        metadata = dict(original)
++        metadata[key] = value
++        object.__setattr__(artifact, "metadata", metadata)
++        with pytest.raises(CpuAvx2ArtifactError, match=key):
++            runtime.load(artifact)
++    metadata = dict(original)
++    modes = [dict(entry) for entry in metadata["execution_modes"]]
++    modes[0]["mode"] = "host_reference"
++    metadata["execution_modes"] = modes
++    object.__setattr__(artifact, "metadata", metadata)
++    with pytest.raises(CpuAvx2ArtifactError, match="execution_modes"):
++        runtime.load(artifact)
++
++
++def test_old_abi_marker_artifact_fails_closed(tmp_path):
++    program = _broadcast_program("float32", (1, 5, 1), (1, 5, 8))
++    _target_ir, artifact = _compile(program, tmp_path, "legacy-marker")
++    current_marker = b"pypto-x.cpu.avx2:7"
++    legacy_marker = b"pypto-x.cpu.avx2:6"
++    native_bytes = Path(artifact.path).read_bytes()
++    assert current_marker in native_bytes
++    legacy_bytes = native_bytes.replace(current_marker, legacy_marker)
++    assert len(legacy_bytes) == len(native_bytes)
++    legacy_dir = tmp_path / "legacy-artifacts"
++    legacy_dir.mkdir()
++    legacy_path = legacy_dir / Path(artifact.path).name
++    legacy_path.write_bytes(legacy_bytes)
++    metadata = dict(artifact.metadata)
++    metadata["native_digest"] = hashlib.sha256(legacy_bytes).hexdigest()
++    legacy_artifact = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        path=str(legacy_path),
++        metadata=metadata,
++    )
++    with pytest.raises(CpuAvx2ArtifactError, match="safety marker"):
++        _runtime().load(legacy_artifact)
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx2_layout.py b/python/tests/ut/pypto_x/test_cpu_avx2_layout.py
+index 5f71162ed..8922cc02e 100644
+--- a/python/tests/ut/pypto_x/test_cpu_avx2_layout.py
++++ b/python/tests/ut/pypto_x/test_cpu_avx2_layout.py
+@@ -570,14 +570,14 @@ def test_layout_native_metadata_declares_the_executed_kernel(tmp_path):
+ 
+ 
+ def test_payload_and_abi_marker_are_bumped(tmp_path):
+-    assert ARTIFACT_PAYLOAD_VERSION == 5
+-    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:6"
++    assert ARTIFACT_PAYLOAD_VERSION == 6
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:7"
+     program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
+     _target_ir, artifact = _compile(program, tmp_path, "marker")
+-    assert artifact.metadata["artifact_payload_version"] == 5
++    assert artifact.metadata["artifact_payload_version"] == 6
+     native_bytes = open(artifact.path, "rb").read()
+-    assert b"pypto-x.cpu.avx2:6" in native_bytes
+-    assert b"pypto-x.cpu.avx2:5" not in native_bytes
++    assert b"pypto-x.cpu.avx2:7" in native_bytes
++    assert b"pypto-x.cpu.avx2:6" not in native_bytes
+ 
+ 
+ def test_pxld_wire_is_byte_identical_to_avx512():
+@@ -1170,7 +1170,7 @@ def test_payload_version_tampering_fails_closed(tmp_path):
+     runtime = _runtime()
+     program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
+     _target_ir, artifact = _compile(program, tmp_path, "payload")
+-    for tamper in (4, 6):
++    for tamper in (5, 7):
+         metadata = dict(artifact.metadata)
+         metadata["artifact_payload_version"] = tamper
+         object.__setattr__(artifact, "metadata", metadata)
+@@ -1245,8 +1245,8 @@ def test_descriptor_digest_mismatch_at_dispatch_fails_closed(tmp_path, monkeypat
+ def test_old_abi_marker_artifact_fails_closed(tmp_path):
+     program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
+     _target_ir, artifact = _compile(program, tmp_path, "legacy-marker")
+-    current_marker = b"pypto-x.cpu.avx2:6"
+-    legacy_marker = b"pypto-x.cpu.avx2:5"
++    current_marker = b"pypto-x.cpu.avx2:7"
++    legacy_marker = b"pypto-x.cpu.avx2:6"
+     native_bytes = open(artifact.path, "rb").read()
+     assert current_marker in native_bytes
+     legacy_bytes = native_bytes.replace(current_marker, legacy_marker)
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx2_packed.py b/python/tests/ut/pypto_x/test_cpu_avx2_packed.py
+index 6404f7890..baf730997 100644
+--- a/python/tests/ut/pypto_x/test_cpu_avx2_packed.py
++++ b/python/tests/ut/pypto_x/test_cpu_avx2_packed.py
+@@ -221,17 +221,18 @@ def _cast_values(dtype, count):
+ 
+ def test_avx2_payload_and_abi_versions_are_bumped():
+     # Payload 3 / ABI :4 add the W8A8 widening kernels (contract 0002 C3);
+-    # payload 5 / ABI :6 add the native PXLD-v2 layout/split/concat plane.
+-    assert ARTIFACT_PAYLOAD_VERSION == 5
+-    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:6"
++    # payload 5 / ABI :6 add the native PXLD-v2 layout/split/concat plane;
++    # payload 6 / ABI :7 add the native f32/bf16 broadcast plane.
++    assert ARTIFACT_PAYLOAD_VERSION == 6
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:7"
+ 
+ 
+ def test_avx2_native_object_carries_the_new_abi_marker(tmp_path):
+     _, artifact = _compile_avx2(_cast_program("bf16", "float32", (4,)), tmp_path, name="marker")
+     native_bytes = Path(artifact.path).read_bytes()
+-    assert b"pypto-x.cpu.avx2:6" in native_bytes
+-    assert b"pypto-x.cpu.avx2:5" not in native_bytes
+-    assert artifact.metadata["artifact_payload_version"] == 5
++    assert b"pypto-x.cpu.avx2:7" in native_bytes
++    assert b"pypto-x.cpu.avx2:6" not in native_bytes
++    assert artifact.metadata["artifact_payload_version"] == 6
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -639,8 +640,8 @@ def test_avx2_missing_or_tampered_packed_metadata_fails_closed(tmp_path):
+ def test_avx2_old_abi_marker_artifact_fails_closed(tmp_path):
+     program = _cast_program("bf16", "float32", (10,))
+     _, artifact = _compile_avx2(program, tmp_path, name="legacy-marker")
+-    current_marker = b"pypto-x.cpu.avx2:6"
+-    legacy_marker = b"pypto-x.cpu.avx2:5"
++    current_marker = b"pypto-x.cpu.avx2:7"
++    legacy_marker = b"pypto-x.cpu.avx2:6"
+     native_bytes = Path(artifact.path).read_bytes()
+     assert current_marker in native_bytes
+     legacy_bytes = native_bytes.replace(current_marker, legacy_marker)
+diff --git a/python/tests/ut/pypto_x/test_qwen35_avx2_parity.py b/python/tests/ut/pypto_x/test_qwen35_avx2_parity.py
+index 14216bb9a..296c768f4 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_avx2_parity.py
++++ b/python/tests/ut/pypto_x/test_qwen35_avx2_parity.py
+@@ -85,7 +85,15 @@ def test_avx2_position_softmax_and_batched_matmul_parity(tmp_path):
+     _launch(scalar_softmax, [logits], [scalar_softmax_output], runtime=CpuScalarRuntime())
+     _assert_close(avx_softmax_output.flat(), scalar_softmax_output.flat())
+     assert "exp" in avx_softmax.metadata["scalar_math_lane_fallback"]
+-    assert "broadcast" in avx_softmax.metadata["host_preexpanded_operations"]
++    assert "broadcast" not in avx_softmax.metadata["host_preexpanded_operations"]
++    assert any(
++        entry["mode"] == "native_avx2_broadcast"
++        for entry in avx_softmax.metadata["execution_modes"]
++    )
++    assert any(
++        str(symbol).startswith("ptx_avx2_broadcast_")
++        for symbol in avx_softmax.metadata["native_helper_symbols"]
++    )
+ 
+     batched = build_batched_matmul((2, 2, 3), (2, 3, 4), "float32")
+     avx_batched = _compile_avx2(batched, tmp_path / "batched")
+diff --git a/python/tests/ut/pypto_x/test_w8a8_avx2.py b/python/tests/ut/pypto_x/test_w8a8_avx2.py
+index b76cd17a5..8c96efce3 100644
+--- a/python/tests/ut/pypto_x/test_w8a8_avx2.py
++++ b/python/tests/ut/pypto_x/test_w8a8_avx2.py
+@@ -258,8 +258,8 @@ def test_w8a8_opcode_names_match_the_c1_portable_constants():
+ def test_qmatmul_metadata_declares_the_native_widening_kernel(build_dir):
+     program = _qmatmul_program((2, 3), (3, 4))
+     artifact = _compile_avx2_artifact(program, build_dir, name="metadata")
+-    assert artifact.metadata["artifact_payload_version"] == ARTIFACT_PAYLOAD_VERSION == 5
+-    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:6"
++    assert artifact.metadata["artifact_payload_version"] == ARTIFACT_PAYLOAD_VERSION == 6
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:7"
+     assert tuple(artifact.metadata["w8a8_kernel_operations"]) == (W8A8_QMATMUL_OPCODE,)
+     assert artifact.metadata["w8a8_kernel_version"] == W8A8_KERNEL_VERSION == 2
+     declared = artifact.metadata["w8a8_capability"]
+@@ -758,4 +758,4 @@ def test_objdump_primitives_are_native_avx2(carrier_artifact):
+ def test_artifact_native_bytes_digest_matches(carrier_artifact):
+     native_bytes = Path(carrier_artifact.path).read_bytes()
+     assert hashlib.sha256(native_bytes).hexdigest() == carrier_artifact.content_digest
+-    assert b"pypto-x.cpu.avx2:6" in native_bytes
++    assert b"pypto-x.cpu.avx2:7" in native_bytes

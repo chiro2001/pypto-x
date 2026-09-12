@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q5_Q6_Q7_Q8_Q8B_Q9_Q10_N4_C6_C7_DONE_W8A8_V2_M2_DONE_VIEW_MODE_REQUIRE_STABLE_U2A_VENDOR_PROVIDER_DONE_AVX2_LAYOUT_DONE_SVE256_W8A8_THROUGHPUT_FIXED_0040_AND_0041_PUSHED_0042_IN_FLIGHT_REPORT_CROSS_BLOCK_15D0FE58D_1B_ECHO_RECONCILE_U2B_INT8_AVX2_BROADCAST_RUNNING_CUDA_TOOLCHAIN_BLOCKED`
+状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_0009_0010_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q5_Q6_Q7_Q8_Q8B_Q9_Q10_N4_C6_C7_DONE_W8A8_V2_M2_DONE_VIEW_MODE_REQUIRE_STABLE_U2A_VENDOR_PROVIDER_DONE_AVX2_LAYOUT_DONE_SVE256_W8A8_THROUGHPUT_FIXED_0040_AND_0041_PUSHED_0042_CLOSED_LOCALLY_PENDING_THE_USER_PUSH_APPROVAL_REPORT_HARDENING_U2B_INT8_AVX2_BROADCAST_NATIVE_CUDA_TOOLCHAIN_BLOCKED`
 
-最后更新：2026-09-12 16:45 CST（Asia/Shanghai；**0042 进行中**：report-only cross-block 已并入 integration（cherry-pick `748717529`→**`15d0fe58d`**，树一致；聚焦 352 passed、验收方 V2–V5 58 passed、collect 1681），但独立验收抓到**同类剩余缺口**——`request.*` 及其在 `resolution.rules[*].details`/`coverage.*` 的回显，与 `capability`/`resolved.target`、`provider.select`/`filter`、`policy.applicability`、`layout.alias_proof` 的普通字段回显，均可单点篡改而被接受（echo 篡改 18/19 ACCEPTED，仅 `provider.select.primary` 被拒）→ **1b 对账修复在跑**；U2b（int8 vendor）与 AVX2 broadcast 原生平面并行在跑；本机无 GPU/nvcc，CUDA 线按既定顺序仍被 toolchain 阻塞）｜**0041 已交付并推送**：integration `8fff50558`、补丁 235、规则 8 全量 1667 passed/7 skipped/0 failed、五条任务级验收全 PASS_WITH_BOUNDARIES；`origin/main = 0d0ec76`；A3 已恢复；`view_mode=require` 提级生效）
+最后更新：2026-09-12 19:50 CST（Asia/Shanghai；**0042 已本地收口，待用户批准推送**：integration 冻结 **`0376e5307`**（tree `8f705bb0d…`）、补丁 **250**（am 复算 250/250 干净、复算 tree = 冻结 tree）、规则 8 全量 **rc=0，1838 passed / 7 skipped / 0 failed，943.10 s**（collect 1845，基线 `8fff50558` = 1674）。三切片：① report 校验补强（项 1/1b/1b2/1c，验收 `cb32c1ba` 两轮 PASS_WITH_BOUNDARIES，单叶可单点篡改数 portable 335→110、vendor 347→126、fallback 404→174）；② U2b int8 vendor（`qmatmul_s8s8_s32`；验收 `71599188` 判 FAIL**仅**包络，其余 7 条 VERIFIED —— 包络经其自有生成器扩 seed 推翻后改为**观测快照 + fail-closed 门**，并修入口开销 5244→152.8 ms、性能改同窗口 0.919×；claim-2 复检在跑）；③ AVX2 broadcast 原生平面（decode 350/350、prefill 494/494 全 native；decode launch 23.78→12.91 s、prefill 108.74→71.05 s；独立验收 `d119bbce` 在跑）。本机无 GPU/nvcc，CUDA 线仍被 toolchain 阻塞）｜**0041 已推送**：`origin/main = 0d0ec76`、补丁 235、五条任务级验收全 PASS_WITH_BOUNDARIES）
 
 > **零记忆恢复（上下文压缩后）**：按顺序读 本文件 §0 → `docs/00-handoffs/ERRATA.zh-CN.md` → `docs/00-handoffs/0039-2026-09-11-a3-onboarding-ascend-bridge-sve-w8a8.zh-CN.md` → `configs/development_lock.yaml` 的 `waves.W8.in_flight_2026_09_11_batch2` 与 `pending_user_decisions_2026_09_11`。
 
@@ -28,8 +28,11 @@
    a) **先读 lock 的 `waves.W8.batch_0041_accumulating_2026_09_12`（+ `in_flight_2026_09_11_batch2` 里仍标 in-flight 的项）**——它才是权威清单。
       当前（2026-09-12 13:20 CST / 05:20Z）：**0041 已交付并推送**（`origin/main = 0d0ec76`，integration tip `8fff50558`，
       235 补丁，规则 8 全量 1674 collected / 1667 passed / 7 skipped / 0 failed，五条任务级验收全 PASS_WITH_BOUNDARIES）；
-      **0042 在跑**（integration tip `15d0fe58d`）：1b 回显对账修复（agent `ecf51a8a`）／U2b int8 vendor（agent `264646fb`）／
-      AVX2 broadcast 原生平面（agent `c8a613dc`）／0042 report 独立验收（agent `cb32c1ba`）；**A3 空闲**（2026-09-11T23:51Z 起可用）；
+      **0042 已本地收口（待用户批准推送）**：冻结 `integration = 0376e5307`、补丁 **250**（am 复算 tree 一致）、
+      规则 8 全量 **rc=0 / 1838 passed / 7 skipped / 0 failed / 943.10 s**（collect 1845，基线 `8fff50558` = 1674）；
+      三切片 = report 校验补强（1/1b/1b2/1c）＋U2b int8 vendor（包络改观测快照 + fail-closed 门、入口开销 5244→152.8 ms）＋
+      AVX2 broadcast 原生平面（decode 350/350、prefill 494/494 全 native）；在途收尾验收：`cb32c1ba`（1c@T6）、`71599188`（U2b claim-2@T6）、`d119bbce`（AVX2@`b89e0b521`）；
+      **A3 空闲**（2026-09-11T23:51Z 起可用）；
       **本机无 GPU / nvcc**（lock: `cuda_c1_acceptance_smoke: BLOCKED_TOOLCHAIN_nvcc_absent`），CUDA 线按 `avx512_and_sve256_first_cuda_later` 仍被工具链阻塞。
    b) **0041 已交付的主要结论**（引用以 lock/ERRATA 为准）：
       · **AVX2 layout 原生化**（`1b1c40656`+`7d8762abe`）：decode launch 28.5→20.4 s、prefill 127.9→109.3 s；per-op layout 中位 0.02–0.04 ms；
@@ -54,25 +57,31 @@
    c) **待用户裁决（6 项，见 `pending_user_decisions_2026_09_11`）**：L4 decode 口径（**最靠前**，决策包 `docs/20-planning/0011`，
       推荐 A+B）｜B4 阈值冻结｜L5/L6 语料与阈值（`0005 §10` 三句话）｜W8A8 之外的新量化方案｜W8J 注入门政策｜A3 chip7/NPU 放行。
       （`view_mode=require` 已于 2026-09-12 裁决并生效。）
-   d) **0042（进行中，2026-09-12T08:35Z；integration tip `15d0fe58d`）**：
-      · **已并入 — report-only cross-block**：任务 commit `748717529` → cherry-pick **`15d0fe58d`**（树 `c54671ffd` 与任务分支完全一致）；
-        聚焦 11 文件 **352 passed**（169.59 s）、验收方 V2–V5 **58 passed**（18.57 s）、collect **1681**（0041 tip 1674，+7）。
-        新增 4 条 cross-block must-reject（capability/contract digest、provider_declared、fallback_used）+ 2 条 contract-derived
-        （`guarantees.accumulation` 由注册 `OpDefinition`+`request.dtype` 重算、`exactness_basis` 由 provider family 重算）；
-        仍属单文档边界的字段（`artifact.pack.included_in_timing`、`resolution.plan_digest`、不嵌 manifest 时的库指纹等）见 0006 §7.1。
-      · **1b（在跑）— 回显对账**：独立验收 + 父方探针抓到**同类剩余缺口**：`request.{op,dtype,left/right/output_shape}` 与其在
-        `resolution.rules[op_contract.lookup|verify].details`、`coverage.*.opcode` 的回显，以及 `capability`/`resolved.target`/`resolved_policy.target`/
-        `provider.select|filter`/`policy.applicability`/`layout.alias_proof` 的普通字段回显，均可**单点篡改而被接受**（echo 篡改 18/19 ACCEPTED，
-        仅 `provider.select.primary` 被拒）。父方探针：`_meta/pypto-x/view-mode-require/scripts/probe_request_block_hole.py` 与
-        `probe_rule_echo_holes.py`（证据 `raw/probe_*.json`）；验收方穷举分类 `_meta/pypto-x/verify-0042-report-cross-block/raw/08_exhaustive_classes.log`。
-        修复要求：按**规则名**（不是下标）逐条对账、缺失/重复回显 fail-closed、不可对账者登记为边界。agent `ecf51a8a`（分支 `work/view-mode-require`，已 rebase 到 `15d0fe58d`）。
-      · **在跑 — U2b**：int8/W8A8 的 AOCL vendor 绑定（agent `264646fb`，分支 `work/u2b-vendor-int8`，已 rebase 到 `15d0fe58d`）；
-        新契约 `qmatmul_s8s8_s32`（packed `[K,out]` 直供 LPGEMM；K≤1024 与契约逐位一致、大 K 仅 `deterministic_bounded`、
-        K≥133145 回绝、`-128` 拒绝）。**交叉影响**：其 `accumulation` 表只有 `integer` 键，必须验证真报告能通过 1 的 cross-block 校验。
-      · **在跑 — AVX2 broadcast 原生平面**（AVX 线）：agent `c8a613dc`，分支 `work/avx2-broadcast-native`（基于 `15d0fe58d`）；
-        镜像 AVX-512 `ptx_avx512_broadcast_f32/bf16` + `broadcast_native_contract()` 先例，把 `broadcast` 移出 `host_preexpanded_operations`，
-        payload 5→6 / marker :6→:7；目标消掉 prefill 剩余 ~39 s 的大头；perf 复用 `_meta/pypto-x/avx2-layout-native/scripts/l1_avx2_instrument.py` 同款 harness（UNGATED）。
-      · **未动**：U3（doctor/explain/plan）、U4（35 env 迁移）、U5（graph/region，等 N4）、memo 命中 ELF 加固、C8 L5/L6（等用户三句话）。
+   d) **0042（已本地收口，待用户批准推送；冻结 integration `0376e5307`，tree `8f705bb0d…`）**：
+      · **交付规模**：补丁 **250**（0041 = 235；250 个 `git am` 全部干净、复算 tree = 冻结 tree）；规则 8 全量
+        **rc=0 / 1838 passed / 7 skipped / 0 failed / 943.10 s**（collect **1845**，基线 `8fff50558` = 1674；added 171 / removed 0；
+        7 skip 全为 `test_cuda_qwen_c2.py` 无 CUDA 驱动）。首跑曾 1 failed（op-bench 的 repeat-run 离散度单测，`median_delta=11.2%`
+        略超其自带 10% 容忍，因 AVX2 验收方并发持锁；安静窗口重跑干净，证据 `raw/failed-run-T6-attempt2.log`）。
+      · **切片① report 校验补强（1/1b/1b2/1c）**：4 条 cross-block + 2 条 contract-derived，随后按 **rule 名**对账全部具名
+        `resolution.rules[*].details` 回显（缺失/重复/未知 fail-closed），再补齐 `request.{op,dtype,shapes}`、fallback 链结构、
+        selected candidate 的 rank/dtype/deterministic 锚点，以及 1c 的 `degraded`/`threads`/`scope`/`error_budget`/`basis`/`stride_class` 回显。
+        验收 `cb32c1ba` 两轮 **PASS_WITH_BOUNDARIES**：单叶"单点篡改被接受"数 portable 335→110、vendor-f32 347→126、fallback 404→174；
+        真 portable + 真 AOCL vendor bf16/f32 + 真 runtime-fallback 报告全部通过（无误伤）。**边界**：协调改写全部副本、`plan_digest`、
+        `content_digest`、manifest-only 事实仍不可单文档自证；执行授权只认 `execute_matmul_plan` canonical 重算；下游不得据 report 重新规划。
+      · **切片② U2b int8 vendor**：新契约 `qmatmul_s8s8_s32`（int8×int8→int32，rank 2–4，K≤133144，码值 [-127,127]，packed `[K,out]`
+        直供 LPGEMM，适配器层 `-128`/K≥133145 fail-closed）。验收 `71599188` 判 **FAIL 仅包络**、其余 7 条 VERIFIED；
+        **包络被其自有生成器扩 seed 推翻**（seeds 1–1000 → K=133144 最大 966 > 声明 457，且中位数 458 已超；K=16696 → 75 > 56）→
+        改为**观测快照 + `require_proven_deviation_bound` fail-closed 门 + 支配不变式**（不声称上界，见 ERR-0010）。副发现并修复：
+        同窗口性能实为 **0.919–0.932×**（非加速；旧 1.16×/1.71× 是跨窗口相除）、每 forward 入口逐元素 `isinstance` 开销
+        （1×1024×8192 dispatch **5244→152.8 ms**）。claim-2 复检在跑。
+      · **切片③ AVX2 broadcast 原生平面**：`ptx_avx2_broadcast_f32/bf16` + 共享谓词，`broadcast` 移出 `host_preexpanded_operations`，
+        payload 5→6 / marker :6→:7。Qwen3.5 census：decode **350/350**、prefill **494/494** 全 native、0 fallback；
+        launch **23.78→12.91 s**（decode）、**108.74→71.05 s**（prefill），host_reference 8.26/39.43 s → ~0；整图 51 输出 digest 前后一致。
+        独立验收 `d119bbce` 在跑。
+      · **ERRATA**：ERR-0009（0042 报告边界声明被穷举验收证伪）、ERR-0010（int8 包络不是上界，两次修订）。
+      · **在途收尾验收**：`cb32c1ba`（1c@T6）、`71599188`（U2b claim-2@T6）、`d119bbce`（AVX2@`b89e0b521`）。
+      · **排队**：U3（doctor/explain/plan）、U4（35 env 迁移）、U5（graph/region，等 N4）、report schema v2（manifest 内嵌）、
+        fused `sym_quant` 契约、`auto_static` vendor 语义、memo 命中 ELF 加固、C8 L5/L6（等用户三句话）、int8 可证明包络（形式化或精确 int32 恢复）。
       · **A3 空闲**（2026-09-11T23:51Z 起可用），新 A3 leg 直接派即可，不必再挂 PENDING。
 5. 并发与资源：平台无 subagent 并发上限（旧文档的 ≤3 属自设假设，ERR-0005 已更正）；重任务一律经 scripts/resource/run_local_heavy.sh（返回 75/69 就等待重试，
    禁止绕过）；**等锁时挂后台或长 timeout，不要在前台循环空转**（会耗尽 agent 回合，S1 曾因此中断一次）；

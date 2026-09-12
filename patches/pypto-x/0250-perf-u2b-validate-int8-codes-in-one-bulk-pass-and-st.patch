@@ -1,0 +1,371 @@
+From 0376e5307e7fd2b19cd834def52e2aaa7e487388 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 18:56:57 +0800
+Subject: [PATCH 250/250] perf(u2b): validate int8 codes in one bulk pass and
+ stop leaking BLIS threads
+
+verify-0042-u2b measured the per-element _check_codes isinstance loop at 20.7ms-5.06s of entry dispatch (op 0.29-2.61ms).  Replace it with a single array('b', values) conversion (C-level type/range work) plus one memchr for the reserved -128 code, and hand the converted buffers to the GEMM via prepare_int32(left_codes=..., right_codes=...) so the elements are marshalled once.  The strict per-element validator stays as the structured-error fallback for non-integer containers.  -128 and out-of-range remain fail-closed before any kernel call, outputs stay untouched, and the api_pinned path now restores BLIS's process-global thread count so it cannot leak into other providers.  Same-window evidence: dispatch geomean ~25x cheaper (1,1024,8192: 5.64s -> 157.5ms), leaving the unavoidable Python->C marshalling floor.
+---
+ python/pypto/execution/provider_aocl_int8.py           | 122 +++++++++++++++++++++++++++++++------
+ python/tests/ut/pypto_x/test_execution_qmatmul_aocl.py | 111 ++++++++++++++++++++++++++++++++-
+ 2 files changed, 214 insertions(+), 19 deletions(-)
+
+diff --git a/python/pypto/execution/provider_aocl_int8.py b/python/pypto/execution/provider_aocl_int8.py
+index 152ff848d..a1454695e 100644
+--- a/python/pypto/execution/provider_aocl_int8.py
++++ b/python/pypto/execution/provider_aocl_int8.py
+@@ -4,8 +4,12 @@ Scope (frozen by the U2b dispatch and the W8A8 contract v2):
+ 
+ * ``vendor:aocl-lpgemm-int8`` -- ``aocl_gemm_s8s8s32os32`` consuming the c1
+   packed ``[K, out]`` row-major weight **directly** (``mem_format_b='n'``,
+-  ``rs_b=n`` / ``cs_b='n'``): zero per-forward repack and zero transfer, the
+-  pack is already the ingestion-time artifact layout (0010 sections 3.4/5);
++  ``rs_b=n`` / ``cs_b='n'``): zero adapter-level reorder/copy, zero transfer;
++  the pack is already the ingestion-time artifact layout (0010 sections 3.4/5).
++  Note for honest baselines: LPGEMM itself still packs the passed row-major B
++  *inside* the call (``mtag_b`` ``UNPACKED`` -> ``PACK``), so the same-storage
++  baseline is exactly that unpacked ``aocl_gemm_s8s8s32os32`` call, not the
++  pre-reordered Q8 ``aocl_int8_packed`` protocol;
+ * the same library's fused ``aocl_gemm_s8s8s32obf16_sym_quant`` variant is
+   declared as a provider capability and implemented here, but is **not routed
+   through the U1 opcode SPI** in this slice: the SPI passes two operands and a
+@@ -252,8 +256,12 @@ def _int8_pack_spec(variant: str = "int32") -> Mapping[str, Any]:
+         "b_layout": "k_out_rowmajor",
+         "b_strides": "[n, 1] (cs_b='n')",
+         "per_forward_repack_bytes": 0,
+-        "note": "the c1 packed [K,out] row-major artifact is consumed directly as B; no "
+-                "reorder, no copy, no per-forward transfer",
++        "note": "the c1 packed [K,out] row-major artifact is consumed directly as B: the "
++                "adapter performs no reorder, copy or per-forward transfer.  This is an "
++                "adapter-level statement only -- LPGEMM still packs the passed row-major B "
++                "inside the call (mtag_b UNPACKED -> PACK), and the honest same-storage "
++                "baseline is that unpacked aocl_gemm_s8s8s32os32 call itself (measured in "
++                "the same window by raw/perf-matrix.json)",
+     }
+ 
+ 
+@@ -591,7 +599,9 @@ def aocl_int8_provider_capabilities(
+             "max_rank": 2,
+             "packed_layout": "k_out_rowmajor",
+             "packed_layout_version": 3,
+-            "b_operand": "contiguous row-major [K,out]; read directly, no per-forward repack",
++            "b_operand": "contiguous row-major [K,out]; passed directly to "
++                         "aocl_gemm_s8s8s32os32(mem_format_b='n'), no adapter-level "
++                         "reorder/copy (LPGEMM packs it internally)",
+             "slice_step_domain": "positive",
+             "layout_descriptor_version": 1,
+             "code_range": [AOCL_INT8_QUANT_MIN, AOCL_INT8_QUANT_MAX],
+@@ -667,7 +677,9 @@ def _packed_f32(values: Sequence[Any], label: str) -> "ctypes.Array":
+     return array
+ 
+ 
+-def _check_codes(values: Sequence[Any], label: str) -> None:
++def _check_codes_strict(values: Sequence[Any], label: str) -> None:
++    """Per-element validator: the structured-error fallback of ``_check_codes``."""
++
+     for index, code in enumerate(values):
+         # ``numbers.Integral`` accepts numpy integer scalars (the ingestion
+         # packer hands over array elements) but not bools or floats.
+@@ -696,6 +708,49 @@ def _check_codes(values: Sequence[Any], label: str) -> None:
+             )
+ 
+ 
++#: ``-128`` is the only in-range int8 value outside the frozen contract domain.
++_RESERVED_CODE_BYTE = b"\x80"
++
++
++def _check_codes(values: Sequence[Any], label: str) -> "array":
++    """Validate the s8 code domain in one bulk conversion; returns the buffer.
++
++    ``array('b', values)`` performs the per-element type/range work in C
++    (``__index__``; ``TypeError`` for floats/strings, ``OverflowError`` outside
++    [-128, 127]) and yields exactly the buffer the GEMM consumes, so callers do
++    not pay a second Python-level pass over M*K + K*N elements.  The only
++    in-range contract violation left is the reserved ``-128`` code, found with
++    a single ``memchr`` over the converted bytes (an ``array('b')`` can never
++    hold a value above 127).  ``bool`` is an ``int`` subclass, so ``True`` /
++    ``False`` are accepted as their numeric codes 1 / 0; non-integer container
++    elements fall back to the strict per-element validator for its structured
++    ``code_not_integer`` / ``code_out_of_range`` errors.
++    """
++
++    try:
++        codes = array("b", values)
++    except (TypeError, ValueError, OverflowError):
++        _check_codes_strict(values, label)
++        raise AssertionError("_check_codes_strict must raise")  # pragma: no cover
++    if codes:
++        index = codes.tobytes().find(_RESERVED_CODE_BYTE)
++        if index >= 0:
++            raise OpContractError(
++                "{}[{}]={} is outside the frozen s8 code range [{}, {}]".format(
++                    label, index, -128, AOCL_INT8_QUANT_MIN, AOCL_INT8_QUANT_MAX
++                ),
++                field="request." + label,
++                requested=-128,
++                available={
++                    "min": AOCL_INT8_QUANT_MIN,
++                    "max": AOCL_INT8_QUANT_MAX,
++                    "reserved": -128,
++                },
++                reason="reserved_code_point",
++            )
++    return codes
++
++
+ def _contiguous_strides(shape: Sequence[int]) -> Tuple[int, ...]:
+     strides = []
+     running = 1
+@@ -883,8 +938,10 @@ class AoclLpgemmInt8Provider:
+             )
+         # Contract code-domain check *before* any kernel call: LPGEMM silently
+         # accepts -128 and any other int8, so the adapter owns this boundary.
+-        _check_codes(left.data, "left")
+-        _check_codes(right.data, "right")
++        # ``_check_codes`` returns the converted buffer, which is handed to the
++        # GEMM so the M*K + K*N elements are marshalled exactly once.
++        left_codes = _check_codes(left.data, "left")
++        right_codes = _check_codes(right.data, "right")
+ 
+         if capability is not None and getattr(capability, "digest", None) != plan.capability_digest:
+             raise ArtifactMismatchError(
+@@ -919,12 +976,31 @@ class AoclLpgemmInt8Provider:
+                 reason="plan_thread_exceeds_host_parallelism",
+             )
+         lib = _get_library(self.library_path)
++        # ``api_pinned`` sets BLIS's *process-global* thread count; restore the
++        # pre-call value afterwards so this provider cannot leak a knob into
++        # other providers (e.g. the U2a bf16 provider measuring its own
++        # ``env_default`` thread footprint in the same process).
++        previous_blis_threads = int(lib.bli_thread_get_num_threads())
+         thread_mode, thread_state = _apply_declared_thread_mode(
+             lib, self.library_path, threads, str(plan.selected.get("thread_mode", "env_default"))
+         )
+-        return self._execute_int32(
+-            plan, left, right, output, lib, threads, binding_mode, thread_mode, thread_state
+-        )
++        try:
++            return self._execute_int32(
++                plan,
++                left,
++                right,
++                output,
++                lib,
++                threads,
++                binding_mode,
++                thread_mode,
++                thread_state,
++                left_codes=left_codes,
++                right_codes=right_codes,
++            )
++        finally:
++            if thread_mode == "api_pinned":
++                lib.bli_thread_set_num_threads(previous_blis_threads)
+ 
+     def _check_request(
+         self,
+@@ -985,14 +1061,21 @@ class AoclLpgemmInt8Provider:
+                 )
+ 
+     def prepare_int32(
+-        self, left: HostTensor, right: HostTensor
++        self,
++        left: HostTensor,
++        right: HostTensor,
++        *,
++        left_codes: Optional["array"] = None,
++        right_codes: Optional["array"] = None,
+     ) -> Any:
+         """Prepare one int32 GEMM call with buffers built outside the timed region.
+ 
+         Returns a zero-argument callable; ``output`` is the reused ``c_int32``
+         buffer.  The execution path uses this so ``op_seconds`` measures only
+         the library call, and the evidence matrix can run a tight Q8-aligned
+-        loop without paying Python marshalling between timed calls.
++        loop without paying Python marshalling between timed calls.  Callers
++        that already validated/converted the codes (``execute``) pass the
++        buffers as ``left_codes``/``right_codes`` to avoid a second pass.
+         """
+ 
+         _check_operand(left, "left")
+@@ -1014,8 +1097,8 @@ class AoclLpgemmInt8Provider:
+                 requested={"left_k": k, "right_k": int(right.shape[0])},
+                 reason="shape_rule_violation",
+             )
+-        _check_codes(left.data, "left")
+-        _check_codes(right.data, "right")
++        a_arr = _check_codes(left.data, "left") if left_codes is None else left_codes
++        b_arr = _check_codes(right.data, "right") if right_codes is None else right_codes
+         if k > AOCL_INT8_K_ACCUMULATION_LIMIT:
+             raise OpContractError(
+                 "qmatmul_s8s8_s32 K={} exceeds the provider's INT32 accumulation limit {} (Q5)".format(
+@@ -1028,8 +1111,6 @@ class AoclLpgemmInt8Provider:
+             )
+         lib = _get_library(self.library_path)
+         _ensure_int8_bound(self.library_path, lib)
+-        a_arr = array("b", left.data)
+-        b_arr = array("b", right.data)
+         a_buf = (ctypes.c_int8 * len(a_arr)).from_buffer(a_arr)
+         b_buf = (ctypes.c_int8 * len(b_arr)).from_buffer(b_arr)
+         c_buf = (ctypes.c_int32 * (m * n))()
+@@ -1065,8 +1146,13 @@ class AoclLpgemmInt8Provider:
+         binding_mode: str,
+         thread_mode: str,
+         thread_state: Mapping[str, Any],
++        *,
++        left_codes: Optional["array"] = None,
++        right_codes: Optional["array"] = None,
+     ) -> ProviderOutcome:
+-        prepared = self.prepare_int32(left, right)
++        prepared = self.prepare_int32(
++            left, right, left_codes=left_codes, right_codes=right_codes
++        )
+         started = time.perf_counter()
+         prepared()
+         op_seconds = time.perf_counter() - started
+diff --git a/python/tests/ut/pypto_x/test_execution_qmatmul_aocl.py b/python/tests/ut/pypto_x/test_execution_qmatmul_aocl.py
+index 85537d17b..56d549379 100644
+--- a/python/tests/ut/pypto_x/test_execution_qmatmul_aocl.py
++++ b/python/tests/ut/pypto_x/test_execution_qmatmul_aocl.py
+@@ -75,6 +75,9 @@ def _imports():
+             AoclLpgemmInt8Provider,
+             AOCL_INT8_MEASURED_DEVIATION_BY_K,
+             AOCL_INT8_UPPER_BOUND_STATUS,
++            _check_codes,
++            _check_codes_strict,
++            _get_library,
+         )
+         from pypto.execution.resolver import resolve_qmatmul
+         return locals()
+@@ -103,6 +106,9 @@ ARTIFACT_MISMATCH = _C["ARTIFACT_MISMATCH"]
+ NUMERIC_GUARANTEE_UNMET = _C["NUMERIC_GUARANTEE_UNMET"]
+ PROVIDER_UNAVAILABLE = _C["PROVIDER_UNAVAILABLE"]
+ AoclLpgemmInt8Provider = _C["AoclLpgemmInt8Provider"]
++_get_library = _C["_get_library"]
++_check_codes = _C["_check_codes"]
++_check_codes_strict = _C["_check_codes_strict"]
+ CapabilitySnapshot = _C["CapabilitySnapshot"]
+ ExecutionError = _C["ExecutionError"]
+ ExecutionPlan = _C["ExecutionPlan"]
+@@ -261,10 +267,15 @@ def test_pinned_int8_probe_facts_and_manifest():
+     assert entry.preconditions["max_rank"] == 2
+     assert entry.preconditions["packed_layout"] == "k_out_rowmajor"
+     assert entry.preconditions["packed_layout_version"] == 3
+-    # Packed [K,out] is consumed directly: no per-forward repack/transfer.
++    # Packed [K,out] is consumed directly: no adapter-level repack/transfer.
+     assert entry.pack["strategy"] == "direct_consume_packed_k_out_rowmajor_zero_repack"
+     assert entry.pack["included_in_timing"] is False
+     assert entry.pack["per_forward_repack_bytes"] == 0
++    # The note must stay honest: LPGEMM packs the passed row-major B inside the
++    # call, so the same-storage baseline is that unpacked call itself.
++    assert "adapter" in entry.pack["note"]
++    assert "LPGEMM" in entry.pack["note"]
++    assert "UNPACKED" in entry.pack["note"]
+     # Fused sym_quant is declared, classified and explicitly not routed.
+     fused = entry.fused_variants["sym_quant_bf16"]
+     assert fused["numeric_class"] == "deterministic_bounded"
+@@ -444,6 +455,104 @@ def test_vendor_qmatmul_reserved_minus128_is_rejected_without_write():
+     assert plan.digest == plan_qmatmul(left.shape, right.shape, policy).plan.digest
+ 
+ 
++def test_check_codes_bulk_validator_returns_the_gemm_buffer():
++    """The code-domain check is one bulk conversion, not a per-element loop."""
++
++    from array import array as _array
++
++    codes = _check_codes([0, 1, -127, 127] * 8, "left")
++    assert isinstance(codes, _array)
++    assert codes.typecode == "b"
++    assert list(codes) == [0, 1, -127, 127] * 8
++    assert list(_check_codes((5, -3), "right")) == [5, -3]
++    assert len(_check_codes([], "left")) == 0
++
++
++def test_check_codes_reserved_point_and_strict_fallbacks():
++    with pytest.raises(OpContractError) as excinfo:
++        _check_codes([1, 2, -128, 4], "left")
++    assert excinfo.value.reason == "reserved_code_point"
++    assert excinfo.value.requested == -128
++    assert excinfo.value.field == "request.left"
++    for bad, reason in (
++        ([200], "code_out_of_range"),
++        ([-129], "code_out_of_range"),
++        ([1.5], "code_not_integer"),
++        (["x"], "code_not_integer"),
++    ):
++        with pytest.raises(OpContractError) as excinfo:
++            _check_codes(bad, "right")
++        assert excinfo.value.reason == reason, (bad, excinfo.value.to_dict())
++        assert excinfo.value.field == "request.right"
++    # The per-element validator is the structured-error fallback.
++    with pytest.raises(OpContractError) as excinfo:
++        _check_codes_strict([1.5, 2], "left")
++    assert excinfo.value.reason == "code_not_integer"
++
++
++def test_check_codes_accepts_numpy_integer_scalars():
++    import numpy as np
++
++    values = [np.int8(3), np.int16(-5), np.int64(127)]
++    codes = _check_codes(values, "left")
++    assert list(codes) == [3, -5, 127]
++    with pytest.raises(OpContractError) as excinfo:
++        _check_codes([np.int8(-128)], "left")
++    assert excinfo.value.reason == "reserved_code_point"
++
++
++@requires_aocl
++@requires_int8_host
++def test_vendor_entry_overhead_tracks_the_bulk_marshalling_floor():
++    """Dispatch is O(marshalling), not the old per-element Python scan.
++
++    The reference floor is the same call the adapter must make anyway
++    (``array('b', data)`` for both operands); the pre-fix per-element validator
++    was ~19x the bulk conversion for the same 8.4M elements (2.48 s vs
++    0.13 s).  The bound is deliberately generous (6x the floor) so a loaded
++    host cannot fail it while a regression to a Python-level scan does.
++    """
++
++    from array import array as _array
++    import time as _time
++
++    left = _tensor((5, 1024), seed=611)
++    right = _tensor((1024, 1024), seed=612)
++    policy = _vendor_policy(max_threads=1)
++    started = _time.perf_counter()
++    _array("b", left.data)
++    _array("b", right.data)
++    floor = _time.perf_counter() - started
++    started = _time.perf_counter()
++    output, report = execute_qmatmul(left, right, policy)
++    dispatch = _time.perf_counter() - started
++    assert len(output.flat()) == 5 * 1024
++    assert report.to_dict()["guarantees"]["exactness_envelope"]["deviation_bound_kind"] == (
++        "measured_snapshot"
++    )
++    assert dispatch < max(1.0, 6.0 * floor), (dispatch, floor)
++
++
++@requires_aocl
++@requires_int8_host
++def test_vendor_execution_restores_the_process_blis_thread_count():
++    """api_pinned must not leak BLIS's process-global thread count."""
++
++    left = _tensor((2, 64), seed=701)
++    right = _tensor((64, 2), seed=702)
++    policy = _vendor_policy(max_threads=1)
++    lib = _get_library(AOCL_DEFAULT_LIBRARY)
++    before = int(lib.bli_thread_get_num_threads())
++    output, report = execute_qmatmul(left, right, policy)
++    after = int(lib.bli_thread_get_num_threads())
++    assert after == before, (
++        before,
++        after,
++        report.to_dict()["resolved"].get("provider"),
++    )
++    assert len(output.flat()) == 4
++
++
+ @requires_aocl
+ @requires_int8_host
+ def test_qmatmul_plan_json_roundtrip_keeps_digest_and_envelope():
