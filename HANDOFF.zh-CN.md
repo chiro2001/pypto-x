@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q7_Q8_Q8B_N4_C6TIMING_DONE_LAUNCH_CACHE_DONE_CUDA_QUANTIZE_DONE_C8_Q5_BLOCKED_ON_SVE_INT8_Q10_MERGED_VERIFYING_SVE_LIVENESS_MERGED_A3_LEG_PENDING_Q9_IN_FLIGHT_U1_REFIX_MERGED_AS_8360A9AEE_REVERIFYING_INTEGRATION_HEALTHY_D1_D2_VERIFIED_D3_FIXED_FINAL_RULE8_RUN_PENDING_Q9_OPBENCH_MERGED_C7_DECODE_DIAGNOSED_U1_REVERIFIED_PASS_WITH_BOUNDARIES_Q10_VERIFIED_PASS_WITH_BOUNDARIES_W8A8_V2_M1_DONE_A3_OUTAGE_OPEN`
+状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q5_Q6_Q7_Q8_Q8B_Q9_Q10_N4_C6_C7_DONE_W8A8_V2_M2_DONE_VIEW_MODE_REQUIRE_STABLE_U2A_VENDOR_PROVIDER_DONE_AVX2_LAYOUT_DONE_SVE256_W8A8_THROUGHPUT_FIXED_0040_AND_0041_PUSHED_0042_SEEDS_READY`
 
-最后更新：2026-09-12 06:25 CST（Asia/Shanghai；**0040 批次已收口待推送**：最终 tip `c63558e9e` 全量 **1438/1431/7/0/0 rc=0**（规则 8 PASS）；补丁 217；D-1/D-2 验收 V1–V4 PASS；规则 8 全量抓到 **D-3**（Q9 新测试文件 session 污染 10 failed）→ 已修合并（tip `c63558e9e`）→ 最终全量在跑；U1 第二轮 **PASS_WITH_BOUNDARIES**；Q10 **PASS_WITH_BOUNDARIES**（A3 leg pending）；C7 decode 缺口定位闭环 + 下钻得"分布式、无支配算子"；**integration 体检判 HEALTHY**（受检 `7e2aea514`，1394/1387/7/0/0，rc=0，759 s，+190/−3 收集差全部溯源），并查出 **D-1**（C6 harness 被 cherry-pick 顺序回退）与 **D-2**（`pack_ours_logits.py` 未定义名）——两者已修复并合入（tip `77981213e`，含新增 6 条静态守卫测试），独立验收在跑、规则 8 全量需在新 tip 重跑｜**U1 首切片验收判 FAIL**（3 条阻断：target fail-open / `policy_from_dict` 吞 `schema_version` / `output` 别名覆盖输入），回修中｜Q10（SVE256 int8 layout）与 liveness 均已合入：Q10 A3 原生 43/43（断线前）、liveness 本地三套件全绿、A3 侧确认待恢复｜C6 计时与 launch-artifact-cache 收口（quantize 重写后位级 58/58、中位 24×；prefill −38.2%、decode −32.1%）｜**A3 自 ~19:12Z 起不可达（20:33Z 复核仍 BLOCKED）**｜控制仓最近一次 push 仍为 7857ae6、补丁 144）
+最后更新：2026-09-12 13:20 CST（Asia/Shanghai；**0041 已交付并推送**：integration `8fff50558`、补丁 235、规则 8 全量 1667 passed/7 skipped/0 failed、五条任务级验收全 PASS_WITH_BOUNDARIES；`origin/main = 0d0ec76`（0040+0041 均已推送、私有备份同步）；A3 已恢复；`view_mode=require` 提级生效；**0042 种子已列 §0.d**；控制仓本地除推送记录外无未推提交）
 
 > **零记忆恢复（上下文压缩后）**：按顺序读 本文件 §0 → `docs/00-handoffs/ERRATA.zh-CN.md` → `docs/00-handoffs/0039-2026-09-11-a3-onboarding-ascend-bridge-sve-w8a8.zh-CN.md` → `configs/development_lock.yaml` 的 `waves.W8.in_flight_2026_09_11_batch2` 与 `pending_user_decisions_2026_09_11`。
 
@@ -25,50 +25,37 @@
    不把静态 lowering 说成真机 PASS；不把 A2 的限定式关闭说成"PyPTO Ascend 后端已通"；
    不推公开仓/不改历史/不发权重证据，除非用户当次明确指示。
 4. 用户说"继续"时的默认动作（按优先级）：
-   a) **先读 lock 的 `waves.W8.in_flight_2026_09_11_batch2`**——它才是权威的在跑清单；当前（2026-09-12 04:50 CST）在跑：
-      `verify-c6-harness-preflight-fold`（D-1/D-2 独立验收 + 新 tip 规则 8 全量）｜`verify-sve256-int8-layout`（Q10 复验）｜
-      `op-bench-framework`(Q9，等 local 锁)｜`c7-decode-gap-localization`（oracle swap 等 3–5 min 锁窗）｜
-      `verify-u1-matmul-policy-slice` 复验（回修 `dce9be581` 已合入 `8360a9aee`）｜`avx2-layout-native`（本批外，AVX2 原生 layout）｜`sve256-liveness-release`（A3 leg 待恢复）；
-      已结束：`integration-health-check`（HEALTHY，受检 `7e2aea514`）。
-   b) **0040 本批已收口的主要结论**（引用时以 lock/ERRATA 为准，不要凭记忆）：
-      · **集成体检 HEALTHY**（2026-09-12，`docs`/lock 有全量证据目录 `worktrees/_meta/pypto-x/integration-health-check`）：
-        `7e2aea514` 上 1394 collected / 1387 passed / 7 skipped（7 条 CUDA driver unavailable）/ 0 failed / 0 error，rc=0，
-        758.99 s；收集数 +190/−3 逐项溯源（新文件全部有来源，消失的 3 个是 Q10 版本改名）；发现 **D-1**（见下）与 **D-2**。
-      · **D-1/D-2（已修，待验收）**：`scripts/perf/c6_timing_harness.py` 被 cherry-pick 顺序回退（修复提交先落、功能提交
-        后落整份覆盖），丢掉 GPU preflight 与 `dispatch_overhead` 的 TimingProxy 修复（`runtime_proxy.collect()` 必抛
-        `AttributeError` 被吞成 error dict）→ 已把 `c6a97dc80` 的 delta fold 回 tip（`77981213e`，保留 R6 的
-        `count = m * int(CUDA_W8A8_BLOCK)`）并加 6 条静态 AST 守卫（修复前文件 4/6 红）；`pack_ours_logits.py:66` 的
-        未定义名同批修复；**规则 8 全量必须在新 tip 重跑**。
-      · **ERR-0006**：B3c 的"41–49% 逐 op 派发"是残差误读——实为**每 launch 的 artifact 校验/重复 lowering/ELF decode**（loop 胶水仅 0.003 ms/op）；N4.0 去重 + launch-artifact-cache 已入（prefill 18.094→**11.745 s**，−38.2%；decode 8.078 s，−32.1%；同 artifact 重复 launch 0.63 s）。
-      · **C8 主判定**：对 W8A8 参照 gold 的 prefill 口径 **6/6 PASS**（chat 2 个 near-tie flip 单列）；**decode 口径 6/6 FAIL（仅 cosine）**，C7 诊断为"小幅真实缺口 + cosine 门与 max_abs 门不一致（差 50–170×）+ 参照自身 1–2% 不确定"，**待用户裁 L4 口径**；C7 另给出 1440 格 state 逐位比较 + row0 单独口径。
-      · **Vendor GEMM**：x86 默认自有 kernel（位级）、AOCL 为 opt-in 提速档（`int32_f32block_bounded`，K≤1024 精确）；aarch64 primary=KleidiAI（int32 精确、`lhs_zero_point=1` 陷阱）、oneDNN+ACL 要 `[K,N]`+stride(0)==1；sm_120 融合 int8 不可用但 `GemmEx int8→s32` 可用且精确。
-      · **C6 计时已收口且前提已变**：原判定 `quantize_per_token_s8` 占完整 op 的 84.7–92.2%（每元素 f64 除法）；重写后
-        289–1034 µs → **11.2–22.2 µs（中位 24×，位级 58/58）**，瓶颈转为 `qmatmul` 25–87 µs，vendor 两趟 GEMM
-        （快 2.1–4.6×）重新有意义（全部 UNGATED，GPU 被机主占用）。
-      · **W8A8 v2（路线 c）**：M1 设计完成（`docs/20-planning/0010-…`），**c1 四后端 kernel 零改动**；重基线 4–7 h；**M4 必须等本批收口**。
-      · **U1 验收 FAIL（3 条阻断，回修中）**：target fail-open（非宿主 triple 被伪造成 CPU capability 后照跑）、
-        `policy_from_dict` 静默吞 `schema_version`（999/1.5/"1"/缺失全收）、`output` 与输入同 storage 时静默覆盖数据；
-        复验入口 `worktrees/_meta/pypto-x/verify-u1-matmul-policy-slice/work/repro_blockers.py`（修复后应 rc=0）。
-   c) **待用户裁决（7 项，见 `pending_user_decisions_2026_09_11`）**：L4 是否含 decode 口径（**最靠前**）｜B4 阈值冻结（已推迟）｜L5/L6 语料与阈值（决策包在 `0005 §10`，三句话）｜`view_mode=require` 提级｜W8A8 v1 之外的新量化方案｜W8J 注入门政策｜A3 chip7/NPU 放行（E 线 N5）。
-   d) **尚未开始但已就绪**：Q5 重跑（需 Q10 + liveness 合入 + **A3 恢复**；6 config 并行、A3 上约 20–40 min 墙钟）｜U2（接第一个 vendor provider，需 U1 复验过）｜W8A8 v2 M2（**等 Q10 验收落地**，因为两者都改 SVE256 的 int8 通路）｜C8 的 L5/L6。**A3 自 ~19:12Z 起不可达**（jump host 正常，仅 `192.168.45.21:22` 不通；A3 相关 leg 一律 `PENDING_A3_OUTAGE`，恢复后合并成一趟做）。
-4.9 **0040 波次中新立的五条流程**（都是踩坑换来的，勿再犯）：
-   · **批量合并 + 单次全量**：当多个任务"只差自己那次全量 pytest"时，**先把它们的提交合入 integration**，
-     再由 `integration-health-check` 在合并后的 tip 上跑**一次**全量；各任务仍 own 自己的聚焦证据，
-     但必须**引用共享全量并注明 commit**，不得写成"我自己跑了全量"。原因：5 个任务各跑 11 分钟全量会在
-     无公平队列的锁上互相饿死（实测每次都差 30–90 s 撞车）。
-   · **不要用"范围字符串替换"编辑 `development_lock.yaml`**（父 agent 三次踩坑：删范围连坐、切出重复键、
-     把 wave 级键塞进 in-flight）。正确做法：改前记录键集 → 定向替换 → 改后比对键集，缺失即报错；**并且必须把"YAML 解析校验"与 `git commit` 用 `&&` 串联**——父 agent 2026-09-12 两次把非法 YAML（一行内 `[a,b,c]_后缀`、以及一次多出的孤立引号行）提交进本地历史，都是"校验失败但脚本继续往下走"造成的；非法文件绝不能进 commit。
-   · **cherry-pick 收尾**：`GIT_EDITOR=true git cherry-pick --continue`，**不要**用 `git commit` 手动收尾
-     （sequencer 会挂着，之后任何 `--abort` 都会回退分支——ERR-0008 就是这么丢掉 Q3 的 4 个提交的）；
-     合入后**必须**用 tree/patch-id 相等核验等价性（cherry-pick 产生新 SHA，`merge-base --is-ancestor` 不适用）。
-   · **同一文件被"功能提交 + 修复提交"各自整份改写的 cherry-pick 顺序**（D-1 教训，2026-09-12）：按分支顺序 pick
-     （旧→新）；顺序颠倒时后落的**旧**版本会静默覆盖新版本（`scripts/perf/c6_timing_harness.py` 就这样丢掉了 GPU
-     preflight 与 `dispatch_overhead` 的 TimingProxy 修复，而 pytest 全绿看不见）。合入后除了全量 pytest，还必须对
-     **受影响的每个文件**做 `git diff <最新源提交> <integration tip> -- <file>` 差分复核：期望为空或恰好等于已知的
-     后续改动；工具/脚本类文件常常没有测试覆盖，**全绿不等于内容对**。
-   · **A3 合并出行**：A3 恢复后把 Q5 重跑、Q9 的 A3 leg、liveness 的 A3 确认**合并成一趟**（同用 host CPU 320–639、
-     同 schema 输出），不要各排一次机时；A3 不可达时一律标 `PENDING_A3_OUTAGE`，不得用 QEMU 冒充原生。
-
+   a) **先读 lock 的 `waves.W8.batch_0041_accumulating_2026_09_12`（+ `in_flight_2026_09_11_batch2` 里仍标 in-flight 的项）**——它才是权威清单。
+      当前（2026-09-12 13:20 CST / 05:20Z）：**0041 已交付并推送**（`origin/main = 0d0ec76`，integration tip `8fff50558`，
+      235 补丁，规则 8 全量 1674 collected / 1667 passed / 7 skipped / 0 failed，五条任务级验收全 PASS_WITH_BOUNDARIES）；
+      **本机无在跑重活**；A3 已恢复且空闲；等父/新 agent 派的下一批（0042）任务。
+   b) **0041 已交付的主要结论**（引用以 lock/ERRATA 为准）：
+      · **AVX2 layout 原生化**（`1b1c40656`+`7d8762abe`）：decode launch 28.5→20.4 s、prefill 127.9→109.3 s；per-op layout 中位 0.02–0.04 ms；
+        剩余 host_reference 仅 `broadcast`（~39 s/494 calls）与 `where/compare/iota`（<1 s）。
+      · **W8A8 契约 v2（packed `[K,out]`）**：M2a `fca4a6d9b`（每 forward int8 权重 transpose 150/186/151/187→0、region 全表对拍、
+        五执行面逐位一致、四后端 kernel 0 行改动；`BINDING_SCHEMA_VERSION`/`PACKED_LAYOUT_VERSION` 2→3、`WeightLayout.layout_version` 1→2、
+        payload 不升）；M2b 重基线（AVX-512 六段 615 s / AVX2 六段 2810 s、prefill 4/4 PASS、AVX-512 v1↔v2 765 arrays 0 mismatch）。
+      · **Q5 SVE256 整网 L4（A3 原生）**：6/6 配置 digest/op 数与静态 census 全对拍、每 forward int8 transpose=0、qmatmul 全 native、
+        `emulated=false/vl_bytes=32`；**prefill 主判定 6/6 PASS**；两批总墙钟 2356 s（39.3 min）；decode 扩展与 x86 同模式
+        （default 两口径 FAIL；full decode-band FAIL / prefill-band PASS）。诚实边界：default/en 与 full/zh 的 decode 链在 prefill-next-token
+        行因 near-tie 转向（`common_prefix_match=False`，主判定仍 PASS）。
+      · **SVE256 W8A8 吞吐修复**（`8dabdf9e6`/`3c4fae931`/`35100030f`）：根因是每节点 O(整图) 的两层开销（per-node re-decode +
+        每 dispatch metadata 深 thaw 535,957 次），修为 identity-keyed 有界 memo + O(1) 声明门；A3 真机 W8A8 算子 13.59/6.75/13.51 s →
+        **7.12/16.08/32.05 ms**（T=5），6 配置从外推 11.8 h → 39.3 min；边界：memo 命中不复查盘上 ELF 摘要（可选加固 stat/rehash ~1 ms）。
+      · **U2a（第一个 vendor provider，AOCL bf16/f32）**（`3dfac2bbe`）：数值仅 (5,1024,32) 差 bf16 5.96e-8 / f32 8.20e-8（保持
+        `deterministic_bounded`）；Q8 同协议 12/12 ≤2×（geomean 0.87–0.97）；plan digest 冻结 `thread_mode`；D1/F5 两条 U1 follow-up 已修。
+      · **`view_mode=require` 提级**（`8a52bfa98..36fa3fd3f` + 修复 `b82cb2022`/`8fff50558`）：五条可机检 proof 条件 + 三态语义 +
+        AVX-512 proof_gated 零拷贝（与 copy 逐位一致）+ SVE256/AVX2 显式 `alias_proof=unsupported`；**提级自 2026-09-12 生效**
+        （0006 provisional 已移除）。独立验收曾抓 3 条阻断反例（plan/report 可自洽伪造），合并回修后全拒。
+      · **forge 修复轮**：新增 `layout_verify.py`/`binding_verify.py` + 执行层 canonical 重算；**公开校验面**与**执行面**的边界已写进 0006
+        （`ExecutionPlan.validate` 是 content-local 门、不是执行授权）。
+   c) **待用户裁决（6 项，见 `pending_user_decisions_2026_09_11`）**：L4 decode 口径（**最靠前**，决策包 `docs/20-planning/0011`，
+      推荐 A+B）｜B4 阈值冻结｜L5/L6 语料与阈值（`0005 §10` 三句话）｜W8A8 之外的新量化方案｜W8J 注入门政策｜A3 chip7/NPU 放行。
+      （`view_mode=require` 已于 2026-09-12 裁决并生效。）
+   d) **下一批（0042）已排好的种子**：**U2b**（int8/W8A8 的 vendor 绑定，前置 W8A8 v2 契约已落地）｜**report-only 边界补校验**
+      （4 类 cross-block：`resolution.capability_digest`/`contract_digest`/`dispatch.provider_declared`/`fallback_used`；3 类无真源字段登记）｜
+      **U3**（doctor/explain/plan）｜**U4**（35 env 迁移）｜**U5**（graph/region，等 N4 决策）｜**AVX2 broadcast 原生平面**（prefill ~39 s 的剩余大头）｜
+      memo 命中 ELF 加固｜C8 L5/L6（等用户三句话）。**A3 已恢复**（2026-09-11T23:51Z 起可用），新 A3 leg 直接派即可，不必再挂 PENDING。
 5. 并发与资源：平台无 subagent 并发上限（旧文档的 ≤3 属自设假设，ERR-0005 已更正）；重任务一律经 scripts/resource/run_local_heavy.sh（返回 75/69 就等待重试，
    禁止绕过）；**等锁时挂后台或长 timeout，不要在前台循环空转**（会耗尽 agent 回合，S1 曾因此中断一次）；
    A2/920B/A3 都是共享资源，约定安静使用。
