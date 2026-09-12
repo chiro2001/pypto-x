@@ -1,8 +1,8 @@
 # PyPTO-X 接手文档
 
-状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_0009_0010_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q5_Q6_Q7_Q8_Q8B_Q9_Q10_N4_C6_C7_DONE_W8A8_V2_M2_DONE_VIEW_MODE_REQUIRE_STABLE_U2A_VENDOR_PROVIDER_DONE_AVX2_LAYOUT_DONE_SVE256_W8A8_THROUGHPUT_FIXED_0040_AND_0041_AND_0042_PUSHED_REPORT_HARDENING_U2B_INT8_AVX2_BROADCAST_NATIVE_CUDA_TOOLCHAIN_BLOCKED`
+状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_0009_0010_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q5_Q6_Q7_Q8_Q8B_Q9_Q10_N4_C6_C7_DONE_W8A8_V2_M2_DONE_VIEW_MODE_REQUIRE_STABLE_U2A_VENDOR_PROVIDER_DONE_AVX2_LAYOUT_DONE_SVE256_W8A8_THROUGHPUT_FIXED_0040_AND_0041_AND_0042_PUSHED_REPORT_HARDENING_U2B_INT8_AVX2_BROADCAST_NATIVE_0043_CLOSED_LOCALLY_PENDING_THE_USER_PUSH_APPROVAL_REPORT_SCHEMA_V3_EMBEDDED_MANIFEST_CUDA_TOOLCHAIN_BLOCKED`
 
-最后更新：2026-09-12 22:05 CST（Asia/Shanghai；**0042 已推送并备份**：`origin/main = 3431e8f`（推送 `0d0ec76 → 4ea914e`，16 个提交；随后推送记录 `4ea914e → 3431e8f`），私有备份已同步。冻结 integration **`94d1ab162`**（tree `e923e6462…`）、补丁 **252**（am 复算 252/252 干净、复算 tree = 冻结 tree）、规则 8 全量 **rc=0，1854 passed / 7 skipped / 0 failed，953.01 s**（collect 1861，基线 `8fff50558` = 1674）。三条独立验收全部 PASS_WITH_BOUNDARIES：① report 校验补强（1/1b/1b2/1c；R1–R10 与 16 条最小反例全闭合，单叶可单点篡改数 335→**102** / 347→**119** / 404→**161**，36/41 类完全受检）；② U2b int8 vendor（初检 FAIL 仅包络 → 观测快照 + fail-closed 门 + 支配不变式 + witness 关系；同窗口 0.919–0.932× 判持平；入口开销 5244→248 ms）；③ AVX2 broadcast（census 350/350 + 494/494、67,275 例 fuzz 0 mismatch、decode 23.78→12.91 s、prefill 108.74→71.05 s）。本机无 GPU/nvcc，CUDA 线仍被 toolchain 阻塞）｜**0041 已推送**：补丁 235）
+最后更新：2026-09-13 00:05 CST（Asia/Shanghai；**0042 已推送并备份**（`origin/main = da35516`）；**0043（report schema v3）已本地收口，待用户批准推送**：冻结 integration **`0a63ed4dd`**（tree `b9803c1d6…`）、补丁 **254**（am 复算 254/254 干净、复算 tree = 冻结 tree）、规则 8 全量 **rc=0，1914 passed / 7 skipped / 0 failed，968.82 s**（collect **1921**，基线 `94d1ab162` = 1861）。0043 把 `ExecutionReport` 升级为**自包含**（内嵌 `provider_manifest` + `resolution_decision`，校验只从内嵌 body 重算 digest、不 probe、不重跑 resolver；版本 2→3 fail-closed），把 0042 遗留的一整类 manifest-only 边界收成可对账字段；独立验收 `f0258e32` 对 round-1 判 PASS_WITH_BOUNDARIES 并抓出 R1–R5，round-2 已逐条收口或登记。仍为边界：运行态/实测事实、未 pin 的 probe 事实（含线程模型数值）、plan payload 未内嵌、整份跨 provider 替换、无外部真源字段的全副本改写、说明层。本机无 GPU/nvcc，CUDA 线仍被 toolchain 阻塞）
 
 > **零记忆恢复（上下文压缩后）**：按顺序读 本文件 §0 → `docs/00-handoffs/ERRATA.zh-CN.md` → `docs/00-handoffs/0039-2026-09-11-a3-onboarding-ascend-bridge-sve-w8a8.zh-CN.md` → `configs/development_lock.yaml` 的 `waves.W8.in_flight_2026_09_11_batch2` 与 `pending_user_decisions_2026_09_11`。
 
@@ -87,6 +87,27 @@
       · **排队**：U3（doctor/explain/plan）、U4（35 env 迁移）、U5（graph/region，等 N4）、report schema v2（manifest 内嵌）、
         fused `sym_quant` 契约、`auto_static` vendor 语义、memo 命中 ELF 加固、C8 L5/L6（等用户三句话）、int8 可证明包络（形式化或精确 int32 恢复）。
       · **A3 空闲**（2026-09-11T23:51Z 起可用），新 A3 leg 直接派即可，不必再挂 PENDING。
+   e) **0043（已本地收口，待用户批准推送；冻结 integration `0a63ed4dd`，tree `b9803c1d6…`）**：
+      · **交付规模**：补丁 **254**（0042 = 252；254 个 `git am` 全部干净、复算 tree = 冻结 tree）；规则 8 全量
+        **rc=0 / 1914 passed / 7 skipped / 0 failed / 968.82 s**（collect **1921**，基线 `94d1ab162` = 1861）。
+      · **内容**：`ExecutionReport` 自包含化——内嵌 `provider_manifest`（invoked provider 的 `ProviderCapability.to_dict()` + canonical digest + snapshot digest）
+        与 `resolution_decision`（plan 冻结决策 + digest，含 round-2 新增的 `selected_threads`/`selected_thread_mode`）；`REPORT_SCHEMA_VERSION` 2→3（旧版本 fail-closed 拒绝）；
+        校验只从内嵌 body 重算 digest + 注册身份锚，**不 probe、不重跑 resolver**（毒化 probe/库/fs 调用后 7/7 真报告仍通过、毒调用 0）；
+        新增 probe-free `provider_identity.py`（与 `provider_aocl`/`provider_aocl_int8` 共享 builder，输出与旧实现逐字节一致）。
+      · **收掉的边界**：库指纹（含 AOCL pin）、pack strategy/included_in_timing、pack_semantics、numeric_class、deterministic、reduction_order、实现/版本常量、
+        vendor artifact digest、单副本 `plan_digest`；round-2 另收 R1 `exactness_basis_detail`、R2 `provider_accumulation`、
+        **R3 报告 vs 内嵌 manifest 的 `exactness_envelope`（修掉"报告与自身内嵌 manifest 自相矛盾"）**、R4/R5 局部对账。
+      · **仍为边界（已逐条登记最小反例）**：运行态/实测事实（`timing.*`、`content_digest`、`threads_used` 值、coverage 计数、`gates.*`）；
+        未 pin 的 probe 事实（host features/target snapshot digest、AOCL fingerprint path/name/size/default_threads、**线程模型数值**）；
+        **plan payload 未内嵌**（协调改写 `plan_digest` 或 decision body + 重算 digest 仍接受）；**整份报告替换为另一注册 provider 的自洽故事**；
+        无外部真源字段（`request.dtype/shape`）的全副本改写；说明层。
+      · **验收**：独立验收 `f0258e32` @ `086441d49` = **PASS_WITH_BOUNDARIES**（枚举 claim 全 verified：28 份真实冻结 v2 报告 28/28 legacy-rejected、
+        两块与 digest 独立重推、无 probe 强于声明、59 例协调矩阵 47 拒/12 已登记边界、锚中和 31→22 flip、builder 逐字节一致、7/7 真报告通过），
+        但指出**边界清单不完备**（R1–R5 存活）→ round-2 已逐条收口或登记；round-2 后父方复核：无误伤、collect 1921、v3 文件 60 passed、
+        qmatmul 59 passed、合并探针 **38/38 全拒（0 接受）**。
+      · **证据**：`_meta/pypto-x/report-schema-v2/`（实现方）、`_meta/pypto-x/verify-0043-report-v3/`（独立验收 ledger+脚本）、`_meta/pypto-x/batch-0043-report-v3/`（批级全量）。
+      · **排队（0044+）**：U3（doctor/explain/plan）、U4（35 env 迁移）、U5（graph/region，等 N4）、memo 命中 ELF stat/re-hash 加固、
+        C8 L5/L6（等用户三句话）、fused `sym_quant` 契约、`auto_static` vendor 语义、int8 可证明包络、plan payload/签名（若要收 §4 的第 3/4 类）。
 5. 并发与资源：平台无 subagent 并发上限（旧文档的 ≤3 属自设假设，ERR-0005 已更正）；重任务一律经 scripts/resource/run_local_heavy.sh（返回 75/69 就等待重试，
    禁止绕过）；**等锁时挂后台或长 timeout，不要在前台循环空转**（会耗尽 agent 回合，S1 曾因此中断一次）；
    A2/920B/A3 都是共享资源，约定安静使用。
