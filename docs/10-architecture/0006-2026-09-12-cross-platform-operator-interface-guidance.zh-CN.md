@@ -189,7 +189,9 @@ execution_policy:
 
 `provider=vendor` 可以作为稳定的意图，但 `provider=oneDNN:某个 microkernel` 不应成为稳定接口。用户要固定某个库时，应固定 provider ID 和版本，而不是固定库内部符号。
 
-`view_mode` 是约束/偏好，不是 alias 授权：contract 的 `view_obligation`、stride 可表达性、写后读、owner/lifetime 和多 view 重叠 proof 优先于 policy。`prefer` 只影响候选排序；`require` 要求 proof 必须通过，无法证明时以 `ALIAS_PROOF_UNAVAILABLE` 给出失败条件并 fail-closed，绝不静默拷贝。**（provisional）** **2026-09-12 用户批准 `require` 提级为公共 stable API；提级在 `view-mode-require` 任务通过独立验收（含全量 UT 与对抗用例）前为 **provisional**，若验收不通过则回退本节；提级以证明链与执行器启用为前提，因此 `require` 的 stable 语义同时包含"proof 通过 → 零拷贝 view"与"proof 不通过 → 结构化失败"两半。**旧的 `allow_view` 只作为兼容输入，不能把 `must_not_alias` 改成 `may_alias`。
+`view_mode` 是约束/偏好，不是 alias 授权：contract 的 `view_obligation`、stride 可表达性、写后读、owner/lifetime 和多 view 重叠 proof 优先于 policy。`prefer` 只影响候选排序；`require` 要求 proof 必须通过，无法证明时以 `ALIAS_PROOF_UNAVAILABLE` 给出失败条件并 fail-closed，绝不静默拷贝。**2026-09-12 用户批准 `require` 提级为公共 stable API；同日独立验收判 PASS_WITH_BOUNDARIES（受检 tip `8fff50558`，含全量 UT 1674/1667/7/0/0、三条伪造反例全拒、对抗用例与逐位一致证据），**本节自 2026-09-12 起生效**。提级以证明链与执行器启用为前提，因此 `require` 的 stable 语义同时包含"proof 通过 → 零拷贝 view"与"proof 不通过 → 结构化失败（`ALIAS_PROOF_UNAVAILABLE`）"两半。**旧的 `allow_view` 只作为兼容输入，不能把 `must_not_alias` 改成 `may_alias`。
+
+> **边界（2026-09-12 独立验收登记，可接受）**：① `ExecutionPlan.validate` 是 **content-local 门**，通过它**不等于**执行授权；执行授权只以执行层对已注册 contract/capability 的 canonical 重算为准（全自洽的 obligation-swap plan 会在 provider 调用前被拒、输出无副作用）。② report 单文档无法对账 manifest-only 字段（`guarantees.deterministic/reduction_order/exactness_basis` 等、vendor library/pack 的双副本改写）：这些字段**不参与 alias 授权**；建议后续把 selected provider 的 manifest/capability digest 嵌入 report（follow-up）。
 
 同理，`allow_materialize_copy` 只是“允许候选考虑 layout 物化”的上限条件；contract 若要求保留 storage alias，或 `max_copy_bytes`/lifetime 不满足，resolver 仍必须拒绝 copy。`allow_transfer_copy` 只控制设备/内存空间搬运，不能替代 layout 的物化约束。
 
