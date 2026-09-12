@@ -487,3 +487,25 @@ scope 之外的 shape/线程。解析上界若要成立，必须覆盖内核的�
    "60 被 75 证伪"说明只做位级 parity 的少量用例不足以支撑一个界。
 3. 误差预算类字段必须有 **bound kind + coverage + not-covered** 三段式语义，不能只给数字。
 
+
+## ERR-0011：任务分支被重建后，按"尾部单提交"cherry-pick 会产生不一致的中间态
+
+**现象**：0042 项 2（U2b）在 round-3 期间把分支 `work/u2b-vendor-int8` 重建（rebase/重放），round-1 的 squash 提交 `7b77284e9`
+不再是其祖先。父 agent 只按"最后两个提交"cherry-pick `11879ec27` + `de919e6b5`：冲突解完后，被冲突文件与源提交**仍不一致**，
+第二个提交又在 `plan.py`/`report.py`/测试三处冲突——因为这两个提交依赖同分支上未被合入的另外 6 个提交
+（`ab58c11d9..87aa3fbae`：包络改快照、支配不变式、文档、测试等）。
+
+**根因**：把"任务分支=当前 integration tip + 我已知的那几个提交"当成不变量，而没有在 pick 前核对分支相对当前 tip 的**完整范围**；
+分支被重建后，"尾部单提交"的父状态不在 integration 里，于是 pick 只能得到半成品（且第二个提交必然冲突）。
+
+**修复**：`git cherry-pick --abort`（integration 未受污染，回到 `b89e0b521`）；改为让**作者自己 rebase 到当前 tip**
+（`git rebase b89e0b521`），再整段重放 `b89e0b521..<新 HEAD>`（本次 8 个提交，无冲突），并核对 cherry-pick 后 **tree 完全一致**
+（`8f705bb0d…`）与 patch-id 一致。
+
+**教训**：
+1. **pick 前必做**：`git log --oneline <integration_tip>..<branch>` 看完整范围；范围里出现的每个提交都要有归属（已合入/待合入/已知依赖）。
+   若分支被重建过（旧 SHA 不在历史），一律按"整段范围"处理，或让作者 rebase 后重放。
+2. **两个提交以上、且与 integration 有同文件交叉时，优先让作者 rebase**：作者懂两侧语义，且能顺带在新 tip 上复跑自己的测试；
+   父 agent 手解冲突容易在"看起来能过"的状态下把半成品合进去。
+3. **等价性判据要选对**：基线相同的 cherry-pick 用 **tree 相等**；基线不同的 cherry-pick 用 **patch-id 相等**（本次 AVX2 切片即基于旧 tip，
+   树必然不同但 patch-id `83811f53…` 相同）。两者都不可省。
