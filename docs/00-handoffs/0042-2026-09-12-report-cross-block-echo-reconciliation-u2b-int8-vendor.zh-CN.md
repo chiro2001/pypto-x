@@ -89,7 +89,7 @@ Cherry-pick 树一致：`15d0fe58d^{tree} == 748717529^{tree} == c54671ffd83778f
 5. **int8 性能**：同窗口对逐字节相同的 unpacked 基线 **0.919–0.932×**（持平略慢，不声称加速）；旧的 1.16×/1.71× 是跨窗口相除，已标 `cross_window_comparability=not_comparable`。"0 reorder" 是**适配器层**——LPGEMM 内部仍把传入 row-major B 打包（UNPACKED→PACK），同存储基线即那次 unpacked 调用本身。
 6. **int8 覆盖**：vendor 仅 rank 2（rank 3/4 与空轴回落 portable）；fused `sym_quant` 已声明+实测但**未路由**（需新 fused 契约 + SPI 扩展；n=1 不写输出 → `min_n=2`，`K%4` 约束）；`auto_static` 无 cost model → vendor 需显式 opt-in；ErrorBudget 仅透传。
 7. **AVX2 broadcast**：kernel 是 scalar odometer（非 SIMD 向量化扩张，不称吞吐）；rank > 16 与非 f32/bf16 仍走 host_reference（且 artifact 记录理由）；无真实权重 s3/L4 数值验收；perf 一律 UNGATED（12 vCPU KVM、无 cpufreq、共享窗口）。
-8. **CUDA 线**：本机无 GPU/nvcc（`cuda_c1_acceptance_smoke: BLOCKED_TOOLCHAIN_nvcc_absent`），既定顺序 `avx512_and_sve256_first_cuda_later`。
+8. **CUDA 线**：GamePC 的 RTX 5080 + nvcc 13.3.73 可用（见 ERR-0012；`avx512_and_sve256_first_cuda_later` 只是判据优先序，不是不可用）。
 
 ## 8. 在途与排队
 

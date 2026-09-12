@@ -34,7 +34,12 @@
       AVX2 broadcast 原生平面（decode 350/350、prefill 494/494 全 native）；三条独立验收全部已回：`cb32c1ba`（report 三轮 PASS_WITH_BOUNDARIES）、
       `71599188`（U2b 初检 FAIL 仅包络 → claim-2 复检 PASS_WITH_BOUNDARIES）、`d119bbce`（AVX2 PASS_WITH_BOUNDARIES）；
       **A3 空闲**（2026-09-11T23:51Z 起可用）；
-      **本机无 GPU / nvcc**（lock: `cuda_c1_acceptance_smoke: BLOCKED_TOOLCHAIN_nvcc_absent`），CUDA 线按 `avx512_and_sve256_first_cuda_later` 仍被工具链阻塞。
+      **CUDA 线可用（勿再引用过期字段，见 ERR-0012）**：GamePC（`192.168.101.5`，Windows+WSL2）持有 **RTX 5080 16 GB**（驱动 **616.92**，已从 610.62 漂移）、
+      **nvcc 13.3.73 + cuBLAS**（`cuda-toolkit-wsl` 任务装入 `/usr/local/cuda-13.3`，10.7 GB），`gamepc` 锁 **FREE**、GPU 为 PyPTO-X 独占；
+      真机执行已有先例（`cuda_c1_real_5080_driver_ptx: PASS`，证据 `_meta/pypto-x/integration-w4-cuda-c1-final`）。
+      lock 里的 `gamepc_toolkit: ..._absent` 与 `cuda_c1_acceptance_smoke: BLOCKED_TOOLCHAIN_nvcc_absent` 是 **2026-09-09 的过期快照**，
+      已就地标注 `*_superseded_2026_09_13`；`criterion_defaults.e4 = avx512_and_sve256_first_cuda_later` 只表示**判据优先序**，不是"CUDA 不可用"。
+      约定：GPU-only 探测/验收不申请 `gamepc` 锁；GamePC host CPU/内存 heavy 阶段才需持有该锁。
    b) **0041 已交付的主要结论**（引用以 lock/ERRATA 为准）：
       · **AVX2 layout 原生化**（`1b1c40656`+`7d8762abe`）：decode launch 28.5→20.4 s、prefill 127.9→109.3 s；per-op layout 中位 0.02–0.04 ms；
         剩余 host_reference 仅 `broadcast`（~39 s/494 calls）与 `where/compare/iota`（<1 s）。
