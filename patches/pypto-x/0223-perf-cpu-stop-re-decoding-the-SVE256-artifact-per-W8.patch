@@ -1,0 +1,125 @@
+From 8dabdf9e610f7f3d4b380319fe9a7feaa080fbb6 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 08:55:14 +0800
+Subject: [PATCH 223/235] perf(cpu): stop re-decoding the SVE256 artifact per
+ W8A8 node
+
+`Sve256Runtime._load_w8a8` called `_decode_for_execution` on every W8A8
+dispatch, and each `_decode_for_execution` reconstructs the whole
+CoreProgram (`CoreProgram.from_dict`), re-runs `lower_sve256`, re-hashes
+the ELF and re-checks every semantic digest/metadata field.  On a
+model-scale graph that is seconds of host work per node, independent of
+the node's element count: the M2b A3/local progress logs show a constant
+~6.0 s for quantize/epilogue and ~3.1 s for qmatmul regardless of
+out_bytes (quantize 8..64 B), because quantize/epilogue decode twice
+(`_execute_w8a8_operation` + `run_w8a8_*`) and qmatmul once.
+
+Artifact is immutable and carries the digest captured at construction, so
+one decoded LoadedSve256Artifact can serve every W8A8 node of a launch.
+Add an identity-keyed, bounded (2 entries, FIFO) memo with a strong
+Artifact reference so `id(artifact)` cannot be recycled; a new or
+tampered Artifact object always misses and goes through the full
+fail-closed decode.  `launch` seeds the memo with the artifact it already
+decoded, so a multi-node launch decodes exactly once.  The W8A8
+declaration gate (`_require_w8a8_declaration`) still runs on every
+dispatch.  `PYPTO_X_SVE_W8A8_DECODE_MEMO=0|off|false|no` restores the
+pre-fix per-dispatch decode for A/B reproduction.
+
+Wire/runner/ELF protocol, artifact metadata and numerical semantics are
+unchanged: AVX-512 parity is untouched and a before/after bit-identity
+probe over negative codes, int32 extremes, signed zero, subnormals,
+bf16 rounding ties, inf/nan scales and the fail-closed -128/sNaN/overflow
+cases produces identical output sha256.
+---
+ python/pypto/backends/cpu/aarch64/sve256.py | 55 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+diff --git a/python/pypto/backends/cpu/aarch64/sve256.py b/python/pypto/backends/cpu/aarch64/sve256.py
+index 2207ab18d..4dfb5245a 100644
+--- a/python/pypto/backends/cpu/aarch64/sve256.py
++++ b/python/pypto/backends/cpu/aarch64/sve256.py
+@@ -1554,6 +1554,25 @@ class Sve256Runtime:
+             self._real_capability = capability
+         self.available_features = CpuFeatureSet(capability.features, source=capability.source)
+         self._selected_artifact: Optional[Artifact] = None
++        # W8A8 decode memo.  A full artifact decode reconstructs the whole
++        # CoreProgram, re-runs ``lower_sve256`` and re-hashes the ELF; on a
++        # model-scale graph that is seconds of host work.  ``Artifact`` is
++        # immutable and carries the digest captured at construction, so one
++        # decoded :class:`LoadedSve256Artifact` can serve every W8A8 node of a
++        # launch.  Entries are keyed by object identity and hold a strong
++        # reference to the Artifact, which keeps ``id(artifact)`` from being
++        # recycled while the entry lives; a new (including tampered) Artifact
++        # object always misses and is fully re-decoded fail-closed.
++        #
++        # ``PYPTO_X_SVE_W8A8_DECODE_MEMO=0`` (or ``off``/``false``/``no``)
++        # restores the pre-fix "decode once per W8A8 dispatch" behaviour and is
++        # the explicit A/B reproduction switch; it is read once at runtime
++        # construction.
++        self._w8a8_memo_enabled = os.environ.get(
++            "PYPTO_X_SVE_W8A8_DECODE_MEMO", "1"
++        ).strip().lower() not in ("0", "false", "no", "off")
++        self._w8a8_loaded: Dict[int, Tuple[Artifact, Any, LoadedSve256Artifact]] = {}
++        self._w8a8_loaded_limit = 2
+         if capability.available:
+             self._status = Availability.yes(self.name)
+         else:
+@@ -1964,15 +1983,47 @@ class Sve256Runtime:
+             raise CpuSve256ArtifactError("SVE256 W8A8 entry points require a non-SDOT/non-I8MM artifact")
+         return declared
+ 
++    def _store_w8a8_loaded(
++        self,
++        artifact: Artifact,
++        declared: Any,
++        loaded: LoadedSve256Artifact,
++    ) -> None:
++        """Memoize one decoded W8A8 artifact (identity keyed, bounded).
++
++        ``declared`` may be ``None`` for the launch seed: the W8A8 declaration
++        stays lazy so a launch that has no W8A8 node keeps the old behaviour of
++        never touching the W8A8 gate.
++        """
++
++        if not self._w8a8_memo_enabled:
++            return
++        self._w8a8_loaded[id(artifact)] = (artifact, declared, loaded)
++        while len(self._w8a8_loaded) > self._w8a8_loaded_limit:
++            self._w8a8_loaded.pop(next(iter(self._w8a8_loaded)))
++
+     def _load_w8a8(self, artifact: Artifact) -> Tuple[Any, LoadedSve256Artifact]:
+         # The real probe decides W8A8 availability, never an injected
+         # capability: an injected "available" cannot forge the native gate,
+         # and an injected low capability cannot disable a real machine that
+         # passes the probe (same fail-closed rule as C3/C4).
++        entry = self._w8a8_loaded.get(id(artifact)) if self._w8a8_memo_enabled else None
++        if entry is not None and entry[0] is artifact:
++            declared = entry[1]
++            if declared is None:
++                capability = self._require_real_capability()
++                declared = sve256_w8a8_capabilities(capability, target=self.name)
++                self._store_w8a8_loaded(artifact, declared, entry[2])
++            # Declaration re-validation stays on every dispatch; only the
++            # whole-program decode/lower/digest work is memoized.  A new
++            # Artifact object (including any tampered variant) never hits.
++            self._require_w8a8_declaration(entry[2].artifact, declared)
++            return declared, entry[2]
+         capability = self._require_real_capability()
+         declared = sve256_w8a8_capabilities(capability, target=self.name)
+         loaded = self._decode_for_execution(artifact, capability)
+         self._require_w8a8_declaration(loaded.artifact, declared)
++        self._store_w8a8_loaded(artifact, declared, loaded)
+         return declared, loaded
+ 
+     def w8a8_capability(self, artifact: Artifact) -> Any:
+@@ -2381,6 +2432,10 @@ class Sve256Runtime:
+         except Exception as exc:
+             raise CpuSve256ExecutionError("invalid LaunchRequest: {}".format(exc)) from exc
+         loaded = self._decode_for_execution(request.artifact, capability)
++        # The launch already paid for one full decode/lower/digest pass; pin it
++        # so the per-node W8A8 dispatch does not repeat it for every qmatmul /
++        # quantize / epilogue node (model-scale: seconds per node before).
++        self._store_w8a8_loaded(request.artifact, None, loaded)
+         self._selected_artifact = request.artifact
+         target = loaded.target_ir.target
+         if target.kind != "cpu" or not _is_little_linux_aarch64(target.triple):

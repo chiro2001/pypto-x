@@ -1,0 +1,2433 @@
+From 1b1c4065649f43b2b3fc90e0a5e2f1d468491de7 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 05:17:58 +0800
+Subject: [PATCH 220/235] perf(cpu): execute AVX2 layout ops natively
+ (avx2-layout-native)
+
+Add a PXLD-v2 descriptor-driven native plane for reshape/view/contiguous/
+transpose/slice plus split/concat on the AVX2 backend for f32/bf16/int8,
+mirroring the verified SVE256/AVX-512 semantics.  The native contract
+predicate is shared by artifact metadata and the runtime dispatch, so a
+declared kernel is the executed kernel; unsupported dtypes stay on the
+vector-common host reference with an explicit metadata reason.  f32/bf16
+lanes reproduce the host reference's Python-float round trip (including
+signaling-NaN quieting) so native outputs are byte-identical to the
+host_reference baseline; contiguous copies and split/concat segments use
+AVX2 integer-lane quieting.  The pre-existing packed rank-2 transpose plane
+is kept byte-for-byte (it preserves sNaN payloads; recorded as a boundary).
+Zero-copy view aliasing is stat-only and remains disabled.  Bump artifact
+payload 4->5 and the native ABI marker to :6.
+---
+ python/pypto/backends/cpu/x86/avx2.py           |  462 +++++++++++++++++-
+ python/pypto/compiler/targets/cpu_avx2.py       |  582 +++++++++++++++++++++-
+ python/tests/ut/pypto_x/test_cpu_avx2_layout.py | 1120 +++++++++++++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_cpu_avx2_packed.py |   29 +-
+ python/tests/ut/pypto_x/test_w8a8_avx2.py       |    6 +-
+ 5 files changed, 2168 insertions(+), 31 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/x86/avx2.py b/python/pypto/backends/cpu/x86/avx2.py
+index f85d682db..d5763734e 100644
+--- a/python/pypto/backends/cpu/x86/avx2.py
++++ b/python/pypto/backends/cpu/x86/avx2.py
+@@ -14,6 +14,7 @@ import hashlib
+ import math
+ from pathlib import Path
+ import struct
++import threading
+ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+ 
+ from pypto.abi import Availability, LaunchRequest, TensorDesc
+@@ -22,6 +23,9 @@ from pypto.compiler.targets.cpu_avx2 import (
+     ARTIFACT_PAYLOAD_VERSION,
+     DEFAULT_ARTIFACT_FORMAT,
+     NATIVE_ABI_MARKER,
++    NATIVE_CONCAT_MODE,
++    NATIVE_LAYOUT_MODE,
++    NATIVE_SPLIT_MODE,
+     PACKED_CAST_MODE,
+     PACKED_EMBEDDING_MODE,
+     PACKED_TRANSPOSE_MODE,
+@@ -33,6 +37,8 @@ from pypto.compiler.targets.cpu_avx2 import (
+     W8A8_QMATMUL_MODE,
+     W8A8_QUANTIZE_MODE,
+     _execution_metadata,
++    layout_native_contract,
++    layout_native_fallback_reason,
+     packed_kernel_contract,
+     w8a8_kernel_contract,
+ )
+@@ -886,6 +892,244 @@ def _call_packed_embedding(
+     function(table.pointer, indices.pointer, destination.pointer, index_count, row_elements)
+ 
+ 
++# --------------------------------------------------------------------------
++# Native layout/split/concat plane (artifact payload version 5).
++#
++# The descriptor wire mirrors the verified SVE256/AVX-512 ``PXLD`` v2 payload:
++# a 40-byte header plus rank-sized uint64 arrays.  Per-descriptor bytes are
++# cached by plan digest; the compiled kernel decodes and re-validates them, so
++# a malformed or oversized descriptor fails closed instead of reading the
++# wrong buffer.
++# --------------------------------------------------------------------------
++
++_LAYOUT_KIND_CODES = {"logical_layout_copy": 0, "transpose": 1, "slice": 2}
++_LAYOUT_DESC_VERSION = 2
++_LAYOUT_DESC_HEADER = struct.Struct("<4s5I2Q")
++_LAYOUT_MAX_RANK = 64
++_LAYOUT_DESCRIPTOR_CACHE: Dict[str, Tuple[bytes, Any]] = {}
++_LAYOUT_DESCRIPTOR_CACHE_LIMIT = 4096
++_LAYOUT_DESCRIPTOR_CACHE_LOCK = threading.RLock()
++_LAYOUT_NATIVE_STATS: Dict[str, int] = {
++    "kernel_calls": 0,
++    "split_calls": 0,
++    "concat_calls": 0,
++    "descriptor_hits": 0,
++    "descriptor_misses": 0,
++    "descriptor_rejections": 0,
++    "view_alias_candidates": 0,
++    "view_alias_enabled": 0,
++    "explicit_host_fallbacks": 0,
++}
++
++
++def layout_native_stats() -> Mapping[str, int]:
++    """Snapshot the native layout plane counters (diagnostics, not a gate)."""
++
++    return dict(_LAYOUT_NATIVE_STATS)
++
++
++def reset_layout_native_stats() -> None:
++    """Zero the native layout plane counters (tests only)."""
++
++    for key in _LAYOUT_NATIVE_STATS:
++        _LAYOUT_NATIVE_STATS[key] = 0
++
++
++def _layout_descriptor_bytes(layout: Any) -> bytes:
++    """Serialize a ``LayoutPlan`` descriptor without any per-element map.
++
++    The wire matches the SVE256/AVX-512 ``PXLD`` v2 payload byte for byte, so
++    every backend describes the same rank-sized schedule.
++    """
++
++    kind = _LAYOUT_KIND_CODES.get(layout.kind)
++    if kind is None:
++        raise CpuAvx2ExecutionError(
++            "unknown AVX2 layout descriptor kind {!r}".format(layout.kind)
++        )
++    input_rank = len(layout.input_shape)
++    output_rank = len(layout.output_shape)
++    if input_rank > _LAYOUT_MAX_RANK or output_rank > _LAYOUT_MAX_RANK:
++        raise CpuAvx2ExecutionError(
++            "AVX2 layout descriptor rank exceeds {}".format(_LAYOUT_MAX_RANK)
++        )
++    descriptor = _LAYOUT_DESC_HEADER.pack(
++        b"PXLD",
++        _LAYOUT_DESC_VERSION,
++        input_rank,
++        output_rank,
++        kind,
++        0,
++        int(layout.source_elements),
++        int(layout.output_elements),
++    )
++    for values in (
++        layout.input_shape,
++        layout.output_shape,
++        layout.source_strides,
++        layout.permutation,
++        layout.slice_starts,
++        layout.slice_steps,
++    ):
++        descriptor += struct.pack("<{}Q".format(len(values)), *[int(value) for value in values])
++    return descriptor
++
++
++def _layout_descriptor_buffer(layout: Any) -> Tuple[bytes, Any]:
++    """Return the cached ``(payload, aligned ctypes buffer)`` for one plan."""
++
++    digest = layout.descriptor_digest
++    with _LAYOUT_DESCRIPTOR_CACHE_LOCK:
++        cached = _LAYOUT_DESCRIPTOR_CACHE.get(digest)
++        if cached is not None:
++            _LAYOUT_NATIVE_STATS["descriptor_hits"] += 1
++            return cached
++        payload = _layout_descriptor_bytes(layout)
++        words = (len(payload) + 7) // 8
++        padded = payload + b"\x00" * (words * 8 - len(payload))
++        array = (ctypes.c_uint64 * words).from_buffer_copy(padded)
++        if len(_LAYOUT_DESCRIPTOR_CACHE) >= _LAYOUT_DESCRIPTOR_CACHE_LIMIT:
++            _LAYOUT_DESCRIPTOR_CACHE.pop(next(iter(_LAYOUT_DESCRIPTOR_CACHE)))
++        _LAYOUT_DESCRIPTOR_CACHE[digest] = (payload, array)
++        _LAYOUT_NATIVE_STATS["descriptor_misses"] += 1
++        return payload, array
++
++
++def _call_layout_kernel(
++    module: Any,
++    kernel: str,
++    descriptor_bytes: bytes,
++    descriptor_buffer: Any,
++    source: _NativeBuffer,
++    destination: _NativeBuffer,
++) -> int:
++    function = _status_symbol(
++        module,
++        "ptx_avx2_{}".format(kernel),
++        [
++            ctypes.c_void_p,
++            ctypes.c_size_t,
++            ctypes.c_void_p,
++            ctypes.c_void_p,
++        ],
++    )
++    return int(
++        function(
++            ctypes.cast(descriptor_buffer, ctypes.c_void_p),
++            len(descriptor_bytes),
++            source.pointer,
++            destination.pointer,
++        )
++    )
++
++
++def _call_split_kernel(
++    module: Any,
++    kernel: str,
++    source: _NativeBuffer,
++    destination: _NativeBuffer,
++    outer: int,
++    inner: int,
++    source_axis: int,
++    axis_offset: int,
++    axis_size: int,
++) -> int:
++    function = _status_symbol(
++        module,
++        "ptx_avx2_{}".format(kernel),
++        [
++            ctypes.c_void_p,
++            ctypes.c_void_p,
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++        ],
++    )
++    return int(
++        function(
++            source.pointer,
++            destination.pointer,
++            outer,
++            inner,
++            source_axis,
++            axis_offset,
++            axis_size,
++        )
++    )
++
++
++def _call_concat_kernel(
++    module: Any,
++    kernel: str,
++    source: _NativeBuffer,
++    destination: _NativeBuffer,
++    outer: int,
++    inner: int,
++    output_axis: int,
++    axis_offset: int,
++    axis_size: int,
++) -> int:
++    function = _status_symbol(
++        module,
++        "ptx_avx2_{}".format(kernel),
++        [
++            ctypes.c_void_p,
++            ctypes.c_void_p,
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++            ctypes.c_size_t,
++        ],
++    )
++    return int(
++        function(
++            source.pointer,
++            destination.pointer,
++            outer,
++            inner,
++            output_axis,
++            axis_offset,
++            axis_size,
++        )
++    )
++
++
++def _layout_view_alias_prefix(
++    layout: Any,
++    source: _NativeBuffer,
++    target_dtype: str,
++    count: int,
++) -> Tuple[bool, str]:
++    """Static prefix of the zero-copy view gate; never sufficient on its own.
++
++    Returns ``(prefix_ok, reason)``.  Even when the prefix passes, the executor
++    keeps the copying path until an SSA liveness proof is wired in: the
++    returned reason records that second, still-unmet condition.
++    """
++
++    if layout.kind != "logical_layout_copy":
++        return False, "layout kind {!r} is not a logical copy".format(layout.kind)
++    if tuple(layout.permutation) != tuple(range(len(layout.input_shape))):
++        return False, "layout permutation is not the identity"
++    if any(layout.slice_starts) or any(step != 1 for step in layout.slice_steps):
++        return False, "layout descriptor is not offset/step free"
++    if layout.source_elements != count or layout.output_elements != count:
++        return False, "source and output element counts do not match"
++    if source.count != count:
++        return False, "source buffer element count does not match the descriptor"
++    if source.dtype != target_dtype:
++        return False, "source and output dtype do not match"
++    if source.direct or source.owner is None:
++        return False, "source buffer is caller-owned storage, not an internal allocation"
++    return (
++        True,
++        "static prefix satisfied; SSA liveness alias proof is not wired into the executor",
++    )
++
++
+ def _reference_operation(
+     operation: Operation,
+     plan: Any,
+@@ -894,11 +1138,14 @@ def _reference_operation(
+ ) -> Dict[str, _RuntimeValue]:
+     """Execute one operation through the shared semantic reference.
+ 
+-    AVX2 keeps the native ABI and runner for the hot floating-point core, but
+-    layout/indexing/control and mixed-dtype operations have deliberately
+-    explicit host-reference implementations until their own emitting ABI is
+-    introduced.  This adapter shares the exact vector-common semantics rather
+-    than duplicating a subtly different fallback here.
++    AVX2 keeps the native ABI and runner for the hot floating-point core and a
++    native PXLD-v2 descriptor plane for layout/split/concat (f32/bf16/int8);
++    indexing, position control, non-native layout dtypes and other
++    mixed-dtype operations deliberately use the exact vector-common semantic
++    reference.  The fallback is reflected in artifact metadata and never
++    invokes another backend implicitly.  This adapter shares the exact
++    vector-common semantics rather than duplicating a subtly different
++    fallback here.
+     """
+ 
+     environment: Dict[str, Any] = {}
+@@ -1592,13 +1839,22 @@ class Avx2Runtime:
+         if packed is not None:
+             environment.update(self._execute_packed(packed, operation, plan, inputs, module))
+             return
+-        if name == "split":
+-            environment.update(
+-                _reference_operation(
+-                    operation, plan, inputs, "AVX2 {} split".format(operation.name)
++        layout = layout_native_contract(operation, plan)
++        if layout is not None:
++            mode = layout["mode"]
++            if mode == NATIVE_LAYOUT_MODE:
++                environment.update(self._execute_layout(layout, operation, plan, inputs, module))
++            elif mode == NATIVE_SPLIT_MODE:
++                environment.update(self._execute_split(layout, operation, plan, inputs, module))
++            elif mode == NATIVE_CONCAT_MODE:
++                environment.update(self._execute_concat(layout, operation, plan, inputs, module))
++            else:
++                raise CpuAvx2ArtifactError(
++                    "AVX2 native layout plane has an unknown mode {!r}".format(mode)
+                 )
+-            )
+             return
++        if layout_native_fallback_reason(operation, plan) is not None:
++            _LAYOUT_NATIVE_STATS["explicit_host_fallbacks"] += 1
+         output_ref = operation.outputs[0]
+         dtype = canonical_dtype(output_ref.type.dtype)
+         native_float = dtype in ("float32", "bf16")
+@@ -1688,6 +1944,192 @@ class Avx2Runtime:
+         except (TypeError, ValueError, OverflowError, ZeroDivisionError) as exc:
+             raise CpuAvx2ExecutionError("AVX2 operation {} failed: {}".format(name, exc)) from exc
+ 
++    # -- native layout / split / concat --------------------------------
++    def _execute_layout(
++        self,
++        contract: Mapping[str, Any],
++        operation: Operation,
++        plan: Any,
++        inputs: Sequence[_RuntimeValue],
++        module: Any,
++    ) -> Mapping[str, _RuntimeValue]:
++        """Run one ``LayoutPlan`` descriptor in the compiled AVX2 object."""
++
++        outputs = list(operation.outputs)
++        plan_layout = plan.layout_plan
++        if plan_layout is None or plan_layout.operation != plan.operation:
++            raise CpuAvx2ArtifactError("AVX2 native layout plan is missing or mismatched")
++        if len(inputs) != 1 or len(outputs) != 1:
++            raise CpuAvx2ArtifactError("AVX2 native layout requires exactly one input and output")
++        target_dtype = canonical_dtype(outputs[0].type.dtype)
++        if target_dtype != contract.get("dtype"):
++            raise CpuAvx2ArtifactError("AVX2 native layout dtype disagrees with the contract")
++        if contract.get("descriptor_digest") != plan_layout.descriptor_digest:
++            _LAYOUT_NATIVE_STATS["descriptor_rejections"] += 1
++            raise CpuAvx2ArtifactError("AVX2 native layout descriptor digest mismatch")
++        source = inputs[0].buffer
++        if source.dtype != target_dtype or source.count != plan_layout.source_elements:
++            raise CpuAvx2ExecutionError(
++                "AVX2 native layout source buffer does not match the descriptor"
++            )
++        count = plan_layout.output_elements
++        if count != int(plan.element_count):
++            raise CpuAvx2ArtifactError("AVX2 native layout output count disagrees with the plan")
++        prefix_ok, _prefix_reason = _layout_view_alias_prefix(
++            plan_layout, source, target_dtype, count
++        )
++        if prefix_ok:
++            _LAYOUT_NATIVE_STATS["view_alias_candidates"] += 1
++        try:
++            payload, descriptor = _layout_descriptor_buffer(plan_layout)
++        except CpuAvx2RuntimeError:
++            _LAYOUT_NATIVE_STATS["descriptor_rejections"] += 1
++            raise
++        destination = _buffer_alloc(target_dtype, count, outputs[0].name)
++        status = _call_layout_kernel(
++            module, contract["kernel"], payload, descriptor, source, destination
++        )
++        if status != 0:
++            _LAYOUT_NATIVE_STATS["descriptor_rejections"] += 1
++            raise CpuAvx2ExecutionError(
++                "AVX2 native layout kernel rejected the descriptor (status {})".format(status)
++            )
++        _LAYOUT_NATIVE_STATS["kernel_calls"] += 1
++        return {outputs[0].name: _RuntimeValue(outputs[0].type, destination)}
++
++    def _split_geometry(self, split: Any, output_index: int) -> Tuple[int, int, int, int, int]:
++        axis = int(split.axis)
++        outer = 1
++        for dimension in split.input_shape[:axis]:
++            outer *= int(dimension)
++        inner = 1
++        for dimension in split.input_shape[axis + 1:]:
++            inner *= int(dimension)
++        source_axis = int(split.input_shape[axis])
++        axis_size = int(split.sizes[output_index])
++        axis_offset = sum(int(size) for size in split.sizes[:output_index])
++        if outer * source_axis * inner != int(split.source_elements):
++            raise CpuAvx2ArtifactError("AVX2 split geometry does not match the source elements")
++        if axis_offset < 0 or axis_offset + axis_size > source_axis:
++            raise CpuAvx2ArtifactError("AVX2 split output offset is outside the axis")
++        return outer, inner, source_axis, axis_offset, axis_size
++
++    def _execute_split(
++        self,
++        contract: Mapping[str, Any],
++        operation: Operation,
++        plan: Any,
++        inputs: Sequence[_RuntimeValue],
++        module: Any,
++    ) -> Mapping[str, _RuntimeValue]:
++        """Copy every split output segment natively (one kernel call per output)."""
++
++        split = plan.split_plan
++        outputs = list(operation.outputs)
++        if split is None or plan.operation != "split":
++            raise CpuAvx2ArtifactError("AVX2 native split plan is missing or mismatched")
++        if len(inputs) != 1 or len(outputs) != len(split.sizes):
++            raise CpuAvx2ArtifactError("AVX2 native split operand count does not match the plan")
++        dtype = canonical_dtype(inputs[0].type.dtype)
++        if dtype != contract.get("dtype") or contract.get("kind") != "split":
++            raise CpuAvx2ArtifactError("AVX2 native split dtype disagrees with the contract")
++        if contract.get("descriptor_digest") != split.descriptor_digest:
++            raise CpuAvx2ArtifactError("AVX2 native split descriptor digest mismatch")
++        source = inputs[0].buffer
++        if source.dtype != dtype or source.count != int(split.source_elements):
++            raise CpuAvx2ExecutionError("AVX2 native split source buffer does not match the plan")
++        results: Dict[str, _RuntimeValue] = {}
++        for output_index, output_ref in enumerate(outputs):
++            if canonical_dtype(output_ref.type.dtype) != dtype:
++                raise CpuAvx2ArtifactError("AVX2 native split output dtype disagrees")
++            outer, inner, source_axis, axis_offset, axis_size = self._split_geometry(
++                split, output_index
++            )
++            count = element_count(split.output_shapes[output_index])
++            if outer * axis_size * inner != count:
++                raise CpuAvx2ArtifactError("AVX2 native split output count is inconsistent")
++            destination = _buffer_alloc(dtype, count, output_ref.name)
++            status = _call_split_kernel(
++                module,
++                contract["kernel"],
++                source,
++                destination,
++                outer,
++                inner,
++                source_axis,
++                axis_offset,
++                axis_size,
++            )
++            if status != 0:
++                _LAYOUT_NATIVE_STATS["descriptor_rejections"] += 1
++                raise CpuAvx2ExecutionError(
++                    "AVX2 native split kernel rejected the geometry (status {})".format(status)
++                )
++            _LAYOUT_NATIVE_STATS["split_calls"] += 1
++            results[output_ref.name] = _RuntimeValue(output_ref.type, destination)
++        return results
++
++    def _execute_concat(
++        self,
++        contract: Mapping[str, Any],
++        operation: Operation,
++        plan: Any,
++        inputs: Sequence[_RuntimeValue],
++        module: Any,
++    ) -> Mapping[str, _RuntimeValue]:
++        """Copy every concat input segment into the output axis column natively."""
++
++        concat = plan.concat_plan
++        outputs = list(operation.outputs)
++        if concat is None or plan.operation != "concat":
++            raise CpuAvx2ArtifactError("AVX2 native concat plan is missing or mismatched")
++        if len(outputs) != 1 or len(inputs) != len(concat.input_shapes):
++            raise CpuAvx2ArtifactError("AVX2 native concat operand count does not match the plan")
++        dtype = canonical_dtype(outputs[0].type.dtype)
++        if dtype != contract.get("dtype") or contract.get("kind") != "concat":
++            raise CpuAvx2ArtifactError("AVX2 native concat dtype disagrees with the contract")
++        if contract.get("descriptor_digest") != concat.descriptor_digest:
++            raise CpuAvx2ArtifactError("AVX2 native concat descriptor digest mismatch")
++        axis = int(concat.axis)
++        output_shape = concat.output_shape
++        output_axis = int(output_shape[axis])
++        outer = 1
++        for dimension in output_shape[:axis]:
++            outer *= int(dimension)
++        inner = 1
++        for dimension in output_shape[axis + 1:]:
++            inner *= int(dimension)
++        destination = _buffer_alloc(dtype, int(concat.output_elements), outputs[0].name)
++        axis_offset = 0
++        for input_index, (value, shape) in enumerate(zip(inputs, concat.input_shapes)):
++            axis_size = int(concat.sizes[input_index])
++            input_count = element_count(shape)
++            if canonical_dtype(value.type.dtype) != dtype or value.buffer.dtype != dtype:
++                raise CpuAvx2ArtifactError("AVX2 native concat input dtype disagrees")
++            if value.buffer.count != input_count or outer * axis_size * inner != input_count:
++                raise CpuAvx2ArtifactError("AVX2 native concat input count is inconsistent")
++            status = _call_concat_kernel(
++                module,
++                contract["kernel"],
++                value.buffer,
++                destination,
++                outer,
++                inner,
++                output_axis,
++                axis_offset,
++                axis_size,
++            )
++            if status != 0:
++                _LAYOUT_NATIVE_STATS["descriptor_rejections"] += 1
++                raise CpuAvx2ExecutionError(
++                    "AVX2 native concat kernel rejected the geometry (status {})".format(status)
++                )
++            _LAYOUT_NATIVE_STATS["concat_calls"] += 1
++            axis_offset += axis_size
++        if axis_offset != output_axis:
++            raise CpuAvx2ArtifactError("AVX2 native concat axis segments do not cover the output")
++        return {outputs[0].name: _RuntimeValue(outputs[0].type, destination)}
++
+     def _execute_w8a8(
+         self,
+         contract: Mapping[str, Any],
+diff --git a/python/pypto/compiler/targets/cpu_avx2.py b/python/pypto/compiler/targets/cpu_avx2.py
+index e3996dcfc..f6781d9f3 100644
+--- a/python/pypto/compiler/targets/cpu_avx2.py
++++ b/python/pypto/compiler/targets/cpu_avx2.py
+@@ -41,13 +41,17 @@ from pypto.target._utils import mapping_copy, sha256_bytes, sha256_text
+ # host_reference and is rejected by the runtime.  Payload 3 adds the W8A8
+ # integer widening kernels (native qmatmul plus the dequantize primitives);
+ # payload 4 adds the graph-path W8A8 quantize/epilogue kernels and the int8
+-# packed transpose.  Old payloads are rejected fail-closed because their
+-# execution-mode table cannot describe the new opcodes.
+-ARTIFACT_PAYLOAD_VERSION = 4
++# packed transpose.  Payload 5 adds the descriptor-driven native layout /
++# split / concat plane (reshape/view/contiguous/transpose/slice for
++# f32/bf16/int8); payload 4 described every one of those operations as
++# host_reference.  Old payloads are rejected fail-closed because their
++# execution-mode table cannot describe the new native plane.
++ARTIFACT_PAYLOAD_VERSION = 5
+ DEFAULT_ARTIFACT_FORMAT = "pypto-x.cpu.avx2"
+ #: Native shared-object ABI marker.  ``:4`` added the W8A8 widening kernels;
+-#: ``:5`` adds the quantize/epilogue kernels and the int8 transpose.
+-NATIVE_ABI_MARKER = "pypto-x.cpu.avx2:5"
++#: ``:5`` adds the quantize/epilogue kernels and the int8 transpose; ``:6``
++#: adds the PXLD-v2 native layout / split / concat kernels.
++NATIVE_ABI_MARKER = "pypto-x.cpu.avx2:6"
+ 
+ 
+ _NATIVE_SOURCE = r'''
+@@ -55,6 +59,7 @@ _NATIVE_SOURCE = r'''
+ #include <math.h>
+ #include <stddef.h>
+ #include <stdint.h>
++#include <string.h>
+ 
+ #ifndef PTX_USE_FMA
+ #define PTX_USE_FMA 0
+@@ -72,7 +77,7 @@ _NATIVE_SOURCE = r'''
+ __attribute__((visibility("default"))) const char *ptx_avx2_variant = PTX_VARIANT;
+ __attribute__((visibility("default"))) const char *ptx_avx2_source_digest = PTX_SOURCE_DIGEST;
+ __attribute__((visibility("default"))) const unsigned int ptx_avx2_feature_mask = PTX_FEATURE_MASK;
+-__attribute__((visibility("default"))) const char *ptx_avx2_abi = "pypto-x.cpu.avx2:5";
++__attribute__((visibility("default"))) const char *ptx_avx2_abi = "pypto-x.cpu.avx2:6";
+ 
+ static inline __m256 ptx_binary_f32(int op, __m256 a, __m256 b) {
+     if (op == 0) return _mm256_add_ps(a, b);
+@@ -714,6 +719,399 @@ int ptx_avx2_quantize_per_token_s8_f32(const float *restrict values,
+     *saturation = total_saturation;
+     return 0;
+ }
++
++/* -------------------------------------------------------------------------
++ * Native layout / split / concat plane (artifact payload version 5).
++ *
++ * The descriptor wire is the same little-endian ``PXLD`` v2 payload the
++ * verified SVE256/AVX-512 runners consume: a 40-byte header followed by the
++ * rank-sized input_shape / output_shape / source_strides / permutation /
++ * slice_starts / slice_steps arrays.  The Python runtime serializes one
++ * descriptor per plan digest and never materializes a per-element index map;
++ * the kernel decodes and re-validates the descriptor before it touches
++ * memory and returns a non-zero status for any violation.
++ *
++ * f32/bf16 lanes reproduce the vector-common host reference exactly: the
++ * reference round-trips every element through a Python float, which is the
++ * identity for finite/subnormal/quiet-NaN values and quiets a signaling NaN.
++ * The contiguous copy kind (reshape/view/contiguous) and the split/concat
++ * segment copies use an AVX2 lane path with pure integer bit operations, so
++ * the quieting stays bit-exact and no FP exception is raised; int8 has no
++ * value conversion, so its lanes are raw byte copies.
++ * ---------------------------------------------------------------------- */
++#define PTX_AVX2_LAYOUT_DESC_VERSION 2U
++#define PTX_AVX2_LAYOUT_DESC_HEADER_BYTES 40U
++#define PTX_AVX2_LAYOUT_MAX_RANK 64U
++#define PTX_AVX2_LAYOUT_KIND_COPY 0U
++#define PTX_AVX2_LAYOUT_KIND_TRANSPOSE 1U
++#define PTX_AVX2_LAYOUT_KIND_SLICE 2U
++
++typedef struct {
++    uint32_t input_rank;
++    uint32_t output_rank;
++    uint32_t kind;
++    uint64_t source_elements;
++    uint64_t output_elements;
++    const uint64_t *input_shape;
++    const uint64_t *output_shape;
++    const uint64_t *source_strides;
++    const uint64_t *permutation;
++    const uint64_t *slice_starts;
++    const uint64_t *slice_steps;
++} PtxAvx2LayoutDescriptor;
++
++static inline uint32_t ptx_avx2_layout_quiet_nan_f32(uint32_t bits) {
++    if ((bits & 0x7f800000U) == 0x7f800000U &&
++        (bits & 0x007fffffU) != 0U &&
++        (bits & 0x00400000U) == 0U)
++        bits |= 0x00400000U;
++    return bits;
++}
++
++static inline uint16_t ptx_avx2_layout_quiet_nan_bf16(uint16_t bits) {
++    if ((bits & 0x7f80U) == 0x7f80U &&
++        (bits & 0x007fU) != 0U &&
++        (bits & 0x0040U) == 0U)
++        bits |= 0x0040U;
++    return bits;
++}
++
++static uint32_t ptx_avx2_layout_read_u32(const unsigned char *bytes) {
++    uint32_t value;
++    memcpy(&value, bytes, sizeof(value));
++    return value;
++}
++
++static uint64_t ptx_avx2_layout_read_u64(const unsigned char *bytes) {
++    uint64_t value;
++    memcpy(&value, bytes, sizeof(value));
++    return value;
++}
++
++static int ptx_avx2_layout_u64_mul(uint64_t left, uint64_t right, uint64_t *result) {
++    if (left != 0U && right > UINT64_MAX / left) return -1;
++    *result = left * right;
++    return 0;
++}
++
++static int ptx_avx2_layout_u64_add(uint64_t left, uint64_t right, uint64_t *result) {
++    if (right > UINT64_MAX - left) return -1;
++    *result = left + right;
++    return 0;
++}
++
++static int ptx_avx2_layout_decode(const unsigned char *bytes, size_t length,
++                                  PtxAvx2LayoutDescriptor *descriptor) {
++    uint32_t input_rank, output_rank, kind;
++    uint64_t array_count, expected;
++    const uint64_t *arrays;
++    if (bytes == NULL || descriptor == NULL) return -1;
++    if (length < PTX_AVX2_LAYOUT_DESC_HEADER_BYTES) return -1;
++    /* The array pointers below must be naturally aligned; the runtime owns
++     * the descriptor buffer and hands over an 8-byte aligned copy. */
++    if (((uintptr_t)bytes & 7U) != 0U) return -1;
++    if (memcmp(bytes, "PXLD", 4) != 0) return -1;
++    if (ptx_avx2_layout_read_u32(bytes + 4) != PTX_AVX2_LAYOUT_DESC_VERSION) return -1;
++    input_rank = ptx_avx2_layout_read_u32(bytes + 8);
++    output_rank = ptx_avx2_layout_read_u32(bytes + 12);
++    kind = ptx_avx2_layout_read_u32(bytes + 16);
++    if (input_rank > PTX_AVX2_LAYOUT_MAX_RANK ||
++        output_rank > PTX_AVX2_LAYOUT_MAX_RANK)
++        return -1;
++    if (kind != PTX_AVX2_LAYOUT_KIND_COPY &&
++        kind != PTX_AVX2_LAYOUT_KIND_TRANSPOSE &&
++        kind != PTX_AVX2_LAYOUT_KIND_SLICE)
++        return -1;
++    array_count = (uint64_t)5U * input_rank + output_rank;
++    if (ptx_avx2_layout_u64_mul(array_count, sizeof(uint64_t), &expected) != 0 ||
++        ptx_avx2_layout_u64_add(PTX_AVX2_LAYOUT_DESC_HEADER_BYTES, expected, &expected) != 0)
++        return -1;
++    if ((uint64_t)length != expected) return -1;
++    arrays = (const uint64_t *)(const void *)(bytes + PTX_AVX2_LAYOUT_DESC_HEADER_BYTES);
++    descriptor->input_rank = input_rank;
++    descriptor->output_rank = output_rank;
++    descriptor->kind = kind;
++    descriptor->source_elements = ptx_avx2_layout_read_u64(bytes + 24);
++    descriptor->output_elements = ptx_avx2_layout_read_u64(bytes + 32);
++    descriptor->input_shape = arrays;
++    descriptor->output_shape = arrays + input_rank;
++    descriptor->source_strides = descriptor->output_shape + output_rank;
++    descriptor->permutation = descriptor->source_strides + input_rank;
++    descriptor->slice_starts = descriptor->permutation + input_rank;
++    descriptor->slice_steps = descriptor->slice_starts + input_rank;
++    return 0;
++}
++
++static int ptx_avx2_layout_validate(const PtxAvx2LayoutDescriptor *descriptor) {
++    uint64_t source_product = 1U, output_product = 1U, running, value;
++    uint32_t axis, other;
++    for (axis = 0; axis < descriptor->input_rank; ++axis) {
++        if (descriptor->permutation[axis] >= descriptor->input_rank) return -1;
++        if (descriptor->slice_steps[axis] == 0U) return -1;
++        if (descriptor->slice_starts[axis] > descriptor->input_shape[axis]) return -1;
++        if (descriptor->input_shape[axis] == 0U && descriptor->slice_starts[axis] != 0U)
++            return -1;
++        if (ptx_avx2_layout_u64_mul(source_product, descriptor->input_shape[axis],
++                                    &source_product) != 0)
++            return -1;
++    }
++    for (axis = 0; axis < descriptor->output_rank; ++axis) {
++        if (ptx_avx2_layout_u64_mul(output_product, descriptor->output_shape[axis],
++                                    &output_product) != 0)
++            return -1;
++    }
++    if (source_product != descriptor->source_elements ||
++        output_product != descriptor->output_elements)
++        return -1;
++    running = 1U;
++    for (axis = descriptor->input_rank; axis > 0U; --axis) {
++        uint32_t current = axis - 1U;
++        if (descriptor->source_strides[current] != running) return -1;
++        if (ptx_avx2_layout_u64_mul(running, descriptor->input_shape[current], &running) != 0)
++            return -1;
++    }
++    for (axis = 0; axis < descriptor->input_rank; ++axis) {
++        for (other = axis + 1U; other < descriptor->input_rank; ++other) {
++            if (descriptor->permutation[axis] == descriptor->permutation[other]) return -1;
++        }
++    }
++    if (descriptor->kind == PTX_AVX2_LAYOUT_KIND_COPY) {
++        if (descriptor->source_elements != descriptor->output_elements) return -1;
++        for (axis = 0; axis < descriptor->input_rank; ++axis) {
++            if (descriptor->permutation[axis] != axis ||
++                descriptor->slice_starts[axis] != 0U ||
++                descriptor->slice_steps[axis] != 1U)
++                return -1;
++        }
++        return 0;
++    }
++    if (descriptor->input_rank != descriptor->output_rank) return -1;
++    for (axis = 0; axis < descriptor->output_rank; ++axis) {
++        uint64_t source_axis = descriptor->permutation[axis];
++        if (descriptor->kind == PTX_AVX2_LAYOUT_KIND_TRANSPOSE) {
++            if (descriptor->output_shape[axis] != descriptor->input_shape[source_axis])
++                return -1;
++            if (descriptor->slice_starts[source_axis] != 0U ||
++                descriptor->slice_steps[source_axis] != 1U)
++                return -1;
++        } else {
++            if (descriptor->permutation[axis] != axis) return -1;
++            if (descriptor->output_shape[axis] != 0U) {
++                if (ptx_avx2_layout_u64_mul(descriptor->output_shape[axis] - 1U,
++                                            descriptor->slice_steps[source_axis],
++                                            &value) != 0)
++                    return -1;
++                if (value >= descriptor->input_shape[source_axis] -
++                                 descriptor->slice_starts[source_axis])
++                    return -1;
++            }
++        }
++    }
++    return 0;
++}
++
++static int ptx_avx2_layout_source_offset(const PtxAvx2LayoutDescriptor *descriptor,
++                                         uint64_t *deltas, uint64_t *offset) {
++    uint64_t term;
++    uint32_t axis;
++    *offset = 0U;
++    for (axis = 0; axis < descriptor->output_rank; ++axis) {
++        uint32_t source_axis = (uint32_t)descriptor->permutation[axis];
++        if (ptx_avx2_layout_u64_mul(descriptor->slice_steps[source_axis],
++                                    descriptor->source_strides[source_axis],
++                                    &deltas[axis]) != 0)
++            return -1;
++        if (ptx_avx2_layout_u64_mul(descriptor->slice_starts[source_axis],
++                                    descriptor->source_strides[source_axis],
++                                    &term) != 0)
++            return -1;
++        if (ptx_avx2_layout_u64_add(*offset, term, offset) != 0) return -1;
++    }
++    return 0;
++}
++
++/* Contiguous copy lanes: reshape/view/contiguous and split/concat segments.
++ * The quieting is done with integer bit tests so the lane results are
++ * byte-identical to the host reference's Python-float round trip. */
++static void ptx_avx2_layout_copy_f32(const float *input, float *output, uint64_t count) {
++    const __m256i exponent = _mm256_set1_epi32(0x7f800000);
++    const __m256i mantissa_mask = _mm256_set1_epi32(0x007fffff);
++    const __m256i quiet = _mm256_set1_epi32(0x00400000);
++    const __m256i zero = _mm256_setzero_si256();
++    uint64_t index = 0U;
++    for (; index + 8U <= count; index += 8U) {
++        __m256i bits = _mm256_loadu_si256((const __m256i *)(const void *)(input + index));
++        __m256i nan = _mm256_and_si256(
++            _mm256_cmpeq_epi32(_mm256_and_si256(bits, exponent), exponent),
++            _mm256_cmpgt_epi32(_mm256_and_si256(bits, mantissa_mask), zero));
++        bits = _mm256_or_si256(bits, _mm256_and_si256(nan, quiet));
++        _mm256_storeu_si256((__m256i *)(void *)(output + index), bits);
++    }
++    for (; index < count; ++index) {
++        uint32_t bits;
++        memcpy(&bits, input + index, sizeof(bits));
++        bits = ptx_avx2_layout_quiet_nan_f32(bits);
++        memcpy(output + index, &bits, sizeof(bits));
++    }
++}
++
++static void ptx_avx2_layout_copy_bf16(const uint16_t *input, uint16_t *output, uint64_t count) {
++    const __m256i exponent = _mm256_set1_epi16((short)0x7f80);
++    const __m256i mantissa_mask = _mm256_set1_epi16(0x007f);
++    const __m256i quiet = _mm256_set1_epi16(0x0040);
++    const __m256i zero = _mm256_setzero_si256();
++    uint64_t index = 0U;
++    for (; index + 16U <= count; index += 16U) {
++        __m256i bits = _mm256_loadu_si256((const __m256i *)(const void *)(input + index));
++        __m256i nan = _mm256_and_si256(
++            _mm256_cmpeq_epi16(_mm256_and_si256(bits, exponent), exponent),
++            _mm256_cmpgt_epi16(_mm256_and_si256(bits, mantissa_mask), zero));
++        bits = _mm256_or_si256(bits, _mm256_and_si256(nan, quiet));
++        _mm256_storeu_si256((__m256i *)(void *)(output + index), bits);
++    }
++    for (; index < count; ++index)
++        output[index] = ptx_avx2_layout_quiet_nan_bf16(input[index]);
++}
++
++static void ptx_avx2_layout_copy_i8(const int8_t *input, int8_t *output, uint64_t count) {
++    if (count) memcpy(output, input, (size_t)count);
++}
++
++#define PTX_AVX2_LAYOUT_REORDER(SUFFIX, TYPE, COPY, QUIET_EXPR)                        \
++static int ptx_avx2_layout_reorder_##SUFFIX(                                           \
++    const PtxAvx2LayoutDescriptor *descriptor, const TYPE *input, TYPE *output)        \
++{                                                                                      \
++    uint64_t coords[PTX_AVX2_LAYOUT_MAX_RANK];                                         \
++    uint64_t deltas[PTX_AVX2_LAYOUT_MAX_RANK];                                         \
++    uint64_t offset = 0U, index, term;                                                 \
++    uint32_t axis;                                                                     \
++    if (descriptor->output_elements == 0U) return 0;                                   \
++    if (descriptor->kind == PTX_AVX2_LAYOUT_KIND_COPY) {                               \
++        COPY(input, output, descriptor->output_elements);                              \
++        return 0;                                                                      \
++    }                                                                                  \
++    if (ptx_avx2_layout_source_offset(descriptor, deltas, &offset) != 0)               \
++        return -1;                                                                     \
++    if (descriptor->output_rank == 0U) {                                               \
++        TYPE value = input[offset];                                                    \
++        QUIET_EXPR;                                                                    \
++        output[0] = value;                                                             \
++        return 0;                                                                      \
++    }                                                                                  \
++    for (axis = 0; axis < descriptor->output_rank; ++axis) coords[axis] = 0U;          \
++    for (index = 0U; index < descriptor->output_elements; ++index) {                   \
++        TYPE value = input[offset];                                                    \
++        QUIET_EXPR;                                                                    \
++        output[index] = value;                                                         \
++        for (axis = descriptor->output_rank; axis > 0U; --axis) {                      \
++            uint32_t current = axis - 1U;                                              \
++            if (ptx_avx2_layout_u64_add(offset, deltas[current], &offset) != 0)        \
++                return -1;                                                             \
++            coords[current] += 1U;                                                     \
++            if (coords[current] < descriptor->output_shape[current]) break;            \
++            if (ptx_avx2_layout_u64_mul(coords[current], deltas[current], &term) != 0) \
++                return -1;                                                             \
++            if (term > offset) return -1;                                              \
++            offset -= term;                                                            \
++            coords[current] = 0U;                                                      \
++        }                                                                              \
++    }                                                                                  \
++    return 0;                                                                          \
++}
++
++#define PTX_AVX2_LAYOUT_SCALAR_QUIET_F32(value)                  \
++    do {                                                         \
++        uint32_t bits__;                                         \
++        memcpy(&bits__, &(value), sizeof(bits__));               \
++        bits__ = ptx_avx2_layout_quiet_nan_f32(bits__);          \
++        memcpy(&(value), &bits__, sizeof(bits__));               \
++    } while (0)
++
++#define PTX_AVX2_LAYOUT_SCALAR_QUIET_BF16(value) \
++    (value) = ptx_avx2_layout_quiet_nan_bf16(value)
++
++#define PTX_AVX2_LAYOUT_SCALAR_QUIET_NONE(value) (void)(value)
++
++PTX_AVX2_LAYOUT_REORDER(f32, float, ptx_avx2_layout_copy_f32,
++                        PTX_AVX2_LAYOUT_SCALAR_QUIET_F32(value))
++PTX_AVX2_LAYOUT_REORDER(bf16, uint16_t, ptx_avx2_layout_copy_bf16,
++                        PTX_AVX2_LAYOUT_SCALAR_QUIET_BF16(value))
++PTX_AVX2_LAYOUT_REORDER(i8, int8_t, ptx_avx2_layout_copy_i8,
++                        PTX_AVX2_LAYOUT_SCALAR_QUIET_NONE(value))
++
++#define PTX_AVX2_LAYOUT_ENTRY(SUFFIX, TYPE, COPY)                                      \
++__attribute__((visibility("default")))                                                 \
++int ptx_avx2_layout_##SUFFIX(const unsigned char *descriptor, size_t descriptor_length, \
++                             const void *input, void *output) {                        \
++    PtxAvx2LayoutDescriptor decoded;                                                   \
++    if (ptx_avx2_layout_decode(descriptor, descriptor_length, &decoded) != 0)          \
++        return -1;                                                                     \
++    if (ptx_avx2_layout_validate(&decoded) != 0) return -1;                            \
++    if (decoded.output_elements == 0U) return 0;                                       \
++    if (input == NULL || output == NULL) return -1;                                    \
++    if (decoded.kind == PTX_AVX2_LAYOUT_KIND_COPY) {                                   \
++        COPY((const TYPE *)input, (TYPE *)output, decoded.output_elements);            \
++        return 0;                                                                      \
++    }                                                                                  \
++    return ptx_avx2_layout_reorder_##SUFFIX(&decoded, (const TYPE *)input,             \
++                                            (TYPE *)output);                           \
++}
++
++PTX_AVX2_LAYOUT_ENTRY(f32, float, ptx_avx2_layout_copy_f32)
++PTX_AVX2_LAYOUT_ENTRY(bf16, uint16_t, ptx_avx2_layout_copy_bf16)
++PTX_AVX2_LAYOUT_ENTRY(i8, int8_t, ptx_avx2_layout_copy_i8)
++
++#define PTX_AVX2_SPLIT_ENTRY(SUFFIX, TYPE, COPY)                                      \
++__attribute__((visibility("default")))                                                \
++int ptx_avx2_split_##SUFFIX(const void *input, void *output, size_t outer,            \
++                            size_t inner, size_t source_axis, size_t axis_offset,     \
++                            size_t axis_size) {                                       \
++    uint64_t row, index, source_base, output_base;                                    \
++    if (ptx_avx2_layout_u64_mul(axis_size, inner, &row) != 0) return -1;              \
++    if (row == 0U || outer == 0U) return 0;                                           \
++    if (input == NULL || output == NULL) return -1;                                   \
++    if (axis_offset > source_axis || axis_size > source_axis - axis_offset)           \
++        return -1;                                                                    \
++    for (index = 0U; index < outer; ++index) {                                        \
++        if (ptx_avx2_layout_u64_mul(index, source_axis, &source_base) != 0 ||         \
++            ptx_avx2_layout_u64_add(source_base, axis_offset, &source_base) != 0 ||   \
++            ptx_avx2_layout_u64_mul(source_base, inner, &source_base) != 0)           \
++            return -1;                                                                \
++        if (ptx_avx2_layout_u64_mul(index, row, &output_base) != 0) return -1;        \
++        COPY((const TYPE *)input + source_base, (TYPE *)output + output_base, row);   \
++    }                                                                                 \
++    return 0;                                                                         \
++}
++
++#define PTX_AVX2_CONCAT_ENTRY(SUFFIX, TYPE, COPY)                                     \
++__attribute__((visibility("default")))                                                \
++int ptx_avx2_concat_##SUFFIX(const void *input, void *output, size_t outer,           \
++                             size_t inner, size_t output_axis, size_t axis_offset,    \
++                             size_t axis_size) {                                      \
++    uint64_t row, index, source_base, output_base, term;                              \
++    if (ptx_avx2_layout_u64_mul(axis_size, inner, &row) != 0) return -1;              \
++    if (row == 0U || outer == 0U) return 0;                                           \
++    if (input == NULL || output == NULL) return -1;                                   \
++    if (axis_offset > output_axis || axis_size > output_axis - axis_offset)           \
++        return -1;                                                                    \
++    for (index = 0U; index < outer; ++index) {                                        \
++        if (ptx_avx2_layout_u64_mul(index, row, &source_base) != 0) return -1;        \
++        if (ptx_avx2_layout_u64_mul(index, output_axis, &output_base) != 0 ||         \
++            ptx_avx2_layout_u64_add(output_base, axis_offset, &output_base) != 0 ||   \
++            ptx_avx2_layout_u64_mul(output_base, inner, &term) != 0)                  \
++            return -1;                                                                \
++        output_base = term;                                                           \
++        COPY((const TYPE *)input + source_base, (TYPE *)output + output_base, row);   \
++    }                                                                                 \
++    return 0;                                                                         \
++}
++
++PTX_AVX2_SPLIT_ENTRY(f32, float, ptx_avx2_layout_copy_f32)
++PTX_AVX2_SPLIT_ENTRY(bf16, uint16_t, ptx_avx2_layout_copy_bf16)
++PTX_AVX2_SPLIT_ENTRY(i8, int8_t, ptx_avx2_layout_copy_i8)
++PTX_AVX2_CONCAT_ENTRY(f32, float, ptx_avx2_layout_copy_f32)
++PTX_AVX2_CONCAT_ENTRY(bf16, uint16_t, ptx_avx2_layout_copy_bf16)
++PTX_AVX2_CONCAT_ENTRY(i8, int8_t, ptx_avx2_layout_copy_i8)
+ '''
+ 
+ 
+@@ -928,6 +1326,134 @@ def packed_kernel_contract(operation: Any, plan: Any) -> Optional[dict]:
+     return None
+ 
+ 
++#: Native layout / split / concat descriptor plane (artifact payload version
++#: 5).  The runtime and the artifact metadata share the two predicates below,
++#: so a declared native layout kernel is exactly the kernel the executor runs.
++#: The descriptor itself is the shared ``LayoutPlan``/``SplitPlan``/
++#: ``ConcatPlan`` wire (PXLD v2 on the C side) and stays numel-independent.
++NATIVE_LAYOUT_KERNEL_VERSION = 1
++NATIVE_LAYOUT_MODE = "native_avx2_layout"
++NATIVE_SPLIT_MODE = "native_avx2_split"
++NATIVE_CONCAT_MODE = "native_avx2_concat"
++#: f32/bf16/int8 only.  Everything else (int32/int64/uint/bool/fp16, ...)
++#: stays on the vector-common host reference with an explicit metadata reason;
++#: this batch does not extend the native layout dtype set.
++_NATIVE_LAYOUT_DTYPES = ("float32", "bf16", "int8")
++_NATIVE_LAYOUT_OPERATIONS = frozenset(("reshape", "view", "contiguous", "transpose", "slice"))
++_NATIVE_LAYOUT_KERNEL_SUFFIX = {"float32": "f32", "bf16": "bf16", "int8": "i8"}
++
++
++def _layout_operand_dtype(operation: Any) -> Optional[str]:
++    """Return the single common tensor dtype of one plan's operands, or None."""
++
++    dtypes = []
++    for ref in tuple(operation.inputs) + tuple(operation.outputs):
++        if ref.type.kind not in _PACKED_TENSOR_KINDS:
++            return None
++        dtypes.append(canonical_dtype(ref.type.dtype))
++    if not dtypes or any(dtype != dtypes[0] for dtype in dtypes):
++        return None
++    return dtypes[0]
++
++
++def layout_native_contract(operation: Any, plan: Any) -> Optional[dict]:
++    """Describe the native AVX2 layout/split/concat kernel for one operation.
++
++    ``None`` means the operation is not covered by this plane; callers that
++    still need an explicit boundary record use
++    :func:`layout_native_fallback_reason`.
++    """
++
++    if operation is None or plan is None:
++        return None
++    name = canonical_operation_name(operation.name)
++    if name != plan.operation:
++        return None
++    if name in _NATIVE_LAYOUT_OPERATIONS:
++        layout = plan.layout_plan
++        if layout is None or layout.operation != name:
++            return None
++        dtype = _layout_operand_dtype(operation)
++        suffix = _NATIVE_LAYOUT_KERNEL_SUFFIX.get(dtype)
++        if suffix is None:
++            return None
++        return {
++            "mode": NATIVE_LAYOUT_MODE,
++            "kernel": "layout_{}".format(suffix),
++            "dtype": dtype,
++            "kind": layout.kind,
++            "descriptor_digest": layout.descriptor_digest,
++        }
++    if name == "split":
++        split = plan.split_plan
++        if split is None or len(operation.inputs) != 1:
++            return None
++        if len(operation.outputs) != len(split.sizes):
++            return None
++        dtype = _layout_operand_dtype(operation)
++        suffix = _NATIVE_LAYOUT_KERNEL_SUFFIX.get(dtype)
++        if suffix is None:
++            return None
++        return {
++            "mode": NATIVE_SPLIT_MODE,
++            "kernel": "split_{}".format(suffix),
++            "dtype": dtype,
++            "kind": "split",
++            "output_count": len(split.sizes),
++            "descriptor_digest": split.descriptor_digest,
++        }
++    if name == "concat":
++        concat = plan.concat_plan
++        if concat is None or len(operation.inputs) != len(concat.input_shapes):
++            return None
++        dtype = _layout_operand_dtype(operation)
++        suffix = _NATIVE_LAYOUT_KERNEL_SUFFIX.get(dtype)
++        if suffix is None:
++            return None
++        return {
++            "mode": NATIVE_CONCAT_MODE,
++            "kernel": "concat_{}".format(suffix),
++            "dtype": dtype,
++            "kind": "concat",
++            "input_count": len(concat.input_shapes),
++            "descriptor_digest": concat.descriptor_digest,
++        }
++    return None
++
++
++def layout_native_fallback_reason(operation: Any, plan: Any) -> Optional[str]:
++    """Return why a layout/split/concat operation is not native, or None.
++
++    The runtime keeps the exact vector-common host reference for these
++    operations; this string is what makes the fallback explicit in artifact
++    metadata instead of silent.
++    """
++
++    if operation is None or plan is None:
++        return None
++    name = canonical_operation_name(operation.name)
++    if name != plan.operation:
++        return None
++    if name not in _NATIVE_LAYOUT_OPERATIONS and name not in ("split", "concat"):
++        return None
++    if layout_native_contract(operation, plan) is not None:
++        return None
++    if name in _NATIVE_LAYOUT_OPERATIONS:
++        layout = plan.layout_plan
++        if layout is None or layout.operation != name:
++            return "layout descriptor is missing or does not match the operation"
++    elif name == "split" and plan.split_plan is None:
++        return "split descriptor is missing"
++    elif name == "concat" and plan.concat_plan is None:
++        return "concat descriptor is missing"
++    dtype = _layout_operand_dtype(operation)
++    if dtype is None:
++        return "operand dtypes are missing, non-tensor, or inconsistent"
++    if dtype not in _NATIVE_LAYOUT_DTYPES:
++        return "dtype {} is not in the native AVX2 layout dtype set (bf16/float32/int8)".format(dtype)
++    return "operation is not covered by the native AVX2 layout plane"
++
++
+ #: W8A8 native kernel plane.  The same predicate feeds artifact metadata and
+ #: runtime dispatch, so a declared widening kernel and the executed widening
+ #: kernel can never disagree.  Version 1 covered the s8 x s8 -> s32 native
+@@ -1126,6 +1652,9 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+     packed_names = []
+     w8a8_operations = []
+     w8a8_names = []
++    layout_native_operations = []
++    layout_native_fallbacks = []
++    native_helpers = set()
+     core_operations = _core_operations(target_ir)
+     for plan in target_ir.plans:
+         name = plan.operation
+@@ -1137,6 +1666,7 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+         )
+         w8a8 = w8a8_kernel_contract(operation, plan)
+         packed = packed_kernel_contract(operation, plan)
++        layout = layout_native_contract(operation, plan)
+         if w8a8 is not None:
+             mode = w8a8["mode"]
+             if name not in w8a8_names:
+@@ -1156,6 +1686,21 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+                     "target_dtype": packed["target_dtype"],
+                 }
+             )
++        elif layout is not None:
++            mode = layout["mode"]
++            if name not in native_operations:
++                native_operations.append(name)
++            layout_native_operations.append(
++                {
++                    "operation_index": plan.operation_index,
++                    "operation": name,
++                    "mode": mode,
++                    "kernel": layout["kernel"],
++                    "dtype": layout["dtype"],
++                    "kind": layout["kind"],
++                }
++            )
++            native_helpers.add("ptx_avx2_{}".format(layout["kernel"]))
+         elif name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
+             mode = "native_scalar_math_lane"
+             if name not in math_fallback:
+@@ -1173,6 +1718,15 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+         else:
+             mode = "host_reference"
+             host_operations.append(name)
++            layout_reason = layout_native_fallback_reason(operation, plan)
++            if layout_reason is not None:
++                layout_native_fallbacks.append(
++                    {
++                        "operation_index": plan.operation_index,
++                        "operation": name,
++                        "reason": layout_reason,
++                    }
++                )
+         operations.append({"operation_index": plan.operation_index, "operation": name, "mode": mode})
+     return {
+         "execution_modes": operations,
+@@ -1185,6 +1739,7 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+         "w8a8_kernel_operations": w8a8_names,
+         "w8a8_operations": w8a8_operations,
+         "w8a8_capability": _w8a8_capability_metadata(),
++        "native_helper_symbols": sorted(native_helpers),
+         "host_preexpanded_operations": [
+             name for name in ("broadcast", "where")
+             if any(plan.operation == name for plan in target_ir.plans)
+@@ -1194,8 +1749,16 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+         "host_reference_operations": host_operations,
+         "layout_plan_version": 2,
+         "layout_operations": _layout_metadata(target_ir),
+-        "layout_descriptor_wire": "host-reference:v1",
++        "layout_descriptor_wire": "native:v1:pxld-v2",
+         "layout_scalar_lane_fallback": [],
++        "layout_native_kernel_version": NATIVE_LAYOUT_KERNEL_VERSION,
++        "layout_native_operations": layout_native_operations,
++        "layout_native_fallback_operations": layout_native_fallbacks,
++        "layout_view_alias_mode": "disabled",
++        "layout_view_alias_reason": (
++            "static-prefix check only; the SSA liveness alias proof is not wired "
++            "into the executor, so every layout output stays a real copy"
++        ),
+         "indexing_descriptor_wire": "host-reference:v1",
+         "indexing_scalar_lane_fallback": [],
+         "indexing_operations": _indexing_metadata(target_ir),
+@@ -1206,7 +1769,10 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+             if plan.layout_plan is not None and plan.layout_plan.kind == "logical_layout_copy"
+         ],
+         "native_layout_reorder_operations": sorted(
+-            {entry["operation"] for entry in packed_operations if entry["mode"] == PACKED_TRANSPOSE_MODE}
++            {entry["operation"] for entry in layout_native_operations
++             if entry["kind"] in ("transpose", "slice")}
++            | {entry["operation"] for entry in packed_operations
++               if entry["mode"] == PACKED_TRANSPOSE_MODE}
+         ),
+         "batched_matmul_fallback": "host_batch_loop_rank2_native",
+         "batched_matmul_operations": [
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx2_layout.py b/python/tests/ut/pypto_x/test_cpu_avx2_layout.py
+new file mode 100644
+index 000000000..927fef08b
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cpu_avx2_layout.py
+@@ -0,0 +1,1120 @@
++"""AVX2 native layout / split / concat execution plane (avx2-layout-native).
++
++Every native execution is compared *bitwise* (full output buffer sha256)
++against an independent pure-stdlib oracle implemented in this file.  The
++oracle derives each output element from the Core IR operation contract
++(shape/permutation/slice bounds/dtype round trip) by explicit coordinate
++enumeration; it never imports or calls the implementation under test.
++
++The dtype round trip is part of the frozen CPU semantic contract: the shared
++vector-common host reference round-trips every f32/bf16 element through a
++Python float, which is the identity for finite/subnormal/quiet-NaN values and
++quiets a signaling NaN.  The oracle models exactly that, so the native plane
++and the host_reference baseline stay byte-identical (a plain bit-copy model
++would differ on sNaN payloads by design).  ``test_native_matches_the_vector_common_reference``
++is a secondary cross-check that pins the same contract against the real
++host-reference path for representative cases.
++
++The layout / split / concat sections are independent: ``-k layout``,
++``-k split`` and ``-k concat`` each run on their own.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import hashlib
++import struct
++
++import pytest
++
++from pypto.abi import LaunchRequest, TensorDesc
++from pypto.backends.cpu import HostTensor
++from pypto.backends.cpu.x86 import (
++    Avx2Runtime,
++    CpuAvx2ArtifactError,
++    CpuAvx2ExecutionError,
++)
++from pypto.backends.cpu.x86 import avx2 as avx2_runtime
++from pypto.compiler import CompileOptions
++from pypto.compiler.targets.cpu_avx2 import (
++    ARTIFACT_PAYLOAD_VERSION,
++    NATIVE_ABI_MARKER,
++    NATIVE_CONCAT_MODE,
++    NATIVE_LAYOUT_KERNEL_VERSION,
++    NATIVE_LAYOUT_MODE,
++    NATIVE_SPLIT_MODE,
++    Avx2Compiler,
++    layout_native_contract,
++    layout_native_fallback_reason,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu import element_count
++from pypto.lowering.cpu.vector import CpuVectorUnsupportedError, CpuVectorValidationError
++from pypto.target import TargetSpec
++
++
++AVX2_TARGET = TargetSpec(
++    "cpu", "x86_64-linux-gnu", features=("avx2",), attributes={"lane_count": 8}
++)
++_CTYPES = {"float32": ctypes.c_float, "bf16": ctypes.c_uint16, "int8": ctypes.c_int8, "int32": ctypes.c_int32}
++_F32_SPECIAL = (
++    0x7F800001,  # signaling NaN, positive payload 1
++    0xFF800001,  # signaling NaN, negative payload 1
++    0x7F812345,
++    0xFF812345,
++    0x7FC00001,  # quiet NaN with payload
++    0xFFC12345,
++    0x7F800000,  # +inf
++    0xFF800000,  # -inf
++    0x00000001,  # subnormal
++    0x80000001,
++    0x7F7FFFFF,  # max finite
++    0x3F800000,
++    0xBF800000,
++    0x41200000,
++    0x00000000,
++)
++_BF16_SPECIAL = (
++    0x7F81,  # signaling NaN
++    0xFF81,
++    0x7FA1,
++    0xFFA1,
++    0x7FC1,  # quiet NaN
++    0xFFC1,
++    0x7F80,  # +inf
++    0xFF80,
++    0x0001,  # subnormal
++    0x8001,
++    0x7F7F,
++    0x3F80,
++    0xBF80,
++    0x4120,
++    0x0000,
++)
++_KERNEL_SUFFIX = {"float32": "f32", "bf16": "bf16", "int8": "i8"}
++
++
++def _runtime():
++    runtime = Avx2Runtime()
++    if not runtime.is_available():
++        pytest.skip("host lacks AVX2/YMM capability: {}".format(runtime.availability().to_dict()))
++    return runtime
++
++
++def _compile(program, tmp_path, name):
++    compiler = Avx2Compiler()
++    target_ir = compiler.lower(program, AVX2_TARGET)
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format="pypto-x.cpu.avx2", extra={"build_dir": str(tmp_path / name)}
++        ),
++    )
++    return target_ir, artifact
++
++
++def _raw_array(dtype, bits):
++    array = (_CTYPES[dtype] * len(bits))()
++    for index, value in enumerate(bits):
++        if dtype == "float32":
++            ctypes.memmove(
++                ctypes.addressof(array) + 4 * index,
++                struct.pack("<I", int(value) & 0xFFFFFFFF),
++                4,
++            )
++        else:
++            array[index] = value
++    return array
++
++
++def _descriptor(dtype, shape, array, readonly=False):
++    return TensorDesc(
++        dtype, shape, device="cpu", address=ctypes.addressof(array), readonly=readonly
++    )
++
++
++def _launch_raw(artifact, inputs, outputs, runtime):
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[_descriptor(dtype, shape, array, True) for dtype, shape, array in inputs],
++            outputs=[_descriptor(dtype, shape, array) for dtype, shape, array in outputs],
++        )
++    )
++
++
++def _buffer_sha256(array):
++    return hashlib.sha256(
++        ctypes.string_at(ctypes.addressof(array), ctypes.sizeof(array))
++    ).hexdigest()
++
++
++def _oracle_sha256(dtype, bits):
++    width = {"float32": 4, "bf16": 2, "int8": 1, "int32": 4}[dtype]
++    signed = dtype in ("int8", "int32")
++    payload = b"".join(
++        int(bits[index]).to_bytes(width, "little", signed=signed)
++        for index in range(len(bits))
++    )
++    return hashlib.sha256(payload).hexdigest()
++
++
++def _pattern_bits(dtype, count, seed=1):
++    if dtype == "float32":
++        special = _F32_SPECIAL
++        return [
++            special[index] if index < len(special)
++            else ((seed * 2654435761 + index * 2246822519) & 0xFFFFFFFF)
++            for index in range(count)
++        ]
++    if dtype == "bf16":
++        special = _BF16_SPECIAL
++        return [
++            special[index] if index < len(special)
++            else ((seed * 40503 + index * 16411) & 0xFFFF)
++            for index in range(count)
++        ]
++    return [((seed * 37 + index * 91) % 255) - 127 for index in range(count)]
++
++
++def _assert_native_matches_oracle(artifact, inputs, output_shapes, dtypes, expected_bits, runtime):
++    native = [
++        _raw_array(dtype, [0] * element_count(shape))
++        for dtype, shape in zip(dtypes, output_shapes)
++    ]
++    _launch_raw(
++        artifact,
++        inputs,
++        [(dtype, shape, array) for dtype, shape, array in zip(dtypes, output_shapes, native)],
++        runtime,
++    )
++    assert len(native) == len(expected_bits)
++    for array, bits, dtype in zip(native, expected_bits, dtypes):
++        assert _buffer_sha256(array) == _oracle_sha256(dtype, bits)
++
++
++# --------------------------------------------------------------------------
++# pure-stdlib oracle (independent of the implementation under test)
++# --------------------------------------------------------------------------
++
++
++def _count(shape):
++    total = 1
++    for dimension in shape:
++        total *= int(dimension)
++    return total
++
++
++def _unravel(index, shape):
++    coords = [0] * len(shape)
++    for axis in range(len(shape) - 1, -1, -1):
++        if shape[axis] == 0:
++            return tuple(coords)
++        coords[axis] = index % shape[axis]
++        index //= shape[axis]
++    return tuple(coords)
++
++
++def _linear(shape, coords):
++    index = 0
++    for axis, coordinate in enumerate(coords):
++        index = index * shape[axis] + coordinate
++    return index
++
++
++def _quiet(bits, dtype):
++    """Model the vector-common Python-float round trip (sNaN quieting only)."""
++
++    if dtype == "float32":
++        bits &= 0xFFFFFFFF
++        if (bits & 0x7F800000) == 0x7F800000 and (bits & 0x007FFFFF) != 0 and (bits & 0x00400000) == 0:
++            bits |= 0x00400000
++        return bits
++    if dtype == "bf16":
++        bits &= 0xFFFF
++        if (bits & 0x7F80) == 0x7F80 and (bits & 0x007F) != 0 and (bits & 0x0040) == 0:
++            bits |= 0x0040
++        return bits
++    return int(bits)
++
++
++def _oracle_layout(name, input_shape, output_shape, attributes, dtype, source_bits, quiet=True):
++    """Expected output bits for one layout op, by coordinate enumeration.
++
++    ``quiet=False`` models the pre-existing packed rank-2 transpose kernel,
++    which is a raw element permutation (see
++    ``test_rank2_packed_transpose_preserves_snan_payloads``); the generic
++    PXLD layout plane uses ``quiet=True`` to reproduce the vector-common
++    Python-float round trip.
++    """
++
++    round_trip = (lambda bits: _quiet(bits, dtype)) if quiet else (lambda bits: bits)
++    if name in ("reshape", "view", "contiguous"):
++        assert _count(input_shape) == _count(output_shape)
++        return [round_trip(source_bits[index]) for index in range(_count(output_shape))]
++    output_count = _count(output_shape)
++    expected = []
++    if name == "transpose":
++        permutation = tuple(int(axis) for axis in attributes["permutation"])
++        assert len(permutation) == len(input_shape)
++        for index in range(output_count):
++            out_coords = _unravel(index, output_shape)
++            in_coords = [0] * len(input_shape)
++            for output_axis, input_axis in enumerate(permutation):
++                in_coords[input_axis] = out_coords[output_axis]
++            expected.append(round_trip(source_bits[_linear(input_shape, in_coords)]))
++        return expected
++    if name == "slice":
++        starts = attributes["starts"]
++        stops = attributes["stops"]
++        axes = attributes.get("axes", list(range(len(starts))))
++        steps = attributes.get("steps", [1] * len(starts))
++        mapping = {}
++        for position, axis in enumerate(axes):
++            dimension = input_shape[axis]
++            start = starts[position]
++            start = start + dimension if start < 0 else start
++            mapping[axis] = (start, steps[position])
++        for index in range(output_count):
++            out_coords = _unravel(index, output_shape)
++            in_coords = list(out_coords)
++            for axis, (start, step) in mapping.items():
++                in_coords[axis] = start + out_coords[axis] * step
++            expected.append(round_trip(source_bits[_linear(input_shape, in_coords)]))
++        return expected
++    raise AssertionError("unknown layout oracle operation {!r}".format(name))
++
++
++def _oracle_split(input_shape, axis, sizes, dtype, source_bits):
++    outputs = []
++    offset = 0
++    for size in sizes:
++        shape = list(input_shape)
++        shape[axis] = size
++        shape = tuple(shape)
++        chunk = []
++        for index in range(_count(shape)):
++            coords = list(_unravel(index, shape))
++            coords[axis] += offset
++            chunk.append(_quiet(source_bits[_linear(input_shape, coords)], dtype))
++        outputs.append(chunk)
++        offset += size
++    return outputs
++
++
++def _oracle_concat(input_shapes, axis, dtype, sources):
++    output_shape = list(input_shapes[0])
++    output_shape[axis] = sum(shape[axis] for shape in input_shapes)
++    output_shape = tuple(output_shape)
++    offsets = []
++    running = 0
++    for shape in input_shapes:
++        offsets.append(running)
++        running += shape[axis]
++    expected = []
++    for index in range(_count(output_shape)):
++        coords = list(_unravel(index, output_shape))
++        coordinate = coords[axis]
++        selected = None
++        for position, shape in enumerate(input_shapes):
++            if offsets[position] <= coordinate < offsets[position] + shape[axis]:
++                selected = position
++                break
++        assert selected is not None
++        in_coords = list(coords)
++        in_coords[axis] = coordinate - offsets[selected]
++        expected.append(
++            _quiet(sources[selected][_linear(input_shapes[selected], in_coords)], dtype)
++        )
++    return expected
++
++
++# --------------------------------------------------------------------------
++# layout
++# --------------------------------------------------------------------------
++
++
++def _layout_program(name, input_shape, output_shape, attributes, dtype):
++    source = ValueRef("source", CoreType.tensor(dtype, input_shape))
++    output = ValueRef("output", CoreType.tensor(dtype, output_shape))
++    operation = Operation(name, (source,), (output,), dict(attributes))
++    return CoreProgram(
++        functions=(CoreFunction(name, (source,), (output,), Region((operation,))),)
++    )
++
++
++def _layout_cases():
++    """One entry per independent native-layout case: dtype/name/shapes/attrs."""
++
++    cases = []
++    for dtype in ("float32", "bf16", "int8"):
++        cases.append((dtype, "reshape", (3, 5), (5, 3), {"shape": [5, 3]}))
++        # Empty axis / degenerate shapes.
++        cases.append((dtype, "reshape", (2, 0, 3), (0, 6), {"shape": [0, 6]}))
++        cases.append((dtype, "view", (1, 1, 1), (1,), {"shape": [1]}))
++        cases.append((dtype, "contiguous", (0, 4), (0, 4), {}))
++        # Non-multiples of the vector width.
++        cases.append((dtype, "reshape", (7,), (7,), {"shape": [7]}))
++        cases.append((dtype, "view", (13,), (1, 13), {"shape": [1, 13]}))
++        # Batch prefix stays outermost.
++        cases.append((dtype, "reshape", (2, 3, 4, 5), (2, 60), {"shape": [2, 60]}))
++        cases.append((dtype, "view", (2, 3, 4), (4, 6), {"shape": [4, 6]}))
++        cases.append((dtype, "contiguous", (2, 3), (2, 3), {}))
++        # Rank-2 transpose keeps the existing packed plane.
++        cases.append((dtype, "transpose", (5, 7), (7, 5), {"permutation": [1, 0]}))
++        # Rank 3/4 generic permutations, including non-trivial cycles.
++        cases.append((dtype, "transpose", (2, 3, 5), (5, 2, 3), {"permutation": [2, 0, 1]}))
++        cases.append((dtype, "transpose", (2, 3, 5), (3, 2, 5), {"permutation": [1, 0, 2]}))
++        cases.append((dtype, "transpose", (2, 3, 4, 5), (4, 5, 2, 3), {"permutation": [2, 3, 0, 1]}))
++        cases.append((dtype, "transpose", (1, 3, 2, 5), (5, 2, 3, 1), {"permutation": [3, 2, 1, 0]}))
++        # Unit / non-unit step slices, batch prefix, empty result.
++        cases.append(
++            (dtype, "slice", (4, 7), (2, 7), {"starts": [1, 0], "stops": [4, 7], "steps": [2, 1]})
++        )
++        cases.append(
++            (dtype, "slice", (5, 7), (3, 2), {"starts": [0, 1], "stops": [5, 7], "steps": [2, 3]})
++        )
++        cases.append(
++            (
++                dtype,
++                "slice",
++                (2, 4, 6),
++                (2, 2, 3),
++                {"starts": [0, 1, 0], "stops": [2, 4, 6], "steps": [1, 2, 2], "axes": [0, 1, 2]},
++            )
++        )
++        cases.append(
++            (
++                dtype,
++                "slice",
++                (4, 5, 6),
++                (4, 5, 3),
++                {"starts": [1], "stops": [6], "steps": [2], "axes": [2]},
++            )
++        )
++        cases.append(
++            (dtype, "slice", (3, 5), (0, 5), {"starts": [2], "stops": [2], "steps": [1], "axes": [0]})
++        )
++        # Empty slice on a zero-length axis.
++        cases.append(
++            (dtype, "slice", (0, 5), (0, 5), {"starts": [0], "stops": [0], "steps": [1], "axes": [0]})
++        )
++    return cases
++
++
++@pytest.mark.parametrize(
++    "dtype,name,input_shape,output_shape,attributes",
++    _layout_cases(),
++    ids=lambda value: str(value) if not isinstance(value, (tuple, dict)) else "",
++)
++def test_layout_native_matches_the_stdlib_oracle(
++    dtype, name, input_shape, output_shape, attributes, tmp_path
++):
++    runtime = _runtime()
++    program = _layout_program(name, input_shape, output_shape, attributes, dtype)
++    _target_ir, artifact = _compile(program, tmp_path, "{}-{}".format(dtype, name))
++    mode = artifact.metadata["execution_modes"][0]["mode"]
++    assert mode in (NATIVE_LAYOUT_MODE, "native_avx2_packed_transpose")
++    source_bits = _pattern_bits(dtype, element_count(input_shape), seed=3)
++    source = _raw_array(dtype, source_bits)
++    expected = _oracle_layout(
++        name,
++        input_shape,
++        output_shape,
++        attributes,
++        dtype,
++        source_bits,
++        quiet=(mode != "native_avx2_packed_transpose"),
++    )
++    _assert_native_matches_oracle(
++        artifact, [(dtype, input_shape, source)], [output_shape], [dtype], [expected], runtime
++    )
++
++
++@pytest.mark.parametrize("dtype", ("float32", "bf16"))
++@pytest.mark.parametrize(
++    "name,input_shape,output_shape,attributes",
++    (
++        ("reshape", (30,), (5, 6), {"shape": [5, 6]}),
++        ("contiguous", (2, 16), (2, 16), {}),
++        ("transpose", (2, 3, 5), (5, 3, 2), {"permutation": [2, 1, 0]}),
++        ("transpose", (2, 3, 4, 5), (5, 4, 3, 2), {"permutation": [3, 2, 1, 0]}),
++        ("slice", (5, 6), (4, 3), {"starts": [1, 0], "stops": [5, 6], "steps": [1, 2]}),
++    ),
++)
++def test_layout_special_nan_payloads_are_bit_identical(
++    dtype, name, input_shape, output_shape, attributes, tmp_path
++):
++    """sNaN/quiet-NaN payloads survive the native plane exactly like the reference."""
++
++    runtime = _runtime()
++    specials = _F32_SPECIAL if dtype == "float32" else _BF16_SPECIAL
++    bits = [specials[index % len(specials)] for index in range(element_count(input_shape))]
++    program = _layout_program(name, input_shape, output_shape, attributes, dtype)
++    _target_ir, artifact = _compile(program, tmp_path, "nan-{}-{}".format(dtype, name))
++    source = _raw_array(dtype, bits)
++    expected = _oracle_layout(name, input_shape, output_shape, attributes, dtype, bits)
++    _assert_native_matches_oracle(
++        artifact, [(dtype, input_shape, source)], [output_shape], [dtype], [expected], runtime
++    )
++    # A signaling NaN must have been quieted (payload preserved); a quiet NaN
++    # must keep its payload untouched.
++    assert any(value & 0x00400000 for value in expected if dtype == "float32") or any(
++        value & 0x0040 for value in expected if dtype == "bf16"
++    )
++
++
++def test_rank2_packed_transpose_keeps_the_packed_plane(tmp_path):
++    for dtype in ("float32", "bf16", "int8"):
++        program = _layout_program("transpose", (5, 7), (7, 5), {"permutation": [1, 0]}, dtype)
++        _target_ir, artifact = _compile(program, tmp_path, "packed-{}".format(dtype))
++        assert artifact.metadata["execution_modes"][0]["mode"] == "native_avx2_packed_transpose"
++        assert tuple(artifact.metadata["packed_kernel_operations"]) == ("transpose",)
++        assert artifact.metadata["layout_native_operations"] == ()
++
++
++def test_rank2_packed_transpose_preserves_snan_payloads(tmp_path):
++    """Documented pre-existing boundary of the B1 packed rank-2 plane.
++
++    The packed rank-2 transpose is a raw element permutation, so it preserves
++    signaling-NaN payloads; the generic PXLD layout plane (this batch) and the
++    vector-common host reference both quiet them.  The packed kernel is kept
++    byte-for-byte unchanged (payload 2 / B1), so this divergence is recorded
++    here instead of being silently blessed by a quieting oracle.
++    """
++
++    runtime = _runtime()
++    program = _layout_program("transpose", (3, 5), (5, 3), {"permutation": [1, 0]}, "float32")
++    _target_ir, artifact = _compile(program, tmp_path, "packed-snan")
++    assert artifact.metadata["execution_modes"][0]["mode"] == "native_avx2_packed_transpose"
++    bits = [
++        0x7F800001, 0xFF812345, 0x7FC00001, 0xFFC12345,
++        0x3F800000, 0xBF800000, 0x00000001, 0x80000001,
++    ] + [0x41200000] * 7
++    source = _raw_array("float32", bits)
++    native = _raw_array("float32", [0] * 15)
++    _launch_raw(
++        artifact, [("float32", (3, 5), source)], [("float32", (5, 3), native)], runtime
++    )
++    expected = _oracle_layout(
++        "transpose", (3, 5), (5, 3), {"permutation": [1, 0]}, "float32", bits, quiet=False
++    )
++    assert _buffer_sha256(native) == _oracle_sha256("float32", expected)
++    first_bits = struct.unpack("<I", ctypes.string_at(ctypes.addressof(native), 4))[0]
++    assert first_bits == 0x7F800001  # sNaN payload preserved, not quieted
++
++
++def test_layout_native_metadata_declares_the_executed_kernel(tmp_path):
++    program = _layout_program("reshape", (2, 6), (3, 4), {"shape": [3, 4]}, "float32")
++    target_ir, artifact = _compile(program, tmp_path, "declared")
++    metadata = artifact.metadata
++    assert metadata["layout_native_kernel_version"] == NATIVE_LAYOUT_KERNEL_VERSION == 1
++    assert metadata["layout_descriptor_wire"] == "native:v1:pxld-v2"
++    assert metadata["indexing_descriptor_wire"] == "host-reference:v1"
++    assert metadata["execution_modes"][0]["mode"] == NATIVE_LAYOUT_MODE
++    entry = dict(metadata["layout_native_operations"][0])
++    assert entry["kernel"] == "layout_f32"
++    assert entry["kind"] == "logical_layout_copy"
++    assert entry["dtype"] == "float32"
++    contract = layout_native_contract(
++        program.functions[0].body.operations[0], target_ir.plans[0]
++    )
++    assert contract is not None
++    assert contract["mode"] == entry["mode"] == NATIVE_LAYOUT_MODE
++    assert contract["kernel"] == entry["kernel"]
++    assert "ptx_avx2_layout_f32" in tuple(metadata["native_helper_symbols"])
++    assert metadata["host_reference_operations"] == ()
++    assert metadata["layout_native_fallback_operations"] == ()
++    assert metadata["layout_view_alias_mode"] == "disabled"
++    assert "liveness" in metadata["layout_view_alias_reason"]
++
++
++def test_payload_and_abi_marker_are_bumped(tmp_path):
++    assert ARTIFACT_PAYLOAD_VERSION == 5
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:6"
++    program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
++    _target_ir, artifact = _compile(program, tmp_path, "marker")
++    assert artifact.metadata["artifact_payload_version"] == 5
++    native_bytes = open(artifact.path, "rb").read()
++    assert b"pypto-x.cpu.avx2:6" in native_bytes
++    assert b"pypto-x.cpu.avx2:5" not in native_bytes
++
++
++def test_declared_kernel_is_the_dispatched_kernel_spy(tmp_path, monkeypatch):
++    """Spy on the module-level C-call helpers: declared == executed, per family."""
++
++    runtime = _runtime()
++    source = ValueRef("source", CoreType.tensor("float32", (2, 3, 4)))
++    transposed = ValueRef("transposed", CoreType.tensor("float32", (3, 2, 4)))
++    left = ValueRef("left", CoreType.tensor("float32", (1, 2, 4)))
++    right = ValueRef("right", CoreType.tensor("float32", (2, 2, 4)))
++    joined = ValueRef("joined", CoreType.tensor("float32", (3, 2, 4)))
++    operations = (
++        Operation("transpose", (source,), (transposed,), {"permutation": [1, 0, 2]}),
++        Operation("split", (transposed,), (left, right), {"axis": 0, "sizes": [1, 2]}),
++        Operation("concat", (left, right), (joined,), {"axis": 0}),
++    )
++    program = CoreProgram(
++        functions=(
++            CoreFunction(
++                "chain", (source,), (joined,), Region(operations)
++            ),
++        )
++    )
++    _target_ir, artifact = _compile(program, tmp_path, "spy")
++    metadata = artifact.metadata
++    declared = {
++        entry["mode"]: entry["kernel"]
++        for entry in metadata["layout_native_operations"]
++    }
++    assert declared == {
++        NATIVE_LAYOUT_MODE: "layout_f32",
++        NATIVE_SPLIT_MODE: "split_f32",
++        NATIVE_CONCAT_MODE: "concat_f32",
++    }
++    calls = []
++    originals = {
++        "_call_layout_kernel": avx2_runtime._call_layout_kernel,
++        "_call_split_kernel": avx2_runtime._call_split_kernel,
++        "_call_concat_kernel": avx2_runtime._call_concat_kernel,
++    }
++
++    def spy(family, original):
++        def wrapper(module, kernel, *args, **kwargs):
++            calls.append((family, kernel))
++            return original(module, kernel, *args, **kwargs)
++
++        return wrapper
++
++    for name, original in originals.items():
++        monkeypatch.setattr(avx2_runtime, name, spy(name, original))
++    source_bits = _pattern_bits("float32", element_count((2, 3, 4)), seed=9)
++    source_array = _raw_array("float32", source_bits)
++    output = _raw_array("float32", [0] * element_count((3, 2, 4)))
++    _launch_raw(
++        artifact,
++        [("float32", (2, 3, 4), source_array)],
++        [("float32", (3, 2, 4), output)],
++        runtime,
++    )
++    families = [family for family, _kernel in calls]
++    assert families == [
++        "_call_layout_kernel",
++        "_call_split_kernel",
++        "_call_split_kernel",
++        "_call_concat_kernel",
++        "_call_concat_kernel",
++    ]
++    for family, kernel in calls:
++        expected = (
++            declared[NATIVE_LAYOUT_MODE]
++            if family == "_call_layout_kernel"
++            else declared[NATIVE_SPLIT_MODE]
++            if family == "_call_split_kernel"
++            else declared[NATIVE_CONCAT_MODE]
++        )
++        assert kernel == expected
++    # Every declared entry was actually dispatched exactly as declared.
++    assert [entry["kernel"] for entry in metadata["layout_native_operations"]] == [
++        "layout_f32", "split_f32", "concat_f32"
++    ]
++
++
++def test_layout_view_alias_is_stat_only_and_disabled(tmp_path):
++    runtime = _runtime()
++    program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
++    _target_ir, artifact = _compile(program, tmp_path, "alias")
++    avx2_runtime.reset_layout_native_stats()
++    source = HostTensor("float32", (3, 5), _pattern_bits("float32", 15, seed=11))
++    output = HostTensor.zeros("float32", (5, 3))
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[source.descriptor(readonly=True)],
++            outputs=[output.descriptor()],
++        )
++    )
++    stats = avx2_runtime.layout_native_stats()
++    # The static prefix of a reshape passes, but zero-copy stays disabled.
++    assert stats["view_alias_candidates"] == 1
++    assert stats["view_alias_enabled"] == 0
++    assert stats["kernel_calls"] == 1
++    layout = _target_ir.plans[0].layout_plan
++    eligible, reason = avx2_runtime._layout_view_alias_prefix(
++        layout,
++        avx2_runtime._buffer_from_values("float32", [0.0] * 15, "alias"),
++        "float32",
++        15,
++    )
++    assert eligible is True and "liveness" in reason
++    slice_program = _layout_program(
++        "slice", (3, 5), (2, 5), {"starts": [1], "stops": [3], "steps": [1], "axes": [0]}, "float32"
++    )
++    slice_ir, _slice_artifact = _compile(slice_program, tmp_path, "alias-slice")
++    ineligible, ineligible_reason = avx2_runtime._layout_view_alias_prefix(
++        slice_ir.plans[0].layout_plan,
++        avx2_runtime._buffer_from_values("float32", [0.0] * 15, "alias"),
++        "float32",
++        10,
++    )
++    assert ineligible is False and "not a logical copy" in ineligible_reason
++
++
++def _native_buffer(dtype, bits):
++    """ctypes-backed native buffer over exact raw bits (no Python round trip)."""
++
++    array = _raw_array(dtype, bits)
++    return avx2_runtime._NativeBuffer(
++        dtype,
++        len(bits),
++        ctypes.cast(array, avx2_runtime._pointer(dtype)),
++        array,
++        True,
++    )
++
++
++def test_native_matches_the_vector_common_reference(tmp_path):
++    """Secondary cross-check: native vs the real host-reference path (f32/bf16)."""
++
++    runtime = _runtime()
++    cases = (
++        ("reshape", (3, 5), (5, 3), {"shape": [5, 3]}),
++        ("transpose", (2, 3, 5), (5, 2, 3), {"permutation": [2, 0, 1]}),
++        ("slice", (5, 6), (3, 3), {"starts": [0, 1], "stops": [5, 6], "steps": [2, 2]}),
++    )
++    for dtype in ("float32", "bf16"):
++        for index, (name, input_shape, output_shape, attributes) in enumerate(cases):
++            program = _layout_program(name, input_shape, output_shape, attributes, dtype)
++            target_ir, artifact = _compile(
++                program, tmp_path, "ref-{}-{}".format(dtype, index)
++            )
++            bits = _pattern_bits(dtype, element_count(input_shape), seed=13)
++            source = _raw_array(dtype, bits)
++            native = _raw_array(dtype, [0] * element_count(output_shape))
++            _launch_raw(
++                artifact,
++                [(dtype, input_shape, source)],
++                [(dtype, output_shape, native)],
++                runtime,
++            )
++            reference = avx2_runtime._reference_operation(
++                program.functions[0].body.operations[0],
++                target_ir.plans[0],
++                [
++                    avx2_runtime._RuntimeValue(
++                        program.functions[0].parameters[0].type,
++                        _native_buffer(dtype, bits),
++                    )
++                ],
++                "reference",
++            )
++            owner = reference["output"].buffer.owner
++            reference_bytes = ctypes.string_at(ctypes.addressof(owner), ctypes.sizeof(owner))
++            assert _buffer_sha256(native) == hashlib.sha256(reference_bytes).hexdigest()
++
++
++def test_unsupported_dtype_is_an_explicit_host_fallback(tmp_path):
++    runtime = _runtime()
++    program = _layout_program("transpose", (2, 3, 4), (4, 3, 2), {"permutation": [2, 1, 0]}, "int32")
++    target_ir, artifact = _compile(program, tmp_path, "int32")
++    assert artifact.metadata["execution_modes"][0]["mode"] == "host_reference"
++    fallbacks = artifact.metadata["layout_native_fallback_operations"]
++    assert len(fallbacks) == 1
++    assert fallbacks[0]["operation"] == "transpose"
++    assert "dtype int32" in fallbacks[0]["reason"]
++    assert "transpose" in tuple(artifact.metadata["host_reference_operations"])
++    assert layout_native_fallback_reason(
++        program.functions[0].body.operations[0], target_ir.plans[0]
++    ) == fallbacks[0]["reason"]
++    assert layout_native_contract(
++        program.functions[0].body.operations[0], target_ir.plans[0]
++    ) is None
++    avx2_runtime.reset_layout_native_stats()
++    bits = _pattern_bits("int32", element_count((2, 3, 4)), seed=3)
++    source = _raw_array("int32", bits)
++    output = _raw_array("int32", [0] * element_count((4, 3, 2)))
++    _launch_raw(
++        artifact, [("int32", (2, 3, 4), source)], [("int32", (4, 3, 2), output)], runtime
++    )
++    assert avx2_runtime.layout_native_stats()["explicit_host_fallbacks"] == 1
++    expected = _oracle_layout(
++        "transpose", (2, 3, 4), (4, 3, 2), {"permutation": [2, 1, 0]}, "int32", bits
++    )
++    assert _buffer_sha256(output) == _oracle_sha256("int32", expected)
++
++
++# --------------------------------------------------------------------------
++# split
++# --------------------------------------------------------------------------
++
++
++def _split_program(input_shape, axis, sizes, dtype):
++    source = ValueRef("source", CoreType.tensor(dtype, input_shape))
++    outputs = []
++    for index, size in enumerate(sizes):
++        shape = list(input_shape)
++        shape[axis] = size
++        outputs.append(ValueRef("out{}".format(index), CoreType.tensor(dtype, tuple(shape))))
++    operation = Operation("split", (source,), tuple(outputs), {"axis": axis, "sizes": list(sizes)})
++    return CoreProgram(
++        functions=(CoreFunction("split", (source,), tuple(outputs), Region((operation,))),)
++    )
++
++
++def _split_cases():
++    cases = []
++    for dtype in ("float32", "bf16", "int8"):
++        cases.append((dtype, (6,), 0, [1, 2, 3]))
++        cases.append((dtype, (2, 5, 3), 1, [2, 3, 0]))
++        cases.append((dtype, (3, 4), 0, [1, 2]))
++        cases.append((dtype, (2, 4, 6), 2, [1, 3, 2]))
++        cases.append((dtype, (2, 7), 1, [7]))
++        cases.append((dtype, (3, 5), 0, [0, 3]))
++        cases.append((dtype, (2, 3, 4), 1, [0, 3]))
++    return cases
++
++
++@pytest.mark.parametrize(
++    "dtype,input_shape,axis,sizes", _split_cases(), ids=lambda value: str(value)
++)
++def test_split_native_matches_the_stdlib_oracle(dtype, input_shape, axis, sizes, tmp_path):
++    runtime = _runtime()
++    program = _split_program(input_shape, axis, sizes, dtype)
++    _target_ir, artifact = _compile(program, tmp_path, "split-{}-{}".format(dtype, axis))
++    assert artifact.metadata["execution_modes"][0]["mode"] == NATIVE_SPLIT_MODE
++    entry = dict(artifact.metadata["layout_native_operations"][0])
++    assert entry["kernel"] == "split_{}".format(_KERNEL_SUFFIX[dtype])
++    output_shapes = []
++    for size in sizes:
++        shape = list(input_shape)
++        shape[axis] = size
++        output_shapes.append(tuple(shape))
++    bits = _pattern_bits(dtype, element_count(input_shape), seed=5)
++    source = _raw_array(dtype, bits)
++    expected = _oracle_split(input_shape, axis, sizes, dtype, bits)
++    avx2_runtime.reset_layout_native_stats()
++    _assert_native_matches_oracle(
++        artifact,
++        [(dtype, input_shape, source)],
++        output_shapes,
++        [dtype] * len(sizes),
++        expected,
++        runtime,
++    )
++    assert avx2_runtime.layout_native_stats()["split_calls"] == len(sizes)
++
++
++@pytest.mark.parametrize("dtype", ("float32", "bf16"))
++def test_split_special_nan_payloads_are_bit_identical(dtype, tmp_path):
++    runtime = _runtime()
++    specials = _F32_SPECIAL if dtype == "float32" else _BF16_SPECIAL
++    bits = [specials[index % len(specials)] for index in range(24)]
++    input_shape = (2, 4, 3)
++    program = _split_program(input_shape, 1, [1, 2, 1], dtype)
++    _target_ir, artifact = _compile(program, tmp_path, "split-nan-{}".format(dtype))
++    source = _raw_array(dtype, bits)
++    expected = _oracle_split(input_shape, 1, [1, 2, 1], dtype, bits)
++    _assert_native_matches_oracle(
++        artifact, [(dtype, input_shape, source)], [(2, 1, 3), (2, 2, 3), (2, 1, 3)], [dtype] * 3, expected, runtime
++    )
++
++
++# --------------------------------------------------------------------------
++# concat
++# --------------------------------------------------------------------------
++
++
++def _concat_program(input_shapes, axis, dtype):
++    references = [
++        ValueRef("in{}".format(index), CoreType.tensor(dtype, shape))
++        for index, shape in enumerate(input_shapes)
++    ]
++    output_shape = list(input_shapes[0])
++    output_shape[axis] = sum(shape[axis] for shape in input_shapes)
++    output = ValueRef("output", CoreType.tensor(dtype, tuple(output_shape)))
++    operation = Operation("concat", tuple(references), (output,), {"axis": axis})
++    return CoreProgram(
++        functions=(
++            CoreFunction("concat", tuple(references), (output,), Region((operation,))),
++        )
++    )
++
++
++def _concat_cases():
++    cases = []
++    for dtype in ("float32", "bf16", "int8"):
++        cases.append((dtype, [(6,)], 0))
++        cases.append((dtype, [(2, 2, 3), (2, 3, 3)], 1))
++        cases.append((dtype, [(2, 4), (3, 4)], 0))
++        cases.append((dtype, [(2, 3, 2), (2, 3, 4)], 2))
++        cases.append((dtype, [(0, 4), (2, 4)], 0))
++        cases.append((dtype, [(3,), (0,), (2,)], 0))
++        cases.append((dtype, [(1, 2, 3, 4), (1, 2, 5, 4)], 2))
++    return cases
++
++
++@pytest.mark.parametrize("dtype,input_shapes,axis", _concat_cases(), ids=lambda value: str(value))
++def test_concat_native_matches_the_stdlib_oracle(dtype, input_shapes, axis, tmp_path):
++    runtime = _runtime()
++    program = _concat_program(input_shapes, axis, dtype)
++    _target_ir, artifact = _compile(program, tmp_path, "concat-{}-{}".format(dtype, axis))
++    assert artifact.metadata["execution_modes"][0]["mode"] == NATIVE_CONCAT_MODE
++    entry = dict(artifact.metadata["layout_native_operations"][0])
++    assert entry["kernel"] == "concat_{}".format(_KERNEL_SUFFIX[dtype])
++    inputs = []
++    sources = []
++    for index, shape in enumerate(input_shapes):
++        bits = _pattern_bits(dtype, element_count(shape), seed=7 + index)
++        sources.append(bits)
++        inputs.append((dtype, shape, _raw_array(dtype, bits)))
++    output_shape = list(input_shapes[0])
++    output_shape[axis] = sum(shape[axis] for shape in input_shapes)
++    expected = _oracle_concat(input_shapes, axis, dtype, sources)
++    avx2_runtime.reset_layout_native_stats()
++    _assert_native_matches_oracle(
++        artifact, inputs, [tuple(output_shape)], [dtype], [expected], runtime
++    )
++    assert avx2_runtime.layout_native_stats()["concat_calls"] == len(input_shapes)
++
++
++@pytest.mark.parametrize("dtype", ("float32", "bf16"))
++def test_concat_special_nan_payloads_are_bit_identical(dtype, tmp_path):
++    runtime = _runtime()
++    specials = _F32_SPECIAL if dtype == "float32" else _BF16_SPECIAL
++    input_shapes = [(2, 3), (2, 5)]
++    sources = [
++        [specials[index % len(specials)] for index in range(6)],
++        [specials[(index + 3) % len(specials)] for index in range(10)],
++    ]
++    program = _concat_program(input_shapes, 1, dtype)
++    _target_ir, artifact = _compile(program, tmp_path, "concat-nan-{}".format(dtype))
++    inputs = [
++        (dtype, shape, _raw_array(dtype, bits)) for shape, bits in zip(input_shapes, sources)
++    ]
++    expected = _oracle_concat(input_shapes, 1, dtype, sources)
++    _assert_native_matches_oracle(
++        artifact, inputs, [(2, 8)], [dtype], [expected], runtime
++    )
++
++
++# --------------------------------------------------------------------------
++# fail-closed boundaries
++# --------------------------------------------------------------------------
++
++
++class _FakeLayout(object):
++    def __init__(self, kind, input_shape, output_shape):
++        self.kind = kind
++        self.input_shape = input_shape
++        self.output_shape = output_shape
++        self.source_elements = element_count(input_shape)
++        self.output_elements = element_count(output_shape)
++        self.source_strides = ()
++        self.permutation = tuple(range(len(input_shape)))
++        self.slice_starts = (0,) * len(input_shape)
++        self.slice_steps = (1,) * len(input_shape)
++        self.descriptor_digest = "0" * 64
++
++
++def test_illegal_shape_combinations_are_rejected_at_lowering(tmp_path):
++    with pytest.raises(CpuVectorValidationError):
++        _compile(
++            _layout_program("transpose", (2, 3), (3, 2), {"permutation": [0, 2]}, "float32"),
++            tmp_path,
++            "bad-permutation",
++        )
++    with pytest.raises(CpuVectorUnsupportedError):
++        _compile(
++            _layout_program(
++                "slice", (4, 5), (2, 5), {"starts": [0], "stops": [4], "steps": [0], "axes": [0]}, "float32"
++            ),
++            tmp_path,
++            "zero-step",
++        )
++    with pytest.raises(CpuVectorValidationError):
++        _compile(
++            _layout_program(
++                "slice", (4, 5), (2, 5), {"starts": [0], "stops": [9], "steps": [2], "axes": [0]}, "float32"
++            ),
++            tmp_path,
++            "out-of-range",
++        )
++    with pytest.raises(CpuVectorValidationError):
++        _compile(
++            _layout_program("reshape", (3, 5), (4, 4), {"shape": [4, 4]}, "float32"),
++            tmp_path,
++            "count-mismatch",
++        )
++
++
++def test_unknown_layout_kind_is_rejected_before_native_execution():
++    with pytest.raises(CpuAvx2ExecutionError, match="unknown AVX2 layout descriptor kind"):
++        avx2_runtime._layout_descriptor_bytes(_FakeLayout("bogus", (2, 3), (6,)))
++    with pytest.raises(CpuAvx2ExecutionError, match="rank exceeds"):
++        avx2_runtime._layout_descriptor_bytes(
++            _FakeLayout("logical_layout_copy", (1,) * 65, (1,) * 65)
++        )
++
++
++def test_corrupted_descriptor_is_rejected_and_writes_nothing(tmp_path, monkeypatch):
++    runtime = _runtime()
++    program = _layout_program("transpose", (2, 3, 4), (4, 3, 2), {"permutation": [2, 1, 0]}, "float32")
++    _target_ir, artifact = _compile(program, tmp_path, "corrupt")
++    payload, buffer = avx2_runtime._layout_descriptor_buffer(_target_ir.plans[0].layout_plan)
++    corrupted = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
++    corrupted[0] = 0x00  # break the "PXLD" magic with a single-byte edit
++    monkeypatch.setattr(
++        avx2_runtime,
++        "_layout_descriptor_buffer",
++        lambda layout: (bytes(payload), corrupted),
++    )
++    avx2_runtime.reset_layout_native_stats()
++    source = _raw_array("float32", _pattern_bits("float32", 24))
++    sentinel = 0xDEADBEEF
++    output = _raw_array("float32", [sentinel] * 24)
++    with pytest.raises(CpuAvx2ExecutionError, match="rejected the descriptor"):
++        _launch_raw(
++            artifact, [("float32", (2, 3, 4), source)], [("float32", (4, 3, 2), output)], runtime
++        )
++    assert avx2_runtime.layout_native_stats()["descriptor_rejections"] == 1
++    # fail-closed: the caller output buffer is untouched (raw bytes).
++    assert ctypes.string_at(ctypes.addressof(output), ctypes.sizeof(output)) == struct.pack(
++        "<%dI" % len(output), *[sentinel] * len(output)
++    )
++
++
++def test_every_single_byte_descriptor_mutation_is_rejected(tmp_path, monkeypatch):
++    """A 1-byte edit anywhere in the wire must be rejected (magic != enough)."""
++
++    runtime = _runtime()
++    program = _layout_program("transpose", (2, 3, 4), (4, 3, 2), {"permutation": [2, 1, 0]}, "float32")
++    _target_ir, artifact = _compile(program, tmp_path, "byte-edit")
++    payload, _buffer = avx2_runtime._layout_descriptor_buffer(_target_ir.plans[0].layout_plan)
++    source = _raw_array("float32", _pattern_bits("float32", 24))
++    observed = set()
++    for position in (0, 4, 8, 12, 16, 24, 32, len(payload) - 1):
++        mutated = bytearray(payload)
++        mutated[position] ^= 0xFF
++        array = (ctypes.c_ubyte * len(mutated)).from_buffer_copy(bytes(mutated))
++        monkeypatch.setattr(
++            avx2_runtime,
++            "_layout_descriptor_buffer",
++            lambda layout, array=array, payload=bytes(mutated): (payload, array),
++        )
++        output = _raw_array("float32", [0] * 24)
++        with pytest.raises(CpuAvx2ExecutionError, match="rejected the descriptor"):
++            _launch_raw(
++                artifact,
++                [("float32", (2, 3, 4), source)],
++                [("float32", (4, 3, 2), output)],
++                runtime,
++            )
++        observed.add(position)
++    assert observed
++
++
++def test_payload_version_tampering_fails_closed(tmp_path):
++    runtime = _runtime()
++    program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
++    _target_ir, artifact = _compile(program, tmp_path, "payload")
++    for tamper in (4, 6):
++        metadata = dict(artifact.metadata)
++        metadata["artifact_payload_version"] = tamper
++        object.__setattr__(artifact, "metadata", metadata)
++        with pytest.raises(CpuAvx2ArtifactError, match="payload version"):
++            runtime.load(artifact)
++
++
++def test_layout_wire_tampering_fails_closed(tmp_path):
++    runtime = _runtime()
++    program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
++    _target_ir, artifact = _compile(program, tmp_path, "wire")
++    original = dict(artifact.metadata)
++    for key, value in (
++        ("layout_descriptor_wire", "host-reference:v1"),
++        ("layout_native_kernel_version", 2),
++        ("layout_view_alias_mode", "enabled"),
++    ):
++        metadata = dict(original)
++        metadata[key] = value
++        object.__setattr__(artifact, "metadata", metadata)
++        with pytest.raises(CpuAvx2ArtifactError, match=key):
++            runtime.load(artifact)
++
++
++def test_descriptor_digest_tampering_fails_closed(tmp_path):
++    runtime = _runtime()
++    program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
++    _target_ir, artifact = _compile(program, tmp_path, "digest")
++    metadata = dict(artifact.metadata)
++    layout_operations = [dict(entry) for entry in metadata["layout_operations"]]
++    layout_operations[0]["descriptor_digest"] = "f" * 64
++    metadata["layout_operations"] = layout_operations
++    object.__setattr__(artifact, "metadata", metadata)
++    with pytest.raises(CpuAvx2ArtifactError, match="layout_operations"):
++        runtime.load(artifact)
++
++
++def test_declared_mode_tampering_fails_closed(tmp_path):
++    runtime = _runtime()
++    program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
++    _target_ir, artifact = _compile(program, tmp_path, "mode")
++    metadata = dict(artifact.metadata)
++    modes = [dict(entry) for entry in metadata["execution_modes"]]
++    modes[0]["mode"] = "host_reference"
++    metadata["execution_modes"] = modes
++    object.__setattr__(artifact, "metadata", metadata)
++    with pytest.raises(CpuAvx2ArtifactError, match="execution_modes"):
++        runtime.load(artifact)
++
++
++def test_descriptor_digest_mismatch_at_dispatch_fails_closed(tmp_path, monkeypatch):
++    runtime = _runtime()
++    program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
++    target_ir, artifact = _compile(program, tmp_path, "dispatch-digest")
++    contract = layout_native_contract(
++        program.functions[0].body.operations[0], target_ir.plans[0]
++    )
++    assert contract is not None
++    tampered = dict(contract)
++    tampered["descriptor_digest"] = "f" * 64
++    monkeypatch.setattr(
++        avx2_runtime, "layout_native_contract", lambda operation, plan: tampered
++    )
++    source = _raw_array("float32", _pattern_bits("float32", 15))
++    output = _raw_array("float32", [0] * 15)
++    with pytest.raises(CpuAvx2ArtifactError, match="descriptor digest mismatch"):
++        _launch_raw(
++            artifact, [("float32", (3, 5), source)], [("float32", (5, 3), output)], runtime
++        )
++
++
++def test_old_abi_marker_artifact_fails_closed(tmp_path):
++    program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
++    _target_ir, artifact = _compile(program, tmp_path, "legacy-marker")
++    current_marker = b"pypto-x.cpu.avx2:6"
++    legacy_marker = b"pypto-x.cpu.avx2:5"
++    native_bytes = open(artifact.path, "rb").read()
++    assert current_marker in native_bytes
++    legacy_bytes = native_bytes.replace(current_marker, legacy_marker)
++    assert len(legacy_bytes) == len(native_bytes)
++    # Keep the content-addressed file name so the compile-command binding check
++    # passes and the ABI marker check is reached.
++    legacy_dir = tmp_path / "legacy-artifacts"
++    legacy_dir.mkdir()
++    legacy_path = legacy_dir / artifact.path.rsplit("/", 1)[-1]
++    legacy_path.write_bytes(legacy_bytes)
++    from pypto.compiler import Artifact
++
++    metadata = dict(artifact.metadata)
++    metadata["native_digest"] = hashlib.sha256(legacy_bytes).hexdigest()
++    legacy_artifact = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        path=str(legacy_path),
++        metadata=metadata,
++    )
++    with pytest.raises(CpuAvx2ArtifactError, match="safety marker"):
++        _runtime().load(legacy_artifact)
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx2_packed.py b/python/tests/ut/pypto_x/test_cpu_avx2_packed.py
+index 0f36d2959..6404f7890 100644
+--- a/python/tests/ut/pypto_x/test_cpu_avx2_packed.py
++++ b/python/tests/ut/pypto_x/test_cpu_avx2_packed.py
+@@ -220,17 +220,18 @@ def _cast_values(dtype, count):
+ 
+ 
+ def test_avx2_payload_and_abi_versions_are_bumped():
+-    # Payload 3 / ABI :4 add the W8A8 widening kernels (contract 0002 C3).
+-    assert ARTIFACT_PAYLOAD_VERSION == 4
+-    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:5"
++    # Payload 3 / ABI :4 add the W8A8 widening kernels (contract 0002 C3);
++    # payload 5 / ABI :6 add the native PXLD-v2 layout/split/concat plane.
++    assert ARTIFACT_PAYLOAD_VERSION == 5
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:6"
+ 
+ 
+ def test_avx2_native_object_carries_the_new_abi_marker(tmp_path):
+     _, artifact = _compile_avx2(_cast_program("bf16", "float32", (4,)), tmp_path, name="marker")
+     native_bytes = Path(artifact.path).read_bytes()
+-    assert b"pypto-x.cpu.avx2:5" in native_bytes
+-    assert b"pypto-x.cpu.avx2:4" not in native_bytes
+-    assert artifact.metadata["artifact_payload_version"] == 4
++    assert b"pypto-x.cpu.avx2:6" in native_bytes
++    assert b"pypto-x.cpu.avx2:5" not in native_bytes
++    assert artifact.metadata["artifact_payload_version"] == 5
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -350,11 +351,13 @@ def test_avx2_non_square_transpose_matches_the_scalar_runtime(dtype, tmp_path):
+     assert _bit_signature(actual.data, dtype) == _bit_signature(expected[0].data, dtype)
+ 
+ 
+-def test_avx2_rank3_transpose_stays_on_the_host_reference(tmp_path):
++def test_avx2_rank3_transpose_is_a_native_layout_reorder(tmp_path):
+     program = _transpose_program("float32", (2, 3, 4), permutation=(0, 2, 1))
+     target_ir, artifact = _compile_avx2(program, tmp_path, name="rank3")
+     assert tuple(artifact.metadata["packed_kernel_operations"]) == ()
+-    assert "transpose" in tuple(artifact.metadata["host_reference_operations"])
++    assert artifact.metadata["host_reference_operations"] == ()
++    assert artifact.metadata["execution_modes"][0]["mode"] == "native_avx2_layout"
++    assert artifact.metadata["native_layout_reorder_operations"] == ("transpose",)
+     contract = packed_kernel_contract(
+         program.functions[0].body.operations[0], target_ir.plans[0]
+     )
+@@ -366,6 +369,12 @@ def test_avx2_rank3_transpose_stays_on_the_host_reference(tmp_path):
+     assert _bit_signature(actual.data, "float32") == _bit_signature(
+         expected[0].data, "float32"
+     )
++    assert tuple(actual.data) == tuple(
++        float(axis0 * 12 + axis2 * 4 + axis1)
++        for axis0 in range(2)
++        for axis1 in range(4)
++        for axis2 in range(3)
++    )
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -630,8 +639,8 @@ def test_avx2_missing_or_tampered_packed_metadata_fails_closed(tmp_path):
+ def test_avx2_old_abi_marker_artifact_fails_closed(tmp_path):
+     program = _cast_program("bf16", "float32", (10,))
+     _, artifact = _compile_avx2(program, tmp_path, name="legacy-marker")
+-    current_marker = b"pypto-x.cpu.avx2:5"
+-    legacy_marker = b"pypto-x.cpu.avx2:4"
++    current_marker = b"pypto-x.cpu.avx2:6"
++    legacy_marker = b"pypto-x.cpu.avx2:5"
+     native_bytes = Path(artifact.path).read_bytes()
+     assert current_marker in native_bytes
+     legacy_bytes = native_bytes.replace(current_marker, legacy_marker)
+diff --git a/python/tests/ut/pypto_x/test_w8a8_avx2.py b/python/tests/ut/pypto_x/test_w8a8_avx2.py
+index 3fde232b4..b76cd17a5 100644
+--- a/python/tests/ut/pypto_x/test_w8a8_avx2.py
++++ b/python/tests/ut/pypto_x/test_w8a8_avx2.py
+@@ -258,8 +258,8 @@ def test_w8a8_opcode_names_match_the_c1_portable_constants():
+ def test_qmatmul_metadata_declares_the_native_widening_kernel(build_dir):
+     program = _qmatmul_program((2, 3), (3, 4))
+     artifact = _compile_avx2_artifact(program, build_dir, name="metadata")
+-    assert artifact.metadata["artifact_payload_version"] == ARTIFACT_PAYLOAD_VERSION == 4
+-    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:5"
++    assert artifact.metadata["artifact_payload_version"] == ARTIFACT_PAYLOAD_VERSION == 5
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:6"
+     assert tuple(artifact.metadata["w8a8_kernel_operations"]) == (W8A8_QMATMUL_OPCODE,)
+     assert artifact.metadata["w8a8_kernel_version"] == W8A8_KERNEL_VERSION == 2
+     declared = artifact.metadata["w8a8_capability"]
+@@ -758,4 +758,4 @@ def test_objdump_primitives_are_native_avx2(carrier_artifact):
+ def test_artifact_native_bytes_digest_matches(carrier_artifact):
+     native_bytes = Path(carrier_artifact.path).read_bytes()
+     assert hashlib.sha256(native_bytes).hexdigest() == carrier_artifact.content_digest
+-    assert b"pypto-x.cpu.avx2:5" in native_bytes
++    assert b"pypto-x.cpu.avx2:6" in native_bytes

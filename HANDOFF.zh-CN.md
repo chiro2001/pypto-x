@@ -75,7 +75,7 @@
 6. 重任务需要用户批准才启动（AGENTS.md「Subagent 协议」第一条）。
 7. 提交纪律：公开主仓 = 本目录（origin）；改完实现 → cherry-pick 到 integration → 独立 verify → 更新
    development_lock/快照/ERRATA → scripts/remote/export_patches.sh → git push origin main → scripts/remote/sync_private_backup.sh。
-   （0038 收口已 push 到 7a064ab；**0039 批次及之后已 push 到 7857ae6，补丁 144**；**0040 批次已本地收口：integration `c63558e9e`、补丁 217（am 复算 tree 一致），控制仓本地提交，未推送——push 需用户当次明确批准。**）
+   （0038 收口已 push 到 7a064ab；**0039 批次及之后已 push 到 7857ae6，补丁 144**；**0040 批次已推送**（`7857ae6 → 41982db`、补丁 217、私有备份已同步）；**0041 批次已本地收口**：integration `8fff50558`、补丁 235（am 复算 tree 一致）、五条任务级验收全 PASS_WITH_BOUNDARIES、规则 8 全量 1667 passed/7 skipped/0 failed，控制仓本地提交——**push 需用户当次明确批准**。）
 8. **cherry-pick 后必须立刻跑一次全量 collect + pass/fail 对比**（KF-1 教训，2026-09-12）：任何改动合入 integration
    之后，即使看起来只碰工具目录或文档，也要跑一次全量 pytest 并对比收集数与失败集合；"改动小"不构成跳过理由。
    触发过的事故：C8/Q2 的 cherry-pick 引入 `tools/qwen35_reference/run_reference.py` 的导入回退，导致一条

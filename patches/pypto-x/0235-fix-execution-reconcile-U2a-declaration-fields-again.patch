@@ -1,0 +1,1009 @@
+From 8fff5055884a2f7ef0fc1087bd658336b19c11d2 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 12:29:52 +0800
+Subject: [PATCH 235/235] fix(execution): reconcile U2a declaration fields
+ against their ground truth
+
+The U2a verifier's recomputed-digest forgery probe showed 10 declaration
+fields were accepted and executed (artifact.kind/library/pack, selected
+library fingerprint, numeric guarantee class/deterministic/reduction order,
+fallback.primary, request.policy_digest, thread mode).
+
+- add pypto.execution.binding_verify: content-local reconciliation of policy
+  digest, selected/numeric/artifact/fallback declarations against the frozen
+  policy/selected/contract/rule documents, plus report cross-block checks
+- ExecutionPlan.validate now refuses all content-local declaration forgeries
+- entry._execute always re-runs the deterministic resolver for the frozen
+  policy against the digest-checked capability snapshot (caller-supplied or
+  synthesized from the default local provider probe) and refuses any payload
+  difference before provider invocation; unregistered providers keep their
+  PROVIDER_UNAVAILABLE reason
+- validate_report_schema refuses single-field report forgeries for artifact
+  kind/library/pack, fallback primary/used, guarantees numeric class and the
+  policy digest; manifest-only double-forgeries are explicitly registered as
+  report-layer boundaries (execution re-resolution still refuses them)
+- tests: convert the U2a probe's 9 accepted fields plus the thread-mode case
+  into must-reject/exempted regressions, cover double-forgery and report
+  single-field forgeries
+---
+ python/pypto/execution/binding_verify.py                  | 525 ++++++++++++++++++++++++++++++++++
+ python/pypto/execution/entry.py                           |  92 +++++-
+ python/pypto/execution/plan.py                            |  30 ++
+ python/pypto/execution/report.py                          |  18 ++
+ python/tests/ut/pypto_x/test_execution_binding_forgery.py | 225 +++++++++++++++
+ 5 files changed, 889 insertions(+), 1 deletion(-)
+
+diff --git a/python/pypto/execution/binding_verify.py b/python/pypto/execution/binding_verify.py
+new file mode 100644
+index 000000000..98b3bcc8b
+--- /dev/null
++++ b/python/pypto/execution/binding_verify.py
+@@ -0,0 +1,525 @@
++"""Content-local reconciliation of frozen plan/report declarations.
++
++U2a verification found that a caller willing to recompute the enclosing plan
++digest could change declaration fields (artifact kind/library/pack, numeric
++guarantee, fallback primary, policy digest, thread mode) and still execute,
++with the forged declaration either silently replaced in the report or copied
++into it.
++
++This module provides the ground-truth checks that do **not** need a live
++capability snapshot:
++
++* recompute the policy digest from the frozen ``policy.requested`` document;
++* reconcile ``selected.threads/thread_mode/scope`` with ``policy.resolved``;
++* reconcile ``numeric_guarantee.*`` with the frozen ``selected`` record;
++* reconcile ``artifact.*`` with ``selected``/``contract`` and the
++  portable/vendor family conventions;
++* reconcile ``fallback.primary`` with the frozen ``provider.select`` rule;
++* for reports, the same checks plus cross-block checks (``request.
++  policy_digest`` vs ``requested_policy``, ``artifact.*`` vs ``resolved.*``,
++  ``guarantees.numeric_class`` vs ``resolved.numeric_class``, and
++  ``fallback_used`` vs the invoked/primary providers).
++
++The execution layer additionally re-runs the resolver against the real
++capability snapshot (see :func:`pypto.execution.entry._verify_plan_binding`),
++which is the ground truth for fields only the provider manifest can settle
++(library fingerprint, pack strategy, thread default).  Fields the report
++cannot objectively validate on its own are registered as boundaries in
++``_meta/pypto-x/view-mode-require/brief.zh-CN.md``.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Mapping, Optional, Sequence, Tuple
++
++from pypto.compiler.targets.cpu import ARTIFACT_PAYLOAD_VERSION
++from pypto.lowering.cpu import LOWERING_VERSION
++
++from .manifest import PORTABLE_ARTIFACT_KIND
++from .policy import policy_from_dict
++from .provider_ids import KNOWN_PROVIDER_IDS, PORTABLE_PROVIDER_ID
++
++VENDOR_ARTIFACT_KIND = "vendor_library"
++PORTABLE_PACK_STRATEGY = "none"
++PORTABLE_EXACTNESS_BASIS = "contract_and_order"
++VENDOR_EXACTNESS_BASIS = "provider_version_threads_and_order"
++
++
++def _portable_provider_constants() -> Tuple[int, str]:
++    """Return the portable runner/numeric constants without an import cycle.
++
++    ``providers`` imports ``capability`` which imports ``provider_aocl`` which
++    imports ``plan``; a module-level import here would close that cycle.  The
++    constants are leaf values, so they are fetched on first use instead.
++    """
++
++    from .providers import PORTABLE_NUMERIC_CLASS, PORTABLE_RUNNER_VERSION
++
++    return PORTABLE_RUNNER_VERSION, PORTABLE_NUMERIC_CLASS
++
++
++def _error(field: str, reason: str, requested: Any = None, available: Any = None) -> Mapping[str, Any]:
++    return {"field": field, "reason": reason, "requested": requested, "available": available}
++
++
++def _policy_from_payload(document: Any, field: str) -> Tuple[Optional[Any], Sequence[Mapping[str, Any]]]:
++    if not isinstance(document, Mapping):
++        return None, (
++            _error(field, "policy_document_missing_or_not_a_mapping", requested=type(document).__name__),
++        )
++    try:
++        return policy_from_dict(document), ()
++    except Exception as exc:  # noqa: BLE001 - any policy failure is a refusal
++        return None, (
++            _error(
++                field,
++                "policy_document_invalid:{}".format(getattr(exc, "reason", None) or exc),
++            ),
++        )
++
++
++def _provider_select_rule(rules: Any) -> Optional[Mapping[str, Any]]:
++    if not isinstance(rules, list):
++        return None
++    matching = [
++        rule
++        for rule in rules
++        if isinstance(rule, Mapping) and rule.get("rule") == "provider.select"
++    ]
++    if len(matching) != 1:
++        return None
++    return matching[0]
++
++
++def _mapping_copy(value: Any) -> Mapping[str, Any]:
++    return dict(value) if isinstance(value, Mapping) else {}
++
++
++def plan_binding_errors(payload: Mapping[str, Any]) -> Tuple[Mapping[str, Any], ...]:
++    """Reconcile a frozen plan payload with its own ground-truth documents."""
++
++    errors = []
++    request = payload.get("request")
++    request = request if isinstance(request, Mapping) else {}
++    policy_document = {}
++    policy_envelope = payload.get("policy")
++    if isinstance(policy_envelope, Mapping) and isinstance(policy_envelope.get("requested"), Mapping):
++        policy_document = policy_envelope["requested"]
++
++    policy, policy_errors = _policy_from_payload(policy_document, "request.policy_digest")
++    errors.extend(policy_errors)
++    if policy is not None and request.get("policy_digest") != policy.digest:
++        errors.append(
++            _error(
++                "request.policy_digest",
++                "plan_policy_digest_mismatch",
++                requested=request.get("policy_digest"),
++                available=policy.digest,
++            )
++        )
++
++    selected = payload.get("selected")
++    selected = selected if isinstance(selected, Mapping) else {}
++    numeric = payload.get("numeric_guarantee")
++    numeric = numeric if isinstance(numeric, Mapping) else {}
++    artifact = payload.get("artifact")
++    artifact = artifact if isinstance(artifact, Mapping) else {}
++    contract = payload.get("contract")
++    contract = contract if isinstance(contract, Mapping) else {}
++    resolved_policy = policy_envelope.get("resolved") if isinstance(policy_envelope, Mapping) else None
++    resolved_policy = resolved_policy if isinstance(resolved_policy, Mapping) else {}
++
++    # selected record vs the resolved policy facts.
++    resolved_resources = resolved_policy.get("resources")
++    resolved_resources = resolved_resources if isinstance(resolved_resources, Mapping) else {}
++    if selected.get("threads") != resolved_resources.get("resolved_threads"):
++        errors.append(
++            _error(
++                "selected.threads",
++                "plan_threads_not_reconciled",
++                requested=selected.get("threads"),
++                available=resolved_resources.get("resolved_threads"),
++            )
++        )
++    if selected.get("thread_mode") != resolved_resources.get("resolved_thread_mode"):
++        errors.append(
++            _error(
++                "selected.thread_mode",
++                # The U2a runtime uses this reason for a mode inconsistent with
++                # the frozen resolved mode; keep the same machine-readable
++                # reason so the refusal surface does not fork by layer.
++                "thread_mode_runtime_mismatch",
++                requested=selected.get("thread_mode"),
++                available=resolved_resources.get("resolved_thread_mode"),
++            )
++        )
++
++    # numeric guarantee vs selected record.
++    if numeric.get("class") != selected.get("numeric_class"):
++        errors.append(
++            _error(
++                "selected.numeric_class",
++                "plan_selected_field_not_reconciled_with_provider_manifest",
++                requested=selected.get("numeric_class"),
++                available=numeric.get("class"),
++            )
++        )
++    if bool(numeric.get("deterministic")) != bool(selected.get("deterministic")):
++        errors.append(
++            _error(
++                "numeric_guarantee.deterministic",
++                "plan_numeric_guarantee_not_reconciled",
++                requested=numeric.get("deterministic"),
++                available=selected.get("deterministic"),
++            )
++        )
++    if numeric.get("reduction_order") != selected.get("reduction_order"):
++        errors.append(
++            _error(
++                "numeric_guarantee.reduction_order",
++                "plan_numeric_guarantee_not_reconciled",
++                requested=numeric.get("reduction_order"),
++                available=selected.get("reduction_order"),
++            )
++        )
++
++    # artifact vs selected/contract and provider family.
++    if artifact.get("contract_version") != contract.get("version"):
++        errors.append(
++            _error(
++                "artifact.contract_version",
++                "artifact_declaration_mismatch",
++                requested=artifact.get("contract_version"),
++                available=contract.get("version"),
++            )
++        )
++    if artifact.get("provider_version") != selected.get("provider_version"):
++        errors.append(
++            _error(
++                "selected.provider_version",
++                "plan_selected_field_not_reconciled_with_provider_manifest",
++                requested=selected.get("provider_version"),
++                available=artifact.get("provider_version"),
++            )
++        )
++    if _mapping_copy(artifact.get("library")) != _mapping_copy(selected.get("library")):
++        errors.append(
++            _error(
++                "artifact.library",
++                "plan_artifact_library_not_reconciled",
++                requested=_mapping_copy(artifact.get("library")),
++                available=_mapping_copy(selected.get("library")),
++            )
++        )
++    pack = artifact.get("pack")
++    pack = pack if isinstance(pack, Mapping) else {}
++    if not isinstance(pack.get("strategy"), str) or not pack["strategy"].strip():
++        errors.append(
++            _error("artifact.pack.strategy", "plan_artifact_pack_strategy_invalid", requested=pack.get("strategy"))
++        )
++
++    provider_is_known = selected.get("provider") in KNOWN_PROVIDER_IDS
++    if not provider_is_known:
++        # Unknown provider ids have no family ground truth here; the provider
++        # registry rejects them at execution with PROVIDER_UNAVAILABLE, so the
++        # artifact-family checks must not preempt that structured reason.
++        pass
++    elif selected.get("provider") == PORTABLE_PROVIDER_ID:
++        portable_runner_version, portable_numeric_class = _portable_provider_constants()
++        if artifact.get("kind") != PORTABLE_ARTIFACT_KIND:
++            errors.append(
++                _error(
++                    "artifact.kind",
++                    "plan_artifact_kind_not_reconciled",
++                    requested=artifact.get("kind"),
++                    available=PORTABLE_ARTIFACT_KIND,
++                )
++            )
++        if artifact.get("lowering_version") != LOWERING_VERSION:
++            errors.append(
++                _error(
++                    "artifact.lowering_version",
++                    "artifact_declaration_mismatch",
++                    requested=artifact.get("lowering_version"),
++                    available=LOWERING_VERSION,
++                )
++            )
++        if artifact.get("runner_version") != portable_runner_version:
++            errors.append(
++                _error(
++                    "artifact.runner_version",
++                    "artifact_declaration_mismatch",
++                    requested=artifact.get("runner_version"),
++                    available=portable_runner_version,
++                )
++            )
++        if artifact.get("wire_version") != ARTIFACT_PAYLOAD_VERSION:
++            errors.append(
++                _error(
++                    "artifact.wire_version",
++                    "artifact_declaration_mismatch",
++                    requested=artifact.get("wire_version"),
++                    available=ARTIFACT_PAYLOAD_VERSION,
++                )
++            )
++        if _mapping_copy(artifact.get("library")):
++            errors.append(
++                _error("artifact.library", "plan_portable_library_must_be_empty", requested=artifact.get("library"))
++            )
++        if pack.get("strategy") != PORTABLE_PACK_STRATEGY:
++            errors.append(
++                _error(
++                    "artifact.pack.strategy",
++                    "plan_portable_pack_strategy_mismatch",
++                    requested=pack.get("strategy"),
++                    available=PORTABLE_PACK_STRATEGY,
++                )
++            )
++        if numeric.get("class") != portable_numeric_class:
++            errors.append(
++                _error(
++                    "numeric_guarantee.class",
++                    "plan_portable_numeric_class_mismatch",
++                    requested=numeric.get("class"),
++                    available=portable_numeric_class,
++                )
++            )
++        if numeric.get("exactness_basis") != PORTABLE_EXACTNESS_BASIS:
++            errors.append(
++                _error(
++                    "numeric_guarantee.exactness_basis",
++                    "plan_portable_exactness_basis_mismatch",
++                    requested=numeric.get("exactness_basis"),
++                    available=PORTABLE_EXACTNESS_BASIS,
++                )
++            )
++        if selected.get("thread_mode") != "single_thread":
++            errors.append(
++                _error(
++                    "selected.thread_mode",
++                    "plan_portable_thread_mode_mismatch",
++                    requested=selected.get("thread_mode"),
++                    available="single_thread",
++                )
++            )
++    else:
++        if artifact.get("kind") != VENDOR_ARTIFACT_KIND:
++            errors.append(
++                _error(
++                    "artifact.kind",
++                    "plan_artifact_kind_not_reconciled",
++                    requested=artifact.get("kind"),
++                    available=VENDOR_ARTIFACT_KIND,
++                )
++            )
++        if numeric.get("exactness_basis") != VENDOR_EXACTNESS_BASIS:
++            errors.append(
++                _error(
++                    "numeric_guarantee.exactness_basis",
++                    "plan_vendor_exactness_basis_mismatch",
++                    requested=numeric.get("exactness_basis"),
++                    available=VENDOR_EXACTNESS_BASIS,
++                )
++            )
++        if pack.get("strategy") == PORTABLE_PACK_STRATEGY or pack.get("strategy") == "unknown":
++            errors.append(
++                _error(
++                    "artifact.pack.strategy",
++                    "plan_vendor_pack_strategy_not_declared",
++                    requested=pack.get("strategy"),
++                    available="a provider-manifest pack strategy",
++                )
++            )
++
++    # fallback.primary vs the frozen provider.select rule.
++    resolution = payload.get("resolution")
++    resolution = resolution if isinstance(resolution, Mapping) else {}
++    select_rule = _provider_select_rule(resolution.get("rules"))
++    if select_rule is None:
++        errors.append(_error("resolution.rules", "plan_provider_select_rule_missing"))
++    else:
++        details = select_rule.get("details")
++        details = details if isinstance(details, Mapping) else {}
++        fallback = payload.get("fallback")
++        fallback = fallback if isinstance(fallback, Mapping) else {}
++        if details.get("primary") != fallback.get("primary"):
++            errors.append(
++                _error(
++                    "fallback.primary",
++                    "plan_fallback_primary_mismatch",
++                    requested=fallback.get("primary"),
++                    available=details.get("primary"),
++                )
++            )
++    return tuple(errors)
++
++
++def report_binding_errors(report: Mapping[str, Any]) -> Tuple[Mapping[str, Any], ...]:
++    """Cross-block reconciliation available from the report document alone."""
++
++    errors = []
++    request = report.get("request")
++    request = request if isinstance(request, Mapping) else {}
++    requested_policy = report.get("requested_policy")
++    requested_policy = requested_policy if isinstance(requested_policy, Mapping) else {}
++    policy, policy_errors = _policy_from_payload(requested_policy, "request.policy_digest")
++    errors.extend(policy_errors)
++    if policy is not None:
++        if request.get("policy_digest") != policy.digest:
++            errors.append(
++                _error(
++                    "request.policy_digest",
++                    "report_policy_digest_mismatch",
++                    requested=request.get("policy_digest"),
++                    available=policy.digest,
++                )
++            )
++        resolution = report.get("resolution")
++        resolution = resolution if isinstance(resolution, Mapping) else {}
++        if resolution.get("policy_digest") != policy.digest:
++            errors.append(
++                _error(
++                    "resolution.policy_digest",
++                    "report_resolution_policy_digest_mismatch",
++                    requested=resolution.get("policy_digest"),
++                    available=policy.digest,
++                )
++            )
++
++    resolution = report.get("resolution")
++    resolution = resolution if isinstance(resolution, Mapping) else {}
++    select_rule = _provider_select_rule(resolution.get("rules"))
++    if select_rule is None:
++        errors.append(_error("resolution.rules", "report_provider_select_rule_missing"))
++    else:
++        details = select_rule.get("details")
++        details = details if isinstance(details, Mapping) else {}
++        if details.get("primary") != resolution.get("fallback_primary"):
++            errors.append(
++                _error(
++                    "resolution.fallback_primary",
++                    "report_fallback_primary_mismatch",
++                    requested=resolution.get("fallback_primary"),
++                    available=details.get("primary"),
++                )
++            )
++
++    dispatch = report.get("dispatch")
++    dispatch = dispatch if isinstance(dispatch, Mapping) else {}
++    invoked = dispatch.get("provider_invoked")
++    primary = resolution.get("fallback_primary")
++    if bool(resolution.get("fallback_used")) != (invoked != primary):
++        errors.append(
++            _error(
++                "resolution.fallback_used",
++                "report_fallback_used_mismatch",
++                requested=resolution.get("fallback_used"),
++                available=(invoked != primary),
++            )
++        )
++
++    resolved = report.get("resolved")
++    resolved = resolved if isinstance(resolved, Mapping) else {}
++    artifact = report.get("artifact")
++    artifact = artifact if isinstance(artifact, Mapping) else {}
++    guarantees = report.get("guarantees")
++    guarantees = guarantees if isinstance(guarantees, Mapping) else {}
++    provider = resolved.get("provider")
++
++    if artifact.get("provider_version") != resolved.get("provider_version"):
++        errors.append(
++            _error(
++                "artifact.provider_version",
++                "report_artifact_provider_version_mismatch",
++                requested=artifact.get("provider_version"),
++                available=resolved.get("provider_version"),
++            )
++        )
++    if _mapping_copy(artifact.get("library")) != _mapping_copy(resolved.get("library")):
++        errors.append(
++            _error(
++                "artifact.library",
++                "report_artifact_library_not_reconciled",
++                requested=_mapping_copy(artifact.get("library")),
++                available=_mapping_copy(resolved.get("library")),
++            )
++        )
++    if guarantees.get("numeric_class") != resolved.get("numeric_class"):
++        errors.append(
++            _error(
++                "guarantees.numeric_class",
++                "report_numeric_class_not_reconciled",
++                requested=guarantees.get("numeric_class"),
++                available=resolved.get("numeric_class"),
++            )
++        )
++    if provider == PORTABLE_PROVIDER_ID:
++        if artifact.get("kind") != PORTABLE_ARTIFACT_KIND:
++            errors.append(
++                _error(
++                    "artifact.kind",
++                    "report_artifact_kind_not_reconciled",
++                    requested=artifact.get("kind"),
++                    available=PORTABLE_ARTIFACT_KIND,
++                )
++            )
++        if _mapping_copy(resolved.get("library")):
++            errors.append(
++                _error("resolved.library", "report_portable_library_must_be_empty", requested=resolved.get("library"))
++            )
++    else:
++        if artifact.get("kind") != VENDOR_ARTIFACT_KIND:
++            errors.append(
++                _error(
++                    "artifact.kind",
++                    "report_artifact_kind_not_reconciled",
++                    requested=artifact.get("kind"),
++                    available=VENDOR_ARTIFACT_KIND,
++                )
++            )
++        pack = artifact.get("pack")
++        pack = pack if isinstance(pack, Mapping) else {}
++        if pack.get("strategy") in (None, "", PORTABLE_PACK_STRATEGY, "unknown"):
++            errors.append(
++                _error(
++                    "artifact.pack.strategy",
++                    "report_vendor_pack_strategy_not_declared",
++                    requested=pack.get("strategy"),
++                    available="a provider-manifest pack strategy",
++                )
++            )
++    return tuple(errors)
++
++
++def payload_difference(
++    expected: Any, actual: Any, path: str = ""
++) -> Optional[Tuple[str, Any, Any]]:
++    """Return ``(path, expected_value, actual_value)`` for the first difference."""
++
++    if isinstance(expected, Mapping) and isinstance(actual, Mapping):
++        for key in sorted(set(expected) | set(actual)):
++            child = "{}.{}".format(path, key) if path else str(key)
++            if key not in expected or key not in actual:
++                return (child, expected.get(key), actual.get(key))
++            difference = payload_difference(expected[key], actual[key], child)
++            if difference is not None:
++                return difference
++        return None
++    if isinstance(expected, (list, tuple)) and isinstance(actual, (list, tuple)):
++        if len(expected) != len(actual):
++            return ("{}[len]".format(path), len(expected), len(actual))
++        for index, (left, right) in enumerate(zip(expected, actual)):
++            difference = payload_difference(left, right, "{}[{}]".format(path, index))
++            if difference is not None:
++                return difference
++        return None
++    if expected != actual:
++        return (path or "<root>", expected, actual)
++    return None
++
++
++__all__ = [
++    "plan_binding_errors",
++    "report_binding_errors",
++    "payload_difference",
++]
+diff --git a/python/pypto/execution/entry.py b/python/pypto/execution/entry.py
+index 20d6bfe37..ad2b677d2 100644
+--- a/python/pypto/execution/entry.py
++++ b/python/pypto/execution/entry.py
+@@ -27,10 +27,12 @@ from typing import Any, Mapping, Optional, Tuple
+ from pypto.backends.cpu import HostTensor
+ from pypto.target._utils import mapping_copy
+ 
++from .binding_verify import payload_difference
+ from .capability import CapabilitySnapshot
+ from .errors import (
+     ArtifactMismatchError,
+     CapabilityUnavailableError,
++    ExecutionError,
+     OpContractError,
+     PolicyInvalidValueError,
+     ProviderUnavailableError,
+@@ -38,7 +40,7 @@ from .errors import (
+ from .layout_verify import layout_decision_errors
+ from .op_registry import get_op_definition
+ from .plan import ExecutionPlan
+-from .policy import KNOWN_TARGET_KINDS, ExecutionPolicy
++from .policy import KNOWN_TARGET_KINDS, ExecutionPolicy, policy_from_dict
+ from .providers import ProviderOutcome, get_provider
+ from .report import ExecutionReport
+ from .resolver import ResolutionResult, resolve_matmul
+@@ -239,6 +241,93 @@ def _verify_plan_layout_decision(plan: ExecutionPlan, definition: Any) -> None:
+     )
+ 
+ 
++def _verify_plan_binding(plan: ExecutionPlan, capability: CapabilitySnapshot) -> None:
++    """Re-derive the whole canonical plan from a real capability snapshot.
++
++    ``ExecutionPlan.validate`` already reconciles every declaration field that
++    has ground truth inside the frozen documents.  This gate re-runs the
++    deterministic resolver for the frozen policy against the capability the
++    caller supplied (which was digest-checked against the plan), and refuses
++    any payload difference.  That is the ground truth for the fields only the
++    provider manifest can settle: library fingerprint, pack strategy, thread
++    default, provider implementation/version/numeric class.
++
++    ``execute_matmul_plan`` synthesizes the snapshot from the default local
++    provider probe when the caller does not supply one; that snapshot is still
++    digest-checked against the frozen plan, so the same canonical comparison
++    applies on every execution path.
++    """
++
++    payload = plan.payload
++    from .providers import registered_providers
++
++    if plan.selected_provider not in registered_providers():
++        raise ProviderUnavailableError(
++            "plan declares an unregistered provider {!r}".format(plan.selected_provider),
++            field="plan.selected.provider",
++            requested=plan.selected_provider,
++            available=sorted(registered_providers()),
++            reason="provider_not_registered",
++        )
++    policy_envelope = payload["policy"]
++    policy_document = policy_envelope["requested"]
++    try:
++        policy = policy_from_dict(policy_document)
++    except ExecutionError as exc:
++        raise ArtifactMismatchError(
++            "plan policy document cannot be rebuilt: {}".format(exc),
++            field="plan.policy.requested",
++            requested=policy_document,
++            available=None,
++            reason="plan_policy_document_invalid",
++            details={"execution_error": exc.to_dict()},
++        ) from exc
++    if policy.digest != plan.policy_digest:
++        raise ArtifactMismatchError(
++            "plan request.policy_digest does not match the frozen policy document",
++            field="plan.request.policy_digest",
++            requested=plan.policy_digest,
++            available=policy.digest,
++            reason="plan_policy_digest_mismatch",
++        )
++    try:
++        canonical = resolve_matmul(
++            policy,
++            capability,
++            plan.left_shape,
++            plan.right_shape,
++            plan.dtype,
++        )
++    except ExecutionError as exc:
++        raise ArtifactMismatchError(
++            "plan policy is not satisfiable against the supplied capability: {}".format(exc),
++            field="plan.policy.requested",
++            requested={"policy_digest": policy.digest, "capability_digest": capability.digest},
++            available=exc.available,
++            reason="plan_policy_not_satisfiable:{}".format(exc.reason or exc.code),
++            details={"execution_error": exc.to_dict()},
++        ) from exc
++    difference = payload_difference(canonical.plan.payload, payload)
++    if difference is None:
++        return
++    path, expected_value, actual_value = difference
++    # Keep the U2a machine-readable reason for the field family that differs,
++    # so the refusal surface does not fork by validation layer.
++    if path.startswith("selected."):
++        reason = "plan_selected_field_not_reconciled_with_provider_manifest"
++    elif path.startswith("artifact."):
++        reason = "artifact_declaration_mismatch"
++    else:
++        reason = "plan_declaration_mismatch"
++    raise ArtifactMismatchError(
++        "plan declaration differs from the canonical resolution at {}".format(path),
++        field="plan." + path,
++        requested=actual_value,
++        available=expected_value,
++        reason=reason,
++    )
++
++
+ def _execute(
+     *,
+     plan: ExecutionPlan,
+@@ -250,6 +339,7 @@ def _execute(
+     plan.validate()
+     definition = get_op_definition(plan.opcode)
+     _verify_plan_layout_decision(plan, definition)
++    _verify_plan_binding(plan, capability)
+     if output is None:
+         output = HostTensor.zeros(plan.dtype, plan.output_shape)
+     if not isinstance(output, HostTensor):
+diff --git a/python/pypto/execution/plan.py b/python/pypto/execution/plan.py
+index 633800acf..dcf9fe5bf 100644
+--- a/python/pypto/execution/plan.py
++++ b/python/pypto/execution/plan.py
+@@ -19,6 +19,7 @@ from typing import Any, Mapping, Tuple
+ 
+ from pypto.target._utils import canonical_json, frozen_mapping, mapping_copy, sha256_text
+ 
++from .binding_verify import plan_binding_errors
+ from .errors import ArtifactMismatchError
+ from .layout_verify import layout_decision_errors, layout_rule_errors
+ 
+@@ -364,6 +365,34 @@ def _validate_layout_decision(data: Mapping[str, Any]) -> None:
+     )
+ 
+ 
++def _validate_binding(data: Mapping[str, Any]) -> None:
++    """Reject self-consistent forgeries of the U2a declaration fields.
++
++    This is the content-local U2a counterpart of the layout checks: policy
++    digest, selected/numeric/artifact/fallback declarations are reconciled
++    against the frozen documents that carry their ground truth.  Fields only a
++    provider manifest can settle (library fingerprint, pack strategy, thread
++    default) are additionally re-derived in
++    :func:`pypto.execution.entry._verify_plan_binding` from the live
++    capability snapshot.
++    """
++
++    errors = list(plan_binding_errors(data))
++    if not errors:
++        return
++    first = errors[0]
++    raise ArtifactMismatchError(
++        "execution plan binding failed {} validation: {}".format(
++            first.get("reason"), first.get("field")
++        ),
++        field="plan." + str(first.get("field")),
++        requested=first.get("requested"),
++        available=first.get("available"),
++        reason=first.get("reason"),
++        details={"errors": [dict(item) for item in errors]},
++    )
++
++
+ @dataclass(frozen=True, init=False)
+ class ExecutionPlan:
+     """Frozen resolution result; runtime only validates, never re-selects."""
+@@ -417,6 +446,7 @@ class ExecutionPlan:
+             _walk(data, path)
+         _validate_plan_types(data)
+         _validate_layout_decision(data)
++        _validate_binding(data)
+         if not isinstance(data["candidates"], list) or not data["candidates"]:
+             raise ArtifactMismatchError(
+                 "execution plan must carry at least one candidate",
+diff --git a/python/pypto/execution/report.py b/python/pypto/execution/report.py
+index 133e0ab03..41c84bde2 100644
+--- a/python/pypto/execution/report.py
++++ b/python/pypto/execution/report.py
+@@ -442,6 +442,24 @@ def validate_report_schema(report: Mapping[str, Any]) -> Mapping[str, Any]:
+             reason=first.get("reason"),
+             details={"errors": [dict(item) for item in layout_errors]},
+         )
++    # U2a declaration reconciliation: every field in the report that has
++    # ground truth in another report block is re-derived and compared, so a
++    # hand-forged single-field report is refused here as well.
++    from .binding_verify import report_binding_errors
++
++    binding_errors = report_binding_errors(report)
++    if binding_errors:
++        first = binding_errors[0]
++        raise ReportSchemaError(
++            "report binding failed {} validation: {}".format(
++                first.get("reason"), first.get("field")
++            ),
++            field="report." + str(first.get("field")),
++            requested=first.get("requested"),
++            available=first.get("available"),
++            reason=first.get("reason"),
++            details={"errors": [dict(item) for item in binding_errors]},
++        )
+     parallelism = report["resources"]["parallelism"]
+     if parallelism["thread_mode"] not in ("single_thread", "env_default", "api_pinned"):
+         raise ReportSchemaError(
+diff --git a/python/tests/ut/pypto_x/test_execution_binding_forgery.py b/python/tests/ut/pypto_x/test_execution_binding_forgery.py
+new file mode 100644
+index 000000000..4387b0417
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_execution_binding_forgery.py
+@@ -0,0 +1,225 @@
++"""U2a declaration-binding forgery regressions (the 10 accepted probe fields).
++
++The U2a verifier's ``v3_forgery_probe.py`` showed that a caller able to
++recompute the enclosing plan digest could change declaration fields
++(``artifact.kind``/``library.sha256``/``pack.strategy``,
++``selected.library.sha256``, ``numeric_guarantee.*``, ``fallback.primary``,
++``request.policy_digest``) and still execute, with the forged declaration
++either silently replaced or copied into the report.
++
++These tests convert each accepted probe case into a "must be rejected or
++explicitly exempted" regression:
++
++* content-local cases are refused by ``ExecutionPlan.validate`` (the same
++  entry as the alias-proof checks);
++* double-forgeries that keep the frozen documents self-consistent are refused
++  by ``execute_matmul_plan`` re-resolving the frozen policy against the
++  supplied capability snapshot (``plan_declaration_mismatch``) before any
++  provider invocation, so the output stays untouched;
++* the report copy is refused by ``validate_report_schema`` for every field
++  that has ground truth in another report block.
++
++The one probe case that is a no-op (``thread_mode env->api`` when the
++canonical mode already is ``api_pinned``) is asserted to be digest-identical
++and is documented as explicitly exempted, not as a hole.
++"""
++
++from __future__ import annotations
++
++import copy
++import json
++import os
++
++import pytest
++
++from pypto.execution import (
++    AOCL_DEFAULT_LIBRARY,
++    ARTIFACT_MISMATCH,
++    CapabilitySnapshot,
++    ExecutionPolicy,
++    FallbackPolicy,
++    NumericPolicy,
++    ProviderPolicy,
++    ResourcePolicy,
++    execute_matmul,
++    execute_matmul_plan,
++    host_features,
++    plan_matmul,
++    validate_report_schema,
++)
++from pypto.backends.cpu import HostTensor
++
++AOCL_PRESENT = os.path.isfile(AOCL_DEFAULT_LIBRARY)
++pytestmark = pytest.mark.skipif(not AOCL_PRESENT, reason="Q8 AOCL artifact is not present on this host")
++
++_SHAPE_A = (4, 32)
++_SHAPE_B = (32, 8)
++
++
++def _capability():
++    return CapabilitySnapshot.for_host(features=host_features())
++
++
++def _vendor_policy(dtype="float32"):
++    return ExecutionPolicy(
++        profile="auto_static",
++        target="auto",
++        provider=ProviderPolicy(mode="vendor"),
++        numeric=NumericPolicy(requirement="deterministic"),
++        deterministic=True,
++        fallback=FallbackPolicy(mode="deny"),
++        resources=ResourcePolicy(max_threads="auto"),
++    )
++
++
++def _vendor_plan(dtype="float32"):
++    capability = _capability()
++    return plan_matmul(_SHAPE_A, _SHAPE_B, dtype, _vendor_policy(dtype), capability=capability).plan, capability
++
++
++def _tensors(dtype):
++    left = HostTensor(dtype, _SHAPE_A, [float((index % 7) + 1) for index in range(_SHAPE_A[0] * _SHAPE_A[1])])
++    right = HostTensor(dtype, _SHAPE_B, [0.5] * (_SHAPE_B[0] * _SHAPE_B[1]))
++    return left, right
++
++
++def _assert_rejected_or_exempted(mutate, dtype="float32", expected_reason=None):
++    """Tamper one declaration, recompute the plan digest, then try to execute."""
++
++    plan, capability = _vendor_plan(dtype)
++    payload = plan.payload
++    mutate(payload)
++    forged = type(plan)(payload)
++    output = HostTensor(dtype, (4, 8), [31.0] * 32)
++    left, right = _tensors(dtype)
++    try:
++        forged.validate()
++    except Exception as exc:
++        assert getattr(exc, "code", None) == ARTIFACT_MISMATCH
++        if expected_reason is not None:
++            assert exc.reason == expected_reason, exc.to_dict()
++        return {"layer": "plan.validate", "reason": exc.reason}
++    # The forged plan is self-consistent enough to reach execution; it must be
++    # refused before the provider runs.
++    with pytest.raises(Exception) as excinfo:
++        execute_matmul_plan(forged, left, right, capability=capability, output=output)
++    error = excinfo.value
++    assert getattr(error, "code", None) == ARTIFACT_MISMATCH, error.to_dict()
++    assert output.flat() == tuple([31.0] * 32)
++    if expected_reason is not None:
++        assert error.reason == expected_reason, error.to_dict()
++    return {"layer": "execute_matmul_plan", "reason": error.reason}
++
++
++def test_u2a_probe_accepted_fields_are_all_refused_or_exempted():
++    cases = (
++        ("artifact.kind", lambda p: p["artifact"].update(kind="core_ir_artifact"), "plan_artifact_kind_not_reconciled"),
++        (
++            "artifact.library.sha256",
++            lambda p: p["artifact"]["library"].update(sha256="deadbeef"),
++            "plan_artifact_library_not_reconciled",
++        ),
++        (
++            "artifact.pack.strategy",
++            lambda p: p["artifact"]["pack"].update(strategy="none"),
++            "plan_vendor_pack_strategy_not_declared",
++        ),
++        ("fallback.primary", lambda p: p["fallback"].update(primary="portable"), "plan_fallback_primary_mismatch"),
++        (
++            "numeric_guarantee.class",
++            lambda p: p["numeric_guarantee"].update({"class": "portable_bitwise"}),
++            "plan_selected_field_not_reconciled_with_provider_manifest",
++        ),
++        (
++            "numeric_guarantee.deterministic",
++            lambda p: p["numeric_guarantee"].update(deterministic=False),
++            "plan_numeric_guarantee_not_reconciled",
++        ),
++        (
++            "numeric_guarantee.reduction_order",
++            lambda p: p["numeric_guarantee"].update(reduction_order="forged_order_v1"),
++            "plan_numeric_guarantee_not_reconciled",
++        ),
++        (
++            "request.policy_digest",
++            lambda p: p["request"].update(policy_digest="sha256:" + "0" * 64),
++            "plan_policy_digest_mismatch",
++        ),
++        (
++            "selected.library.sha256",
++            lambda p: p["selected"]["library"].update(sha256="deadbeef"),
++            "plan_artifact_library_not_reconciled",
++        ),
++    )
++    for name, mutate, reason in cases:
++        outcome = _assert_rejected_or_exempted(mutate, expected_reason=reason)
++        assert outcome["layer"] in ("plan.validate", "execute_matmul_plan"), (name, outcome)
++
++    # 10th probe case: env->api is either a no-op (canonical mode is already
++    # api_pinned) or a real declaration change, which must be refused.
++    plan, _capability_snapshot = _vendor_plan("float32")
++    payload = plan.payload
++    payload["selected"] = dict(payload["selected"], thread_mode="api_pinned")
++    forged = type(plan)(payload)
++    if forged.digest == plan.digest:
++        # Explicit exemption: the mutation did not change the declaration.
++        assert forged.payload["selected"]["thread_mode"] == plan.payload["selected"]["thread_mode"]
++    else:
++        with pytest.raises(Exception) as excinfo:
++            forged.validate()
++        assert getattr(excinfo.value, "code", None) == ARTIFACT_MISMATCH
++        assert excinfo.value.reason == "thread_mode_runtime_mismatch"
++
++
++def test_u2a_double_forgery_library_identity_is_refused_before_provider():
++    """Forge both copies of a manifest-only fact and recompute every digest."""
++
++    plan, capability = _vendor_plan("float32")
++    payload = plan.payload
++    payload["artifact"]["library"]["sha256"] = "deadbeef"
++    payload["selected"]["library"]["sha256"] = "deadbeef"
++    forged = type(plan)(payload)
++    left, right = _tensors("float32")
++    output = HostTensor("float32", (4, 8), [31.0] * 32)
++    with pytest.raises(Exception) as excinfo:
++        execute_matmul_plan(forged, left, right, capability=capability, output=output)
++    error = excinfo.value
++    assert getattr(error, "code", None) == ARTIFACT_MISMATCH
++    # The canonical re-resolution compares the manifest library fingerprint.
++    assert error.reason == "artifact_declaration_mismatch"
++    assert output.flat() == tuple([31.0] * 32)
++
++
++def _vendor_report():
++    capability = _capability()
++    policy = _vendor_policy("float32")
++    left, right = _tensors("float32")
++    _, report = execute_matmul(left, right, policy, capability=capability)
++    return json.loads(json.dumps(report.to_dict()))
++
++
++def test_u2a_report_single_field_forgeries_are_refused():
++    document = _vendor_report()
++    cases = (
++        lambda d: d["artifact"].update(kind="core_ir_artifact"),
++        lambda d: d["artifact"]["library"].update(sha256="deadbeef"),
++        lambda d: d["artifact"]["pack"].update(strategy="none"),
++        lambda d: d["resolution"].update(fallback_primary="portable"),
++        lambda d: d["guarantees"].update(numeric_class="portable_bitwise"),
++        lambda d: d["request"].update(policy_digest="sha256:" + "0" * 64),
++    )
++    for mutate in cases:
++        broken = copy.deepcopy(document)
++        mutate(broken)
++        with pytest.raises(Exception) as excinfo:
++            validate_report_schema(broken)
++        assert getattr(excinfo.value, "code", None) == "REPORT_SCHEMA_INVALID"
++
++
++def test_u2a_report_fallback_used_relationship_is_enforced():
++    document = _vendor_report()
++    broken = copy.deepcopy(document)
++    broken["resolution"]["fallback_used"] = not document["resolution"]["fallback_used"]
++    with pytest.raises(Exception) as excinfo:
++        validate_report_schema(broken)
++    assert getattr(excinfo.value, "code", None) == "REPORT_SCHEMA_INVALID"

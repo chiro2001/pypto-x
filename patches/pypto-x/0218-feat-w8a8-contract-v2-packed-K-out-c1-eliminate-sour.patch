@@ -1,0 +1,1998 @@
+From fca4a6d9b2405c5e4a14d96e7dae9bfe3a73439c Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 08:04:50 +0800
+Subject: [PATCH 218/235] =?UTF-8?q?feat(w8a8):=20contract=20v2=20packed=20?=
+ =?UTF-8?q?[K,out]=20(c1)=20=E2=80=94=20eliminate=20source=20int8=20transp?=
+ =?UTF-8?q?ose?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- runtime_binding v3: int8 region [out,in] -> packed [K,out], frozen
+  storage_layout=k_out_rowmajor, fail-closed on v1/v2 schema/payload
+- qwen35 graph: drop the per-forward int8 weight transpose (150/186/151/187
+  nodes), declare packed int8 parameters [K,out] + scale [out]
+- packer: emit packed k_out_rowmajor codes by default (v1 order kept for
+  differential/audit); manifest gains storage_shape/codes_layout and
+  codes_sha256 covers packed bytes
+- weight_map/weight_layout/driver/fixture/audit tooling adapted to packed
+  storage; WeightLayout layout_version 1->2
+- SVE256 int8 ingestion regression (BufferBinding byte view, negative
+  codes, -128 fail-closed); four-backend v1-vs-v2 opcode differential
+  (scalar/vector/AVX2/AVX-512/SVE256 + CUDA fake driver)
+- no backend kernel/lowering/artifact-payload changes (payload version
+  not bumped; stale artifacts rejected via program_digest)
+
+Evidence: _meta/pypto-x/w8a8-v2-m2/{brief.zh-CN.md,logs,raw,scripts}
+Refs: docs/20-planning/0010-2026-09-12-w8a8-contract-v2-packed-k-out.zh-CN.md
+---
+ python/pypto/portable/qwen35.py                             |  68 ++++---
+ python/pypto/portable/qwen35_w8a8_weight.py                 |  95 ++++++++-
+ python/pypto/portable/qwen35_weight_layout.py               |  33 +++-
+ python/pypto/portable/qwen35_weight_map.py                  |  12 +-
+ python/pypto/portable/runtime_binding.py                    | 131 +++++++++---
+ python/tests/ut/pypto_x/qwen35_w8a8_binding_driver.py       | 103 +++++++++-
+ python/tests/ut/pypto_x/qwen35_weight_fixture.py            |  13 +-
+ python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py |  21 +-
+ python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py     |   6 +
+ python/tests/ut/pypto_x/test_w8a8_binding.py                | 127 +++++++++---
+ python/tests/ut/pypto_x/test_w8a8_cuda.py                   |  66 +++++++
+ python/tests/ut/pypto_x/test_w8a8_graph_path.py             |  38 +++-
+ python/tests/ut/pypto_x/test_w8a8_sve256.py                 |  84 ++++++++
+ python/tests/ut/pypto_x/test_w8a8_v2_packed_differential.py | 340 ++++++++++++++++++++++++++++++++
+ tools/qwen35_reference/packer_side_a.py                     |  47 ++++-
+ 15 files changed, 1075 insertions(+), 109 deletions(-)
+
+diff --git a/python/pypto/portable/qwen35.py b/python/pypto/portable/qwen35.py
+index c6d21a78f..f8ea1e382 100644
+--- a/python/pypto/portable/qwen35.py
++++ b/python/pypto/portable/qwen35.py
+@@ -441,14 +441,16 @@ def _quantized_linear_projection(
+     output_features: int,
+     prefix: str,
+ ) -> ValueRef:
+-    """Build the frozen W8A8 linear chain (contract §2.3/§3.3).
++    """Build the W8A8 linear chain (contract 0010 v2 §4.1).
+ 
+     ``x`` is reshaped to ``[rows, K]`` and cast to float32 (exact for BF16)
+-    before the dynamic per-token quantizer; the int8 weight is transposed to
+-    ``[K, out]`` by an explicit Core ``transpose`` (no implicit matmul
+-    transpose); the int32 accumulator is dequantized once into the bf16
+-    output.  ``output_dtype`` must be bf16 because the frozen epilogue emits
+-    BF16 with a single RNE rounding.
++    before the dynamic per-token quantizer; the int8 weight parameter is
++    already the packed ``[K, out]`` region produced by the offline packer, so
++    it feeds ``qmatmul_s8s8_s32`` directly with **no per-forward transpose**
++    (the 0002 v1 graph transposed ``[out,K]`` every invocation); the int32
++    accumulator is dequantized once into the bf16 output.  ``output_dtype``
++    must be bf16 because the frozen epilogue emits BF16 with a single RNE
++    rounding.
+     """
+ 
+     if output_dtype != "bf16":
+@@ -457,10 +459,10 @@ def _quantized_linear_projection(
+         raise ValueError("W8A8 linear weight must be int8")
+     if weight_scale.type.dtype != "float32" or len(weight_scale.type.shape) != 1:
+         raise ValueError("W8A8 weight scale must be rank-1 float32")
+-    if tuple(weight_s8.type.shape) != (output_features, input_shape[-1]):
++    if tuple(weight_s8.type.shape) != (input_shape[-1], output_features):
+         raise ValueError(
+-            "W8A8 weight shape {} does not match [out={}, in={}]".format(
+-                tuple(weight_s8.type.shape), output_features, input_shape[-1]
++            "W8A8 packed weight shape {} does not match [K={}, out={}] (0010 v2)".format(
++                tuple(weight_s8.type.shape), input_shape[-1], output_features
+             )
+         )
+     if tuple(weight_scale.type.shape) != (output_features,):
+@@ -487,10 +489,9 @@ def _quantized_linear_projection(
+             (prefix + "_input_scale", _tensor("float32", (rows,))),
+         ),
+     )
+-    weight_t = _transpose(builder, weight_s8, (1, 0), prefix + "_weight_t")
+     accumulator = builder.op(
+         "qmatmul_s8s8_s32",
+-        (quantized, weight_t),
++        (quantized, weight_s8),
+         ((prefix + "_acc_s32", _tensor("int32", (rows, output_features))),),
+     )[0]
+     projected = builder.op(
+@@ -659,12 +660,14 @@ def qwen35_lm_head_quantized_manifest_entry(vocab: int, hidden: int) -> Mapping[
+     """Trusted compact entry for the opt-in §3.4 lm_head int8 dual packing.
+ 
+     The embedding region stays BF16; this entry only describes the extra int8
+-    parameter/scale pair that points at the same logical lm_head weight.
++    parameter/scale pair that points at the same logical lm_head weight.  The
++    0010 v2 storage shape is the packed ``[K,out] = [hidden,vocab]`` (the
++    checkpoint source tensor is ``[vocab,hidden]``).
+     """
+ 
+     return _decoder_parameter_entry(
+         QWEN35_LM_HEAD_QUANTIZED_FUNCTION_PARAMETER,
+-        (int(vocab), int(hidden)),
++        (int(hidden), int(vocab)),
+         "int8",
+         aliases=("lm_head.weight",),
+     )
+@@ -776,10 +779,17 @@ def _quantized_compact_manifest(
+             if entry.get("dtype") == "int8":
+                 rewritten.append(entry)
+                 continue
++            source_shape = tuple(entry["shape"])
++            if len(source_shape) != 2:
++                raise ValueError(
++                    "quantized linear manifest class {!r} must be rank 2".format(name)
++                )
++            # 0010 v2：graph/binding 里 int8 参数的 shape 是 packed [K,out]，
++            # 即 checkpoint [out,in] 的翻转；元素数/字节数不变（frozen 输出不变）。
+             rewritten.append(
+                 _decoder_parameter_entry(
+                     str(name),
+-                    tuple(entry["shape"]),
++                    (int(source_shape[1]), int(source_shape[0])),
+                     "int8",
+                     count=int(entry["count"]),
+                     aliases=tuple(entry.get("aliases", ())),
+@@ -1812,6 +1822,7 @@ def qwen35_text_decoder_manifest(
+                 "scale_dtype": "float32",
+                 "zero_point": 0,
+                 "group_size": None,
++                "storage_layout": "k_out_rowmajor",
+             }
+             for name in quantized_names
+         ]
+@@ -1829,6 +1840,7 @@ def qwen35_text_decoder_manifest(
+                     "scale_dtype": "float32",
+                     "zero_point": 0,
+                     "group_size": None,
++                    "storage_layout": "k_out_rowmajor",
+                     "storage_id": QWEN35_LM_HEAD_QUANTIZED_STORAGE_ID,
+                     "scale_storage_id": QWEN35_LM_HEAD_QUANTIZED_SCALE_STORAGE_ID,
+                 }
+@@ -1972,8 +1984,9 @@ def build_qwen35_text_decoder_graph(
+     ``precision='w8a8-linear'`` keeps ``dtype`` as the activation/island dtype
+     and replaces the covered linear projections by
+     ``quantize_per_token_s8 -> qmatmul_s8s8_s32 -> dequantize_epilogue_bf16``
+-    with explicit int8 weight + fp32 per-output-channel scale function
+-    parameters (contract 0002 §2.3/§3.5).
++    with packed ``[K,out]`` int8 weight + fp32 per-output-channel scale
++    function parameters (contract 0010 v2, superseding 0002 §2.3/§3.5).  The
++    v1 per-forward int8 weight ``transpose`` is removed.
+     """
+ 
+     batch = _positive_or_zero_int(batch, "batch", allow_zero=False)
+@@ -2099,15 +2112,24 @@ def build_qwen35_text_decoder_graph(
+         )
+ 
+     def linear_parameter(layer_index: int, suffix: str, shape: Sequence[int]) -> ValueRef:
+-        """Declare a linear weight parameter as int8 + scale when quantized."""
++        """Declare a linear weight parameter as packed int8 + scale when quantized.
++
++        ``shape`` stays the checkpoint ``[out,in]`` contract used by every call
++        site; the int8 parameter itself is declared in the 0010 v2 packed
++        storage order ``[K,out]`` while the fp32 per-output-channel scale
++        keeps ``(out,)`` elements.
++        """
+ 
+         name = "layer_{:02d}_{}".format(layer_index, suffix)
+         if name in quantized_names:
+-            if not shape or int(shape[0]) <= 0:
+-                raise ValueError("quantized linear weight {!r} needs a positive out dimension".format(name))
+-            weight = builder.parameter(name, _tensor("int8", tuple(int(dim) for dim in shape)))
++            if len(shape) != 2 or int(shape[0]) <= 0 or int(shape[1]) <= 0:
++                raise ValueError(
++                    "quantized linear weight {!r} needs a positive [out,in] shape".format(name)
++                )
++            out_features, in_features = int(shape[0]), int(shape[1])
++            weight = builder.parameter(name, _tensor("int8", (in_features, out_features)))
+             weight_scales[name] = builder.parameter(
+-                name + "_scale", _tensor("float32", (int(shape[0]),))
++                name + "_scale", _tensor("float32", (out_features,))
+             )
+             return weight
+         return layer_parameter(layer_index, suffix, shape)
+@@ -2316,8 +2338,10 @@ def build_qwen35_text_decoder_graph(
+     final_hidden = _cast_from_f32(builder, final_hidden_f32, dtype, "final_hidden")
+     final_flat = _reshape(builder, final_hidden, (batch * steps, h), "final_hidden_flat")
+     if precision == "w8a8-linear" and quantize_lm_head:
++        # 0010 v2 packed storage [K,out] = [hidden,vocab]; the scale stays the
++        # source per-output-channel [vocab].
+         lm_head_weight = builder.parameter(
+-            QWEN35_LM_HEAD_QUANTIZED_FUNCTION_PARAMETER, _tensor("int8", (v, h))
++            QWEN35_LM_HEAD_QUANTIZED_FUNCTION_PARAMETER, _tensor("int8", (h, v))
+         )
+         lm_head_scale = builder.parameter(
+             QWEN35_LM_HEAD_QUANTIZED_FUNCTION_PARAMETER + "_scale", _tensor("float32", (v,))
+diff --git a/python/pypto/portable/qwen35_w8a8_weight.py b/python/pypto/portable/qwen35_w8a8_weight.py
+index 744e9e990..5b21c3f7e 100644
+--- a/python/pypto/portable/qwen35_w8a8_weight.py
++++ b/python/pypto/portable/qwen35_w8a8_weight.py
+@@ -1,4 +1,4 @@
+-"""Qwen3.5-0.8B W8A8 weight quantization (offline ingestion, contract §1.1/§3).
++"""Qwen3.5-0.8B W8A8 weight quantization (offline ingestion, contract 0010 v2).
+ 
+ This module turns one BF16/FP16/FP32 checkpoint tensor in ``[out, in]`` layout
+ into the frozen W8A8 storage:
+@@ -7,7 +7,11 @@ into the frozen W8A8 storage:
+   max(|W[o,:]|)/127``, clamp ``[-127, 127]``, RNE ties-to-even;
+ * fp32 per-output-channel scales;
+ * Q1 zero rows -> ``s=1.0`` / ``q=0``; Q2 NaN/Inf fail closed; Q3 saturation
+-  counts are reported; scale underflow on a non-zero row fails closed.
++  counts are reported; scale underflow on a non-zero row fails closed;
++* **code值不变，只是排布**：契约 0010 v2 默认产出 packed ``[K,out]``
++  （``q[k*out + o]``，无 padding），即 0002 v1 图里 ``transpose([out,in])``
++  输出的一份逐位镜像。``storage_layout='out_in_rowmajor'`` 保留给 v1↔v2
++  differential / 审计脚本显式复现，不进入 v2 schema。
+ 
+ The numpy implementation below is a vectorized transcription of the C1 golden
+ (:mod:`pypto.portable.qwen35_w8a8_scheme`); a focused differential test pins it
+@@ -29,6 +33,10 @@ from pypto.portable.qwen35_w8a8_scheme import (
+     QUANT_MIN,
+     W8A8SchemeError,
+ )
++from pypto.portable.runtime_binding import (
++    QUANT_STORAGE_LAYOUT_K_OUT,
++    QUANT_STORAGE_LAYOUT_OUT_IN,
++)
+ 
+ 
+ class W8A8WeightQuantizationError(ValueError):
+@@ -37,7 +45,13 @@ class W8A8WeightQuantizationError(ValueError):
+ 
+ @dataclass(frozen=True)
+ class QuantizedWeight:
+-    """One quantized weight payload plus its artifact-safe manifest fields."""
++    """One quantized weight payload plus its artifact-safe manifest fields.
++
++    ``shape`` stays the checkpoint source ``[out,in]``; ``storage_shape`` is
++    the packed code layout (0010 v2: ``[K,out]``) and ``codes_sha256`` covers
++    the packed bytes.  ``scales``/``scales_sha256`` are bit-identical between
++    v1 and v2 (the quantization scheme itself is unchanged).
++    """
+ 
+     name: str
+     source_dtype: str
+@@ -52,6 +66,30 @@ class QuantizedWeight:
+     codes_sha256: str
+     scales_sha256: str
+     source_sha256: str
++    storage_layout: str = QUANT_STORAGE_LAYOUT_K_OUT
++    storage_shape: Tuple[int, int] = ()
++
++    def __post_init__(self) -> None:
++        if not self.storage_shape:
++            rows, columns = int(self.shape[0]), int(self.shape[1])
++            storage_shape = (
++                (rows, columns)
++                if self.storage_layout == QUANT_STORAGE_LAYOUT_OUT_IN
++                else (columns, rows)
++            )
++            object.__setattr__(self, "storage_shape", storage_shape)
++        if self.storage_layout not in (QUANT_STORAGE_LAYOUT_K_OUT, QUANT_STORAGE_LAYOUT_OUT_IN):
++            raise W8A8WeightQuantizationError(
++                "unsupported codes storage_layout {!r}".format(self.storage_layout)
++            )
++        if self.storage_shape != _storage_shape_for(self.shape, self.storage_layout):
++            raise W8A8WeightQuantizationError(
++                "storage_shape {} does not match {} under {!r}".format(
++                    self.storage_shape, tuple(self.shape), self.storage_layout
++                )
++            )
++        if len(self.codes) != int(self.shape[0]) * int(self.shape[1]):
++            raise W8A8WeightQuantizationError("int8 codes byte count does not match the source shape")
+ 
+     def manifest_entry(self) -> Mapping[str, Any]:
+         """Per-tensor §5.1 manifest entry without any weight bytes."""
+@@ -60,6 +98,8 @@ class QuantizedWeight:
+             "name": self.name,
+             "source_dtype": self.source_dtype,
+             "shape": list(self.shape),
++            "storage_shape": list(self.storage_shape),
++            "codes_layout": self.storage_layout,
+             "max_abs": self.max_abs,
+             "scale_min": self.scale_min,
+             "scale_max": self.scale_max,
+@@ -84,6 +124,15 @@ class QuantizedWeight:
+         return int(self.shape[0])
+ 
+ 
++def _storage_shape_for(shape: Sequence[int], storage_layout: str) -> Tuple[int, int]:
++    rows, columns = int(shape[0]), int(shape[1])
++    if storage_layout == QUANT_STORAGE_LAYOUT_OUT_IN:
++        return (rows, columns)
++    if storage_layout == QUANT_STORAGE_LAYOUT_K_OUT:
++        return (columns, rows)
++    raise W8A8WeightQuantizationError("unsupported codes storage_layout {!r}".format(storage_layout))
++
++
+ def _require_numpy() -> Any:
+     try:
+         import numpy as np  # noqa: WPS433
+@@ -152,14 +201,20 @@ def quantize_weight_per_output_channel(
+     dtype: str,
+     shape: Sequence[int],
+     name: str = "<weight>",
++    storage_layout: str = QUANT_STORAGE_LAYOUT_K_OUT,
+     chunk_elements: int = _QUANTIZE_CHUNK_ELEMENTS,
+ ) -> QuantizedWeight:
+     """Quantize one ``[out, in]`` weight with the frozen per-channel scheme.
+ 
+     Rows are processed in blocks bounded by ``chunk_elements`` so that the
+     fp64 working set stays ~32 MiB even for the 248320×1024 tied lm_head; the
+-    per-row arithmetic and its order are unchanged, so the output is bit-exact
+-    with the previous whole-tensor implementation and the C1 golden.
++    per-row arithmetic and its order are unchanged, so the code values and
++    scales are bit-exact with the previous whole-tensor implementation and the
++    C1 golden.  ``storage_layout`` selects only the byte order of the int8
++    payload: the default 0010 v2 ``k_out_rowmajor`` writes ``q[k*out+o]``
++    (a row-major transpose of the [out,in] codes, byte-identical to the v1
++    graph transpose output), while ``out_in_rowmajor`` is the 0002 v1 order
++    kept for differential/audit reproduction.
+     """
+ 
+     if not isinstance(source_bytes, (bytes, bytearray, memoryview)):
+@@ -174,6 +229,11 @@ def quantize_weight_per_output_channel(
+         raise W8A8WeightQuantizationError(
+             "K={} exceeds the INT32 accumulation limit {} (Q5)".format(columns, MAX_ACCUMULATOR_K)
+         )
++    if storage_layout not in (QUANT_STORAGE_LAYOUT_K_OUT, QUANT_STORAGE_LAYOUT_OUT_IN):
++        raise W8A8WeightQuantizationError(
++            "unsupported codes storage_layout {!r}".format(storage_layout)
++        )
++    packed = storage_layout == QUANT_STORAGE_LAYOUT_K_OUT
+     decode_dtype = str(dtype).lower()
+     if decode_dtype not in _SUPPORTED_SOURCE_DTYPES:
+         raise W8A8WeightQuantizationError("unsupported weight source dtype {!r}".format(dtype))
+@@ -187,7 +247,8 @@ def quantize_weight_per_output_channel(
+     np = _require_numpy()
+     rows_per_chunk = max(1, int(chunk_elements) // columns)
+ 
+-    codes = bytearray(rows * columns)
++    codes = None if packed else bytearray(rows * columns)
++    packed_codes = np.empty((columns, rows), dtype=np.int8) if packed else None
+     scale_bytes = bytearray(4 * rows)
+     max_abs = 0.0
+     scale_min: Optional[float] = None
+@@ -218,8 +279,13 @@ def quantize_weight_per_output_channel(
+         saturation += int(np.count_nonzero((rounded < QUANT_MIN) | (rounded > QUANT_MAX)))
+         block_codes = np.clip(rounded, QUANT_MIN, QUANT_MAX).astype(np.int8)
+         block_codes[block_zero] = np.int8(0)
+-        code_flat = block_codes.reshape(-1)
+-        codes[row_start * columns:row_stop * columns] = code_flat.tobytes()
++        if packed:
++            # q[k*out + o] = block_codes[o, k]: write the [rows,columns] block
++            # transposed into the [columns,rows] packed plane.  The output
++            # element values are unchanged; only their addresses move.
++            packed_codes[:, row_start:row_stop] = block_codes.T
++        else:
++            codes[row_start * columns:row_stop * columns] = block_codes.reshape(-1).tobytes()
+         scale_flat = scales.reshape(-1)
+         scale_bytes[row_start * 4:row_stop * 4] = scale_flat.astype("<f4").tobytes()
+         max_abs = max(max_abs, float(absmax.max()))
+@@ -229,7 +295,7 @@ def quantize_weight_per_output_channel(
+         scale_max = block_max if scale_max is None else max(scale_max, block_max)
+         zero_rows += int(np.count_nonzero(block_zero))
+ 
+-    codes_payload = bytes(codes)
++    codes_payload = packed_codes.tobytes() if packed else bytes(codes)
+     scales_payload = bytes(scale_bytes)
+     return QuantizedWeight(
+         name=name,
+@@ -245,6 +311,8 @@ def quantize_weight_per_output_channel(
+         codes_sha256=hashlib.sha256(codes_payload).hexdigest(),
+         scales_sha256=hashlib.sha256(scales_payload).hexdigest(),
+         source_sha256=hashlib.sha256(payload).hexdigest(),
++        storage_layout=storage_layout,
++        storage_shape=(columns, rows) if packed else (rows, columns),
+     )
+ 
+ 
+@@ -254,17 +322,24 @@ def quantize_weight_from_view(
+     dtype: str,
+     shape: Sequence[int],
+     name: str = "<weight>",
++    storage_layout: str = QUANT_STORAGE_LAYOUT_K_OUT,
+ ) -> QuantizedWeight:
+     """Quantize a safetensors ``memoryview`` without materializing a copy first."""
+ 
+     if not hasattr(view, "tobytes"):
+         raise W8A8WeightQuantizationError("weight view must expose tobytes()")
+     return quantize_weight_per_output_channel(
+-        bytes(view.tobytes()), dtype=dtype, shape=tuple(int(d) for d in shape), name=name
++        bytes(view.tobytes()),
++        dtype=dtype,
++        shape=tuple(int(d) for d in shape),
++        name=name,
++        storage_layout=storage_layout,
+     )
+ 
+ 
+ __all__ = [
++    "QUANT_STORAGE_LAYOUT_K_OUT",
++    "QUANT_STORAGE_LAYOUT_OUT_IN",
+     "QuantizedWeight",
+     "W8A8WeightQuantizationError",
+     "quantize_weight_from_view",
+diff --git a/python/pypto/portable/qwen35_weight_layout.py b/python/pypto/portable/qwen35_weight_layout.py
+index c354b6cba..17e6ef550 100644
+--- a/python/pypto/portable/qwen35_weight_layout.py
++++ b/python/pypto/portable/qwen35_weight_layout.py
+@@ -90,6 +90,8 @@ class WeightLayoutRegion:
+     requires_dtype_conversion: bool
+     quantized: bool = False
+     derived_from: Optional[str] = None
++    storage_layout: Optional[str] = None
++    source_shape: Optional[Tuple[int, ...]] = None
+ 
+     def to_dict(self) -> Mapping[str, Any]:
+         payload: Dict[str, Any] = {
+@@ -116,6 +118,10 @@ class WeightLayoutRegion:
+         # 只在 W8A8 region 上出现的新键：BF16 layout JSON 保持逐字节不变。
+         if self.quantized:
+             payload["quantized"] = True
++            if self.storage_layout is not None:
++                payload["storage_layout"] = self.storage_layout
++            if self.source_shape is not None:
++                payload["source_shape"] = list(self.source_shape)
+         if self.derived_from is not None:
+             payload["derived_from"] = self.derived_from
+         return payload
+@@ -163,7 +169,9 @@ class WeightLayout:
+     def to_dict(self) -> Mapping[str, Any]:
+         payload: Dict[str, Any] = {
+             "layout_kind": "qwen35_text_decoder_weight_layout",
+-            "layout_version": 1,
++            # 0010 v2：1 -> 2（quant_weight region 增加 storage_layout/source_shape；
++            # region shape 变为 packed [K,out]）。
++            "layout_version": 2,
+             "schema_digest": self.schema_digest,
+             "checkpoint_path": self.checkpoint_path,
+             "alignment": self.alignment,
+@@ -350,6 +358,9 @@ def build_weight_layout(
+                 )
+             )
+         scale_derivation[scale_entry.storage_id] = weight_entries[0].storage_id
++    quant_entry_by_storage = {
++        entry.storage_id: entry for entry in schema.parameters if entry.quant is not None
++    }
+     regions: List[WeightLayoutRegion] = []
+     for region in packed.regions:
+         if region.role in ("parameter", QUANT_WEIGHT_REGION_ROLE):
+@@ -360,6 +371,8 @@ def build_weight_layout(
+                 )
+             source = item.source
+             quantized = region.role == QUANT_WEIGHT_REGION_ROLE
++            storage_layout: Optional[str] = None
++            source_shape: Optional[Tuple[int, ...]] = None
+             if quantized:
+                 # W8A8：来源是浮点 checkpoint 张量，落盘字节由量化器生成，不能
+                 # 按“字节减半转换”处理；这里只校验契约与来源的元素数/类型前提。
+@@ -381,6 +394,22 @@ def build_weight_layout(
+                             region.storage_id, source.pypto_dtype
+                         )
+                     )
++                quant_entry = quant_entry_by_storage.get(region.storage_id)
++                if quant_entry is None:
++                    raise WeightLayoutError(
++                        "quantized region {!r} is absent from the binding schema".format(
++                            region.storage_id
++                        )
++                    )
++                storage_layout = str(quant_entry.quant["storage_layout"])
++                # 0010 v2：packed storage [K,out] 的 checkpoint 源是 [out,in]。
++                source_shape = tuple(reversed(tuple(region.shape)))
++                if tuple(source.shape) != source_shape:
++                    raise WeightLayoutError(
++                        "quantized region {!r} source shape {} does not match packed {}".format(
++                            region.storage_id, list(source.shape), list(source_shape)
++                        )
++                    )
+                 requires_conversion = False
+             elif item.dtype_conforms:
+                 if source.nbytes != region.nbytes:
+@@ -416,6 +445,8 @@ def build_weight_layout(
+                     source.elements,
+                     requires_conversion,
+                     quantized=quantized,
++                    storage_layout=storage_layout,
++                    source_shape=source_shape,
+                 )
+             )
+         elif region.role == QUANT_SCALE_ROLE:
+diff --git a/python/pypto/portable/qwen35_weight_map.py b/python/pypto/portable/qwen35_weight_map.py
+index 1c4c0fa6f..8000b93e7 100644
+--- a/python/pypto/portable/qwen35_weight_map.py
++++ b/python/pypto/portable/qwen35_weight_map.py
+@@ -521,10 +521,16 @@ def build_weight_mapping(
+                 )
+             prior_claims.append(function_parameter)
+             mapped_names.add(tensor.name)
+-            if tuple(tensor.shape) != manifest_shape:
++            # 0010 v2：int8 manifest shape 是 packed storage [K,out]，而官方
++            # checkpoint 张量仍是 [out,in]；只有 int8（量化权重）类允许翻转，
++            # 其它存储类继续要求逐维全等。
++            expected_source_shape = (
++                tuple(reversed(manifest_shape)) if manifest_dtype == "int8" else manifest_shape
++            )
++            if tuple(tensor.shape) != expected_source_shape:
+                 raise WeightMapMismatchError(
+-                    "checkpoint tensor {!r} shape {} does not match contract shape {}".format(
+-                        official_name, list(tensor.shape), list(manifest_shape)
++                    "checkpoint tensor {!r} shape {} does not match contract source shape {}".format(
++                        official_name, list(tensor.shape), list(expected_source_shape)
+                     )
+                 )
+             if tensor.elements != manifest_elements:
+diff --git a/python/pypto/portable/runtime_binding.py b/python/pypto/portable/runtime_binding.py
+index f358f31ff..3a9cd7a7a 100644
+--- a/python/pypto/portable/runtime_binding.py
++++ b/python/pypto/portable/runtime_binding.py
+@@ -26,17 +26,24 @@ from pypto.core_ir import CoreIRError, CoreProgram, QuantizedTensorDesc, ValueRe
+ 
+ 
+ UINT64_MAX = (1 << 64) - 1
+-# v2 增加 BindingEntry.quant / quant_scale role / packed v2 量化 region（契约 §3.1/§3.2）。
+-BINDING_SCHEMA_VERSION = 2
+-PACKED_LAYOUT_VERSION = 2
++# v3 = W8A8 契约 v2（0010 §4）：int8 region 语义 [out,in] -> [K,out]（packed
++# k_out_rowmajor），quant 映射新增冻结键 storage_layout。v2 是 v1 的 9 键 /
++# [out,in] 语义，from_dict/packed layout 均对旧版本 fail-closed。
++BINDING_SCHEMA_VERSION = 3
++PACKED_LAYOUT_VERSION = 3
+ DEFAULT_PACK_ALIGNMENT = 64
+ 
++#: int8 packed region 的唯一现行布局：q[k * out + o]（[K,out] 行主序，无 padding）。
++QUANT_STORAGE_LAYOUT_K_OUT = "k_out_rowmajor"
++#: 0002 v1 遗留布局，仅用于 differential/审计脚本显式复现，不进入 v3 schema。
++QUANT_STORAGE_LAYOUT_OUT_IN = "out_in_rowmajor"
++
+ QUANT_SCHEME_NAME = "w8a8_linear"
+ QUANT_WEIGHT_DTYPE = "int8"
+ QUANT_SCALE_DTYPE = "float32"
+ QUANT_SCALE_ROLE = "quant_scale"
+ QUANT_WEIGHT_REGION_ROLE = "quant_weight"
+-# BindingEntry.quant 的冻结键集合（契约 §3.2 第 2 条）。
++# BindingEntry.quant 的冻结键集合（契约 0010 §4.1/§4.2）。
+ QUANT_ENTRY_KEYS = (
+     "scheme",
+     "signed",
+@@ -47,6 +54,7 @@ QUANT_ENTRY_KEYS = (
+     "zero_point",
+     "scale_entry",
+     "group_size",
++    "storage_layout",
+ )
+ _QUANT_DEFAULTS = {
+     "scheme": QUANT_SCHEME_NAME,
+@@ -58,6 +66,7 @@ _QUANT_DEFAULTS = {
+     "zero_point": 0,
+     "scale_entry": None,
+     "group_size": None,
++    "storage_layout": QUANT_STORAGE_LAYOUT_K_OUT,
+ }
+ 
+ _DTYPE_BYTES = {
+@@ -191,12 +200,16 @@ def _canonical_json(value: Any) -> str:
+ 
+ 
+ def _canonical_quant_entry(value: Any, context: str) -> Optional[Mapping[str, Any]]:
+-    """Validate and freeze one ``BindingEntry.quant`` mapping (contract §3.2).
++    """Validate and freeze one ``BindingEntry.quant`` mapping (contract 0010 §4).
+ 
+     ``None`` keeps the BF16 path byte-identical.  Any unknown/missing key,
+-    ``per_group`` granularity or non-fixed zero point fails closed.  Field
+-    level validation is delegated to the C1 ``QuantizedTensorDesc`` so the
+-    scheme descriptor and the binding schema cannot drift apart.
++    non-``k_out_rowmajor`` ``storage_layout``, ``per_group`` granularity or
++    non-fixed zero point fails closed.  Field level validation is delegated to
++    the C1 ``QuantizedTensorDesc`` so the scheme descriptor and the binding
++    schema cannot drift apart.  ``logical_layout`` stays ``out_in_rowmajor``
++    because it describes the source quantization axis (per-output-channel,
++    axis=0 over the checkpoint ``[out,in]`` tensor), not the packed storage
++    order; the storage order is the new frozen ``storage_layout`` key.
+     """
+ 
+     if value is None:
+@@ -213,6 +226,13 @@ def _canonical_quant_entry(value: Any, context: str) -> Optional[Mapping[str, An
+         raise BindingMismatchError(
+             "{} scheme must be {!r}; got {!r}".format(context, QUANT_SCHEME_NAME, value["scheme"])
+         )
++    storage_layout = value["storage_layout"]
++    if storage_layout != QUANT_STORAGE_LAYOUT_K_OUT:
++        raise BindingMismatchError(
++            "{} storage_layout must be {!r} (contract 0010 v2); got {!r}".format(
++                context, QUANT_STORAGE_LAYOUT_K_OUT, storage_layout
++            )
++        )
+     scale_entry = value["scale_entry"]
+     if not isinstance(scale_entry, str) or not scale_entry:
+         raise BindingMismatchError("{}.scale_entry must be a non-empty string".format(context))
+@@ -235,6 +255,48 @@ def _canonical_quant_entry(value: Any, context: str) -> Optional[Mapping[str, An
+     return MappingProxyType(dict(value))
+ 
+ 
++def logical_shape(entry: "BindingEntry") -> Tuple[int, ...]:
++    """Return the checkpoint/logical shape of one binding entry.
++
++    Contract 0010 v2 stores quantized int8 weights packed as ``[K,out]`` while
++    the checkpoint (and every shape rule inherited from 0002) speaks
++    ``[out,in]``.  Non-quantized entries have identical logical and storage
++    shapes.  Routing profile/shape audits through this helper keeps the two
++    coordinate systems from being mixed.
++    """
++
++    if not isinstance(entry, BindingEntry):
++        raise BindingMismatchError("logical_shape expects a BindingEntry")
++    if entry.quant is None:
++        return tuple(entry.shape)
++    if len(entry.shape) != 2:
++        raise BindingMismatchError("quantized weight {!r} must be rank 2".format(entry.name))
++    return (int(entry.shape[1]), int(entry.shape[0]))
++
++
++class _LogicalEntryView:
++    """Read-only BindingEntry proxy whose ``shape`` is the checkpoint shape.
++
++    Contract 0010 v2 stores int8 weights as ``[K,out]``; every Qwen profile
++    rule (gate/up/down, q/k/v/o, GDR projections) is written against the
++    checkpoint ``[out,in]`` layout.  This proxy plugs :func:`logical_shape`
++    into those rules without touching the storage-shape comparisons that run
++    afterwards.
++    """
++
++    __slots__ = ("_entry",)
++
++    def __init__(self, entry: BindingEntry) -> None:
++        self._entry = entry
++
++    @property
++    def shape(self) -> Tuple[int, ...]:
++        return logical_shape(self._entry)
++
++    def __getattr__(self, name: str) -> Any:
++        return getattr(self._entry, name)
++
++
+ _BINDING_ENTRY_ROLES = frozenset(("runtime", "parameter", "state", "output", "state_output", QUANT_SCALE_ROLE))
+ 
+ 
+@@ -594,10 +656,12 @@ class BindingSchema:
+                     "quant_scale entry {!r} is referenced by more than one weight".format(scale_entry.name)
+                 )
+             referenced_scales.add(scale_entry.name)
+-            if scale_entry.shape != (entry.shape[0],):
++            # v3 storage shape 是 [K,out]，out 是最后一维；scale 仍按源
++            # per-output-channel 语义取 out 个元素（0010 §4.1）。
++            if scale_entry.shape != (entry.shape[-1],):
+                 raise BindingMismatchError(
+                     "quant_scale entry {!r} shape {} does not match weight {!r} out channels {}".format(
+-                        scale_entry.name, scale_entry.shape, entry.name, entry.shape[0]
++                        scale_entry.name, scale_entry.shape, entry.name, entry.shape[-1]
+                     )
+                 )
+         unreferenced = tuple(sorted(set(scale_entries) - referenced_scales))
+@@ -780,12 +844,16 @@ def _expected_qwen_parameter_manifest(
+     portable builder.  The trusted builder then supplies the only accepted
+     compact names, storage IDs, counts and aliases.
+ 
+-    W8A8 extension (contract 0002 §3.2/§3.5): ``quantized_names`` lists the
+-    exact int8 weight parameters registered in ``quantized_parameters``.
+-    Non-quantized parameters must still share one exact floating dtype; every
+-    quantized parameter must be int8, and a storage class may not be partially
+-    quantized.  ``lm_head_quantized`` adds the §3.4 dual-packing int8 entry
+-    without changing the BF16 embedding entry.
++    W8A8 extension (contract 0002 §3.2/§3.5, upgraded by 0010 §4): the
++    ``quantized_names`` exact int8 parameters are packed ``[K,out]`` while the
++    profile geometry below is defined on the checkpoint ``[out,in]`` layout,
++    so every dimension rule reads :func:`logical_shape` through
++    ``_LogicalEntryView``.  Non-quantized parameters must still share one
++    exact floating dtype; every quantized parameter must be int8, and a
++    storage class may not be partially quantized.  ``lm_head_quantized`` adds
++    the §3.4 dual-packing int8 entry without changing the BF16 embedding
++    entry.  The returned compact manifest describes packed storage shapes for
++    int8 classes and is compared field-for-field with graph metadata.
+     """
+ 
+     from .qwen35 import (
+@@ -796,7 +864,7 @@ def _expected_qwen_parameter_manifest(
+     )
+ 
+     quantized = frozenset(quantized_names)
+-    parameters = tuple(parameter_entries)
++    parameters = tuple(_LogicalEntryView(entry) for entry in parameter_entries)
+     shared = _qwen_entry(parameters, "embedding_lm_head_shared_weight", "parameter")
+     if len(shared.shape) != 2:
+         raise BindingMismatchError("Qwen tied embedding parameter must be rank 2")
+@@ -922,6 +990,10 @@ def _expected_qwen_parameter_manifest(
+             if selected:
+                 replacement = dict(entry)
+                 replacement["dtype"] = QUANT_WEIGHT_DTYPE
++                # 0010 v2：int8 参数的 graph/binding shape 是 packed storage
++                # [K,out]；compact manifest 与 Core 参数逐字段对拍，所以这里
++                # 也必须翻转。元素数不变，region nbytes/offset 不变。
++                replacement["shape"] = list(reversed(tuple(entry["shape"])))
+                 replacement["storage_bytes"] = entry["elements_per_tensor"] * entry["count"]
+                 rewritten_manifest.append(replacement)
+             else:
+@@ -952,7 +1024,7 @@ def _expected_qwen_parameter_manifest(
+         if name in expected_exact:
+             raise BindingMismatchError("trusted Qwen manifest expands duplicate parameter {!r}".format(name))
+         expected_exact[name] = (exact["dtype"], tuple(exact["shape"]))
+-    actual_exact = {entry.name: (entry.dtype, entry.shape) for entry in parameters}
++    actual_exact = {entry.name: (entry.dtype, entry.shape) for entry in parameter_entries}
+     if set(actual_exact) != set(expected_exact):
+         raise BindingMismatchError("exact Core parameter names do not match fixed Qwen topology")
+     for name, expected_contract in expected_exact.items():
+@@ -1467,12 +1539,13 @@ def _align_up(value: int, alignment: int) -> int:
+ def build_packed_layout(schema: BindingSchema, alignment: int = DEFAULT_PACK_ALIGNMENT) -> PackedLayout:
+     """Compute parameter/state offsets only; never allocate backing storage.
+ 
+-    Version 2 keeps the BF16 layout byte-identical (each non-quantized entry
++    Version 3 keeps the BF16 layout byte-identical (each non-quantized entry
+     contributes exactly one region) and expands each quantized weight into the
+-    two regions frozen in contract §3.1: ``<param>.int8`` (role
+-    ``quant_weight``) plus its ``quant_scale`` entry (role ``quant_scale``).
+-    A v1 schema handed to this builder is rejected with an explicit
+-    ``reject_and_recompile`` message.
++    two regions frozen in contract 0010 §4: ``<param>.int8`` (role
++    ``quant_weight``, storage shape ``[K,out]``, ``nbytes == K*out`` with no
++    row padding) plus its ``quant_scale`` entry (role ``quant_scale``,
++    ``[out]`` fp32).  A v1/v2 schema handed to this builder is rejected with
++    an explicit ``reject_and_recompile`` message.
+     """
+ 
+     if not isinstance(schema, BindingSchema):
+@@ -1490,6 +1563,15 @@ def build_packed_layout(schema: BindingSchema, alignment: int = DEFAULT_PACK_ALI
+     aliases_by_name = dict(schema.aliases)
+     for entry in schema.parameters + schema.quant_scales + schema.states:
+         region_role = QUANT_WEIGHT_REGION_ROLE if entry.quant is not None else entry.role
++        if entry.quant is not None:
++            # 0010 R17：packed int8 region 无行内 padding，nbytes == K*out。
++            expected_packed_nbytes = int(entry.shape[0]) * int(entry.shape[1])
++            if entry.dtype != QUANT_WEIGHT_DTYPE or entry.nbytes != expected_packed_nbytes:
++                raise BindingMismatchError(
++                    "quant_weight {!r} must be dense int8 K*out={} bytes; got dtype={!r} nbytes={}".format(
++                        entry.name, expected_packed_nbytes, entry.dtype, entry.nbytes
++                    )
++                )
+         existing = by_storage.get(entry.storage_id)
+         if existing is not None:
+             if existing.role != region_role or existing.dtype != entry.dtype or existing.shape != entry.shape:
+@@ -1741,6 +1823,8 @@ __all__ = [
+     "QUANT_SCALE_DTYPE",
+     "QUANT_SCALE_ROLE",
+     "QUANT_SCHEME_NAME",
++    "QUANT_STORAGE_LAYOUT_K_OUT",
++    "QUANT_STORAGE_LAYOUT_OUT_IN",
+     "QUANT_WEIGHT_DTYPE",
+     "QUANT_WEIGHT_REGION_ROLE",
+     "RuntimeBindingError",
+@@ -1749,5 +1833,6 @@ __all__ = [
+     "bind_packed_region",
+     "build_binding_schema",
+     "build_packed_layout",
++    "logical_shape",
+     "ordered_input_descriptors",
+ ]
+diff --git a/python/tests/ut/pypto_x/qwen35_w8a8_binding_driver.py b/python/tests/ut/pypto_x/qwen35_w8a8_binding_driver.py
+index 01a56ff7c..d5d3d37fb 100644
+--- a/python/tests/ut/pypto_x/qwen35_w8a8_binding_driver.py
++++ b/python/tests/ut/pypto_x/qwen35_w8a8_binding_driver.py
+@@ -59,6 +59,7 @@ def _quant_mapping(scale_entry: str) -> Mapping[str, Any]:
+         "zero_point": 0,
+         "scale_entry": scale_entry,
+         "group_size": None,
++        "storage_layout": "k_out_rowmajor",
+     }
+ 
+ 
+@@ -96,6 +97,12 @@ def build_default_w8a8_schema(*, past_length: int = 1, batch: int = 1, steps: in
+         name = str(entry["name"])
+         shape = tuple(int(dimension) for dimension in entry["shape"])
+         if name in quantized_names:
++            if len(shape) != 2:
++                raise ValueError("quantized decoder linear {!r} must be rank 2".format(name))
++            # 0010 v2：schema 里的 int8 条目是 packed storage [K,out]，
++            # scale 仍是源 per-output-channel [out]。
++            out_features, in_features = shape[0], shape[1]
++            storage_shape = (in_features, out_features)
+             scale_name = name + "_scale"
+             inputs.append(
+                 BindingEntry(
+@@ -103,15 +110,15 @@ def build_default_w8a8_schema(*, past_length: int = 1, batch: int = 1, steps: in
+                     name,
+                     "parameter",
+                     "int8",
+-                    shape,
+-                    _nbytes("int8", shape),
++                    storage_shape,
++                    _nbytes("int8", storage_shape),
+                     "parameter:" + name + ".int8",
+                     True,
+                     quant=_quant_mapping(scale_name),
+                 )
+             )
+             ordinal += 1
+-            scale_shape = (shape[0],)
++            scale_shape = (out_features,)
+             inputs.append(
+                 BindingEntry(
+                     ordinal,
+@@ -181,23 +188,72 @@ def build_default_w8a8_schema(*, past_length: int = 1, batch: int = 1, steps: in
+     )
+ 
+ 
+-def _v1_rejection_probe(schema: BindingSchema) -> Dict[str, Any]:
+-    v1 = BindingSchema(
++def _version_rejection_probe(schema: BindingSchema, version: int) -> Dict[str, Any]:
++    stale = BindingSchema(
+         function_name=schema.function_name,
+         graph_digest=schema.graph_digest,
+         inputs=schema.inputs,
+         outputs=schema.outputs,
+         aliases=dict(schema.aliases),
+-        schema_version=1,
++        schema_version=version,
+     )
+     try:
+-        build_packed_layout(v1)
++        build_packed_layout(stale)
+     except BindingMismatchError as exc:
+         message = str(exc)
+-        return {"rejected": True, "message": message, "mentions_reject_and_recompile": "reject_and_recompile" in message}
++        return {
++            "rejected": True,
++            "message": message,
++            "mentions_reject_and_recompile": "reject_and_recompile" in message,
++        }
+     return {"rejected": False, "message": "", "mentions_reject_and_recompile": False}
+ 
+ 
++def _v1_rejection_probe(schema: BindingSchema) -> Dict[str, Any]:
++    return _version_rejection_probe(schema, 1)
++
++
++def _serialized_schema_probes(schema: BindingSchema) -> Dict[str, Any]:
++    """Stale/old serialized schema fail-closed probes (0010 R16).
++
++    A real v2 payload predates the frozen ``storage_layout`` key, so the
++    harness strips it; the version gate must reject first.  A forged v3 payload
++    missing the key, or carrying an unknown layout, must be rejected by
++    ``_canonical_quant_entry`` even though the version matches.
++    """
++
++    payload = json.loads(json.dumps(schema.to_dict()))
++
++    def _reject(modified: Mapping[str, Any], label: str) -> Dict[str, Any]:
++        try:
++            BindingSchema.from_dict(modified)
++        except BindingMismatchError as exc:
++            return {"rejected": True, "label": label, "message": str(exc)}
++        return {"rejected": False, "label": label, "message": ""}
++
++    v2_payload = json.loads(json.dumps(payload))
++    v2_payload["schema_version"] = 2
++    for item in v2_payload["inputs"]:
++        if isinstance(item.get("quant"), Mapping):
++            item["quant"].pop("storage_layout", None)
++
++    missing_payload = json.loads(json.dumps(payload))
++    for item in missing_payload["inputs"]:
++        if isinstance(item.get("quant"), Mapping):
++            item["quant"].pop("storage_layout", None)
++
++    unknown_payload = json.loads(json.dumps(payload))
++    for item in unknown_payload["inputs"]:
++        if isinstance(item.get("quant"), Mapping):
++            item["quant"]["storage_layout"] = "n_k_rowmajor"
++
++    return {
++        "v2_schema_version_gate": _reject(v2_payload, "schema_version=2"),
++        "v3_missing_storage_layout": _reject(missing_payload, "missing storage_layout"),
++        "v3_unknown_storage_layout": _reject(unknown_payload, "storage_layout=n_k_rowmajor"),
++    }
++
++
+ def collect_driver_result(*, past_length: int = 1) -> Dict[str, Any]:
+     """收集 R7–R9 的 metadata-only 证据（不写文件、不分配存储）。"""
+ 
+@@ -237,6 +293,8 @@ def collect_driver_result(*, past_length: int = 1) -> Dict[str, Any]:
+         ),
+         "quant_scale_region_example": (scale_regions[0].to_dict() if scale_regions else None),
+         "v1_rejection": _v1_rejection_probe(schema),
++        "v2_rejection": _version_rejection_probe(schema, 2),
++        "serialized_schema_probes": _serialized_schema_probes(schema),
+         "coverage_manifest": coverage.to_dict(),
+         "coverage_manifest_summary": {
+             "w8a8_linear_coverage": coverage.w8a8_linear_coverage,
+@@ -251,11 +309,13 @@ def collect_region_matrix(past_length: int = 1) -> Dict[str, Any]:
+     """ERR-0003 evidence: real graph region counts for 518 / 554 / 520 / 556.
+ 
+     Each row builds the actual portable W8A8 graph (metadata only; no weights,
+-    no buffers) and derives the binding schema v2 + packed layout v2 from it.
++    no buffers) and derives the binding schema v3 + packed layout v3 from it.
++    Every quantized entry is asserted to be packed ``[K,out]`` with
++    ``nbytes == K*out`` and the frozen ``k_out_rowmajor`` storage layout.
+     """
+ 
+     from pypto.portable.qwen35 import build_qwen35_text_decoder_graph
+-    from pypto.portable.runtime_binding import build_binding_schema, build_packed_layout
++    from pypto.portable.runtime_binding import build_binding_schema, build_packed_layout, logical_shape
+ 
+     matrix = []
+     for scope, quantize_lm_head, expected in (
+@@ -270,6 +330,24 @@ def collect_region_matrix(past_length: int = 1) -> Dict[str, Any]:
+         )
+         schema = build_binding_schema(program)
+         layout = build_packed_layout(schema)
++        packed_checks = []
++        for entry in schema.parameters:
++            if entry.quant is None:
++                continue
++            logical = logical_shape(entry)
++            packed_checks.append(
++                {
++                    "name": entry.name,
++                    "storage_shape": list(entry.shape),
++                    "logical_shape": list(logical),
++                    "nbytes": entry.nbytes,
++                    "packed_ok": (
++                        tuple(entry.shape) == tuple(reversed(logical))
++                        and entry.nbytes == int(entry.shape[0]) * int(entry.shape[1])
++                        and entry.quant["storage_layout"] == "k_out_rowmajor"
++                    ),
++                }
++            )
+         matrix.append(
+             {
+                 "quantized_linear_scope": scope,
+@@ -281,6 +359,11 @@ def collect_region_matrix(past_length: int = 1) -> Dict[str, Any]:
+                 "regions": len(layout.regions),
+                 "expected_regions": expected,
+                 "matches": len(layout.regions) == expected,
++                "quantized_entries": len(packed_checks),
++                "all_quantized_entries_packed_k_out": all(
++                    item["packed_ok"] for item in packed_checks
++                ),
++                "packed_entry_example": packed_checks[0] if packed_checks else None,
+                 "formula": (
+                     "368-150+150*2=518" if expected == 518 else
+                     "368-186+186*2=554" if expected == 554 else
+diff --git a/python/tests/ut/pypto_x/qwen35_weight_fixture.py b/python/tests/ut/pypto_x/qwen35_weight_fixture.py
+index d5bad1cf4..4e26de36a 100644
+--- a/python/tests/ut/pypto_x/qwen35_weight_fixture.py
++++ b/python/tests/ut/pypto_x/qwen35_weight_fixture.py
+@@ -124,11 +124,20 @@ def official_names_for_metadata(
+     """按 graph metadata 独立推导 (official_name, manifest_pattern, shape)。
+ 
+     只用 ``layers[].parameter_routes`` / ``kind`` 与 metadata 的 compact
+-    manifest 形状，不调用 weight-map 模块。
++    manifest 形状，不调用 weight-map 模块。0010 v2：manifest 里 int8 条目的
++    shape 是 packed storage ``[K,out]``，官方 checkpoint 张量仍是
++    ``[out,in]``，所以这里对 int8 条目翻转成 source shape。
+     """
+ 
+     manifest = program_metadata["parameter_manifest"]
+-    shape_by_pattern = {entry["name"]: tuple(entry["shape"]) for entry in manifest}
++    shape_by_pattern = {
++        entry["name"]: (
++            tuple(reversed(tuple(entry["shape"])))
++            if entry.get("dtype") == "int8"
++            else tuple(entry["shape"])
++        )
++        for entry in manifest
++    }
+     results: List[Tuple[str, str, Tuple[int, ...]]] = [
+         (
+             "model.language_model.embed_tokens.weight",
+diff --git a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+index b01d3c5b4..facdb0963 100644
+--- a/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
++++ b/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py
+@@ -748,10 +748,16 @@ def w8a8_real_parameters(
+             item = by_name.get(entry.name)
+             if item is None:
+                 raise DriverError("quantized parameter {!r} has no checkpoint mapping".format(entry.name))
+-            if tuple(item.source.shape) != tuple(entry.shape):
++            # 0010 v2：binding entry.shape 是 packed storage [K,out]，checkpoint
++            # 源张量仍是 [out,in]；量化输入必须用 source shape，输出必须与
++            # storage shape/nbytes 逐位对齐。
++            if len(entry.shape) != 2:
++                raise DriverError("quantized parameter {!r} must be rank 2".format(entry.name))
++            source_shape = (int(entry.shape[1]), int(entry.shape[0]))
++            if tuple(item.source.shape) != tuple(source_shape):
+                 raise DriverError(
+-                    "quantized parameter {!r} source shape {} does not match contract {}".format(
+-                        entry.name, tuple(item.source.shape), tuple(entry.shape)
++                    "quantized parameter {!r} source shape {} does not match checkpoint layout {}".format(
++                        entry.name, tuple(item.source.shape), tuple(source_shape)
+                     )
+                 )
+             view = reader.view(item.source.official_name)
+@@ -759,11 +765,18 @@ def w8a8_real_parameters(
+                 quantized_weight = quantize_weight_from_view(
+                     view,
+                     dtype=item.source.pypto_dtype,
+-                    shape=entry.shape,
++                    shape=source_shape,
+                     name=entry.name,
++                    storage_layout=str(entry.quant["storage_layout"]),
+                 )
+             finally:
+                 view.release()
++            if tuple(quantized_weight.storage_shape) != tuple(entry.shape):
++                raise DriverError(
++                    "quantized parameter {!r} packed shape {} does not match binding {}".format(
++                        entry.name, tuple(quantized_weight.storage_shape), tuple(entry.shape)
++                    )
++                )
+             bindings[entry.name] = BufferBinding.from_buffer(
+                 quantized_weight.codes, region.storage_id, entry.dtype, entry.shape, readonly=True
+             )
+diff --git a/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py b/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py
+index 0a4cd9916..0f08023a2 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py
++++ b/python/tests/ut/pypto_x/test_qwen35_weight_ingestion.py
+@@ -406,6 +406,7 @@ def test_w8a8_dual_packing_maps_tied_lm_head_to_shared_checkpoint_tensor(tmp_pat
+         ]
+         layout = build_weight_layout(schema, mapping, reader)
+         payload = layout.to_dict()
++        assert payload["layout_version"] == 2
+         assert payload["region_count"] == 556
+         assert payload["parameter_region_count"] == 321
+         assert payload["quantized_region_count"] == 187
+@@ -423,6 +424,11 @@ def test_w8a8_dual_packing_maps_tied_lm_head_to_shared_checkpoint_tensor(tmp_pat
+         region = layout.region_for(LM_HEAD_PARAMETER)
+         assert region.role == "quant_weight" and region.quantized is True
+         assert region.dtype == "int8" and region.nbytes * 2 == region.source_nbytes
++        # 0010 v2: packed [K,out] = [hidden=8, vocab=32]; source [32,8].
++        assert region.shape == (8, 32)
++        assert region.storage_layout == "k_out_rowmajor"
++        assert region.source_shape == (32, 8)
++        assert region.nbytes == 8 * 32
+         assert region.source_name == QWEN35_EMBED_TOKENS_TENSOR
+         assert region.requires_dtype_conversion is False
+         scale_region = layout.region_for(LM_HEAD_PARAMETER + "_scale")
+diff --git a/python/tests/ut/pypto_x/test_w8a8_binding.py b/python/tests/ut/pypto_x/test_w8a8_binding.py
+index 489f88f84..817ab6a65 100644
+--- a/python/tests/ut/pypto_x/test_w8a8_binding.py
++++ b/python/tests/ut/pypto_x/test_w8a8_binding.py
+@@ -48,8 +48,9 @@ driver = _load_driver()
+ 
+ 
+ def _quant_program(*, weight_dtype="int8", granularity="per_output_channel", scale_shape=(2,), scale_entry="layer_weight_scale"):
++    # 0010 v2 packed storage：activation [M=2,K=3] x weight [K=3,out=2] -> [2,2]。
+     activation = ValueRef("activation", CoreType.tensor("int8", (2, 3)))
+-    weight = ValueRef("layer_weight", CoreType.tensor(weight_dtype, (2, 3)))
++    weight = ValueRef("layer_weight", CoreType.tensor(weight_dtype, (3, 2)))
+     scale = ValueRef("layer_weight_scale", CoreType.tensor("float32", tuple(scale_shape)))
+     output = ValueRef("qmatmul_out", CoreType.tensor("int32", (2, 2)))
+     body = Region((Operation("qmatmul_s8s8_s32", inputs=(activation, weight), outputs=(output,)),))
+@@ -85,13 +86,14 @@ def _quant_schema():
+ 
+ def test_r7_quantized_schema_has_weight_scale_and_aliases():
+     schema = _quant_schema()
+-    assert schema.schema_version == BINDING_SCHEMA_VERSION == 2
++    assert schema.schema_version == BINDING_SCHEMA_VERSION == 3
+     assert len(schema.parameters) == 1
+     assert len(schema.quant_scales) == 1
+     weight = schema.entry_for("layer_weight")
+     scale = schema.entry_for("layer_weight_scale")
+     assert weight.dtype == "int8"
+-    assert weight.shape == (2, 3)
++    # 0010 v2：int8 entry shape 是 packed storage [K,out] = [3,2]。
++    assert weight.shape == (3, 2)
+     assert weight.storage_id == "parameter:layer_weight.int8"
+     assert dict(weight.quant) == {
+         "scheme": "w8a8_linear",
+@@ -103,6 +105,7 @@ def test_r7_quantized_schema_has_weight_scale_and_aliases():
+         "zero_point": 0,
+         "scale_entry": "layer_weight_scale",
+         "group_size": None,
++        "storage_layout": "k_out_rowmajor",
+     }
+     assert scale.role == QUANT_SCALE_ROLE
+     assert scale.dtype == "float32"
+@@ -201,21 +204,81 @@ def test_r7_quantized_metadata_unknown_keys_are_rejected():
+         build_binding_schema(CoreProgram(functions=program.functions, metadata=metadata))
+ 
+ 
+-def test_r7_schema_version_1_is_rejected():
++def test_r7_schema_version_1_and_2_are_rejected():
++    for stale_version in (1, 2):
++        payload = _quant_schema().to_dict()
++        payload["schema_version"] = stale_version
++        with pytest.raises(BindingMismatchError, match="reject_and_recompile"):
++            BindingSchema.from_dict(payload)
++        stale = BindingSchema(
++            function_name=_quant_schema().function_name,
++            graph_digest=_quant_schema().graph_digest,
++            inputs=_quant_schema().inputs,
++            outputs=_quant_schema().outputs,
++            aliases={},
++            schema_version=stale_version,
++        )
++        with pytest.raises(BindingMismatchError, match="reject_and_recompile"):
++            build_packed_layout(stale)
++
++
++def test_r7_storage_layout_missing_or_unknown_fails_closed():
+     payload = _quant_schema().to_dict()
+-    payload["schema_version"] = 1
+-    with pytest.raises(BindingMismatchError, match="reject_and_recompile"):
++    del payload["inputs"][1]["quant"]["storage_layout"]
++    with pytest.raises(BindingMismatchError, match="missing keys"):
+         BindingSchema.from_dict(payload)
+-    v1 = BindingSchema(
+-        function_name=_quant_schema().function_name,
+-        graph_digest=_quant_schema().graph_digest,
+-        inputs=_quant_schema().inputs,
+-        outputs=_quant_schema().outputs,
+-        aliases={},
+-        schema_version=1,
++    payload = _quant_schema().to_dict()
++    payload["inputs"][1]["quant"]["storage_layout"] = "n_k_rowmajor"
++    with pytest.raises(BindingMismatchError, match="storage_layout"):
++        BindingSchema.from_dict(payload)
++    # graph metadata 侧：显式非 k_out_rowmajor 也必须拒绝（默认值只补缺失键）。
++    program = _quant_program()
++    metadata = dict(program.metadata)
++    metadata["quantized_parameters"] = [
++        dict(metadata["quantized_parameters"][0], storage_layout="out_in_rowmajor")
++    ]
++    with pytest.raises(BindingMismatchError, match="storage_layout"):
++        build_binding_schema(CoreProgram(functions=program.functions, metadata=metadata))
++
++
++def test_r7_logical_shape_view_of_packed_weights():
++    from pypto.portable.runtime_binding import logical_shape
++
++    schema = _quant_schema()
++    weight = schema.entry_for("layer_weight")
++    assert logical_shape(weight) == (2, 3)  # checkpoint [out,in]
++    assert weight.shape == (3, 2)           # packed storage [K,out]
++    bf16_shared = schema.entry_for("layer_weight_scale")
++    assert logical_shape(bf16_shared) == bf16_shared.shape == (2,)
++
++
++def test_r7_v1_payload_shape_mismatch_fails_closed_before_launch():
++    from pypto.portable.runtime_binding import BufferBinding, ordered_input_descriptors
++
++    schema = _quant_schema()
++    layout = build_packed_layout(schema)
++    runtime = {
++        entry.name: BufferBinding.from_buffer(
++            bytearray(entry.nbytes), entry.storage_id, entry.dtype, entry.shape, readonly=True
++        )
++        for entry in schema.runtime_inputs
++    }
++    packed = bytearray(layout.total_nbytes)
++    parameters = {
++        entry.name: bind_packed_region(layout, entry.name, packed)
++        for entry in schema.parameters + schema.quant_scales
++    }
++    # v1 的 [out,K] 字节被声明为 v1 shape：dtype/shape/nbytes 全等校验拒绝。
++    v1_weight = BufferBinding.from_buffer(
++        bytes(layout.region_for("layer_weight").nbytes),
++        "parameter:layer_weight.int8",
++        "int8",
++        (2, 3),
++        readonly=True,
+     )
+-    with pytest.raises(BindingMismatchError, match="reject_and_recompile"):
+-        build_packed_layout(v1)
++    parameters["layer_weight"] = v1_weight
++    with pytest.raises(BindingMismatchError):
++        ordered_input_descriptors(schema, runtime, parameters, {})
+ 
+ 
+ # ------------------------------------------------------------------ R8
+@@ -224,12 +287,13 @@ def test_r7_schema_version_1_is_rejected():
+ def test_r8_quantized_packed_layout_expands_to_two_regions():
+     schema = _quant_schema()
+     layout = build_packed_layout(schema)
+-    assert layout.layout_version == PACKED_LAYOUT_VERSION == 2
++    assert layout.layout_version == PACKED_LAYOUT_VERSION == 3
+     assert [region.role for region in layout.regions] == [QUANT_WEIGHT_REGION_ROLE, QUANT_SCALE_ROLE]
+     weight_region, scale_region = layout.regions
+     assert weight_region.storage_id == "parameter:layer_weight.int8"
+     assert weight_region.dtype == "int8"
+-    assert weight_region.shape == (2, 3)
++    # 0010 v2：region shape 是 packed [K,out]；nbytes == K*out 无 padding。
++    assert weight_region.shape == (3, 2)
+     assert weight_region.nbytes == 6
+     assert scale_region.storage_id == "parameter:layer_weight.scale"
+     assert scale_region.dtype == "float32"
+@@ -256,23 +320,28 @@ def test_r8_quantized_packed_layout_expands_to_two_regions():
+     assert scale_binding.byte_offset == 64
+ 
+ 
+-def test_r8_bf16_path_is_byte_identical_368_regions():
++def test_r8_bf16_path_keeps_368_regions_with_v3_metadata():
+     bf16_schema = build_binding_schema(build_qwen35_text_decoder_graph(1, 1, shape_profile="synthetic_test"))
+-    assert bf16_schema.schema_version == 2
++    assert bf16_schema.schema_version == 3
+     assert len(bf16_schema.quant_scales) == 0
+     bf16_layout = build_packed_layout(bf16_schema)
+-    assert bf16_layout.layout_version == 2
++    assert bf16_layout.layout_version == 3
+     assert len(bf16_layout.regions) == 368
+     assert {region.role for region in bf16_layout.regions} == {"parameter", "state"}
+     assert all("quant" not in entry.to_dict() for entry in bf16_schema.inputs)
++    # BF16 graph digest 不变（只升序列化/布局版本常量）。
++    import hashlib
++
++    program = build_qwen35_text_decoder_graph(1, 1, shape_profile="synthetic_test")
++    assert bf16_schema.graph_digest == hashlib.sha256(program.canonical_json().encode()).hexdigest()
+ 
+ 
+ def test_r8_default_qwen_w8a8_layout_has_518_regions_metadata_only():
+     result = driver.collect_driver_result()
+     assert result["weights_loaded"] is False
+     assert result["buffers_allocated"] is False
+-    assert result["schema_version"] == 2
+-    assert result["layout_version"] == 2
++    assert result["schema_version"] == 3
++    assert result["layout_version"] == 3
+     assert result["counts"]["parameters"] == 320
+     assert result["counts"]["quant_scales"] == 150
+     assert result["counts"]["states"] == 48
+@@ -280,11 +349,23 @@ def test_r8_default_qwen_w8a8_layout_has_518_regions_metadata_only():
+     assert result["counts"]["quant_scale_regions"] == 150
+     assert result["counts"]["packed_region_count"] == 518
+     assert result["packed_region_count_matches"] is True
++    assert result["quant_weight_region_example"]["shape"] == [1024, 3584]
++    assert result["quant_weight_region_example"]["nbytes"] == 1024 * 3584
+     assert result["v1_rejection"] == {
+         "rejected": True,
+-        "message": "packed layout v2 requires binding schema v2; got v1 -> reject_and_recompile",
++        "message": "packed layout v3 requires binding schema v3; got v1 -> reject_and_recompile",
+         "mentions_reject_and_recompile": True,
+     }
++    assert result["v2_rejection"]["rejected"] is True
++    assert result["v2_rejection"]["mentions_reject_and_recompile"] is True
++    probes = result["serialized_schema_probes"]
++    assert probes["v2_schema_version_gate"]["rejected"] is True
++    assert probes["v3_missing_storage_layout"]["rejected"] is True
++    assert probes["v3_unknown_storage_layout"]["rejected"] is True
++    # region 矩阵：四种 scope 的 int8 entry 全部是 packed [K,out]。
++    matrix = driver.collect_region_matrix()
++    assert [row["regions"] for row in matrix["rows"]] == [518, 554, 520, 556]
++    assert all(row["all_quantized_entries_packed_k_out"] for row in matrix["rows"])
+ 
+ 
+ # ------------------------------------------------------------------ R9
+diff --git a/python/tests/ut/pypto_x/test_w8a8_cuda.py b/python/tests/ut/pypto_x/test_w8a8_cuda.py
+index e255174e1..b31b4c33e 100644
+--- a/python/tests/ut/pypto_x/test_w8a8_cuda.py
++++ b/python/tests/ut/pypto_x/test_w8a8_cuda.py
+@@ -86,6 +86,11 @@ from pypto.portable.qwen35_w8a8_scheme import (
+     qmatmul_s8s8_s32,
+     quantize_per_token_s8,
+ )
++from pypto.portable.runtime_binding import (
++    BindingMismatchError,
++    assemble_launch_request,
++    build_binding_schema,
++)
+ from pypto.target import TargetSpec, UnsupportedCapabilityError
+ 
+ 
+@@ -654,6 +659,67 @@ def test_qmatmul_signed_extremes_and_zero_accumulators():
+     assert actual[0] == 127 * 127 + 127 * 127 + 127 * 127 + 127 * 127
+ 
+ 
++def test_qmatmul_packed_k_out_equals_host_transpose_of_v1_source():
++    """M2a CUDA decision: evidence boundary stays opcode level.
++
++    The CUDA W8A8 plane has no graph executor and accepts only the four frozen
++    opcodes (no ``transpose``), so a literal v1 4-op artifact cannot exist.
++    The c1 contract only requires that the packed ``[K,out]`` region is the
++    byte-identical row-major mirror of the host transpose of the v1
++    ``[out,K]`` source and that ``dp4a`` consumes it bit-exactly.
++    """
++
++    rows, k, columns = 5, 7, 3
++    rng = random.Random(20260912)
++    left = [rng.randint(-127, 127) for _ in range(rows * k)]
++    w_source = [[rng.randint(-127, 127) for _ in range(k)] for _ in range(columns)]
++    # Host transpose: exactly what the 0002 v1 graph node would have produced.
++    w_transposed = [w_source[o][inner] for inner in range(k) for o in range(columns)]
++    # Packed [K,out] region bytes: q[k*out + o].
++    w_packed_bytes = bytes(value & 0xFF for value in w_transposed)
++    expected = qmatmul_s8s8_s32(
++        left, w_transposed, left_shape=(rows, k), right_shape=(k, columns)
++    )
++    artifact, target_ir = _compile(_qmatmul_program((rows, k), (k, columns)))
++    driver = FakeCudaDriver()
++    driver.active_operation = target_ir.operations[0]
++    copies = []
++    original_memcpy_htod = driver.memcpy_htod
++
++    def recording_memcpy_htod(pointer, data):
++        copies.append(bytes(data))
++        return original_memcpy_htod(pointer, data)
++
++    driver.memcpy_htod = recording_memcpy_htod
++    actual = CudaRuntime(driver=driver).run_w8a8_qmatmul(
++        artifact, left, w_transposed, left_shape=(rows, k), right_shape=(k, columns)
++    )
++    assert tuple(actual) == tuple(expected.values)
++    # The right operand is H2D-copied as exactly the packed [K,out] region
++    # bytes (left is copies[0]); no Python list survives the wire boundary.
++    assert copies[0] == bytes(value & 0xFF for value in left)
++    assert copies[1] == w_packed_bytes
++
++
++def test_stale_cuda_artifact_program_digest_fails_closed_against_v2_schema():
++    """Any artifact carrying a stale graph digest is rejected at assembly."""
++
++    artifact, _ = _compile(_qmatmul_program((2, 3), (3, 4)))
++    other_program = _qmatmul_program((2, 3), (3, 5))
++    schema = build_binding_schema(other_program)
++    assert artifact.metadata["program_digest"] != schema.graph_digest
++    with pytest.raises(BindingMismatchError, match="program_digest"):
++        assemble_launch_request(
++            schema,
++            artifact,
++            runtime_bindings={},
++            parameter_bindings={},
++            state_bindings={},
++            outputs={},
++            state_outputs={},
++        )
++
++
+ def test_qmatmul_k_upper_bound_is_exact_and_over_limit_fails_closed():
+     k = W8A8_MAX_ACCUMULATOR_K
+     artifact, target_ir = _compile(_qmatmul_program((1, k), (k, 1)))
+diff --git a/python/tests/ut/pypto_x/test_w8a8_graph_path.py b/python/tests/ut/pypto_x/test_w8a8_graph_path.py
+index 0ec503343..8a911ca20 100644
+--- a/python/tests/ut/pypto_x/test_w8a8_graph_path.py
++++ b/python/tests/ut/pypto_x/test_w8a8_graph_path.py
+@@ -46,7 +46,7 @@ from pypto.portable.qwen35_w8a8_scheme import (
+     quantize_per_token_s8,
+ )
+ from pypto.portable.qwen35_w8a8_weight import quantize_weight_per_output_channel
+-from pypto.portable.runtime_binding import build_binding_schema, build_packed_layout
++from pypto.portable.runtime_binding import QUANT_WEIGHT_REGION_ROLE, build_binding_schema, build_packed_layout
+ from pypto.target import TargetSpec
+ 
+ 
+@@ -83,12 +83,31 @@ def test_w8a8_default_graph_contract_and_518_regions():
+     assert counts["quantize_per_token_s8"] == 150
+     assert counts["qmatmul_s8s8_s32"] == 150
+     assert counts["dequantize_epilogue_bf16"] == 150
++    # 0010 v2: the per-forward int8 weight transpose is gone (float32/bf16
++    # transposes for attention/GDR stay untouched).
++    int8_transposes = [
++        operation
++        for operation in program.functions[0].body.operations
++        if operation.name == "transpose"
++        and any(ref.type.dtype == "int8" for ref in operation.inputs)
++    ]
++    assert int8_transposes == []
++    assert counts.get("transpose", 0) > 0  # non-int8 transposes still exist
+     schema = build_binding_schema(program)
+     layout = build_packed_layout(schema)
+     assert len(schema.parameters) == 320
+     assert len(schema.quant_scales) == 150
+     assert len(schema.states) == 48
+     assert len(layout.regions) == 518
++    # Packed storage: every int8 parameter is [K,out], scale stays [out].
++    gate = schema.entry_for("layer_00_mlp_gate_proj_weight")
++    assert gate.shape == (8, 16)  # synthetic_test hidden=8 -> intermediate=16
++    assert gate.quant["storage_layout"] == "k_out_rowmajor"
++    assert gate.nbytes == 8 * 16
++    # 0010 R17: no row padding, region nbytes == K*out.
++    for region in layout.regions:
++        if region.role == QUANT_WEIGHT_REGION_ROLE:
++            assert region.nbytes == int(region.shape[0]) * int(region.shape[1])
+     # Coverage fields are computed from the emitted graph and match the
+     # analytic frozen-topology formula (fail-closed drift check in the builder).
+     real = program.metadata["w8a8_coverage_manifest"]
+@@ -127,6 +146,10 @@ def test_w8a8_lm_head_dual_packing_region_counts_and_storage_ids():
+     weight = schema.entry_for(QWEN35_LM_HEAD_QUANTIZED_FUNCTION_PARAMETER)
+     scale = schema.entry_for(QWEN35_LM_HEAD_QUANTIZED_FUNCTION_PARAMETER + "_scale")
+     assert weight.dtype == "int8"
++    # synthetic_test: vocab=32, hidden=8 -> packed [K,out] = [8,32].
++    assert weight.shape == (8, 32)
++    assert weight.quant["storage_layout"] == "k_out_rowmajor"
++    assert scale.shape == (32,)
+     assert weight.storage_id == "parameter:embedding_lm_head_shared_weight.lm_head.int8"
+     assert scale.storage_id == "parameter:embedding_lm_head_shared_weight.lm_head.scale"
+     # The embedding region itself stays BF16 and keeps its tied storage id.
+@@ -233,12 +256,23 @@ def test_weight_quantization_matches_c1_per_token_golden():
+             for row in range(out)
+         ]
+         golden = quantize_per_token_s8(decoded)
++        # v2 default: packed [K,out]; unpack back to [out,in] for the v1 golden.
+         quantized = quantize_weight_per_output_channel(
+             raw_bytes, dtype="bf16", shape=(out, k), name="w"
+         )
+-        assert list(struct.unpack("<{}b".format(out * k), quantized.codes)) == list(golden.codes)
++        assert quantized.storage_layout == "k_out_rowmajor"
++        assert quantized.storage_shape == (k, out)
++        packed = np.frombuffer(quantized.codes, dtype=np.int8).reshape(k, out)
++        assert list(packed.T.reshape(-1).tolist()) == list(golden.codes)
+         assert list(struct.unpack("<{}f".format(out), quantized.scales)) == list(golden.scales)
+         assert quantized.saturation_count == golden.saturation_count
++        # Legacy v1 order stays explicitly reproducible (differential/audit).
++        legacy = quantize_weight_per_output_channel(
++            raw_bytes, dtype="bf16", shape=(out, k), name="w",
++            storage_layout="out_in_rowmajor",
++        )
++        assert list(struct.unpack("<{}b".format(out * k), legacy.codes)) == list(golden.codes)
++        assert legacy.scales == quantized.scales
+     # Q1 zero row, Q2 NaN/Inf, scale underflow.
+     zero = quantize_weight_per_output_channel(
+         np.zeros((2, 3), dtype=np.float32).tobytes(), dtype="float32", shape=(2, 3)
+diff --git a/python/tests/ut/pypto_x/test_w8a8_sve256.py b/python/tests/ut/pypto_x/test_w8a8_sve256.py
+index 456b089a0..e66e36ee3 100644
+--- a/python/tests/ut/pypto_x/test_w8a8_sve256.py
++++ b/python/tests/ut/pypto_x/test_w8a8_sve256.py
+@@ -406,6 +406,90 @@ def test_sve_w8a8_qmatmul_raw_address_int_output(build_root):
+     assert [output[index] for index in range(2)] == [7, 10]
+ 
+ 
++def test_sve256_qmatmul_ingests_bufferbinding_int8_negative_codes(build_root):
++    """M2a seam: packed int8 regions arrive as ``BufferBinding`` byte views.
++
++    ``BufferBinding`` exposes a ``memoryview`` with ``format='B'`` even for
++    signed int8 tensors.  Before the Q10 byte-view seam this was decoded as
++    unsigned (128..255) and ``_cast_value`` rejected every negative code.  This
++    pins the signed bit-level ingestion for the code points that matter:
++    ``-127`` (valid minimum), ``-1``, ``0``, ``+127``, and ``-128`` (reserved
++    -> fail-closed).
++    """
++
++    _require_sve_execution()
++    from pypto.backends.cpu.aarch64.sve256 import _storage_values
++    from pypto.backends.cpu.byte_view import TypedByteView
++    from pypto.portable.runtime_binding import BufferBinding
++
++    left_shape, right_shape = (3, 5), (5, 4)
++    left_values = [
++        -127, -64, -1, 0, 127,
++        -2, -3, -4, -5, -6,
++        1, 2, 3, 4, 5,
++    ]
++    right_values = [
++        -127, -1, 0, 127,
++        12, -13, 14, -15,
++        -16, 17, -18, 19,
++        20, -21, 22, -23,
++        -24, 25, -26, 27,
++    ]
++    program, output_shape = _qmatmul_program(left_shape, right_shape)
++    _, artifact = _compile(program, build_root, "qm_bufferbinding_int8")
++    expected = _qmatmul_golden(left_values, right_values, left_shape, right_shape)
++
++    left_binding = BufferBinding.from_buffer(
++        bytes(value & 0xFF for value in left_values),
++        "external:left",
++        "int8",
++        left_shape,
++        readonly=True,
++    )
++    right_binding = BufferBinding.from_buffer(
++        bytes(value & 0xFF for value in right_values),
++        "external:right",
++        "int8",
++        right_shape,
++        readonly=True,
++    )
++    # Seam-level: the byte view is decoded as signed int8 without a Python list.
++    typed = _storage_values(left_binding.to_tensor_desc(), "int8", "m2a-probe")
++    assert isinstance(typed, TypedByteView)
++    assert list(struct.unpack("<15b", typed.to_bytes())) == left_values
++
++    output = HostTensor("int32", output_shape, [0] * 12)
++    _runtime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[left_binding.to_tensor_desc(), right_binding.to_tensor_desc()],
++            outputs=[output.descriptor()],
++        )
++    )
++    assert _flat_values(output) == tuple(expected)
++
++    # -128 is the reserved code point and must still fail closed through the
++    # same byte-view ingestion path.
++    reserved_values = list(left_values)
++    reserved_values[0] = -128
++    reserved_binding = BufferBinding.from_buffer(
++        bytes(value & 0xFF for value in reserved_values),
++        "external:left",
++        "int8",
++        left_shape,
++        readonly=True,
++    )
++    reserved_output = HostTensor("int32", output_shape, [0] * 12)
++    with pytest.raises(CpuSve256ExecutionError):
++        _runtime().launch(
++            LaunchRequest(
++                artifact,
++                inputs=[reserved_binding.to_tensor_desc(), right_binding.to_tensor_desc()],
++                outputs=[reserved_output.descriptor()],
++            )
++        )
++
++
+ # ---------------------------------------------------------------------------
+ # a) Connected fix: integer raw-address outputs (pre-existing known limit)
+ # ---------------------------------------------------------------------------
+diff --git a/python/tests/ut/pypto_x/test_w8a8_v2_packed_differential.py b/python/tests/ut/pypto_x/test_w8a8_v2_packed_differential.py
+new file mode 100644
+index 000000000..e93dba8a3
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_w8a8_v2_packed_differential.py
+@@ -0,0 +1,340 @@
++"""W8A8 contract 0010 v2: packed ``[K,out]`` vs v1 transpose, opcode level.
++
++This module is the M2a cross-backend assembly evidence for route c1:
++
++* the v1 program (0002 FROZEN) explicitly ``transpose``s the ``[out,K]`` weight
++  parameter before ``qmatmul_s8s8_s32``; the v2 program feeds the packed
++  ``[K,out]`` weight parameter directly (no transpose node);
++* both programs carry the same integer codes (v2 packed bytes are the
++  row-major mirror of the v1 transpose output), so every backend must produce
++  the *same* BF16 output bit-pattern;
++* a v1 artifact (different ``program_digest``) is rejected by the v2 binding
++  schema before any launch (fail-closed);
++* backends: scalar, vector-common, AVX2, AVX-512 VNNI and SVE256 (QEMU by
++  default; ``PYPTO_X_SVE_TEST_MODE=native`` on an AArch64 host).  CUDA's local
++  fake-driver differential lives in ``test_w8a8_cuda.py`` because its W8A8
++  plane only accepts the four frozen opcodes (there is no CUDA graph
++  executor / transpose opcode).
++"""
++
++from __future__ import annotations
++
++import os
++import random
++import shutil
++import struct
++from pathlib import Path
++
++import pytest
++
++from pypto.abi import LaunchRequest
++from pypto.backends.cpu import CpuScalarRuntime, HostTensor
++from pypto.backends.cpu.aarch64 import Sve256Runtime
++from pypto.backends.cpu.vector import CpuVectorRuntime
++from pypto.backends.cpu.x86 import Avx2Runtime, Avx512Runtime
++from pypto.compiler import CompileOptions
++from pypto.compiler.targets.cpu import CpuScalarCompiler
++from pypto.compiler.targets.cpu_avx2 import Avx2Compiler
++from pypto.compiler.targets.cpu_avx512 import Avx512Compiler
++from pypto.compiler.targets.cpu_sve256 import Sve256Compiler
++from pypto.compiler.targets.cpu_vector import CpuVectorCompiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.portable.qwen35_w8a8_scheme import (
++    dequantize_epilogue_bf16,
++    qmatmul_s8s8_s32,
++    quantize_per_token_s8,
++)
++from pypto.portable.runtime_binding import (
++    BindingMismatchError,
++    assemble_launch_request,
++    build_binding_schema,
++)
++from pypto.target import TargetSpec
++
++
++SCALAR_TARGET = TargetSpec("cpu", "x86_64-linux-gnu")
++VECTOR_TARGET = TargetSpec("cpu", "x86_64-linux-gnu", attributes={"lane_count": 4})
++AVX2_TARGET = TargetSpec(
++    "cpu",
++    "x86_64-linux-gnu",
++    features=("avx", "avx2", "fma", "osxsave", "ymm"),
++    attributes={"lane_count": 8},
++)
++AVX512_TARGET = TargetSpec(
++    "cpu",
++    "x86_64-linux-gnu",
++    features=("avx512f", "avx512vnni"),
++    attributes={"lane_count": 16},
++)
++SVE256_TARGET = TargetSpec(
++    "cpu",
++    "aarch64-linux-gnu",
++    features=("sve", "sve2", "vl256"),
++    attributes={"vl_bytes": 32},
++)
++
++SHAPES = ((5, 7, 3), (9, 16, 17))
++SVE_SHAPES = ((5, 7, 3),)
++
++_SVE_MODE = os.environ.get("PYPTO_X_SVE_TEST_MODE", "qemu").strip().lower()
++if _SVE_MODE not in ("native", "qemu"):
++    raise RuntimeError("PYPTO_X_SVE_TEST_MODE must be 'native' or 'qemu'")
++
++_COMPILED = {}
++
++
++# --------------------------------------------------------------------------
++# v1 / v2 four-op and three-op programs
++# --------------------------------------------------------------------------
++
++
++_PROGRAM_METADATA = {
++    "runtime_inputs": [{"name": "x", "shape": [5, 7], "dtype": "float32"}],
++    "state_input_names": [],
++    "parameter_function_inputs": ["w", "ws"],
++    "quantized_parameters": [
++        {
++            "name": "w",
++            "scale_entry": "ws",
++            "storage_layout": "k_out_rowmajor",
++        }
++    ],
++}
++
++
++def _v1_transpose_program(rows, k, columns, name="w8a8_demo"):
++    """0002 v1: weight parameter is [out,K]; an explicit transpose feeds qmatmul."""
++
++    x = ValueRef("x", CoreType.tensor("float32", (rows, k)))
++    w = ValueRef("w", CoreType.tensor("int8", (columns, k)))
++    ws = ValueRef("ws", CoreType.tensor("float32", (columns,)))
++    q = ValueRef("q", CoreType.tensor("int8", (rows, k)))
++    sa = ValueRef("sa", CoreType.tensor("float32", (rows,)))
++    wt = ValueRef("wt", CoreType.tensor("int8", (k, columns)))
++    acc = ValueRef("acc", CoreType.tensor("int32", (rows, columns)))
++    out = ValueRef("out", CoreType.tensor("bf16", (rows, columns)))
++    operations = (
++        Operation("quantize_per_token_s8", (x,), (q, sa)),
++        Operation("transpose", (w,), (wt,), {"permutation": [1, 0]}),
++        Operation("qmatmul_s8s8_s32", (q, wt), (acc,)),
++        Operation("dequantize_epilogue_bf16", (acc, sa, ws), (out,)),
++    )
++    metadata = dict(_PROGRAM_METADATA)
++    metadata["runtime_inputs"] = [{"name": "x", "shape": [rows, k], "dtype": "float32"}]
++    return CoreProgram(
++        functions=(CoreFunction(name, (x, w, ws), (out,), Region(operations)),),
++        metadata=metadata,
++    )
++
++
++def _v2_packed_program(rows, k, columns, name="w8a8_demo"):
++    """0010 v2: weight parameter is already packed [K,out]; no transpose node."""
++
++    x = ValueRef("x", CoreType.tensor("float32", (rows, k)))
++    w = ValueRef("w", CoreType.tensor("int8", (k, columns)))
++    ws = ValueRef("ws", CoreType.tensor("float32", (columns,)))
++    q = ValueRef("q", CoreType.tensor("int8", (rows, k)))
++    sa = ValueRef("sa", CoreType.tensor("float32", (rows,)))
++    acc = ValueRef("acc", CoreType.tensor("int32", (rows, columns)))
++    out = ValueRef("out", CoreType.tensor("bf16", (rows, columns)))
++    operations = (
++        Operation("quantize_per_token_s8", (x,), (q, sa)),
++        Operation("qmatmul_s8s8_s32", (q, w), (acc,)),
++        Operation("dequantize_epilogue_bf16", (acc, sa, ws), (out,)),
++    )
++    metadata = dict(_PROGRAM_METADATA)
++    metadata["runtime_inputs"] = [{"name": "x", "shape": [rows, k], "dtype": "float32"}]
++    return CoreProgram(
++        functions=(CoreFunction(name, (x, w, ws), (out,), Region(operations)),),
++        metadata=metadata,
++    )
++
++
++def _inputs(rows, k, columns, seed):
++    rng = random.Random(seed)
++    x_values = [[rng.uniform(-3.0, 3.0) for _ in range(k)] for _ in range(rows)]
++    w_source = [[rng.randint(-127, 127) for _ in range(k)] for _ in range(columns)]
++    ws_values = [rng.uniform(0.001, 0.05) for _ in range(columns)]
++    # packed [K,out] is byte-identical to the v1 transpose output.
++    w_packed = [[w_source[o][inner] for o in range(columns)] for inner in range(k)]
++    quantized = quantize_per_token_s8(x_values)
++    accumulator = qmatmul_s8s8_s32(
++        list(quantized.code_rows()), w_packed, left_shape=(rows, k), right_shape=(k, columns)
++    )
++    epilogue = dequantize_epilogue_bf16(
++        list(accumulator.values), list(quantized.scales), ws_values, shape=(rows, columns)
++    )
++    golden = [
++        struct.unpack("<f", struct.pack("<I", epilogue.bf16_bits[row * columns + column] << 16))[0]
++        for row in range(rows)
++        for column in range(columns)
++    ]
++    v1_inputs = [
++        HostTensor("float32", (rows, k), [value for row in x_values for value in row]),
++        HostTensor("int8", (columns, k), [value for row in w_source for value in row]),
++        HostTensor("float32", (columns,), ws_values),
++    ]
++    v2_inputs = [
++        HostTensor("float32", (rows, k), [value for row in x_values for value in row]),
++        HostTensor("int8", (k, columns), [value for row in w_packed for value in row]),
++        HostTensor("float32", (columns,), ws_values),
++    ]
++    return v1_inputs, v2_inputs, golden
++
++
++def _run(runtime, artifact, inputs, rows, columns):
++    output = HostTensor.zeros("bf16", (rows, columns))
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[value.descriptor(readonly=True) for value in inputs],
++            outputs=[output.descriptor()],
++        )
++    )
++    return [value for row in output.tolist() for value in row]
++
++
++def _compile(backend, program, build_dir, key, target):
++    cache_key = (backend, key, program.canonical_json())
++    cached = _COMPILED.get(cache_key)
++    if cached is not None:
++        return cached
++    if backend == "scalar":
++        compiler = CpuScalarCompiler()
++        artifact = compiler.compile(compiler.lower(program, target))
++    elif backend == "vector":
++        compiler = CpuVectorCompiler()
++        artifact = compiler.compile(compiler.lower(program, target))
++    elif backend == "avx2":
++        compiler = Avx2Compiler()
++        artifact = compiler.compile(
++            compiler.lower(program, target),
++            CompileOptions(
++                artifact_format="pypto-x.cpu.avx2",
++                extra={"build_dir": str(Path(build_dir) / key)},
++            ),
++        )
++    elif backend == "avx512":
++        compiler = Avx512Compiler()
++        artifact = compiler.compile(
++            compiler.lower(program, target),
++            CompileOptions(
++                artifact_format="pypto-x.cpu.avx512",
++                extra={"build_dir": str(Path(build_dir) / key)},
++            ),
++        )
++    elif backend == "sve256":
++        compiler = Sve256Compiler()
++        artifact = compiler.compile(
++            compiler.lower(program, target),
++            CompileOptions(
++                artifact_format="pypto-x.cpu.sve256",
++                extra={"build_dir": str(Path(build_dir) / key)},
++            ),
++        )
++    else:  # pragma: no cover - test plumbing
++        raise AssertionError("unknown backend {!r}".format(backend))
++    _COMPILED[cache_key] = artifact
++    return artifact
++
++
++def _assert_v1_artifact_rejected_by_v2_schema(v1_artifact, v2_program):
++    schema = build_binding_schema(v2_program)
++    assert v1_artifact.metadata.get("program_digest") != schema.graph_digest
++    with pytest.raises(BindingMismatchError, match="program_digest"):
++        assemble_launch_request(
++            schema,
++            v1_artifact,
++            runtime_bindings={},
++            parameter_bindings={},
++            state_bindings={},
++            outputs={},
++            state_outputs={},
++        )
++
++
++def _differential(runtime, backend, build_dir, shapes, target, seed):
++    for rows, k, columns in shapes:
++        v1_program = _v1_transpose_program(rows, k, columns)
++        v2_program = _v2_packed_program(rows, k, columns)
++        v1_inputs, v2_inputs, golden = _inputs(rows, k, columns, seed)
++        v1_artifact = _compile(backend, v1_program, build_dir, "v1", target)
++        v2_artifact = _compile(backend, v2_program, build_dir, "v2", target)
++        v1_output = _run(runtime, v1_artifact, v1_inputs, rows, columns)
++        v2_output = _run(runtime, v2_artifact, v2_inputs, rows, columns)
++        assert v1_output == golden
++        assert v2_output == golden
++        assert v1_output == v2_output
++        _assert_v1_artifact_rejected_by_v2_schema(v1_artifact, v2_program)
++
++
++def test_v2_graph_has_no_int8_transpose_and_v1_graph_has_one():
++    import hashlib
++
++    v1 = _v1_transpose_program(5, 7, 3)
++    v2 = _v2_packed_program(5, 7, 3)
++    v1_ops = [operation.name for operation in v1.functions[0].body.operations]
++    v2_ops = [operation.name for operation in v2.functions[0].body.operations]
++    assert v1_ops == [
++        "quantize_per_token_s8",
++        "transpose",
++        "qmatmul_s8s8_s32",
++        "dequantize_epilogue_bf16",
++    ]
++    assert v2_ops == [
++        "quantize_per_token_s8",
++        "qmatmul_s8s8_s32",
++        "dequantize_epilogue_bf16",
++    ]
++    v1_weight = v1.functions[0].parameters[1]
++    v2_weight = v2.functions[0].parameters[1]
++    assert tuple(v1_weight.type.shape) == (3, 7)  # [out,K]
++    assert tuple(v2_weight.type.shape) == (7, 3)  # packed [K,out]
++    # The transpose + flipped parameter shape are the only structural
++    # difference; both graph digests differ (graph_digest has no version
++    # constant, contract 0010 §4.2.6).
++    v1_digest = hashlib.sha256(v1.canonical_json().encode("utf-8")).hexdigest()
++    v2_digest = hashlib.sha256(v2.canonical_json().encode("utf-8")).hexdigest()
++    assert v1_digest != v2_digest
++    # The v2 program produces a valid v3 schema; the v1-shaped parameter is
++    # rejected by the same v3 scale/out-channel rule (fail-closed).
++    assert build_binding_schema(v2).graph_digest == v2_digest
++    with pytest.raises(BindingMismatchError):
++        build_binding_schema(v1)
++
++
++def test_packed_k_out_matches_v1_transpose_on_scalar_and_vector(tmp_path):
++    _differential(CpuScalarRuntime(), "scalar", tmp_path, SHAPES, SCALAR_TARGET, seed=11)
++    _differential(CpuVectorRuntime(), "vector", tmp_path, SHAPES, VECTOR_TARGET, seed=13)
++
++
++def test_packed_k_out_matches_v1_transpose_on_avx2(tmp_path):
++    runtime = Avx2Runtime()
++    if not runtime.is_available():
++        pytest.skip("host lacks AVX2/YMM capability")
++    _differential(runtime, "avx2", tmp_path, SHAPES, AVX2_TARGET, seed=17)
++
++
++def test_packed_k_out_matches_v1_transpose_on_avx512_vnni(tmp_path):
++    runtime = Avx512Runtime()
++    if not runtime.is_available():
++        pytest.skip("host lacks AVX-512/ZMM capability")
++    if not getattr(runtime.capability, "avx512vnni", False):
++        pytest.skip("host lacks AVX-512 VNNI capability")
++    _differential(runtime, "avx512", tmp_path, SHAPES, AVX512_TARGET, seed=19)
++
++
++def test_packed_k_out_matches_v1_transpose_on_sve256(tmp_path):
++    if _SVE_MODE == "qemu":
++        if shutil.which("qemu-aarch64") is None:
++            pytest.skip("qemu-aarch64 is unavailable")
++    else:
++        import platform
++
++        if platform.machine().lower() not in ("aarch64", "arm64"):
++            pytest.skip("native SVE256 execution requires an AArch64 host")
++    runtime = Sve256Runtime(
++        execution_mode=_SVE_MODE,
++        qemu_cpu="max,sve256=on",
++    )
++    _differential(runtime, "sve256", tmp_path, SVE_SHAPES, SVE256_TARGET, seed=23)
+diff --git a/tools/qwen35_reference/packer_side_a.py b/tools/qwen35_reference/packer_side_a.py
+index 8e969e70f..cdfe47055 100644
+--- a/tools/qwen35_reference/packer_side_a.py
++++ b/tools/qwen35_reference/packer_side_a.py
+@@ -7,22 +7,28 @@
+ 数据本体的产生路径仍然与 PyPTO-X 运行时完全隔离。
+ 
+ 复现口径与 ``python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py``
+-的 W8A8 ingestion 完全一致：
++的 W8A8 ingestion 完全一致（契约 0010 v2）：
+ 
+ 1. ``build_qwen35_text_decoder_graph(1, 5, past_length=0, precision='w8a8-linear',
+    quantized_linear_scope='default', quantize_lm_head=False)``；
+ 2. ``build_binding_schema`` / ``build_packed_layout``；
+ 3. ``SafetensorsReader`` + ``build_weight_mapping``（tied embedding 回退）；
+ 4. 对每个 ``entry.quant is not None`` 的 150 个参数调用
+-   ``quantize_weight_from_view``；
++   ``quantize_weight_from_view``（输入 shape = checkpoint ``[out,in]``，
++   输出 packed ``[K,out]`` codes）；
+ 5. 用与 driver 完全相同的序列化方式重算
+    ``weight_scale_manifest_digest``，并与冻结 manifest 对拍。
+ 
++0010 v2 审计口径：``codes_sha256`` 覆盖 packed 字节（与冻结 v1 manifest 的
++hash 必然不同），因此额外提供 ``codes_unpacked_sha256``——把 packed codes 反
++排回 ``[out,in]`` 后的 sha256，用来证明"码值逐位不变、只是排布变了"；
++``scales_sha256``/``source_sha256`` 继续与冻结 manifest 严格相等。
++
+ 输出（供 ``audit_w8a8_scale.py`` 逐元素按位比对）：
+ 
+ * ``--out-npz``：每个参数名 -> fp32 ``scales`` 数组；
+-* ``--out-json``：per-tensor codes/scales sha256、重算 manifest digest 与
+-  冻结 manifest 的匹配结果。
++* ``--out-json``：per-tensor codes/scales sha256、unpacked codes digest、重算
++   manifest digest 与冻结 manifest 的匹配结果。
+ """
+ 
+ import argparse
+@@ -100,15 +106,31 @@ def main(argv=None):
+             if item is None:
+                 raise RuntimeError("quantized parameter %r has no checkpoint mapping" % entry.name)
+             view = reader.view(item.source.official_name)
++            if len(entry.shape) != 2:
++                raise RuntimeError("quantized parameter %r must be rank 2" % entry.name)
++            source_shape = (int(entry.shape[1]), int(entry.shape[0]))
+             try:
+                 quantized = quantize_weight_from_view(
+-                    view, dtype=item.source.pypto_dtype, shape=entry.shape, name=entry.name
++                    view, dtype=item.source.pypto_dtype, shape=source_shape, name=entry.name
+                 )
+             finally:
+                 view.release()
++            if tuple(quantized.storage_shape) != tuple(int(dim) for dim in entry.shape):
++                raise RuntimeError(
++                    "packed storage shape %s does not match binding %s for %r"
++                    % (quantized.storage_shape, tuple(entry.shape), entry.name)
++                )
++            unpacked = (
++                np.frombuffer(quantized.codes, dtype=np.int8)
++                .reshape(tuple(int(dim) for dim in quantized.storage_shape))
++                .T
++            )
++            unpacked_sha = hashlib.sha256(
++                np.ascontiguousarray(unpacked, dtype=np.int8).tobytes()
++            ).hexdigest()
+             manifest.append(quantized.manifest_entry())
+             scales = np.frombuffer(quantized.scales, dtype="<f4").astype(np.float32)
+-            if scales.shape != (int(entry.shape[0]),):
++            if scales.shape != (int(entry.shape[-1]),):
+                 raise RuntimeError("scale shape mismatch for %r" % entry.name)
+             scale_arrays[entry.name] = scales
+             frozen_entry = frozen_by_name.get(entry.name)
+@@ -116,9 +138,12 @@ def main(argv=None):
+                 "name": entry.name,
+                 "official_name": item.source.official_name,
+                 "shape": [int(dim) for dim in entry.shape],
++                "source_shape": [int(dim) for dim in source_shape],
++                "codes_layout": quantized.storage_layout,
+                 "source_dtype": item.source.pypto_dtype,
+                 "scales_sha256": quantized.scales_sha256,
+                 "codes_sha256": quantized.codes_sha256,
++                "codes_unpacked_sha256": unpacked_sha,
+                 "source_sha256": quantized.source_sha256,
+                 "saturation_count": int(quantized.saturation_count),
+                 "zero_row_count": int(quantized.zero_row_count),
+@@ -128,7 +153,7 @@ def main(argv=None):
+                 ),
+                 "matches_frozen_codes_sha256": bool(
+                     frozen_entry is not None and
+-                    frozen_entry["codes_sha256"] == quantized.codes_sha256
++                    frozen_entry["codes_sha256"] == unpacked_sha
+                 ),
+                 "matches_frozen_source_sha256": bool(
+                     frozen_entry is not None and
+@@ -147,6 +172,7 @@ def main(argv=None):
+     report = {
+         "schema": "pypto-x.c8-w8a8-scale-crosscheck.side-a.v1",
+         "role": "path (a): reproduce PyPTO-X packer payload (pypto imports live here only)",
++        "contract": "0010 v2 packed k_out_rowmajor (codes_sha256 over packed bytes)",
+         "assets_dir": os.path.abspath(args.assets_dir),
+         "checkpoint": os.path.abspath(args.checkpoint),
+         "manifest_path": os.path.abspath(args.manifest),
+@@ -154,12 +180,14 @@ def main(argv=None):
+         "scale_payload_bytes": int(sum(int(scale_arrays[name].nbytes) for name in names)),
+         "recomputed_manifest_digest": digest,
+         "frozen_manifest_digest": frozen.get("weight_scale_manifest_digest"),
++        # v2 packed manifest digest 与 v1 冻结值必然不同（codes 排布变了）。
+         "matches_frozen_manifest_digest": bool(
+             digest == frozen.get("weight_scale_manifest_digest")
+         ),
+         "all_frozen_scales_sha256_match": all(
+             entry["matches_frozen_scales_sha256"] for entry in per_tensor
+         ),
++        # 0010 v2 的核心审计：packed codes 反排回 [out,in] 后与 v1 冻结 hash 全等。
+         "all_frozen_codes_sha256_match": all(
+             entry["matches_frozen_codes_sha256"] for entry in per_tensor
+         ),
+@@ -172,9 +200,10 @@ def main(argv=None):
+     }
+     with open(args.out_json, "w", encoding="utf-8") as handle:
+         json.dump(report, handle, ensure_ascii=False, indent=2)
+-    print("[side-a] tensors=%d digest_match=%s scales_sha256_all=%s" % (
++    print("[side-a] tensors=%d digest_match=%s scales_sha256_all=%s unpacked_codes_match=%s" % (
+         len(names), report["matches_frozen_manifest_digest"],
+-        report["all_frozen_scales_sha256_match"]), flush=True)
++        report["all_frozen_scales_sha256_match"],
++        report["all_frozen_codes_sha256_match"]), flush=True)
+     return 0
+ 
+ 

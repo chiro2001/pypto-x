@@ -1,0 +1,742 @@
+From a16a5869fe2196bf128fa79594da168f69d25a13 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 08:21:27 +0800
+Subject: [PATCH 227/235] feat(c8-sve256-a3): W8A8 v2 whole-net L4 runner +
+ local judgment chain
+
+M2b item 6 tooling (no implementation change):
+- m2b_make_bundle.sh / m2b_sync_to_a3.sh: ship source+driver+tools+input_ids
+  +RoPE (never gold logits, never weights) to ~/pypto-x-a3/w8a8-v2-m2b
+- m2b_run_a3_w8a8_l4.sh: 3 prompts x {default=518, full=556} native SVE256
+  stage-s3 runs (prefill + 4 greedy decode) on disjoint 8-core sets,
+  --skip-gold-alignment, --debug-dump, pack logits before return,
+  env capability evidence + discipline/residue checks
+- m2b_fetch_results.sh: packed logits + driver JSON/progress + sha256 back
+- m2b_make_manifest.py / m2b_run_judgments.sh / m2b_summarize_a3_results.py:
+  verify fetch hashes, build the ours-manifest, run c8_l4_compare with
+  prefill-main and decode-extension reported separately, executed int8
+  transpose census (must be 0)
+- m2b_start_a3_window.sh: detached window launcher
+
+Refs: docs/20-planning/0010 section 6 item 6
+---
+ tools/c8_sve256_a3/m2b_fetch_results.sh        |  45 +++++++++++
+ tools/c8_sve256_a3/m2b_make_bundle.sh          |  64 +++++++++++++++
+ tools/c8_sve256_a3/m2b_make_manifest.py        | 112 ++++++++++++++++++++++++++
+ tools/c8_sve256_a3/m2b_run_a3_w8a8_l4.sh       | 174 ++++++++++++++++++++++++++++++++++++++++
+ tools/c8_sve256_a3/m2b_run_judgments.sh        |  43 ++++++++++
+ tools/c8_sve256_a3/m2b_start_a3_window.sh      |  13 +++
+ tools/c8_sve256_a3/m2b_summarize_a3_results.py | 192 +++++++++++++++++++++++++++++++++++++++++++++
+ tools/c8_sve256_a3/m2b_sync_to_a3.sh           |  19 +++++
+ 8 files changed, 662 insertions(+)
+
+diff --git a/tools/c8_sve256_a3/m2b_fetch_results.sh b/tools/c8_sve256_a3/m2b_fetch_results.sh
+new file mode 100755
+index 000000000..cf21f3dd5
+--- /dev/null
++++ b/tools/c8_sve256_a3/m2b_fetch_results.sh
+@@ -0,0 +1,45 @@
++#!/usr/bin/env bash
++# M2b item 6: fetch the packed SVE256 W8A8 L4 artifacts back to the local
++# evidence dir.  Only packed logits + JSON/progress/sha256 files travel back;
++# the raw debug dumps stay on A3.
++set -euo pipefail
++
++EVID=${1:?usage: m2b_fetch_results.sh <evidence-root>}
++A3=a3-21
++A3_HOME=/home/l00886679
++A3_ROOT=pypto-x-a3/w8a8-v2-m2b
++LOCAL="${EVID}/a3"
++LOCAL_RAW="${LOCAL}/raw"
++LOCAL_LOGS="${LOCAL}/logs"
++mkdir -p "${LOCAL_RAW}" "${LOCAL_LOGS}"
++
++echo "[fetch] remote inventory"
++ssh -o BatchMode=yes "${A3}" "cd ${A3_HOME}/${A3_ROOT} && du -sb raw logs 2>/dev/null; find raw -name '*.npz' -type f | sort | xargs -r sha256sum" \
++  > "${LOCAL}/a3_dump_inventory.txt"
++
++for config in default full; do
++  mkdir -p "${LOCAL_RAW}/${config}" "${LOCAL_RAW}/dumps/${config}"
++  scp -q -o BatchMode=yes \
++    "${A3}:${A3_HOME}/${A3_ROOT}/raw/${config}/*.json" \
++    "${A3}:${A3_HOME}/${A3_ROOT}/raw/${config}/*.progress.log" \
++    "${A3}:${A3_HOME}/${A3_ROOT}/raw/${config}/sha256sums.txt" \
++    "${LOCAL_RAW}/${config}/"
++  scp -q -o BatchMode=yes \
++    "${A3}:${A3_HOME}/${A3_ROOT}/raw/dumps_packed/${config}/*.npz" \
++    "${LOCAL_RAW}/dumps/${config}/"
++done
++scp -q -o BatchMode=yes \
++  "${A3}:${A3_HOME}/${A3_ROOT}/raw/matrix_status.json" \
++  "${A3}:${A3_HOME}/${A3_ROOT}/raw/A3_SHA256SUMS.txt" \
++  "${LOCAL_RAW}/"
++scp -q -o BatchMode=yes \
++  "${A3}:${A3_HOME}/${A3_ROOT}/logs/*.log" \
++  "${A3}:${A3_HOME}/${A3_ROOT}/logs/*.txt" \
++  "${LOCAL_LOGS}/" || true
++ssh -o BatchMode=yes "${A3}" "date -u '+[fetch] a3_utc=%Y-%m-%dT%H:%M:%SZ'" | tee "${LOCAL}/clock_offset.txt"
++date -u '+[fetch] local_utc=%Y-%m-%dT%H:%M:%SZ' | tee -a "${LOCAL}/clock_offset.txt"
++
++( cd "${LOCAL_RAW}" && find . -type f ! -name 'LOCAL_SHA256SUMS.txt' -print0 \
++    | sort -z | xargs -0 sha256sum > LOCAL_SHA256SUMS.txt )
++echo "[fetch] local bytes:"
++du -sb "${LOCAL_RAW}" "${LOCAL_LOGS}"
+diff --git a/tools/c8_sve256_a3/m2b_make_bundle.sh b/tools/c8_sve256_a3/m2b_make_bundle.sh
+new file mode 100755
+index 000000000..58e92c50f
+--- /dev/null
++++ b/tools/c8_sve256_a3/m2b_make_bundle.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++# M2b item 6: build the A3 transfer bundle for the SVE256 W8A8 L4 window.
++# Runs on the LOCAL machine; never contains model weights.
++#
++# The A3 host already has ~/models/Qwen3.5-0.8B; this bundle ships:
++#   * our source tree (python/pypto + the weighted execution driver)
++#   * the packing + census tools used by the A3-side window
++#   * gold input_ids only (NEVER gold logits)
++#   * RoPE tables
++# and a MANIFEST.sha256.
++set -euo pipefail
++
++WT=${1:?usage: m2b_make_bundle.sh <worktree> <evidence-root>}
++EVID=${2:?usage: m2b_make_bundle.sh <worktree> <evidence-root>}
++GOLD=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/c8-w8a8-reference-gold/reference
++ROPE_SRC=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/qwen35-bf16-weighted-execution/reference_rope
++BUNDLE="${EVID}/a3/a3_bundle"
++
++rm -rf "${BUNDLE}"
++mkdir -p "${BUNDLE}/src/python/tests/ut/pypto_x" "${BUNDLE}/tools" "${BUNDLE}/refmin/float32" "${BUNDLE}/rope"
++
++tar -C "${WT}" -cf - --exclude='__pycache__' --exclude='*.pyc' python/pypto \
++    | tar -C "${BUNDLE}/src" -xf -
++cp -f "${WT}/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py" \
++      "${BUNDLE}/src/python/tests/ut/pypto_x/"
++cp -f "${WT}/tools/c8_l4_compare.py" "${BUNDLE}/tools/"
++cp -rf "${WT}/tools/c8_sve256_a3" "${BUNDLE}/tools/"
++cp -f "${WT}/tools/c8_sve256_a3/m2b_run_a3_w8a8_l4.sh" "${BUNDLE}/run_a3_w8a8_l4.sh"
++chmod +x "${BUNDLE}/run_a3_w8a8_l4.sh"
++
++# --- golden input_ids only (no logits are shipped to A3) --------------------
++python3 - "${GOLD}" "${BUNDLE}/refmin/float32" <<'PY'
++import sys
++from pathlib import Path
++import numpy as np
++
++gold = Path(sys.argv[1])
++out = Path(sys.argv[2])
++out.mkdir(parents=True, exist_ok=True)
++total = 0
++for prompt in ("en_continuation", "zh_continuation", "chat_zh_user"):
++    with np.load(gold / "float32" / (prompt + ".npz"), allow_pickle=False) as data:
++        ids = np.asarray(data["input_ids"])
++    path = out / (prompt + ".npz")
++    np.savez(path, input_ids=ids)
++    total += path.stat().st_size
++    print("[refmin] {} input_ids={} bytes={}".format(prompt, ids.tolist(), path.stat().st_size))
++print("[refmin] total_bytes={}".format(total))
++PY
++
++# --- RoPE tables (292 KiB) --------------------------------------------------
++cp -f "${ROPE_SRC}/rope_summary.json" "${BUNDLE}/rope/"
++for prompt in en_continuation zh_continuation chat_zh_user; do
++  cp -f "${ROPE_SRC}/${prompt}.npz" "${BUNDLE}/rope/"
++done
++
++# --- manifest + tar ---------------------------------------------------------
++( cd "${BUNDLE}" && find . -type f ! -name 'MANIFEST.sha256' -print0 \
++    | sort -z | xargs -0 sha256sum > MANIFEST.sha256 )
++BUNDLE_BYTES=$(du -sb "${BUNDLE}" | cut -f1)
++TAR="${EVID}/a3/a3_bundle.tar"
++tar -C "${EVID}/a3" -cf "${TAR}" a3_bundle
++echo "[bundle] dir=${BUNDLE} bytes=${BUNDLE_BYTES} tar=${TAR} tar_bytes=$(stat -c %s "${TAR}")"
++sha256sum "${TAR}" | tee "${EVID}/a3/a3_bundle.tar.sha256"
+diff --git a/tools/c8_sve256_a3/m2b_make_manifest.py b/tools/c8_sve256_a3/m2b_make_manifest.py
+new file mode 100755
+index 000000000..f94c3bc7d
+--- /dev/null
++++ b/tools/c8_sve256_a3/m2b_make_manifest.py
+@@ -0,0 +1,112 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""Build the ours-manifest consumed by tools/c8_l4_compare.py for the M2b A3 flow.
++
++Local layout after ``m2b_fetch_results.sh``::
++
++    <raw>/<config>/<prompt>.json                 driver stage-s3 result
++    <raw>/<config>/<prompt>.progress.log         executed op stream
++    <raw>/dumps/<config>/<prompt>.s3-*.npz       packed logits (logits only)
++
++The fetched per-artifact ``sha256sums.txt`` (A3-relative paths) is verified
++against the local bytes before the manifest is written, so a corrupted fetch
++cannot silently feed the L4 judgment.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++from pathlib import Path
++
++PROMPTS = (("en_continuation", 5), ("zh_continuation", 8), ("chat_zh_user", 18))
++
++
++def sha256(path: Path) -> str:
++    digest = hashlib.sha256()
++    with open(path, "rb") as stream:
++        for chunk in iter(lambda: stream.read(1 << 20), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _verify_fetch(raw: Path, config: str) -> dict:
++    sums = raw / config / "sha256sums.txt"
++    if not sums.is_file():
++        raise SystemExit("missing {}".format(sums))
++    verified = 0
++    for line in sums.read_text(encoding="utf-8").splitlines():
++        line = line.strip()
++        if not line:
++            continue
++        digest, remote = line.split(None, 1)
++        remote = remote.lstrip("*")
++        local_rel = remote[len("raw/"):] if remote.startswith("raw/") else remote
++        local_rel = local_rel.replace("dumps_packed/", "dumps/")
++        local = raw / local_rel
++        if not local.is_file():
++            raise SystemExit("fetched artifact missing: {}".format(local))
++        actual = sha256(local)
++        if actual != digest:
++            raise SystemExit("sha256 mismatch for {}: {} != {}".format(local, actual, digest))
++        verified += 1
++    return {"sha256_verified_files": verified, "sha256sums": str(sums)}
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--raw-dir", required=True)
++    parser.add_argument("--config", required=True, choices=("default", "full"))
++    parser.add_argument("--output", required=True)
++    args = parser.parse_args()
++
++    raw = Path(args.raw_dir).resolve()
++    verify = _verify_fetch(raw, args.config)
++    manifest_prompts = {}
++    artifacts = {}
++    for prompt, steps in PROMPTS:
++        driver = raw / args.config / "{}.json".format(prompt)
++        prefill = raw / "dumps" / args.config / "{}.s3-prefill.past0.npz".format(prompt)
++        decode = {
++            str(steps + step): str(
++                raw / "dumps" / args.config / "{}.s3-decode.past{}.npz".format(prompt, steps + step)
++            )
++            for step in range(4)
++        }
++        for path in [driver, prefill] + [Path(item) for item in decode.values()]:
++            if not path.is_file():
++                raise SystemExit("missing required artifact: {}".format(path))
++        artifacts[prompt] = {
++            "driver_json_sha256": sha256(driver),
++            "prefill_npz_sha256": sha256(prefill),
++            "decode_npz_sha256": {
++                key: sha256(Path(item)) for key, item in sorted(decode.items())
++            },
++        }
++        manifest_prompts[prompt] = {
++            "steps": steps,
++            "driver_json": str(driver),
++            "prefill_npz": str(prefill),
++            "decode_npz": decode,
++        }
++    payload = {
++        "config": args.config,
++        "generated_by": "tools/c8_sve256_a3/m2b_make_manifest.py",
++        "fetch_verification": verify,
++        "artifacts": artifacts,
++        "prompts": manifest_prompts,
++    }
++    output = Path(args.output)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    output.write_text(
++        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
++        encoding="utf-8",
++    )
++    print("manifest: {} ({} prompts, {} files verified)".format(
++        output, len(manifest_prompts), verify["sha256_verified_files"]))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/c8_sve256_a3/m2b_run_a3_w8a8_l4.sh b/tools/c8_sve256_a3/m2b_run_a3_w8a8_l4.sh
+new file mode 100755
+index 000000000..1b95e776f
+--- /dev/null
++++ b/tools/c8_sve256_a3/m2b_run_a3_w8a8_l4.sh
+@@ -0,0 +1,174 @@
++#!/usr/bin/env bash
++# M2b item 6: SVE256 W8A8 whole-network L4 execution on A3 (a3-21).
++# Runs ON the A3 host as l00886679 (NOT in the container).
++#
++# Scope: 3 prompts x {default(518), full(556)} whole-net runs, native SVE256,
++# driver stage s3 (prefill + 4 greedy decode steps in one process), W8A8-linear,
++# --skip-gold-alignment (gold logits stay on the local machine), --debug-dump
++# then pack_ours_logits to keep only logits arrays for the return trip.
++#
++# Discipline: only writes under ~/pypto-x-a3/w8a8-v2-m2b/**; only taskset CPUs
++# 320-639 (two disjoint 8-physical-core sets per batch); never touches
++# chip7/NPU; no machine config changes; no weights leave the host.
++#
++# Batches: default (3 prompts parallel) then full (3 prompts parallel).  Each
++# prompt gets 8 physical cores; batch wall is bounded by the longest prompt.
++set -u
++
++ROOT="${HOME}/pypto-x-a3/w8a8-v2-m2b"
++PY="${HOME}/pypto-x-a3/envs/pypto-x-c8/bin/python"
++SRC="${ROOT}/src"
++DRIVER="${SRC}/python/tests/ut/pypto_x/qwen35_weighted_execution_driver.py"
++ASSET="${HOME}/models/Qwen3.5-0.8B"
++PACK="${ROOT}/tools/c8_sve256_a3/pack_ours_logits.py"
++RAW="${ROOT}/raw"
++LOGS="${ROOT}/logs"
++WORK="${ROOT}/work"
++TMP="${ROOT}/tmp"
++mkdir -p "${RAW}" "${LOGS}" "${WORK}" "${TMP}"
++
++export PYTHONPATH="${SRC}/python"
++export PYPTO_X_PORTABLE_ONLY=1
++export TMPDIR="${TMP}"
++export OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 MKL_NUM_THREADS=8
++export OMP_PROC_BIND=close OMP_PLACES=cores
++export PYPTO_X_SVE_TEST_MODE=native
++
++CLOCK_START=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
++
++# --- environment evidence (capability must show emulated=false/vl_bytes=32) --
++{
++  echo "== a3_w8a8_v2_m2b_l4_window =="
++  date -u '+started_utc=%Y-%m-%dT%H:%M:%SZ'
++  date '+started_local=%Y-%m-%dT%H:%M:%S%z'
++  echo "hostname=$(hostname) user=$(whoami) home=${HOME}"
++  echo "cpuset_self=$(awk '/Cpus_allowed_list/{print $2}' /proc/self/status)"
++  echo "nproc=$(nproc) mem_available_kib=$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
++  echo "uname=$(uname -m) kernel=$(uname -r)"
++  echo "python=$(${PY} --version 2>&1) cc=$(cc --version | head -1)"
++  echo "env_numpy=$(${PY} -c 'import numpy; print(numpy.__version__)' 2>&1)"
++  echo "checkpoint_bytes=$(stat -c %s "${ASSET}/model.safetensors-00001-of-00001.safetensors" 2>/dev/null)"
++  ${PY} - <<'PY'
++from pypto.lowering.cpu.aarch64.sve import probe_sve256_capabilities
++import json
++capability = probe_sve256_capabilities(execution_mode="native")
++print("sve256_capability=" + json.dumps(capability.to_dict(), sort_keys=True))
++assert capability.available and not capability.emulated and capability.vl_bytes == 32, capability
++PY
++} > "${LOGS}/env_evidence.log" 2>&1
++ENV_STATUS=$?
++echo "[env] log=${LOGS}/env_evidence.log status=${ENV_STATUS}"
++
++# --- prompt/CPU map (same physical-core map as the Q5/Q10 windows) ----------
++PROMPTS=(en_continuation zh_continuation chat_zh_user)
++STEPS=(5 8 18)
++declare -A CPUS
++CPUS[en_continuation]="320,322,324,326,328,330,332,334"
++CPUS[zh_continuation]="336,338,340,342,344,346,348,350"
++CPUS[chat_zh_user]="352,354,356,358,360,362,364,366"
++
++declare -A BATCH_EXIT
++declare -A BATCH_ELAPSED
++
++run_batch() {
++  local config=$1
++  local -a extra=()
++  if [[ ${config} == full ]]; then
++    extra=(--quantized-linear-scope all --quantize-lm-head)
++  fi
++  mkdir -p "${RAW}/${config}" "${RAW}/dumps_raw/${config}" "${RAW}/dumps_packed/${config}"
++  echo "[batch ${config}] start $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
++  local batch_start
++  batch_start=$(date +%s)
++  local -a pids=()
++  local -a starts=()
++  local index prompt steps cpu log out progress dump
++  for index in 0 1 2; do
++    prompt="${PROMPTS[$index]}"
++    steps="${STEPS[$index]}"
++    cpu="${CPUS[$prompt]}"
++    out="${RAW}/${config}/${prompt}.json"
++    progress="${RAW}/${config}/${prompt}.progress.log"
++    dump="${RAW}/dumps_raw/${config}/${prompt}"
++    log="${LOGS}/${config}_${prompt}.log"
++    starts[$index]=$(date +%s)
++    echo "[run ] ${config}/${prompt} steps=${steps} cpus=${cpu} start=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
++    setsid --wait timeout 5400 taskset -c "${cpu}" \
++      env OMP_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8 MKL_NUM_THREADS=8 \
++          OMP_PROC_BIND=close OMP_PLACES=cores \
++      "${PY}" "${DRIVER}" \
++        --stage s3 --backend sve256 --precision w8a8-linear --sve-execution-mode native \
++        --prompt "${prompt}" --steps "${steps}" --decode-steps 4 \
++        --asset-dir "${ASSET}" --reference-dir "${ROOT}/refmin" --rope-dir "${ROOT}/rope" \
++        --skip-gold-alignment --debug-dump "${dump}" \
++        --output "${out}" --progress "${progress}" \
++        --work-dir "${WORK}/${config}/${prompt}" --no-watchdog \
++        "${extra[@]}" \
++      > "${log}" 2>&1 &
++    pids+=("$!")
++  done
++  local failures=0
++  for index in 0 1 2; do
++    local status=0
++    wait "${pids[$index]}" || status=$?
++    local elapsed=$(( $(date +%s) - starts[$index] ))
++    echo "[done] ${config}/${PROMPTS[$index]} exit=${status} elapsed_s=${elapsed}"
++    [[ ${status} -eq 0 ]] || failures=$((failures + 1))
++  done
++  BATCH_ELAPSED[$config]=$(( $(date +%s) - batch_start ))
++
++  # Keep only the logits rows needed by c8_l4_compare (never ship raw dumps).
++  echo "[pack] ${config} -> ${RAW}/dumps_packed/${config}"
++  "${PY}" "${PACK}" \
++    --ours-dir "${RAW}/dumps_raw/${config}" \
++    --output-dir "${RAW}/dumps_packed/${config}" \
++    >> "${LOGS}/${config}_pack.log" 2>&1
++  local pack_status=$?
++  echo "[pack] ${config} exit=${pack_status}"
++
++  # Per-artifact sha256 (driver JSON, progress, packed npz).
++  (
++    cd "${ROOT}"
++    find "raw/${config}" "raw/dumps_packed/${config}" -type f \( -name '*.json' -o -name '*.log' -o -name '*.npz' \) -print0 \
++      | sort -z | xargs -0 sha256sum > "${RAW}/${config}/sha256sums.txt"
++  )
++
++  BATCH_EXIT[$config]=$(( failures + (pack_status != 0 ? 1 : 0) ))
++  echo "[batch ${config}] failures=${failures} pack_exit=${pack_status} elapsed_s=${BATCH_ELAPSED[$config]} end=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
++}
++
++run_batch default
++run_batch full
++
++# --- discipline self-check --------------------------------------------------
++{
++  echo "cpuset_self=$(awk '/Cpus_allowed_list/{print $2}' /proc/self/status)"
++  echo "written_root=${ROOT}"
++  echo "default_exit=${BATCH_EXIT[default]} full_exit=${BATCH_EXIT[full]}"
++  echo "residue_processes=$(pgrep -u "$(whoami)" -f 'qwen35_weighted_execution_driver' | wc -l)"
++  echo "npu_calls=none"
++  date -u '+finished_utc=%Y-%m-%dT%H:%M:%SZ'
++} > "${LOGS}/discipline_check.txt" 2>&1
++
++{
++  echo "{"
++  echo "  \"window\": \"m2b_a3_sve256_w8a8_l4\","
++  echo "  \"default_exit\": ${BATCH_EXIT[default]},"
++  echo "  \"full_exit\": ${BATCH_EXIT[full]},"
++  echo "  \"default_wall_s\": ${BATCH_ELAPSED[default]},"
++  echo "  \"full_wall_s\": ${BATCH_ELAPSED[full]},"
++  echo "  \"env_status\": ${ENV_STATUS},"
++  echo "  \"started_utc\": \"${CLOCK_START}\","
++  echo "  \"a3_utc\": \"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\""
++  echo "}"
++} > "${RAW}/matrix_status.json"
++
++# One combined manifest for the return trip (packed + JSON + logs).
++(
++  cd "${ROOT}"
++  find raw -type f \( -name '*.json' -o -name '*.log' -o -name '*.npz' -o -name 'sha256sums.txt' \) -print0 \
++    | sort -z | xargs -0 sha256sum > "${RAW}/A3_SHA256SUMS.txt"
++)
++
++echo "[done] default_exit=${BATCH_EXIT[default]} full_exit=${BATCH_EXIT[full]} wall_s=$(( ${BATCH_ELAPSED[default]} + ${BATCH_ELAPSED[full]} ))"
++exit $(( BATCH_EXIT[default] + BATCH_EXIT[full] + (ENV_STATUS != 0 ? 1 : 0) ))
+diff --git a/tools/c8_sve256_a3/m2b_run_judgments.sh b/tools/c8_sve256_a3/m2b_run_judgments.sh
+new file mode 100755
+index 000000000..1793d3185
+--- /dev/null
++++ b/tools/c8_sve256_a3/m2b_run_judgments.sh
+@@ -0,0 +1,43 @@
++#!/usr/bin/env bash
++# M2b item 6: local prefill-main + decode-extension L4 judgments for the A3
++# SVE256 W8A8 run.  Light (numpy over logits only), no heavy lock required.
++set -uo pipefail
++
++EVID=${1:?usage: m2b_run_judgments.sh <evidence-root>}
++WT=${2:?usage: m2b_run_judgments.sh <evidence-root> <worktree>}
++A3DIR="${EVID}/a3"
++RAW="${A3DIR}/raw"
++GOLD=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/c8-w8a8-reference-gold/reference
++TOOL="${WT}/tools/c8_l4_compare.py"
++MAKEMAN="${WT}/tools/c8_sve256_a3/m2b_make_manifest.py"
++export PATH=/home/chiro/miniforge3/bin:$PATH
++export PYTHONDONTWRITEBYTECODE=1
++
++failures=0
++for config in default full; do
++  manifest="${RAW}/ours_manifest_${config}.json"
++  if ! python3 "${MAKEMAN}" --raw-dir "${RAW}" --config "${config}" --output "${manifest}"; then
++    echo "[warn] manifest ${config} failed"
++    failures=$((failures + 1))
++    continue
++  fi
++  for variant in w8a8 w8a8_f32ref; do
++    if [[ ${variant} == w8a8 ]]; then
++      out="${RAW}/judgment_${config}.json"
++    else
++      out="${RAW}/judgment_f32ref_${config}.json"
++    fi
++    echo "[tool] ${variant} ${config} $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
++    python3 "${TOOL}" --gold-dir "${GOLD}" --variant "${variant}" \
++      --config "${config}" --ours-manifest "${manifest}" --output "${out}" \
++      > "${RAW}/judgment_${variant}_${config}.stdout.log" 2>&1
++    tool_status=$?
++    # exit 1 is a real FAIL verdict, not a tool crash; it stays in the JSON.
++    echo "[tool] ${variant} ${config} exit=${tool_status} -> ${out}"
++  done
++done
++
++python3 "${WT}/tools/c8_sve256_a3/m2b_summarize_a3_results.py" \
++  --a3-dir "${A3DIR}" --output "${RAW}/m2b_a3_summary.json" || failures=$((failures + 1))
++echo "[judgments] failures=${failures} end $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
++exit "${failures}"
+diff --git a/tools/c8_sve256_a3/m2b_start_a3_window.sh b/tools/c8_sve256_a3/m2b_start_a3_window.sh
+new file mode 100755
+index 000000000..77349eba8
+--- /dev/null
++++ b/tools/c8_sve256_a3/m2b_start_a3_window.sh
+@@ -0,0 +1,13 @@
++#!/usr/bin/env bash
++# M2b item 6: start the A3 SVE256 W8A8 L4 window detached on a3-21.
++# Runs on the LOCAL machine after m2b_sync_to_a3.sh.
++set -euo pipefail
++
++EVID=${1:?usage: m2b_start_a3_window.sh <evidence-root>}
++A3=a3-21
++A3_HOME=/home/l00886679
++A3_ROOT=pypto-x-a3/w8a8-v2-m2b
++
++ssh -o BatchMode=yes "${A3}" "cd ${A3_HOME}/${A3_ROOT} && mkdir -p logs raw && setsid nohup bash run_a3_w8a8_l4.sh > logs/window.out 2>&1 < /dev/null & echo remote_pid=\$!; date -u '+a3_utc=%Y-%m-%dT%H:%M:%SZ'"
++date -u '+local_utc=%Y-%m-%dT%H:%M:%SZ'
++echo "[start] window launched; poll: ssh ${A3} 'tail -f ${A3_HOME}/${A3_ROOT}/logs/window.out'"
+diff --git a/tools/c8_sve256_a3/m2b_summarize_a3_results.py b/tools/c8_sve256_a3/m2b_summarize_a3_results.py
+new file mode 100755
+index 000000000..ce219b6bb
+--- /dev/null
++++ b/tools/c8_sve256_a3/m2b_summarize_a3_results.py
+@@ -0,0 +1,192 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""Summarize the M2b A3 SVE256 W8A8 L4 window.
++
++Reports, per config (default/full) and prompt:
++  * driver status / graph_digest / operation_total / wall_seconds
++  * **executed** int8 transpose count from the --progress op stream (must be 0)
++  * executed native qmatmul count
++  * packed logits npz sha256 (prefill + 4 decode rows)
++  * L4 prefill main verdict + decode-extension verdicts (reported separately)
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++from pathlib import Path
++
++PROMPTS = ("en_continuation", "zh_continuation", "chat_zh_user")
++
++
++def _sha256(path: Path) -> str:
++    digest = hashlib.sha256()
++    with open(path, "rb") as stream:
++        for chunk in iter(lambda: stream.read(1 << 20), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _progress_counts(path: Path) -> dict:
++    launches = 0
++    ops = 0
++    int8_transposes = 0
++    qmatmul_native = 0
++    qmatmul_any = 0
++    boundaries = {}
++    if not path.is_file():
++        return {"error": "missing progress log"}
++    last_index = None
++    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
++        line = line.strip()
++        if not line.startswith("{"):
++            continue
++        try:
++            item = json.loads(line)
++        except json.JSONDecodeError:
++            continue
++        if item.get("kind") != "op":
++            continue
++        index = int(item.get("index") or 0)
++        if ops and index == 0:
++            launches += 1
++        elif ops == 0:
++            launches = 1
++        ops += 1
++        name = str(item.get("operation"))
++        dtype = str(item.get("dtype"))
++        mode = str(item.get("mode"))
++        boundary = "native" if mode.startswith("native") else (
++            "host_reference" if mode in ("host_reference", "host_materialize")
++            else ("host_boundary" if mode.startswith("host") else "unclassified")
++        )
++        boundaries[boundary] = boundaries.get(boundary, 0) + 1
++        if name == "transpose" and dtype == "int8":
++            int8_transposes += 1
++        if name == "qmatmul_s8s8_s32":
++            qmatmul_any += 1
++            if boundary == "native":
++                qmatmul_native += 1
++    return {
++        "launches": launches,
++        "executed_ops": ops,
++        "executed_int8_transposes": int8_transposes,
++        "executed_qmatmul_s8s8_s32": qmatmul_any,
++        "executed_qmatmul_native": qmatmul_native,
++        "boundaries": boundaries,
++    }
++
++
++def _judgment_verdict(judgment: dict) -> dict:
++    return {
++        "overall": judgment.get("overall"),
++        "prefill_main": judgment.get("overall_prefill_logits_main"),
++        "decode_extension_decode_band": judgment.get("overall_decode_extension_decode_band"),
++        "decode_extension_prefill_band": judgment.get("overall_decode_extension_prefill_band"),
++        "union_all_logits_keys": judgment.get("overall_union_all_logits_keys"),
++        "band_sha256": (judgment.get("band_source") or {}).get("sha256"),
++        "per_prompt": {
++            prompt: {
++                key: data.get(key)
++                for key in (
++                    "verdict", "verdict_prefill_logits", "verdict_decode_extension_decode_band",
++                    "verdict_decode_extension_prefill_band", "verdict_union_all_logits_keys",
++                    "argmax_gate", "cosine_gate", "max_abs_gate", "gated_rows",
++                    "strict_argmax_match_rows", "argmax_fail_rows", "near_tie_flip_rows",
++                    "gold_near_tie_rows", "token_chain",
++                )
++            }
++            for prompt, data in sorted(judgment.get("prompts", {}).items())
++        },
++    }
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--a3-dir", required=True)
++    parser.add_argument("--output", required=True)
++    args = parser.parse_args()
++    a3 = Path(args.a3_dir).resolve()
++    raw = a3 / "raw"
++
++    summary = {
++        "status": "PASS",
++        "window": "m2b_a3_sve256_w8a8_l4",
++        "criteria_note": (
++            "prefill main = band.json source_key=prefill_logits gate; decode extension uses "
++            "the same methodology re-measured on decode rows (reported separately, never mixed)"
++        ),
++        "matrix_status": json.loads((raw / "matrix_status.json").read_text(encoding="utf-8")),
++        "configs": {},
++    }
++    failures = 0
++    for config in ("default", "full"):
++        config_entry = {"prompts": {}}
++        for prompt in PROMPTS:
++            driver = raw / config / "{}.json".format(prompt)
++            progress = raw / config / "{}.progress.log".format(prompt)
++            entry = {"prompt": prompt}
++            if not driver.is_file():
++                entry["error"] = "missing driver JSON"
++                failures += 1
++                config_entry["prompts"][prompt] = entry
++                continue
++            payload = json.loads(driver.read_text(encoding="utf-8"))
++            census = payload.get("census") or {}
++            entry.update(
++                {
++                    "driver_status": payload.get("status"),
++                    "graph_digest": census.get("graph_digest"),
++                    "operation_total": census.get("operation_total"),
++                    "wall_seconds": payload.get("wall_seconds"),
++                    "shape_profile": payload.get("shape_profile"),
++                }
++            )
++            entry["executed"] = _progress_counts(progress)
++            # packed logits sha256
++            steps = {"en_continuation": 5, "zh_continuation": 8, "chat_zh_user": 18}[prompt]
++            dumps = raw / "dumps" / config
++            prefill = dumps / "{}.s3-prefill.past0.npz".format(prompt)
++            entry["prefill_npz_sha256"] = _sha256(prefill) if prefill.is_file() else None
++            entry["decode_npz_sha256"] = {
++                str(steps + step): (
++                    _sha256(dumps / "{}.s3-decode.past{}.npz".format(prompt, steps + step))
++                    if (dumps / "{}.s3-decode.past{}.npz".format(prompt, steps + step)).is_file()
++                    else None
++                )
++                for step in range(4)
++            }
++            if payload.get("status") != "PASS":
++                failures += 1
++            if entry["executed"].get("executed_int8_transposes") != 0:
++                failures += 1
++            config_entry["prompts"][prompt] = entry
++        for variant, name in (("w8a8", "judgment_{}.json"), ("w8a8_f32ref", "judgment_f32ref_{}.json")):
++            path = raw / name.format(config)
++            if path.is_file():
++                config_entry[variant + "_judgment"] = _judgment_verdict(
++                    json.loads(path.read_text(encoding="utf-8"))
++                )
++            else:
++                config_entry[variant + "_judgment"] = {"error": "missing {}".format(path)}
++                failures += 1
++        summary["configs"][config] = config_entry
++
++    summary["failures"] = failures
++    summary["status"] = "PASS" if failures == 0 else "PARTIAL"
++    Path(args.output).write_text(
++        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
++        encoding="utf-8",
++    )
++    print(json.dumps({k: summary[k] for k in ("status", "failures")}, sort_keys=True))
++    for config in ("default", "full"):
++        j = summary["configs"][config].get("w8a8_judgment", {})
++        print("[{}] prefill_main={} decode_extension(decode_band)={} decode_extension(prefill_band)={}".format(
++            config, j.get("prefill_main"), j.get("decode_extension_decode_band"),
++            j.get("decode_extension_prefill_band")))
++    return 0 if failures == 0 else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/c8_sve256_a3/m2b_sync_to_a3.sh b/tools/c8_sve256_a3/m2b_sync_to_a3.sh
+new file mode 100755
+index 000000000..f1d3d38f2
+--- /dev/null
++++ b/tools/c8_sve256_a3/m2b_sync_to_a3.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++# M2b item 6: ship the A3 bundle to a3-21 and verify it by sha256 manifest.
++# Runs on the LOCAL machine.  Called only after m2b_make_bundle.sh.
++set -euo pipefail
++
++EVID=${1:?usage: m2b_sync_to_a3.sh <evidence-root>}
++TAR="${EVID}/a3/a3_bundle.tar"
++A3=a3-21
++A3_HOME=/home/l00886679
++A3_ROOT=pypto-x-a3/w8a8-v2-m2b
++
++[[ -f "${TAR}" ]] || { echo "missing ${TAR}; run m2b_make_bundle.sh first" >&2; exit 2; }
++
++echo "[sync] local tar bytes=$(stat -c %s "${TAR}") sha256=$(cut -d' ' -f1 "${EVID}/a3/a3_bundle.tar.sha256")"
++ssh -o BatchMode=yes "${A3}" "mkdir -p ${A3_HOME}/${A3_ROOT} && rm -rf ${A3_HOME}/${A3_ROOT}/src ${A3_HOME}/${A3_ROOT}/tools ${A3_HOME}/${A3_ROOT}/refmin ${A3_HOME}/${A3_ROOT}/rope"
++scp -q -o BatchMode=yes "${TAR}" "${A3}:${A3_HOME}/${A3_ROOT}/a3_bundle.tar"
++ssh -o BatchMode=yes "${A3}" "cd ${A3_HOME}/${A3_ROOT} && tar -xf a3_bundle.tar && rm -rf src tools refmin rope && mv a3_bundle/src . && mv a3_bundle/tools . && mv a3_bundle/refmin . && mv a3_bundle/rope . && mv a3_bundle/run_a3_w8a8_l4.sh . && mv a3_bundle/MANIFEST.sha256 . && rm -rf a3_bundle && sha256sum -c MANIFEST.sha256 >/dev/null && echo '[sync] remote manifest OK'"
++ssh -o BatchMode=yes "${A3}" "du -sh ${A3_HOME}/${A3_ROOT}; date -u '+[sync] a3_utc=%Y-%m-%dT%H:%M:%SZ'"
++date -u '+[sync] local_utc=%Y-%m-%dT%H:%M:%SZ'

@@ -1,0 +1,498 @@
+From 11b9fb7972e374d89784af51d3bb9002aec1449c Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 05:42:50 +0800
+Subject: [PATCH 219/235] fix(tools): C7 drilldown comparison completeness
+ (736/736 matched, sha256, mechanism checks)
+
+- reshape/layout handling for logits/l2/z/recurrent outputs, no missing pairs.
+- canonical first-divergence order includes intra-layer ops (first non-zero:
+  layer_00_in_proj_qkv_output).
+- mechanism_checks quantifies ours-fp32-RMSNorm vs HF-bf16-RMSNorm (the
+  quantizer input boundary).
+---
+ tools/diag_c7/compare_step_intermediates.py | 477 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 477 insertions(+)
+
+diff --git a/tools/diag_c7/compare_step_intermediates.py b/tools/diag_c7/compare_step_intermediates.py
+new file mode 100755
+index 000000000..9ffa478fc
+--- /dev/null
++++ b/tools/diag_c7/compare_step_intermediates.py
+@@ -0,0 +1,477 @@
++#!/usr/bin/env python3
++"""C7 drilldown：ours(state=gold) vs HF gold(state=gold) 同一步的逐层/逐算子对比。
++
++输入：
++  --ours-npz   driver dump（<out>/dumps.s3-decode.past10.npz，含 --debug-extra-returns）
++  --gold-npz   dump_gold_step_intermediates.py 产物
++  --gold-manifest  对应 manifest（dtype/shape/校验）
++输出：
++  --output     compute_drilldown_step2.json
++
++指标：relative L2 = ||ours-HF|| / ||HF||（同 transform 后同 shape）、cosine、max_abs；
++以及"分段更新误差"：对相邻 checkpoint (x_{k-1}, x_k)，
++  segment_rel = ||(ours_k-ours_{k-1}) - (HF_k-HF_{k-1})|| / ||HF_k-HF_{k-1}||
++用于回答"compute 缺口集中在少数算子还是全层分布式"。
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import math
++from pathlib import Path
++
++import numpy as np
++
++LAYERS = 24
++ATTENTION_LAYERS = (3, 7, 11, 15, 19, 23)
++
++
++def f32_to_bf16(a):
++    a = np.ascontiguousarray(a, dtype=np.float32)
++    bits = a.view(np.uint32)
++    lsb = (bits >> 16) & np.uint32(1)
++    rounded = bits + np.uint32(0x7FFF) + lsb
++    return (rounded >> np.uint32(16)).astype(np.uint16)
++
++
++def to_bf16_f32(a):
++    bits = f32_to_bf16(a)
++    return (bits.astype(np.uint32) << 16).view(np.float32)
++
++
++def match_dtype(a, dtype):
++    if dtype == "torch.bfloat16":
++        return to_bf16_f32(a)
++    return np.asarray(a, dtype=np.float32)
++
++
++def cosine(a, b):
++    a = np.asarray(a, dtype=np.float64).reshape(-1)
++    b = np.asarray(b, dtype=np.float64).reshape(-1)
++    na = math.sqrt(float(np.dot(a, a)))
++    nb = math.sqrt(float(np.dot(b, b)))
++    return float(np.dot(a, b) / (na * nb)) if na and nb else float("nan")
++
++
++def metric(ours, hf):
++    ours = np.asarray(ours, dtype=np.float64).reshape(-1)
++    hf = np.asarray(hf, dtype=np.float64).reshape(-1)
++    delta = ours - hf
++    norm = math.sqrt(float(np.dot(hf, hf)))
++    return {
++        "rel_l2": float(math.sqrt(float(np.dot(delta, delta))) / norm) if norm else None,
++        "cosine": cosine(ours, hf),
++        "max_abs": float(np.max(np.abs(delta))) if delta.size else 0.0,
++        "ours_norm": math.sqrt(float(np.dot(ours, ours))),
++        "hf_norm": norm,
++    }
++
++
++def t_transpose_ours_heads(a):
++    return np.transpose(np.asarray(a, dtype=np.float32), (0, 2, 1, 3))
++
++
++def t_cast_ours_bf16(a):
++    return to_bf16_f32(a)
++
++
++def t_reshape_gated_norm(a):
++    return np.asarray(a, dtype=np.float32).reshape(-1, 128)
++
++
++class GoldView:
++    """把 HF capture 的 tensor 取出来并做需要的重算/布局转换。"""
++
++    def __init__(self, arrays, dtypes):
++        self.a = arrays
++        self.d = dtypes
++
++    def raw(self, key):
++        return self.a[key]
++
++    def dtype(self, key):
++        return self.d.get(key, "torch.float32")
++
++    # ---- recomputes ----
++    def attention_residual(self, layer):
++        hidden = self.a["layer_{:02d}__input_hidden".format(layer)]
++        branch = self.a["layer_{:02d}__branch_output".format(layer)]
++        return to_bf16_f32(np.asarray(hidden, np.float32) + np.asarray(branch, np.float32))
++
++    def mlp_gate_silu(self, layer):
++        gate = to_bf16_f32(self.a["layer_{:02d}__mlp_gate".format(layer)])
++        return to_bf16_f32(1.0 / (1.0 + np.exp(-np.asarray(gate, np.float32))) * np.asarray(gate, np.float32))
++
++    def mlp_product(self, layer):
++        gate = self.a["layer_{:02d}__mlp_gate".format(layer)]
++        up = self.a["layer_{:02d}__mlp_up".format(layer)]
++        silu = 1.0 / (1.0 + np.exp(-np.asarray(gate, np.float32))) * np.asarray(gate, np.float32)
++        return to_bf16_f32(silu * np.asarray(up, np.float32))
++
++    def split_conv(self, layer):
++        conv = np.transpose(np.asarray(self.a["layer_{:02d}__causal_conv_output".format(layer)],
++                                       dtype=np.float32), (0, 2, 1))
++        q, k, v = np.split(conv, [2048, 4096], axis=-1)
++        return q, k, v
++
++    def reshape_qkv(self, layer, which):
++        q, k, v = self.split_conv(layer)
++        return {"q": q, "k": k, "v": v}[which].reshape(1, 1, 16, 128)
++
++    def l2norm(self, layer, which):
++        q, k, v = self.split_conv(layer)
++        x = {"q": q, "k": k, "v": v}[which].reshape(-1, 2048).astype(np.float64)
++        x = x.reshape(-1, 16, 128)
++        norm = np.sqrt((x * x).sum(-1, keepdims=True) + 1e-6)
++        return (x / norm).astype(np.float32)
++
++    def z_reshaped(self, layer):
++        z = self.a["layer_{:02d}__in_proj_z".format(layer)]
++        return np.asarray(z, np.float32).reshape(1, 1, 16, 128)
++
++    @staticmethod
++    def z_from_inproj(ours_array):
++        return np.asarray(ours_array, np.float32).reshape(1, 1, 16, 128)
++
++    def merged_gdn(self, layer):
++        return self.a["layer_{:02d}__merged".format(layer)]
++
++    def gated_core_from_hf(self, layer):
++        gated_norm = self.a["layer_{:02d}__gated_norm".format(layer)]
++        # HF 的 RMSNormGated 把 silu(gate) 包含在内：输出 = (norm*w) * silu(z)，形状 (16,128)
++        return to_bf16_f32(np.asarray(gated_norm, np.float32).reshape(1, 1, 16, 128))
++
++
++def build_pairs():
++    """返回 [(ours_ssa, hf_spec, ours_transform)]；hf_spec 为 str（直接取）或
++    ("method", <name>, ...)（由 GoldView 重算/转换）。"""
++    pairs = []
++    for layer in range(LAYERS):
++        p = "layer_{:02d}_".format(layer)
++        gp = "layer_{:02d}__".format(layer)
++        pairs += [
++            (p + "input_norm_scaled", gp + "input_norm", t_cast_ours_bf16),
++            (p + "branch_output", gp + "branch_output", None),
++            (p + "attention_residual", ("method", "attention_residual", layer), None),
++            (p + "post_attention_norm_scaled", gp + "post_attention_norm", t_cast_ours_bf16),
++            (p + "mlp_gate_output", gp + "mlp_gate", None),
++            (p + "mlp_up_output", gp + "mlp_up", None),
++            (p + "mlp_gate_silu", ("method", "mlp_gate_silu", layer), t_cast_ours_bf16),
++            (p + "mlp_product", ("method", "mlp_product", layer), t_cast_ours_bf16),
++            (p + "mlp_down_output", gp + "mlp_down", None),
++            (p + "output", gp + "output", None),
++        ]
++        if layer in ATTENTION_LAYERS:
++            pairs += [
++                (p + "q_projection_output", gp + "q_projection", None),
++                (p + "k_projection_output", gp + "k_projection", None),
++                (p + "v_projection_output", gp + "v_projection", None),
++                (p + "q_norm_scaled", gp + "q_norm",
++                 lambda a: t_cast_ours_bf16(t_transpose_ours_heads(a))),
++                (p + "k_norm_scaled", gp + "k_norm",
++                 lambda a: t_cast_ours_bf16(t_transpose_ours_heads(a))),
++                (p + "q_rope_full_result", gp + "q_rope", t_cast_ours_bf16),
++                (p + "k_rope_full_result", gp + "k_rope", t_cast_ours_bf16),
++                (p + "probabilities", gp + "probabilities", None),
++                (p + "context", gp + "context", t_transpose_ours_heads),
++                (p + "merged", gp + "merged", None),
++                (p + "o_projection_output", gp + "o_projection", None),
++                (p + "new_k", gp + "new_k", None),
++                (p + "new_v", gp + "new_v", None),
++            ]
++        else:
++            pairs += [
++                (p + "in_proj_qkv_output", gp + "in_proj_qkv", None),
++                (p + "causal_conv_output", gp + "causal_conv_output", None),
++                (p + "conv_time", ("method", "conv_time", layer), None),
++                (p + "q_raw", ("method", "split", layer, "q"), None),
++                (p + "k_raw", ("method", "split", layer, "k"), None),
++                (p + "v_raw", ("method", "split", layer, "v"), None),
++                (p + "q", ("method", "qkv", layer, "q"), None),
++                (p + "k", ("method", "qkv", layer, "k"), None),
++                (p + "v", ("method", "qkv", layer, "v"), None),
++                (p + "q_l2_normalized", ("method", "l2", layer, "q"), t_cast_ours_bf16),
++                (p + "k_l2_normalized", ("method", "l2", layer, "k"), t_cast_ours_bf16),
++                (p + "q_norm_bf16", ("method", "l2_bf16", layer, "q"), None),
++                (p + "k_norm_bf16", ("method", "l2_bf16", layer, "k"), None),
++                (p + "in_proj_z_output", gp + "in_proj_z", None),
++                (p + "z_from_inproj", ("method", "z", layer), None),
++                (p + "in_proj_b_output", gp + "in_proj_b", None),
++                (p + "beta", gp + "beta", None),
++                (p + "beta_f32", gp + "beta", t_cast_ours_bf16),
++                (p + "in_proj_a_output", gp + "in_proj_a", None),
++                (p + "gate_log_decay", gp + "gate_log_decay", None),
++                (p + "recurrent_step_0_output", gp + "recurrent_step_0_output",
++                 lambda a: np.transpose(np.asarray(a, np.float32), (0, 2, 1, 3))),
++                (p + "gated_core", ("method", "gated_core", layer), t_cast_ours_bf16),
++                (p + "out_projection_output", gp + "out_projection", None),
++            ]
++    pairs += [
++        ("hidden_input", "layer_00__input_hidden", None),
++        ("final_norm_scaled", "final_norm", t_cast_ours_bf16),
++        ("final_hidden", "final_hidden", None),
++        ("logits", "logits", None),
++    ]
++    return pairs
++
++
++def resolve_hf(gold, spec):
++    if spec is None:
++        return None, None
++    try:
++        return _resolve_hf_inner(gold, spec)
++    except (KeyError, ValueError):
++        return None, None
++
++
++def _resolve_hf_inner(gold, spec):
++    if not isinstance(spec, tuple):
++        return gold.raw(spec), gold.dtype(spec)
++    kind = spec[0]
++    if kind == "method":
++        name = spec[1]
++        layer = spec[2]
++        if name == "attention_residual":
++            return gold.attention_residual(layer), "torch.bfloat16"
++        if name == "mlp_gate_silu":
++            return gold.mlp_gate_silu(layer), "torch.bfloat16"
++        if name == "mlp_product":
++            return gold.mlp_product(layer), "torch.bfloat16"
++        if name == "conv_time":
++            value = gold.raw("layer_{:02d}__causal_conv_output".format(layer))
++            return np.transpose(np.asarray(value, np.float32), (0, 2, 1)), "torch.bfloat16"
++        if name == "split":
++            which = spec[3]
++            q, k, v = gold.split_conv(layer)
++            return {"q": q, "k": k, "v": v}[which], "torch.bfloat16"
++        if name == "qkv":
++            return gold.reshape_qkv(layer, spec[3]), "torch.bfloat16"
++        if name == "l2":
++            return gold.l2norm(layer, spec[3]), "torch.float32"
++        if name == "l2_bf16":
++            return to_bf16_f32(gold.l2norm(layer, spec[3])), "torch.bfloat16"
++        if name == "z":
++            return gold.z_reshaped(layer), "torch.bfloat16"
++        if name == "gated_core":
++            return gold.gated_core_from_hf(layer), "torch.bfloat16"
++    raise SystemExit("unknown hf spec {}".format(spec))
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--ours-npz", required=True)
++    parser.add_argument("--gold-npz", required=True)
++    parser.add_argument("--gold-manifest", required=True)
++    parser.add_argument("--output", required=True)
++    args = parser.parse_args()
++
++    ours = {key: np.asarray(value) for key, value in np.load(args.ours_npz, allow_pickle=False).items()}
++    gold_manifest = json.loads(Path(args.gold_manifest).read_text(encoding="utf-8"))
++    gold = GoldView({key: np.asarray(value) for key, value in np.load(args.gold_npz, allow_pickle=False).items()},
++                    gold_manifest.get("dtypes", {}))
++
++    result = {
++        "tool": "compare_step_intermediates",
++        "ours_npz": str(args.ours_npz),
++        "gold_npz": str(args.gold_npz),
++        "gold_manifest": str(args.gold_manifest),
++        "gold_validation_vs_gold_logits": gold_manifest.get("validation_vs_gold_logits"),
++        "comparisons": [],
++        "missing": [],
++    }
++    def ours_value(name):
++        if name in ours:
++            return ours[name]
++        if name.endswith("_z_from_inproj"):
++            base = name[:-len("_z_from_inproj")] + "_in_proj_z_output"
++            if base in ours:
++                return np.asarray(ours[base], np.float32).reshape(1, 1, 16, 128)
++        return None
++
++    for ours_name, hf_spec, ours_transform in build_pairs():
++        if ours_value(ours_name) is None:
++            result["missing"].append({"ours": ours_name, "hf": str(hf_spec)})
++            continue
++        hf_value, hf_dtype = resolve_hf(gold, hf_spec)
++        if hf_value is None:
++            result["missing"].append({"ours": ours_name, "hf": str(hf_spec), "reason": "hf_missing"})
++            continue
++        a = ours_value(ours_name)
++        if ours_transform is not None:
++            a = ours_transform(a)
++        a = np.asarray(a, dtype=np.float32)
++        b = np.asarray(hf_value, dtype=np.float32)
++        if a.shape != b.shape:
++            if a.size == b.size:
++                a = a.reshape(-1)
++                b = b.reshape(-1)
++            else:
++                result["missing"].append({"ours": ours_name, "hf": str(hf_spec),
++                                          "reason": "shape", "ours_shape": list(a.shape),
++                                          "hf_shape": list(b.shape)})
++                continue
++        a = match_dtype(a, hf_dtype)
++        if a.shape != b.shape:
++            result["missing"].append({"ours": ours_name, "hf": str(hf_spec),
++                                      "reason": "shape", "ours_shape": list(a.shape),
++                                      "hf_shape": list(b.shape)})
++            continue
++        item = {"ours": ours_name, "hf": str(hf_spec), "shape": list(a.shape),
++                "hf_dtype": hf_dtype, "ours_dtype": str(np.asarray(ours_value(ours_name)).dtype),
++                "ours_sha256": hashlib.sha256(np.ascontiguousarray(
++                    ours_value(ours_name)).tobytes()).hexdigest(),
++                "hf_sha256": hashlib.sha256(np.ascontiguousarray(
++                    gold.raw(hf_spec)).tobytes()).hexdigest() if isinstance(hf_spec, str) else None}
++        item.update(metric(a, b))
++        result["comparisons"].append(item)
++
++    # ---- 机制检查：ours 的 RMSNorm 输出是 fp32（未 bf16 舍入），而 HF/参照是 bf16；
++    #      量化线性看到的输入因此不同。这里量化该差异（不做 cast）。----
++    mechanism = []
++    for layer in range(LAYERS):
++        pairs_mech = [
++            ("layer_{:02d}_input_norm_scaled".format(layer),
++             "layer_{:02d}__input_norm".format(layer)),
++            ("layer_{:02d}_post_attention_norm_scaled".format(layer),
++             "layer_{:02d}__post_attention_norm".format(layer)),
++        ]
++        for ours_key, hf_key in pairs_mech:
++            if ours_key not in ours or hf_key not in gold.a:
++                continue
++            a = np.asarray(ours[ours_key], np.float32)
++            b = np.asarray(gold.raw(hf_key), np.float32)
++            item = {"ours": ours_key, "hf": hf_key,
++                    "note": "ours_raw_fp32 vs HF_bf16 (quantizer 实际看到的输入差异)"}
++            item.update(metric(a, b))
++            mechanism.append(item)
++    result["mechanism_checks"] = mechanism
++
++    # ---- 分段更新误差（在同一层内按 checkpoint 顺序）----
++    def get_pair(ours_name, hf_spec, ours_transform=None):
++        ours_raw = ours_value(ours_name)
++        if ours_raw is None:
++            return None
++        hf_value, _ = resolve_hf(gold, hf_spec)
++        if hf_value is None:
++            return None
++        a = ours_raw
++        if ours_transform is not None:
++            a = ours_transform(a)
++        return np.asarray(a, dtype=np.float32), np.asarray(hf_value, dtype=np.float32)
++
++    segment_metrics = []
++    for layer in range(LAYERS):
++        p = "layer_{:02d}_".format(layer)
++        gp = "layer_{:02d}__".format(layer)
++        chain = []
++        if layer == 0:
++            chain.append(("input", "hidden_input", "layer_00__input_hidden", None))
++        else:
++            chain.append(("input", "layer_{:02d}_output".format(layer - 1),
++                          "layer_{:02d}__input_hidden".format(layer), None))
++        chain += [
++            ("input_norm", p + "input_norm_scaled", gp + "input_norm", t_cast_ours_bf16),
++            ("token_mixer", p + "branch_output", gp + "branch_output", None),
++            ("attention_residual", p + "attention_residual", ("method", "attention_residual", layer), None),
++            ("post_attention_norm", p + "post_attention_norm_scaled", gp + "post_attention_norm", t_cast_ours_bf16),
++            ("mlp", p + "mlp_down_output", gp + "mlp_down", None),
++            ("output_residual", p + "output", gp + "output", None),
++        ]
++        for index in range(1, len(chain)):
++            name = "{}->{}".format(chain[index - 1][0], chain[index][0])
++            left = get_pair(chain[index - 1][1], chain[index - 1][2], chain[index - 1][3])
++            right = get_pair(chain[index][1], chain[index][2], chain[index][3])
++            if left is None or right is None:
++                continue
++            ours_delta = right[0] - left[0]
++            hf_delta = right[1] - left[1]
++            norm = math.sqrt(float(np.dot(hf_delta.astype(np.float64).reshape(-1),
++                                         hf_delta.astype(np.float64).reshape(-1))))
++            diff = ours_delta - hf_delta
++            rel = (math.sqrt(float(np.dot(diff.astype(np.float64).reshape(-1),
++                                         diff.astype(np.float64).reshape(-1)))) / norm) if norm else None
++            segment_metrics.append({"layer": layer, "segment": name, "segment_rel_l2": rel,
++                                    "hf_update_norm": norm,
++                                    "ours_update_norm": math.sqrt(float(np.dot(
++                                        ours_delta.astype(np.float64).reshape(-1),
++                                        ours_delta.astype(np.float64).reshape(-1))))})
++    result["segment_metrics"] = segment_metrics
++
++    # ---- 汇总 ----
++    import re as _re
++    layer_output_pattern = _re.compile(r"^layer_(\d+)_output$")
++    by_layer_output = {}
++    for item in result["comparisons"]:
++        if layer_output_pattern.match(item["ours"]):
++            by_layer_output[item["ours"]] = item["rel_l2"]
++    ranked_segments = sorted([item for item in segment_metrics if item["segment_rel_l2"] is not None],
++                             key=lambda item: -item["segment_rel_l2"])
++
++    # 第一次出现明显分歧的 checkpoint（按层内 canonical 顺序）
++    canonical = ["hidden_input"]
++    for layer in range(LAYERS):
++        p = "layer_{:02d}_".format(layer)
++        canonical.append(p + "input_norm_scaled")
++        if layer in ATTENTION_LAYERS:
++            canonical += [p + "q_projection_output", p + "k_projection_output", p + "v_projection_output",
++                          p + "q_rope_full_result", p + "probabilities", p + "context"]
++        else:
++            canonical += [p + "in_proj_qkv_output", p + "causal_conv_output", p + "in_proj_z_output",
++                          p + "in_proj_b_output", p + "in_proj_a_output", p + "gate_log_decay",
++                          p + "recurrent_step_0_output"]
++        canonical += [p + "branch_output", p + "attention_residual",
++                      p + "post_attention_norm_scaled", p + "mlp_gate_output", p + "mlp_down_output",
++                      p + "output"]
++    comparisons_by_key = {item["ours"]: item for item in result["comparisons"]}
++    first_divergence = []
++    for key in canonical:
++        item = comparisons_by_key.get(key)
++        if item is None or item["rel_l2"] is None:
++            continue
++        if item["rel_l2"] > 1e-3:
++            first_divergence.append({"key": key, "rel_l2": item["rel_l2"],
++                                     "cosine": item["cosine"], "max_abs": item["max_abs"]})
++            if len(first_divergence) >= 5:
++                break
++    # 按 segment 名称聚合
++    segment_aggregates = {}
++    for item in ranked_segments:
++        segment_aggregates.setdefault(item["segment"], []).append(item["segment_rel_l2"])
++    segment_aggregates = {
++        name: {"n": len(values), "median": float(np.median(values)),
++               "max": float(np.max(values))}
++        for name, values in sorted(segment_aggregates.items())}
++    squares = np.asarray([item["segment_rel_l2"] ** 2 for item in ranked_segments], dtype=np.float64)
++    total_square = float(squares.sum()) if squares.size else 0.0
++    top5_share = (float(np.sort(squares)[::-1][:5].sum() / total_square)
++                  if total_square else None)
++    result["summary"] = {
++        "layers_output_rel_l2": by_layer_output,
++        "final_logits_rel_l2": next((item["rel_l2"] for item in result["comparisons"]
++                                     if item["ours"] == "logits"), None),
++        "final_logits_cosine": next((item["cosine"] for item in result["comparisons"]
++                                     if item["ours"] == "logits"), None),
++        "first_divergence_checkpoints": first_divergence,
++        "segment_aggregates": segment_aggregates,
++        "segment_top10": ranked_segments[:10],
++        "segment_median": float(np.median([item["segment_rel_l2"] for item in ranked_segments])) if ranked_segments else None,
++        "segment_p90": float(np.percentile([item["segment_rel_l2"] for item in ranked_segments], 90)) if ranked_segments else None,
++        "segment_top5_squared_share": top5_share,
++        "layers_output_rel_l2_sorted": sorted(by_layer_output.items(), key=lambda kv: -(kv[1] or 0))[:8],
++    }
++    out = Path(args.output)
++    out.write_text(json.dumps(result, indent=1), encoding="utf-8")
++    print("[compare_step] comparisons={} missing={} logits_rel={} cos={}".format(
++        len(result["comparisons"]), len(result["missing"]),
++        result["summary"]["final_logits_rel_l2"], result["summary"]["final_logits_cosine"]))
++    print("[compare_step] top segments:")
++    for item in ranked_segments[:8]:
++        print("  layer_{:02d} {:<20} rel={:.5f} hf_update_norm={:.4g}".format(
++            item["layer"], item["segment"], item["segment_rel_l2"], item["hf_update_norm"]))
++    print("[compare_step] wrote {}".format(out))
++
++
++if __name__ == "__main__":
++    main()

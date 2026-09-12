@@ -4,7 +4,7 @@
 
 归档日期：2026-09-12（Asia/Shanghai；0040 推送后至本批收口）
 
-状态：`DRAFT_PENDING_FREEZE`（收口时把"冻结点"一节补成最终值；正文事实均已在 `configs/development_lock.yaml` 与各任务证据目录登记）
+状态：`CLOSED_LOCALLY_PENDING_THE_USER_PUSH_APPROVAL`（正文事实均已在 `configs/development_lock.yaml` 与各任务证据目录登记）
 
 本快照覆盖：AVX2 layout 原生化（B6 的 AVX2 对应件）｜W8A8 契约 v2 的 M2a 实现与 M2b 重基线（含 **Q5 SVE256 整网 L4 判定**）｜**SVE256 W8A8 每节点 O(整图) 开销修复**（A3 6 配置从外推 11.8 h 降到 39.3 min）｜U 线 **U2a**（第一个 vendor provider：AOCL bf16/f32）与 **`view_mode=require` 提级**（含独立验收抓到的 plan/report 伪造阻断）｜C7 下钻工具补齐。
 
@@ -14,11 +14,13 @@
 
 ```text
 upstream base        34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad
-integration base     195ace3eb8a521950c72ffc62f0349aed6c7ac04（0039 交接点）
-integration head     TBD_AT_FREEZE（本批节点：35100030f 吞吐修复 → 3dfac2bbe U2a → fe8e6fd17 M2b 工具 → 36fa3fd3f view-mode → 修复后最终）
-patches              TBD_AT_FREEZE（0040 收口时为 217）
-控制仓 main          TBD_AT_FREEZE（本批提交，未推送）
+integration base     195ace3eb8a521950c72ffc62f0349aed6c7ac04（0039 交接点；0040 推送点为 c63558e9e）
+integration head     8fff5055884a2f7ef0fc1087bd658336b19c11d2（本批 18 提交）
+patches              235（patches/pypto-x，SERIES 235 行，413 文件）
+控制仓 main          本次收口提交（本地，未推送；上次 push 为 57cba40、补丁 217）
 ```
+
+**导出复核（2026-09-12 收口时实测）**：`git clone --shared` 上游 → checkout base → `git am patches/pypto-x/*.patch`（235 个）→ 结果 **tree = `14cfee54a9258c5c1455a7d878200916659b800b`，与 integration tip `8fff50558` 的 tree 逐字相同**，`am_rc=0`。规则 8 全量：**1674 collected / 1667 passed / 7 skipped / 0 failed / 0 error，rc=0，912.81 s**（受检同一 tip；7 skip 全为 CUDA 驱动环境不可用）。
 
 ## 2. AVX2 layout 原生化（`avx2-layout-native`，W8B 续作）
 
@@ -45,7 +47,7 @@ patches              TBD_AT_FREEZE（0040 收口时为 217）
 
 - **U2a（`3dfac2bbe`）**：AOCL/LPGEMM bf16+f32 绑进 U1 执行面（probe/manifest/解析/降级语义/report schema v2）；数值仅 (5,1024,32) 差 bf16 5.96e-8 / f32 8.20e-8（保持 `deterministic_bounded`）；D1/F5 两条 U1 follow-up 一并修；**Q8 同协议 12/12 ≤2×、geomean 0.970×**（首轮 3.13× 因线程路径，方案=seed `BLIS_NUM_THREADS` + plan 冻结 `thread_mode`）；全量 UT 1609 passed 0 failed；逐调用 repack 口径 3.32× 单列为诊断（属 ingestion 预 pack 后续项）。
 - **`view_mode=require` 提级**（用户 2026-09-12 批准）：五条可机检证明条件（contract view obligation / stride-shape 可表达 / 写后读 / owner-lifetime / 多 view 重叠）+ 三态语义 + AVX-512 `proof_gated` 零拷贝（与 copy 路径逐位一致）+ SVE256/AVX2 显式 `alias_proof=unsupported` + plan/report 字段 + 对抗用例。
-- **独立验收抓到 3 条阻断反例**（`36fa3fd3f`）：report 层零校验；plan 层"重算 alias digest + plan_digest 的自洽伪造"被 `ExecutionPlan.from_dict` 接受并成功执行；`recompute_alias_proof_digest` 无调用路径。**数据面未被绕过**（AVX-512 执行器每次从编译 plan+SSA 重新 prove），缺口在**公开校验面**。修复中（(a)–(e) 五条校验 + 回归用例），验收方停手等修，0006 的 **provisional 标注保留**。
+- **独立验收先抓 3 条阻断反例**（`36fa3fd3f`）：report 层零校验；plan 层"重算 alias digest + plan_digest 的自洽伪造"被接受并成功执行；`recompute_alias_proof_digest` 无调用路径——缺口在**公开校验面**（数据面每次从编译 plan+SSA 重新 prove，未被绕过）。实现方在同一轮回修两族（alias 五条 + U2a 声明族九字段，新增 `layout_verify.py`/`binding_verify.py` 与执行层 canonical 重算），合入 `8fff50558` 后复验 **PASS_WITH_BOUNDARIES**：原三条反例全拒、全自洽 obligation-swap 在执行前被拒且输出无副作用；0006 的 **provisional 标注已移除、提级自 2026-09-12 生效**。
 
 ## 6. C7 下钻工具补齐
 
@@ -53,16 +55,16 @@ patches              TBD_AT_FREEZE（0040 收口时为 217）
 
 ## 7. 验收与规则 8
 
-- **批次级 canonical 全量**：`36fa3fd3f` 上的一次因 harness 超时 TERM 于 82% **作废**；修复后将在**最终 tip** 上重跑一次，作为 U2a / view-mode / M2b 三方共同引用的规则 8 证据（`batch-0041-rule8`，waiter 已改 `setsid`）。
-- 三个任务级独立验收：AVX2（PASS_WITH_BOUNDARIES r2）、吞吐修复（PASS_WITH_BOUNDARIES 52/52）、M2a（PASS_WITH_BOUNDARIES）、U2a（in flight）、view-mode（FAIL→修复中）。
+- **批次级 canonical 全量 PASS**（受检 `8fff50558`，一次完整运行）：1674 collected / 1667 passed / 7 skipped / 0 failed / 0 error，rc=0，912.81 s；collect 四集合逐名对拍（1674 / 36fa3fd3f 1665 / fe8e6fd17 1617 / 35100030f 1590）全部溯源，消失 3 条为改名/参数替换。（`36fa3fd3f` 上的一次因 harness 超时 TERM 于 82% 已作废、不得引用；修正为 `setsid` waiter 后未再复现。）
+- 五个任务级独立验收全部 PASS_WITH_BOUNDARIES：AVX2（r2，163 次独立差分）、吞吐修复（52/52 机检）、M2a（region/位级/版本审计）、U2a（复验 37 探针 36 拒 + V2/V4/V5 无回归）、view-mode（复验原三反例全拒，提级生效）。
 
 ## 8. 在途与排队（收口时更新）
 
-`verify-u2a-vendor-provider`（跑中）｜view-mode 实现方回修 → 验收方复验｜批次规则 8 全量（等新 tip）｜W8A8 v2 M2b 待命（除共享全量外清单全清）｜`view_mode` provisional 待办。
+全部收口（2026-09-12）：U2a 复验 PASS_WITH_BOUNDARIES｜view-mode 复验 PASS_WITH_BOUNDARIES（提级生效）｜批次规则 8 全量 PASS｜W8A8 v2 M2b 清单完成（全量引用共享运行）｜A3 侧无在跑任务。
 
 ## 9. 待用户决策
 
-L4 decode 口径（决策包 `0011`，现已有 x86+SVE256 三平台同模式证据，推荐 A+B）｜B4 阈值冻结｜L5/L6 语料与阈值｜`view_mode` 已裁决（提级中）｜新量化方案｜W8J 注入门政策｜A3 chip7/NPU 放行。
+L4 decode 口径（决策包 `0011`，现已有 x86+SVE256 三平台同模式证据，推荐 A+B）｜B4 阈值冻结｜L5/L6 语料与阈值｜~~`view_mode`~~ 已裁决并生效（2026-09-12）｜新量化方案｜W8J 注入门政策｜A3 chip7/NPU 放行。
 
 ## 10. 证据路径
 

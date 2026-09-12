@@ -1,0 +1,1025 @@
+From b82cb202219b1e46538cbcaaad3c65ed93b0843f Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 12:13:16 +0800
+Subject: [PATCH 234/235] fix(execution): reject self-consistent forged view
+ decisions in plan and report
+
+Independent verification showed that a forged layout_decision with recomputed
+alias-proof and plan digests could be accepted and executed, because nothing
+re-verified the proof digest, the proof facts, the obligation invariants, the
+rule trace or the registered contract.
+
+- add pypto.execution.layout_verify: recomputable alias-proof digest check,
+  proof-facts/obligation agreement, must_not_alias/require/view/materialized
+  invariants, rule/decision agreement, and canonical re-derivation from the
+  frozen policy plus the registered OpDefinition
+- ExecutionPlan.validate rejects content-local inconsistencies (including a
+  mismatched rule trace) before any provider is selected
+- entry._execute cross-checks the frozen decision against the matmul
+  OpDefinition and the canonical decision; a self-consistent forgery is
+  refused with ARTIFACT_MISMATCH and no provider is invoked
+- validate_report_schema applies the same checks to the report copy, with the
+  runtime alias_check=verified_distinct included
+- tests: replay the verifier's plan/report tamper matrix plus recomputed-digest
+  forgeries; both must be refused, the forged plan must not execute
+---
+ python/pypto/execution/entry.py                     |  52 ++++-
+ python/pypto/execution/layout_verify.py             | 414 ++++++++++++++++++++++++++++++++++++++++
+ python/pypto/execution/plan.py                      |  32 ++++
+ python/pypto/execution/report.py                    |  51 +++++
+ python/pypto/execution/resolver.py                  | 102 +---------
+ python/tests/ut/pypto_x/test_execution_view_mode.py | 204 ++++++++++++++++++++
+ 6 files changed, 759 insertions(+), 96 deletions(-)
+
+diff --git a/python/pypto/execution/entry.py b/python/pypto/execution/entry.py
+index ee0378d90..20d6bfe37 100644
+--- a/python/pypto/execution/entry.py
++++ b/python/pypto/execution/entry.py
+@@ -22,7 +22,7 @@ execution outcome (U1 follow-up ``F5``).
+ from __future__ import annotations
+ 
+ import time
+-from typing import Any, Optional, Tuple
++from typing import Any, Mapping, Optional, Tuple
+ 
+ from pypto.backends.cpu import HostTensor
+ from pypto.target._utils import mapping_copy
+@@ -35,6 +35,7 @@ from .errors import (
+     PolicyInvalidValueError,
+     ProviderUnavailableError,
+ )
++from .layout_verify import layout_decision_errors
+ from .op_registry import get_op_definition
+ from .plan import ExecutionPlan
+ from .policy import KNOWN_TARGET_KINDS, ExecutionPolicy
+@@ -191,6 +192,53 @@ def execute_matmul_plan(
+     return _execute(plan=plan, left=left, right=right, capability=capability, output=output)
+ 
+ 
++def _verify_plan_layout_decision(plan: ExecutionPlan, definition: Any) -> None:
++    """Cross-check the frozen layout decision against the registered contract.
++
++    ``ExecutionPlan.validate`` already rejects content-local inconsistencies
++    (recomputed alias-proof digest, obligation invariants, rule/decision
++    agreement).  This second gate re-derives the canonical decision from the
++    frozen policy and the registered ``OpDefinition``, so a forgery that also
++    recomputes every digest is still refused before any provider is invoked.
++    """
++
++    if plan.contract_digest != definition.contract_digest:
++        raise ArtifactMismatchError(
++            "plan contract digest does not match the registered OpDefinition",
++            field="plan.contract.digest",
++            requested=plan.contract_digest,
++            available=definition.contract_digest,
++            reason="contract_digest_mismatch",
++        )
++    payload = plan.payload
++    policy_layout = None
++    policy_document = payload.get("policy")
++    if isinstance(policy_document, Mapping):
++        requested_document = policy_document.get("requested")
++        if isinstance(requested_document, Mapping):
++            candidate = requested_document.get("layout")
++            if isinstance(candidate, Mapping):
++                policy_layout = candidate
++    errors = layout_decision_errors(
++        payload["layout_decision"],
++        definition=definition,
++        layout_policy_document=policy_layout,
++    )
++    if not errors:
++        return
++    first = errors[0]
++    raise ArtifactMismatchError(
++        "plan layout decision failed {} validation: {}".format(
++            first.get("reason"), first.get("field")
++        ),
++        field="plan." + str(first.get("field")),
++        requested=first.get("requested"),
++        available=first.get("available"),
++        reason=first.get("reason"),
++        details={"errors": [dict(item) for item in errors]},
++    )
++
++
+ def _execute(
+     *,
+     plan: ExecutionPlan,
+@@ -200,6 +248,8 @@ def _execute(
+     output: Optional[HostTensor]
+ ) -> Tuple[HostTensor, ExecutionReport]:
+     plan.validate()
++    definition = get_op_definition(plan.opcode)
++    _verify_plan_layout_decision(plan, definition)
+     if output is None:
+         output = HostTensor.zeros(plan.dtype, plan.output_shape)
+     if not isinstance(output, HostTensor):
+diff --git a/python/pypto/execution/layout_verify.py b/python/pypto/execution/layout_verify.py
+new file mode 100644
+index 000000000..233789652
+--- /dev/null
++++ b/python/pypto/execution/layout_verify.py
+@@ -0,0 +1,414 @@
++"""Fail-closed verification of a frozen layout/view decision.
++
++The resolver computes a layout decision from ``(OpDefinition, layout policy)``.
++This module re-derives the same decision and checks every frozen plan/report
++copy against it, so a self-consistent forgery (recomputed alias-proof digest
++and recomputed top-level plan digest) is still rejected unless it also matches
++the registered operator contract.
++
++Three layers call the same helpers:
++
++* :meth:`pypto.execution.plan.ExecutionPlan.validate` -- content-local checks
++  (digest self-consistency, obligation invariants, rule/decision agreement);
++* :func:`pypto.execution.entry.execute_matmul_plan` / ``_execute`` -- the same
++  checks plus the cross-check against the registered ``OpDefinition`` and the
++  canonical decision re-derived from the frozen policy;
++* :func:`pypto.execution.report.validate_report_schema` -- the same for the
++  report copy (with ``alias_check=verified_distinct`` from the runtime).
++
++Nothing here relaxes a semantic rule; every helper only adds a refusal.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Callable, Mapping, Optional, Sequence, Tuple
++
++from pypto.alias import (
++    VIEW_MODES,
++    ViewCapability,
++    ViewContract,
++    ViewIntent,
++    ViewResolutionError,
++    recompute_alias_proof_digest,
++    resolve_view,
++)
++
++from .errors import (
++    AliasProofUnavailableError,
++    ExecutionError,
++    PolicyConflictError,
++)
++
++
++def matmul_view_contract(definition: Any) -> ViewContract:
++    """Translate a matmul ``OpDefinition`` into the shared alias contract."""
++
++    return ViewContract(
++        opcode=definition.canonical_opcode,
++        view_obligation=definition.view_obligation,
++        allows_materialize_copy=False,
++        copy_bytes=0,
++        max_copy_bytes=None,
++        effects=str(definition.numeric_contract.get("effects", "pure")),
++    )
++
++
++def matmul_view_capability() -> ViewCapability:
++    """Capability facts for evaluating the matmul contract obligation."""
++
++    return ViewCapability(
++        backend="portable.cpu.scalar",
++        alias_proof="supported",
++        stride_class="contiguous_identity",
++        supported_view_modes=VIEW_MODES,
++        max_rank=4,
++        reason="",
++    )
++
++
++def layout_intent_from_document(layout_document: Optional[Mapping[str, Any]]) -> ViewIntent:
++    """Rebuild the layout intent from a policy/report layout document.
++
++    Unknown or malformed values fail closed through ``ViewIntent``.
++    """
++
++    document = dict(layout_document or {})
++    return ViewIntent(
++        view_mode=document.get("view_mode", "forbid"),
++        allow_materialize_copy=document.get("allow_materialize_copy", True),
++        max_copy_bytes=document.get("max_copy_bytes", None),
++    )
++
++
++def _translate_resolution_error(exc: ViewResolutionError) -> ExecutionError:
++    details = exc.to_dict()
++    if exc.code == "POLICY_CONFLICT":
++        return PolicyConflictError(
++            str(exc),
++            field=exc.field,
++            requested={"view_mode": exc.requested_view_mode},
++            available=exc.available,
++            reason=exc.reason,
++            suggested_policy=exc.suggested_policy,
++            details=details,
++        )
++    return AliasProofUnavailableError(
++        str(exc),
++        field=exc.field,
++        requested={"view_mode": exc.requested_view_mode},
++        available=exc.available,
++        reason=exc.reason,
++        suggested_policy=exc.suggested_policy,
++        details=details,
++    )
++
++
++def canonical_layout_decision(
++    definition: Any, layout_policy_document: Optional[Mapping[str, Any]]
++) -> Mapping[str, Any]:
++    """Re-derive the exact layout decision for a frozen policy.
++
++    Raises :class:`AliasProofUnavailableError` / :class:`PolicyConflictError`
++    when the policy is not satisfiable for this contract (for example
++    ``view_mode=require`` on ``must_not_alias``).
++    """
++
++    contract = matmul_view_contract(definition)
++    capability = matmul_view_capability()
++    intent = layout_intent_from_document(layout_policy_document)
++    try:
++        resolution = resolve_view(contract, capability, intent)
++    except ViewResolutionError as exc:
++        raise _translate_resolution_error(exc) from exc
++    proof = resolution.alias_proof
++    return {
++        "requested_view_mode": resolution.requested_view_mode,
++        "resolved_view_mode": resolution.resolved_view_mode,
++        "view_obligation": definition.view_obligation,
++        "alias_check": "contract_requires_distinct_storage"
++        if definition.view_obligation == "must_not_alias"
++        else "contract_permits_alias",
++        "alias_proof_digest": proof.digest,
++        "alias_proof": proof.to_dict(),
++        "layout_copy_bytes": resolution.layout_copy_bytes,
++        "transfer_bytes": 0,
++        "materialize_allowed": resolution.materialize_allowed,
++        "materialize_reason": resolution.materialize_reason,
++        "resolution_reason": resolution.reason,
++    }
++
++
++def _error(field: str, reason: str, requested: Any = None, available: Any = None) -> Mapping[str, Any]:
++    return {"field": field, "reason": reason, "requested": requested, "available": available}
++
++
++def alias_proof_errors(
++    decision: Mapping[str, Any],
++    *,
++    runtime_alias_check: bool = False
++) -> Tuple[Mapping[str, Any], ...]:
++    """Content-local checks on one frozen ``layout_decision``."""
++
++    errors = []
++    alias_proof = decision.get("alias_proof")
++    if not isinstance(alias_proof, Mapping):
++        return (_error("layout_decision.alias_proof", "alias_proof_missing"),)
++    digest = decision.get("alias_proof_digest")
++    proof_digest = alias_proof.get("digest")
++    if not isinstance(digest, str) or digest != proof_digest:
++        errors.append(
++            _error(
++                "layout_decision.alias_proof_digest",
++                "alias_proof_digest_mismatch",
++                requested=digest,
++                available=proof_digest,
++            )
++        )
++    try:
++        recomputed = recompute_alias_proof_digest(alias_proof)
++    except Exception as exc:  # pragma: no cover - defensive
++        errors.append(
++            _error(
++                "layout_decision.alias_proof.digest",
++                "alias_proof_digest_unrecomputable:{}".format(exc),
++            )
++        )
++    else:
++        if recomputed != proof_digest:
++            errors.append(
++                _error(
++                    "layout_decision.alias_proof.digest",
++                    "alias_proof_digest_mismatch",
++                    requested=proof_digest,
++                    available=recomputed,
++                )
++            )
++
++    obligation = decision.get("view_obligation")
++    facts = alias_proof.get("facts")
++    facts = facts if isinstance(facts, Mapping) else {}
++    contract_facts = facts.get("contract")
++    contract_facts = contract_facts if isinstance(contract_facts, Mapping) else {}
++    if contract_facts.get("view_obligation") != obligation:
++        errors.append(
++            _error(
++                "layout_decision.view_obligation",
++                "alias_proof_contract_obligation_mismatch",
++                requested=obligation,
++                available=contract_facts.get("view_obligation"),
++            )
++        )
++    requested = decision.get("requested_view_mode")
++    resolved = decision.get("resolved_view_mode")
++    if obligation == "must_not_alias" and (requested == "require" or resolved == "view"):
++        errors.append(
++            _error(
++                "layout_decision.resolved_view_mode",
++                "must_not_alias_requires_no_view",
++                requested={"requested_view_mode": requested, "resolved_view_mode": resolved},
++                available={"requested_view_mode": "forbid|prefer", "resolved_view_mode": "not_applicable|materialized"},
++            )
++        )
++    if requested == "require" and resolved != "view":
++        errors.append(
++            _error(
++                "layout_decision.resolved_view_mode",
++                "require_view_mode_not_satisfied",
++                requested=resolved,
++                available="view",
++            )
++        )
++    if resolved == "view" and decision.get("layout_copy_bytes") != 0:
++        errors.append(
++            _error(
++                "layout_decision.layout_copy_bytes",
++                "view_with_nonzero_copy_bytes",
++                requested=decision.get("layout_copy_bytes"),
++                available=0,
++            )
++        )
++    if resolved == "materialized" and decision.get("materialize_allowed") is not True:
++        errors.append(
++            _error(
++                "layout_decision.materialize_allowed",
++                "materialized_without_materialize_permission",
++                requested=decision.get("materialize_allowed"),
++                available=True,
++            )
++        )
++    if runtime_alias_check and decision.get("alias_check") != "verified_distinct":
++        errors.append(
++            _error(
++                "layout_decision.alias_check",
++                "layout_alias_check_not_verified",
++                requested=decision.get("alias_check"),
++                available="verified_distinct",
++            )
++        )
++    return tuple(errors)
++
++
++def layout_rule_errors(payload: Mapping[str, Any]) -> Tuple[Mapping[str, Any], ...]:
++    """Require the plan rule trace to agree with the frozen decision."""
++
++    decision = payload.get("layout_decision")
++    if not isinstance(decision, Mapping):
++        return (_error("layout_decision", "layout_decision_missing"),)
++    resolution = payload.get("resolution")
++    rules = resolution.get("rules") if isinstance(resolution, Mapping) else None
++    if not isinstance(rules, list):
++        return (_error("resolution.rules", "plan_layout_rule_missing"),)
++    matching = [
++        rule
++        for rule in rules
++        if isinstance(rule, Mapping) and rule.get("rule") == "layout.alias_proof"
++    ]
++    if len(matching) != 1:
++        return (
++            _error(
++                "resolution.rules",
++                "plan_layout_rule_missing",
++                requested=len(matching),
++                available=1,
++            ),
++        )
++    details = matching[0].get("details")
++    details = details if isinstance(details, Mapping) else {}
++    alias_proof = decision.get("alias_proof")
++    alias_proof = alias_proof if isinstance(alias_proof, Mapping) else {}
++    expected = {
++        "requested_view_mode": decision.get("requested_view_mode"),
++        "resolved_view_mode": decision.get("resolved_view_mode"),
++        "view_obligation": decision.get("view_obligation"),
++        "alias_proof_status": alias_proof.get("status"),
++        "alias_proof_digest": decision.get("alias_proof_digest"),
++        "failed_conditions": list(alias_proof.get("failed_conditions", [])),
++        "layout_copy_bytes": decision.get("layout_copy_bytes"),
++    }
++    errors = []
++    for key, value in expected.items():
++        if details.get(key) != value:
++            errors.append(
++                _error(
++                    "resolution.rules.layout.alias_proof.{}".format(key),
++                    "plan_layout_rule_decision_mismatch",
++                    requested=details.get(key),
++                    available=value,
++                )
++            )
++    if matching[0].get("outcome") != "ok":
++        errors.append(
++            _error(
++                "resolution.rules.layout.alias_proof.outcome",
++                "plan_layout_rule_decision_mismatch",
++                requested=matching[0].get("outcome"),
++                available="ok",
++            )
++        )
++    return tuple(errors)
++
++
++def layout_decision_errors(
++    decision: Mapping[str, Any],
++    *,
++    definition: Optional[Any] = None,
++    layout_policy_document: Optional[Mapping[str, Any]] = None,
++    runtime_alias_check: bool = False
++) -> Tuple[Mapping[str, Any], ...]:
++    """All layout-decision refusals available at the caller's layer.
++
++    ``definition`` adds the registered-contract cross-check and, together with
++    ``layout_policy_document``, the canonical re-derivation comparison.
++    """
++
++    if not isinstance(decision, Mapping):
++        return (_error("layout_decision", "layout_decision_not_a_mapping"),)
++    errors = list(alias_proof_errors(decision, runtime_alias_check=runtime_alias_check))
++    if definition is not None:
++        obligation = decision.get("view_obligation")
++        if obligation != definition.view_obligation:
++            errors.append(
++                _error(
++                    "layout_decision.view_obligation",
++                    "layout_view_obligation_contract_mismatch",
++                    requested=obligation,
++                    available=definition.view_obligation,
++                )
++            )
++        alias_proof = decision.get("alias_proof")
++        facts = alias_proof.get("facts") if isinstance(alias_proof, Mapping) else None
++        contract_facts = facts.get("contract") if isinstance(facts, Mapping) else None
++        contract_facts = contract_facts if isinstance(contract_facts, Mapping) else {}
++        if contract_facts.get("opcode") != definition.canonical_opcode:
++            errors.append(
++                _error(
++                    "layout_decision.alias_proof.facts.contract.opcode",
++                    "alias_proof_opcode_mismatch",
++                    requested=contract_facts.get("opcode"),
++                    available=definition.canonical_opcode,
++                )
++            )
++        if layout_policy_document is not None:
++            try:
++                expected = canonical_layout_decision(definition, layout_policy_document)
++            except ExecutionError as exc:
++                errors.append(
++                    _error(
++                        "layout_decision",
++                        "layout_decision_not_satisfiable:{}".format(exc.reason or exc.code),
++                        requested=decision.get("requested_view_mode"),
++                        available={
++                            "reason": exc.reason,
++                            "code": exc.code,
++                            "failed_conditions": exc.details.get("failed_conditions")
++                            if isinstance(exc.details, Mapping)
++                            else None,
++                        },
++                    )
++                )
++            else:
++                for key, value in expected.items():
++                    if key == "alias_check" and runtime_alias_check:
++                        continue
++                    if decision.get(key) != value:
++                        errors.append(
++                            _error(
++                                "layout_decision.{}".format(key),
++                                "layout_decision_contract_mismatch",
++                                requested=decision.get(key),
++                                available=value,
++                            )
++                        )
++    return tuple(errors)
++
++
++def raise_first_layout_error(
++    errors: Sequence[Mapping[str, Any]],
++    error_type: Callable[..., Any],
++    field_prefix: str = "plan."
++) -> None:
++    """Raise the first structured layout error through a layer-specific class."""
++
++    if not errors:
++        return
++    first = errors[0]
++    raise error_type(
++        "layout decision failed {} validation: {}".format(first.get("reason"), first.get("field")),
++        field=field_prefix + str(first.get("field")),
++        requested=first.get("requested"),
++        available=first.get("available"),
++        reason=first.get("reason"),
++        details={"errors": [dict(item) for item in errors]},
++    )
++
++
++__all__ = [
++    "alias_proof_errors",
++    "canonical_layout_decision",
++    "layout_decision_errors",
++    "layout_intent_from_document",
++    "layout_rule_errors",
++    "matmul_view_capability",
++    "matmul_view_contract",
++    "raise_first_layout_error",
++]
+diff --git a/python/pypto/execution/plan.py b/python/pypto/execution/plan.py
+index 18f5a0584..633800acf 100644
+--- a/python/pypto/execution/plan.py
++++ b/python/pypto/execution/plan.py
+@@ -20,6 +20,7 @@ from typing import Any, Mapping, Tuple
+ from pypto.target._utils import canonical_json, frozen_mapping, mapping_copy, sha256_text
+ 
+ from .errors import ArtifactMismatchError
++from .layout_verify import layout_decision_errors, layout_rule_errors
+ 
+ 
+ PLAN_SCHEMA_VERSION = 2
+@@ -333,6 +334,36 @@ def _validate_plan_types(data: Mapping[str, Any]) -> None:
+     _require_type(data, "resolution.tie_break", list)
+ 
+ 
++def _validate_layout_decision(data: Mapping[str, Any]) -> None:
++    """Reject a self-inconsistent frozen layout/view decision.
++
++    Content-local checks only: the alias-proof digest must recompute, the
++    proof facts must agree with the declared obligation, the obligation
++    invariants (``must_not_alias``/``require``/``view``/``materialized``) must
++    hold, and the ``layout.alias_proof`` rule trace must agree with the
++    decision.  The cross-check against the registered OpDefinition runs in
++    :func:`pypto.execution.entry._verify_plan_layout_decision`, where the plan
++    meets the contract registry.
++    """
++
++    decision = data["layout_decision"]
++    errors = list(layout_decision_errors(decision))
++    errors.extend(layout_rule_errors(data))
++    if not errors:
++        return
++    first = errors[0]
++    raise ArtifactMismatchError(
++        "execution plan layout decision failed {} validation: {}".format(
++            first.get("reason"), first.get("field")
++        ),
++        field="plan." + str(first.get("field")),
++        requested=first.get("requested"),
++        available=first.get("available"),
++        reason=first.get("reason"),
++        details={"errors": [dict(item) for item in errors]},
++    )
++
++
+ @dataclass(frozen=True, init=False)
+ class ExecutionPlan:
+     """Frozen resolution result; runtime only validates, never re-selects."""
+@@ -385,6 +416,7 @@ class ExecutionPlan:
+         for path in _REQUIRED_PATHS:
+             _walk(data, path)
+         _validate_plan_types(data)
++        _validate_layout_decision(data)
+         if not isinstance(data["candidates"], list) or not data["candidates"]:
+             raise ArtifactMismatchError(
+                 "execution plan must carry at least one candidate",
+diff --git a/python/pypto/execution/report.py b/python/pypto/execution/report.py
+index 4621d51c4..133e0ab03 100644
+--- a/python/pypto/execution/report.py
++++ b/python/pypto/execution/report.py
+@@ -391,6 +391,57 @@ def validate_report_schema(report: Mapping[str, Any]) -> Mapping[str, Any]:
+             },
+             reason="negative_layout_bytes",
+         )
++    # The report copy must also match the registered contract and the
++    # canonical re-derivation: a self-consistent forgery (recomputed
++    # alias-proof digest, flipped obligation) is still refused.
++    from .layout_verify import layout_decision_errors
++    from .op_registry import get_op_definition
++
++    contract = report["resolved"]["contract"]
++    try:
++        definition = get_op_definition(str(contract["opcode"]))
++    except Exception as exc:
++        raise ReportSchemaError(
++            "report contract opcode is not registered",
++            field="report.resolved.contract.opcode",
++            requested=contract["opcode"],
++            reason="report_contract_unknown",
++        ) from exc
++    if definition.contract_digest != contract["digest"] or definition.contract_version != contract["version"]:
++        raise ReportSchemaError(
++            "report contract identity does not match the registered OpDefinition",
++            field="report.resolved.contract.digest",
++            requested={"version": contract["version"], "digest": contract["digest"]},
++            available={
++                "version": definition.contract_version,
++                "digest": definition.contract_digest,
++            },
++            reason="report_contract_identity_mismatch",
++        )
++    policy_layout = None
++    requested_policy = report.get("requested_policy")
++    if isinstance(requested_policy, Mapping):
++        candidate = requested_policy.get("layout")
++        if isinstance(candidate, Mapping):
++            policy_layout = candidate
++    layout_errors = layout_decision_errors(
++        layout,
++        definition=definition,
++        layout_policy_document=policy_layout,
++        runtime_alias_check=True,
++    )
++    if layout_errors:
++        first = layout_errors[0]
++        raise ReportSchemaError(
++            "report layout decision failed {} validation: {}".format(
++                first.get("reason"), first.get("field")
++            ),
++            field="report." + str(first.get("field")),
++            requested=first.get("requested"),
++            available=first.get("available"),
++            reason=first.get("reason"),
++            details={"errors": [dict(item) for item in layout_errors]},
++        )
+     parallelism = report["resources"]["parallelism"]
+     if parallelism["thread_mode"] not in ("single_thread", "env_default", "api_pinned"):
+         raise ReportSchemaError(
+diff --git a/python/pypto/execution/resolver.py b/python/pypto/execution/resolver.py
+index a3f2ffe78..ae7a4bb53 100644
+--- a/python/pypto/execution/resolver.py
++++ b/python/pypto/execution/resolver.py
+@@ -34,14 +34,6 @@ from __future__ import annotations
+ from dataclasses import dataclass
+ from typing import Any, Mapping, Optional, Sequence, Tuple
+ 
+-from pypto.alias import (
+-    VIEW_MODES,
+-    ViewCapability,
+-    ViewContract,
+-    ViewIntent,
+-    ViewResolutionError,
+-    resolve_view,
+-)
+ from pypto.compiler.targets.cpu import ARTIFACT_PAYLOAD_VERSION
+ from pypto.core_ir import CoreType
+ from pypto.lowering.cpu import (
+@@ -54,7 +46,6 @@ from pypto.target._utils import mapping_copy
+ 
+ from .capability import CapabilitySnapshot, ProviderCapability, host_triple
+ from .errors import (
+-    AliasProofUnavailableError,
+     ArtifactMismatchError,
+     CapabilityUnavailableError,
+     FallbackDisallowedError,
+@@ -66,6 +57,7 @@ from .errors import (
+     ProviderUnavailableError,
+     ResourceBudgetExceededError,
+ )
++from .layout_verify import canonical_layout_decision
+ from .op_registry import MATMUL_CANONICAL_OPCODE, OpDefinition, get_op_definition
+ from .plan import PLAN_TIE_BREAK, ExecutionPlan, build_plan_payload
+ from .policy import KNOWN_TARGET_KINDS, ExecutionPolicy
+@@ -631,99 +623,19 @@ def _evaluate_provider(
+     }
+ 
+ 
+-def _matmul_view_contract(definition: OpDefinition) -> ViewContract:
+-    """Translate the matmul OpDefinition into the shared alias-proof contract.
+-
+-    Matmul is a P3 contraction: its inputs are read-only and the output is a
+-    distinct destination, so ``view_obligation=must_not_alias``.  That is
+-    enough for ``prefer``/``forbid`` to resolve to ``not_applicable`` and for
+-    ``require`` to fail closed with the failed contract condition.
+-    """
+-
+-    aliasing = definition.numeric_contract.get("aliasing")
+-    allows_materialize = False
+-    copy_bytes = 0
+-    return ViewContract(
+-        opcode=definition.canonical_opcode,
+-        view_obligation=definition.view_obligation,
+-        allows_materialize_copy=allows_materialize,
+-        copy_bytes=copy_bytes,
+-        max_copy_bytes=None,
+-        effects=str(definition.numeric_contract.get("effects", "pure")),
+-    )
+-
+-
+-def _matmul_view_capability() -> ViewCapability:
+-    """Capability facts for evaluating the matmul contract obligation."""
+-
+-    return ViewCapability(
+-        backend="portable.cpu.scalar",
+-        alias_proof="supported",
+-        stride_class="contiguous_identity",
+-        supported_view_modes=VIEW_MODES,
+-        max_rank=4,
+-        reason="",
+-    )
+-
+-
+ def _resolve_matmul_layout(
+     policy: ExecutionPolicy, definition: OpDefinition
+ ) -> Mapping[str, Any]:
+     """Return the plan ``layout_decision`` for a matmul request.
+ 
+-    ``require`` that cannot be proved fails closed with
+-    ``ALIAS_PROOF_UNAVAILABLE`` and never degrades to a silent copy.  For
+-    ``forbid``/``prefer`` the contract has no view obligation, so the
+-    resolved decision is ``not_applicable`` while the requested intent and the
+-    contract-proof result stay visible in the plan/report.
++    The canonical derivation lives in
++    :mod:`pypto.execution.layout_verify` and is shared with the plan/report
++    validators, so the frozen decision can be re-derived from the policy and
++    the registered contract.  ``require`` that cannot be proved fails closed
++    with ``ALIAS_PROOF_UNAVAILABLE`` and never degrades to a silent copy.
+     """
+ 
+-    contract = _matmul_view_contract(definition)
+-    capability = _matmul_view_capability()
+-    intent = ViewIntent(
+-        view_mode=policy.layout.view_mode,
+-        allow_materialize_copy=policy.layout.allow_materialize_copy,
+-        max_copy_bytes=policy.layout.max_copy_bytes,
+-    )
+-    try:
+-        resolution = resolve_view(contract, capability, intent)
+-    except ViewResolutionError as exc:
+-        details = exc.to_dict()
+-        if exc.code == "POLICY_CONFLICT":
+-            raise PolicyConflictError(
+-                str(exc),
+-                field=exc.field,
+-                requested={"view_mode": policy.layout.view_mode},
+-                available=exc.available,
+-                reason=exc.reason,
+-                suggested_policy=exc.suggested_policy,
+-                details=details,
+-            ) from exc
+-        raise AliasProofUnavailableError(
+-            str(exc),
+-            field=exc.field,
+-            requested={"view_mode": policy.layout.view_mode, "opcode": definition.canonical_opcode},
+-            available=exc.available,
+-            reason=exc.reason,
+-            suggested_policy=exc.suggested_policy,
+-            details=details,
+-        ) from exc
+-    proof = resolution.alias_proof
+-    return {
+-        "requested_view_mode": resolution.requested_view_mode,
+-        "resolved_view_mode": resolution.resolved_view_mode,
+-        "view_obligation": definition.view_obligation,
+-        "alias_check": "contract_requires_distinct_storage"
+-        if definition.view_obligation == "must_not_alias"
+-        else "contract_permits_alias",
+-        "alias_proof_digest": proof.digest,
+-        "alias_proof": proof.to_dict(),
+-        "layout_copy_bytes": resolution.layout_copy_bytes,
+-        "transfer_bytes": 0,
+-        "materialize_allowed": resolution.materialize_allowed,
+-        "materialize_reason": resolution.materialize_reason,
+-        "resolution_reason": resolution.reason,
+-    }
++    return canonical_layout_decision(definition, policy.layout.to_dict())
+ 
+ 
+ def resolve_matmul(
+diff --git a/python/tests/ut/pypto_x/test_execution_view_mode.py b/python/tests/ut/pypto_x/test_execution_view_mode.py
+index 551f31cd3..f70798fbf 100644
+--- a/python/tests/ut/pypto_x/test_execution_view_mode.py
++++ b/python/tests/ut/pypto_x/test_execution_view_mode.py
+@@ -17,6 +17,7 @@ matmul resolver and the native AVX-512 layout executor.  These tests pin:
+ 
+ from __future__ import annotations
+ 
++import copy
+ import json
+ 
+ import pytest
+@@ -51,8 +52,10 @@ from pypto.execution import (
+     ExecutionPolicy,
+     LayoutPolicy,
+     execute_matmul,
++    execute_matmul_plan,
+     plan_matmul,
+     policy_from_dict,
++    validate_report_schema,
+ )
+ from pypto.backends.cpu import HostTensor
+ 
+@@ -771,3 +774,204 @@ def test_alias_proof_status_domain_is_closed():
+     document = proof.to_dict()
+     assert document["status"] in ALIAS_PROOF_STATUSES
+     assert isinstance(document["conditions"], list)
++
++
++# ---------------------------------------------------------------------------
++# adversarial forgery probes (independent-verification blockers V3)
++# ---------------------------------------------------------------------------
++def _valid_report_document():
++    left = HostTensor("float32", (2, 4), [float(index + 1) for index in range(8)])
++    right = HostTensor("float32", (4, 4), [0.5] * 16)
++    _, report = execute_matmul(left, right, policy=ExecutionPolicy())
++    return json.loads(json.dumps(report.to_dict()))
++
++
++def _align_rules_with_decision(payload):
++    """Update the plan rule trace so only the contract cross-check can refuse."""
++
++    decision = payload["layout_decision"]
++    proof = decision["alias_proof"]
++    for rule in payload["resolution"]["rules"]:
++        if rule.get("rule") == "layout.alias_proof":
++            rule["details"].update(
++                {
++                    "requested_view_mode": decision["requested_view_mode"],
++                    "resolved_view_mode": decision["resolved_view_mode"],
++                    "view_obligation": decision["view_obligation"],
++                    "alias_proof_status": proof["status"],
++                    "alias_proof_digest": decision["alias_proof_digest"],
++                    "failed_conditions": list(proof["failed_conditions"]),
++                    "layout_copy_bytes": decision["layout_copy_bytes"],
++                }
++            )
++    return payload
++
++
++def _make_self_consistent_forged_view_decision(payload):
++    """Turn a matmul plan into a (content-local) self-consistent require->view."""
++
++    layout = payload["layout_decision"]
++    layout["requested_view_mode"] = "require"
++    layout["resolved_view_mode"] = "view"
++    layout["layout_copy_bytes"] = 0
++    layout["materialize_allowed"] = False
++    layout["materialize_reason"] = "forged"
++    layout["resolution_reason"] = "forged"
++    # Flip the declared obligation and the proof facts together, then rebuild
++    # every digest so that only the registered contract can tell the forgery.
++    layout["view_obligation"] = "may_alias"
++    layout["alias_proof"]["facts"]["contract"]["view_obligation"] = "may_alias"
++    layout["alias_proof"]["status"] = "proven"
++    layout["alias_proof"]["reason"] = "all_alias_proof_conditions_passed"
++    layout["alias_proof"]["failed_conditions"] = []
++    for condition in layout["alias_proof"]["conditions"]:
++        condition["status"] = "passed"
++        condition["code"] = "forged"
++        condition["reason"] = "forged"
++        condition["evidence"] = {}
++    layout["alias_proof"]["digest"] = recompute_alias_proof_digest(layout["alias_proof"])
++    layout["alias_proof_digest"] = layout["alias_proof"]["digest"]
++    return _align_rules_with_decision(payload)
++
++
++def test_report_schema_rejects_forged_alias_proof_without_digest_recompute():
++    document = _valid_report_document()
++    layout = document["layout_decision"]
++    layout["requested_view_mode"] = "require"
++    layout["resolved_view_mode"] = "view"
++    layout["layout_copy_bytes"] = 0
++    layout["alias_proof"]["status"] = "proven"
++    layout["alias_proof"]["reason"] = "forged"
++    with pytest.raises(Exception) as excinfo:
++        validate_report_schema(document)
++    assert getattr(excinfo.value, "code", None) == REPORT_SCHEMA_INVALID
++
++
++def test_plan_validate_rejects_content_inconsistent_alias_decision():
++    payload = plan_matmul((2, 3), (3, 4), "float32").plan.payload
++
++    # (a) alias_proof_digest must equal the recomputable proof digest.
++    forged = copy.deepcopy(payload)
++    forged["layout_decision"]["alias_proof_digest"] = "sha256:" + "0" * 64
++    with pytest.raises(Exception) as digest_error:
++        ExecutionPlan(forged).validate()
++    assert getattr(digest_error.value, "code", None) == ARTIFACT_MISMATCH
++    assert digest_error.value.reason == "alias_proof_digest_mismatch"
++
++    # (b) the proof facts and the declared obligation must agree.
++    forged = copy.deepcopy(payload)
++    forged["layout_decision"]["alias_proof"]["facts"]["contract"][
++        "view_obligation"
++    ] = "may_alias"
++    recomputed = recompute_alias_proof_digest(forged["layout_decision"]["alias_proof"])
++    forged["layout_decision"]["alias_proof"]["digest"] = recomputed
++    forged["layout_decision"]["alias_proof_digest"] = recomputed
++    with pytest.raises(Exception) as obligation_error:
++        ExecutionPlan(forged).validate()
++    assert obligation_error.value.reason == "alias_proof_contract_obligation_mismatch"
++
++    # (c) must_not_alias may never claim require/view (no digest recompute needed).
++    forged = copy.deepcopy(payload)
++    forged["layout_decision"]["requested_view_mode"] = "require"
++    forged["layout_decision"]["resolved_view_mode"] = "view"
++    forged["layout_decision"]["layout_copy_bytes"] = 0
++    with pytest.raises(Exception) as view_error:
++        ExecutionPlan(forged).validate()
++    assert view_error.value.reason == "must_not_alias_requires_no_view"
++
++    # (e) the layout.alias_proof rule trace must agree with the decision.
++    forged = copy.deepcopy(payload)
++    for rule in forged["resolution"]["rules"]:
++        if rule.get("rule") == "layout.alias_proof":
++            rule["details"]["resolved_view_mode"] = "view"
++    with pytest.raises(Exception) as rule_error:
++        ExecutionPlan(forged).validate()
++    assert rule_error.value.reason == "plan_layout_rule_decision_mismatch"
++
++
++def test_plan_validate_rejects_invariant_violations():
++    from pypto.execution.layout_verify import alias_proof_errors
++
++    decision = plan_matmul((2, 3), (3, 4), "float32").plan.payload["layout_decision"]
++
++    # (d) require must resolve to view; view must copy nothing; materialized
++    # must be explicitly allowed.
++    forged = copy.deepcopy(decision)
++    forged["requested_view_mode"] = "require"
++    forged["resolved_view_mode"] = "materialized"
++    assert "require_view_mode_not_satisfied" in {
++        item["reason"] for item in alias_proof_errors(forged)
++    }
++
++    forged = copy.deepcopy(decision)
++    forged["resolved_view_mode"] = "view"
++    forged["layout_copy_bytes"] = 64
++    assert "view_with_nonzero_copy_bytes" in {
++        item["reason"] for item in alias_proof_errors(forged)
++    }
++
++    forged = copy.deepcopy(decision)
++    forged["resolved_view_mode"] = "materialized"
++    forged["materialize_allowed"] = False
++    assert "materialized_without_materialize_permission" in {
++        item["reason"] for item in alias_proof_errors(forged)
++    }
++
++
++def test_recomputed_digest_forged_plan_is_rejected_before_execution():
++    """The verifier's blocker 2: self-consistent forgery must not execute."""
++
++    payload = _make_self_consistent_forged_view_decision(
++        copy.deepcopy(plan_matmul((2, 3), (3, 4), "float32").plan.payload)
++    )
++    forged = ExecutionPlan(payload)
++    # Content-local validation passes because every digest was recomputed.
++    forged.validate()
++
++    left = HostTensor("float32", (2, 3), [float(index + 1) for index in range(6)])
++    right = HostTensor("float32", (3, 4), [0.5] * 12)
++    with pytest.raises(Exception) as excinfo:
++        execute_matmul_plan(forged, left, right)
++    error = excinfo.value
++    assert getattr(error, "code", None) == ARTIFACT_MISMATCH
++    assert error.reason in {
++        "layout_view_obligation_contract_mismatch",
++        "layout_decision_contract_mismatch",
++        "layout_decision_not_satisfiable:contract_requires_distinct_storage",
++    }
++    # No output side effect: the contract cross-check ran before any provider.
++    assert left.flat() == tuple(float(index + 1) for index in range(6))
++
++
++def test_recomputed_digest_forged_report_is_rejected():
++    document = _valid_report_document()
++    layout = document["layout_decision"]
++    layout["requested_view_mode"] = "require"
++    layout["resolved_view_mode"] = "view"
++    layout["layout_copy_bytes"] = 0
++    layout["materialize_allowed"] = False
++    layout["materialize_reason"] = "forged"
++    layout["resolution_reason"] = "forged"
++    layout["view_obligation"] = "may_alias"
++    layout["alias_proof"]["facts"]["contract"]["view_obligation"] = "may_alias"
++    layout["alias_proof"]["status"] = "proven"
++    layout["alias_proof"]["reason"] = "forged"
++    layout["alias_proof"]["failed_conditions"] = []
++    for condition in layout["alias_proof"]["conditions"]:
++        condition["status"] = "passed"
++        condition["code"] = "forged"
++        condition["reason"] = "forged"
++        condition["evidence"] = {}
++    layout["alias_proof"]["digest"] = recompute_alias_proof_digest(layout["alias_proof"])
++    layout["alias_proof_digest"] = layout["alias_proof"]["digest"]
++    with pytest.raises(Exception) as excinfo:
++        validate_report_schema(document)
++    assert getattr(excinfo.value, "code", None) == REPORT_SCHEMA_INVALID
++    # Both the alias_proof_digest equality and the registered-contract
++    # cross-check are part of the refusal surface.
++    reasons = {item["reason"] for item in excinfo.value.details.get("errors", [])}
++    assert reasons & {
++        "layout_view_obligation_contract_mismatch",
++        "layout_decision_not_satisfiable:contract_requires_distinct_storage",
++        "layout_decision_contract_mismatch",
++    }

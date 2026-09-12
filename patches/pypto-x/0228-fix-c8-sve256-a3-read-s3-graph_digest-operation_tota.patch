@@ -1,0 +1,177 @@
+From fe8e6fd17535a8282c1d5f490faf7d91aec3b6a2 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 10:21:14 +0800
+Subject: [PATCH 228/235] fix(c8-sve256-a3): read s3
+ graph_digest/operation_total from the top level
+
+The stage-s3 JSON carries graph_digest/operation_total at the top level, not
+under census; the A3 summarizer/batch reporter must not fall back to empty
+values.  Adds the read-only per-batch A3 report helper.
+---
+ tools/c8_sve256_a3/m2b_batch_report.py         | 142 +++++++++++++++++++++++++++++++++++++++++++++
+ tools/c8_sve256_a3/m2b_summarize_a3_results.py |   4 +-
+ 2 files changed, 144 insertions(+), 2 deletions(-)
+
+diff --git a/tools/c8_sve256_a3/m2b_batch_report.py b/tools/c8_sve256_a3/m2b_batch_report.py
+new file mode 100644
+index 000000000..e6541665a
+--- /dev/null
++++ b/tools/c8_sve256_a3/m2b_batch_report.py
+@@ -0,0 +1,142 @@
++#!/usr/bin/env python3
++# -*- coding: utf-8 -*-
++"""Per-batch A3 report for the M2b SVE256 W8A8 L4 window.
++
++Read-only over the A3 root layout:
++
++    raw/<config>/<prompt>.json              driver stage-s3 result
++    raw/<config>/<prompt>.progress.log      executed op stream
++    raw/dumps_packed/<config>/<prompt>.*.npz packed logits
++
++Prints one JSON object with, per prompt: status, graph_digest, op total, wall,
++executed int8 transpose count (must be 0), native qmatmul count, packed logits
++sha256/size, and the static-census cross-check (digest/op count).
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++from pathlib import Path
++
++PROMPTS = ("en_continuation", "zh_continuation", "chat_zh_user")
++STEPS = {"en_continuation": 5, "zh_continuation": 8, "chat_zh_user": 18}
++
++
++def _sha256(path: Path) -> str:
++    digest = hashlib.sha256()
++    with open(path, "rb") as stream:
++        for chunk in iter(lambda: stream.read(1 << 20), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _progress(path: Path) -> dict:
++    launches = 0
++    ops = 0
++    int8_transposes = 0
++    qmatmul_native = 0
++    qmatmul_any = 0
++    last = None
++    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
++        line = line.strip()
++        if not line.startswith("{"):
++            continue
++        try:
++            item = json.loads(line)
++        except json.JSONDecodeError:
++            continue
++        if item.get("kind") != "op":
++            continue
++        index = int(item.get("index") or 0)
++        if ops and index == 0:
++            launches += 1
++        elif ops == 0:
++            launches = 1
++        ops += 1
++        last = index
++        name = str(item.get("operation"))
++        dtype = str(item.get("dtype"))
++        mode = str(item.get("mode"))
++        if name == "transpose" and dtype == "int8":
++            int8_transposes += 1
++        if name == "qmatmul_s8s8_s32":
++            qmatmul_any += 1
++            if mode.startswith("native"):
++                qmatmul_native += 1
++    return {
++        "launches": launches,
++        "executed_ops": ops,
++        "last_op_index": last,
++        "executed_int8_transposes": int8_transposes,
++        "executed_qmatmul_s8s8_s32": qmatmul_any,
++        "executed_qmatmul_native": qmatmul_native,
++    }
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--root", required=True)
++    parser.add_argument("--config", required=True, choices=("default", "full"))
++    parser.add_argument("--static-census", default=None)
++    args = parser.parse_args()
++    root = Path(args.root).resolve()
++
++    expected = {}
++    if args.static_census:
++        census = json.loads(Path(args.static_census).read_text(encoding="utf-8"))
++        for row in census["rows"]:
++            if row["config"] == args.config:
++                expected[row["prompt"]] = row
++
++    report = {"config": args.config, "prompts": {}}
++    for prompt in PROMPTS:
++        driver = root / "raw" / args.config / "{}.json".format(prompt)
++        progress = root / "raw" / args.config / "{}.progress.log".format(prompt)
++        entry = {"prompt": prompt}
++        if not driver.is_file():
++            entry["error"] = "driver JSON missing"
++            report["prompts"][prompt] = entry
++            continue
++        payload = json.loads(driver.read_text(encoding="utf-8"))
++        census = payload.get("census") or {}
++        entry.update(
++            {
++                "status": payload.get("status"),
++                "graph_digest": payload.get("graph_digest") or census.get("graph_digest"),
++                "operation_total": payload.get("operation_total") or census.get("operation_total"),
++                "wall_seconds": payload.get("wall_seconds"),
++                "launch_error": payload.get("launch_error"),
++                "executed": _progress(progress) if progress.is_file() else None,
++            }
++        )
++        steps = STEPS[prompt]
++        dumps = root / "raw" / "dumps_packed" / args.config
++        prefill = dumps / "{}.s3-prefill.past0.npz".format(prompt)
++        entry["prefill_npz"] = (
++            {"sha256": _sha256(prefill), "nbytes": prefill.stat().st_size}
++            if prefill.is_file() else None
++        )
++        entry["decode_npz"] = {}
++        for step in range(4):
++            path = dumps / "{}.s3-decode.past{}.npz".format(prompt, steps + step)
++            if path.is_file():
++                entry["decode_npz"][str(steps + step)] = {
++                    "sha256": _sha256(path), "nbytes": path.stat().st_size
++                }
++        exp = expected.get(prompt)
++        if exp:
++            entry["static_check"] = {
++                "digest_matches": exp["graph_digest"] == entry["graph_digest"],
++                "ops_matches": exp["operation_total"] == entry["operation_total"],
++                "expected_digest": exp["graph_digest"],
++                "expected_ops": exp["operation_total"],
++            }
++        report["prompts"][prompt] = entry
++    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/c8_sve256_a3/m2b_summarize_a3_results.py b/tools/c8_sve256_a3/m2b_summarize_a3_results.py
+index ce219b6bb..f060e058f 100755
+--- a/tools/c8_sve256_a3/m2b_summarize_a3_results.py
++++ b/tools/c8_sve256_a3/m2b_summarize_a3_results.py
+@@ -137,8 +137,8 @@ def main() -> int:
+             entry.update(
+                 {
+                     "driver_status": payload.get("status"),
+-                    "graph_digest": census.get("graph_digest"),
+-                    "operation_total": census.get("operation_total"),
++                    "graph_digest": payload.get("graph_digest") or census.get("graph_digest"),
++                    "operation_total": payload.get("operation_total") or census.get("operation_total"),
+                     "wall_seconds": payload.get("wall_seconds"),
+                     "shape_profile": payload.get("shape_profile"),
+                 }

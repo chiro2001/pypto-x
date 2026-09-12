@@ -1,0 +1,769 @@
+From 9cb3e7b59ab0433f6e6cf8e62f0efd0a08cbfb95 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 12 Sep 2026 08:09:00 +0800
+Subject: [PATCH 222/235] tools: complete the C7 drill-down script set in
+ integration
+
+The drill-down tooling was built as a five-commit series on
+work/c7-decode-gap-localization (093ccb438 .. 0d98a7f28) adding
+dump_gold_step_intermediates.py, run_drilldown_ours.py,
+run_drilldown_heavy.sh, wait_and_run_drilldown.sh and
+compare_step_intermediates.py.  Only the last commit was cherry-picked
+(11b9fb797), so the four companion scripts were missing while
+compare_step_intermediates.py already carried the series' final content.
+
+This commit materialises the four missing files from the branch tip so
+that tools/diag_c7/ is byte-identical to 0d98a7f28 (verified with
+`git diff --stat 0d98a7f28 HEAD -- tools/diag_c7/` being empty), which is
+what the drill-down evidence (raw/compute_drilldown_step2.json) was
+produced with.
+---
+ tools/diag_c7/dump_gold_step_intermediates.py | 340 ++++++++++++++++++++++++++++++++++++++++++++++
+ tools/diag_c7/run_drilldown_heavy.sh          |  84 ++++++++++++
+ tools/diag_c7/run_drilldown_ours.py           | 253 ++++++++++++++++++++++++++++++++++
+ tools/diag_c7/wait_and_run_drilldown.sh       |  42 ++++++
+ 4 files changed, 719 insertions(+)
+
+diff --git a/tools/diag_c7/dump_gold_step_intermediates.py b/tools/diag_c7/dump_gold_step_intermediates.py
+new file mode 100755
+index 000000000..2bd28aa9c
+--- /dev/null
++++ b/tools/diag_c7/dump_gold_step_intermediates.py
+@@ -0,0 +1,340 @@
++#!/usr/bin/env python3
++"""C7 drilldown（gold 侧）：在 HF w8a8 gold 上注入 gold 输入 state，跑目标 decode step 的
++一次前向，抓取与 ours SSA 同名的逐层/逐算子中间张量。
++
++映射（ours SSA -> 本脚本 key）：
++  layer_XX_input_norm_scaled      -> layer_XX__input_norm        (HF RMSNorm 输出 bf16)
++  layer_XX_branch_output          -> layer_XX__branch_output     (self_attn / linear_attn 输出)
++  layer_XX_attention_residual     -> layer_XX__attention_residual（HF 由 input+branch 重算）
++  layer_XX_post_attention_norm_scaled -> layer_XX__post_attention_norm
++  layer_XX_mlp_*_output           -> layer_XX__mlp_{gate,up,down}
++  layer_XX_output                 -> layer_XX__output
++  attention: q/k/v_projection_output, q/k_norm_scaled, q/k_rope_full_result,
++             probabilities, context, merged, o_projection_output, new_k/new_v
++  gdr: in_proj_*_output, causal_conv_output, conv_time, q/k/v_raw, q/k,
++       beta, gate_log_decay, recurrent_step_0_output, gated_norm_scaled_bf16,
++       merged, out_projection_output
++  final_norm_scaled / final_hidden -> final_norm / final_hidden; logits -> logits
++
++只读资产（local_files_only=True），输出一个 npz + mapping JSON。
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import importlib.util
++import json
++import os
++import sys
++import time
++from pathlib import Path
++
++import numpy as np
++
++
++def load_module(name, path):
++    spec = importlib.util.spec_from_file_location(name, path)
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++def sha256_file(path):
++    digest = hashlib.sha256()
++    with open(path, "rb") as handle:
++        for chunk in iter(lambda: handle.read(1 << 20), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def parse_args():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--harness", required=True)
++    parser.add_argument("--assets-dir", required=True)
++    parser.add_argument("--gold-states-dir", required=True)
++    parser.add_argument("--gold-reference-dir", required=True)
++    parser.add_argument("--gold-tag", default="step_1")
++    parser.add_argument("--prompt", default="zh_continuation")
++    parser.add_argument("--token-index", type=int, default=2,
++                        help="该步消费的 gold token 下标（zh step2 为 2）")
++    parser.add_argument("--out-dir", required=True)
++    parser.add_argument("--threads", type=int, default=6)
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument("--variant", default="w8a8")
++    parser.add_argument("--dry-run", action="store_true")
++    return parser.parse_args()
++
++
++def main():
++    args = parse_args()
++    harness = load_module("c7_run_reference", os.path.abspath(args.harness))
++    import w8a8_reference  # noqa: F401
++    import torch
++
++    torch.set_num_threads(args.threads)
++    np.random.seed(args.seed)
++    torch.manual_seed(args.seed)
++
++    gold_states_path = Path(args.gold_states_dir) / "{}.npz".format(args.prompt)
++    gold = dict(np.load(gold_states_path, allow_pickle=False))
++    chain = [int(v) for v in gold["decode_token_ids"]]
++    token = chain[args.token_index]
++    if args.dry_run:
++        print("[hf-drill] dry-run: token={} tag={} prompt={}".format(token, args.gold_tag, args.prompt))
++        return 0
++
++    from transformers import AutoTokenizer
++    tokenizer = AutoTokenizer.from_pretrained(args.assets_dir, local_files_only=True)
++    prompts = harness.encode_prompts(tokenizer, [args.prompt])
++    item = prompts[0]
++
++    variant = harness.W8A8_VARIANTS[args.variant]
++    model = harness.load_model(args.assets_dir, variant["base_dtype"], "eager")
++    audit = w8a8_reference.apply_fake_quant(model, args.variant)
++    layers = model.model.language_model.layers
++    text_model = model.model.language_model
++
++    # ---- state dtype map / cache injection (复用 C7 已修的两点：按 kind dtype、torch.tensor 拷贝) ----
++    kind_map = {"conv_state": "conv", "recurrent_state": "recurrent",
++                "key_cache": "k", "value_cache": "v"}
++    manifest = json.loads((Path(args.gold_states_dir) / "gold_states_manifest.json").read_text(encoding="utf-8"))
++    dtype_by_kind = {}
++    for run in manifest.get("runs", []):
++        for key, dtype_name in run.get("state_dtypes", {}).items():
++            kind = kind_map[key.split("__")[-1]]
++            dtype = getattr(torch, dtype_name.replace("torch.", ""))
++            dtype_by_kind[kind] = dtype
++
++    from transformers import DynamicCache
++    cache = DynamicCache(config=text_model.config)
++    for index, layer in enumerate(layers):
++        snap = {kind: gold.get("{}__layer_{:02d}__{}".format(
++            args.gold_tag, index, {"conv": "conv_state", "recurrent": "recurrent_state",
++                                   "k": "key_cache", "v": "value_cache"}[kind]))
++            for kind in ("conv", "recurrent", "k", "v")}
++        cache_layer = cache.layers[index]
++        if hasattr(cache_layer, "conv_states"):
++            if snap["conv"] is not None:
++                tensor = torch.tensor(np.ascontiguousarray(snap["conv"]), dtype=dtype_by_kind["conv"])
++                cache_layer.conv_states[0] = tensor
++                cache_layer.is_conv_states_initialized[0] = True
++                cache_layer.conv_kernel_size[0] = int(tensor.shape[-1])
++            if snap["recurrent"] is not None:
++                cache_layer.recurrent_states[0] = torch.tensor(
++                    np.ascontiguousarray(snap["recurrent"]), dtype=dtype_by_kind["recurrent"])
++                cache_layer.is_recurrent_states_initialized[0] = True
++                cache_layer.has_previous_state[0] = True
++            cache_layer.dtype = dtype_by_kind.get("conv")
++            cache_layer.device = torch.device("cpu")
++        else:
++            cache_layer.keys = torch.tensor(np.ascontiguousarray(snap["k"]), dtype=dtype_by_kind["k"])
++            cache_layer.values = torch.tensor(np.ascontiguousarray(snap["v"]), dtype=dtype_by_kind["v"])
++            cache_layer.is_initialized = True
++            cache_layer.dtype = dtype_by_kind["k"]
++            cache_layer.device = torch.device("cpu")
++
++    # ---- capture helpers ----
++    captured = {}
++    shapes = {}
++    dtypes = {}
++
++    def store(key, tensor):
++        if tensor is None:
++            return
++        array = tensor.detach().to(torch.float32).cpu().numpy().copy()
++        captured[key] = array
++        shapes[key] = list(array.shape)
++        dtypes[key] = str(tensor.dtype)
++
++    def hook_output(module, key):
++        def _hook(_module, _inputs, output):
++            value = output[0] if isinstance(output, tuple) else output
++            store(key, value)
++        module.register_forward_hook(_hook)
++
++    def hook_input(module, key):
++        def _hook(_module, inputs, _output):
++            if inputs:
++                store(key, inputs[0])
++        module.register_forward_hook(_hook)
++
++    import transformers.models.qwen3_5.modeling_qwen3_5 as modeling
++
++    # id maps for patched functions
++    conv_state_ids = {}
++    recurrent_state_ids = {}
++    for index, layer in enumerate(layers):
++        cache_layer = cache.layers[index]
++        if hasattr(cache_layer, "conv_states") and cache_layer.conv_states.get(0) is not None:
++            conv_state_ids[id(cache_layer.conv_states[0])] = index
++        if hasattr(cache_layer, "recurrent_states") and cache_layer.recurrent_states.get(0) is not None:
++            recurrent_state_ids[id(cache_layer.recurrent_states[0])] = index
++
++    # ---- register hooks ----
++    for index, layer in enumerate(layers):
++        prefix = "layer_{:02d}".format(index)
++        layer.register_forward_pre_hook(
++            lambda _m, inputs, _idx=index: store("layer_{:02d}__input_hidden".format(_idx), inputs[0]))
++        hook_output(layer, prefix + "__output")
++        hook_output(layer.input_layernorm, prefix + "__input_norm")
++        hook_output(layer.post_attention_layernorm, prefix + "__post_attention_norm")
++        hook_output(layer.mlp, prefix + "__mlp_down")
++        hook_output(layer.mlp.gate_proj, prefix + "__mlp_gate")
++        hook_output(layer.mlp.up_proj, prefix + "__mlp_up")
++        hook_output(layer.mlp.down_proj, prefix + "__mlp_down_proj")
++        if hasattr(layer, "self_attn"):
++            attn = layer.self_attn
++            hook_output(attn, prefix + "__branch_output")
++            hook_output(attn.q_proj, prefix + "__q_projection")
++            hook_output(attn.k_proj, prefix + "__k_projection")
++            hook_output(attn.v_proj, prefix + "__v_projection")
++            hook_output(attn.q_norm, prefix + "__q_norm")
++            hook_output(attn.k_norm, prefix + "__k_norm")
++            hook_output(attn.o_proj, prefix + "__o_projection")
++            hook_input(attn.o_proj, prefix + "__merged")
++        else:
++            gdn = layer.linear_attn
++            hook_output(gdn, prefix + "__branch_output")
++            hook_output(gdn.in_proj_qkv, prefix + "__in_proj_qkv")
++            hook_output(gdn.in_proj_z, prefix + "__in_proj_z")
++            hook_output(gdn.in_proj_b, prefix + "__in_proj_b")
++            hook_output(gdn.in_proj_a, prefix + "__in_proj_a")
++            hook_output(gdn.norm, prefix + "__gated_norm")
++            hook_output(gdn.out_proj, prefix + "__out_projection")
++    hook_output(text_model.norm, "final_norm")
++
++    # ---- patch module-level functions ----
++    original_conv_update = modeling.causal_conv1d_update
++
++    def patched_conv_update(hidden_states, conv_state, weight, bias, activation, **kwargs):
++        output = original_conv_update(hidden_states, conv_state, weight, bias, activation, **kwargs)
++        index = conv_state_ids.get(id(conv_state))
++        if index is not None:
++            store("layer_{:02d}__causal_conv_output".format(index), output)
++        return output
++
++    modeling.causal_conv1d_update = patched_conv_update
++
++    original_recurrent = modeling.torch_recurrent_gated_delta_rule
++
++    def patched_recurrent(query, key, value, g, beta, initial_state=None,
++                          output_final_state=False, use_qk_l2norm_in_kernel=False, **kwargs):
++        output, final_state = original_recurrent(
++            query, key, value, g, beta, initial_state=initial_state,
++            output_final_state=output_final_state,
++            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel, **kwargs)
++        index = recurrent_state_ids.get(id(initial_state))
++        if index is not None:
++            prefix = "layer_{:02d}".format(index)
++            store(prefix + "__recurrent_step_0_output", output)
++            store(prefix + "__recurrent_q_input", query)
++            store(prefix + "__recurrent_k_input", key)
++            store(prefix + "__recurrent_v_input", value)
++            store(prefix + "__gate_log_decay", g)
++            store(prefix + "__beta", beta)
++        return output, final_state
++
++    modeling.torch_recurrent_gated_delta_rule = patched_recurrent
++
++    rope_calls = {"index": 0}
++    attention_indices = [i for i, layer in enumerate(layers) if hasattr(layer, "self_attn")]
++    original_rope = modeling.apply_rotary_pos_emb
++
++    def patched_rope(query, key, cos, sin, unsqueeze_dim=1, **kwargs):
++        q_out, k_out = original_rope(query, key, cos, sin, unsqueeze_dim=unsqueeze_dim, **kwargs)
++        call = rope_calls["index"]
++        rope_calls["index"] += 1
++        if call < len(attention_indices):
++            prefix = "layer_{:02d}".format(attention_indices[call])
++            store(prefix + "__q_rope", q_out)
++            store(prefix + "__k_rope", k_out)
++        return q_out, k_out
++
++    modeling.apply_rotary_pos_emb = patched_rope
++
++    original_eager = modeling.eager_attention_forward
++
++    def patched_eager(module, query, key, value, attention_mask, dropout=0.0, scaling=None, **kwargs):
++        output, weights = original_eager(module, query, key, value, attention_mask,
++                                         dropout=dropout, scaling=scaling, **kwargs)
++        prefix = "layer_{:02d}".format(module.layer_idx)
++        store(prefix + "__context", output)
++        store(prefix + "__probabilities", weights)
++        return output, weights
++
++    modeling.eager_attention_forward = patched_eager
++
++    # ---- forward ----
++    with torch.no_grad():
++        outputs = model(
++            input_ids=torch.tensor([[int(token)]], dtype=torch.long),
++            past_key_values=cache,
++            use_cache=True,
++            return_dict=True,
++        )
++    store("logits", outputs.logits[0, -1])
++    # lm_head 的输入就是 final norm 输出；ours 的 final_hidden 是同一个值 cast bf16
++    if "final_norm" in captured:
++        captured["final_hidden"] = captured["final_norm"].copy()
++        shapes["final_hidden"] = shapes["final_norm"]
++        dtypes["final_hidden"] = dtypes["final_norm"]
++
++    # attention KV cache after the step（与 ours new_k/new_v 对应）
++    for index, layer in enumerate(layers):
++        cache_layer = cache.layers[index]
++        keys = getattr(cache_layer, "keys", None)
++        values = getattr(cache_layer, "values", None)
++        if keys is not None and keys.numel():
++            store("layer_{:02d}__new_k".format(index), keys)
++            store("layer_{:02d}__new_v".format(index), values)
++
++    out_dir = Path(args.out_dir)
++    out_dir.mkdir(parents=True, exist_ok=True)
++    npz_path = out_dir / "gold_step_intermediates.npz"
++    np.savez_compressed(str(npz_path), **captured)
++
++    # validation: our injected-gold forward must equal the reference gold decode row
++    gold_ref_path = Path(args.gold_reference_dir) / "w8a8" / "{}.npz".format(args.prompt)
++    validation = None
++    if gold_ref_path.is_file():
++        with np.load(str(gold_ref_path), allow_pickle=False) as ref:
++            ref_row = np.asarray(ref["decode_logits"][args.token_index + 1], dtype=np.float32)
++        logits = np.asarray(captured["logits"], dtype=np.float32)
++        validation = {
++            "gold_ref_npz": str(gold_ref_path),
++            "row": args.token_index + 1,
++            "bitwise_equal": bool(np.array_equal(logits, ref_row)),
++            "max_abs_diff": float(np.max(np.abs(logits.astype(np.float64) - ref_row.astype(np.float64)))),
++            "cosine": float(np.dot(logits, ref_row) / (np.linalg.norm(logits) * np.linalg.norm(ref_row))),
++        }
++
++    mapping = {
++        "tool": "dump_gold_step_intermediates",
++        "generated_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
++        "variant": args.variant,
++        "fake_quant_scope": audit.get("scope"),
++        "prompt": args.prompt,
++        "gold_tag": args.gold_tag,
++        "token_index": args.token_index,
++        "token": int(token),
++        "gold_states": str(gold_states_path),
++        "gold_states_sha256": sha256_file(gold_states_path),
++        "npz": str(npz_path),
++        "npz_sha256": sha256_file(npz_path),
++        "npz_bytes": npz_path.stat().st_size,
++        "state_dtypes": {key: str(value) for key, value in dtype_by_kind.items()},
++        "keys": sorted(captured.keys()),
++        "shapes": shapes,
++        "dtypes": dtypes,
++        "validation_vs_gold_logits": validation,
++    }
++    (out_dir / "gold_step_intermediates_manifest.json").write_text(
++        json.dumps(mapping, indent=1), encoding="utf-8")
++    print("[hf-drill] wrote {} keys={} validation={}".format(npz_path, len(captured), validation), flush=True)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/diag_c7/run_drilldown_heavy.sh b/tools/diag_c7/run_drilldown_heavy.sh
+new file mode 100755
+index 000000000..fdd7d4c67
+--- /dev/null
++++ b/tools/diag_c7/run_drilldown_heavy.sh
+@@ -0,0 +1,84 @@
++#!/usr/bin/env bash
++# C7 drilldown heavy inner（在 local 锁内运行）：
++#   1) ours driver（avx512, w8a8-linear, default scope, zh_continuation, steps=8, decode=3），
++#      在 past=10（decode step 2）注入 gold 输入 state，并 dump 逐层/逐算子中间张量；
++#      若完整 extra-returns（~1000 tensor）失败，自动降级到 minimal（~312 tensor）重试一次；
++#   2) HF w8a8 gold 在同一输入 state/token 下跑一步，抓同名中间张量；
++#   3) 逐层/逐算子对比 -> compute_drilldown_step2.json
++#
++# usage: run_drilldown_heavy.sh <evidence-dir> <worktree>
++set -uo pipefail
++
++EV=${1:?evidence dir required}
++WT=${2:-/home/chiro/projects/pypto/worktrees/pypto-x/c7-decode-gap-localization}
++OUT="${EV}/raw/drilldown_step2"
++LOGS="${EV}/logs"
++ASSETS=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/assets/qwen35-0.8b/2fc06364715b967f1860aea9cf38778875588b17
++GOLD_REF=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/c8-w8a8-reference-gold/reference
++ROPE=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/qwen35-bf16-weighted-execution/reference_rope
++VENV=/home/chiro/projects/pypto/worktrees/_meta/pypto-x/qwen35-bf16-reference/venv
++GOLD_STATES="${EV}/raw/gold_states_w8a8/zh_continuation.npz"
++mkdir -p "${OUT}/gold" "${LOGS}"
++
++if [[ ! -f ${GOLD_STATES} ]]; then
++  echo "[drilldown] missing gold states: ${GOLD_STATES}" >&2
++  exit 66
++fi
++
++DRIVER_ARGS=(
++  --stage s3 --backend avx512 --precision w8a8-linear
++  --quantized-linear-scope default
++  --prompt zh_continuation --steps 8 --decode-steps 3
++  --asset-dir "${ASSETS}" --reference-dir "${GOLD_REF}" --rope-dir "${ROPE}"
++  --debug-dump "${OUT}/dumps" --abort-op-mib 512
++  --output "${OUT}/s3_default_zh_continuation.json"
++  --progress "${OUT}/s3_default_zh_continuation.progress.log"
++  --work-dir "${OUT}/work"
++)
++
++run_ours() {
++  local mode=$1
++  echo "[drilldown] ours driver extra-returns=${mode} $(date -u +%Y-%m-%dT%H:%M:%SZ)"
++  PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH="${WT}/python" python3 "${WT}/tools/diag_c7/run_drilldown_ours.py" \
++    --worktree "${WT}" \
++    --gold-states "${GOLD_STATES}" \
++    --gold-tag step_1 \
++    --target-past 10 \
++    --extra-returns "${mode}" \
++    -- "${DRIVER_ARGS[@]}" \
++    2>&1 | tee "${LOGS}/drilldown_ours_${mode}.log"
++  return ${PIPESTATUS[0]}
++}
++
++run_ours auto || {
++  echo "[drilldown] full extra-returns failed; retry with minimal set" | tee -a "${LOGS}/drilldown_ours_auto.log"
++  run_ours minimal || exit $?
++}
++OURS_NPZ="${OUT}/dumps.s3-decode.past10.npz"
++[[ -f ${OURS_NPZ} ]] || { echo "[drilldown] missing ${OURS_NPZ}" >&2; exit 67; }
++
++echo "[drilldown] step 2/3 HF gold-side intermediates $(date -u +%Y-%m-%dT%H:%M:%SZ)"
++"${VENV}/bin/python" "${WT}/tools/diag_c7/dump_gold_step_intermediates.py" \
++  --harness "${WT}/tools/qwen35_reference/run_reference.py" \
++  --assets-dir "${ASSETS}" \
++  --gold-states-dir "${EV}/raw/gold_states_w8a8" \
++  --gold-reference-dir "${GOLD_REF}" \
++  --gold-tag step_1 --prompt zh_continuation --token-index 2 \
++  --out-dir "${OUT}/gold" --threads 6 --seed 0 --variant w8a8 \
++  2>&1 | tee "${LOGS}/drilldown_gold.log"
++rc=${PIPESTATUS[0]}
++if [[ ${rc} -ne 0 ]]; then
++  echo "[drilldown] HF gold capture failed rc=${rc}"
++  exit ${rc}
++fi
++
++echo "[drilldown] step 3/3 compare $(date -u +%Y-%m-%dT%H:%M:%SZ)"
++python3 "${WT}/tools/diag_c7/compare_step_intermediates.py" \
++  --ours-npz "${OURS_NPZ}" \
++  --gold-npz "${OUT}/gold/gold_step_intermediates.npz" \
++  --gold-manifest "${OUT}/gold/gold_step_intermediates_manifest.json" \
++  --output "${EV}/raw/compute_drilldown_step2.json" \
++  2>&1 | tee "${LOGS}/drilldown_compare.log"
++rc=${PIPESTATUS[0]}
++echo "[drilldown] done rc=${rc} $(date -u +%Y-%m-%dT%H:%M:%SZ)"
++exit ${rc}
+diff --git a/tools/diag_c7/run_drilldown_ours.py b/tools/diag_c7/run_drilldown_ours.py
+new file mode 100755
+index 000000000..950932e13
+--- /dev/null
++++ b/tools/diag_c7/run_drilldown_ours.py
+@@ -0,0 +1,253 @@
++#!/usr/bin/env python3
++"""C7 drilldown（ours 侧）：跑 driver s3，但在目标 decode step 注入 gold 输入 state，
++并额外 dump 逐层/逐算子中间张量。
++
++用法::
++
++    python3 run_drilldown_ours.py \
++        --worktree <worktree> \
++        --gold-states <raw/gold_states_w8a8/zh_continuation.npz> \
++        --gold-tag step_1 \
++        --target-past 10 \
++        -- <driver 原有参数...>
++        # e.g. --stage s3 --backend avx512 --precision w8a8-linear --prompt zh_continuation
++        #      --steps 8 --decode-steps 3 --asset-dir ... --reference-dir ... --rope-dir ...
++        #      --debug-dump <out>/dumps --abort-op-mib 512 --output <out>/run.json ...
++
++原理：monkey-patch driver 的 ``_run_once``，当 (stage, past_length) == (s3-decode, target)
++时，用 gold state dump 构造 ``previous_states``（按 state input 名 + schema dtype 编码为
++bytes；bf16 用 RNE float32->bfloat16），其余步骤不变。这样该步的输入 state 与 gold 完全
++一致，可以单独比较"单步计算"。
++
++同时自动把逐层/逐算子中间 SSA 名字追加进 ``--debug-extra-returns``（先 build 一次
++graph 扫描可用名字，避免拼错），并加上 ``--debug-hidden-states``。
++"""
++
++from __future__ import annotations
++
++import argparse
++import re
++import sys
++from pathlib import Path
++
++import numpy as np
++
++#: 逐层/逐算子中间张量的 SSA 名字模式（对 build_graph 的真实名字做 regex 匹配；
++#: 只选 operation 输出且 dtype ∈ {bf16,float32}，绝不把参数/权重拷进 dump）。
++LAYER_PATTERNS = (
++    # layer / norm / mlp 边界
++    r"layer_\d+_input_norm_(scaled|normalized)$",
++    r"layer_\d+_branch_output$",
++    r"layer_\d+_attention_residual$",
++    r"layer_\d+_post_attention_norm_(scaled|normalized)$",
++    r"layer_\d+_mlp_(gate_output|up_output|gate_silu|product|down_output)$",
++    r"layer_\d+_output$",
++    # full attention 内部
++    r"layer_\d+_(q|k|v)_projection_output$",
++    r"layer_\d+_(query_raw|output_gate_raw|output_gate_sigmoid|gated_context|merged_heads|merged)$",
++    r"layer_\d+_(q|k)_norm_(scaled|normalized)$",
++    r"layer_\d+_(q|k)_rope_(result|full_result)$",
++    r"layer_\d+_(probabilities|masked_logits|context|new_k|new_v|o_projection_output)$",
++    # GDR 内部
++    r"layer_\d+_in_proj_(qkv|z|b|a)_output$",
++    r"layer_\d+_causal_conv_(output|silu)$",
++    r"layer_\d+_(conv_time|q_raw|k_raw|v_raw|q|k|v)$",
++    r"layer_\d+_(q|k)_l2_normalized$",
++    r"layer_\d+_(beta_f32|beta|a_plus_dt|positive_dt|a_log_exp|negative_a_log|gate_log_decay)$",
++    r"layer_\d+_(q|k)_norm_bf16$",
++    r"layer_\d+_recurrent_step_0_output$",
++    r"layer_\d+_gated_norm_(scaled_bf16|normalized|normalized_bf16)$",
++    r"layer_\d+_(z_gate|gated_core)$",
++    r"layer_\d+_out_projection_output$",
++    # 全局
++    r"final_norm_(scaled|normalized)$",
++    r"final_hidden$",
++    r"final_hidden_flat$",
++    r"logits$",
++)
++DTYPES = ("bf16", "float32")
++
++
++def f32_to_bf16_bytes(array: np.ndarray) -> bytes:
++    """float32 -> bfloat16 (round-to-nearest-even) little-endian bytes."""
++    values = np.ascontiguousarray(array, dtype=np.float32)
++    bits = values.view(np.uint32)
++    lsb = (bits >> 16) & np.uint32(1)
++    rounded = bits + np.uint32(0x7FFF) + lsb
++    return (rounded >> np.uint32(16)).astype(np.uint16).tobytes()
++
++
++def encode_state(array: np.ndarray, dtype: str) -> bytes:
++    array = np.ascontiguousarray(array)
++    if dtype == "float32":
++        return array.astype(np.float32).tobytes()
++    if dtype == "bf16":
++        return f32_to_bf16_bytes(array)
++    if dtype == "int64":
++        return array.astype(np.int64).tobytes()
++    raise SystemExit("unsupported state dtype for injection: {}".format(dtype))
++
++
++def build_gold_payloads(schema, gold: dict, tag: str) -> dict:
++    """按 state input 名构造 bytes payload（与 driver 的 state schema 对齐）。"""
++    payloads = {}
++    patterns = (
++        (re.compile(r"^layer_(\d+)_conv_state_in$"), "__conv_state"),
++        (re.compile(r"^layer_(\d+)_recurrent_state_in$"), "__recurrent_state"),
++        (re.compile(r"^layer_(\d+)_prior_k$"), "__key_cache"),
++        (re.compile(r"^layer_(\d+)_prior_v$"), "__value_cache"),
++    )
++    for entry in schema.states:
++        source = None
++        for pattern, suffix in patterns:
++            match = pattern.match(entry.name)
++            if match:
++                key = "{}__layer_{:02d}{}".format(tag, int(match.group(1)), suffix)
++                source = gold.get(key)
++                if source is None:
++                    raise SystemExit("gold dump missing key {}".format(key))
++                break
++        if source is None:
++            raise SystemExit("cannot map state input {}".format(entry.name))
++        if tuple(source.shape) != tuple(entry.shape):
++            raise SystemExit("state {} shape mismatch: gold {} vs schema {}".format(
++                entry.name, source.shape, entry.shape))
++        payload = encode_state(source, entry.dtype)
++        if len(payload) != entry.nbytes:
++            raise SystemExit("state {} bytes {} != schema nbytes {}".format(
++                entry.name, len(payload), entry.nbytes))
++        payloads[entry.name] = payload
++    return payloads
++
++
++def graph_names(program) -> set:
++    names = {ref.name for ref in program.functions[0].parameters}
++    for operation in program.functions[0].body.operations:
++        for ref in operation.outputs:
++            names.add(ref.name)
++    return names
++
++
++def minimal_extra_returns(drv, target_past: int):
++    """降级清单：只保留层边界与少数关键算子（约 130 个 tensor）。"""
++    import re as _re
++    program, _schema, _layout = drv.build_graph(
++        1, target_past, debug_hidden_states=True, precision="w8a8-linear",
++        quantized_linear_scope="default", quantize_lm_head=False,
++    )
++    patterns = [_re.compile(pattern) for pattern in (
++        r"layer_\d+_(input_norm_scaled|branch_output|attention_residual|post_attention_norm_scaled|mlp_down_output)$",
++        r"layer_\d+_(q|k|v)_projection_output$",
++        r"layer_\d+_(in_proj_qkv|in_proj_z|in_proj_a|in_proj_b)_output$",
++        r"layer_\d+_causal_conv_output$",
++        r"layer_\d+_(probabilities|context|new_k|new_v|recurrent_step_0_output|gated_core|out_projection_output|o_projection_output)$",
++    )]
++    parameter_names = {ref.name for ref in program.functions[0].parameters}
++    selected = []
++    for operation in program.functions[0].body.operations:
++        for ref in operation.outputs:
++            if ref.name in parameter_names or str(ref.type.dtype) not in DTYPES:
++                continue
++            if any(pattern.match(ref.name) for pattern in patterns):
++                selected.append(ref.name)
++    return sorted(set(selected))
++
++
++def auto_extra_returns(drv, target_past: int):
++    """build 一次 graph，按 LAYER_PATTERNS + dtype 选可 dump 的中间 SSA 名字。"""
++    import re as _re
++    program, _schema, _layout = drv.build_graph(
++        1, target_past, debug_hidden_states=True, precision="w8a8-linear",
++        quantized_linear_scope="default", quantize_lm_head=False,
++    )
++    patterns = [_re.compile(pattern) for pattern in LAYER_PATTERNS]
++    parameter_names = {ref.name for ref in program.functions[0].parameters}
++    selected = []
++    for operation in program.functions[0].body.operations:
++        for ref in operation.outputs:
++            if ref.name in parameter_names:
++                continue
++            if str(ref.type.dtype) not in DTYPES:
++                continue
++            if any(pattern.match(ref.name) for pattern in patterns):
++                selected.append(ref.name)
++    return sorted(set(selected)), len(parameter_names)
++
++
++def main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--worktree", required=True)
++    parser.add_argument("--gold-states", required=True)
++    parser.add_argument("--gold-tag", required=True)
++    parser.add_argument("--target-past", type=int, required=True)
++    parser.add_argument("--extra-returns", default="auto", choices=("auto", "minimal", "none"))
++    args, driver_argv = parser.parse_known_args()
++    if driver_argv and driver_argv[0] == "--":
++        driver_argv = driver_argv[1:]
++
++    driver_dir = Path(args.worktree).resolve() / "python" / "tests" / "ut" / "pypto_x"
++    sys.path.insert(0, str(driver_dir))
++    import qwen35_weighted_execution_driver as drv  # noqa: E402
++
++    gold = dict(np.load(args.gold_states, allow_pickle=False))
++    if args.extra_returns in ("auto", "minimal"):
++        if args.extra_returns == "minimal":
++            selected, parameter_count = minimal_extra_returns(drv, args.target_past), 0
++        else:
++            selected, parameter_count = auto_extra_returns(drv, args.target_past)
++        print("[drilldown] extra returns: {} intermediate tensors (graph parameters={})".format(
++            len(selected), parameter_count), flush=True)
++        if not any(item.startswith("--debug-extra-returns") for item in driver_argv):
++            driver_argv += ["--debug-extra-returns", ",".join(selected)]
++    if not any(item == "--debug-hidden-states" for item in driver_argv):
++        driver_argv.append("--debug-hidden-states")
++
++    # --debug-extra-returns 是全局静态列表，而 prefill(steps=8) 与 decode(steps=1) 的
++    # 中间 SSA 名字集合不同（例如 GDN chunk vs recurrent）。patch extend_returns，
++    # 对每个 graph 只追加该 graph 真实存在的名字，避免 prefill 阶段因缺名报错。
++    original_extend_returns = drv.extend_returns
++
++    def patched_extend_returns(program, names):
++        available = {ref.name for ref in program.functions[0].parameters}
++        for operation in program.functions[0].body.operations:
++            for ref in operation.outputs:
++                available.add(ref.name)
++        filtered = [name for name in names if name in available]
++        return original_extend_returns(program, filtered)
++
++    drv.extend_returns = patched_extend_returns
++
++    injected = {"done": False}
++    original_run_once = drv._run_once
++
++    def patched_run_once(run_args, stage, steps, past_length, reader, previous_states,
++                         input_ids, cos_bits, sin_bits, build_dir):
++        if stage == "s3-decode" and past_length == args.target_past:
++            program, schema, _layout = drv.build_graph(
++                steps, past_length,
++                debug_hidden_states=bool(getattr(run_args, "debug_hidden_states", False)),
++                debug_extra_returns=drv._debug_extra_return_names(run_args),
++                debug_decay_exp_a_log=bool(getattr(run_args, "debug_decay_exp_a_log", False)),
++                precision=getattr(run_args, "precision", "bf16"),
++                quantized_linear_scope=getattr(run_args, "quantized_linear_scope", "default"),
++                quantize_lm_head=bool(getattr(run_args, "quantize_lm_head", False)),
++            )
++            payloads = build_gold_payloads(schema, gold, args.gold_tag)
++            injected["done"] = True
++            print("[drilldown] INJECT gold states tag={} into stage={} past={} ({} tensors)".format(
++                args.gold_tag, stage, past_length, len(payloads)), flush=True)
++            previous_states = payloads
++        return original_run_once(run_args, stage, steps, past_length, reader, previous_states,
++                                 input_ids, cos_bits, sin_bits, build_dir)
++
++    drv._run_once = patched_run_once
++    sys.argv = ["qwen35_weighted_execution_driver"] + driver_argv
++    status = drv.main()
++    if not injected["done"]:
++        print("[drilldown] ERROR: target step past={} never reached".format(args.target_past))
++        return 2
++    return status
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/diag_c7/wait_and_run_drilldown.sh b/tools/diag_c7/wait_and_run_drilldown.sh
+new file mode 100755
+index 000000000..860dfd407
+--- /dev/null
++++ b/tools/diag_c7/wait_and_run_drilldown.sh
+@@ -0,0 +1,42 @@
++#!/usr/bin/env bash
++# C7 drilldown：按 300s 节奏抢 local 锁，锁定窗口的门槛时间（UTC epoch）之前不抢。
++# usage: wait_and_run_drilldown.sh <evidence-dir> [worktree] [not_before_epoch]
++set -uo pipefail
++
++EV=${1:?evidence dir required}
++WT=${2:-/home/chiro/projects/pypto/worktrees/pypto-x/c7-decode-gap-localization}
++NOT_BEFORE=${3:-0}
++RUNNER=/home/chiro/projects/pypto/pypto_x/scripts/resource/run_local_heavy.sh
++mkdir -p "${EV}/logs"
++OUT="${EV}/logs/heavy_drilldown.out"
++echo "[c7-drill-waiter] start $(date -u +%Y-%m-%dT%H:%M:%SZ) pid=$$ not_before=${NOT_BEFORE}" | tee -a "${OUT}"
++
++now=$(date +%s)
++if (( NOT_BEFORE > now )); then
++  wait_s=$(( NOT_BEFORE - now ))
++  echo "[c7-drill-waiter] gating ${wait_s}s until $(date -u -d @${NOT_BEFORE} +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${OUT}"
++  sleep "${wait_s}"
++fi
++
++for attempt in $(seq 1 60); do
++  echo "[c7-drill-waiter] attempt ${attempt} $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${OUT}"
++  "${RUNNER}" \
++    --task c7-drilldown-step2 --agent c7-decode-gap-localization \
++    --min-available-mib 8192 --safety-floor-mib 4096 --max-cpus 6 \
++    --log-file "${EV}/logs/heavy_drilldown_resource.log" \
++    -- bash "${WT}/tools/diag_c7/run_drilldown_heavy.sh" "${EV}" "${WT}" \
++    >> "${OUT}" 2>&1
++  rc=$?
++  echo "[c7-drill-waiter] attempt ${attempt} rc=${rc} $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${OUT}"
++  if [[ ${rc} -eq 0 ]]; then
++    echo "[c7-drill-waiter] SUCCESS" | tee -a "${OUT}"
++    exit 0
++  fi
++  if [[ ${rc} -ne 75 && ${rc} -ne 69 ]]; then
++    echo "[c7-drill-waiter] non-retryable rc=${rc}" | tee -a "${OUT}"
++    exit ${rc}
++  fi
++  sleep 300
++done
++echo "[c7-drill-waiter] gave up" | tee -a "${OUT}"
++exit 1
