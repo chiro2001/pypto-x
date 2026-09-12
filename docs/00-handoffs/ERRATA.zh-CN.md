@@ -521,3 +521,34 @@ scope 之外的 shape/线程。解析上界若要成立，必须覆盖内核的�
    父 agent 手解冲突容易在"看起来能过"的状态下把半成品合进去。
 3. **等价性判据要选对**：基线相同的 cherry-pick 用 **tree 相等**；基线不同的 cherry-pick 用 **patch-id 相等**（本次 AVX2 切片即基于旧 tip，
    树必然不同但 patch-id `83811f53…` 相同）。两者都不可省。
+
+## ERR-0012：CUDA 线"被工具链阻塞"的结论来自**引用过期 lock 字段**（实际 5080 + nvcc 13.3 早已可用）
+
+**现象**：2026-09-12/13 的父 agent 报告与若干快照/HANDOFF 反复写"本机无 GPU/nvcc，CUDA 线被 toolchain 阻塞"，
+并引用 lock 的 `gamepc_toolkit: nvcc_nvrtc_cudart_sdk_headers_absent` 与 `cuda_c1_acceptance_smoke: BLOCKED_TOOLCHAIN_nvcc_absent`。
+用户在 2026-09-13 指出"先前应该在 GamePC 上用 5080 完成过执行"。实测（只读 SSH 探测，未申请 `gamepc` 锁——按约定 GPU-only 探测不需要）：
+
+```text
+GamePC 192.168.101.5（Windows + WSL2）：
+  nvcc:      Cuda compilation tools, release 13.3, V13.3.73  (/usr/local/cuda-13.3)
+  nvidia-smi: NVIDIA GeForce RTX 5080, 16303 MiB, driver 616.92
+  gamepc 锁: FREE；GPU owner: pypto-x-exclusive
+```
+
+**根因**：两处**过期快照**没有被后来的完成记录覆盖所推翻：
+1. `gamepc_toolkit: ..._absent` 出自 2026-09-09 的 `gamepc-cuda-probe`；此后 `cuda-toolkit-wsl` 任务
+   （commit `0f2e82158`，`toolkit: cuda_13_3_nvcc_13_3_73_cublas_13_6_0_2`、`install_bytes: 10710024192`）已把它安装完毕并 `status: complete`；
+2. `cuda_c1_acceptance_smoke: BLOCKED_TOOLCHAIN_nvcc_absent` 同理；而**同一条记录里**早已有
+   `cuda_c1_real_5080_driver_ptx: PASS`（真实 5080 上跑过 fp32/bf16 elementwise/reduce/matmul/multi-op chain，证据 `_meta/pypto-x/integration-w4-cuda-c1-final`）。
+另外驱动已从 610.62 **漂移到 616.92**（`configs/perf_protocol.proposed.yaml` 里那条"驱动漂移待归档"的问题也因此有了实测值）。
+父 agent 只在本机（12 vCPU KVM guest）跑 `nvidia-smi`/`which nvcc` 失败后，就复述了上述过期字段，没有去 GamePC 复核。
+
+**修复**：
+1. lock 里两处过期字段已就地追加 `*_superseded_2026_09_13` 说明（保留历史、标注当前真值）；
+2. 本 ERRATA 与 HANDOFF 的"CUDA 被阻塞"表述全部订正为"CUDA 线**可用**（GamePC 5080 16 GB + nvcc 13.3.73 + cuBLAS，`gamepc` 锁空闲、GPU 独占）；
+3. CUDA 线重新排队（C1 acceptance smoke 重跑、cuBLAS 基线、W8A8 CUDA kernel 真机复验）。
+
+**教训**：
+1. **禁止把 lock 里的状态字段当作"当前事实"引用**——它们是某次探测的时间快照；引用前必须看同一记录里是否有更晚的完成/覆盖记录，或直接复测。
+2. **"本机"≠"本项目可用资源"**：本项目有 GamePC（RTX 5080）、A3（SVE256）、920B 等外部资源，判断某条线是否可跑必须逐资源确认（HANDOFF §0 应列出各资源的可用性与其锁）。
+3. 同一条记录内自相矛盾（`BLOCKED_TOOLCHAIN` 与 `real_5080_driver_ptx: PASS` 并存）时，必须先解决矛盾再对外报告。
