@@ -426,7 +426,7 @@ target 副本、threads、guarantees 派生字段；拒绝空/重复 fallback ch
 3. **未登记 ≠ 边界**：单文档中真源在外的字段（timing/resources/叙述串）必须**显式**排除在证据契约外并给理由，
    否则"边界清单"会把绕过（如空 chain 跳过检查）与固有不可验证混在一起。
 
-## ERR-0010（2026-09-12，两次修订）：AOCL int8 偏差包络先被 Q8 低估、修订后的实测快照也不是上界（最终：不提供解析上界，改由 policy fail-closed）
+## ERR-0010（2026-09-12，三次修订）：AOCL int8 偏差包络先被 Q8 低估、修订后的实测快照也不是上界（最终：不提供解析上界，改由 policy fail-closed）
 
 **现象（第一次）**：`docs/20-planning/0006` §8.2 记录 AOCL `s8s8s32os32` 的实测偏差包络
 `5099 → ≤6`｜`16696 → ≤33`｜`133144 → 22`。U2b 在同一固定库（BLIS 5.3.2 zen4、
@@ -441,6 +441,15 @@ sha256 `c7d74a31…`）上用 `uniform[100,127]`、seeds 1–8 复测得 `5099 �
 仍**不是上界**，且随扫描规模继续上抬。原始证据：
 `_meta/pypto-x/u2b-vendor-int8/raw/{bit-envelope.json,envelope-refutation.json}`、
 `_meta/pypto-x/verify-0042-u2b/raw/{envelope-author-scope.json,envelope-author-scope-1000.json,envelope-exceedance-stats.json,envelope-top-seeds.json,bit-envelope.json}`。
+
+**现象（第三次，独立验收 agent `71599188` 的 r2 复检）**：同一生成器继续扩到
+**seeds 1001–6000** 后 `133144 → 1067`（seed 1591，threads 1/2/6 复核一致，provider 1715435392
+vs exact 1715436459）；**seeds 6001–12000** 另有 `133144 → 1043`（seed 6323），`16696` 在
+12000 seeds 内保持在 75（seed 8410）。即 r2 冻结时记录的 `966` 又被刷新到 `1067`；这再次
+说明该表的性质是**可继续上抬的实测快照**，而不是界。原始证据：
+`_meta/pypto-x/verify-0042-u2b-r2/raw/{extension-scan-1001-6000.json,extension-scan-6001-12000.json,extension-witness-crosscheck.json}`、
+本任务 round-4 证据 `_meta/pypto-x/u2b-vendor-int8/raw/envelope-extension.json`（自有新窗口
+12001–15000 + witness 复核 + domination）。
 
 **根因**：
 1. 偏差同时依赖 **K 与码值分布**：KC=2048 的 int32 block partial 在 f32 上链式累加，
@@ -459,18 +468,21 @@ sha256 `c7d74a31…`）上用 `uniform[100,127]`、seeds 1–8 复测得 `5099 �
 **修复（最终语义，未放宽契约）**：
 1. `vendor:aocl-lpgemm-int8` manifest 明确声明 `deviation_bound_kind = "measured_snapshot"`、
    `deviation_bound_available = false`，**删除** `deviation_bound_by_k`；观测值改名
-   `measured_deviation_by_k`（聚合 internal 扫描 + 外部 200-seed 与 1000-seed 扫描：
-   16696→75、133144→966），
+   `measured_deviation_by_k`（聚合 internal 扫描 + 外部 seeds 1–200/1–1000/1001–6000/
+   6001–12000 扫描：16696→75、133144→1067），
    并在 `measurement_scope` 记录分布/seed/线程/外部证据路径与
    `observations_are_not_a_bound=true`；`upper_bound.status="not_provided"` 附阻塞证据。
+   每次刷新都进 `provider_artifact_digest`，快照值可随新证据继续上抬。
 2. 数值分类仍 `deterministic_bounded`：K≤1024 全分布/全线程逐位；K≥133145 在任何 kernel
-   调用前 fail-closed；`-128` 在适配层拒绝。
+   调用前 fail-closed；`-128` 与 `True/False`（round 4 恢复）在适配层拒绝。
 3. 新增 policy 旋钮 `numeric.require_proven_deviation_bound=true`：resolver 只接受
    `deviation_bound_kind ∈ {exact_contract_bound, analytic_f32_chain_upper_bound}` 的 provider；
    拿到 `measured_snapshot`（或 deterministic-bounded 但无 envelope）时结构化拒绝
    `proven_deviation_bound_unavailable`（无 fallback 时 `NUMERIC_GUARANTEE_UNMET`），
    portable 参考主干因 `exact_contract_bound` 仍可用。plan/report schema 同步规定：
-   measured-snapshot envelope **不得**携带 `deviation_bound_by_k`。
+   measured-snapshot envelope **不得**携带 `deviation_bound_by_k`，**必须**携带
+   `measured_deviation_by_k`（plan/report 两侧对称）；proven kind 的 bound 必须逐 K 支配
+   自己的观测，否则 fail-closed。
 
 **覆盖与不覆盖（本任务结论的边界）**：被观测/建模的量是
 `|AOCL_int32 - 精确 int32 参照|`（LC 契约的 int8×int8→int32 段），输入限码值
