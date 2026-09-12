@@ -390,3 +390,38 @@ Q5 版（`TOOL_VERSION=1`、CLI `--ours-dir`），而 Q3 规范版（`TOOL_VERSI
 2. **"已合入"必须有独立核验**：登记 `integration_commits` 前应 `git merge-base --is-ancestor <sha> <tip>` 逐个验证
    （本次若做一步就能当场发现）；该核验已加入本仓的惯例；
 3. 这也解释了为什么"cherry-pick 后必须立刻跑全量"这条规矩（KF-1 教训）是必要的——**分支状态也会骗人**。
+
+## ERR-0009：0042 项 1 的"report 单文档边界"表述被独立验收证伪（校验面按已知缺口逐点补，而非按副本穷举）
+
+**现象**：0042 项 1（`748717529`，cherry-pick = `15d0fe58d`）新增 4 类 cross-block + 2 类 contract-derived must-reject 后，
+`binding_verify` 的模块 docstring 与 `0006 §7.1` 声称"report 中每个在另一块有真源的字段都被重算并比较；剩余边界仅
+manifest-only 字段与 `resolution.plan_digest`"。**独立验收（agent `cb32c1ba`，冻结 `15d0fe58d`）穷举证伪**：
+
+- 按"代码 provenance 等价类"枚举 41 类，**39 类存在 ≥1 未对账成员**；仅 `request.policy_digest↔resolution.policy_digest`
+  与 vendor `artifact.library↔resolved.library` 是完整单点受检。
+- 单叶扫描：portable **335/449**、vendor-f32 **347/536**、fallback **404/518** 个叶子的单点篡改被 `validate_report_schema` 接受。
+- `resolution.rules[*].details` 回显面 62 叶中 **61 叶**可单点篡改被接受（仅 `provider.select.primary` 被拒）。
+- 两个**真实绕过**（不是"未登记边界"）：`resolution.fallback_chain=[]` 使 `report_provider_declaration_mismatch` 的关系检查
+  被整体跳过；`request.dtype="complex64"` 配合 integer 表值的 `guarantees.accumulation` 被接受（dtype 无成员校验）。
+- 父方独立探针在修复前同样复现：`probe_request_block_hole.py` 4/4 接受、`probe_rule_echo_holes.py` 18/19 接受。
+- 执行面不受影响（验收步骤 11）：`validate_report_schema` 只在 `ExecutionReport.__init__`（执行之后）调用；伪造 plan 仍被
+  `execute_matmul_plan` 的 canonical 重算以 `plan_declaration_mismatch`/`artifact_declaration_mismatch` 拒绝且输出未动。
+  ⚠️ 但若下游消费者从 report 重新规划，则 `request.op/shapes/dtype` 会变成执行相关——此 caveat 必须写进契约。
+
+**根因**：校验面是**按"已知的 4 对 cross-block"逐点补**出来的，而不是按"文档内每个字段的全部副本"做 provenance 穷举驱动；
+且文档用了过宽措辞，把"权威块"与"说明层"（`resolution.rules[*]`、`resolution.candidates[*].checks[*]`、`resolution.why/tie_break`、
+`coverage.*`、叙述性 timing/resources 字段）混为一谈。
+
+**修复**（0042 项 1b/1b2，同一分支）：`binding_verify.py::report_rule_echo_errors` 按 **rule 名**（非下标）对账命名回显，
+缺失/重复/未知 rule **fail-closed**；补齐 `request.{op,dtype,shapes}`、`coverage.*`、`artifact.*` 版本、capability/resolved_policy/
+target 副本、threads、guarantees 派生字段；拒绝空/重复 fallback chain；对被选中候选补 rank/dtype 校验；并把 docstring 与
+`0006 §7.1` 改成精确表述（normative = 被对账的字段；explanation layer = 明确列举且**非证据**；执行授权只以 canonical 重算为准）。
+修复后父方合并探针：**28 篡改中 27 拒**（唯一残留为位置型 candidata rank 回显，见 1b2 处理）。
+
+**教训**：
+1. **校验器的边界声明必须由穷举驱动**（按字段副本的 provenance 等价类），不能由"已知缺口清单"驱动；
+   缺口清单只能证明"修了什么"，不能证明"还剩什么"。
+2. **validator 的 docstring/文档是契约的一部分**：过宽措辞（"every field …"）会被独立验收当作可证伪声明；
+   写"我们检查 X"而不是"不存在未检查的 Y"。
+3. **未登记 ≠ 边界**：单文档中真源在外的字段（timing/resources/叙述串）必须**显式**排除在证据契约外并给理由，
+   否则"边界清单"会把绕过（如空 chain 跳过检查）与固有不可验证混在一起。
