@@ -1157,6 +1157,10 @@ P8 额外报告：
 | 4 | `view_mode=require` 是否作为公共 stable API？ | **暂不**：B6 实测视图别名 hard-off、liveness proof 未接入，此时 `require` 必然失败，公开它只会变成陷阱。现阶段公共 stable 只保留 `forbid` / `prefer`，`require` 记为 internal，待 proof schema 接入后再提级 | `verify-b6-layout-native` §5：`layout_view_alias_mode="disabled"`、3 个 env 开关无效、执行器总分配独立 destination |
 | 5 | W8A8 各 primitive 的 exact/bounded 划分与 scale 归约顺序是否已冻结？ | **v1 方案已冻结**，逐 opcode 划分为：`qmatmul_s8s8_s32` = `exact`（int32 累加，且无饱和时与整数和恒等）；`quantize_per_token_s8` = `exact`（RNE + absmax + 码值域 `[-127,127]`，拒 `-128`）；`dequantize_epilogue_bf16` = **相对契约声明的单次 RNE 序为 exact、相对其它乘序为 bounded**；scale 归约顺序冻结为“先形成一次 `s_a*s_w`，再与 accumulator 相乘”。机器报告必须同时写 `scheme_digest`、`reduction_order_id`、`exactness_basis`；vendor 融合路径若为两次 accumulator-scale 乘法（如 AOCL `_sym_quant`）只能记 `deterministic_bounded`，不得继承位级主张 | 契约 `docs/20-planning/0002-…`（FROZEN）；C5/C6 验收的逐位证据；AOCL LPGEMM 源码级语义发现（AOCL `(acc×s_w)×s_a` 两次乘） |
 
+> **2026-09-12 用户裁决（更新第 4 答）**：用户明确"`view_mode=require` 我认为可以"，即**批准把 `require` 提级为公共 stable API**。
+> 提级**不是文案变更**：已派落地任务 `view-mode-require`（证明链 contract-view-obligation / stride 可表达 / 写后读 / owner-lifetime / 多 view 重叠 + 执行器启用 + 三态语义 + 对抗性测试 + 报告字段 + 文档提级）。
+> **在任务验收通过前，公共 stable 仍只有 `forbid` / `prefer`**；任何文档、报告或口头说明都不得宣称 `require` 已可用（否则就是本节警告过的"必然失败的陷阱"）。
+
 **同时采纳的三处修正**（v1 → v2）：
 
 1. `allow_view: true` 的"授权"语义删除，改为三态 `view_mode: forbid | prefer | require` + `max_copy_bytes`，并明确"policy 不得把 contract 的 `must_not_alias` 改成 `may_alias`"；
@@ -1180,6 +1184,8 @@ P8 额外报告：
 |---|---|---|---|
 | A-1 | **L5/L6 的语料与阈值** | 契约 §5.2 的 L4–L6 阈值是暂定值，`D5` 明确需用户确认；决定 Q6 能否启动，也决定能否对外声称"W8A8 精度达标" | 先只做 L4（logits）；L5 用现有 token 链做弱化版并显式标注覆盖不足；L6 待语料与阈值 |
 | A-2 | **`view_mode=require` 何时提级为公共 stable** | 当前 view alias 为 hard-off（liveness proof 未接入），公开 `require` 必然失败 | 先保持 internal，待 proof schema 接入（与 A-4 相关）后再提级 |
+
+> **2026-09-12 更新**：用户已批准提级；任务 `view-mode-require` 进行中（证明链 + 执行器启用 + 对抗测试 + 文档）。验收通过前仍按"internal/不得宣称可用"执行。
 | A-3 | **W8A8 v1 之外是否立项新量化方案** | 新 scheme/码制/scale 粒度按 §13.7 必须新建 contract 版本，不许复用 `w8a8-linear.v1` | 等单算子框架与真实工业框架对比之后再议（用户 2026-09-12） |
 | A-4 | **图执行层：自研还是外包**（决定 N4 的存废） | 现状是我们自己的 Python 逐 op 循环；B6 后 prefill launch 约 24 s 中 op 约 4.5 s，残差约 19.4 s（约 81%）。这些数字来自本机 KVM、无 cpufreq、非静默窗口，**永久 `UNGATED`**，只能作为诊断线索，不能解释为与算子内容无关或跨平台结论。若外包给框架（PyTorch/vLLM 的 executor），残差变成框架的问题；若保留自研，必须先分解再优化 | 先做**三档计时分解**（低成本的诊断），用数据支撑"自研 vs 外包"；“每次 launch 重复 `from_dict`+`canonical_json`+`sha256`”目前是待 profile 证实的假设，确认后无论走哪条路都应修；证据来自 `verify-b6-layout-native/brief.zh-CN.md §7` |
 | A-5 | **W8J 注入门政策** | 现行门是"必须追平 oneDNN 才允许注入"，导致注入被禁；vendor GEMM 决策后背景已变（W8J 转 W8A8） | 改为**按 provider/精度分层声明 + 显式 opt-in + 诚实标注倍数**，而不是一刀切禁止 |
