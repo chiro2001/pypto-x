@@ -1,6 +1,6 @@
 # PyPTO-X 接手文档
 
-状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_0009_0010_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q5_Q6_Q7_Q8_Q8B_Q9_Q10_N4_C6_C7_DONE_W8A8_V2_M2_DONE_VIEW_MODE_REQUIRE_STABLE_U2A_VENDOR_PROVIDER_DONE_AVX2_LAYOUT_DONE_SVE256_W8A8_THROUGHPUT_FIXED_0040_AND_0041_AND_0042_AND_0043_PUSHED_0044_CLOSED_LOCALLY_VERIFICATION_IN_FLIGHT_REPORT_SCHEMA_V4_MEMO_ELF_INTEGRITY_REPORT_HARDENING_U2B_INT8_AVX2_BROADCAST_NATIVE_CUDA_TOOLCHAIN_BLOCKED`
+状态：`W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_0009_0010_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q5_Q6_Q7_Q8_Q8B_Q9_Q10_N4_C6_C7_DONE_W8A8_V2_M2_DONE_VIEW_MODE_REQUIRE_STABLE_U2A_VENDOR_PROVIDER_DONE_AVX2_LAYOUT_DONE_SVE256_W8A8_THROUGHPUT_FIXED_0040_AND_0041_AND_0042_AND_0043_PUSHED_0044_CLOSED_LOCALLY_VERIFICATION_IN_FLIGHT_REPORT_SCHEMA_V4_MEMO_ELF_INTEGRITY_REPORT_HARDENING_U2B_INT8_AVX2_BROADCAST_NATIVE_0045_CUDA_REVIVED_ALL_LEGS_PASS`
 
 最后更新：2026-09-13 02:00 CST（Asia/Shanghai；**0039–0043 已全部推送**（`origin/main = a65a3b9`；推送政策自 2026-09-13 起为**自动**）；**0044 已本地收口、两条独立验收在跑**：冻结候选 **`dcc5371cb`**（tree `42e4477ad…`）、补丁 **256**（am 复算 256/256 干净、复算 tree = 冻结 tree）、规则 8 全量 **rc=0，1932 passed / 7 skipped / 0 failed，1066.72 s**（collect **1939**，基线 `0a63ed4dd` = 1921）。0044 = ① report schema **v4**：内嵌必需块 `plan_payload`（`resolution.plan_digest` 的 preimage），digest 三处互等、`resolution_decision` 必须是 payload 的投影（新 leaf 模块 `decision.py`），版本 3→4 fail-closed —— 0043 验收残余 3 与 R5-full 已闭合，新登记残余 3'（完全协调的 alternate payload）与 4（无 attestation 的整份替换）；② SVE256 W8A8 **memo 命中盘上 ELF 完整性**：每次命中 re-hash 对比 `content_digest`（hit 0.642 ms vs miss 2.644 s = 4,119×，整网 QEMU smoke +0.1%），登记 check→exec TOCTOU 等边界（均为本机 QEMU，非 A3 原生）。本机无 GPU/nvcc，CUDA 线仍被 toolchain 阻塞）
 
@@ -39,6 +39,7 @@
       真机执行已有先例（`cuda_c1_real_5080_driver_ptx: PASS`，证据 `_meta/pypto-x/integration-w4-cuda-c1-final`）。
       lock 里的 `gamepc_toolkit: ..._absent` 与 `cuda_c1_acceptance_smoke: BLOCKED_TOOLCHAIN_nvcc_absent` 是 **2026-09-09 的过期快照**，
       已就地标注 `*_superseded_2026_09_13`；`criterion_defaults.e4 = avx512_and_sve256_first_cuda_later` 只表示**判据优先序**，不是"CUDA 不可用"。
+      **2026-09-13 已重启并全部 PASS（batch 0045）**：C1 smoke + 扩展验收 **10/10** 真机 bit-exact（sm_120 cubin 4/4 位级一致）、本机 7 条设备 skip 的 CUDA 单测真机 **41 passed/0 failed/0 skipped**、cuBLAS GEMM 复核与冻结值差 **≤1.46%**（同 616.92 窗口噪声，B4 仍需用户批准冻结）、W8A8 CUDA 真机差分 **53/53 checks / 0 mismatch**；边界：WSL2 时钟不可 pin（比值 UNGATED）、cubin arch-locked（`sm_80` cubin 在 sm_120 报 209，PTX JIT 才是前向兼容）、**GamePC 是与用户共用的游戏机**——性能腿前后必须查外来负载，有游戏就 `perf deferred` 且绝不动用户进程。
       约定：GPU-only 探测/验收不申请 `gamepc` 锁；GamePC host CPU/内存 heavy 阶段才需持有该锁。
    b) **0041 已交付的主要结论**（引用以 lock/ERRATA 为准）：
       · **AVX2 layout 原生化**（`1b1c40656`+`7d8762abe`）：decode launch 28.5→20.4 s、prefill 127.9→109.3 s；per-op layout 中位 0.02–0.04 ms；
