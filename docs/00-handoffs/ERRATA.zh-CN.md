@@ -426,37 +426,64 @@ target 副本、threads、guarantees 派生字段；拒绝空/重复 fallback ch
 3. **未登记 ≠ 边界**：单文档中真源在外的字段（timing/resources/叙述串）必须**显式**排除在证据契约外并给理由，
    否则"边界清单"会把绕过（如空 chain 跳过检查）与固有不可验证混在一起。
 
-## ERR-0010（2026-09-12）：0006 §8.2 的 AOCL int8 偏差包络不是上界（K/分布依赖，`133144→22` 被 `452` 取代）
+## ERR-0010（2026-09-12，两次修订）：AOCL int8 偏差包络先被 Q8 低估、修订后的实测快照也不是上界（最终：不提供解析上界，改由 policy fail-closed）
 
-**现象**：`docs/20-planning/0006` §8.2 记录 AOCL `s8s8s32os32` 的实测偏差包络
-（"最坏码值分布，实测"）：`5099 → ≤6`｜`16696 → ≤33`｜`133144 → 22`。U2b（任务 `u2b-vendor-int8`，
-分支 `work/u2b-vendor-int8`）在同一固定库（BLIS 5.3.2 zen4、sha256 `c7d74a31…`、
-`bli_arch_string=zen4`）上用更强对抗分布复测：
-U2b envelope（seeds 1–8 × {`uniform[100,127]`（A/B 独立生成器）、all-127、`uniform[-127,127]`} × 线程 {1,2,6}，
-m=2,n=6）→ `5099 → 8`、`16696 → 56`、`133144 → 457`；另按 Q8 parity-probe 的"同一生成器续采样"分布
-（`uniform[100,127]`，seeds 1–3）→ `5099 → 6`、`16696 → 40`、`133144 → 452/444/435`；
-all-127 下 `133144 → 24`（与 Q8 E3 的 `2147479576 → 2147479552` 一致）。
-即 **`133144 → 22` 连 Q8 自己的构造观测（24）都没有覆盖**。raw 调用探针见
-`_meta/pypto-x/u2b-vendor-int8/raw/bit-envelope.json`、`raw/adversarial-probe.json`。
+**现象（第一次）**：`docs/20-planning/0006` §8.2 记录 AOCL `s8s8s32os32` 的实测偏差包络
+`5099 → ≤6`｜`16696 → ≤33`｜`133144 → 22`。U2b 在同一固定库（BLIS 5.3.2 zen4、
+sha256 `c7d74a31…`）上用 `uniform[100,127]`、seeds 1–8 复测得 `5099 → 8`、`16696 → 56`、
+`133144 → 457`，且 `133144` 的 all-127 构造用例是 24（连 Q8 自己 E3 的 24 都未被其记录的 22 覆盖）。
 
-**根因**：偏差不只由 K 决定，而由 **K 与码值分布共同决定**：`S8S8S32OS32` 的 KC=2048 block partial 在
-binary32 上链式累加，block partial 的 f32 ULP（大码值下 4–256）随块数累积；"3 seeds × 单一分布"只能给出
-观测快照，不能给出上界。且 E10 只测到 K=5099，`16696/133144` 的数字来自 parity probe 的少量构造用例，
-本身不是 max-over-distributions。
+**现象（第二次，独立验收 agent `71599188`）**：把同一生成器扩到 seeds 1–200 后，
+`16696 → 75`（seed 147）、`133144 → 841`（seed 115）；验收方另一 seed 族到 `133144 → 924`
+（seed 48），648 用例扫描到 5099 → 7、16696 → 62、133144 → 678；继续扩到 **seeds 1–1000**
+后同一生成器到 `133144 → 966`（seed 428），且 1000 个种子里有 503 个超过第一轮声明的 `457`
+（`16696` 侧为 48/1000 超过 `56`）。即 U2b 第一轮修订出的"声明包络 = max(Q8 参考, 实测)"
+仍**不是上界**，且随扫描规模继续上抬。原始证据：
+`_meta/pypto-x/u2b-vendor-int8/raw/{bit-envelope.json,envelope-refutation.json}`、
+`_meta/pypto-x/verify-0042-u2b/raw/{envelope-author-scope.json,envelope-author-scope-1000.json,envelope-exceedance-stats.json,envelope-top-seeds.json,bit-envelope.json}`。
 
-**修复**（U2b，未放宽契约）：
-1. `vendor:aocl-lpgemm-int8` manifest 的 `exactness_envelope.deviation_bound_by_k` 改为逐 K
-   `max(Q8 参考值, U2b 实测值)`，同时记录 `q8_reference_bound_by_k`、`measured_bound_by_k`、
-   `measurement_scope`（seeds 1–8 × 4 分布 × 线程 {1,2,6}，m=2,n=6），全部 hash 进
-   `provider_artifact_digest`；
-2. 数值分类仍 `deterministic_bounded`：K≤1024 全分布/全线程逐位；K≥133145 在任何 kernel 调用前 fail-closed；
-   `-128` 在适配层拒绝；
-3. `0006 §8.2` 的包络段按实测值修订，并显式标注"实测包络、非上界证明"（本次修订）。
+**根因**：
+1. 偏差同时依赖 **K 与码值分布**：KC=2048 的 int32 block partial 在 f32 上链式累加，
+   大码值下 f32 ULP 达 4–256，"3 seeds × 单一分布"只是观测快照；E10 本身只测到 K=5099，
+   更大的 K 来自少量构造用例，不是 max-over-distributions。
+2. 更关键：**真实内核不是可解析建模的"块内精确 int32 + 块间纯 f32 链"**。pinned zen4
+   int32 输出内核（`kernels/zen4/lpgemm/s8s8s32/lpgemm_6x64rowmajor_s8_amd512vnni.c` +
+   `u8s8s32/lpgemm_s32_kern_macros.h`）把 s8 加 128 转 u8 走 `vpdpbusd`，再用 **int32**
+   减去 B 列和补偿；每个 KC block 结束时把 int32 累加器 `_mm512_cvtepi32_ps` 转 f32、
+   必要时做 post-op/beta，再 `_mm512_cvtps_epi32` 写回 int32；m/n fringe 还走不同 kernel。
+   Q8 自己的"块间 f32 链"模型只 25/31 用例逐位吻合（mixed 差 2–5），不是内核语义。
+3. 因此按文档语义推导的递归界（K=16696 为 60，见 `_meta/pypto-x/u2b-vendor-int8/raw/analytic-bound-attempt.json`）被真实 provider 观测的 75 直接证伪；
+   而"任意 f32 求和顺序"的通用界（K=133144 约 8.4e3）又超过 int32 头寸（最大精确和
+   2,147,479,576 距 2³¹ 仅 4,072），连"不会静默回绕"都无法证明。
+
+**修复（最终语义，未放宽契约）**：
+1. `vendor:aocl-lpgemm-int8` manifest 明确声明 `deviation_bound_kind = "measured_snapshot"`、
+   `deviation_bound_available = false`，**删除** `deviation_bound_by_k`；观测值改名
+   `measured_deviation_by_k`（聚合 internal 扫描 + 外部 200-seed 与 1000-seed 扫描：
+   16696→75、133144→966），
+   并在 `measurement_scope` 记录分布/seed/线程/外部证据路径与
+   `observations_are_not_a_bound=true`；`upper_bound.status="not_provided"` 附阻塞证据。
+2. 数值分类仍 `deterministic_bounded`：K≤1024 全分布/全线程逐位；K≥133145 在任何 kernel
+   调用前 fail-closed；`-128` 在适配层拒绝。
+3. 新增 policy 旋钮 `numeric.require_proven_deviation_bound=true`：resolver 只接受
+   `deviation_bound_kind ∈ {exact_contract_bound, analytic_f32_chain_upper_bound}` 的 provider；
+   拿到 `measured_snapshot`（或 deterministic-bounded 但无 envelope）时结构化拒绝
+   `proven_deviation_bound_unavailable`（无 fallback 时 `NUMERIC_GUARANTEE_UNMET`），
+   portable 参考主干因 `exact_contract_bound` 仍可用。plan/report schema 同步规定：
+   measured-snapshot envelope **不得**携带 `deviation_bound_by_k`。
+
+**覆盖与不覆盖（本任务结论的边界）**：被观测/建模的量是
+`|AOCL_int32 - 精确 int32 参照|`（LC 契约的 int8×int8→int32 段），输入限码值
+`[-127,127]`、`K ≤ 133144`、m/n/线程在记录 scope 内。它**不覆盖**：
+反量化/epilogue 之后的输出误差（例如 fused `(acc×s_w)×s_a` 的 bf16 误差）、`-128` 与
+K>133144（两者在适配层 fail-closed，不进入 kernel）、其它 AOCL 构建/架构、以及
+scope 之外的 shape/线程。解析上界若要成立，必须覆盖内核的真实算术路径；本轮结论是
+**不提供**。
 
 **教训**：
-1. "实测包络"必须写清分布/线程/seed 口径，并区分观测快照与上界；同一文档内的数字若与其自身的构造用例
-   （E3 all-127 → 24）矛盾，冻结前必须对账。
-2. 依赖 f32 链式累加的 vendor 语义，其误差是**输入依赖**的；仅按 K 分档不足以支撑误差预算，
-   任何"最坏码值分布"的表都要声明取 max 的分布集合。
-3. 复测要用绕过适配层的 raw 调用 + 独立整数参照，避免把适配层行为误当成库行为。
+1. **字段名就是契约**：`deviation_bound_by_k` 一旦存在就会被消费者当成上界；实测快照必须
+   用 `measured_*` 命名并带 `*_kind`，且让"要求上界"的消费者 fail-closed。
+2. **模型界 ≠ 内核界**：从源码/文档推导的界必须先用真实 kernel 路径做反例扫描；本轮
+   "60 被 75 证伪"说明只做位级 parity 的少量用例不足以支撑一个界。
+3. 误差预算类字段必须有 **bound kind + coverage + not-covered** 三段式语义，不能只给数字。
 

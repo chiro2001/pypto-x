@@ -93,19 +93,25 @@
 | 分类 | `int32_f32block_bounded`（`bitwise` 仅当 provider=portable/自有 kernel 或 **k ≤ 1024**） | `deterministic_bounded` / `fp32_1ulp_epilogue` |
 | 边界 | `K % 4 != 0` 时 reorder API 返回缓冲区大小 0 → **fail-closed** | 同左 |
 
-偏差包络（**实测，非上界证明**；修订见 ERR-0010）：`K=512/1024 → 0`（逐位）｜`2048 → ≤1`｜`3584 → ≤4`｜
-`5099 → 8`｜`16696 → 56`｜`133144 → 457`｜**`133145 → 回绕到 −2147471616 且无报错`**。
+偏差是一组**实测观测，不是上界**（两次修订见 ERR-0010）：`K=512/1024 → 0`（逐位）｜
+`2048 → 1`｜`3584 → 4`｜`5099 → 8`｜`16696 → 75`｜`133144 → 966`（seeds 1–1000 扫描）｜
+**`133145 → 回绕到 −2147471616 且无报错`**。
 
-U2b 复测口径（`u2b-vendor-int8`）：seeds 1–8 × {`uniform[100,127]`（A/B 独立生成器）、all-127、`uniform[-127,127]`}
-× 线程 {1,2,6}，m=2,n=6 → `5099 → 8`、`16696 → 56`、`133144 → 457`；另按本节 parity-probe 的
-"同一生成器续采样"分布复测（`uniform[100,127]`，seeds 1–3）→ `5099 → 6`、`16696 → 40`、`133144 → 452/444/435`，
-all-127 下 `133144 → 24`。**偏差同时依赖 K 与码值分布**（KC=2048 的 int32 block partial
-在 binary32 上链式累加，大码值下 f32 ULP 达 4–256），因此"3 seeds × 单一分布"只是观测快照、不是上界；本段旧值
-`5099→6 / 16696→33 / 133144→22` 已被 ERR-0010 更正（`133144→22` 连 Q8 E3 的 all-127 观测 24 都未覆盖）。
+U2b 及独立验收的观测口径：seeds 1–8 × {`uniform[100,127]`（A/B 独立生成器）、all-127、
+`uniform[-127,127]`} × 线程 {1,2,6}（m=2,n=6）只给到 `16696→56 / 133144→457`；同一生成器扩到
+seeds 1–200 后为 `16696→75（seed 147）/ 133144→841（seed 115）`，验收方另一 seed 族到
+`133144→924（seed 48）`，seeds 1–1000 扫描到 `133144→966（seed 428）`（503/1000 超过
+第一轮声明的 457），648 用例扫描到 5099→7、16696→62、133144→678。**偏差同时依赖 K 与码值分布**
+（KC=2048 的 int32 partial 在 f32 上链式累加），且 pinned zen4 内核还包含 s8→u8 转换、
+int32 列和补偿、每 KC block 的 f32 转换/写回与 m/n fringe 分支，"块间纯 f32 链"模型只 25/31
+用例逐位吻合。因此本选型**不提供可证明的解析上界**：vendor manifest 声明
+`deviation_bound_kind=measured_snapshot`、`deviation_bound_available=false`，只给
+`measured_deviation_by_k` + `measurement_scope`；需要"有证明上界"的消费者必须用
+`numeric.require_proven_deviation_bound=true`，否则会拿到观测而非界。契约本身未放宽：仍是
+`deterministic_bounded`、K≤1024 逐位、K≥133145 在任何 kernel 调用前 fail-closed、
+`-128` 在适配层拒绝。以上观测/（若有）上界**只约束 `|AOCL_int32 - 精确 int32 参照|`**，
+不覆盖反量化/epilogue 之后的输出误差，也不覆盖 scope 之外的 shape/线程/其它构建。
 
-vendor provider 的声明值取 `max(Q8 参考值, U2b 实测值)`，`q8_reference_bound_by_k` / `measured_bound_by_k` /
-`measurement_scope` 一并进 manifest 并 hash 进 `provider_artifact_digest`；**契约未放宽**：仍是
-`deterministic_bounded`、K≤1024 逐位、K≥133145 在任何 kernel 调用前 fail-closed、`-128` 在适配层拒绝。
 实现方模型（块内精确 int32 → 块间 f32 → mod 2³²）在 31 用例中 25 个逐位吻合（含回绕），6 个 mixed 用例差 2–5 → **机制已定位、细节未钉死**（如实登记为模型解释力边界）。
 
 **三条必须由我们守的硬约束**（各带可复现探针）：
