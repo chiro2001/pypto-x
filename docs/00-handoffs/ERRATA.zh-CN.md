@@ -425,3 +425,38 @@ target 副本、threads、guarantees 派生字段；拒绝空/重复 fallback ch
    写"我们检查 X"而不是"不存在未检查的 Y"。
 3. **未登记 ≠ 边界**：单文档中真源在外的字段（timing/resources/叙述串）必须**显式**排除在证据契约外并给理由，
    否则"边界清单"会把绕过（如空 chain 跳过检查）与固有不可验证混在一起。
+
+## ERR-0010（2026-09-12）：0006 §8.2 的 AOCL int8 偏差包络不是上界（K/分布依赖，`133144→22` 被 `452` 取代）
+
+**现象**：`docs/20-planning/0006` §8.2 记录 AOCL `s8s8s32os32` 的实测偏差包络
+（"最坏码值分布，实测"）：`5099 → ≤6`｜`16696 → ≤33`｜`133144 → 22`。U2b（任务 `u2b-vendor-int8`，
+分支 `work/u2b-vendor-int8`）在同一固定库（BLIS 5.3.2 zen4、sha256 `c7d74a31…`、
+`bli_arch_string=zen4`）上用更强对抗分布复测：
+U2b envelope（seeds 1–8 × {`uniform[100,127]`（A/B 独立生成器）、all-127、`uniform[-127,127]`} × 线程 {1,2,6}，
+m=2,n=6）→ `5099 → 8`、`16696 → 56`、`133144 → 457`；另按 Q8 parity-probe 的"同一生成器续采样"分布
+（`uniform[100,127]`，seeds 1–3）→ `5099 → 6`、`16696 → 40`、`133144 → 452/444/435`；
+all-127 下 `133144 → 24`（与 Q8 E3 的 `2147479576 → 2147479552` 一致）。
+即 **`133144 → 22` 连 Q8 自己的构造观测（24）都没有覆盖**。raw 调用探针见
+`_meta/pypto-x/u2b-vendor-int8/raw/bit-envelope.json`、`raw/adversarial-probe.json`。
+
+**根因**：偏差不只由 K 决定，而由 **K 与码值分布共同决定**：`S8S8S32OS32` 的 KC=2048 block partial 在
+binary32 上链式累加，block partial 的 f32 ULP（大码值下 4–256）随块数累积；"3 seeds × 单一分布"只能给出
+观测快照，不能给出上界。且 E10 只测到 K=5099，`16696/133144` 的数字来自 parity probe 的少量构造用例，
+本身不是 max-over-distributions。
+
+**修复**（U2b，未放宽契约）：
+1. `vendor:aocl-lpgemm-int8` manifest 的 `exactness_envelope.deviation_bound_by_k` 改为逐 K
+   `max(Q8 参考值, U2b 实测值)`，同时记录 `q8_reference_bound_by_k`、`measured_bound_by_k`、
+   `measurement_scope`（seeds 1–8 × 4 分布 × 线程 {1,2,6}，m=2,n=6），全部 hash 进
+   `provider_artifact_digest`；
+2. 数值分类仍 `deterministic_bounded`：K≤1024 全分布/全线程逐位；K≥133145 在任何 kernel 调用前 fail-closed；
+   `-128` 在适配层拒绝；
+3. `0006 §8.2` 的包络段按实测值修订，并显式标注"实测包络、非上界证明"（本次修订）。
+
+**教训**：
+1. "实测包络"必须写清分布/线程/seed 口径，并区分观测快照与上界；同一文档内的数字若与其自身的构造用例
+   （E3 all-127 → 24）矛盾，冻结前必须对账。
+2. 依赖 f32 链式累加的 vendor 语义，其误差是**输入依赖**的；仅按 K 分档不足以支撑误差预算，
+   任何"最坏码值分布"的表都要声明取 max 的分布集合。
+3. 复测要用绕过适配层的 raw 调用 + 独立整数参照，避免把适配层行为误当成库行为。
+
