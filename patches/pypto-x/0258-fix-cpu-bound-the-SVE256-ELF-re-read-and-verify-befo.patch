@@ -1,0 +1,549 @@
+From 2d6e87c7d87bbe5b2d96761ebdf55f18b479d171 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sun, 13 Sep 2026 03:41:17 +0800
+Subject: [PATCH 258/258] fix(cpu): bound the SVE256 ELF re-read and verify
+ before every spawn
+
+Round-2 verification of the 0044 memo hardening registered two more
+boundaries:
+
+* `_read_native_bytes` only wrapped `os.open`; `os.fstat`/`os.read`
+  OSError and MemoryError escaped raw, and a sparse append made a memo
+  hit read/allocate the whole file (probe_10: 1 GiB sparse under
+  RLIMIT_AS=256 MiB -> raw MemoryError, memo entry retained).
+* Non-W8A8 dispatch went from the launch decode straight to
+  `_run_runner` with no re-check, so a rewrite in that window was
+  executed by the child (probe_07).
+
+`_read_native_bytes` now enforces a 64 MiB cap and, when known, the size
+captured at decode time *before* reading; it reads into a pre-sized
+buffer with os.readv, re-checks ino/size/mtime after the read, and
+raises the canonical CpuSve256ArtifactError for every open/fstat/read
+OSError, size/limit mismatch, short read and MemoryError.  A memo hit
+drops the entry and falls back to the full decode on any of these, so no
+raw MemoryError can escape and no stale entry can be reused.
+
+Every runtime subprocess that executes the artifact (`_invoke_runner_raw`
+and `guarded_buffer_self_test`) now re-hashes the on-disk ELF (0.45 ms)
+immediately before spawning; a mismatch fails closed before the child
+starts.  This mitigates probe_07.  The check->exec TOCTOU and the
+unprivileged FUSE per-PID view split stay registered boundaries: both
+need fd-based/private-copy execution rather than another read, which is a
+runner/protocol change and out of scope here.
+
+Same-window numbers on the 883,064-byte model ELF: miss 2.733 s, checked
+memo hit 0.660 ms (4,140x), bounded read+hash 0.447 ms, pre-exec verify
+0.450 ms.  W8A8 per-op times are unchanged within noise (5120: 19-28 ms,
+30720: 44-70 ms, 65536: 76-132 ms) and the whole-graph QEMU smoke is
+PASS at 70.9 s with bit-identical outputs.
+
+Tests: sparse 1 GiB append under RLIMIT_AS=256 MiB (subprocess) stays
+canonical with an empty memo; injected read MemoryError is canonical;
+unreadable/directory/unlinked paths; probe_07-style non-W8A8 launch with
+an injected malicious ELF raises before spawn and leaves no marker.
+Three of the six new cases fail on the pre-round-2 code, so they pin the
+fixes.
+---
+ python/pypto/backends/cpu/aarch64/sve256.py | 182 ++++++++++++++++++++++++++++++++++++-----
+ python/tests/ut/pypto_x/test_w8a8_sve256.py | 211 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 374 insertions(+), 19 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/aarch64/sve256.py b/python/pypto/backends/cpu/aarch64/sve256.py
+index 63c66e598..6e71e842f 100644
+--- a/python/pypto/backends/cpu/aarch64/sve256.py
++++ b/python/pypto/backends/cpu/aarch64/sve256.py
+@@ -700,25 +700,97 @@ def _validate_runtime_indices(values: Sequence[Any], axis_length: int, operation
+             )
+ 
+ 
+-def _read_native_bytes(path: str) -> bytes:
++#: SVE256 runners are one generic arch-locked AArch64 SVE ELF (~0.9 MB on
++#: disk; the CoreProgram/plan lives in the artifact metadata).  This cap
++#: bounds every integrity re-read so a sparse or hostile file cannot turn a
++#: memo hit into an unbounded allocation; it leaves a ~70x margin over the
++#: observed image while staying far below any plausible runner size.
++_MAX_NATIVE_ELF_BYTES = 64 * 1024 * 1024
++
++
++def _read_native_bytes(
++    path: str,
++    *,
++    expected_size: Optional[int] = None,
++    limit: int = _MAX_NATIVE_ELF_BYTES,
++) -> bytes:
++    """Read one SVE256 ELF with a bounded, canonical fail-closed path.
++
++    ``O_NOFOLLOW`` and the single-link regular-file contract stay in place.
++    The on-disk size is checked *before* any read: against ``expected_size``
++    (the size captured at decode time, when known) and against ``limit``.
++    Every failure mode -- open/fstat/read ``OSError``, size/limit mismatch,
++    short read, allocation ``MemoryError`` -- is raised as
++    :class:`CpuSve256ArtifactError`, so no raw ``OSError``/``MemoryError``
++    can escape through a memo hit or a pre-execution re-check.
++    """
++
+     nofollow = getattr(os, "O_NOFOLLOW", 0)
+     try:
+         descriptor = os.open(path, os.O_RDONLY | nofollow)
+     except OSError as exc:
+         raise CpuSve256ArtifactError("SVE256 ELF cannot be opened safely: {}".format(exc)) from exc
+     try:
+-        metadata = os.fstat(descriptor)
++        try:
++            metadata = os.fstat(descriptor)
++        except OSError as exc:
++            raise CpuSve256ArtifactError(
++                "SVE256 ELF cannot be inspected safely: {}".format(exc)
++            ) from exc
+         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+             raise CpuSve256ArtifactError("SVE256 ELF must be a single-link regular file")
+-        chunks = []
+-        while True:
+-            chunk = os.read(descriptor, 1024 * 1024)
+-            if not chunk:
+-                break
+-            chunks.append(chunk)
+-        return b"".join(chunks)
++        size = int(metadata.st_size)
++        if size < 0 or size > limit:
++            raise CpuSve256ArtifactError(
++                "SVE256 ELF size {} exceeds the {} byte integrity read limit".format(size, limit)
++            )
++        if expected_size is not None and size != int(expected_size):
++            raise CpuSve256ArtifactError(
++                "SVE256 ELF size changed on disk: {} != decoded {}".format(size, expected_size)
++            )
++        try:
++            buffer = bytearray(size)
++        except MemoryError as exc:
++            raise CpuSve256ArtifactError(
++                "SVE256 ELF read could not allocate {} bytes".format(size)
++            ) from exc
++        view = memoryview(buffer)
++        try:
++            offset = 0
++            while offset < size:
++                try:
++                    read = os.readv(descriptor, [view[offset:]])
++                except (OSError, MemoryError) as exc:
++                    raise CpuSve256ArtifactError(
++                        "SVE256 ELF read failed: {}".format(exc)
++                    ) from exc
++                if not read:
++                    raise CpuSve256ArtifactError("SVE256 ELF shrank while it was read")
++                offset += read
++            try:
++                after = os.fstat(descriptor)
++            except OSError as exc:
++                raise CpuSve256ArtifactError(
++                    "SVE256 ELF cannot be re-inspected safely: {}".format(exc)
++                ) from exc
++            if (
++                int(after.st_size) != size
++                or int(after.st_nlink) != 1
++                or int(after.st_ino) != int(metadata.st_ino)
++                or int(after.st_mtime_ns) != int(metadata.st_mtime_ns)
++            ):
++                raise CpuSve256ArtifactError("SVE256 ELF changed while it was read")
++        finally:
++            view.release()
++        try:
++            return bytes(buffer)
++        except MemoryError as exc:
++            raise CpuSve256ArtifactError("SVE256 ELF read could not be finalised") from exc
+     finally:
+-        os.close(descriptor)
++        try:
++            os.close(descriptor)
++        except OSError:
++            pass
+ 
+ 
+ def _validate_elf_header(native_bytes: bytes) -> None:
+@@ -1604,6 +1676,12 @@ class Sve256Runtime:
+         ).strip().lower() not in ("0", "false", "no", "off")
+         self._w8a8_loaded: Dict[int, Tuple[Artifact, Any, LoadedSve256Artifact]] = {}
+         self._w8a8_loaded_limit = 2
++        # Decode-time ELF size per Artifact object.  The integrity re-reads
++        # (memo hit and pre-execution) compare the on-disk size against this
++        # value before reading, so a sparse/huge rewrite is rejected without
++        # allocating the file.  Entries hold a strong Artifact reference.
++        self._artifact_nbytes: Dict[int, Tuple[Artifact, int]] = {}
++        self._artifact_nbytes_limit = 8
+         if capability.available:
+             self._status = Availability.yes(self.name)
+         else:
+@@ -1681,6 +1759,7 @@ class Sve256Runtime:
+             available_features, source="injected"
+         )
+         loaded = _decode_artifact(artifact, available)
++        self._remember_artifact_nbytes(artifact)
+         return LoadedSve256Artifact(loaded.artifact, loaded.target_ir, loaded.feature_contract, self.execution_mode)
+ 
+     def workspace_size(self, request: Any) -> int:
+@@ -1701,6 +1780,7 @@ class Sve256Runtime:
+         self._decode_for_execution(artifact, capability)
+         if not mapping_copy(artifact.metadata).get("guarded_buffer_self_test", False):
+             raise CpuSve256ArtifactError("SVE256 artifact lacks guarded-buffer self-test marker")
++        self._verify_artifact_before_exec(artifact)
+         if self.execution_mode == "native":
+             command = [str(artifact.path), "--guarded-self-test"]
+         else:
+@@ -1727,10 +1807,64 @@ class Sve256Runtime:
+     ) -> LoadedSve256Artifact:
+         available = CpuFeatureSet(capability.features, source=capability.source)
+         loaded = _decode_artifact(artifact, available)
++        self._remember_artifact_nbytes(artifact)
+         return LoadedSve256Artifact(
+             loaded.artifact, loaded.target_ir, loaded.feature_contract, self.execution_mode
+         )
+ 
++    def _remember_artifact_nbytes(self, artifact: Artifact) -> None:
++        """Pin the decoded ELF size for later bounded integrity re-reads."""
++
++        path = artifact.path
++        if path is None:
++            return
++        try:
++            size = int(os.stat(path).st_size)
++        except OSError:
++            return
++        if size < 0 or size > _MAX_NATIVE_ELF_BYTES:
++            return
++        self._artifact_nbytes[id(artifact)] = (artifact, size)
++        while len(self._artifact_nbytes) > self._artifact_nbytes_limit:
++            self._artifact_nbytes.pop(next(iter(self._artifact_nbytes)))
++
++    def _expected_artifact_nbytes(self, artifact: Artifact) -> Optional[int]:
++        entry = self._artifact_nbytes.get(id(artifact))
++        if entry is not None and entry[0] is artifact:
++            return entry[1]
++        return None
++
++    def _verify_artifact_before_exec(self, artifact: Artifact) -> None:
++        """Fail-closed digest re-check immediately before any runner exec.
++
++        Every SVE256 operation executes the artifact ELF as a child process,
++        and the launch-time decode is not enough: the verifier's fault
++        injection showed that a rewrite between the decode and a non-W8A8
++        dispatch is executed unchecked.  Re-read the ELF through the bounded
++        reader (with the size captured at decode time when available) and
++        compare sha256 with the immutable artifact digest.  Any mismatch is a
++        canonical :class:`CpuSve256ArtifactError` raised *before* the child is
++        spawned.
++        """
++
++        if artifact.path is None:
++            raise CpuSve256ArtifactError("SVE256 artifact has no ELF path to execute")
++        try:
++            native_bytes = _read_native_bytes(
++                artifact.path,
++                expected_size=self._expected_artifact_nbytes(artifact),
++            )
++        except CpuSve256ArtifactError:
++            raise
++        except (OSError, MemoryError) as exc:
++            raise CpuSve256ArtifactError(
++                "SVE256 ELF integrity re-check failed before execution: {}".format(exc)
++            ) from exc
++        if hashlib.sha256(native_bytes).hexdigest() != artifact.content_digest:
++            raise CpuSve256ArtifactError(
++                "SVE256 ELF on-disk digest changed; refusing to execute the artifact"
++            )
++
+     def _run_runner(
+         self,
+         artifact: Artifact,
+@@ -1898,8 +2032,13 @@ class Sve256Runtime:
+         The raw response payload is returned undecoded; callers that need a
+         specific bit pattern (BF16 epilogue) can read it without a lossy
+         float round trip.
++
++        The on-disk ELF is re-read and re-hashed immediately before the child
++        is spawned; a rewrite between the launch decode and a non-W8A8 dispatch
++        must not be executed (verifier probe_07).
+         """
+ 
++        self._verify_artifact_before_exec(artifact)
+         if self.execution_mode == "native":
+             command = [str(artifact.path)]
+         else:
+@@ -2047,21 +2186,26 @@ class Sve256Runtime:
+ 
+         The memo key is the Artifact object identity, but the file behind that
+         immutable object can still be rewritten in place after the first
+-        decode.  Re-read it through the same hardened reader the full decode
+-        uses (``O_NOFOLLOW``, single-link regular file) and compare sha256 with
+-        the digest captured when the artifact was decoded.  A model-graph ELF
+-        is ~0.9 MB, so this bounded read+hash costs milliseconds per W8A8 node
+-        and stays orders of magnitude below the seconds-long full decode it
+-        guards.  ``False`` means fail-closed: the caller drops the memo entry
+-        and lets the full decode re-validate (and raise its canonical error).
++        decode.  Re-read it through the same hardened, size-bounded reader the
++        full decode uses (``O_NOFOLLOW``, single-link regular file, decode-time
++        size) and compare sha256 with the digest captured when the artifact was
++        decoded.  A model-graph ELF is ~0.9 MB, so this bounded read+hash costs
++        milliseconds per W8A8 node and stays orders of magnitude below the
++        seconds-long full decode it guards.  ``False`` means fail-closed: the
++        caller drops the memo entry and lets the full decode re-validate (and
++        raise its canonical error).  Every reader failure -- including
++        ``MemoryError`` and ``OSError`` -- is folded into ``False``.
+         """
+ 
+         path = artifact.path
+         if path is None:
+             return False
+         try:
+-            native_bytes = _read_native_bytes(path)
+-        except CpuSve256ArtifactError:
++            native_bytes = _read_native_bytes(
++                path,
++                expected_size=self._expected_artifact_nbytes(artifact),
++            )
++        except (CpuSve256ArtifactError, OSError, MemoryError):
+             return False
+         return hashlib.sha256(native_bytes).hexdigest() == loaded.artifact.content_digest
+ 
+diff --git a/python/tests/ut/pypto_x/test_w8a8_sve256.py b/python/tests/ut/pypto_x/test_w8a8_sve256.py
+index 52fd573d7..20671660f 100644
+--- a/python/tests/ut/pypto_x/test_w8a8_sve256.py
++++ b/python/tests/ut/pypto_x/test_w8a8_sve256.py
+@@ -36,6 +36,7 @@ import re
+ import shutil
+ import struct
+ import subprocess
++import sys
+ 
+ import pytest
+ 
+@@ -1048,6 +1049,7 @@ def test_sve256_w8a8_memo_hit_detects_same_object_in_place_rewrite(build_root):
+     path.write_bytes(bytes(tampered))
+     with pytest.raises(CpuSve256ArtifactError):
+         runtime._load_w8a8(artifact)
++    assert id(artifact) not in runtime._w8a8_loaded
+ 
+     # Restoring the exact original bytes recovers: the stale entry was dropped
+     # and the full decode re-validated the file from scratch.
+@@ -1112,6 +1114,7 @@ def test_sve256_w8a8_memo_hit_detects_rewrite_variants(build_root, tmp_path, var
+ 
+     with pytest.raises(CpuSve256ArtifactError):
+         runtime._load_w8a8(artifact)
++    assert id(artifact) not in runtime._w8a8_loaded
+     if variant == "legal_other_elf":
+         path.write_bytes(original)  # leave the shared tmp build tree tidy
+ 
+@@ -1177,6 +1180,214 @@ def test_sve256_w8a8_memo_hit_rejects_hardlink_swap(build_root, tmp_path):
+     path.write_bytes(original)  # leave the shared tmp build tree tidy
+ 
+ 
++def _pwned_aarch64_elf(tmp_path, marker):
++    """Compile a static AArch64 ELF that marks the box if it is executed."""
++
++    source = tmp_path / "pwned.c"
++    source.write_text(
++        "#include <stdio.h>\n"
++        "int main(void){\n"
++        "  FILE *f = fopen(\"@MARKER@\", \"w\");\n"
++        "  if (f) { fputs(\"PWNED\", f); fclose(f); }\n"
++        "  fputs(\"PWNED-ELF\\n\", stderr);\n"
++        "  return 0;\n"
++        "}\n".replace("@MARKER@", str(marker)),
++        encoding="utf-8",
++    )
++    target = tmp_path / "pwned.elf"
++    result = subprocess.run(
++        ["aarch64-linux-gnu-gcc", "-static", "-O2", str(source), "-o", str(target)],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        check=False,
++    )
++    if result.returncode != 0 or not target.is_file():
++        pytest.skip("cross gcc cannot build the malicious ELF")
++    return target.read_bytes()
++
++
++def test_sve256_w8a8_memo_hit_rejects_unreadable_file(build_root):
++    """EACCES on the memo re-read is canonical and drops the entry."""
++
++    _require_sve_execution()
++    if os.geteuid() == 0:
++        pytest.skip("root ignores mode 000")
++    program, _ = _qmatmul_program((1, 2), (2, 1))
++    _, artifact = _compile(program, build_root, "qm_memo_unreadable")
++    path = Path(artifact.path)
++    original_mode = path.stat().st_mode & 0o7777
++    runtime = _runtime()
++    runtime._load_w8a8(artifact)
++
++    os.chmod(path, 0o000)
++    try:
++        with pytest.raises(CpuSve256ArtifactError):
++            runtime._load_w8a8(artifact)
++        assert id(artifact) not in runtime._w8a8_loaded
++    finally:
++        os.chmod(path, original_mode)
++
++
++def test_sve256_w8a8_memo_hit_rejects_directory_replacement(build_root):
++    """A directory at the artifact path is not a regular ELF and fails closed."""
++
++    _require_sve_execution()
++    program, _ = _qmatmul_program((1, 2), (2, 1))
++    _, artifact = _compile(program, build_root, "qm_memo_directory")
++    path = Path(artifact.path)
++    original = path.read_bytes()
++    runtime = _runtime()
++    runtime._load_w8a8(artifact)
++
++    path.unlink()
++    path.mkdir()
++    try:
++        with pytest.raises(CpuSve256ArtifactError):
++            runtime._load_w8a8(artifact)
++        assert id(artifact) not in runtime._w8a8_loaded
++    finally:
++        path.rmdir()
++        path.write_bytes(original)
++
++
++def test_sve256_w8a8_memo_hit_rejects_unlinked_file(build_root):
++    """Unlinking the ELF between warm-up and dispatch fails closed."""
++
++    _require_sve_execution()
++    program, _ = _qmatmul_program((1, 2), (2, 1))
++    _, artifact = _compile(program, build_root, "qm_memo_unlink")
++    path = Path(artifact.path)
++    original = path.read_bytes()
++    runtime = _runtime()
++    runtime._load_w8a8(artifact)
++
++    path.unlink()
++    try:
++        with pytest.raises(CpuSve256ArtifactError):
++            runtime._load_w8a8(artifact)
++        assert id(artifact) not in runtime._w8a8_loaded
++    finally:
++        path.write_bytes(original)
++
++
++def test_sve256_w8a8_memo_hit_sparse_append_is_bounded(tmp_path):
++    """A sparse 1 GiB append under RLIMIT_AS must still be a canonical error."""
++
++    _require_sve_execution()
++    tree = Path(__file__).resolve().parents[4]
++    assert (tree / "python" / "pypto").is_dir(), tree
++    work = tmp_path / "sparse_probe"
++    code = (
++        "import os, resource, sys\n"
++        "from pathlib import Path\n"
++        "TREE = {tree!r}\n"
++        "sys.path.insert(0, TREE + '/python')\n"
++        "sys.path.insert(0, TREE + '/python/tests/ut')\n"
++        "sys.path.insert(0, TREE + '/python/tests/ut/pypto_x')\n"
++        "os.environ.setdefault('PYPTO_X_PORTABLE_ONLY', '1')\n"
++        "os.environ.setdefault('PYPTO_X_SVE_TEST_MODE', 'qemu')\n"
++        "import test_w8a8_sve256 as helpers\n"
++        "from pypto.backends.cpu.aarch64 import CpuSve256ArtifactError\n"
++        "work = Path({work!r})\n"
++        "work.mkdir(parents=True, exist_ok=True)\n"
++        "program, _ = helpers._qmatmul_program((1, 2), (2, 1))\n"
++        "_, artifact = helpers._compile(program, work, 'sparse')\n"
++        "path = Path(artifact.path)\n"
++        "original = path.read_bytes()\n"
++        "runtime = helpers._runtime()\n"
++        "runtime._load_w8a8(artifact)\n"
++        "os.chmod(path, 0o755)\n"
++        "os.truncate(path, 1 << 30)\n"
++        "soft, hard = resource.getrlimit(resource.RLIMIT_AS)\n"
++        "resource.setrlimit(resource.RLIMIT_AS, (256 << 20, hard))\n"
++        "caught = None\n"
++        "try:\n"
++        "    runtime._load_w8a8(artifact)\n"
++        "except BaseException as exc:\n"
++        "    caught = exc\n"
++        "finally:\n"
++        "    resource.setrlimit(resource.RLIMIT_AS, (soft, hard))\n"
++        "memo_len = len(runtime._w8a8_loaded)\n"
++        "os.chmod(path, 0o644)\n"
++        "os.truncate(path, 0)\n"
++        "path.write_bytes(original)\n"
++        "ok = isinstance(caught, CpuSve256ArtifactError) and memo_len == 0\n"
++        "print('OK' if ok else 'FAIL', type(caught).__name__, memo_len, str(caught)[:200])\n"
++        "sys.exit(0 if ok else 3)\n"
++    ).format(tree=str(tree), work=str(work))
++    result = subprocess.run(
++        [sys.executable, "-c", code],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        timeout=600,
++        check=False,
++    )
++    assert result.returncode == 0, result.stdout.decode("utf-8", "replace") + result.stderr.decode(
++        "utf-8", "replace"
++    )
++    assert "OK" in result.stdout.decode("utf-8", "replace")
++
++
++def test_sve256_w8a8_memo_hit_wraps_reader_memoryerror(build_root, monkeypatch):
++    """An injected allocation failure in the re-read is canonical, not raw."""
++
++    _require_sve_execution()
++    import pypto.backends.cpu.aarch64.sve256 as sve_module
++
++    program, _ = _qmatmul_program((1, 2), (2, 1))
++    _, artifact = _compile(program, build_root, "qm_memo_memerror")
++    runtime = _runtime()
++    runtime._load_w8a8(artifact)  # warm with a real read
++
++    def boom(fd, buffers):
++        raise MemoryError("injected read allocation failure")
++
++    monkeypatch.setattr(sve_module.os, "readv", boom)
++    with pytest.raises(CpuSve256ArtifactError):
++        runtime._load_w8a8(artifact)
++    assert id(artifact) not in runtime._w8a8_loaded
++
++
++def test_sve256_non_w8a8_exec_rechecks_artifact_before_spawn(build_root, tmp_path):
++    """Verifier probe_07: a non-W8A8 dispatch must not execute a rewritten ELF."""
++
++    _require_sve_execution()
++    program = _elementwise_program((4,))
++    _, artifact = _compile(program, build_root, "exec_recheck_neg")
++    path = Path(artifact.path)
++    original = path.read_bytes()
++    marker = tmp_path / "PWNED_MARKER"
++    malicious = _pwned_aarch64_elf(tmp_path, marker)
++    runtime = _runtime()
++    real_decode = runtime._decode_for_execution
++    injected = {"count": 0}
++
++    def tampering_decode(*args, **kwargs):
++        loaded = real_decode(*args, **kwargs)
++        os.chmod(path, 0o755)
++        path.write_bytes(malicious)
++        injected["count"] += 1
++        return loaded
++
++    runtime._decode_for_execution = tampering_decode
++    source = HostTensor("float32", (4,), [1.0, -2.0, 3.0, -4.0])
++    output = HostTensor("float32", (4,), [0.0] * 4)
++    try:
++        with pytest.raises(CpuSve256ArtifactError):
++            runtime.launch(
++                LaunchRequest(
++                    artifact,
++                    inputs=[source.descriptor(readonly=True)],
++                    outputs=[output.descriptor()],
++                )
++            )
++        assert injected["count"] == 1
++        assert not marker.exists()
++    finally:
++        os.chmod(path, 0o755)
++        path.write_bytes(original)
++
++
+ def test_sve256_w8a8_dispatch_revalidates_declaration_on_memo_hit(build_root):
+     """The memo only skips decode; the W8A8 gate runs on every dispatch."""
+ 

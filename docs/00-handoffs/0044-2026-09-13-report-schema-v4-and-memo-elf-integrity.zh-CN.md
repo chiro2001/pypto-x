@@ -1,6 +1,6 @@
 # PyPTO-X 0044 波次快照：report schema v4（内嵌 plan payload）与 SVE256 W8A8 memo 盘上 ELF 完整性
 
-状态：`CLOSED_LOCALLY`（memo 验收在跑；报告侧已按 round-3 重冻结到 T13，推送政策为自动）
+状态：`CLOSED_LOCALLY`（两条独立验收均已回；报告侧 round-3 + memo 侧 round-2 收口后冻结于 T14；推送政策为自动）
 批次：`batch_0044_plan_payload_and_memo_integrity_2026_09_13`（见 `configs/development_lock.yaml`）
 撰写：parent（自动批次）
 
@@ -12,10 +12,10 @@
 
 | 项 | 值 |
 |---|---|
-| integration tip（frozen） | **`2d83bb8a5`**（tree `d50d94188375baf7abd5af11d43051c7f0c05723`；= `dcc5371cb` + round-3 `da3c5b904`） |
+| integration tip（frozen） | **`2d6e87c7d`**（tree `538367cf845e4ff2b2daddaa92b3b7b41788a66d`；= T13 + memo round-2 `701fc294c`） |
 | 任务分支 commit | A：`e1c480be2` → cherry-pick `581510882`（T11）；B：`932980c2f` → cherry-pick `dcc5371cb`（T12，patch-id `fd91a2379…` 一致，因 B 基于 `0a63ed4dd` 而 T11 在其上，故用 patch-id 判等价） |
-| 补丁数 | **257**（0043 = 254）；am 复算：257 个全部干净应用，复算 tree = 冻结 tree |
-| 规则 8 全量 | **rc=0，1939 passed / 7 skipped / 0 failed，991.06 s**（attempt 2；attempt 1 为锁忙重试）；collect **1946**；基线 `0a63ed4dd` = **1921** |
+| 补丁数 | **258**（0043 = 254）；am 复算：258 个全部干净应用，复算 tree = 冻结 tree |
+| 规则 8 全量 | **rc=0，1945 passed / 7 skipped / 0 failed，907.17 s**（attempt 1）；collect **1952**；基线 `0a63ed4dd` = **1921** |
 
 ## 2. 切片 A：report schema v4（`REPORT_SCHEMA_VERSION = 4`）
 
@@ -39,7 +39,7 @@
 | 切片 | agent | 判决 |
 |---|---|---|
 | report v4 | `0eb1b90a` | 初检 **FAIL**（claim 1–4、6 VERIFIED——版本门 23 例 0 mismatch、plan_payload 60 项 0 失败、残余 3 与 R5-full 已拒、34 条锚全拒、无 probe 0 禁止调用、10/10 真报告；**claim 5** 缺一类"报告副本 vs `plan_payload.document`"（36/36 曾被接受）；**claim 7** 聚焦测试非密封（canonical 顺序 1 failed/328 passed））→ **round-3 后父方复核**：验收方自有 harness 指向 T13 报 **36/36 REFUSED / 0 accepted**（其内建"复现 bug"断言随后自爆，属预期）；canonical 顺序两次 **336 passed / 0 failed** |
-| memo 完整性 | `a9a98cd6` | 待回（重点：七类改写是否全部检出并 fail-closed、纪律测试未削弱、命中成本、TOCTOU 边界是否已登记、全量 UT） |
+| memo 完整性 | `a9a98cd6` | **PASS_WITH_BOUNDARIES**：12–13 场景全部 detected+fail-closed；A/B 证明修复前恶意 ELF 会被 memo 服务并由 qemu 执行（PWNED），修好后在 0 次子进程调用前 fail-closed；14/14 纪律测试、8 形状输出逐位一致；checked hit 0.439 ms vs miss 2.739 s（**6,242×**）；确认 TOCTOU 可实战（`renameat2` 1–7 次即赢）并给出**非特权 FUSE per-PID 视图分裂**反例（**仅传 fd 不足以闭合**）；新登记两条（"非 W8A8 dispatch 不复查"、"无界读/非 canonical 失败路径"）→ round-2 后分别为**已缓解**（所有 spawn 前复验，0.450 ms/op）与**已闭合**（size 预检 + 64 MiB 上限 + `readv` + 读后复查，失败即丢弃条目并抛规范错误） |
 
 父方复核（T12）：collect **1939**；`test_w8a8_sve256.py` **54 passed**；`test_execution_report_manifest_v31.py` **70 passed**；合并探针 **38/38 全拒（0 接受）**；无误伤（portable + 真 AOCL f32/bf16 + 真 runtime fallback）。
 
@@ -49,7 +49,7 @@
 2. 未 pin 的 probe 事实（host features、target snapshot digest、AOCL fingerprint 路径/大小/线程数、线程模型数值）。
 3. 报告残余 3'（完全协调的 alternate payload）与残余 4（无 attestation 的整份替换）。
 4. 无外部真源字段（`request.dtype/shape`）的全副本改写；说明层。
-5. memo 完整性：check→exec TOCTOU；root/块设备/page cache 级；SHA-256 碰撞。
+5. memo 完整性（round-2 后状态）：① **check→exec TOCTOU** 登记待修（需 fd 持有或私有副本执行）；② **非特权 FUSE per-PID 视图分裂** 登记待修（需同一不可变快照/私有副本，**仅传 fd 不够**）；③ root/块设备/page cache 登记（威胁模型外）；④ SHA-256 碰撞登记（不可行）；⑤ 非 W8A8 dispatch 复验 **已缓解**（所有 spawn 前 re-hash，0.450 ms/op）；⑥ 读取上界与非 canonical 失败路径 **已闭合**；⑦ runner 为 arch-locked 通用 AArch64 ELF（plan 在 metadata，换 arch/字节均被 digest 拒）。
 6. AVX2 broadcast 为 scalar odometer（不称 SIMD 吞吐）；int8 包络为观测快照非上界；性能一律 UNGATED。
 
 ## 6. 证据路径
