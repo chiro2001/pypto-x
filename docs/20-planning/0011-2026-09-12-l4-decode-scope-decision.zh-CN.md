@@ -12,6 +12,7 @@
 | 口径 | 结果 | 证据 |
 |---|---|---|
 | **prefill**（row0=prefill_next + prefill 块） | **6/6 PASS**（chat 2 个 near-tie flip 单列） | `c8-l4-avx512`、`c8-w8a8-reference-gold` |
+| **SVE256 整网（A3 原生）** | **prefill 主判定 6/6 PASS**；decode 扩展 default 两口径 FAIL / full decode-band FAIL、prefill-band PASS | M2b item 6（`m2b/a3/raw/judgment_*`，2026-09-12） |
 | **decode**（declared decode key，rows0–3 的 cosine 门） | **6/6 FAIL（仅 cosine 门）** | 同上 + C7 `raw/tables_decode_gap.md` |
 | 同一批输出改用 prefill band 判 decode | 5/6 PASS（仅 zh/default 差 −0.00326） | C7 §3 |
 
