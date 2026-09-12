@@ -57,7 +57,7 @@
      但必须**引用共享全量并注明 commit**，不得写成"我自己跑了全量"。原因：5 个任务各跑 11 分钟全量会在
      无公平队列的锁上互相饿死（实测每次都差 30–90 s 撞车）。
    · **不要用"范围字符串替换"编辑 `development_lock.yaml`**（父 agent 三次踩坑：删范围连坐、切出重复键、
-     把 wave 级键塞进 in-flight）。正确做法：改前记录键集 → 定向替换 → 改后比对键集，缺失即报错。
+     把 wave 级键塞进 in-flight）。正确做法：改前记录键集 → 定向替换 → 改后比对键集，缺失即报错；**并且必须把"YAML 解析校验"与 `git commit` 用 `&&` 串联**——父 agent 2026-09-12 两次把非法 YAML（一行内 `[a,b,c]_后缀`、以及一次多出的孤立引号行）提交进本地历史，都是"校验失败但脚本继续往下走"造成的；非法文件绝不能进 commit。
    · **cherry-pick 收尾**：`GIT_EDITOR=true git cherry-pick --continue`，**不要**用 `git commit` 手动收尾
      （sequencer 会挂着，之后任何 `--abort` 都会回退分支——ERR-0008 就是这么丢掉 Q3 的 4 个提交的）；
      合入后**必须**用 tree/patch-id 相等核验等价性（cherry-pick 产生新 SHA，`merge-base --is-ancestor` 不适用）。
