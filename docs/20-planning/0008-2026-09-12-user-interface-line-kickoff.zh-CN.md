@@ -48,6 +48,12 @@
 
 **明确不做**（本切片）：命令行（doctor/explain/plan）、graph/region 作用域、cost model 与 tuning profile、环境变量迁移、复合算子（CompositeContract）、StateContract、自定义 provider 插件、P1–P8 里 matmul 以外的族。
 
+> **U1-VIEW 扩展（2026-09-12 用户批准）**：在 U1 竖切之外增加 `layout.view_mode`
+> 三态与零拷贝 alias proof（证明链 + AVX-512 proof-gated 执行器 + SVE256 capability
+> 声明 + 对抗测试 + plan/report 字段 + `0006`/`0008` 文档）。它不是 matmul provider
+> 的新实现，而是把 0006 §7.1 的 view 契约从"hard-off 警告"推进到可执行 proof；
+> `matmul` 自身 contract 仍是 `must_not_alias`，只用于验证 `require` 的 fail-closed 分支。
+
 ## 4. 首切片的硬性验收
 
 1. **`profile=portable` 与既有路径逐位一致**：同一输入下，结果与现有 native 路径全 buffer `sha256` 相同（不是"误差内相同"）；
@@ -72,13 +78,14 @@
 | vendor GEMM 选型（Q8） | 本线**消费**其 provider 结论与绑定方式；U2 才接 vendor provider |
 | N4（dispatch 残差） | 与 0006 的 P3（graph 作用域）强相关；**P3 必须排在 N4 决策之后**，本线不碰 |
 | C8（W8A8 精度收口） | 数值类别（exact / bounded）与参照 gold 的来源；本线报告里的 `precision_class` 引用它 |
-| B6（layout 原生化） | 已收口；其 hard-off 的视图别名决定 `view_mode` 的公开范围（§13.9 第 4 答） |
+| B6（layout 原生化） | 已收口；`view-mode-require` 已把其 hard-off 视图别名改为 AVX-512 `proof_gated`，SVE256 声明 `alias_proof=unsupported`（见 `0006` §13.9 第 4 答 / §14.1 A-2） |
 
 ## 7. 任务阶梯（后续，不在本次派发）
 
 | # | 任务 | 依赖 | 说明 |
 |---|---|---|---|
 | **U1** | **本切片（matmul + portable + plan/report）** | 无 | 本次启动 |
+| **U1-VIEW** | **`view_mode=require` 提级（证明链 + 执行器启用 + 文档）** | U1 + B6 | 2026-09-12 用户批准提级；任务 `view-mode-require`，分支 `work/view-mode-require`。交付五项 proof、三态语义、AVX-512 proof-gated 零拷贝、SVE256 capability 声明、对抗测试、plan/report 字段与 `0006` 文档提级 |
 | U2 | 第一个 vendor provider 绑定（oneDNN 或 AOCL/LPGEMM，取绑定干净的） | U1 + Q8 | 引入 `precision_class` 与库版本指纹 |
 | U3 | `doctor` / `explain` / `plan` 三个发现命令 + capability snapshot | U1 | 把"事实/为什么/可重放"暴露给用户 |
 | U4 | 35 个环境变量迁移 P0–P1（登记 → 兼容层 + 弃用警告） | U1 | 不破坏旧用户；影响 artifact 语义的 env 必须进 policy digest |

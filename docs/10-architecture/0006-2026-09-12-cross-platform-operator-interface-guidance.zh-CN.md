@@ -168,7 +168,7 @@ execution_policy:
     transfer: auto
   layout:
     preferred: preserve_input
-    view_mode: forbid          # stable: forbid | prefer；require 仅 internal
+    view_mode: forbid          # stable: forbid | prefer | require（proof 未过时 require fail-closed）
     allow_materialize_copy: true
     max_copy_bytes: null
   optimization:
@@ -183,13 +183,13 @@ execution_policy:
 
 | 档位 | 面向谁 | 示例 | 稳定性 |
 |---|---|---|---|
-| `stable` | 普通用户、模型作者 | `profile`、`target`、`numeric.requirement`、`deterministic`、`max_workspace_bytes`、`fallback`、`view_mode=forbid/prefer`、`allow_materialize_copy`、`allow_fusion` | 走兼容承诺和变更记录 |
+| `stable` | 普通用户、模型作者 | `profile`、`target`、`numeric.requirement`、`deterministic`、`max_workspace_bytes`、`fallback`、`view_mode=forbid/prefer/require`、`allow_materialize_copy`、`allow_fusion` | 走兼容承诺和变更记录 |
 | `tuning` | 性能工程师 | `profile_id`、固定线程上限、provider pin、已登记的 shape bucket | 必须有证据、版本和可重放制品 |
 | `internal` | target/provider 实现者 | ISA、tile、microkernel、寄存器/共享内存布局、CCE Pipe 参数 | 不进入公共稳定 API |
 
 `provider=vendor` 可以作为稳定的意图，但 `provider=oneDNN:某个 microkernel` 不应成为稳定接口。用户要固定某个库时，应固定 provider ID 和版本，而不是固定库内部符号。
 
-`view_mode` 是约束/偏好，不是 alias 授权：contract 的 `view_obligation`、liveness、写覆盖和 owner/lifetime proof 优先于 policy。`prefer` 只影响候选排序；`require` 在 proof 未接入前仅供 internal 调试使用，无法证明时必须 fail-closed。旧的 `allow_view` 只作为兼容输入，不能把 `must_not_alias` 改成 `may_alias`。
+`view_mode` 是约束/偏好，不是 alias 授权：contract 的 `view_obligation`、stride 可表达性、写后读、owner/lifetime 和多 view 重叠 proof 优先于 policy。`prefer` 只影响候选排序；`require` 要求 proof 必须通过，无法证明时以 `ALIAS_PROOF_UNAVAILABLE` 给出失败条件并 fail-closed，绝不静默拷贝。**2026-09-12 用户批准 `require` 提级为公共 stable API；提级以证明链与执行器启用为前提，因此 `require` 的 stable 语义同时包含"proof 通过 → 零拷贝 view"与"proof 不通过 → 结构化失败"两半。**旧的 `allow_view` 只作为兼容输入，不能把 `must_not_alias` 改成 `may_alias`。
 
 同理，`allow_materialize_copy` 只是“允许候选考虑 layout 物化”的上限条件；contract 若要求保留 storage alias，或 `max_copy_bytes`/lifetime 不满足，resolver 仍必须拒绝 copy。`allow_transfer_copy` 只控制设备/内存空间搬运，不能替代 layout 的物化约束。
 
@@ -255,11 +255,15 @@ execution_plan:
   numeric_guarantee: {...}
   policy_applicability: {status: validated, rejected_fields: []}
   layout_decision:
-    requested_view_mode: not_applicable
-    resolved_view_mode: not_applicable
-    alias_proof_digest: null
-    layout_copy_bytes: null
-    transfer_bytes: null
+    requested_view_mode: forbid          # forbid | prefer | require | not_applicable
+    resolved_view_mode: not_applicable   # view | materialized | not_applicable
+    view_obligation: must_not_alias      # must_alias | may_alias | must_not_alias
+    alias_check: contract_requires_distinct_storage
+    alias_proof: {status: not_applicable, reason: op_contract_has_no_view_obligation,
+                  failed_conditions: [], digest: sha256:...}
+    alias_proof_digest: sha256:...
+    layout_copy_bytes: 0
+    transfer_bytes: 0
   fallback_chain: [vendor:onednn, portable]
   artifact: {format_version: ..., digest: ...}
 ```
@@ -290,11 +294,25 @@ policy = px.ExecutionPolicy(
     provider=px.ProviderPolicy(mode="auto"),
     fallback=px.FallbackPolicy(mode="portable_only"),
     resources=px.ResourcePolicy(max_threads="auto"),
+    # 三态 view_mode 于 2026-09-12 提级为 stable；require 要求 alias proof
+    # 全部通过，否则抛 ALIAS_PROOF_UNAVAILABLE 并列出失败条件，不会静默拷贝。
+    layout=px.LayoutPolicy(
+        view_mode="prefer",              # forbid | prefer | require
+        allow_materialize_copy=True,
+        max_copy_bytes=None,
+    ),
 )
 
 with px.execution(policy):
     y = ops.matmul(a, b)
+
+# 只有确认“零拷贝 view 是硬要求”时才使用 require：
+strict_view = px.ExecutionPolicy(
+    layout=px.LayoutPolicy(view_mode="require", allow_materialize_copy=False),
+)
 ```
+
+`layout.view_mode=forbid` 是默认值，保持"总是独立 destination"的旧行为；`prefer` 在 proof 通过时零拷贝、否则在 contract/`allow_materialize_copy`/`max_copy_bytes` 允许时显式 materialize，并在 plan/report 写 `resolved_view_mode=materialized` 与 `layout_copy_bytes>0`；`require` 不参与 materialize 降级。
 
 如果用户需要可移植基准：
 
@@ -589,12 +607,12 @@ numeric_class / exactness_basis / reduction_order_id / deterministic / accumulat
 layout:
   preferred: preserve_input
   allowed: [contiguous, blocked]
-  view_mode: forbid          # stable: forbid | prefer；require 仅 internal
+  view_mode: forbid          # stable: forbid | prefer | require
   allow_materialize_copy: true
   max_copy_bytes: null
 ```
 
-`view` 只有在别名、stride、写后读和生命周期证明通过时才可解析为零拷贝；否则必须生成显式 copy 并在计划中可见。`view_mode=prefer` 只影响候选排序，`require` 在 proof 未接入前不属于 stable API。不能用 policy 绕过 Core IR 的 alias/effect 契约。
+`view` 只有在 contract-`view_obligation`、stride/shape 可表达、写后读、owner/lifetime 和多 view 重叠五项证明全部通过时才可解析为零拷贝；否则必须生成显式 copy 并在计划中可见（`resolved_view_mode=materialized`、`layout_copy_bytes>0`、alias decision 全量落 plan/report）。`view_mode=prefer` 只影响候选排序；`view_mode=require` 要求 proof 必须通过，proof 缺失时以 `ALIAS_PROOF_UNAVAILABLE` 列出失败的证明条件并 fail-closed，不进入 materialize 降级。不能用 policy 绕过 Core IR 的 alias/effect 契约（`must_not_alias` 永不零拷贝）。
 
 ### 7.2 Placement 与搬运
 
@@ -650,11 +668,22 @@ execution_report:
     status: validated
     rejected_fields: []
   layout_decision:
-    requested_view_mode: not_applicable
-    resolved_view_mode: not_applicable
-    alias_proof_digest: null
-    layout_copy_bytes: null
-    transfer_bytes: null
+    requested_view_mode: forbid          # forbid | prefer | require | not_applicable
+    resolved_view_mode: not_applicable   # view | materialized | not_applicable
+    view_obligation: must_not_alias      # must_alias | may_alias | must_not_alias
+    alias_check: contract_requires_distinct_storage
+    alias_proof:
+      status: not_applicable             # proven | rejected | not_applicable | unsupported
+      reason: op_contract_has_no_view_obligation
+      conditions: [...]                  # 五项条件逐条 name/status/code/reason/evidence
+      failed_conditions: []
+      digest: sha256:...
+    alias_proof_digest: sha256:...
+    layout_copy_bytes: 0
+    transfer_bytes: 0
+    materialize_allowed: false
+    materialize_reason: not_applicable_no_view_obligation
+    resolution_reason: op_contract_has_no_view_obligation
   resolution:
     candidates: [...]
     fallback_events: []
@@ -1039,7 +1068,7 @@ effectful/reserved 或 target-private namespace，不伪装成 P1–P8 的 porta
 
 | 族/层 | 可表达的意图 | 不可表达的内容 |
 |---|---|---|
-| P2 | stable `view_mode=forbid/prefer`、internal `require`、`max_copy_bytes` | 通过 policy 授权 alias、改 stride/shape/写覆盖语义 |
+| P2 | stable `view_mode=forbid/prefer/require`、`max_copy_bytes`、`allow_materialize_copy` | 通过 policy 授权 alias、改 stride/shape/写覆盖语义；`must_not_alias` 上不得出现零拷贝 |
 | P3 | provider、workspace、线程上限、numeric requirement | ISA、microkernel、accumulation/rounding 变更 |
 | P4/P1 | deterministic、region fusion preference、资源上限 | 改 reduction order 或舍入次数 |
 | P5/P6 | placement、residency preference、资源上限 | 越界、duplicate update、atomic 语义 |
@@ -1047,8 +1076,10 @@ effectful/reserved 或 target-private namespace，不伪装成 P1–P8 的 porta
 | CompositeContract | allow/prefer/forbid fusion | 把假融合变成公共 opcode |
 
 `view_mode=require` 是硬要求而不是授权；resolver 没有 alias/liveness/lifetime proof
-时必须返回 `CAPABILITY_UNAVAILABLE` 或 `POLICY_CONFLICT`。不适用字段必须返回
-`POLICY_FIELD_NOT_APPLICABLE`，不得静默忽略。
+时必须返回 `ALIAS_PROOF_UNAVAILABLE` 并列出失败证明条件（`must_not_alias`
+contract 也以同一错误码 + `contract_view_obligation` 条件返回；`forbid` 与
+`must_alias` 矛盾返回 `POLICY_CONFLICT`），不得静默改成 copy 或 view。不适用
+字段必须返回 `POLICY_FIELD_NOT_APPLICABLE`，不得静默忽略。
 
 ### 13.5 单一真源与 Core IR 映射
 
@@ -1132,7 +1163,7 @@ P8 额外报告：
 1. 用 exact profile-specific histogram 修正 §13.1；
 2. 以现有 op-bench registry 建立 `OpDefinition` 单一真源；
 3. 先完成 matmul 的 resolver/plan/report 竖切；
-4. P2 layout 继续 hard-off view alias，先接入 proof schema，再考虑启用；
+4. P2 layout 接入 proof schema 并在 AVX-512 原生 layout 面 proof-gated 启用（2026-09-12 完成；SVE256 声明 `alias_proof=unsupported`，require 结构化拒绝）；
 5. 拆分 pointwise/reduction/index-read/index-write；
 6. 接入 W8A8 P8，逐 opcode 声明 exact/bounded；
 7. 最后接入 composite/state/streaming contract；
@@ -1154,12 +1185,15 @@ P8 额外报告：
 | 1 | “源 strides 必须行主连续、slice step 必须为正”是公共 contract 还是 CPU provider 限制？ | **是 lowering/provider 前置条件，不是 L0 语义**。它属于既有 `LayoutPlan` 校验与 runtime descriptor 约束；跨平台公共契约里只登记 shape/permutation/slice 的语义合法域，contiguous/step/rank 上限记入 capability precondition | `lowering/cpu/vector/plan.py` 的 `LayoutPlan` 要求 `source_strides == 连续 strides`；`abi/descriptors.py` 的 contiguous 检查 |
 | 2 | `sort/topk/random/collective` 是否纳入当前公共 API？ | **全部列为 reserved**：不在公共 API、不在 capability 的 supported 集合内；出现在图上必须 fail-closed。经典 PyPTO 审计中的这些条目属于"未来需要覆盖"的历史清单 | 当前 MVP 图只用 26 个 operation key（见 §13.1 的证据文件） |
 | 3 | §13 证据基线用哪个 commit？ | **统计绑定三元组**：`graph_digest 456ab519…d786e` + precision profile `BF16/T=5` + evidence `verify-w8a-decay-fix/raw/s3_aligned.json`；文档修订对应 integration HEAD `c2ec98f3c`。W8A8 图另立 profile 统计，不与 BF16 混算 | 本次核对：五组之和精确 6728、无未归类项 |
-| 4 | `view_mode=require` 是否作为公共 stable API？ | **暂不**：B6 实测视图别名 hard-off、liveness proof 未接入，此时 `require` 必然失败，公开它只会变成陷阱。现阶段公共 stable 只保留 `forbid` / `prefer`，`require` 记为 internal，待 proof schema 接入后再提级 | `verify-b6-layout-native` §5：`layout_view_alias_mode="disabled"`、3 个 env 开关无效、执行器总分配独立 destination |
+| 4 | `view_mode=require` 是否作为公共 stable API？ | **已提级（2026-09-12）**：用户批准；任务 `view-mode-require` 已把五项证明链（contract-view-obligation / stride 可表达 / 写后读 / owner-lifetime / 多 view 重叠）与执行器 proof gate 落地。公共 stable 更新为 `forbid | prefer | require`：`require` + proof 通过 → 零拷贝 view（`layout_copy_bytes=0`）；proof 不通过 → `ALIAS_PROOF_UNAVAILABLE` 并列出失败条件，绝不静默拷贝。旧答"暂不提级"作为历史记录保留在本节更新块中 | 代码分支 `work/view-mode-require`；证明链 `python/pypto/alias/proof.py`；AVX-512 proof-gated metadata `layout_view_alias_mode="proof_gated"`；SVE256 明确 `alias_proof=unsupported`（见 §14.1 A-2 更新） |
 | 5 | W8A8 各 primitive 的 exact/bounded 划分与 scale 归约顺序是否已冻结？ | **v1 方案已冻结**，逐 opcode 划分为：`qmatmul_s8s8_s32` = `exact`（int32 累加，且无饱和时与整数和恒等）；`quantize_per_token_s8` = `exact`（RNE + absmax + 码值域 `[-127,127]`，拒 `-128`）；`dequantize_epilogue_bf16` = **相对契约声明的单次 RNE 序为 exact、相对其它乘序为 bounded**；scale 归约顺序冻结为“先形成一次 `s_a*s_w`，再与 accumulator 相乘”。机器报告必须同时写 `scheme_digest`、`reduction_order_id`、`exactness_basis`；vendor 融合路径若为两次 accumulator-scale 乘法（如 AOCL `_sym_quant`）只能记 `deterministic_bounded`，不得继承位级主张 | 契约 `docs/20-planning/0002-…`（FROZEN）；C5/C6 验收的逐位证据；AOCL LPGEMM 源码级语义发现（AOCL `(acc×s_w)×s_a` 两次乘） |
 
 > **2026-09-12 用户裁决（更新第 4 答）**：用户明确"`view_mode=require` 我认为可以"，即**批准把 `require` 提级为公共 stable API**。
-> 提级**不是文案变更**：已派落地任务 `view-mode-require`（证明链 contract-view-obligation / stride 可表达 / 写后读 / owner-lifetime / 多 view 重叠 + 执行器启用 + 三态语义 + 对抗性测试 + 报告字段 + 文档提级）。
-> **在任务验收通过前，公共 stable 仍只有 `forbid` / `prefer`**；任何文档、报告或口头说明都不得宣称 `require` 已可用（否则就是本节警告过的"必然失败的陷阱"）。
+> 提级**不是文案变更**：落地任务 `view-mode-require` 已实现证明链 + 执行器启用 + 三态语义 + 对抗性测试 + plan/report 字段 + 文档提级。
+> - **证明链**：`pypto.alias` 对 `contract_view_obligation`、`stride_shape_expressible`（`stride_class` capability 前置）、`write_after_read`（含 effectful/in-place 写与输出别名）、`owner_lifetime`（含 caller-owned `TypedByteView` 不得在 view 存活期释放）、`multi_view_overlap` 逐条给出 `status/code/reason/evidence` 与 digest；
+> - **执行器**：AVX-512 原生 layout 面由 `layout_view_alias_mode="disabled"` 改为 `"proof_gated"`，proof 通过才返回零拷贝 view，否则显式 copy，两条路径逐位一致；SVE256 因运行时物化 Python value list、且不跨 view 保留 caller-owned `TypedByteView` export，声明 `alias_proof=unsupported`、`supported_view_modes=[forbid, prefer]`，`require` 以该 capability reason 拒绝（不允许"假装可用"）；
+> - **语义**：`forbid` 保持独立 destination；`prefer` proof 通过则 view，否则在 contract/`allow_materialize_copy`/`max_copy_bytes` 允许时显式 materialize 并记录 `resolved_view_mode=materialized`、`layout_copy_bytes>0`；`require` 不参与 materialize 降级。
+> 证据：`worktrees/_meta/pypto-x/view-mode-require/brief.zh-CN.md` 与同目录 `raw/`、`logs/`；代码分支 `work/view-mode-require`。
 
 **同时采纳的三处修正**（v1 → v2）：
 
@@ -1167,9 +1201,8 @@ P8 额外报告：
 2. §13.7 的性能引用补上完整边界：**本机 12 vCPU KVM、无 cpufreq、非静默窗口 → 永久 `UNGATED`**，只能报中位与离散度，**不得写成跨平台加速比结论**；引用时必须带 host、commit、协议与证据路径；
 3. 分类从五族平级改为 **P1–P8 primitive + CompositeContract + StateContract + artifact/target 层**，并为 P6/P7 与非 Qwen 族显式标注 reserved/unsupported，避免读者误以为已覆盖全部 PyPTO。
 
-**仍待用户裁决的两项**（不属于本次审理范围）：
+**仍待用户裁决的事项**（不属于本次审理范围；`view_mode=require` 已于 2026-09-12 由用户裁决并落地，见上）：
 
-- `view_mode=require` 何时提级为公共 stable API（取决于 liveness proof 的接入时机与形态）；
 - W8A8 v1 之外的量化方案（新 scheme/新码制/新 scale 粒度）是否立项，以及届时是否新建 contract 版本而非复用 `w8a8-linear.v1`。
 
 ---
@@ -1183,9 +1216,9 @@ P8 额外报告：
 | # | 事项 | 现状与影响 | 项目方倾向 |
 |---|---|---|---|
 | A-1 | **L5/L6 的语料与阈值** | 契约 §5.2 的 L4–L6 阈值是暂定值，`D5` 明确需用户确认；决定 Q6 能否启动，也决定能否对外声称"W8A8 精度达标" | 先只做 L4（logits）；L5 用现有 token 链做弱化版并显式标注覆盖不足；L6 待语料与阈值 |
-| A-2 | **`view_mode=require` 何时提级为公共 stable** | 当前 view alias 为 hard-off（liveness proof 未接入），公开 `require` 必然失败 | 先保持 internal，待 proof schema 接入（与 A-4 相关）后再提级 |
+| A-2 | **`view_mode=require` 提级为公共 stable** | **已解决（2026-09-12）**：用户批准提级；任务 `view-mode-require` 落地证明链与执行器 proof gate，`view_mode` stable 集为 `forbid | prefer | require`。剩余边界：AVX-512 支持 `require`（proof-gated）；SVE256 声明 `alias_proof=unsupported` / `supported_view_modes=[forbid, prefer]`，`require` 以 capability reason 结构化拒绝 | 已按此执行；若后续在 SVE256 上接入零拷贝 view，需先实现 view 值表示与 owner 保留，再更新该 capability |
 
-> **2026-09-12 更新**：用户已批准提级；任务 `view-mode-require` 进行中（证明链 + 执行器启用 + 对抗测试 + 文档）。验收通过前仍按"internal/不得宣称可用"执行。
+> **2026-09-12 更新**：用户已批准提级；实现证据见 `worktrees/_meta/pypto-x/view-mode-require/`（brief + raw/logs）与代码分支 `work/view-mode-require`。旧"先保持 internal"的文字仅作为历史记录保留在 §13.9 的更新块中。
 | A-3 | **W8A8 v1 之外是否立项新量化方案** | 新 scheme/码制/scale 粒度按 §13.7 必须新建 contract 版本，不许复用 `w8a8-linear.v1` | 等单算子框架与真实工业框架对比之后再议（用户 2026-09-12） |
 | A-4 | **图执行层：自研还是外包**（决定 N4 的存废） | 现状是我们自己的 Python 逐 op 循环；B6 后 prefill launch 约 24 s 中 op 约 4.5 s，残差约 19.4 s（约 81%）。这些数字来自本机 KVM、无 cpufreq、非静默窗口，**永久 `UNGATED`**，只能作为诊断线索，不能解释为与算子内容无关或跨平台结论。若外包给框架（PyTorch/vLLM 的 executor），残差变成框架的问题；若保留自研，必须先分解再优化 | 先做**三档计时分解**（低成本的诊断），用数据支撑"自研 vs 外包"；“每次 launch 重复 `from_dict`+`canonical_json`+`sha256`”目前是待 profile 证实的假设，确认后无论走哪条路都应修；证据来自 `verify-b6-layout-native/brief.zh-CN.md §7` |
 | A-5 | **W8J 注入门政策** | 现行门是"必须追平 oneDNN 才允许注入"，导致注入被禁；vendor GEMM 决策后背景已变（W8J 转 W8A8） | 改为**按 provider/精度分层声明 + 显式 opt-in + 诚实标注倍数**，而不是一刀切禁止 |
@@ -1216,4 +1249,4 @@ P8 额外报告：
 | B-5 模型级验收 | 增加轻量 `ModelReport` 外壳，引用一个或多个 `ExecutionReport`，只放 L4–L6、gold digest、token chain、near-tie、state 有限性等模型字段；不复制 op/provider 字段 | `ModelReport {execution_report_refs, model_gates}` |
 | B-6 进程并行 | 增加 deployment-level `parallelism`：`worker_count`、`worker_index`、`intra_op_threads`、`oversubscription_policy`、`cpu_affinity`；不放入 OpContract，也不让 per-op policy 改写它 | `ExecutionPolicy.resources.parallelism`、host report |
 
-`view_mode=require`、新量化 scheme、L5/L6 阈值和自研/外包执行层仍保持 §14.1 的用户裁决状态；本节只冻结可审计的数据形状和边界，不替用户做产品选择。
+新量化 scheme、L5/L6 阈值和自研/外包执行层仍保持 §14.1 的用户裁决状态；`view_mode=require` 已于 2026-09-12 由用户裁决并落地（见 §13.9 第 4 答与 §14.1 A-2）。本节只冻结可审计的数据形状和边界，不替用户做产品选择。
