@@ -1,6 +1,6 @@
 # PyPTO-X 0044 波次快照：report schema v4（内嵌 plan payload）与 SVE256 W8A8 memo 盘上 ELF 完整性
 
-状态：`CLOSED_LOCALLY_VERIFICATION_IN_FLIGHT`（两条独立验收在跑；回来后按既定政策自动推送）
+状态：`CLOSED_LOCALLY`（memo 验收在跑；报告侧已按 round-3 重冻结到 T13，推送政策为自动）
 批次：`batch_0044_plan_payload_and_memo_integrity_2026_09_13`（见 `configs/development_lock.yaml`）
 撰写：parent（自动批次）
 
@@ -12,10 +12,10 @@
 
 | 项 | 值 |
 |---|---|
-| integration tip（frozen 候选） | **`dcc5371cb`**（tree `42e4477ad5514395c4cac1e6a31cca5b9f62a133`） |
+| integration tip（frozen） | **`2d83bb8a5`**（tree `d50d94188375baf7abd5af11d43051c7f0c05723`；= `dcc5371cb` + round-3 `da3c5b904`） |
 | 任务分支 commit | A：`e1c480be2` → cherry-pick `581510882`（T11）；B：`932980c2f` → cherry-pick `dcc5371cb`（T12，patch-id `fd91a2379…` 一致，因 B 基于 `0a63ed4dd` 而 T11 在其上，故用 patch-id 判等价） |
-| 补丁数 | **256**（0043 = 254）；am 复算：256 个全部干净应用，复算 tree = 冻结 tree |
-| 规则 8 全量 | **rc=0，1932 passed / 7 skipped / 0 failed，1066.72 s**（attempt 1）；collect **1939**；基线 `0a63ed4dd` = **1921**（runner 的基线目录路径未对上预置目录，父方手工补跑基线 collect 到 `raw/collect-0a63ed4dd.out`，rc=0） |
+| 补丁数 | **257**（0043 = 254）；am 复算：257 个全部干净应用，复算 tree = 冻结 tree |
+| 规则 8 全量 | **rc=0，1939 passed / 7 skipped / 0 failed，991.06 s**（attempt 2；attempt 1 为锁忙重试）；collect **1946**；基线 `0a63ed4dd` = **1921** |
 
 ## 2. 切片 A：report schema v4（`REPORT_SCHEMA_VERSION = 4`）
 
@@ -38,7 +38,7 @@
 
 | 切片 | agent | 判决 |
 |---|---|---|
-| report v4 | `0eb1b90a` | 待回（重点：版本语义、payload digest 三处互等、decision 投影、无 probe、残余 3'/4 与清单完备性、全量 UT 独立复跑） |
+| report v4 | `0eb1b90a` | 初检 **FAIL**（claim 1–4、6 VERIFIED——版本门 23 例 0 mismatch、plan_payload 60 项 0 失败、残余 3 与 R5-full 已拒、34 条锚全拒、无 probe 0 禁止调用、10/10 真报告；**claim 5** 缺一类"报告副本 vs `plan_payload.document`"（36/36 曾被接受）；**claim 7** 聚焦测试非密封（canonical 顺序 1 failed/328 passed））→ **round-3 后父方复核**：验收方自有 harness 指向 T13 报 **36/36 REFUSED / 0 accepted**（其内建"复现 bug"断言随后自爆，属预期）；canonical 顺序两次 **336 passed / 0 failed** |
 | memo 完整性 | `a9a98cd6` | 待回（重点：七类改写是否全部检出并 fail-closed、纪律测试未削弱、命中成本、TOCTOU 边界是否已登记、全量 UT） |
 
 父方复核（T12）：collect **1939**；`test_w8a8_sve256.py` **54 passed**；`test_execution_report_manifest_v31.py` **70 passed**；合并探针 **38/38 全拒（0 接受）**；无误伤（portable + 真 AOCL f32/bf16 + 真 runtime fallback）。
