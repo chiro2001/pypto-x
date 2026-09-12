@@ -616,6 +616,8 @@ layout:
 
 `view` 只有在 contract-`view_obligation`、stride/shape 可表达、写后读、owner/lifetime 和多 view 重叠五项证明全部通过时才可解析为零拷贝；否则必须生成显式 copy 并在计划中可见（`resolved_view_mode=materialized`、`layout_copy_bytes>0`、alias decision 全量落 plan/report）。`view_mode=prefer` 只影响候选排序；`view_mode=require` 要求 proof 必须通过，proof 缺失时以 `ALIAS_PROOF_UNAVAILABLE` 列出失败的证明条件并 fail-closed，不进入 materialize 降级。不能用 policy 绕过 Core IR 的 alias/effect 契约（`must_not_alias` 永不零拷贝）。
 
+> **report 单文档校验边界（2026-09-12，0042）**：`ExecutionReport` 由共享校验器 `validate_report_schema` 做 cross-block 对账：`resolution.capability_digest`↔`capability.snapshot_digest`、`resolution.contract_digest`↔`resolved.contract.digest`、`dispatch.provider_declared`↔`resolution.fallback_chain[0]`/`resolved.provider`/`dispatch.provider_invoked`（fallback 场景允许 declared≠invoked，但 chain/resolved/invoked 关系必须成立）、`dispatch.fallback_used`↔`resolution.fallback_used`；`guarantees.accumulation` 由注册 `OpDefinition` + `request.dtype` 重算，`guarantees.exactness_basis` 由 provider family（portable/vendor）重算。仍有 report 单文档无法自证的外部引用：`artifact.pack.included_in_timing`（真源是 provider manifest）与 `resolution.plan_digest`（外部 plan 引用）；在不嵌入 provider manifest 时，库指纹/pack strategy/numeric_class/deterministic/reduction_order 的"双副本一致伪造"也不能只靠 report 判断。**执行授权只以 `execute_matmul_plan` 对 digest-checked capability 的 canonical 重算通过为准**；report 校验是审计层，不是执行门。若要求 report 单文档自证，应在 report 内嵌 selected provider 的 manifest（`ProviderCapability` 结构 + canonical digest）并做 fail-closed 校验。
+
 ### 7.2 Placement 与搬运
 
 `placement` 应在 graph/region 级优先表达：设备、内存空间、是否允许 HtoD/DtoH/跨设备 copy、是否允许 host staging。`allow_transfer_copy` 只控制这些搬运，不控制 layout materialization。算子 provider 只能在父级允许的 placement 中选路。这样可避免每个 op 分别“选 CUDA”而图中间隐式发生不可见搬运。
