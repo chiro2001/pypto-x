@@ -13,10 +13,10 @@
 | 项 | 值 |
 |---|---|
 | 控制仓 | 收口提交见 §10（含 lock 记录、本快照、ERR-0009/0010、0006 §7.1/§8.2） |
-| integration tip（frozen） | **`0376e5307`**（tree `8f705bb0d7cd4df145dc4bde92ddf3f92cb8037b`） |
-| 任务分支 commit | 项 1 `748717529`（→ `15d0fe58d`）；项 1b `4ddf84e1c`（→ `53d3deab9`）；项 1b2 `7f5b26675`（→ `e860f69c6`）；项 1c `c2af5bb1d`+`512b2e5ff`（→ `134d1dd21`+`b89e0b521`）；U2b 初版 `7b77284e9`（→ `1d23a597f`）+ round-3 的 8 个提交（→ `0376e5307` 的末 8 个提交）；AVX2 `b37e2d58e`（→ `27a0cb477`） |
-| 补丁数 | **250**（0041 = 235）；am 复算：250 个全部干净应用，复算 tree = `8f705bb0d…` = 冻结 tree |
-| 规则 8 全量 | **rc=0，1838 passed / 7 skipped / 0 failed，943.10 s**；collect 1845（基线 `8fff50558` = 1674） |
+| integration tip（frozen） | **`94d1ab162`**（tree `e923e6462611a6d3951a23d9858bd21a806e4333`） |
+| 任务分支 commit | 项 1 `748717529`（→ `15d0fe58d`）；项 1b `4ddf84e1c`（→ `53d3deab9`）；项 1b2 `7f5b26675`（→ `e860f69c6`）；项 1c `c2af5bb1d`+`512b2e5ff`（→ `134d1dd21`+`b89e0b521`）；U2b 初版 `7b77284e9`（→ `1d23a597f`）+ round-3 的 8 个提交（→ `0376e5307`）+ round-4 `7d03bab0c`（→ `1822b366b`）+ round-5 `42aa36727`（→ `94d1ab162`）；AVX2 `b37e2d58e`（→ `27a0cb477`） |
+| 补丁数 | **252**（0041 = 235）；am 复算：252 个全部干净应用，复算 tree `e923e6462…` = 冻结 tree |
+| 规则 8 全量 | **rc=0，1854 passed / 7 skipped / 0 failed，953.01 s**；collect **1861**（基线 `8fff50558` = 1674）；三个候选 tip 连续干净（`0376e5307` 1838 → `1822b366b` 1845 → `94d1ab162` 1854，均 attempt 1） |
 | 备份同步 | 待 push 批准后执行 `scripts/remote/sync_private_backup.sh` |
 
 ## 2. 项 1：report cross-block（`748717529` → `15d0fe58d`）
@@ -64,9 +64,10 @@ Cherry-pick 树一致：`15d0fe58d^{tree} == 748717529^{tree} == c54671ffd83778f
 |---|---|---|---|---|
 | 项 1 | `cb32c1ba` | `15d0fe58d` | **PASS_WITH_BOUNDARIES** | 6/6 声明条件 VERIFIED；无假阳性（portable + 真 AOCL vendor bf16/f32 + 真 fallback 均通过）；聚焦 352 passed/181.96 s；穷举 41 类 39 类有未对账成员，单叶 accepted portable 335/449、vendor-f32 347/536、fallback 404/518；rule-echo 62 叶中 61 曾被接受 |
 | 项 1b/1b2 | `cb32c1ba` | `e860f69c6` | **PASS_WITH_BOUNDARIES** | rule-echo 60/62 叶被拒；单叶 accepted 降到 portable 110/449、vendor 126/536、fallback 174/518；4/4 真报告仍通过；聚焦 386 passed；新列出 R1–R9 与三处文档措辞问题 |
-| 项 1c | 待 `cb32c1ba` 在 T6 复检 | `0376e5307` | 待定 | 父方 v2 探针：非基线 **37/37 全拒**（28 cross-block/echo + R1–R9），真 portable 与真 fallback 通过，2 登记边界通过 |
+| 项 1c | `cb32c1ba` | `1822b366b` | **PASS_WITH_BOUNDARIES** | R1–R10 **全部闭合**（各有具名码）、16 条最小反例全部拒绝；单叶"单点篡改被接受"数再降为 portable **102**/488、vendor **119**/575、fallback **161**/557；41 类中 **36 类**完全单点受检、26 类协调改写被 registry/policy/digest 拒绝、12 类为不可约边界；真 portable + 真 AOCL bf16/f32 + 真 fallback + int8 报告全部通过；聚焦 420 passed、report 测试 38、qmatmul 50。**遗留（round-5 收）**：`measured_deviation_by_k` 与内嵌 witness 未比对（文内真源，可检）；docstring/0006 §7.1 与 brief §15 两处措辞不准 |
 | 项 2（U2b） | `71599188` | `1d23a597f` | **FAIL（仅包络项）** | claim 1/3/4/5/6/7 VERIFIED；全量 UT 1744 collected = 1737 passed/7 skipped/0 failed/958.30 s；包络被其自有生成器扩 seed 推翻（seeds 1–1000 → 966 > 声明 457，中位数 458 已超；K=16696 → 75 > 56）；同窗口性能 0.932×（非加速）；新发现入口开销 20.7 ms–5.06 s vs op 0.29–2.61 ms |
-| 项 2 修复轮 | `71599188` | `0376e5307` | **PASS_WITH_BOUNDARIES** | 诚实化与消费门按规范工作；13,317 观测下记录值 ≥ 观测值；同窗口性能判为**持平（无加速）**；入口开销 (1,1024,8192) 5244→**184.9 ms**、(1,3584,1024) 2251→**78.5 ms**；线程泄漏已修。边界 + 待收：同生成器 seeds 1–12000 → K=133144 **1067** > 记录 966（应刷新）；批量校验放松了 bool 的 `code_not_integer` 拒绝；report 侧缺 `measured_deviation_by_k` 未拒（plan 侧拒）。**round-4 在跑**收这三条 |
+| 项 2 修复轮 | `71599188` | `0376e5307` | **PASS_WITH_BOUNDARIES** | 诚实化与消费门按规范工作；13,317 观测下记录值 ≥ 观测值；同窗口性能判为**持平（无加速）**；入口开销 (1,1024,8192) 5244→**184.9 ms**、(1,3584,1024) 2251→**78.5 ms**；线程泄漏已修。边界 → 已由 round-4/5 收：快照刷新 **966→1067**（同生成器 seeds 1001–12000）、bool 恢复 `code_not_integer` 拒绝、report 侧对称、`measured_deviation_by_k` 必须支配内嵌 witness（plan+report），并明确登记"抬高 measured 在单文档内不可反驳"为不可约边界 |
+| report 最终复检 | `cb32c1ba` | `1822b366b`（round-5 前） | **PASS_WITH_BOUNDARIES** | R1–R10 与 16 条反例全闭合；单叶接受面 **102/488、119/575、161/557**；36/41 类完全受检；真报告全通过。round-5 收掉其最后两条（witness 关系 + 两处措辞） |
 | AVX2 broadcast | `d119bbce` | `b89e0b521` | **PASS_WITH_BOUNDARIES** | 自建复现：census decode 350/350、prefill 494/494 native（真跑分派 844/844 native、0 reference）；86 例逐位矩阵 + **67,275 例 ctypes kernel fuzz** 全 0 mismatch（含 rank 0–16、23 个 Qwen 契约、f32/bf16 特殊位型）；共享谓词 identity True、9 种整型/bool 与 rank 17 走 host_reference 带显式 reason；payload 6/marker :7 与旧产物拒绝、缓存键改变且 cache miss；全量 UT 1824 passed/7 skipped/0 failed/964.64 s；perf 自测 decode 22.130→13.022 s、prefill 106.919→69.664 s，51 个整图输出 digest 一致。边界：view-kind 输入不可达、标量非有限值不可注入、不可表达维度在 codegen 前即拒（fallback reason 属防御性）、无真实权重 s3/L4 与 T=18 |
 
 **执行边界（项 1 验收已证）**：伪造 plan 在 plan 层 `validate` PASS，但 `execute_matmul_plan` 报 `plan_declaration_mismatch`/`artifact_declaration_mismatch` 且**输出未动**；`validate_report_schema` 只在 `ExecutionReport.__init__`（执行之后）调用，执行路径不消费 report。⚠️ caveat：若下游从 report 重新规划，`request.op/shapes/dtype` 会变成执行相关。
@@ -74,9 +75,10 @@ Cherry-pick 树一致：`15d0fe58d^{tree} == 748717529^{tree} == c54671ffd83778f
 
 ## 6. 规则 8 全量
 
-- 冻结 tip：**`0376e5307`**；命令：`batch-0042-rule8/scripts/run_locked_retry.sh`（内部 `run_local_heavy.sh`，75/69 重试 300 s，`setsid`，从未绕过锁）。
-- 结果：**rc=0，1838 passed / 7 skipped / 0 failed，943.10 s**（attempt 1）；collect **1845**；基线 `8fff50558` = **1674**；added 171 / removed 0（无收集丢失）；7 个 skip 全为 `test_cuda_qwen_c2.py`（本机无 CUDA 驱动）。
-- 首跑曾 1 failed（`test_op_bench_framework.py::test_repeat_run_structure_and_median_within_dispersion`，`median_delta=0.004295 s = 11.2%` 略超该单测自带的 10% 噪声容忍，发生在 AVX2 验收方并发持锁重活时）；安静窗口重跑干净。失败证据保留在 `raw/failed-run-T6-attempt2.log`。
+- 冻结 tip：**`94d1ab162`**；命令：`batch-0042-rule8/scripts/run_locked_retry.sh`（内部 `run_local_heavy.sh`，75/69 重试 300 s，`setsid`，从未绕过锁）。
+- 结果：**rc=0，1854 passed / 7 skipped / 0 failed，953.01 s**（attempt 1）；collect **1861**；基线 `8fff50558` = **1674**；7 个 skip 全为 `test_cuda_qwen_c2.py`（本机无 CUDA 驱动）。
+- 三个候选 tip 各跑一次全量、均 attempt 1 干净：`0376e5307` 1838 passed / 943.10 s → `1822b366b` 1845 passed / 946.91 s → **`94d1ab162` 1854 passed / 953.01 s**（每轮新增测试数与实现方复跑吻合）。
+- 唯一一次失败发生在最早一轮（`test_op_bench_framework.py::test_repeat_run_structure_and_median_within_dispersion`，`median_delta=0.004295 s = 11.2%` 略超该单测自带的 10% 噪声容忍，发生在 AVX2 验收方并发持锁重活时）；安静窗口重跑干净，未放宽任何测试。失败证据保留在 `raw/failed-run-T6-attempt2.log`。
 
 ## 7. 已知边界（带进下一批）
 
