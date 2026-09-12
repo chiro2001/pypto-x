@@ -67,7 +67,7 @@ Cherry-pick 树一致：`15d0fe58d^{tree} == 748717529^{tree} == c54671ffd83778f
 | 项 1c | 待 `cb32c1ba` 在 T6 复检 | `0376e5305`→`0376e5307` | 待定 | 父方 v2 探针：非基线 **37/37 全拒**（28 cross-block/echo + R1–R9），真 portable 与真 fallback 通过，2 登记边界通过 |
 | 项 2（U2b） | `71599188` | `1d23a597f` | **FAIL（仅包络项）** | claim 1/3/4/5/6/7 VERIFIED；全量 UT 1744 collected = 1737 passed/7 skipped/0 failed/958.30 s；包络被其自有生成器扩 seed 推翻（seeds 1–1000 → 966 > 声明 457，中位数 458 已超；K=16696 → 75 > 56）；同窗口性能 0.932×（非加速）；新发现入口开销 20.7 ms–5.06 s vs op 0.29–2.61 ms |
 | 项 2 修复轮 | 待 `71599188` 在 T6 复检 | `0376e5307` | 待定 | 包络改 `measured_snapshot` + `require_proven_deviation_bound` fail-closed 门 + 支配不变式；性能改同窗口 0.919×；入口开销 5244→152.8 ms（1×1024×8192） |
-| AVX2 broadcast | `d119bbce` | `b89e0b521` | 待定 | 待其自建 census/逐位/兼容/回归/同窗口 perf 复现 |
+| AVX2 broadcast | `d119bbce` | `b89e0b521` | **PASS_WITH_BOUNDARIES** | 自建复现：census decode 350/350、prefill 494/494 native（真跑分派 844/844 native、0 reference）；86 例逐位矩阵 + **67,275 例 ctypes kernel fuzz** 全 0 mismatch（含 rank 0–16、23 个 Qwen 契约、f32/bf16 特殊位型）；共享谓词 identity True、9 种整型/bool 与 rank 17 走 host_reference 带显式 reason；payload 6/marker :7 与旧产物拒绝、缓存键改变且 cache miss；全量 UT 1824 passed/7 skipped/0 failed/964.64 s；perf 自测 decode 22.130→13.022 s、prefill 106.919→69.664 s，51 个整图输出 digest 一致。边界：view-kind 输入不可达、标量非有限值不可注入、不可表达维度在 codegen 前即拒（fallback reason 属防御性）、无真实权重 s3/L4 与 T=18 |
 
 **执行边界（项 1 验收已证）**：伪造 plan 在 plan 层 `validate` PASS，但 `execute_matmul_plan` 报 `plan_declaration_mismatch`/`artifact_declaration_mismatch` 且**输出未动**；`validate_report_schema` 只在 `ExecutionReport.__init__`（执行之后）调用，执行路径不消费 report。⚠️ caveat：若下游从 report 重新规划，`request.op/shapes/dtype` 会变成执行相关。
 验收证据：`_meta/pypto-x/verify-0042-report-cross-block/raw/18_FINAL_LEDGER.md`、`_meta/pypto-x/verify-0042-report-1b2/raw/18_FINAL_LEDGER_1b2.md`、`_meta/pypto-x/verify-0042-u2b/raw/verification-summary.json`、`12_focused_suite.*`、`11_execution_boundary.*`。
@@ -91,7 +91,7 @@ Cherry-pick 树一致：`15d0fe58d^{tree} == 748717529^{tree} == c54671ffd83778f
 
 ## 8. 在途与排队
 
-- 在途（截至收口）：`cb32c1ba` 在 T6 复检 1c；`71599188` 在 T6 复检 U2b claim-2 与两项副发现；`d119bbce` 在 `b89e0b521` 验收 AVX2 broadcast（其代码在 T6 未变）。
+- 在途（截至收口）：`cb32c1ba` 在 T6 复检 1c；`71599188` 在 T6 复检 U2b claim-2 与两项副发现。**AVX2 broadcast 已完成**：`d119bbce` @ `b89e0b521` 判 **PASS_WITH_BOUNDARIES**（其代码在 T6 未变）。
 - 排队（0043+ 候选）：U3（doctor/explain/plan）、U4（35 env 迁移）、U5（graph/region，等 N4）、report schema v2（manifest 内嵌）、fused `sym_quant` 契约决策、`auto_static` vendor 语义决策、memo 命中 ELF 加固、C8 L5/L6（等用户三句话）、int8 可证明包络（形式化或精确 int32 恢复）。
 
 ## 9. 待用户决策（截至收口）
