@@ -149,10 +149,13 @@ effect_evidence` 见 registry 与 `_meta/pypto-x/u4-env-migration/raw/env_regist
   `test_execution_env_registry.py` 的静态扫描测试发现（`env_read_scan.json` 中
   `unregistered_reads: []`）。
 
-doctor 的退出码契约（与 U3 round-2 修复后一致）：默认 rc=0，`--strict` 且
-`fail_closed=true` 时 rc=3，argparse 用法错误 rc=2，请求级错误 rc=1。doctor/plan 的
-`library.path` 默认只给 basename（`--show-paths` 才显示完整 host 路径），
-`path_policy` 进入文档 digest；这些都不影响 env registry 的 40 行内容。
+doctor 的退出码契约（与 U3 round-2/round-3 修复后一致）：默认 rc=0，`--strict` 且
+`fail_closed=true` 时 rc=3，argparse 用法错误 rc=2，请求级错误 rc=1；`doctor --help`
+epilog 写明全部四个码。doctor/plan 的 `library.path` 默认只给 basename
+（`--show-paths` 才显示完整 host 路径），`path_policy` 进入文档 digest；默认脱敏时
+`providers[].manifest_digest` / 内嵌 `capability_snapshot.digest` 定义在实际输出视图上
+（分别带 `manifest_canonical_digest` / `canonical_digest` 锚点），因此脱敏输出仍可自证。
+这些都不影响 env registry 的 40 行内容。
 
 ## 7. 语义影响筛查结论（先量后改）
 
@@ -188,12 +191,13 @@ doctor 的退出码契约（与 U3 round-2 修复后一致）：默认 rc=0，`-
 
 ## 9. 验收与证据
 
-- 实现 commit（`work/u4-env-migration`，不 push）：U3-fix `0e688aacb`（round-2 七项 +
-  两条边界）在前，U4 `3d43592cb` 在其上；base `7378aa943`。
-- focused：`python/pypto.execution` 相关 407 passed（含 discovery 55 + registry 16）；
-  collect 2036 vs base 1994（+42 = U3 round-2 +26、U4 +16）。
-- U3 round-2 独立复现：`raw/u3fix_repro/` + `logs/u3fix_*.log`，
-  `raw/v3_snapshot_tamper.json` 80 cases / 0 violations。
+- 实现 commit（`work/u4-env-migration`，不 push）：U3 round-2 修复 `0e688aacb` 在前，
+  U4 `3d43592cb` 在其上，U3 round-3 修复 `625484741b357e82900c912c0b29e7ecc9b8fed3` 为当前 tip；base `7378aa943`。
+- focused：`python/pypto.execution` 相关 420 passed（含 discovery 68 + registry 16）；
+  collect 2049 vs base 1994（+55 = U3 round-2 +26、U4 +16、round-3 +13）。
+- U3 round-2/3 独立复现：`raw/u3fix_repro/` + `logs/u3fix_*.log`、`logs/r3_*.log`；
+  `raw/v3_snapshot_tamper.json` 80 cases / 0 violations；`raw/r2_targeted.json`
+  49 cases / 0 violations；`repro_empty_mapping_holes` 10/10 拒绝。
 - 证据目录：`/home/chiro/projects/pypto/worktrees/_meta/pypto-x/u4-env-migration/`
   （`brief.zh-CN.md` + `raw/` + `logs/`）；证据不含原始 env 值、私有端点或凭据。
 - 性能：`UNGATED`。
