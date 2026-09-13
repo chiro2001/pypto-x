@@ -3,8 +3,10 @@
 - 任务：`qwen35-composite-composition`（batch 0048 切片 A）
 - 分支/工作树：`work/qwen35-composite-composition` @
   `/home/chiro/projects/pypto/worktrees/pypto-x/qwen35-composite-composition`
-- 交付基线：integration `923a72e26`（tree `5945f3448f184bb76a9eeea1c7a5a188ebdfb927`）
-- 实现 commit：`54d2f4ea9`（`work/qwen35-composite-composition`，未 push）
+- 交付基线：round-1 `923a72e26`（tree `5945f3448f184bb76a9eeea1c7a5a188ebdfb927`，
+  已合入 integration 为 `3770b2280`）；round-2 `4521558e6`
+- 实现 commit：round-1 `3770b2280`（已进 integration）；round-2 `f64a15c47`
+  （`work/qwen35-composite-composition-r2`，基于 `4521558e6`，未 push）
 - 语义真源：`python/pypto/portable/qwen35.py` 的既有公共 composite；重构**不改变**
   任何公共 builder 的签名，也不改变任何已构建程序的 Core IR（逐字节）。
 - 证据目录：`/home/chiro/projects/pypto/worktrees/_meta/pypto-x/qwen35-composite-composition/`
@@ -43,6 +45,17 @@ builder"的唯一入口：
   的命名冲突由 `_Builder._reserve` 直接报错，不会静默重命名；
 - 拼接的 op 保留 opcode、操作数顺序、attributes、effect 与输出类型；非 pure op
   与带嵌套 region 的 op 会被拒绝（当前组合面全部是 pure op）。
+
+**歧义 fail-closed（round-2 收紧）**：以下情况全部抛 `ValueError`（消息含子函数名与
+违规名字），不再静默选择：
+
+1. `bindings` 里出现子函数未声明的参数名（此前被静默忽略）；
+2. binding 值不属于父 builder（其 name 未被父 builder 注册）；
+3. `rename` 的键或值为空串/非字符串；
+4. 子函数参数名同时是某个 op 输出名（此前参数会在操作数解析时静默遮蔽输出）；
+5. `returns` 直接传字符串而不是 SSA 名字序列。
+
+收紧后公共 builder 的所有调用点不受影响：59/59 快照仍与 round-1/重构前逐字节相同。
 
 配套 `_rope_core_result_name(shape, rotary_dim, prefix)` 暴露 `_rope_core` 的 FP32
 结果 SSA 名（`_result` / `_full_result`），供组合方选择内部值。
@@ -90,17 +103,25 @@ builder 的最终 dtype 包装：这既是逐位不变的前提（避免 bf16 ro
 
 ## 4. IR 等价性证据（P2-1）
 
-方法：同一份捕获脚本 `scripts/capture_ir.py` 在重构前后各生成 50 条程序快照
-（20 个公共 builder × dtype/shape 变体 + 7 个整图契约变体），保存 `canonical_json`
-与 sha256；`scripts/compare_ir.py` 逐条比较；`scripts/structural_hashes.py` 再对
-五个维度独立算哈希（op 多重集合、def-use 边、SSA 类型签名、attributes 序列、
-canonical digest）。
+方法：同一份捕获脚本 `scripts/capture_ir.py` 在重构前后各生成程序快照，保存
+`canonical_json` 与 sha256；`scripts/compare_ir.py` 逐条比较；
+`scripts/structural_hashes.py` 再对五个维度独立算哈希（op 多重集合、def-use 边、
+SSA 类型签名、attributes 序列、canonical digest）。
 
-结果（`raw/ir-diff-step7.json`、`raw/ir-structural-equivalence.json`）：
+- round-1：50 条快照（20 个公共 builder 的 dtype/shape 变体 + 7 个整图契约变体），
+  结果 `identical=50 different=0 missing=0`；
+- round-2：扩展到 **59 条**（新增 l2/swiglu/softmax/causal_mask 的 output_dtype 变体、
+  rope f32→bf16、gqa int32、rank-3 batched matmul、steps=0 position_control、
+  synthetic b1t1 整图），用控制模块 overlay 复算重构前 59 条并与 round-2 树逐条比较
+  （`raw/r2/ir-diff-r2.json`、`raw/r2/ir-structural-equivalence.json`）。
 
-- 50/50 条 `canonical_json` **逐字节相同**（`identical=50 different=0 missing=0`）；
-- 50/50 条在 op 多重集合 / def-use / 类型签名 / attributes / canonical digest
-  五个维度全部相同（`entries=50 all_identical=True`）。
+结果（round-2）：**59/59 条 `canonical_json` 逐字节相同**
+（`identical=59 different=0 missing=0`）；59/59 条在五个维度全部相同
+（`entries=59 all_identical=True`）。用 overlay 复算的 round-1 50 条 digest 与
+round-1 冻结快照逐条一致（mismatch=0）。
+
+另做 round-1 → round-2 **直接**对照（同一进程加载两个实现，`raw/r2/ir-round1-vs-round2.json`）：
+59 条全部相同、`differences=0`。
 
 逐项表（节选，完整表见 `raw/ir-structural-equivalence.json`；`= ` 表示五维全同）：
 
@@ -134,6 +155,8 @@ sha256 `5ede665f7e5c417a963920ca311a93dfb3088d4e33d0114f231685b6a994406d`）
 汇总 `raw/exec_summary.json`、日志 `logs/differential2.log`（资源锁 +
 cgroup 内存上限内运行）。
 
+round-1 结果（`raw/exec_*.json`，round-2 在 `4521558e6` 上用同一脚本复算，见下）：
+
 | 后端 | 语料数 | IR 相同 | 成功执行 | 输出逐位相同 | max_abs_diff |
 | --- | --- | --- | --- | --- | --- |
 | cpu-scalar 参考 | 16 | 16 | 16 | **16** | **0.0** |
@@ -141,6 +164,10 @@ cgroup 内存上限内运行）。
 | AVX-512 | 11 | 11 | 11 | **11** | **0.0** |
 | SVE256（QEMU, VL=32B） | 11 | 11 | 11 | **11** | **0.0** |
 | IR-only（不执行） | 4 | 4 | - | - | - |
+
+round-2 复算：**四个后端全部逐位相同、max_abs_diff 全为 0.0**——
+cpu-scalar 16/16、AVX2 11/11、AVX-512 11/11、SVE256(QEMU) 11/11（IR 相同 16/16、11/11…），
+与 round-1 结论一致；`raw/r2/exec_*.json`、`raw/r2/exec_summary.json`、`logs/r2-evidence.log`。
 
 语料覆盖：整图 decode（synthetic T=1/past=5）、整图 prefill（T=5/past=0）、
 attention_kv_cache decode T=1/past=5 与 prefill T=3、attention_subgraph、
@@ -165,16 +192,38 @@ position_control、**GDR T=128（3843 ops，四个后端都执行）**。
 
 ## 6. 测试（P3）
 
-新增 `python/tests/ut/pypto_x/test_qwen35_composite_composition.py`（14 个用例）：
+新增 `python/tests/ut/pypto_x/test_qwen35_composite_composition.py`（round-1 14 个 +
+round-2 6 个 = **20 个用例**）：
 
-- 对每条组合边做"精确嵌入"断言：从子 composite 程序按 `returns` 做可达切片，
-  以子函数参数绑定与 rename 规则映射后，在父程序 op 序列中必须找到唯一、连续的
-  同构窗口（opcode、操作数顺序/类型、输出名/类型、attributes 全等）；
-- 覆盖 position_control、gated_delta_conv_state、decoder_subgraph、
-  attention_kv_cache（含两个 batched matmul）、attention_subgraph、整图顶层
-  position_control、整图 layer_03 full-attention 与 layer_00 GDR 的组合关系；
-- 冻结 7 条重构前 canonical digest（与基线快照一致），任何 op/attribute/顺序漂移
-  都会失败。
+- **精确嵌入断言（round-1）**：从子 composite 程序按 `returns` 做可达切片，以子
+  函数参数绑定与 rename 规则映射后，在父程序 op 序列中必须找到唯一、连续的同构
+  窗口（opcode、操作数顺序/类型、输出名/类型、attributes 全等）；覆盖
+  position_control、gated_delta_conv_state、decoder_subgraph、attention_kv_cache
+  （含两个 batched matmul）、attention_subgraph、整图顶层 position_control、整图
+  layer_03 full-attention 与 layer_00 GDR。
+- **冻结 digest（round-1）**：7 条重构前 canonical digest，任何 op/attribute/顺序
+  漂移都会失败。
+- **"父真的调用子"调用图守卫（round-2）**：spy `_compose_program` 并记录
+  `(父 builder, 子函数, binding 键)`，断言每条复用边真实发生且 binding 恰好覆盖子
+  函数参数：attention_kv_cache 6 次、attention_subgraph 4 次、decoder_subgraph 2 次、
+  gated_delta_conv_state 1 次、position_control 2 次；整图 synthetic 构建共
+  **105 次**组合触发（103 次由 graph builder 发出，2 次在 position_control 内部），
+  子 composite 直方图为
+  `position_control 1 + position_ids 1 + causal_mask_from_positions 1 + rms_norm 12 +
+  rope_rotate_half 12 + batched_matmul 12 + causal_mask 6 + stable_softmax 6 +
+  causal_conv1d_state 18 + l2_norm 36`。
+- **`_compose_program` 健壮性（round-2）**：多余 binding、外部 binding、参数/输出
+  同名遮蔽、裸字符串 `returns`、空 rename 键共 5 个拒绝用例。
+
+### 6.1 "回退复用 → 测试变红"实测（round-2）
+
+| 场景 | 做法 | 结果 | 证据 |
+| --- | --- | --- | --- |
+| 全部复用回退成内联 | 用 `work/baseline-src` overlay（`qwen35.py` = 重构前 `923a72e26` 版本）跑本测试文件 | **8 failed / 12 passed**：新守卫 `test_parent_builders_actually_call_compose` 以 `assert 0 == 6` 失败；5 个健壮性用例因 `_compose_program` 不存在而红；另有 2 个旧嵌入断言在纯内联基线上也红 | `logs/r2-red-baseline.log` |
+| **只回退一处复用**（attention_kv_cache 的 QK `batched_matmul` 改回内联 `matmul`） | `work/single-revert-src` overlay（其余复用保持） | **1 failed / 19 passed**：唯一红是 `assert 5 == 6` 的调用图守卫；`test_attention_kv_cache_reuses_...` 与 7 条 digest 断言**全绿** | `logs/r2-red-single-revert.log` |
+
+单点回退实测说明：仅靠 IR 嵌入/digest 断言无法发现"复用被改回内联"（内联与组合
+的 IR 相同），round-2 的调用图守卫是唯一能红的断言。
 
 聚焦回归（资源锁内，`logs/focused.log`）：
 
@@ -185,8 +234,9 @@ env PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=python:python/tests/ut \
    position_native 共 19 个文件>
 ```
 
-结果：**246 passed, 0 failed, 0 error, rc=0, 330.02 s**（最慢单例 74.6 s：
+round-1 结果：**246 passed, 0 failed, 0 error, rc=0, 330.02 s**（最慢单例 74.6 s：
 `test_cpu_avx2_position_native::test_compare_flat_contiguous_bytes_are_bit_exact_for_f32_and_bf16`）。
+round-2 结果：**252 passed, 0 failed, 0 error, rc=0, 336.47 s (5:36)**（`logs/r2-focused.log`；round-1 246 + round-2 新增 6）。
 
 规则 8 全量（`logs/rule8.log`）：
 
@@ -195,26 +245,38 @@ env PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=python:python/tests/ut \
   python3 -m pytest -q -rs -p no:cacheprovider python/tests/ut/pypto_x
 ```
 
-结果：**2194 passed, 7 skipped, 0 failed, 0 error, rc=0, 1306.49 s (21:46)**；
+round-1 结果：**2194 passed, 7 skipped, 0 failed, 0 error, rc=0, 1306.49 s (21:46)**；
 collect ≈ 2201（2194 passed + 7 skipped）。7 个 skip 全部是 `test_cuda_qwen_c2.py`
 的 CUDA Driver 设备不可用（本机无 libcuda.so），与本次重构无关。
+
+round-2 结果：**2323 passed, 9 skipped, 0 failed, 0 error, rc=0, 1289.27 s (21:29)**；
+collect = 2332（round-1 为 2201，差额来自 round-2 新增 6 个组合测试与基线
+`4521558e6` 带入的 execution batch-1 测试）。9 个 skip 全部与本切片无关：7 个是
+`test_cuda_qwen_c2.py` 无 libcuda 的 CUDA 设备用例，2 个是 execution batch-1 的
+host-probe 基线跳过（证据：`logs/r2-evidence.log`，differential 与 rule-8 同一次锁会话）。
 
 ## 7. 未替换路径与后续计划
 
 以下路径**没有**改成复用公共 composite，均有明确原因：
 
-| 路径 | 现状 | 原因 / 后续 |
-| --- | --- | --- |
-| 整图 GQA repeat (`_repeat_kv_heads`) | 保持 slice+concat | 公共 `build_gqa_repeat_kv` 是 runtime-index `gather`；整图契约刻意避免整数 index ABI。两条语义各自冻结，改动会变 IR。 |
-| MLP `silu(gate)*up` | 保持内联 | 公共 `build_swiglu` 以 packed last-axis 输入 + `split` 为契约；整图 gate/up 是两次独立投影，直接组合会引入额外 split/reshape。 |
-| `_gdr_recurrent_inline` / `_gdr_step` | 保持内联 | 公共 `build_qwen35_gdr_recurrent_state` 是固定 shape 的独立 builder，与整图按 layer prefix 的 SSA 展开不是同一程序结构。 |
-| `_rms_gated_core` | 保持私有 core | 没有公共 composite 对应（Qwen RMSNormGated 的直接 scale + bf16 round-trip 语义）。 |
-| 整图 lm_head / in_proj matmul | 保持内联 `matmul` | 只对 full-attention 内 f32×f32 的 QK^T/PV 使用了 `build_batched_matmul`；其余 matmul 与显式 transpose/cast 链绑定，单独组合收益低。 |
-| `build_qwen35_attention_kv_cache` / `build_attention_subgraph` / `build_decoder_subgraph` | 独立 harness | 已由子 composite 组合而成；整图走 `_append_*` 路径，二者共享同一批子 composite。 |
+| 路径 | 现状 | 数量/图 | 原因 / 后续 |
+| --- | --- | --- | --- |
+| 整图 stream RMSNorm（input / post-attention / final，`_rms_core` 内联） | 保持内联 | **24 + 24 + 1 = 49** | 这三处直接消费 `_rms_core` 的 FP32 输出进入后续 matmul/gate（不经过 public `build_rms_norm` 的末尾 cast）；而 `build_rms_norm` 本身只是 `_rms_core` + 末尾 cast，公式只有一份，不存在双实现漂移。对照：整图 q/k RMSNorm（12 次/图）已按 `build_rms_norm(output_dtype="float32")` + rename 组合。后续可把 49 处也按同样方式组合（IR 逐字节不变可验证），属低风险收敛项。 |
+| 整图 GQA repeat (`_repeat_kv_heads`) | 保持 slice+concat | 6 层 × (K,V) 各 2 次 slice + 1 次 concat | 公共 `build_gqa_repeat_kv` 是 runtime-index `gather`；整图契约刻意避免整数 index ABI。两条语义各自冻结，改动会变 IR。 |
+| MLP `silu(gate)*up` | 保持内联 | 24 层 | 公共 `build_swiglu` 以 packed last-axis 输入 + `split` 为契约；整图 gate/up 是两次独立投影，直接组合会引入额外 split/reshape。 |
+| `_gdr_recurrent_inline` / `_gdr_step` | 保持内联 | 18 层（6 层 × T 步展开） | 公共 `build_qwen35_gdr_recurrent_state` 是固定 shape 的独立 builder，与整图按 layer prefix 的 SSA 展开不是同一程序结构。 |
+| `_rms_gated_core` | 保持私有 core | 18 层 × 1 | 没有公共 composite 对应（Qwen RMSNormGated 的直接 scale + bf16 round-trip 语义）。 |
+| 整图 lm_head / in_proj matmul | 保持内联 `matmul` | lm_head 1 + 每层投影若干 | 只对 full-attention 内 f32×f32 的 QK^T/PV 使用了 `build_batched_matmul`；其余 matmul 与显式 transpose/cast 链绑定，单独组合收益低。 |
+| `build_qwen35_attention_kv_cache` / `build_attention_subgraph` / `build_decoder_subgraph` | 独立 harness | 不参与整图 | 已由子 composite 组合而成；整图走 `_append_*` 路径，二者共享同一批子 composite。 |
 
-后续若要继续收敛，建议顺序：先把 `build_batched_matmul` 组合推进到整图
-lm_head/in_proj（需要保持现有显式 transpose 语义），再评估把整图 MLP 改成
-`build_swiglu` 的 IR 契约变更（会改 graph digest，需要图契约升版）。
+后续若要继续收敛，建议顺序：
+
+1. 把 49 处 stream RMSNorm 改成 `build_rms_norm(output_dtype="float32")` 组合
+   （纯结构改动，已验证同类组合 IR 逐字节不变）；
+2. 把 `build_batched_matmul` 组合推进到整图 lm_head/in_proj（需要保持现有显式
+   transpose 语义）；
+3. 再评估把整图 MLP 改成 `build_swiglu`、GQA repeat 换成 runtime-index gather
+   的 IR 契约变更（会改 graph digest，需要图契约升版，属有意变更）。
 
 ## 8. 边界与未做到的面
 
@@ -225,7 +287,10 @@ lm_head/in_proj（需要保持现有显式 transpose 语义），再评估把整
   作为回归门（聚焦集已包含）。
 - 跨后端相同输入仍存在既有的 GDR/softmax 差异（见 §5.3）；本切片只保证
   "同后端 baseline == current 逐位"，不声称跨后端逐位。
-- 控制仓中的本契约文档为新增文件，未由实现 agent 提交；由父方按控制仓流程登记。
+- 控制仓中的本契约文档 round-1 由父方提交为 `790bad5`；round-2 更新由父方登记。
+- round-2 的 49 处 stream RMSNorm 仍以内联 `_rms_core` 呈现（见 §7），未在 round-2
+  改成组合；原因是 round-2 的硬约束是 IR 与 round-1 逐字节相同且最小化改动面，
+  而该路径与 `build_rms_norm` 共享同一 `_rms_core`，不存在公式漂移。
 - 已观察到 Python 侧构图成本小幅上升（model bf16 整图：0.123 s → 0.147 s，
   单次 best-of-2，UNGATED）：组合需要重新实例化子 composite 程序并再次
   `verify()`。这是构建期一次性成本，不是运行时/端到端性能声明，也未做优化；
