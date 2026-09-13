@@ -14,11 +14,11 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
 
 | 命令 | 回答 | 是否执行 provider | 输入 |
 |---|---|---|---|
-| `doctor` | 这台机器/这份快照有什么事实、哪些 fail-closed 条件成立 | 否（仅探测已 pin 的产物） | 无；可选导入的 capability snapshot |
+| `doctor` | 这台机器/这份快照有什么事实、哪些 fail-closed 条件成立 | 否（仅探测已 pin 的产物） | 无；可选导入的 capability snapshot；`--strict` 见 §3.5 |
 | `explain` | 为什么选了某个 provider、每个候选为何被拒 | 否 | 请求（op/shape/dtype/policy/snapshot）或 plan/report 文档 |
 | `plan` | 给定请求的冻结 plan（含 digest）与解析所用 snapshot | 否 | 请求 + 可选 policy/snapshot |
 
-入口：`python -m pypto.execution.cli <command> [--json]`，或
+入口：`python -m pypto.execution.cli <command> [--json]`（`doctor` 另有 `--strict`），或
 `python3 scripts/perf/execution_cli.py <command>`（wrapper 会设置
 `PYPTO_X_PORTABLE_ONLY=1` 并把 `python/` 放进 `sys.path`）。Python API 从
 `pypto.execution` 导出：`doctor` / `explain` / `plan_request` /
@@ -61,9 +61,10 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
 - `fail_closed_checks` 覆盖：capability digest 自检、契约 digest 自检、已登记 opcode
   覆盖、provider 与 registered identity 一致、provider artifact digest 可复算、
   pinned library 存在/sha256/arch/符号/ABI、payload/ABI 版本登记、schema 版本。
-- `fail_closed=true` 表示存在失败条件（例如库缺失）；doctor 作为事实报告退出码仍为 0，
-  条件在 `fail_closed_checks` 与人类摘要中显式列出；导入快照非法等**请求级**错误则
-  结构化报错（退出码 1）。
+- `fail_closed=true` 表示存在失败条件（例如库缺失）。doctor 默认是事实报告：退出码 0，
+  条件在 `fail_closed_checks` 与人类摘要中显式列出（避免 CI 在缺少非必需 pin 库的机器上
+  误报）；加 `--strict` 时 `fail_closed=true` 退出码为 2。导入快照非法等**请求级**错误
+  始终结构化报错（退出码 1）。详见 §3.5。
 
 ### 2.2 `explain`
 
@@ -122,7 +123,32 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
 4. 本切片不做：`--emit` 之外的 CLI 配置发现（`pypto doctor` 顶层入口）、cost model /
    tuning profile、graph/region 作用域、35 个环境变量的迁移（U4）、remote capability
    probe、快照签名/attestation。
-5. 跨主机静态规划不在本切片：`plan`/`explain` 使用的 snapshot 必须匹配本机 probe
-   （`kind=cpu` 且 triple 等于本机探测 triple），否则 `CAPABILITY_UNAVAILABLE`。
-6. `doctor` 的 `source=imported_snapshot` 只报告快照内已捕获事实，不重新探测；本地
-   probe 路径才读取已 pin 库的 sha256/arch。
+- `doctor` 的 `source=imported_snapshot` 只报告快照内已捕获事实，不重新探测；本地
+  probe 路径才读取已 pin 库的 sha256/arch。
+
+### 3.5 doctor 退出码与 `--strict`
+
+- 默认：`doctor` 是事实报告，无论 `fail_closed` 与否都退出码 0；`fail_closed_checks`、
+  `fail_closed` 字段与人类摘要完整列出条件，便于 CI/脚本自行判定。
+- `--strict`：当 `fail_closed=true` 时退出码 **2**（报告仍会正常打印；`--json` 下文档仍可
+  解析），便于需要"缺库即失败"的流水线。请求级错误（非法 snapshot、读文件失败等）在两种
+  模式下都退出码 1。退出码 2 在 CLI `--help` 中写明。
+
+### 3.6 跨主机静态规划（接受为边界）
+
+- `plan` / `explain` 使用的 snapshot 必须与本机 probe 对齐（`kind=cpu` 且 triple 等于本机
+  探测 triple），否则 `CAPABILITY_UNAVAILABLE`；`doctor --snapshot` 同样只接受本机对齐快照。
+- 为什么不做跨主机：已登记 provider 都在本机执行，其 version/pin/library/thread 事实来自
+  本机 probe 与已 pin 产物；用一份外部快照在本机解析会让 plan 声明一个本机无法验证或执行的
+  target，属于 0006 §2.1 "声明=执行" 的反面，因此本切片宁可拒绝也不假装支持。
+
+### 3.7 `CapabilitySnapshot.from_dict` 宽松边界登记
+
+- U1 语义保留：`CapabilitySnapshot.from_dict` 允许缺 `digest`/`triple` 等字段并按默认值
+  重建（这是 U1 已登记的兼容边界）。
+- 发现层的严格导入路径不受影响：`import_capability_snapshot` 在调用 `from_dict` **之前**
+  先做必需字段/未知字段/类型/schema/digest 检查，之后再做规范结构逐字段相等检查。
+- 当前宽松路径的调用方：生产代码里只有 `import_capability_snapshot` 一处（且先经过严格
+  检查）；直接以宽松方式调用的是 U1 回归测试
+  `python/tests/ut/pypto_x/test_execution_matmul.py::test_capability_digest_mismatch_and_contract_mismatch_fail_closed`。
+  resolver / plan / report / entry 均不经过该宽松默认路径。
