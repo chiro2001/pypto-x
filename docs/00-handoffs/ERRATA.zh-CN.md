@@ -578,3 +578,19 @@ FROZEN = Path("/…/worktrees/_meta/pypto-x/verify-0046-u3")
 2. 复跑 harness 必须**只用显式传入的 `--tree` 参数**构造 `sys.path`（不得依赖脚本周目录或环境残留），参数与实际加载树不一致时直接报错退出。
 3. 验收报告应记录 `pypto.__file__` / tree HEAD / 脚本 `sha256`；仅凭"我改了常量"不能证明加载到了新树（本 ERRATA 与 0046 批内 `harness_caveat` 字段互为索引）。
 4. 父方已在 `_meta/pypto-x/verify-0046-u3-r2/` 旁保留自建 harness 与其原始输出，作为 round-3 收口的权威证据。
+
+## ERR-0014（2026-09-13）：0014 文档把 +10 collect 增量全部归因给 op-bench，被独立验收逐提交分解证伪
+
+**状态**：已就地订正（`docs/20-planning/0014` §9 二次订正 + lock `verify_u4_other_findings`）；数值本身（1994/2049/2059/2169/2170）全部正确，仅归因错误。
+
+### 现象
+`0014` §9 写「2059 − 2049 = **+10 来自祖先 `27fbae5e4`**（op-bench 测试改动）」。
+
+### 根因与订正
+`verify-0047-u4-followup`（agent `9e0de13f`）用 `git diff --name-only` 逐提交分解：
+**+9 来自 `a52687ade`**（`test_cuda_sm120_target.py` 13→22，CUDA arch-selection 边界测试）、**+1 来自 `27fbae5e4`**（`test_op_bench_framework.py` 31→32）。
+根因：按「最近一次与自己相关的提交」就近归因，没有逐提交做文件级增量分解。
+
+### 教训
+1. 任何**计数变化的归因**必须逐提交做**文件级**增量分解（`git diff --name-only <a>..<b>` + 文件内 case 计数），不得按时间就近归因。
+2. 同一数字的历史序列（`7378aa943`=1994、`625484741`=2049、`a52687ade`=2045、`27fbae5e4`=2046、`393d28e0f`=2059、`3c2756c0e`=2169、`f3d71de04`=2170）应随订正一并记录，避免再次误读。
