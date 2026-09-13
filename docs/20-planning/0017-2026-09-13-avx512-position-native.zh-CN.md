@@ -1,8 +1,11 @@
-# 0017 AVX-512 位置控制原生面（payload 8）契约
+# 0017 AVX-512 位置控制原生面（payload 9）契约
 
 - 任务：`avx512-position-native`（batch 0047 切片 C）
-- 分支/工作树：`work/avx512-position-native` @ `/home/chiro/projects/pypto/worktrees/pypto-x/avx512-position-native`
-- 交付基线：integration `3c2756c0e`（AVX2 切片落地后的 tip；原切片起点为 `393d28e0f`，tree `eebb0d584c6f1d8088637a4f7c59a484e49e5bd7`）
+- 分支/工作树：round-2 `work/avx512-position-native-r2` @
+  `/home/chiro/projects/pypto/worktrees/pypto-x/avx512-position-native-r2`；
+  round-1 工作树 `work/avx512-position-native` 保留作为历史
+- 交付基线：integration `0b5b5899e`（round-1 已作为该 tip 合入；round-2 单 commit
+  `3e378ecffcf4d8d504c4518992ea71d5974db1b7` 基于该 tip）
 - 语义真源：`CpuScalarRuntime` / vector-common host reference，逐位一致，不允许"顺带修正"
 
 ## 1. 目标与不变量
@@ -14,15 +17,24 @@ AVX-512 后端此前把 `iota` / `compare` 记为 `host_reference` 并把 `where
 2. artifact 元数据**逐 op** 如实描述 native / fallback；`mode == "native"` 与"零回退"互为充要。
 3. 新 payload/描述符版本严格解码：旧 reader 读新 payload fail-closed；新 reader 拒绝旧
    `host_reference`-only payload，绝不把 host 路径读成 native。
-4. 不修改 `cpu_avx2.py`；不做跨目标共享抽象重构；不新增环境变量。
+4. 声明的指令集类别必须覆盖 kernel 实际执行的指令集类别（见 §2.1 的 AVX2 前提修正）。
+5. 不修改 `cpu_avx2.py`；不做跨目标共享抽象重构；不新增环境变量。
 
 ## 2. 版本与 wire
 
-| 项 | 旧 | 新 |
+| 项 | round-1 | round-2（本契约） |
 | --- | --- | --- |
-| `artifact_payload_version` | 7 | **8** |
-| `NATIVE_ABI_MARKER` / ELF `ptx_avx512_abi` | `pypto-x.cpu.avx512:8` | **`pypto-x.cpu.avx512:9`** |
-| `control_descriptor_wire` | 无 | **`v1:pxio-pxcp-pxwh+fnv1a64`** |
+| `artifact_payload_version` | 8 | **9**（AVX2 前提语义变更） |
+| `NATIVE_ABI_MARKER` / ELF `ptx_avx512_abi` | `pypto-x.cpu.avx512:9` | **`pypto-x.cpu.avx512:9` 不变**（无符号/调用契约变化） |
+| `required_features` 基础集 | `avx, avx512f, osxsave, ymm, opmask, zmm` | **`avx, avx2, avx512f, osxsave, ymm, opmask, zmm`** |
+| `native_feature_mask`（默认 variant） | `0x01` | **`0x81`**（新增 bit 7 = AVX2） |
+| `control_descriptor_wire` | `v1:pxio-pxcp-pxwh+fnv1a64` | 不变 |
+| 编译 flag | `-mavx512f`(+`-mfma` 等 variant) | **不变**（不使用 `-mno-avx2`） |
+
+版本决策理由：AVX2 前提是 **artifact 解码/准入语义**，属于 payload 契约级变化，故 payload 8→9；
+ABI marker 按既定约定只跟踪 **符号集/调用契约**变化（`:9` 由 PXIO/PXCP/PXWH 入口点引入），
+本次没有新增/改名符号，故保持 `:9`；旧 runtime 仍会因 `native_feature_mask` 不匹配拒绝新 ELF，
+新 runtime 因 payload 9 拒绝旧 artifact，双向 fail-closed。
 
 描述符字节布局与已验收的 SVE256 控制 wire 完全一致（小端）：
 
@@ -34,6 +46,21 @@ AVX-512 后端此前把 `iota` / `compare` 记为 `host_reference` 并把 `where
 `where` 的 condition dtype 在 Core IR 校验里被限定为 `bool`；但 native kernel 对描述符允许的
 所有 condition dtype 都实现了 host `_where_values` 的 Python 真值（NaN 为真、±0 为假、非零为真），
 保证前端放松校验时不会与 host 分歧。
+
+### 2.1 ISA 依赖与反汇编口径
+
+- 依赖声明：**AVX-512F + AVX2**。`-mavx512f` 在 Clang/GCC 的 ISA 模型下隐式启用 AVX2
+  （编译 flag 保持原样，未用 `-mno-avx2` 兑现"F-only"以免改变代码生成与性能路径）。
+- 运行期门：`required_features` 现在包含 `avx2`，`CpuFeatureContract` 在 `dlopen` 之前校验宿主
+  特性集；探测侧从 `CPUID.(EAX=7,ECX=0):EBX[5]` 独立读取 AVX2（并要求 OS YMM state），不从
+  AVX-512F 推断。
+- 反汇编口径（独立验收 `97503c56` 复核，round-2 复验一致）：
+  - AVX2 VEX.256 指令共 **16 条**：`ptx_avx512_compare_control` 4 条 `vextracti128`；
+    `ptx_avx512_where_control` 12 条（9×`vextracti128` + 1×`vpand` + 1×`vpcmpgtw` + 1×`vpmovzxbw`）；
+    均来自归约尾部自动向量化。
+  - `ptx_avx512_iota_control` 为纯标量循环，0 条 VEX.256。
+  - DQ / BW / VL / FMA / gather 专属指令 = **0**（对应编译 flag 未启用，且当前 codegen 不发射
+    gather）；`vextracti64x4` 等 ymm 目标指令为 EVEX AVX512F，不计入 AVX2。
 
 ## 3. 覆盖矩阵（dtype × kind）
 
@@ -80,19 +107,25 @@ AVX-512 后端此前把 `iota` / `compare` 记为 `host_reference` 并把 `where
   - `position_control_fallback` 必须与表的存在性自洽。
 - native C decoder 对每个描述符校验 magic/version/reserved/rank/ shape-product/strides 上界/FNV 校验值；
   任一项失败返回非零，Python 侧抛 `CpuAvx512ExecutionError`，不执行任何元素读写。
-- 旧 reader 读新 payload：payload 8 ≠ 旧常量 7，`_validate_primary_semantics` 首查即拒绝（见证据）。
+- payload/ABI 前置门：payload 9 的 artifact 在本 payload-8 runtime 上首查即拒绝；旧 payload 7
+  artifact 在新 runtime 上同样拒绝（见证据）。
+- 宿主特性门：`required_features` 含 `avx2`，缺 AVX2 的注入特性集在 `dlopen` 之前抛
+  `CpuAvx512FeatureMismatchError`（单元测试覆盖）。
 
 ## 6. 测试与证据
 
 - `python/tests/ut/pypto_x/test_cpu_avx512_position_native.py`：差分矩阵（6 predicate × f32/bf16/i8/int32 ×
   普通/±0/±inf/NaN 各位型/subnormal/极值）、iota 负 step/多轴/零长度/极值、where 广播与 NaN/±0 条件、
-  元数据 native-iff-zero-fallback、payload/描述符攻击、与基线树逐位一致、UNGATED 计时。
+  元数据 native-iff-zero-fallback、payload/描述符攻击、**required_features 含 avx2 / mask=0x81 /
+  缺 avx2 宿主被结构化拒绝**、与基线树逐位一致、UNGATED 计时。
 - 证据目录：`/home/chiro/projects/pypto/worktrees/_meta/pypto-x/avx512-position-native/`
-  （`brief.zh-CN.md`、`raw/`、`logs/`、`scripts/`）。
+  （`brief.zh-CN.md`、`raw/`、`logs/`、`scripts/`；round-2 日志以 r5/full-r3/evidence-r3 区分）。
 
 ## 7. 登记边界（未覆盖/不声称）
 
-- 不启用 AVX-512 DQ/BW/VL 变体；native 面只依赖 AVX-512F（+可用 FMA），全部 kernel 在默认 variant 下可编译。
+- 不启用 AVX-512 DQ/BW/VL 变体、不使用 FMA；`fma` variant 仅在显式启用时存在。
+- native 面依赖 AVX-512F **+ AVX2**：AVX2 由 `-mavx512f` 隐式启用，实际只执行 16 条归约尾部
+  VEX.256 指令（compare/where），不声称整个 kernel 是纯 AVX-512F。
 - `iota` 的 native kernel 是 native 标量循环（名称/描述符/边界检查在 ELF 内），未做 ZMM iota 向量化。
 - 广播/非连续源的 lane 收集是 native 标量 odometer，不是 gather 指令；性能不作为门槛（UNGATED）。
 - 未覆盖：`iota` 的 float dtype（Core IR 不支持）、`compare` 混合输入 dtype（Core IR 拒绝）、
