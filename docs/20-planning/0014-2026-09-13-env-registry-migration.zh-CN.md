@@ -149,8 +149,10 @@ effect_evidence` 见 registry 与 `_meta/pypto-x/u4-env-migration/raw/env_regist
   `test_execution_env_registry.py` 的静态扫描测试发现（`env_read_scan.json` 中
   `unregistered_reads: []`）。
 
-doctor 的退出码契约不变：默认 rc=0，`--strict` 且 `fail_closed=true` 时 rc=2，请求级
-错误 rc=1。
+doctor 的退出码契约（与 U3 round-2 修复后一致）：默认 rc=0，`--strict` 且
+`fail_closed=true` 时 rc=3，argparse 用法错误 rc=2，请求级错误 rc=1。doctor/plan 的
+`library.path` 默认只给 basename（`--show-paths` 才显示完整 host 路径），
+`path_policy` 进入文档 digest；这些都不影响 env registry 的 40 行内容。
 
 ## 7. 语义影响筛查结论（先量后改）
 
@@ -158,7 +160,7 @@ doctor 的退出码契约不变：默认 rc=0，`--strict` 且 `fail_closed=true
 （`raw/plan_digest_env_matrix.json`）：
 
 - 10 个代表变量（覆盖各 category）单独设置时，plan digest 与基线
-  `sha256:e48c7f78...debfd` 逐一相等；35 个迁移变量均不变更已登记 provider 的 plan/artifact
+  `sha256:e0d1287e...814df` 逐一相等；35 个迁移变量均不变更已登记 provider 的 plan/artifact
   字节。
 - `OMP_NUM_THREADS` / `BLIS_NUM_THREADS` 会进入 capability 快照 digest；将
   `BLIS_NUM_THREADS=2` 冻结的 plan 在默认环境重放（不传 capability）→ 结构化
@@ -186,9 +188,12 @@ doctor 的退出码契约不变：默认 rc=0，`--strict` 且 `fail_closed=true
 
 ## 9. 验收与证据
 
-- 实现 commit：`work/u4-env-migration`（base `7378aa943`，见分支 tip，不 push）。
-- focused：`python/pypto.execution` 相关 381 passed；
-  `test_execution_env_registry.py` 16 passed；collect 2010 vs base 1994（+16）。
+- 实现 commit（`work/u4-env-migration`，不 push）：U3-fix `0e688aacb`（round-2 七项 +
+  两条边界）在前，U4 `3d43592cb` 在其上；base `7378aa943`。
+- focused：`python/pypto.execution` 相关 407 passed（含 discovery 55 + registry 16）；
+  collect 2036 vs base 1994（+42 = U3 round-2 +26、U4 +16）。
+- U3 round-2 独立复现：`raw/u3fix_repro/` + `logs/u3fix_*.log`，
+  `raw/v3_snapshot_tamper.json` 80 cases / 0 violations。
 - 证据目录：`/home/chiro/projects/pypto/worktrees/_meta/pypto-x/u4-env-migration/`
   （`brief.zh-CN.md` + `raw/` + `logs/`）；证据不含原始 env 值、私有端点或凭据。
 - 性能：`UNGATED`。
