@@ -12,10 +12,10 @@
 
 | 项 | 值 |
 |---|---|
-| integration tip（frozen） | **`0b5b5899e`**（tree `412a8b109e9c9cba74cc1fcc7fb7b339cf2d42f2`） |
-| 切片与提交 | int8：作者 `63980fc5e` → `c91d771b9`；AVX2：作者 `460f58506`+`b64a59f99` → `2f0b31d0f`+`3c2756c0e`；U4-followup：作者 `8cf9a1b4e` → `f3d71de04`；AVX-512：作者 `8dedc5909` → `0b5b5899e` |
-| 补丁数 | **274**（0046 = 269；本批 +5）；`git am` 干净树复算 **274/274**，复算 tree = 冻结 tree（base 相同 ⇒ tree 判据） |
-| 父方最终 gate | **rc=0，2179 passed / 7 skipped / 0 failed，1313.71 s**（collect **2186** = 3c2756c0e 的 2169 + U4-followup 1 + AVX-512 16；7 skip 全为 libcuda 缺失） |
+| integration tip（frozen） | **`923a72e26`**（tree `5945f3448f184bb76a9eeea1c7a5a188ebdfb927`；含 AVX-512 round-2 声明修复） |
+| 切片与提交 | int8：作者 `63980fc5e` → `c91d771b9`；AVX2：作者 `460f58506`+`b64a59f99` → `2f0b31d0f`+`3c2756c0e`；U4-followup：作者 `8cf9a1b4e` → `f3d71de04`；AVX-512：作者 `8dedc5909` → `0b5b5899e`，round-2 作者 `3e378ecff` → `923a72e26` |
+| 补丁数 | **275**（0046 = 269；本批 +6：int8 1 + AVX2 2 + U4-followup 1 + AVX-512 2）；`git am` 干净树复算 **275/275**（两轮均复算，最终 tree `5945f3448` = 冻结 tree） |
+| 父方最终 gate | **rc=0，2180 passed / 7 skipped / 0 failed，1358.54 s**（round-2 tip `923a72e26`，collect **2187**；7 skip 全为 libcuda 缺失）；round-1 tip `0b5b5899e` 上另有 rc=0 / 2179 passed / 1313.71 s（collect 2186） |
 | 父方中间 gate | rc=0，2162 passed / 7 skipped / 0 failed，1253.66 s（tip `3c2756c0e`，collect 2169 = 2059 + int8 46 + AVX2 64） |
 
 ## 2. 切片 A：int8 exact-blocked（收 ERR-0010 的"包络非上界"）
@@ -37,10 +37,10 @@
 
 ## 4. 切片 C：AVX-512 位置控制面原生（payload 7→8）
 
-- **wire**：`artifact_payload_version` 7→8、`ptx_avx512_abi`/`NATIVE_ABI_MARKER` `:8`→`:9`、同一 `v1:pxio-pxcp-pxwh+fnv1a64` 控制描述符 wire（与 SVE256 控制面布局一致）；native decoder 对 magic/version/reserved/长度/FNV 严格 fail-closed。
+- **wire**：`artifact_payload_version` 7→8、`ptx_avx512_abi`/`NATIVE_ABI_MARKER` `:8`→`:9`、同一 `v1:pxio-pxcp-pxwh+fnv1a64` 控制描述符 wire（与 SVE256 控制面布局一致）；native decoder 对 magic/version/reserved/长度/FNV 严格 fail-closed。**round-2（`923a72e26`）**：payload **8→9** + `PTX_FEATURE_MASK 0x01→0x81` + `_BASE_FEATURES`/runtime 安全集/`expected_required` 补 `avx2`（`-mavx512f` 隐式启用 AVX2，compare/where 归约尾部 16 条 VEX.256；缺 AVX2 宿主在 `dlopen` 前结构化拒绝），ABI marker 保持 `:9`，编译 flag 不变。 |
 - **覆盖**：iota/compare/where 对全部 wire dtype 原生（bool 限 eq/ne）；rank>16 与 scalar 输出逐 op host 回退并带稳定 reason；`mode==native` 与零回退互为充要；`python_list_elements==0` 作为"消除 host 逐元素路径"的硬断言。
 - **零漂移**：跨树 45 cases 不一致 0；单元 384 compare 元素 + 88 where 选择 + 20 非 bool condition 合成 + 8 iota 全绿。
-- **边界**：round-1 的"只依赖 AVX-512F"表述被独立验收的反汇编证伪（`-mavx512f` 隐式启用 AVX2，compare/where 归约尾部有 16 条 VEX.256 指令）→ **round-2 修复中**：声明与运行期特性门补 `avx2`、编译 flag 不变；DQ/BW/VL/FMA/gather 专属指令为 0，iota 为 native 标量循环；广播/非连续 lane 收集为 native 标量 odometer；非 bool where 条件在 Core IR 校验下不可达。
+- **边界**：round-1 的「只依赖 AVX-512F」表述被独立验收的反汇编证伪（`-mavx512f` 隐式启用 AVX2，compare/where 归约尾部 16 条 VEX.256 指令）→ **round-2 已修复**（声明与运行期特性门补 `avx2`、mask `0x81`、payload 9，编译 flag 不变，数值逐位不变）；DQ/BW/VL/FMA/gather 专属指令为 0，iota 为 native 标量循环；广播/非连续 lane 收集为 native 标量 odometer；非 bool where 条件在 Core IR 校验下不可达。
 - **性能（UNGATED）**：1M 元素 iota 0.625 vs 0.917 s、compare 0.482 vs 1.784 s、where 0.783 vs 2.750 s，输出逐位一致。
 
 ## 5. 切片 D：U4 收尾（登记仓库范围未登记读取）
@@ -56,7 +56,7 @@
 | int8 exact-blocked | `7095f221` | **PASS_WITH_BOUNDARIES**：12/12 声明独立复现；336 例构造差分 + **1307 例 falsification**（M/N=1、tail、`kc·p=2²⁴−1` 的 117×119、8 seeds）零界内偏差；规则 8 collect 2105 / 2098 passed（991.90 s）。边界：残余假设（非形式化）、`prepare_int32` 显式 codes 不重复码域校验、Kc 无解/溢出合法域不可达仅注入。 |
 | AVX2 position-native | `32165fae` | **PASS_WITH_BOUNDARIES**：oracle 逐字节未改 + 自建第二 oracle 184 checks 0 mismatch；覆盖 spy 5 native/0 host；双树 4 向 reader + ABI 对调 + 1-bit 篡改 fail-closed；39 raw buffer 零漂移；变异测试 18/64 红；全量 collect 2169 / 2162 passed / rc=0。边界：契约两处措辞不精确（已订正 0016：iota 抛 `CpuVectorUnsupportedError`；"dtype not in set" 分支不可达）。 |
 | U4 follow-up | `9e0de13f` | **PASS_WITH_BOUNDARIES**：自写扫描器复现 46 行/33 名/0 未登记，父提交恰好 6 名；37 项 digest all_equal；doctor 不变式与 canary 零泄漏；守卫测试在父提交失败；全量 collect 2170 / 2163 passed / rc=0。唯一在范围内问题 = 0014 的 +10 归因（已订正，见 ERR-0014）。 |
-| AVX-512 position-native | `97503c56` | **PASS_WITH_BOUNDARIES**（round-1 @`0b5b5899e`）：oracle 逐字节未改 + 自写 ctypes oracle 102/102 + `CpuScalarRuntime` 20/20；metadata/覆盖 87/87；payload/metadata 篡改 33 例与描述符篡改全 fail-closed；20 例语料两树 raw sha256 20/20 一致；focused 206 passed、全量 2179 passed（1313.31 s）。**唯一实质发现**：`-mavx512f` 隐式启用 AVX2，compare/where kernel 含 16 条 AVX2 VEX.256 指令而 `required_features`/feature mask 未声明 `avx2` → **已派 round-2 修复**（声明与运行期门补 `avx2`，编译 flag 不变以保数值/性能，0017 措辞订正）。 |
+| AVX-512 position-native | `97503c56` | **PASS_WITH_BOUNDARIES**（round-1 @`0b5b5899e`；round-2 复验在跑）：oracle 逐字节未改 + 自写 ctypes oracle 102/102 + `CpuScalarRuntime` 20/20；metadata/覆盖 87/87；payload/metadata 篡改 33 例与描述符篡改全 fail-closed；20 例语料两树 raw sha256 20/20 一致；focused 206 passed、全量 2179 passed（1313.31 s）。**唯一实质发现**：`-mavx512f` 隐式启用 AVX2，compare/where kernel 含 16 条 AVX2 VEX.256 指令而 `required_features`/feature mask 未声明 `avx2` → **已派 round-2 修复**（声明与运行期门补 `avx2`，编译 flag 不变以保数值/性能，0017 措辞订正）。 |
 
 ## 7. 证据路径
 
