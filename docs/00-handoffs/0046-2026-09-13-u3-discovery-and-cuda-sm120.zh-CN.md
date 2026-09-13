@@ -34,7 +34,10 @@
 - **语义筛查（先量后改）**：5 个 `affects_artifact_semantics=true` 全部判定 `outside_registered_execution_providers`（当前只注册 portable/AOCL）→ **未发现真实执行层 bug，故无最小修复**；作为未来 Ascend/AArch64 native/vLLM 接入时的 provider digest 风险点登记（`0014` §7/§8）。
 - **兼容层**：旧变量行为零变化（`read_env` 与 `os.environ.get` 逐值一致）；deprecated 变量按进程一次性告警、`PYPTO_X_ENV_DEPRECATION_WARNINGS=0` 静默；未登记 `PYPTO_X_*` 一次性告警 + doctor 列名（敏感名脱敏、值不外显）；`policy_hints_from_env` 只给声明式提示，不隐式覆盖显式 policy。
 - 测试：新增 `test_execution_env_registry.py` 16 条 focused；collect 1994→2020（U3 r2）→**2036（U4）**→2049（U3 r3）→**2059（op-bench 加固）**。文档 `docs/20-planning/0014-2026-09-13-env-registry-migration.zh-CN.md`。
-- **验收状态**：U4 未在推送前单独派独立验收（父方本地复核 collect/focused 全绿），收口时已补派独立 U4 验收；其判决按批次惯例作为 follow-up 记录。
+- **验收状态（已回）**：独立验收 `f2d5db72` @`393d28e0f` 判 **PASS_WITH_BOUNDARIES**（12 条声明 11 条成立；加载树已按 ERR-0013 核实）。
+  唯一被推翻的是**范围性**声明「仓库范围零未登记读取」：`tools/`、`scripts/perf` 与 1 个 UT 辅助文件里读了 6 个未登记名（`PYPTO_X_AOCL_LIB`/`PYPTO_X_AVX2_LAYOUT_SHA256_MANIFEST`/`PYPTO_X_DRIVER_PATH`/`PYPTO_X_LIBXSMM_LIB`/`PYPTO_X_VENDOR_EVIDENCE`/`PYPTO_X_WORKTREE`，全在执行层之外）；实现方扫描只覆盖 `python/pypto`，两者在该范围内一致。
+  另两处文档漂移：`affects_artifact_semantics=true` 实为 6 行（5 个迁移变量 + extra `PYPTO_X_OP_BENCH_AOCL_LIB`），及 0014 §9 的 collect 2049 对冻结 tip 实测 2059（+10 来自 `27fbae5e4`）。已派收尾切片 `u4-followup-registry`（agent `925c7693`）登记 6 名 + 补筛 + 订正计数。
+  验收方独立跑成规则 8 全量：rc=0 / 2052 passed / 7 skipped / 1009.75 s（collect 2059），focused 84 passed。
 
 ## 3. 切片 B：CUDA sm_120 / sm_121 显式原生目标
 
