@@ -51,6 +51,10 @@ builder"的唯一入口：
 
 1. `bindings` 里出现子函数未声明的参数名（此前被静默忽略）；
 2. binding 值不属于父 builder（其 name 未被父 builder 注册）；
+   - 注（round-2 复验登记）：该检查是**名字存在性**（`bound.name in builder._names`）而非 owner 归属；
+     同名跨 builder 绑定会被接受，但实测其发射 IR 与绑定本地同名值**逐 op 相同**（语义不可区分），
+     同名异型则由 `finish()` 的 `CoreProgram.verify` 以类型不一致拒绝，故不产生静默错误 IR；
+     加 owner 标识属后续收紧项（见 §8）。
 3. `rename` 的键或值为空串/非字符串；
 4. 子函数参数名同时是某个 op 输出名（此前参数会在操作数解析时静默遮蔽输出）；
 5. `returns` 直接传字符串而不是 SSA 名字序列。
@@ -264,7 +268,7 @@ host-probe 基线跳过（证据：`logs/r2-evidence.log`，differential 与 rul
 | 整图 stream RMSNorm（input / post-attention / final，`_rms_core` 内联） | 保持内联 | **24 + 24 + 1 = 49** | 这三处直接消费 `_rms_core` 的 FP32 输出进入后续 matmul/gate（不经过 public `build_rms_norm` 的末尾 cast）；而 `build_rms_norm` 本身只是 `_rms_core` + 末尾 cast，公式只有一份，不存在双实现漂移。对照：整图 q/k RMSNorm（12 次/图）已按 `build_rms_norm(output_dtype="float32")` + rename 组合。后续可把 49 处也按同样方式组合（IR 逐字节不变可验证），属低风险收敛项。 |
 | 整图 GQA repeat (`_repeat_kv_heads`) | 保持 slice+concat | 6 层 × (K,V) 各 2 次 slice + 1 次 concat | 公共 `build_gqa_repeat_kv` 是 runtime-index `gather`；整图契约刻意避免整数 index ABI。两条语义各自冻结，改动会变 IR。 |
 | MLP `silu(gate)*up` | 保持内联 | 24 层 | 公共 `build_swiglu` 以 packed last-axis 输入 + `split` 为契约；整图 gate/up 是两次独立投影，直接组合会引入额外 split/reshape。 |
-| `_gdr_recurrent_inline` / `_gdr_step` | 保持内联 | 18 层（6 层 × T 步展开） | 公共 `build_qwen35_gdr_recurrent_state` 是固定 shape 的独立 builder，与整图按 layer prefix 的 SSA 展开不是同一程序结构。 |
+| `_gdr_recurrent_inline` / `_gdr_step` | 保持内联 | 18 层（T=1：18 次内联/18 个 step；T=5：90） | 公共 `build_qwen35_gdr_recurrent_state` 是固定 shape 的独立 builder，与整图按 layer prefix 的 SSA 展开不是同一程序结构。 |
 | `_rms_gated_core` | 保持私有 core | 18 层 × 1 | 没有公共 composite 对应（Qwen RMSNormGated 的直接 scale + bf16 round-trip 语义）。 |
 | 整图 lm_head / in_proj matmul | 保持内联 `matmul` | lm_head 1 + 每层投影若干 | 只对 full-attention 内 f32×f32 的 QK^T/PV 使用了 `build_batched_matmul`；其余 matmul 与显式 transpose/cast 链绑定，单独组合收益低。 |
 | `build_qwen35_attention_kv_cache` / `build_attention_subgraph` / `build_decoder_subgraph` | 独立 harness | 不参与整图 | 已由子 composite 组合而成；整图走 `_append_*` 路径，二者共享同一批子 composite。 |
