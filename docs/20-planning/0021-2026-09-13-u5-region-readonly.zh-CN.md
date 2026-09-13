@@ -1,7 +1,9 @@
 # 0021 — U5 region 只读规划（batch 0049 切片 A）
 
 - 任务：`u5-region-readonly`
-- 实现基线：integration tip `4521558e6`；实现 commit `46daf77d2`（分支 `work/u5-region-readonly`，未 push）
+- 实现基线：integration tip `b643229bd`（round-2 修复已由父方 cherry-pick）；round-3 修复 commit
+  `06910f996`（分支 `work/u5-region-readonly`，未 push）
+- **schema**：`REGION_SCHEMA_VERSION = 2`（v1 只存在于 round-1 未发布阶段；v1 文档一律 fail-closed 拒绝）
 - 依赖：`0019`（opcode 契约第一批，已落地）、`0018`（composite 组合化，已落地）、父方提案 `0020`
 - 结论等级：**实现完成（只读）**。未做执行、未做 v5 报告、未做动态 shape、未做性能声明；本机数字一律 UNGATED
 - 证据目录：`/home/chiro/projects/pypto/worktrees/_meta/pypto-x/u5-region-readonly/`
@@ -11,7 +13,7 @@
 本切片把 "图" 提升为一等公民的**第一步（只读）**：
 
 - `plan_region(program, region_spec, policy, capability=None) -> RegionPlan`：把 `CoreProgram`
-  中由静态 def-use 连通的算子集合冻结成 `REGION_SCHEMA_VERSION=1` 的 region plan 文档，
+  中由静态 def-use 连通的算子集合冻结成 `REGION_SCHEMA_VERSION=2` 的 region plan 文档，
   逐 op 复用 `plan_operation`（不新造 resolver），产出 `region_digest` 与 region 级精度声明；
 - `explain_region(...)` / `explain_region_plan(...)`：逐 op 复用 U3 的 explain 文档
   （候选 / 拒绝原因 / tie-break / fallback / 边界表），region 级给出可复算的合成推导；
@@ -73,11 +75,11 @@ digest 会在两次 revision 之间悄悄改变含义；而 `boundary` 由 SSA �
 所有错误都带 `code`（沿用 `OP_CONTRACT_INVALID`）、`field`、`requested`、`reason`、`details`，
 可用 `to_dict()` 机器读取。
 
-## 2. 冻结 region plan（`REGION_SCHEMA_VERSION=1`）
+## 2. 冻结 region plan（`REGION_SCHEMA_VERSION=2`）
 
 ```jsonc
 {
-  "region_schema_version": 1,
+  "region_schema_version": 2,
   "kind": "region_plan",
   "region_id": "region.<region_digest hex 前 16 位>",
   "region_digest": "sha256:...",
@@ -100,18 +102,28 @@ digest 会在两次 revision 之间悄悄改变含义；而 `boundary` 由 SSA �
 
 ```text
 region_digest = "sha256:" + sha256(canonical_json({
-  "region_schema_version": 1,
+  "region_schema_version": 2,
   "boundary_signature": <boundary_signature>,
-  "operations": [
-    {"index": i, "function": fn, "opcode": opcode, "single_op_plan_digest": digest_i},
-    ... 按拓扑序 ...
-  ]
+  "operations": [ <完整逐 op 条目（含单算子 plan digest、selected、
+                    numeric_guarantee、precision/envelope、fallback、bound、
+                    provider metadata）>, ... 按 region-local 拓扑序 ... ]
 }))
 ```
 
 要点：
 
-- 有序 op digest 列表 + 边界签名 + schema 版本三者进 preimage；`region_id` 由 digest 派生；
+- **版本纪律**：round-2 把 preimage 从"4 个 op 字段"扩成"完整 op 条目"，这是**语义变更**，
+  因此 `REGION_SCHEMA_VERSION` 从 1 升到 **2**；解码器对 v1 文档抛命名错误
+  `region_schema_version_legacy`（requested=1/available=2），绝不按 v2 重新解释；其余未知版本
+  抛 `region_schema_version_mismatch`；
+- **完整有序 op 条目**（不是只有 `single_op_plan_digest`）+ 边界签名 + schema 版本三者进
+  preimage；`region_id` 由 digest 派生；round-2 起，逐 op 的
+  `selected`/`numeric_guarantee`/`precision`/`envelope`/`fallback`/`bound`/provider metadata
+  全部在 preimage 内，改任一字段即 `region_digest_mismatch`；
+- `operations[].index` 是 **region-local** 拓扑位置 0..N-1（不是扁平化全局 op 序号）；
+  文档内一切引用（exit 的 `producer_op_index`、def-use 检查）都用该编号；
+- entry input 的 producer 若在 region 外，记 `source="outside_region_operation"` 且
+  `producer_op_index=null`（region 外 op 不属于本冻结文档）；
 - 逐 op plan digest 自身绑定 policy digest、capability digest、contract digest、precision/envelope；
   因此 **capability 变化如果影响任一 op 的解析，必然改变 region digest**；与 region 语义无关的
   变化也在 per-op plan payload 的 `target.capability_digest` 中体现。文档另存 base
@@ -147,9 +159,12 @@ region_digest = "sha256:" + sha256(canonical_json({
   "implementation": "...",
   "numeric_class": "deterministic_bounded",     // 该 op 的 contract 精度类
   "selected_numeric_class": "portable_bitwise", // provider manifest 的 numeric class
-  "precision": {...} | null,
-  "envelope": {...} | null,
-  "fallback": {"mode","primary","chain","used","degraded","events"},
+  "selected": { ...plan payload selected 原文... },          // round-2 新增，进 preimage
+  "numeric_guarantee": { ...plan payload 原文... },           // round-2 新增，进 preimage
+  "precision": {...} | null,                    // numeric_guarantee 的投影（可复算）
+  "envelope": {...} | null,                     // numeric_guarantee 的投影（可复算）
+  "fallback": { ...plan payload fallback 原文（含 events）... },  // round-2 原样落盘
+  "fallback_used": true,                        // 由 events 派生，不改写 resolver 声明
   "bound": {"declared_class","proven","bound","bound_kind","is_upper_bound","reference","reasons"}
 }
 ```
@@ -158,24 +173,61 @@ region_digest = "sha256:" + sha256(canonical_json({
 output_shape=..., output_dtype=..., attributes=..., policy=<文档内 policy>, capability=<replay
 snapshot>)` 得到的 `ExecutionPlan.digest`；`request` 字段足以在**不依赖源 program** 的情况下重放。
 
+### 3.1 锚定口径（round-2 修复的核心）
+
+只有 `single_op_plan_digest` + 3 个 replay 字段（plan/contract/provider）不够：`region_digest`
+的公开算法任何人都能重签，因此保证字段必须同时满足两条：
+
+1. **进 preimage**：`operations` 的**完整条目**（`selected`/`numeric_guarantee`/`precision`/
+   `envelope`/`fallback`/`fallback_used`/`bound`/provider metadata/`request`/digest ...）都进
+   `region_digest`。只改保证字段而不重签 digest → `region_digest_mismatch`；
+2. **replay 逐字段比对**：`re_resolve=True` 时，除 `single_op_plan_digest` / `contract_digest` /
+   `contract_version` / `plan_schema_version` / provider metadata 外，还把文档里的
+   `selected`、`numeric_guarantee`、`fallback` 与 `plan_operation` 重放出的 plan payload
+   **逐字段相等**比对。即使攻击者重签了公开 digest，把 `exp` 的
+   `precision` 从 `deterministic_bounded` 伪造成 `exact`/proven 仍会因
+   `region_numeric_guarantee_payload_mismatch` 被拒；抹掉 `fallback.events` 会因
+   `region_fallback_payload_mismatch` 被拒。
+
+`region_spec`/`policy`/`capability_digest`/`region_precision` 不进 preimage，但分别由语义交叉
+校验、policy digest 复算、replay capability 锚定与 `region_precision` 复算覆盖。
+
+### 3.2 零输入 opcode 与 region-local 编号
+
+- **零输入 opcode**：`request.inputs`/`input_shapes`/`input_dtypes` 允许为空；validator 不再
+  假设"输入非空"，而是按冻结契约的 arity（`len(OpDefinition.inputs)`）校验
+  `request.op`/operand 数/role/结果数。batch-1 的 `iota` 因此可以 `plan → validate → load →
+  explain` 完整往返；
+- **region-local 编号**：boundary 子图即使从全局第 1 个 op 开始，落盘后也重编号为 0..N-1；
+  exit 的 `producer_op_index` 用 region-local 编号；region 外 producer 的 entry 记
+  `source="outside_region_operation"` + `producer_op_index=null`；
+- **自检不变量**：`plan_region` 在返回前对自己的 document 跑一次
+  `validate_region_plan(..., re_resolve=False)`；任何"自产不可 load"的文档在 plan 阶段就
+  结构化失败（boundary 编号、iota、空选择三类问题都会在此暴露）。
+
 严格校验器 `validate_region_plan(document, *, policy=None, capability=None, re_resolve=False)`
 按固定顺序检查（任一失败抛 `ARTIFACT_MISMATCH`，不修复）：
 
-1. 顶层 schema/kind、必填字段、未知字段、`resolver_version` 精确匹配；
-2. `boundary_signature` 结构（角色/类型/静态 shape/entry 不得有 region 内 producer/exit source 语义）；
-3. **从文档自身复算 `region_digest`，再复算 `region_id`**（改一位 → `region_digest_mismatch` /
-   `region_id_mismatch`）；
-4. 逐 op 结构 + `bound` 视图必须等于从 `precision`/`envelope` 重新归一化的结果
-   （改 `bound` → `region_operation_bound_mismatch`）；
+1. 顶层 schema/kind、必填字段、未知字段、`resolver_version` 精确匹配；`region_schema_version`
+   必须为 int 且 == 2（v1 → `region_schema_version_legacy`，其他 → `region_schema_version_mismatch`）；
+   类型为 bool 的 `op_count` 等一律拒绝，未知 `policy.numeric.requirement` 抛结构化
+   `region_policy_invalid`（不再裸 `ValueError`）；`operations` 为空 → `region_operations_empty`；
+2. `boundary_signature` 结构（角色/类型/静态 shape/entry `producer_op_index=null`/exit source
+   `operation_result` 用 region-local producer 编号）；
+3. **从文档自身复算 `region_digest`（完整 op 条目），再复算 `region_id`**（改一位 →
+   `region_digest_mismatch` / `region_id_mismatch`）；
+4. 逐 op 结构 + `precision`/`envelope` 必须等于 `numeric_guarantee` 的投影 + `bound` 视图
+   必须等于从 `numeric_guarantee` 重新归一化的结果（重签 digest 后仍抓 `bound` 篡改）；
 5. 文档内部 def-use 闭包（重复定义、正向引用、隐式捕获、exit producer 一致性、
    entry/exit 与 request 的类型一致）；
 6. `region_spec` 与边界/算子集合语义一致（region_spec 不进 digest，改用语义交叉校验）；
 7. `policy` 复算 digest；`region_precision` 必须逐字节等于从 op 列表重新合成的结果；
 8. `op_count == len(operations)`；
-9. `re_resolve=True` 时：重放每个 op 的 `plan_operation`，要求 `single_op_plan_digest`、
-   `contract_digest`、`provider_id` 一致，并要求传入 capability 的 digest 等于文档
-   `capability_digest`（`region_capability_digest_mismatch`）。未显式传 capability 时探测本机，
-   探测 digest 必须与文档一致，否则拒绝（合成 capability 的计划必须显式带 snapshot 才能 replay）。
+9. `re_resolve=True` 时：重放每个 op 的 `plan_operation`，要求 `single_op_plan_digest` 一致，
+   并对 `selected`/`numeric_guarantee`/`fallback`/contract/plan schema/provider metadata
+   **逐字段比对**；传入 capability 的 digest 必须等于文档 `capability_digest`
+   （`region_capability_digest_mismatch`）。未显式传 capability 时探测本机，探测 digest 必须
+   与文档一致，否则拒绝（合成 capability 的计划必须显式带 snapshot 才能 replay）。
 
 `RegionPlan.validate(...)` 默认 `re_resolve=True`；`load_region_plan(path, ...)` 默认
 `re_resolve=True`。因此"文档自证 + 单算子路径双向锚定"是同一次调用完成的。
@@ -210,6 +262,10 @@ best_effort                                        （任一 precision 或 provi
 - 任何情况下都给出 `provider_ids` / `provider_counts` / `mixed_providers`；
   `cross_provider_policy` 明写"各 provider 界独立相加，不做抵消/补偿/重排"；
 - `all_portable_trunk` 单独记录"是否整个 region 都跑 portable trunk"（与 contract 精度声明解耦）；
+  只有**所有 op 都真的跑 portable trunk** 时，`portable_bitwise` 的
+  `deviation_bound.statement` 才写"逐位一致于 portable trunk"且 `is_upper_bound=true`；
+  混 provider 的 portable_bitwise region 改写成条件式 statement、`is_upper_bound=false`、
+  reasons `not_every_operation_ran_on_the_portable_trunk`（round-2 修复）；
 - **回退如实标注**：逐 op 记录 `fallback.mode/primary/chain/used/degraded/events`（冻结 plan
   payload 只有 `events`/`degraded`；`used` 由 "events 非空（selected != preferred）" 派生，
   绝不把发生过的 host/scalar 回退写成未发生）。region 级另有 `fallback_ops`（含 mode/used/degraded）
@@ -225,15 +281,19 @@ best_effort                                        （任一 precision 或 provi
 ### 4.3 `deviation_bound` 与"和是否为上界"
 
 - `exact`：`{kind: exact_contract_bound, sum: 0, deviation_bound_by_k: {all_k_le_limit: 0}, is_upper_bound: true}`；
-- `portable_bitwise`：`{kind: portable_bitwise_trunk_identity, sum: 0, is_upper_bound: true}`，
-  声明的是"与顺序执行的 portable trunk 逐位一致"，不是"与数学参考的误差界"；
+- `portable_bitwise`：全 portable region 为
+  `{kind: portable_bitwise_trunk_identity, sum: 0, is_upper_bound: true}`，声明的是"与顺序执行的
+  portable trunk 逐位一致"，不是"与数学参考的误差界"；混 provider 时为
+  `{kind: portable_bitwise_mixed_provider_identities, is_upper_bound: false}`；
 - `deterministic_bounded`：`{kind: sum_of_per_operation_proven_bounds, sum: Σ, is_upper_bound: ?}`。
   逐项列出 `terms`（index/opcode/provider/bound_kind/bound/is_upper_bound/reference）。
   `is_upper_bound=true` 当且仅当：
   1. 每一项的界都是 proven，且可数值相加（`int` 或同 key 的 `by_k` 逐项相加）；
-  2. 非零界项的 reference 一致（portable 恒等项是 0，不改变参考系）；
-  否则给出 `cross_reference_bounds_not_comparable` / `nonzero_bound_has_no_reference` 等理由，
+  2. **所有项（含 0 界项）的 reference 一致**，且每一项都带 reference；
+  否则给出 `cross_reference_bounds_not_comparable` / `bound_without_reference_present` 等理由，
   `is_upper_bound=false`，且在 `require_proven_deviation_bound=true` 下 region 级 fail-closed。
+  （round-2 前的缺陷：reference 一致性只看非零界项，导致 "exact 0 界 ref A + bounded 5 界 ref B"
+  错误地报 `is_upper_bound=true`；现在两个不同 reference 的项一律 false。）
 - `deterministic_bounded_unproven` / `best_effort`：`{kind: none, sum: null, is_upper_bound: false}`，
   不做任何"求和成界"声明。
 
@@ -308,7 +368,7 @@ proven-bounded / portable-present）、`selected_class`、`selected_rule`、
 
 复用 U3 的 explain 机制，不新造第二套解释层：
 
-- 每个 op 的 `operations[i]` 是 `discovery._explain_document(plan, "region_op", ...)` 的原样输出，
+- 每个 op 的 `operations[i]` 复用 **公开** U3 入口 `discovery.explain(plan=...)` 的原样输出，
   含 `candidates` / `rejections` / `tie_break` / `fallback` / `rules` / `boundaries`，
   另加 `region_op_index`、`region_opcode`、`bound_view`、`region_fallback`；
 - region 级 `composition` 给出 `derivation`（与文档内 `region_precision.derivation` 相同）、
@@ -351,6 +411,11 @@ python -m pypto.execution.cli explain --region-plan region.json [--snapshot snap
 | 混 provider 且全 unproven（真实 AOCL f32 + AOCL int8，vendor policy） | `deterministic_bounded_unproven`, provider set 2 个 | 不声明界；strict 结构化拒绝 |
 | best_effort（合成 term；本树无 shipped best_effort provider） | `best_effort`, `best_effort_region_not_usable_for_require_policy` | 任何 require policy 不可用；fabricated best_effort provider 被 resolver 结构性拒绝 |
 | host/vendor 回退（required AOCL 不可用 → fallback portable） | op.fallback `used/degraded/mode=declared/events`，region `fallback_ops` 有 mode | replay/verify 通过 |
+| 混 provider 的 portable_bitwise（exact-blocked qmatmul + portable matmul） | `portable_bitwise_mixed_provider_identities`, `all_portable_trunk=false`, `is_upper_bound=false` | statement 与 provider 集合一致，无"逐位等于 portable trunk"的过度声明 |
+| F3-B 0 界跨 reference（exact ref A + bounded ref B） | `deterministic_bounded`, sum 保留, `is_upper_bound=false` | reason `cross_reference_bounds_not_comparable`；strict fail-closed |
+| boundary 往返（region 外 producer / 晚起子图） | region-local 编号 0..N-1；entry `source=outside_region_operation` + `producer_op_index=null` | validate/load/explain 全通 |
+| 零输入 `iota` | `request.inputs=[]`，契约 arity=0 | validate/load/explain 全通 |
+| 嵌套/block region | — | `region_nested_region_not_supported` / `region_block_region_not_supported` |
 
 ### 7.2 确定性 / 自证 / 篡改
 
@@ -358,17 +423,38 @@ python -m pypto.execution.cli explain --region-plan region.json [--snapshot snap
 - `validate_region_plan` 从文档自身复算 `region_digest` / `region_id` / 逐 op `bound` 视图 /
   `region_precision` / `policy_digest` / def-use 闭包；`re_resolve=True` 再逐 op 与
   `plan_operation` 重放比对；
-- 篡改矩阵（op digest 翻一位、边界 source 改写、删 op、rewrite bound、rewrite region class、
-  rewrite region_id、rewrite policy/capability digest、未知字段）全部结构化拒绝；
-- 序列化往返（`load_region_plan` / `RegionPlan.from_dict`）digest 不变；
-- capability 变化（portable provider version 改一位）→ region digest 变化并可用新 snapshot replay。
+- 篡改矩阵（op digest 翻一位、边界 source 改写、删 op、rewrite bound、region class、region_id、
+  policy/capability digest、未知字段、bool 型 schema/op_count、未知 requirement）全部结构化拒绝；
+- **逐字段锚定矩阵（14 类，参数化测试）**：`precision`、`bound`、`numeric_class`、
+  `fallback`、`selected_numeric_class`、`provider_version`、`implementation`、
+  `contract_version`、`plan_schema_version`、`op_name`、`path`、`request.inputs[].role`、
+  `selected` payload、`numeric_guarantee.precision` 逐项"改写 + 自洽重算"：
+  不重签 digest 一律 `region_digest_mismatch`；重签后分别被
+  `region_numeric_guarantee_payload_mismatch`（precision）/`region_operation_bound_mismatch`（bound）/
+  `region_operation_numeric_class_mismatch`/`region_fallback_payload_mismatch`/
+  `region_selected_payload_mismatch`/`region_contract_digest_mismatch`/
+  `region_plan_schema_version_mismatch`/`region_operation_opcode_mismatch`（op_name 不是该
+  opcode 的 Core IR 拼写）/`region_operation_path_invalid`（path 非扁平
+  `body.ops[N]` 或函数内非递增）/`region_operation_request_inconsistent`（role）/
+  `region_precision_projection_mismatch` 结构化拒绝；
+- 序列化往返（`load_region_plan` / `RegionPlan.from_dict`）digest 不变；对 boundary / 整图 /
+  零输入 iota 三种产出各跑 `plan → validate(re_resolve=False) → load → explain` 往返；
+- **版本拒绝**：把 round-1 的文档（schema=1，已知 digest `626cc908…`）交给 v2 解码器 →
+  `region_schema_version_legacy`（`re_resolve=False/True` 都一样，先于任何语义解释）；当前 v2
+  文档正常接受；重签后的"空 operations"文档 → `region_operations_empty`（不再是裸 `ValueError`）；
+- `plan_region` 返回前自检：自产 document 不能通过结构校验即 plan 失败；
+- capability 变化（portable provider version 改一位）→ region digest 变化并可用新 snapshot replay；
+- **显式 capability 不 probe**：monkeypatch `CapabilitySnapshot.probe_host` 抛异常后，
+  `plan_region(..., capability=<snapshot>)` 与 `plan_operation(..., capability=<snapshot>)`
+  仍正常工作（无 `/proc/cpuinfo`、无 pinned library dlopen）；默认路径（不传 capability）
+  仍按 lazy 一次性探测。
 
-### 7.3 零回归（923a72e26 → `46daf77d2`）
+### 7.3 零回归（923a72e26 → `06910f996`）
 
 证据：`raw/single_op_digests_923a72e26.json`、`raw/single_op_digests_tip.json`、
 `raw/single_op_digest_zero_regression.json`（同一主机、同一 capability digest `e0a9dac8…`）：
 
-| 项 | 923a72e26 | tip `46daf77d2` | 结论 |
+| 项 | 923a72e26 | tip `06910f996` | 结论 |
 |---|---|---|---|
 | `plan_matmul` f32 (2,3)×(3,4) | `e0d1287e…` | `e0d1287e…` | 逐字节一致 |
 | `plan_matmul` bf16 | `7e95c65c…` | `7e95c65c…` | 逐字节一致 |
@@ -376,33 +462,54 @@ python -m pypto.execution.cli explain --region-plan region.json [--snapshot snap
 | `plan_operation` matmul/qmatmul | 不存在（0048 新增） | 与专用入口一致 | 委托逐字节一致 |
 
 新测试 `python/tests/ut/pypto_x/test_execution_region_planning.py` 在父提交 `4521558e6`
-上 **collect 即 ImportError**（`cannot import name 'RegionPlan'`），非空转。
+上 **collect 即 ModuleNotFoundError**（`No module named 'pypto.execution.region'`），非空转。
+round-2 另外把验收方的最小复现脚本语义纳入测试：
+`raw/round2_repro_results.json`（precision forgery 两段、fallback forgery、boundary 往返两种、
+iota 往返、嵌套/block 拒绝、显式 capability 无 probe）。
 
 ### 7.4 focused / 规则 8
 
 - focused（未持锁）：`env PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=python:python/tests/ut
   python3 -m pytest -q -rs -p no:cacheprovider
-  python/tests/ut/pypto_x/test_execution_region_planning.py` → **26 passed**（约 1.8 s）；
-  与既有 `test_execution_ops_registry_batch1.py` 合并跑 → **151 passed**。
-- 规则 8 全量（hold local lock，6 线程）：**（见 `logs/rule8_summary.txt` / `logs/rule8_rc.txt`）**。
+  python/tests/ut/pypto_x/test_execution_region_planning.py` → **64 passed**（约 2.4 s）；
+  与既有 `test_execution_matmul.py` + `test_execution_ops_registry_batch1.py` +
+  `test_execution_discovery.py` 合并跑 → **307 passed**（`logs/focused_region_tests.log`、
+  `logs/focused_region_plus_execution_suite.log`）。
+- 规则 8 全量（hold local lock，6 线程，命令
+  `env PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=python:python/tests/ut python3 -m pytest -q -rs
+  -p no:cacheprovider python/tests/ut/pypto_x`）：**collect 2390 / passed 2380 / skipped 10 /
+  failed 0 / rc 0，耗时 22:01（1321.44 s）**（`logs/rule8_full.log`、`logs/rule8_rc.txt`、
+  `logs/rule8_elapsed_seconds.txt`、`logs/rule8_final_summary.json`）。10 个 skip 为 7 个本机无
+  CUDA driver（既有）+ 3 个 host-guarded 基线 digest 钉（batch1 的 2 个 + 本切片新增的
+  `test_single_operation_digests_match_the_frozen_baseline`：heavy 锁把 `OMP_NUM_THREADS`
+  设为 6，AOCL manifest 的线程事实变化导致 capability digest 不同，这是既有机制而不是本切片漂移）。
 
 ## 8. 登记边界（未做与已知限制）
 
 - **不执行**：本切片没有 `execute_region_plan`，没有 runtime/launch 调用，没有 v5 报告；
-- **不动单算子路径**：`entry.py` / `resolver.py` / `plan.py` / provider 实现零改动；
+- **单算子路径零语义变化**：`resolver.py` / `plan.py` / provider 实现未改；
+  round-2 仅为验收要求把 `entry.capability_for_policy` 改成 **lazy probe**（显式 capability
+  不再无条件 `probe_host()`），默认路径行为与 digest 逐字节不变（§7.3 重新验证）；
   `pypto/__init__.py` 未改（region API 经 `pypto.execution` 显式导入）；
 - **不支持的请求**：标量 operand（`where` fill 等）、多输出/无输出、非 tensor 结果、
-  动态/符号 shape；这些全部结构化拒绝，不静默降级。带 block region / 嵌套 op region 的程序
-  受 Core IR `verify()` 的可见性规则限制（嵌套 region 输出不泄漏回父作用域、block 输出不能
-  作为函数返回），当前以 `region_program_invalid` 结构化拒绝；扁平的 `CoreProgram`（Qwen
-  三个真实图均为扁平）是已验证路径；
+  动态/符号 shape；这些全部结构化拒绝，不静默降级；
+- **嵌套/block region 明确拒绝**：`region_nested_region_not_supported` /
+  `region_block_region_not_supported`；扁平 `CoreProgram`（Qwen 三个真实图均为扁平）是唯一
+  已冻结路径。round-2 前它们会被"拍平"进计划，无法表达嵌套作用域，属实现与文档不一致，现已
+  按 fail-closed 修正；
 - **best_effort 在本树不可达**：现有 resolver 的 requirement 判定（portable/deterministic/bounded）
   都强于 best_effort，因此 shipped provider 无法产出 best_effort plan；合成 term 覆盖了组合器
   路径并验证"best_effort region 不可用于 require policy"；
 - **性能**：region 规划耗时（decoder 整图约 15 s）只是本机 UNGATED 观测，不作为性能声明；
 - **vendor 依赖**：AOCL 相关对抗用例依赖本机 pinned artifact 的可用性（测试中 skip-guard）；
+- **显式 capability 的 probe 边界**：默认/显式 capability 路径都不再无条件 probe；仅当 policy
+  显式 opt-in 0047 exact-blocked 时，其 manifest 由 pinned artifact 探测构造（policy 语义
+  需要），此时会有一次该 artifact 的探测；默认与 portable 路径无 `/proc/cpuinfo`、无 dlopen；
 - **capability replay**：用非默认/合成 capability 生成的 region plan，`load_region_plan`
   / `validate_region_plan(re_resolve=True)` 必须显式传入同一 capability snapshot；
   否则按 fail-closed 拒绝（`region_capability_digest_mismatch`）；
+- **v1 region plan 不可 load**：round-1 的 schema=1 文档在 r2/r3 之后一律
+  `region_schema_version_legacy` 拒绝（fail-closed 正确）；没有旧 artifact 需要兼容，因为该
+  schema 从未随实现提交发布；
 - **下一步（不属于本切片）**：`execute_region_plan`（第二步）与 region 级 report v5（第二步）、
   region workspace/缓存/并行调度（第三步）。
