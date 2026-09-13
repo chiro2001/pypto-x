@@ -40,6 +40,7 @@
       lock 里的 `gamepc_toolkit: ..._absent` 与 `cuda_c1_acceptance_smoke: BLOCKED_TOOLCHAIN_nvcc_absent` 是 **2026-09-09 的过期快照**，
       已就地标注 `*_superseded_2026_09_13`；`criterion_defaults.e4 = avx512_and_sve256_first_cuda_later` 只表示**判据优先序**，不是"CUDA 不可用"。
       **2026-09-13 已重启并全部 PASS（batch 0045）**：C1 smoke + 扩展验收 **10/10** 真机 bit-exact（sm_120 cubin 4/4 位级一致）、本机 7 条设备 skip 的 CUDA 单测真机 **41 passed/0 failed/0 skipped**、cuBLAS GEMM 复核与冻结值差 **≤1.46%**（同 616.92 窗口噪声，B4 仍需用户批准冻结）、W8A8 CUDA 真机差分 **53/53 checks / 0 mismatch**；边界：WSL2 时钟不可 pin（比值 UNGATED）、cubin arch-locked（`sm_80` cubin 在 sm_120 报 209，PTX JIT 才是前向兼容）、**GamePC 是与用户共用的游戏机**——性能腿前后必须查外来负载，有游戏就 `perf deferred` 且绝不动用户进程。
+      **用户日程约束（2026-09-13 晚）**：**CUDA 线明天（2026-09-14）09:00 CST 之后才能开始**；守望器已加日程门（`NOT_BEFORE_UTC=2026-09-14T01:00:00Z`、`UNTIL_UTC=2026-09-14T10:00:00Z`），在此之前即使窗口干净也只记 `CLEAN_BUT_SCHEDULED_DEFER`、**不跑计时腿**；仍只做只读 `nvidia-smi` 快照、绝不动用户进程。
       约定：GPU-only 探测/验收不申请 `gamepc` 锁；GamePC host CPU/内存 heavy 阶段才需持有该锁。
    b) **0041 已交付的主要结论**（引用以 lock/ERRATA 为准）：
       · **AVX2 layout 原生化**（`1b1c40656`+`7d8762abe`）：decode launch 28.5→20.4 s、prefill 127.9→109.3 s；per-op layout 中位 0.02–0.04 ms；
