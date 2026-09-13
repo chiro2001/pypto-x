@@ -116,7 +116,8 @@
 | 条件 | mode | reason 形态 |
 | --- | --- | --- |
 | rank > 16（iota/compare/where） | `host_reference` | `<op> rank <r> exceeds the native AVX2 position-control max rank 16` |
-| dtype 不在集合（防御性；AVX2 lowering 先拒绝 float16/float64） | `host_reference` | `dtype <dtype> is not in the native AVX2 ... dtype set` |
+| dtype 不在集合（**compare/where 的防御性路径**） | `host_reference` | `dtype <dtype> is not in the native AVX2 ... dtype set` |
+| dtype 不在集合（**iota**） | 不适用 | **该 reason 分支不可达**：iota 的非法 dtype 在 lowering 直接抛 `CpuVectorUnsupportedError`；其 schedule 校验的实际 reason 字符串是 `iota schedule is invalid`（由 `verify-0047-avx2` 复核订正） |
 | 混合 dtype / 非法 predicate / 形状不可广播（防御性） | `host_reference` | 对应原因字符串 |
 
 - shared validator 会在 lowering 阶段先拒绝 float16/float64、非 bool 条件、混合 dtype；
