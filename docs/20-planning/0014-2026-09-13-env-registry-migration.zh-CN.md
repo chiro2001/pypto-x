@@ -259,9 +259,13 @@ epilog 写明全部四个码。doctor/plan 的 `library.path` 默认只给 basen
 - U3 round-2/3 独立复现：`raw/u3fix_repro/` + `logs/u3fix_*.log`、`logs/r3_*.log`；
   `raw/v3_snapshot_tamper.json` 80 cases / 0 violations；`raw/r2_targeted.json`
   49 cases / 0 violations；`repro_empty_mapping_holes` 10/10 拒绝。
-- **§9 计数订正（followup）**：上面的 2049 是 U4 实现时点的历史值；原始冻结 tip `393d28e0f`
-  实测 collect **2059**（`verify-0046-u4` 独立复现，`logs/full_ut_collect.log`），+10 来自先于
-  冻结 tip 的祖先 `27fbae5e4`（op-bench 测试改动），与 registry 行数/类别/digest 无关。
+- **§9 计数订正（followup，2026-09-13 二次订正）**：上面的 2049 是 U4 实现时点的历史值；原始冻结 tip `393d28e0f`
+  实测 collect **2059**（`verify-0046-u4` 独立复现，`logs/full_ut_collect.log`）。2049→2059 的 **+10** 经
+  `verify-0047-u4-followup` 用 `git diff --name-only` 逐提交分解复核为：**+9 来自 `a52687ade`**
+  （`test_cuda_sm120_target.py` 13→22，CUDA arch-selection 边界测试）**+ 1 来自 `27fbae5e4`**
+  （`test_op_bench_framework.py` 31→32）；此前把 +10 全部归给 op-bench 的表述**已证伪并订正**。
+  逐点实测：`7378aa943`=1994、`625484741`=2049、`a52687ade`=2045、`27fbae5e4`=2046、`393d28e0f`=2059、
+  `3c2756c0e`=2169、`f3d71de04`=2170；与 registry 行数/类别/digest 无关。
 - **rebase 后的 base 与 followup 计数**：base `3c2756c0e`（int8 exact-blocked `c91d771b9`
   + AVX2 position-native）collect **2169**；followup 后 collect **2170** = 2169 + 1 条仓库
   范围扫描测试（`logs/collect_after_summary.txt`）。
