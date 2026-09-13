@@ -59,6 +59,21 @@
   校验仍不 probe、不重跑 resolver：`region_digest` 必须能从 `region_plan` 自身复算，逐 op 的 digest 必须与各单算子 plan 的 digest 一致（锚定关系双向可检）。
 - **兼容**：单算子路径不变（`plan_matmul`/`plan_qmatmul` 与 v4 报告逐字节不变）；region 是**新增**入口。
 
+### 3.1 锚定必须覆盖"声明字段"（2026-09-14 验收教训，硬要求）
+
+`verify-0049-u5-region` 证明：若 region digest 的 preimage 只含"逐 op 的 plan digest + 边界 + schema"，那么
+**逐 op 的 `numeric_guarantee` / `envelope` / `bound` / `numeric_class` / `fallback` / `selected.*` 可以被改写而不改 region_digest**——
+已复现的最小反例：把 `exp` 从 `deterministic_bounded`（无可用界）改成 `exact` + proven bound 0，digest 一字不变，
+`load_region_plan` 仍接受并对外宣称 exact；`fallback` 的 used/degraded/events 同样可无痕改写。
+
+因此**强制要求**（实现与验收都必须按此检查）：
+
+1. region digest 的 preimage **必须**包含逐 op 的声明字段（或其 canonical 视图 digest），
+   或 `load/validate` 必须对 `numeric_guarantee` / `fallback` / `selected.*` **逐字段比对**重放结果；
+2. 两者至少要有一个是"完整覆盖"，且要有"改任一字段 → 拒绝"的回归测试；
+3. `is_upper_bound` 只有在**所有**求和项都是经证明的上界时才可为 `true`；跨 reference 或不 proven 的项必须 `false`；
+4. 组合类声明（如 `portable_bitwise` 的说明文字）必须由实际判定生成，不得写死。
+
 ## 4. 建议的用户入口（分三步落地）
 
 1. **只读**（第一步，风险最低）：`plan_region(program, region_spec, policy)` → 冻结 region plan；`explain_region(...)` 复用 U3 的 explain 输出；CLI 加 `plan --region`/`explain --region`。
