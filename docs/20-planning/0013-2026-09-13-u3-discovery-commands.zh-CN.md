@@ -41,7 +41,8 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
  host: {triple, machine, platform, features, python, byteorder},
  opcodes: [{opcode, contract_version, contract_digest, registry_schema_version}],
  capability: {schema_version, kind, triple, features, snapshot_digest, provider_ids},
- providers: [ProviderCapability.to_dict() + {manifest_digest}],
+ providers: [ProviderCapability.to_dict() + {manifest_digest
+             [, manifest_canonical_digest]}],
  pinned_libraries: [{provider_id, library_name, path, exists, size_bytes,
                      sha256_expected, sha256_actual, sha256_matches,
                      blis_version_pin, blis_version_actual, arch_pin, arch_actual,
@@ -66,10 +67,21 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
 - **路径隐私**：`provider.library.path` 与 `pinned_libraries[].path` 默认只给 basename
   （sha256/arch 仍在各自字段），`--show-paths` / `show_paths=True` 才输出完整 host 绝对
   路径；`path_policy` 记录本次输出采用哪种口径，并进入 `digest`。
+- **内层 digest 可自证（round-3）**：`providers[].manifest_digest` 定义在**实际输出**的
+  provider 行上（`manifest_digest == sha256(canon(row 去掉 manifest_digest))`），因此默认
+  脱敏输出也可从行内复算；同一行额外携带 `manifest_canonical_digest`（未脱敏完整
+  manifest 的 digest，默认脱敏时才有），`--show-paths` 时两者相等。
 - `fail_closed_checks` 有 **8 个不同 check name**（capability digest 自检、契约 digest
   自检、已登记 opcode 覆盖、provider 与 registered identity 一致、provider artifact
   digest 可复算、pinned library 存在/sha256/arch/符号/ABI、payload/ABI 版本登记、schema
   版本）；provider identity / payload 行按 provider 展开，所以行数 ≥ 8（本机 11 行）。
+- **注册 manifest 不可清空（round-3）**：provider identity 检查除字段子集外，还把
+  registered provider 条目对照本地 canonical manifest 的集合形状校验——规范上非空的
+  `contracts/dtypes/numeric_modes/required_features/preconditions/threads/pack/library`
+  必须保持非空、静态必需键必须存在、规范为空的集合不得新增条目（探针相关可选键不强制，
+  数值不 pin 本机）。doctor 收到这类对象时报 `provider_identity` failed、
+  `fail_closed=true`（默认 rc 0、`--strict` rc 3）；CLI `doctor --snapshot` 的文件导入
+  路径按 §2.4 直接结构化拒绝（rc 1）。
 - 自洽快照里出现**未注册 opcode**（例如 portable 里多出 `add`）或未知 provider identity
   时，doctor 把它作为 `fail_closed=true` 的事实列出（默认 rc 0、`--strict` rc 3），不得抛
   异常；导入本身仍是结构校验（未注册 opcode 结构合法即可导入）。
@@ -107,7 +119,7 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
 ```text
 {schema_version, kind: "plan", requested_op,
  plan: {plan payload + plan_digest}, plan_digest,
- capability_snapshot: {schema + digest}, capability_digest,
+ capability_snapshot: {schema + digest [, canonical_digest]}, capability_digest,
  request, resolved_policy, path_policy, digest}
 ```
 
@@ -115,9 +127,15 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
 - 同 `(policy, capability snapshot, request)` ⇒ 同 `plan_digest`；导入/导出的 snapshot
   round-trip 后 plan digest 不变；冻结 plan + 同一 snapshot 可被
   `execute_matmul_plan` / `execute_qmatmul_plan` 接受。
-- wrapper 顶层携带 canonical `digest`（覆盖 wrapper 去掉自身后的全部字段，含
-  `capability_snapshot` 与 `path_policy`）；`explain --plan <wrapper>` 会复算该 digest，
-  不符即 `ARTIFACT_MISMATCH/plan_wrapper_digest_mismatch`。
+- wrapper 顶层 `digest` 是**必需**字段（覆盖 wrapper 去掉自身后的全部字段，含
+  `capability_snapshot` 与 `path_policy`）；`explain --plan <wrapper>` 缺失或复算不符即
+  `ARTIFACT_MISMATCH/plan_wrapper_digest_mismatch`，嵌套 `plan_digest` 仍按 plan schema
+  校验。
+- **内层 snapshot 可自证（round-3）**：默认脱敏时 `capability_snapshot.digest` 重定义为
+  实际输出（basename）视图的 canonical digest，行内保留 `canonical_digest` 指向未脱敏
+  完整快照（等于 wrapper 顶层 `capability_digest`）；`--show-paths` 时不带
+  `canonical_digest`，内嵌文档即规范导出，`digest == capability_digest`。两种输出均可从
+  文档自身复算 `digest`。
 - `capability_snapshot.providers[].library.path` 默认只给 basename；`--show-paths` 显示
   完整路径（两种输出各自自洽，`plan_digest` 不变）。
 
@@ -140,6 +158,14 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
   拦截。
 - `CapabilitySnapshot.from_dict` 的宽松行为（缺 digest 默认接受）保留为 U1 登记边界，
   仅严格导入路径受上述要求约束。
+- **注册 manifest 集合不可清空（round-3）**：对 `provider_id` 在本地注册表中的条目，
+  严格导入还要求文档保留 canonical manifest 的集合形状：规范非空的
+  `contracts/dtypes/numeric_modes/required_features/preconditions/threads/pack/library`
+  必须非空、对应静态必需键必须存在、规范为空的集合不得新增条目；探针相关可选键与
+  本机数值不 pin。清空任一集合的 10 个复现（portable/aocl 的上述字段）全部
+  `ARTIFACT_MISMATCH/capability_structure_mismatch`；CLI 文件路径因此 rc 1 结构化拒绝。
+  若这类 snapshot 以对象形式（宽松 `from_dict` 边界）进入 doctor，doctor 的
+  `provider_identity` 将其报为 failed、`fail_closed=true`（默认 rc 0、`--strict` rc 3）。
 - 自洽但引用**未注册 opcode**的 snapshot 结构上仍可导入；doctor 将其报告为
   `fail_closed=true` 的事实（见 §2.1），resolver 只会按请求的已登记 opcode 工作。
 
@@ -164,7 +190,11 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
 - argparse 用法错误保持 conventional 退出码 **2**（与 strict-fail-closed 的 3 不同，
   无需读输出即可区分）；请求级错误（非法 snapshot、读文件失败、结构化解析失败等）在
   default/`--strict` 两种模式下都退出码 **1**，`--json` 时 stdout 必为可解析的
-  `ExecutionError` 文档、stderr 无 traceback。三个码均在 CLI `--help` 与本节写明。
+  `ExecutionError` 文档、stderr 无 traceback。
+- `doctor --help` 的 epilog 明确写出四个码：`0 report` / `1 request-level error` /
+  `2 argparse usage error` / `3 fail_closed=true with --strict`；`--strict` 帮助行也写明
+  "request-level errors exit status 1; usage errors exit 2"。round-3 修复补齐了此前
+  漏写的请求级 1。
 
 ### 3.6 跨主机静态规划（接受为边界）
 
