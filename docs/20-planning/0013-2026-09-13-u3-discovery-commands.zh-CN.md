@@ -22,6 +22,7 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
 `python3 scripts/perf/execution_cli.py <command>`（wrapper 会设置
 `PYPTO_X_PORTABLE_ONLY=1` 并把 `python/` 放进 `sys.path`）。Python API 从
 `pypto.execution` 导出：`doctor` / `explain` / `plan_request` /
+`doctor_document` / `explain_document` / `plan_document`（纯 mapping 便捷入口）/
 `export_capability_snapshot` / `import_capability_snapshot` 及 `DoctorReport` /
 `Explanation` / `PlanDocument`。
 
@@ -69,7 +70,7 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
 ```text
 {schema_version, kind: "explain", input_kind: request|plan|report,
  request, policy_applicability, requested_policy, resolved_policy,
- selected, numeric_guarantee, layout_decision,
+ selected, numeric_guarantee, guarantees（报告形视图）, layout_decision,
  candidates: [Candidate.to_dict()（含 state/reason/scope/checks）],
  rejections: [resolver rejection records],
  tie_break, numeric_class_order, fallback, rules, why,
