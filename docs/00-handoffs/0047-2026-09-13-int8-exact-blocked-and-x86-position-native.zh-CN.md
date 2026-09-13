@@ -56,7 +56,7 @@
 | int8 exact-blocked | `7095f221` | **PASS_WITH_BOUNDARIES**：12/12 声明独立复现；336 例构造差分 + **1307 例 falsification**（M/N=1、tail、`kc·p=2²⁴−1` 的 117×119、8 seeds）零界内偏差；规则 8 collect 2105 / 2098 passed（991.90 s）。边界：残余假设（非形式化）、`prepare_int32` 显式 codes 不重复码域校验、Kc 无解/溢出合法域不可达仅注入。 |
 | AVX2 position-native | `32165fae` | **PASS_WITH_BOUNDARIES**：oracle 逐字节未改 + 自建第二 oracle 184 checks 0 mismatch；覆盖 spy 5 native/0 host；双树 4 向 reader + ABI 对调 + 1-bit 篡改 fail-closed；39 raw buffer 零漂移；变异测试 18/64 红；全量 collect 2169 / 2162 passed / rc=0。边界：契约两处措辞不精确（已订正 0016：iota 抛 `CpuVectorUnsupportedError`；"dtype not in set" 分支不可达）。 |
 | U4 follow-up | `9e0de13f` | **PASS_WITH_BOUNDARIES**：自写扫描器复现 46 行/33 名/0 未登记，父提交恰好 6 名；37 项 digest all_equal；doctor 不变式与 canary 零泄漏；守卫测试在父提交失败；全量 collect 2170 / 2163 passed / rc=0。唯一在范围内问题 = 0014 的 +10 归因（已订正，见 ERR-0014）。 |
-| AVX-512 position-native | `97503c56` | **PASS_WITH_BOUNDARIES**（round-1 @`0b5b5899e`；round-2 复验在跑）：oracle 逐字节未改 + 自写 ctypes oracle 102/102 + `CpuScalarRuntime` 20/20；metadata/覆盖 87/87；payload/metadata 篡改 33 例与描述符篡改全 fail-closed；20 例语料两树 raw sha256 20/20 一致；focused 206 passed、全量 2179 passed（1313.31 s）。**唯一实质发现**：`-mavx512f` 隐式启用 AVX2，compare/where kernel 含 16 条 AVX2 VEX.256 指令而 `required_features`/feature mask 未声明 `avx2` → **已派 round-2 修复**（声明与运行期门补 `avx2`，编译 flag 不变以保数值/性能，0017 措辞订正）。 |
+| AVX-512 position-native | `97503c56` | **PASS_WITH_BOUNDARIES**（round-1 @`0b5b5899e` + round-2 @`923a72e26` 定点复验 PASS）：oracle 逐字节未改 + 自写 ctypes oracle 102/102 + `CpuScalarRuntime` 20/20；metadata/覆盖 87/87；payload/metadata 篡改 33 例与描述符篡改全 fail-closed；20 例语料两树 raw sha256 20/20 一致；focused 206 passed、全量 2179 passed（1313.31 s）。**唯一实质发现**：`-mavx512f` 隐式启用 AVX2，compare/where kernel 含 16 条 AVX2 VEX.256 指令而 `required_features`/feature mask 未声明 `avx2` → **已派 round-2 修复**（声明与运行期门补 `avx2`，编译 flag 不变以保数值/性能，0017 措辞订正）。 |
 
 ## 7. 证据路径
 
@@ -71,7 +71,7 @@
 ## 8. 登记的边界与口径
 
 - **int8**：exactness 是**条件命题**（"pinned 闭源内核该路径只做 int32/f32"），不是形式化证明；撤回路径写在 envelope；fused/反量化误差不在范围；−128 与 K>133144 仍拒绝；`prepare_int32` 显式 codes 入参不重复码域校验（内部 API）。
-- **x86 位置控制**：AVX2 的 f32 快路径要求连续输入；AVX-512 只依赖 F（DQ/BW/VL 未用）；两者 rank>16 与部分 scalar 输出走 host；float16/float64 三种算子在 lowering 阶段即拒绝（基线同）。
+- **x86 位置控制**：AVX2 的 f32 快路径要求连续输入；AVX-512 的**先决条件是 AVX-512F + AVX2**（`-mavx512f` 隐式启用 AVX2，compare/where 归约尾部 16 条 VEX.256，round-2 起声明与运行期门均已覆盖；DQ/BW/VL/FMA/gather 专属指令为 0）；两者 rank>16 与部分 scalar 输出走 host；float16/float64 三种算子在 lowering 阶段即拒绝（基线同）；round-2 新登记：bit7=AVX2 是 AVX-512 mask 空间内的新分配（仓内无跨目标位表，等值校验仍 fail-closed）、`Avx512Capability.injected_capability()` 默认参数未含 avx2（仓内无调用者，留待清理）。
 - **U4**：6 名仍 `os.environ` 直读（仅登记）；`consumer_kind` 出现自由文本 `evidence_path`（待加枚举）；AOCL 正向语义仅 zen4。
 - **性能**：本批全部数字 **UNGATED**（12 vCPU KVM 无 cpufreq；AVX-512 未跑真实权重整网）。
 - **勘误**：ERR-0014（0014 的 +10 collect 归因被独立验收逐提交分解证伪并订正）。
