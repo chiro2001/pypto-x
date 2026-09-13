@@ -1,0 +1,1261 @@
+From 835f453ffeaf5fd6e2d23c1fc854ffd9f2436943 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sun, 13 Sep 2026 13:30:49 +0800
+Subject: [PATCH 265/269] fix(execution): close U3 round-2 findings from
+ verify-0046-u3
+
+Independent verification (verify-0046-u3 @ 7378aa943) refuted seven claims
+in the U3 discovery slice.  This commit keeps discovery behavior for real
+snapshots while closing each counterexample:
+
+* strict snapshot import is now type-strict recursively: bool/int and
+  int/float conflations, unknown/missing nested keys, duplicate provider_id
+  values and known-opcode contract digests are refused before canonical
+  equality; JSON documents are parsed with an object_pairs_hook that rejects
+  duplicate keys at any depth and parse_constant rejects NaN/Infinity;
+* doctor reports self-consistent but unregistered contract opcodes / provider
+  identities as failed fail-closed facts (default rc 0) instead of raising;
+* the CLI converts every parse/serialization failure into a structured
+  ExecutionError document (rc 1, no traceback); a catch-all keeps internal
+  failures structured too;
+* the capability-snapshot digest preimage uses the exported schema_version
+  key, so sha256(canon(export minus digest)) == digest is directly
+  verifiable; the plan wrapper gains its own canonical top-level digest and
+  explain --plan verifies it;
+* doctor --strict fail-closed exit code is 3 (argparse usage errors stay 2),
+  documented in --help and 0013 section 3.5 with a test asserting the codes
+  differ;
+* doctor/plan redact host-absolute library paths to the basename by default
+  (sha256/arch stay); --show-paths / show_paths=True is the explicit opt-in
+  and path_policy participates in the digest;
+* the fail-closed check wording is now "8 distinct check names" (11 rows on
+  this host), matching the implementation.
+
+Two registered boundaries are pinned by tests and documented in 0013:
+same-triple weaker snapshots (fewer features/providers) are accepted by the
+kind+triple alignment rule, and report resolution.why is an un-anchored
+explanation-layer copy that explain echoes without endorsing (a boundaries
+entry now states this explicitly).
+
+Focused evidence: 55 discovery tests, 391 execution-related tests, collect
+2020 (base 1994, +26).  The adapted independent repros pass: strict nested
+matrix (14+ cases refused), doctor unknown contract (rc 0 / strict rc 3),
+CLI unstructured errors (4/4 structured), digest preimage recompute, and
+the 80-case tamper ledger with 0 violations.
+---
+ python/pypto/execution/capability.py                |   9 +-
+ python/pypto/execution/cli.py                       |  71 +++++-
+ python/pypto/execution/discovery.py                 | 513 ++++++++++++++++++++++++++++++++++++++--
+ python/tests/ut/pypto_x/test_execution_discovery.py | 335 +++++++++++++++++++++++++-
+ 4 files changed, 898 insertions(+), 30 deletions(-)
+
+diff --git a/python/pypto/execution/capability.py b/python/pypto/execution/capability.py
+index f18d39348..f5b96369b 100644
+--- a/python/pypto/execution/capability.py
++++ b/python/pypto/execution/capability.py
+@@ -227,7 +227,10 @@ class CapabilitySnapshot:
+         normalized_features = _normalize_features(features)
+         sorted_providers = tuple(sorted(entries, key=lambda item: item.provider_id))
+         document = {
+-            "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
++            # The digest preimage deliberately uses the same ``schema_version``
++            # key as the exported document, so every exported snapshot can be
++            # verified with sha256(canonical_json(document minus digest)).
++            "schema_version": CAPABILITY_SCHEMA_VERSION,
+             "kind": normalized_kind,
+             "triple": triple.strip().lower(),
+             "features": list(normalized_features),
+@@ -293,8 +296,10 @@ class CapabilitySnapshot:
+         }
+ 
+     def canonical_document(self) -> Mapping[str, Any]:
++        """Digest preimage; equals :meth:`to_dict` without the digest field."""
++
+         return {
+-            "capability_schema_version": self.schema_version,
++            "schema_version": self.schema_version,
+             "kind": self.kind,
+             "triple": self.triple,
+             "features": list(self.features),
+diff --git a/python/pypto/execution/cli.py b/python/pypto/execution/cli.py
+index d562e5d4a..289df6abf 100644
+--- a/python/pypto/execution/cli.py
++++ b/python/pypto/execution/cli.py
+@@ -2,14 +2,14 @@
+ 
+ Supported entry points::
+ 
+-    python -m pypto.execution.cli doctor [--json] [--strict]
++    python -m pypto.execution.cli doctor [--json] [--strict] [--show-paths]
+     python -m pypto.execution.cli explain --op matmul --left 2,3 --right 3,4 \
+         --dtype float32 [--policy policy.json] [--snapshot snapshot.json] [--json]
+     python -m pypto.execution.cli explain --plan plan.json [--json]
+     python -m pypto.execution.cli explain --report report.json [--json]
+     python -m pypto.execution.cli plan --op matmul --left 2,3 --right 3,4 \
+         --dtype float32 [--policy policy.json] [--snapshot snapshot.json] \
+-        [--out plan.json] [--json]
++        [--out plan.json] [--json] [--show-paths]
+ 
+ ``scripts/perf/execution_cli.py`` is the wrapper that sets
+ ``PYPTO_X_PORTABLE_ONLY=1`` and puts ``python/`` on ``sys.path`` before the
+@@ -18,11 +18,18 @@ package import, mirroring the op-bench launcher.
+ All three commands are read-only with respect to execution state: ``doctor``
+ probes only pinned artifacts, ``explain`` and ``plan`` never execute a
+ provider.  Structured failures exit with status 1 and print the
+-``ExecutionError.to_dict()`` payload under ``--json``.
++``ExecutionError.to_dict()`` payload under ``--json``; malformed JSON
++(including duplicate keys and NaN/Infinity) and unexpected parsing failures
++are converted to the same structured document instead of a traceback.
+ 
+ ``doctor`` always reports the fail-closed conditions and exits 0 by
+ default (a missing optional pinned artifact is a fact, not a usage error).
+-With ``--strict`` it exits 2 when the report carries ``fail_closed=true``.
++With ``--strict`` it exits 3 when the report carries ``fail_closed=true``;
++argparse usage errors keep the conventional exit status 2, so the two
++statuses are distinguishable without reading the output.
++
++Host-absolute library paths are reduced to their basename by default;
++``--show-paths`` opts into full paths.
+ """
+ 
+ from __future__ import annotations
+@@ -78,7 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
+     doctor_cmd.add_argument(
+         "--strict",
+         action="store_true",
+-        help="exit with status 2 when the report has fail_closed=true (default: exit 0, report only)",
++        help="exit with status 3 when the report has fail_closed=true (default: exit 0, report only; usage errors exit 2)",
++    )
++    doctor_cmd.add_argument(
++        "--show-paths",
++        action="store_true",
++        help="publish full host-absolute library paths (default: basename only)",
+     )
+ 
+     explain_cmd = sub.add_parser("explain", parents=[common], help="explain the resolver decision")
+@@ -100,13 +112,39 @@ def build_parser() -> argparse.ArgumentParser:
+     plan_cmd.add_argument("--policy", default=None, help="policy JSON document")
+     plan_cmd.add_argument("--snapshot", default=None, help="capability snapshot JSON document")
+     plan_cmd.add_argument("--out", default=None, help="write the frozen plan document to this path")
++    plan_cmd.add_argument(
++        "--show-paths",
++        action="store_true",
++        help="publish full host-absolute library paths (default: basename only)",
++    )
+     return parser
+ 
+ 
++def _reject_duplicate_keys(pairs: Sequence[Any]) -> dict:
++    """object_pairs_hook that refuses duplicate JSON keys at any depth."""
++
++    document = {}
++    for key, value in pairs:
++        if key in document:
++            raise ValueError("duplicate JSON key {!r}".format(key))
++        document[key] = value
++    return document
++
++
++def _reject_json_constant(value: str) -> Any:
++    """parse_constant hook that refuses NaN / Infinity / -Infinity."""
++
++    raise ValueError("non-finite JSON constant {!r} is not allowed".format(value))
++
++
+ def _load_json(path: str, field: str) -> Any:
+     try:
+         with open(path, "r", encoding="utf-8") as handle:
+-            return json.load(handle)
++            return json.load(
++                handle,
++                object_pairs_hook=_reject_duplicate_keys,
++                parse_constant=_reject_json_constant,
++            )
+     except OSError as exc:
+         raise ArtifactMismatchError(
+             "could not read {} document {!r}: {}".format(field, path, exc),
+@@ -185,10 +223,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
+     as_json = bool(getattr(args, "json", False))
+     try:
+         if command == "doctor":
+-            report = doctor(capability=_load_snapshot(getattr(args, "snapshot", None)))
++            report = doctor(
++                capability=_load_snapshot(getattr(args, "snapshot", None)),
++                show_paths=bool(getattr(args, "show_paths", False)),
++            )
+             _print_document(report.to_dict(), report.summary, as_json)
+             if getattr(args, "strict", False) and report.fail_closed:
+-                return 2
++                return 3
+             return 0
+         if command == "explain":
+             policy = _load_policy(getattr(args, "policy", None))
+@@ -210,6 +251,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
+             _print_document(explanation.to_dict(), explanation.summary, as_json)
+             return 0
+         if command == "plan":
++            show_paths = bool(getattr(args, "show_paths", False))
+             plan_document = plan_request(
+                 op=args.op,
+                 left_shape=args.left,
+@@ -218,7 +260,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
+                 policy=_load_policy(getattr(args, "policy", None)),
+                 capability=_load_snapshot(getattr(args, "snapshot", None)),
+             )
+-            document = plan_document.to_dict()
++            document = plan_document.to_dict(show_paths=show_paths)
+             if args.out:
+                 try:
+                     with open(args.out, "w", encoding="utf-8") as handle:
+@@ -237,6 +279,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
+     except ExecutionError as exc:
+         _print_error(exc, as_json)
+         return 1
++    except Exception as exc:  # defensive: never surface a traceback from the CLI
++        wrapped = ArtifactMismatchError(
++            "{} failed while building its document: {}: {}".format(
++                command, type(exc).__name__, exc
++            ),
++            field="request",
++            reason="discovery_request_unstructured_failure",
++            details={"exception": type(exc).__name__},
++        )
++        _print_error(wrapped, as_json)
++        return 1
+ 
+ 
+ __all__ = ["build_parser", "main"]
+diff --git a/python/pypto/execution/discovery.py b/python/pypto/execution/discovery.py
+index 33f76a6c1..228b616dd 100644
+--- a/python/pypto/execution/discovery.py
++++ b/python/pypto/execution/discovery.py
+@@ -30,6 +30,7 @@ report.
+ 
+ from __future__ import annotations
+ 
++import math
+ import os
+ import platform
+ import sys
+@@ -48,6 +49,7 @@ from .entry import _explain as _entry_explain, capability_for_policy
+ from .errors import (
+     ArtifactMismatchError,
+     CapabilityUnavailableError,
++    ExecutionError,
+     OpContractError,
+     PolicyInvalidValueError,
+     ReportSchemaError,
+@@ -113,7 +115,399 @@ EXPLAIN_BOUNDARIES = (
+         "layer": "execution/probe",
+         "why": "probed when the provider library is loaded; an imported snapshot reports its captured facts",
+     },
++    {
++        "field": "why (report input)",
++        "layer": "report",
++        "why": "the v4 report carries an un-anchored explanation-layer copy; explain echoes it verbatim and does not endorse it",
++    },
++)
++
++
++# ---------------------------------------------------------------------------
++# strict capability-snapshot schema
++#
++# The strict import path must not rely on Python ``==`` for nested mappings
++# (``False == 0``, ``True == 1``, ``1.0 == 1``) and must refuse unknown nested
++# fields instead of echoing them back verbatim.  The tables below declare the
++# exact registered shape; open maps (by-k measurements, symbol tables, fused
++# variant names) keep arbitrary keys only where the provider manifest itself
++# uses them as data.
++# ---------------------------------------------------------------------------
++def _check_json_value(value: Any, path: str, errors: list) -> None:
++    if value is None or isinstance(value, (str, bool)):
++        return
++    if isinstance(value, int):
++        return
++    if isinstance(value, float):
++        if math.isfinite(value):
++            return
++        errors.append((path, "non-finite number is not a JSON value"))
++        return
++    if isinstance(value, list):
++        for index, item in enumerate(value):
++            _check_json_value(item, "{}[{}]".format(path, index), errors)
++        return
++    if isinstance(value, Mapping):
++        for key, item in value.items():
++            if not isinstance(key, str):
++                errors.append((path, "mapping keys must be strings, got {!r}".format(key)))
++                continue
++            _check_json_value(item, "{}.{}".format(path, key), errors)
++        return
++    errors.append((path, "not a JSON value: {}".format(type(value).__name__)))
++
++
++def _check_schema(value: Any, schema: Any, path: str, errors: list) -> None:
++    if schema == "str":
++        if not isinstance(value, str):
++            errors.append((path, "expected string, got {}".format(type(value).__name__)))
++        return
++    if schema == "int":
++        if isinstance(value, bool) or not isinstance(value, int):
++            errors.append((path, "expected integer, got {}".format(type(value).__name__)))
++        return
++    if schema == "bool":
++        if not isinstance(value, bool):
++            errors.append((path, "expected boolean, got {}".format(type(value).__name__)))
++        return
++    if schema == "int_or_str":
++        if isinstance(value, bool) or not isinstance(value, (int, str)):
++            errors.append((path, "expected int or string, got {}".format(type(value).__name__)))
++        return
++    if schema == "contract_digest":
++        if not isinstance(value, str) or len(value) != 71 or not value.startswith("sha256:"):
++            errors.append((path, "expected sha256:<64 lowercase hex>, got {!r}".format(value)))
++            return
++        if any(character not in "0123456789abcdef" for character in value[7:]):
++            errors.append((path, "expected sha256:<64 lowercase hex>, got {!r}".format(value)))
++        return
++    if schema == "json":
++        _check_json_value(value, path, errors)
++        return
++    if not isinstance(schema, tuple):
++        raise ValueError("unknown snapshot schema {!r}".format(schema))
++    tag = schema[0]
++    if tag == "opt":
++        if value is not None:
++            _check_schema(value, schema[1], path, errors)
++        return
++    if tag == "list":
++        if not isinstance(value, list):
++            errors.append((path, "expected list, got {}".format(type(value).__name__)))
++            return
++        for index, item in enumerate(value):
++            _check_schema(item, schema[1], "{}[{}]".format(path, index), errors)
++        return
++    if tag == "tuple":
++        item_schemas = schema[1]
++        if not isinstance(value, list) or len(value) != len(item_schemas):
++            errors.append((path, "expected fixed list of {} items".format(len(item_schemas))))
++            return
++        for index, item_schema in enumerate(item_schemas):
++            _check_schema(value[index], item_schema, "{}[{}]".format(path, index), errors)
++        return
++    if tag == "openmap":
++        if not isinstance(value, Mapping):
++            errors.append((path, "expected mapping, got {}".format(type(value).__name__)))
++            return
++        for key, item in value.items():
++            if not isinstance(key, str):
++                errors.append((path, "mapping keys must be strings, got {!r}".format(key)))
++                continue
++            _check_schema(item, schema[1], "{}.{}".format(path, key), errors)
++        return
++    if tag in ("obj", "obj_if_nonempty"):
++        if not isinstance(value, Mapping):
++            errors.append((path, "expected mapping, got {}".format(type(value).__name__)))
++            return
++        if tag == "obj_if_nonempty" and not value:
++            return
++        required, optional = schema[1], schema[2]
++        if not isinstance(optional, Mapping):
++            optional = {}
++        allowed = set(required) | set(optional)
++        for key in value:
++            if key not in allowed:
++                errors.append(("{}.{}".format(path, key), "unknown nested field"))
++        for key in required:
++            if key not in value:
++                errors.append(("{}.{}".format(path, key), "missing required field"))
++        for key, item in value.items():
++            item_schema = required.get(key, optional.get(key))
++            if item_schema is not None:
++                _check_schema(item, item_schema, "{}.{}".format(path, key), errors)
++        return
++    raise ValueError("unknown snapshot schema tag {!r}".format(tag))
++
++
++_PACK_REQUIRED = {"strategy": "str", "included_in_timing": "bool"}
++_PACK_OPTIONAL = {
++    "api": "str",
++    "note": "str",
++    "b_layout": "str",
++    "b_strides": "str",
++    "per_forward_repack_bytes": "int",
++}
++_THREADS_REQUIRED = {"model": "str", "max_threads": "int"}
++_THREADS_OPTIONAL = {
++    "api": "str",
++    "default_threads": "int",
++    "knob": "str",
++    "requires_env_before_load": "bool",
++    "env_knobs": ("list", "str"),
++}
++_PRECONDITION_REQUIRED = {
++    "min_dimension": "int",
++    "slice_step_domain": "str",
++    "layout_descriptor_version": "int",
++}
++_PRECONDITION_OPTIONAL = {
++    "row_major_contiguous": "bool",
++    "b_operand": "str",
++    "max_k": "int",
++    "max_rank": "int",
++    "packed_layout": "str",
++    "packed_layout_version": "int",
++    "reserved_code": "int",
++    "code_range": ("list", "int"),
++}
++_LIBRARY_REQUIRED = {
++    "name": "str",
++    "path": "str",
++    "sha256_expected": "str",
++    "sha256": ("opt", "str"),
++    "size_bytes": ("opt", "int"),
++    "blis_tag": "str",
++    "blis_commit": "str",
++    "arch_id_expected": "int",
++    "arch_string_expected": "str",
++    "int_type_size_expected": "int",
++    "blas_int_type_size_expected": "int",
++    "build_options": ("list", "str"),
++}
++_LIBRARY_OPTIONAL = {
++    "arch_id": ("opt", "int"),
++    "arch_string": ("opt", "str"),
++    "blis_version": ("opt", "str"),
++    "default_threads": ("opt", "int"),
++    "int_type_size": ("opt", "int"),
++    "blas_int_type_size": ("opt", "int"),
++    "thread_knob": ("opt", "str"),
++    "env_thread_knobs": ("list", "str"),
++    "symbols": ("openmap", ("list", "str")),
++    "int8_api": (
++        "obj",
++        {
++            "axis_contract": "str",
++            "fused": "str",
++            "gemm": "str",
++            "kc_block": "int",
++            "reorder": "str",
++        },
++        set(),
++    ),
++}
++_MEASUREMENT_EXTERNAL = (
++    "obj",
++    {},
++    {
++        "artifact": "str",
++        "generator": "str",
++        "observed_max_by_k": ("openmap", "int"),
++        "source": "str",
++        "witnesses": ("openmap", ("obj", {"delta": "int", "seed": "int"}, set())),
++        "declared_vs_observed": "json",
++        "crosscheck_artifact": "str",
++        "recorded_vs_observed": "json",
++    },
+ )
++_MEASUREMENT_INTERNAL = (
++    "obj",
++    {
++        "distributions": ("list", "str"),
++        "m": "int",
++        "metric": "str",
++        "n": "int",
++        "note": "str",
++        "seeds": ("list", "int"),
++        "thread_counts": ("list", "int"),
++        "thread_mode": "str",
++    },
++    set(),
++)
++_MEASUREMENT_SCOPE = (
++    "obj",
++    {
++        "external": ("list", _MEASUREMENT_EXTERNAL),
++        "internal": _MEASUREMENT_INTERNAL,
++        "observations_are_not_a_bound": "bool",
++    },
++    set(),
++)
++_UPPER_BOUND = (
++    "obj",
++    {
++        "blocking_evidence": ("list", "str"),
++        "generic_bound_rejected": "bool",
++        "reason": "str",
++        "status": "str",
++    },
++    set(),
++)
++_EXACTNESS_ENVELOPE = (
++    "obj",
++    {
++        "accumulation_width_bits": "int",
++        "bitwise_max_k": "int",
++        "class": "str",
++        "code_range": ("list", "int"),
++        "deviation_bound_available": "bool",
++        "deviation_bound_kind": "str",
++        "deviation_metric": "str",
++        "evidence": "str",
++        "fused_epilogue_order_id": "str",
++        "k_accumulation_limit": "int",
++        "k_exactness_boundary": "int",
++        "kc_block": "int",
++        "measured_deviation_by_k": ("openmap", "int"),
++        "measurement_scope": _MEASUREMENT_SCOPE,
++        "not_covered": ("list", "str"),
++        "q8_reference_observed_by_k": ("openmap", "int"),
++        "reduction_order_id": "str",
++        "reserved_code": "int",
++        "reserved_code_behavior": "str",
++        "upper_bound": _UPPER_BOUND,
++        "wrap_behavior": "str",
++    },
++    set(),
++)
++_FUSED_VARIANT = (
++    "obj",
++    {
++        "api": "str",
++        "b_layout": "str",
++        "contract_equivalence": "str",
++        "epilogue_order_id": "str",
++        "exactness_basis": "str",
++        "implementation": "str",
++        "k_multiple_of": "int",
++        "min_n": "int",
++        "min_n_note": "str",
++        "numeric_class": "str",
++        "reorder_api": "str",
++        "reorder_buf_size_api": "str",
++        "routable_reason": "str",
++        "routable_via_opcode": "bool",
++        "scale_dtype": "str",
++        "scale_granularity": ("obj", {"a": "str", "b": "str"}, set()),
++        "scale_lengths": ("obj", {"a": ("list", "int_or_str"), "b": ("list", "int_or_str")}, set()),
++    },
++    set(),
++)
++_PROVIDER_REQUIRED = {
++    "provider_id": "str",
++    "version": "str",
++    "available": "bool",
++    "target_kinds": ("list", "str"),
++    "numeric_modes": ("list", "str"),
++    "deterministic": "bool",
++    "required_features": ("list", "str"),
++    "contracts": ("openmap", "contract_digest"),
++    "max_threads": "int",
++    "workspace_bytes": "int",
++    "reason": ("opt", "str"),
++    "implementation": "str",
++    "numeric_class": ("opt", "str"),
++    "dtypes": ("list", "str"),
++    "stride_class": "str",
++    "rank_range": ("tuple", ["int", "int"]),
++    "reduction_order_id": "str",
++    "artifact_kind": "str",
++    "pack": ("obj_if_nonempty", _PACK_REQUIRED, _PACK_OPTIONAL),
++    "provider_artifact_digest": ("opt", "str"),
++    "library": ("obj_if_nonempty", _LIBRARY_REQUIRED, _LIBRARY_OPTIONAL),
++    "threads": ("obj_if_nonempty", _THREADS_REQUIRED, _THREADS_OPTIONAL),
++    "preconditions": ("obj_if_nonempty", _PRECONDITION_REQUIRED, _PRECONDITION_OPTIONAL),
++}
++_PROVIDER_OPTIONAL = {
++    "accumulation": "str",
++    "exactness_basis": "str",
++    "exactness_envelope": _EXACTNESS_ENVELOPE,
++    "fused_variants": ("openmap", _FUSED_VARIANT),
++}
++_REGISTERED_OPCODE_SET = frozenset(registered_opcodes())
++
++
++def _validate_provider_documents(providers: Any) -> None:
++    errors = []
++    provider_ids = []
++    for index, entry in enumerate(providers):
++        path = "snapshot.providers[{}]".format(index)
++        if not isinstance(entry, Mapping):
++            errors.append((path, "expected mapping, got {}".format(type(entry).__name__)))
++            continue
++        provider_ids.append(entry.get("provider_id"))
++        _check_schema(entry, ("obj", _PROVIDER_REQUIRED, _PROVIDER_OPTIONAL), path, errors)
++        contracts = entry.get("contracts")
++        if isinstance(contracts, Mapping):
++            for opcode, digest in contracts.items():
++                if not isinstance(opcode, str) or not opcode.strip():
++                    errors.append((path + ".contracts", "contract opcode must be a non-empty string"))
++                    continue
++                if opcode not in _REGISTERED_OPCODE_SET:
++                    continue
++                definition = get_op_definition(opcode)
++                if digest != definition.contract_digest:
++                    errors.append(
++                        (
++                            "{}.contracts.{}".format(path, opcode),
++                            "contract digest does not match the registered OpDefinition",
++                        )
++                    )
++    seen = set()
++    for provider_id in provider_ids:
++        if not isinstance(provider_id, str):
++            continue
++        if provider_id in seen:
++            errors.append(("snapshot.providers", "duplicate provider_id {!r}".format(provider_id)))
++        seen.add(provider_id)
++    if errors:
++        details = [{"path": path, "detail": detail} for path, detail in errors[:8]]
++        raise ArtifactMismatchError(
++            "capability snapshot document is not the canonical registered structure",
++            field="snapshot",
++            reason="capability_structure_mismatch",
++            details={"violations": details, "violation_count": len(errors)},
++        )
++
++
++def _strict_json_difference(left: Any, right: Any, path: str = "snapshot") -> Optional[Tuple[str, str]]:
++    """Return the first type-strict difference between two JSON values."""
++
++    if type(left) is not type(right):
++        return (path, "type {} != {}".format(type(left).__name__, type(right).__name__))
++    if isinstance(left, Mapping):
++        if set(left) != set(right):
++            missing = sorted(set(right) - set(left))
++            extra = sorted(set(left) - set(right))
++            return (path, "key mismatch missing={} extra={}".format(missing, extra))
++        for key in sorted(left):
++            difference = _strict_json_difference(left[key], right[key], "{}.{}".format(path, key))
++            if difference is not None:
++                return difference
++        return None
++    if isinstance(left, list):
++        if len(left) != len(right):
++            return (path, "list length {} != {}".format(len(left), len(right)))
++        for index, (left_item, right_item) in enumerate(zip(left, right)):
++            difference = _strict_json_difference(left_item, right_item, "{}[{}]".format(path, index))
++            if difference is not None:
++                return difference
++        return None
++    if left != right:
++        return (path, "value {} != {}".format(left, right))
++    return None
++
+ 
+ #: Policy-related environment variables.  Only these names are read by the
+ #: doctor command; raw values are never echoed (only a typed interpretation).
+@@ -298,15 +692,30 @@ def import_capability_snapshot(document: Mapping[str, Any]) -> CapabilitySnapsho
+             requested=providers,
+             reason="capability_structure_mismatch",
+         )
+-    snapshot = CapabilitySnapshot.from_dict(document)
+-    snapshot.verify_digest()
++    _validate_provider_documents(providers)
++    try:
++        snapshot = CapabilitySnapshot.from_dict(document)
++        snapshot.verify_digest()
++    except ExecutionError:
++        raise
++    except Exception as exc:
++        raise ArtifactMismatchError(
++            "capability snapshot document is not structurally valid: {}: {}".format(
++                type(exc).__name__, exc
++            ),
++            field="snapshot",
++            reason="capability_structure_mismatch",
++            details={"exception": type(exc).__name__},
++        ) from exc
+     canonical = snapshot.to_dict()
+-    if dict(document) != dict(canonical):
++    difference = _strict_json_difference(document, canonical)
++    if difference is not None:
++        path, detail = difference
+         raise ArtifactMismatchError(
+             "capability snapshot document is not the canonical exported structure",
+             field="snapshot",
+             reason="capability_structure_mismatch",
+-            details={"expected_keys": sorted(canonical), "requested_keys": sorted(document)},
++            details={"path": path, "detail": detail},
+         )
+     return snapshot
+ 
+@@ -368,6 +777,34 @@ def _resolve_request(
+     return resolve_qmatmul(policy, capability, left_shape, right_shape)
+ 
+ 
++def _redacted_path(value: Any) -> Any:
++    if not isinstance(value, str) or not value:
++        return value
++    base = os.path.basename(value.rstrip("/"))
++    return base or value
++
++
++def _apply_path_policy(document: Mapping[str, Any], show_paths: bool) -> None:
++    """Redact host-absolute library paths unless ``show_paths`` is set.
++
++    The default discovery output keeps only the basename; sha256 and arch
++    facts stay in their own fields, so the pin is still auditable without
++    publishing the host's directory layout or user name.
++    """
++
++    if show_paths:
++        return
++    for row in document.get("providers", ()):
++        if not isinstance(row, Mapping):
++            continue
++        library = row.get("library")
++        if isinstance(library, dict) and "path" in library:
++            library["path"] = _redacted_path(library.get("path"))
++    for row in document.get("pinned_libraries", ()):
++        if isinstance(row, dict) and "path" in row:
++            row["path"] = _redacted_path(row.get("path"))
++
++
+ @dataclass(frozen=True)
+ class PlanDocument:
+     """Frozen plan plus the capability snapshot it was resolved against."""
+@@ -384,7 +821,7 @@ class PlanDocument:
+     def capability_digest(self) -> str:
+         return self.capability.digest
+ 
+-    def to_dict(self) -> Mapping[str, Any]:
++    def to_dict(self, show_paths: bool = False) -> Mapping[str, Any]:
+         if self.plan.capability_digest != self.capability.digest:
+             raise ArtifactMismatchError(
+                 "plan capability digest does not match the returned snapshot",
+@@ -393,20 +830,27 @@ class PlanDocument:
+                 available=self.capability.digest,
+                 reason="plan_capability_digest_mismatch",
+             )
+-        return {
++        capability_document = self.capability.to_dict()
++        _apply_path_policy(capability_document, show_paths)
++        document = {
+             "schema_version": DISCOVERY_SCHEMA_VERSION,
+             "kind": "plan",
+             "requested_op": self.requested_op,
+             "plan": self.plan.to_dict(),
+             "plan_digest": self.plan.digest,
+-            "capability_snapshot": self.capability.to_dict(),
++            "capability_snapshot": capability_document,
+             "capability_digest": self.capability.digest,
+             "request": self.plan.request,
+             "resolved_policy": mapping_copy(self.plan.payload["policy"]["resolved"]),
++            "path_policy": "full" if show_paths else "basename",
+         }
++        # Every discovery output carries a canonical digest over its own
++        # content (excluding the digest field).
++        document["digest"] = _digest(document)
++        return document
+ 
+-    def to_json(self) -> str:
+-        return canonical_json(self.to_dict())
++    def to_json(self, show_paths: bool = False) -> str:
++        return canonical_json(self.to_dict(show_paths=show_paths))
+ 
+ 
+ def plan_request(
+@@ -483,6 +927,17 @@ def _plan_from_document(value: Any) -> ExecutionPlan:
+                 available=plan.digest,
+                 reason="plan_digest_mismatch",
+             )
++        wrapper_digest = value.get("digest")
++        if wrapper_digest is not None:
++            expected = _digest({key: item for key, item in value.items() if key != "digest"})
++            if wrapper_digest != expected:
++                raise ArtifactMismatchError(
++                    "plan wrapper digest does not match the wrapper document",
++                    field="plan.digest",
++                    requested=wrapper_digest,
++                    available=expected,
++                    reason="plan_wrapper_digest_mismatch",
++                )
+     elif isinstance(value, Mapping):
+         plan = ExecutionPlan.from_dict(value)
+     else:
+@@ -945,7 +1400,22 @@ def _payload_abi_checks(snapshot: CapabilitySnapshot) -> Mapping[str, Any]:
+     facts = []
+     for entry in snapshot.providers:
+         for opcode in sorted(str(item) for item in entry.contracts):
+-            identity = registered_identity(entry.provider_id, opcode) or {}
++            try:
++                identity = registered_identity(entry.provider_id, opcode) or {}
++            except Exception as exc:
++                # A self-consistent snapshot may declare an opcode that is not
++                # registered locally (for example a snapshot from a newer
++                # provider release).  That is a fail-closed fact, not a crash.
++                identity = {}
++                errors.append(
++                    {
++                        "provider": entry.provider_id,
++                        "opcode": opcode,
++                        "field": "identity",
++                        "reason": "provider_identity_unregistered",
++                        "details": _error_details(exc),
++                    }
++                )
+             fact = {
+                 "provider": entry.provider_id,
+                 "opcode": opcode,
+@@ -987,13 +1457,19 @@ def _payload_abi_checks(snapshot: CapabilitySnapshot) -> Mapping[str, Any]:
+     )
+ 
+ 
+-def doctor(capability: Any = None) -> DoctorReport:
++def doctor(capability: Any = None, *, show_paths: bool = False) -> DoctorReport:
+     """Report host/provider/contract facts and fail-closed conditions.
+ 
+     Read-only: probes only the pinned artifacts embedded in the capability
+     snapshot (the real local probe by default) and never echoes raw
+     environment values.  Missing optional vendor artifacts are reported as
+-    fail-closed conditions, not guessed.
++    fail-closed conditions, not guessed.  Unregistered contract opcodes and
++    unknown provider identities are reported as failed checks (default exit 0,
++    ``--strict`` exit 3), never raised as unstructured exceptions.
++
++    Host-absolute library paths are reduced to their basename by default;
++    ``show_paths=True`` is an explicit opt-in that publishes full paths (and
++    the digest changes accordingly).
+     """
+ 
+     imported = capability is not None
+@@ -1097,8 +1573,10 @@ def doctor(capability: Any = None) -> DoctorReport:
+         "fail_closed": bool(fail_closed),
+         "read_only": True,
+         "probe_scope": "pinned artifacts only",
++        "path_policy": "full" if show_paths else "basename",
+         "digest": "",
+     }
++    _apply_path_policy(document, show_paths)
+     document["digest"] = _digest({key: value for key, value in document.items() if key != "digest"})
+     summary_lines = [
+         "doctor source={source} fail_closed={fail}".format(
+@@ -1141,10 +1619,10 @@ def doctor(capability: Any = None) -> DoctorReport:
+     )
+ 
+ 
+-def doctor_document(capability: Any = None) -> Mapping[str, Any]:
++def doctor_document(capability: Any = None, *, show_paths: bool = False) -> Mapping[str, Any]:
+     """Convenience wrapper returning the doctor document as a plain mapping."""
+ 
+-    return doctor(capability).to_dict()
++    return doctor(capability, show_paths=show_paths).to_dict()
+ 
+ 
+ def explain_document(**kwargs: Any) -> Mapping[str, Any]:
+@@ -1159,11 +1637,14 @@ def plan_document(
+     right_shape: Any,
+     dtype: Any = None,
+     policy: Optional[ExecutionPolicy] = None,
+-    capability: Any = None
++    capability: Any = None,
++    show_paths: bool = False,
+ ) -> Mapping[str, Any]:
+     """Convenience wrapper returning the plan wrapper document as a mapping."""
+ 
+-    return plan_request(op, left_shape, right_shape, dtype, policy, capability).to_dict()
++    return plan_request(op, left_shape, right_shape, dtype, policy, capability).to_dict(
++        show_paths=show_paths
++    )
+ 
+ 
+ __all__ = [
+diff --git a/python/tests/ut/pypto_x/test_execution_discovery.py b/python/tests/ut/pypto_x/test_execution_discovery.py
+index dd0ca8a0c..e52d80e27 100644
+--- a/python/tests/ut/pypto_x/test_execution_discovery.py
++++ b/python/tests/ut/pypto_x/test_execution_discovery.py
+@@ -238,6 +238,12 @@ def test_doctor_document_is_deterministic_versioned_and_read_only():
+         assert item["manifest_digest"].startswith("sha256:")
+     assert isinstance(document["fail_closed"], bool)
+     assert all(item["status"] in ("ok", "failed") for item in document["fail_closed_checks"])
++    check_names = [item["check"] for item in document["fail_closed_checks"]]
++    # Eight distinct check names; identity/payload checks expand per provider.
++    assert len(check_names) >= 8
++    assert len(set(check_names)) == 8
++    # Host-absolute paths are reduced to a basename by default.
++    assert document["path_policy"] == "basename"
+     # The digest is over the canonical document without the digest field.
+     without_digest = dict(document)
+     without_digest.pop("digest")
+@@ -255,6 +261,7 @@ def test_doctor_reports_pinned_library_and_environment_status():
+         assert item["blis_version_pin"] == "5.3.2"
+         assert item["arch_pin"] == AOCL_ARCH_STRING
+         assert item["path"]
++        assert "/" not in item["path"], "doctor must redact host paths by default"
+     environment = document["environment"]
+     assert environment["raw_values_included"] is False
+     names = [item["name"] for item in environment["variables"]]
+@@ -315,6 +322,49 @@ def test_doctor_imported_snapshot_must_match_the_local_host():
+     assert details["reason"] == "capability_does_not_match_host_probe"
+ 
+ 
++def test_doctor_reports_unregistered_contract_as_fail_closed_fact():
++    host = _host_snapshot()
++    portable = portable_provider_capability()
++    forged_contracts = dict(portable.contracts)
++    forged_contracts["add"] = "sha256:" + "a" * 64
++    injected = _replace_provider(host, PORTABLE_PROVIDER_ID, contracts=forged_contracts)
++    identity = injected.provider(PORTABLE_PROVIDER_ID)
++    assert identity.contracts["add"] == "sha256:" + "a" * 64
++    report = doctor(capability=injected)
++    document = report.to_dict()
++    assert document["fail_closed"] is True
++    failed = [item["check"] for item in document["fail_closed_checks"] if item["status"] != "ok"]
++    assert "provider_identity" in failed
++    assert "payload_abi_versions" in failed
++
++
++def test_doctor_and_plan_paths_are_redacted_by_default():
++    redacted = doctor().to_dict()
++    for row in redacted["providers"]:
++        assert "/" not in row["library"].get("path", "")
++    for row in redacted["pinned_libraries"]:
++        assert "/" not in row["path"]
++
++    full = doctor(show_paths=True).to_dict()
++    assert full["path_policy"] == "full"
++    assert any("/" in row["path"] for row in full["pinned_libraries"])
++    assert redacted["digest"] != full["digest"], "path policy must be covered by the digest"
++
++    frozen = plan_request("matmul", (2, 3), (3, 4), "float32")
++    default_plan = frozen.to_dict()
++    shown_plan = frozen.to_dict(show_paths=True)
++    assert default_plan["path_policy"] == "basename"
++    assert shown_plan["path_policy"] == "full"
++    for row in default_plan["capability_snapshot"]["providers"]:
++        assert "/" not in row["library"].get("path", "")
++    assert any(
++        "/" in row["library"].get("path", "")
++        for row in shown_plan["capability_snapshot"]["providers"]
++    )
++    assert default_plan["digest"] != shown_plan["digest"]
++    assert default_plan["plan_digest"] == shown_plan["plan_digest"]
++
++
+ # ---------------------------------------------------------------------------
+ # explain
+ # ---------------------------------------------------------------------------
+@@ -390,6 +440,23 @@ def test_explain_rejects_tampered_plan_and_report():
+     _assert_failure(REPORT_SCHEMA_INVALID, lambda: explain(report=report_document))
+ 
+ 
++def test_explain_echoes_report_why_without_endorsing_it():
++    # v4 registered boundary: resolution.why is an un-anchored
++    # explanation-layer copy.  explain echoes it verbatim and lists the
++    # boundary explicitly; it must not be treated as an execution fact.
++    document = dict(_validated_report_document())
++    document["resolution"] = dict(document["resolution"])
++    rewritten = "rewritten explanation-layer text that v4 does not anchor"
++    document["resolution"]["why"] = rewritten
++    validate_report_schema(document)
++    explanation = explain(report=document).to_dict()
++    assert explanation["why"] == rewritten
++    assert any(
++        item["field"] == "why (report input)" and "does not endorse" in item["why"]
++        for item in explanation["boundaries"]
++    )
++
++
+ def _validated_report_document():
+     left = HostTensor("float32", (2, 3), [1, 2, 3, 4, 5, 6])
+     right = HostTensor("float32", (3, 4), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+@@ -414,6 +481,15 @@ def test_plan_is_replayable_deterministic_and_never_executes(monkeypatch):
+     assert first.to_dict()["kind"] == "plan"
+     assert first.to_dict()["capability_digest"] == snapshot.digest
+     assert first.to_dict()["plan_digest"] == first.plan.digest
++    wrapper = first.to_dict()
++    without_digest = dict(wrapper)
++    without_digest.pop("digest")
++    assert wrapper["digest"] == "sha256:" + sha256_text(without_digest)
++    explained = explain(plan=wrapper)
++    assert explained.to_dict()["plan_digest"] == first.plan_digest
++    tampered_wrapper = dict(wrapper)
++    tampered_wrapper["digest"] = "sha256:" + "0" * 64
++    _assert_failure(ARTIFACT_MISMATCH, lambda: explain(plan=tampered_wrapper))
+     assert plan_document("matmul", (2, 3), (3, 4), "float32")["kind"] == "plan"
+     assert explain_document(
+         op="matmul", left_shape=(2, 3), right_shape=(3, 4), dtype="float32"
+@@ -488,6 +564,154 @@ def test_snapshot_import_rejects_non_mapping():
+     _assert_failure(CAPABILITY_UNAVAILABLE, lambda: import_capability_snapshot(["not", "a", "mapping"]))
+ 
+ 
++def _forge_snapshot_digest(document):
++    """Recompute the exported-document digest (new preimage convention)."""
++
++    return "sha256:" + sha256_text({key: value for key, value in document.items() if key != "digest"})
++
++
++def _provider_index(document, provider_id):
++    return [
++        index for index, item in enumerate(document["providers"])
++        if item["provider_id"] == provider_id
++    ][0]
++
++
++def _tampered_snapshot(mutate):
++    document = json.loads(json.dumps(export_capability_snapshot(_host_snapshot())))
++    mutate(document)
++    document["digest"] = _forge_snapshot_digest(document)
++    return document
++
++
++_NON_CANONICAL_NESTED_CASES = (
++    (
++        "preconditions.min_dimension=false",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)][
++            "preconditions"
++        ].__setitem__("min_dimension", False),
++    ),
++    (
++        "preconditions.layout_descriptor_version=true",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)][
++            "preconditions"
++        ].__setitem__("layout_descriptor_version", True),
++    ),
++    (
++        "preconditions.unknown_key",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)][
++            "preconditions"
++        ].__setitem__("rogue_key", 1),
++    ),
++    (
++        "library.size_bytes=float",
++        lambda document: document["providers"][_provider_index(document, AOCL_LPGEMM_BF16_PROVIDER_ID)][
++            "library"
++        ].__setitem__(
++            "size_bytes",
++            float(
++                document["providers"][_provider_index(document, AOCL_LPGEMM_BF16_PROVIDER_ID)][
++                    "library"
++                ]["size_bytes"]
++            ),
++        ),
++    ),
++    (
++        "library=false-container",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)].__setitem__(
++            "library", 5
++        ),
++    ),
++    (
++        "contracts=false-container",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)].__setitem__(
++            "contracts", 5
++        ),
++    ),
++    (
++        "contracts.matmul=sha256:xyz",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)][
++            "contracts"
++        ].__setitem__("matmul", "sha256:xyz"),
++    ),
++    (
++        "provider.reason=5",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)].__setitem__(
++            "reason", 5
++        ),
++    ),
++    (
++        "provider.unknown_key",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)].__setitem__(
++            "rogue_key", 1
++        ),
++    ),
++    (
++        "provider.missing_reason",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)].pop("reason"),
++    ),
++    (
++        "pack.included_in_timing=1",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)][
++            "pack"
++        ].__setitem__("included_in_timing", 1),
++    ),
++    (
++        "threads.max_threads=float",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)][
++            "threads"
++        ].__setitem__(
++            "max_threads",
++            float(
++                document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)]["threads"][
++                    "max_threads"
++                ]
++            ),
++        ),
++    ),
++    (
++        "rank_range=[2.0,4.0]",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)].__setitem__(
++            "rank_range", [2.0, 4.0]
++        ),
++    ),
++)
++
++
++@pytest.mark.parametrize(
++    "mutate",
++    [item[1] for item in _NON_CANONICAL_NESTED_CASES],
++    ids=[item[0] for item in _NON_CANONICAL_NESTED_CASES],
++)
++def test_snapshot_import_rejects_non_canonical_nested_values(mutate):
++    details = _assert_failure(ARTIFACT_MISMATCH, lambda: import_capability_snapshot(_tampered_snapshot(mutate)))
++    assert details["reason"] == "capability_structure_mismatch"
++    assert details["details"]["violation_count"] >= 1
++
++
++def test_snapshot_import_rejects_duplicate_provider_ids():
++    provider_id = PORTABLE_PROVIDER_ID
++
++    def mutate(document):
++        index = _provider_index(document, provider_id)
++        document["providers"].insert(index + 1, json.loads(json.dumps(document["providers"][index])))
++
++    details = _assert_failure(ARTIFACT_MISMATCH, lambda: import_capability_snapshot(_tampered_snapshot(mutate)))
++    assert details["reason"] == "capability_structure_mismatch"
++    assert any(
++        "duplicate provider_id" in item["detail"]
++        for item in details["details"]["violations"]
++    )
++
++
++def test_exported_snapshot_digest_is_recomputable_from_document():
++    document = export_capability_snapshot(_host_snapshot())
++    assert document["digest"] == _forge_snapshot_digest(document)
++    assert document["digest"] == "sha256:" + sha256_text(
++        {key: value for key, value in document.items() if key != "digest"}
++    )
++
++
+ def test_tampered_snapshot_is_rejected_at_plan_replay():
+     snapshot = _host_snapshot()
+     tampered = _replace_provider(
+@@ -588,19 +812,124 @@ def test_cli_doctor_strict_exit_code_for_fail_closed_reports(tmp_path):
+     default_document = json.loads(default.stdout)
+     assert default_document["fail_closed"] is True
+ 
+-    # --strict promotes a fail-closed report to exit status 2.
++    # --strict promotes a fail-closed report to exit status 3 (usage errors
++    # keep the argparse status 2, so the two are distinguishable by code).
+     strict = _run_cli(
+         "doctor", "--snapshot", str(snapshot_path), "--strict", "--json", cwd=tmp_path
+     )
+-    assert strict.returncode == 2, strict.stderr
++    assert strict.returncode == 3, strict.stderr
+     strict_document = json.loads(strict.stdout)
+     assert strict_document["fail_closed"] is True
+     assert strict_document["digest"] == default_document["digest"]
+ 
++    usage = _run_cli("doctor", "--definitely-not-an-option", cwd=tmp_path)
++    assert usage.returncode == 2
++    assert usage.returncode != strict.returncode
++
+     help_result = _run_cli("doctor", "--help", cwd=tmp_path)
+     assert help_result.returncode == 0
+     assert "fail_closed" in help_result.stdout
+-    assert "status 2" in help_result.stdout
++    assert "status 3" in help_result.stdout
++    assert "--show-paths" in help_result.stdout
++
++
++def test_cli_unregistered_contract_is_a_fact_not_a_crash(tmp_path):
++    host = _host_snapshot()
++    portable = portable_provider_capability()
++    contracts = dict(portable.contracts)
++    contracts["add"] = "sha256:" + "a" * 64
++    injected = _replace_provider(host, PORTABLE_PROVIDER_ID, contracts=contracts)
++    snapshot_path = tmp_path / "snapshot.json"
++    snapshot_path.write_text(json.dumps(export_capability_snapshot(injected)), encoding="utf-8")
++
++    default = _run_cli("doctor", "--snapshot", str(snapshot_path), "--json", cwd=tmp_path)
++    assert default.returncode == 0, default.stderr
++    assert "Traceback" not in default.stderr
++    document = json.loads(default.stdout)
++    assert document["kind"] == "doctor"
++    assert document["fail_closed"] is True
++
++    strict = _run_cli(
++        "doctor", "--snapshot", str(snapshot_path), "--strict", "--json", cwd=tmp_path
++    )
++    assert strict.returncode == 3, strict.stderr
++
++
++@pytest.mark.parametrize(
++    "label,raw_text",
++    (
++        ("library=5", {"mutate": "library"}),
++        ("contracts=5", {"mutate": "contracts"}),
++        ("NaN", {"mutate": "nan"}),
++        ("Infinity", {"mutate": "inf"}),
++        ("duplicate-json-keys", {"mutate": "duplicate"}),
++    ),
++    ids=("library=5", "contracts=5", "NaN", "Infinity", "duplicate-json-keys"),
++)
++def test_cli_malformed_snapshot_is_always_structured(tmp_path, label, raw_text):
++    document = json.loads(json.dumps(export_capability_snapshot(_host_snapshot())))
++    mutate = raw_text["mutate"]
++    if mutate == "library":
++        document["providers"][0]["library"] = 5
++        text = json.dumps(document)
++    elif mutate == "contracts":
++        document["providers"][0]["contracts"] = 5
++        text = json.dumps(document)
++    elif mutate == "nan":
++        document["providers"][0]["preconditions"]["min_dimension"] = float("nan")
++        text = json.dumps(document)
++    elif mutate == "inf":
++        document["providers"][0]["preconditions"]["min_dimension"] = float("inf")
++        text = json.dumps(document)
++    else:
++        text = json.dumps(document).replace('"schema_version": 2,', '"schema_version": 1, "schema_version": 2,', 1)
++    path = tmp_path / "snapshot.json"
++    path.write_text(text, encoding="utf-8")
++    completed = _run_cli("doctor", "--snapshot", str(path), "--json", cwd=tmp_path)
++    assert completed.returncode == 1, completed.stderr
++    payload = json.loads(completed.stdout)
++    assert payload["code"] == ARTIFACT_MISMATCH
++    assert payload["reason"]
++    assert "Traceback" not in completed.stderr
++    if mutate in ("library", "contracts"):
++        assert payload["reason"] == "capability_structure_mismatch"
++    else:
++        assert payload["reason"] == "snapshot_file_invalid_json"
++
++
++def test_cli_show_paths_is_an_explicit_opt_in(tmp_path):
++    default = _run_cli("doctor", "--json", cwd=tmp_path)
++    assert default.returncode == 0, default.stderr
++    default_document = json.loads(default.stdout)
++    assert default_document["path_policy"] == "basename"
++    for row in default_document["pinned_libraries"]:
++        assert "/" not in row["path"]
++
++    shown = _run_cli("doctor", "--json", "--show-paths", cwd=tmp_path)
++    assert shown.returncode == 0, shown.stderr
++    shown_document = json.loads(shown.stdout)
++    assert shown_document["path_policy"] == "full"
++    assert any("/" in row["path"] for row in shown_document["pinned_libraries"])
++    assert "chiro" not in default.stdout
++
++
++def test_weaker_same_triple_snapshot_is_accepted_by_design():
++    # 0013 section 3.6 defines alignment as kind+triple; a same-triple
++    # snapshot with fewer features/providers is therefore accepted and the
++    # resolver simply has fewer candidates.  This is a registered boundary.
++    host = _host_snapshot()
++    weaker = CapabilitySnapshot(
++        kind="cpu",
++        triple=host.triple,
++        features=(),
++        providers=(portable_provider_capability(),),
++    )
++    document = json.loads(json.dumps(export_capability_snapshot(weaker)))
++    imported = import_capability_snapshot(document)
++    frozen = plan_request("matmul", (2, 3), (3, 4), "float32", capability=imported)
++    assert imported.features == ()
++    assert imported.provider_ids() == (PORTABLE_PROVIDER_ID,)
++    assert frozen.plan.selected_provider == PORTABLE_PROVIDER_ID
+ 
+ 
+ # ---------------------------------------------------------------------------

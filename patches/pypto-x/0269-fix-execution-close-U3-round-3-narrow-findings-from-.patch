@@ -1,0 +1,522 @@
+From 393d28e0f2a8d532fd4a2a0ee1715f6f88b673ac Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sun, 13 Sep 2026 14:44:04 +0800
+Subject: [PATCH 269/269] fix(execution): close U3 round-3 narrow findings from
+ verify-0046-u3-r2
+
+Round-3 fixes on top of the round-2 strict-import work:
+
+* R2-G1: strict import now also checks each registered provider entry against
+  the local canonical manifest collection shape: canonically non-empty
+  contracts/dtypes/numeric_modes/required_features/preconditions/threads/pack/
+  library must stay non-empty, static required keys must be present, and
+  canonically empty collections must not gain entries.  Probe-dependent
+  optional keys (an unavailable library's missing arch facts) stay optional
+  and scalar values are not pinned.  The ten emptied-collection repro cases
+  all fail ARTIFACT_MISMATCH/capability_structure_mismatch; doctor flags a
+  programmatically supplied emptied manifest as provider_identity failed /
+  fail_closed=true (rc 0, --strict rc 3), while the CLI file path reports the
+  structured request-level rc 1 refusal.
+* R2-G2: the plan wrapper top-level digest is now required; a wrapper with
+  the digest removed (or tampered) is refused with
+  ARTIFACT_MISMATCH/plan_wrapper_digest_mismatch while the nested
+  plan_digest is still validated.
+* Help text: doctor --help now documents all four exit codes via an epilog,
+  including request-level status 1; the --strict help line also spells out
+  request-level 1 and usage 2.
+* Redaction vs digests: emitted documents stay self-verifying.  Provider
+  rows hash the actually emitted row (manifest_digest) and keep
+  manifest_canonical_digest as the full-manifest anchor when redacted.  The
+  plan wrapper's embedded capability snapshot digest is recomputed over the
+  emitted (basename) view and carries canonical_digest for the full snapshot
+  identity; --show-paths emits the canonical snapshot with digest ==
+  capability_digest.  Wrapper digests still cover everything.
+
+Adds 13 focused tests: 10 emptied-collection refusals, doctor fact path,
+redacted self-verification, wrapper missing digest, CLI structured refusal
+and help-code assertions.  Focused discovery 68 + env registry 16; execution
+related 420 passed; collect 2049 (base 1994, +55) unchanged from round-3
+additions only.
+---
+ python/pypto/execution/cli.py                       |  16 +++-
+ python/pypto/execution/discovery.py                 | 190 +++++++++++++++++++++++++++++++++++++---
+ python/tests/ut/pypto_x/test_execution_discovery.py | 155 +++++++++++++++++++++++++++++++-
+ 3 files changed, 345 insertions(+), 16 deletions(-)
+
+diff --git a/python/pypto/execution/cli.py b/python/pypto/execution/cli.py
+index d20c364ff..9f0ac096a 100644
+--- a/python/pypto/execution/cli.py
++++ b/python/pypto/execution/cli.py
+@@ -81,12 +81,24 @@ def build_parser() -> argparse.ArgumentParser:
+     _add_common(common)
+     sub = parser.add_subparsers(dest="command")
+ 
+-    doctor_cmd = sub.add_parser("doctor", parents=[common], help="report host, contract, provider and pin facts")
++    doctor_cmd = sub.add_parser(
++        "doctor",
++        parents=[common],
++        help="report host, contract, provider and pin facts",
++        formatter_class=argparse.RawDescriptionHelpFormatter,
++        epilog=(
++            "Exit codes:\n"
++            "  0  report printed (even when fail_closed=true without --strict)\n"
++            "  1  request-level error (structured ExecutionError document; status 1)\n"
++            "  2  argparse usage error\n"
++            "  3  fail_closed=true with --strict\n"
++        ),
++    )
+     doctor_cmd.add_argument("--snapshot", default=None, help="report on an imported capability snapshot instead of the local probe")
+     doctor_cmd.add_argument(
+         "--strict",
+         action="store_true",
+-        help="exit with status 3 when the report has fail_closed=true (default: exit 0, report only; usage errors exit 2)",
++        help="exit with status 3 when the report has fail_closed=true (default: exit 0, report only; request-level errors exit status 1; usage errors exit 2)",
+     )
+     doctor_cmd.add_argument(
+         "--show-paths",
+diff --git a/python/pypto/execution/discovery.py b/python/pypto/execution/discovery.py
+index e043e9bea..29f679384 100644
+--- a/python/pypto/execution/discovery.py
++++ b/python/pypto/execution/discovery.py
+@@ -35,6 +35,7 @@ import os
+ import platform
+ import sys
+ from dataclasses import dataclass
++from functools import lru_cache
+ from typing import Any, Mapping, Optional, Tuple
+ 
+ from pypto.target._utils import canonical_json, mapping_copy, sha256_text
+@@ -42,6 +43,7 @@ from pypto.target._utils import canonical_json, mapping_copy, sha256_text
+ from .capability import (
+     CAPABILITY_SCHEMA_VERSION,
+     CapabilitySnapshot,
++    default_providers,
+     host_features,
+     host_triple,
+ )
+@@ -439,9 +441,131 @@ _PROVIDER_OPTIONAL = {
+ _REGISTERED_OPCODE_SET = frozenset(registered_opcodes())
+ 
+ 
+-def _validate_provider_documents(providers: Any) -> None:
++@lru_cache(maxsize=4)
++def _registered_manifest_templates(kind: str) -> Mapping[str, Any]:
++    """Local registered provider manifests keyed by ``provider_id``.
++
++    Used only for shape / required-field checks.  Host-specific values
++    (library path/sha, thread counts, version strings) are never compared
++    here; the canonical collection structure is what "emptied manifest"
++    attacks drop.
++    """
++
++    try:
++        entries = default_providers(kind)
++    except Exception:
++        return {}
++    return {entry.provider_id: entry for entry in entries}
++
++
++def _manifest_collection_errors(
++    canonical: Mapping[str, Any],
++    actual: Mapping[str, Any],
++    path: str,
++    errors: list,
++) -> None:
++    """Require the document to preserve registered manifest collections.
++
++    Only the registered collection shape is checked: a canonically non-empty
++    collection must stay non-empty, static required keys must be present, and
++    a canonically empty collection must not gain entries.  Probe-dependent
++    optional keys (for example an unavailable library's missing arch facts)
++    are not required, and scalar values are never pinned to the local host.
++    """
++
++    for field in ("dtypes", "numeric_modes", "target_kinds", "required_features"):
++        expected = canonical.get(field)
++        observed = actual.get(field)
++        if not isinstance(expected, list) or not isinstance(observed, list):
++            continue
++        if expected and not observed:
++            errors.append(
++                (
++                    "{}.{}".format(path, field),
++                    "registered manifest collection is non-empty but the document list is empty",
++                )
++            )
++        elif not expected and observed:
++            errors.append(
++                (
++                    "{}.{}".format(path, field),
++                    "registered manifest list is empty but the document list has items",
++                )
++            )
++
++    expected_contracts = canonical.get("contracts") or {}
++    observed_contracts = actual.get("contracts")
++    if isinstance(observed_contracts, Mapping):
++        for opcode in expected_contracts:
++            if opcode not in observed_contracts:
++                errors.append(
++                    (
++                        "{}.contracts.{}".format(path, opcode),
++                        "missing registered manifest field",
++                    )
++                )
++
++    for field, required in (
++        ("preconditions", _PRECONDITION_REQUIRED),
++        ("threads", _THREADS_REQUIRED),
++        ("pack", _PACK_REQUIRED),
++    ):
++        expected = canonical.get(field) or {}
++        observed = actual.get(field)
++        if not isinstance(observed, Mapping):
++            continue
++        if expected and not observed:
++            errors.append(
++                ("{}.{}".format(path, field), "registered manifest collection is non-empty but the document is empty")
++            )
++            continue
++        if not expected and observed:
++            errors.append(
++                ("{}.{}".format(path, field), "registered manifest field is empty but the document adds fields")
++            )
++            continue
++        if observed:
++            for key in required:
++                if key not in observed:
++                    errors.append(
++                        (
++                            "{}.{}.{}".format(path, field, key),
++                            "missing registered manifest field",
++                        )
++                    )
++
++    expected_library = canonical.get("library") or {}
++    observed_library = actual.get("library")
++    if isinstance(observed_library, Mapping):
++        if expected_library and not observed_library:
++            errors.append(
++                ("{}.library".format(path), "registered manifest collection is non-empty but the document is empty")
++            )
++        elif not expected_library and observed_library:
++            errors.append(
++                ("{}.library".format(path), "registered manifest field is empty but the document adds fields")
++            )
++        elif expected_library:
++            for key in _LIBRARY_REQUIRED:
++                if key not in observed_library:
++                    errors.append(
++                        (
++                            "{}.library.{}".format(path, key),
++                            "missing registered manifest field",
++                        )
++                    )
++
++    for field in ("exactness_envelope", "fused_variants"):
++        if canonical.get(field) and not actual.get(field):
++            errors.append(
++                ("{}.{}".format(path, field), "missing registered manifest field")
++            )
++
++
++def _validate_provider_documents(providers: Any, kind: str) -> None:
+     errors = []
+     provider_ids = []
++    templates = _registered_manifest_templates(kind)
+     for index, entry in enumerate(providers):
+         path = "snapshot.providers[{}]".format(index)
+         if not isinstance(entry, Mapping):
+@@ -449,6 +573,10 @@ def _validate_provider_documents(providers: Any) -> None:
+             continue
+         provider_ids.append(entry.get("provider_id"))
+         _check_schema(entry, ("obj", _PROVIDER_REQUIRED, _PROVIDER_OPTIONAL), path, errors)
++        provider_id = entry.get("provider_id")
++        template = templates.get(provider_id) if isinstance(provider_id, str) else None
++        if template is not None:
++            _manifest_collection_errors(template.to_dict(), entry, path + ".manifest", errors)
+         contracts = entry.get("contracts")
+         if isinstance(contracts, Mapping):
+             for opcode, digest in contracts.items():
+@@ -671,7 +799,7 @@ def import_capability_snapshot(document: Mapping[str, Any]) -> CapabilitySnapsho
+             requested=providers,
+             reason="capability_structure_mismatch",
+         )
+-    _validate_provider_documents(providers)
++    _validate_provider_documents(providers, document["kind"])
+     try:
+         snapshot = CapabilitySnapshot.from_dict(document)
+         snapshot.verify_digest()
+@@ -811,6 +939,15 @@ class PlanDocument:
+             )
+         capability_document = self.capability.to_dict()
+         _apply_path_policy(capability_document, show_paths)
++        if not show_paths:
++            # The embedded snapshot is a redacted view: its own digest is
++            # recomputed over that view so the emitted document stays
++            # self-proving, while `canonical_digest` (and the wrapper's
++            # `capability_digest`) anchor the full execution identity.
++            capability_document["canonical_digest"] = self.capability.digest
++            capability_document["digest"] = _digest(
++                {key: value for key, value in capability_document.items() if key != "digest"}
++            )
+         document = {
+             "schema_version": DISCOVERY_SCHEMA_VERSION,
+             "kind": "plan",
+@@ -907,16 +1044,23 @@ def _plan_from_document(value: Any) -> ExecutionPlan:
+                 reason="plan_digest_mismatch",
+             )
+         wrapper_digest = value.get("digest")
+-        if wrapper_digest is not None:
+-            expected = _digest({key: item for key, item in value.items() if key != "digest"})
+-            if wrapper_digest != expected:
+-                raise ArtifactMismatchError(
+-                    "plan wrapper digest does not match the wrapper document",
+-                    field="plan.digest",
+-                    requested=wrapper_digest,
+-                    available=expected,
+-                    reason="plan_wrapper_digest_mismatch",
+-                )
++        if not isinstance(wrapper_digest, str) or not wrapper_digest.startswith("sha256:"):
++            raise ArtifactMismatchError(
++                "plan wrapper must carry its canonical top-level digest",
++                field="plan.digest",
++                requested=wrapper_digest,
++                available="sha256:<canonical wrapper document digest>",
++                reason="plan_wrapper_digest_mismatch",
++            )
++        expected = _digest({key: item for key, item in value.items() if key != "digest"})
++        if wrapper_digest != expected:
++            raise ArtifactMismatchError(
++                "plan wrapper digest does not match the wrapper document",
++                field="plan.digest",
++                requested=wrapper_digest,
++                available=expected,
++                reason="plan_wrapper_digest_mismatch",
++            )
+     elif isinstance(value, Mapping):
+         plan = ExecutionPlan.from_dict(value)
+     else:
+@@ -1176,6 +1320,18 @@ def _provider_manifest_digest(entry: Any) -> str:
+ 
+ def _provider_identity_check(entry: Any) -> Mapping[str, Any]:
+     errors = []
++    template = _registered_manifest_templates("cpu").get(entry.provider_id)
++    if template is not None:
++        shape_errors = []
++        _manifest_collection_errors(template.to_dict(), entry.to_dict(), "manifest", shape_errors)
++        for field_path, detail in shape_errors:
++            errors.append(
++                {
++                    "field": field_path,
++                    "reason": "provider_manifest_shape_mismatch",
++                    "detail": detail,
++                }
++            )
+     declared = sorted(str(opcode) for opcode in entry.contracts)
+     for opcode in declared:
+         try:
+@@ -1453,7 +1609,15 @@ def doctor(capability: Any = None, *, show_paths: bool = False) -> DoctorReport:
+     identity_checks = []
+     for entry in snapshot.providers:
+         row = mapping_copy(entry.to_dict())
+-        row["manifest_digest"] = _provider_manifest_digest(entry)
++        canonical_manifest_digest = _provider_manifest_digest(entry)
++        if not show_paths:
++            library = row.get("library")
++            if isinstance(library, dict) and "path" in library:
++                library["path"] = _redacted_path(library.get("path"))
++            # Anchor the full-manifest identity while the emitted row stays
++            # self-verifying (manifest_digest covers exactly this row).
++            row["manifest_canonical_digest"] = canonical_manifest_digest
++        row["manifest_digest"] = _digest(row)
+         provider_rows.append(row)
+         identity_checks.append(_provider_identity_check(entry))
+ 
+diff --git a/python/tests/ut/pypto_x/test_execution_discovery.py b/python/tests/ut/pypto_x/test_execution_discovery.py
+index 3b3ee06a4..883b7da14 100644
+--- a/python/tests/ut/pypto_x/test_execution_discovery.py
++++ b/python/tests/ut/pypto_x/test_execution_discovery.py
+@@ -494,7 +494,12 @@ def test_plan_is_replayable_deterministic_and_never_executes(monkeypatch):
+     assert explained.to_dict()["plan_digest"] == first.plan_digest
+     tampered_wrapper = dict(wrapper)
+     tampered_wrapper["digest"] = "sha256:" + "0" * 64
+-    _assert_failure(ARTIFACT_MISMATCH, lambda: explain(plan=tampered_wrapper))
++    details = _assert_failure(ARTIFACT_MISMATCH, lambda: explain(plan=tampered_wrapper))
++    assert details["reason"] == "plan_wrapper_digest_mismatch"
++    missing_wrapper_digest = dict(wrapper)
++    missing_wrapper_digest.pop("digest")
++    details = _assert_failure(ARTIFACT_MISMATCH, lambda: explain(plan=missing_wrapper_digest))
++    assert details["reason"] == "plan_wrapper_digest_mismatch"
+     assert plan_document("matmul", (2, 3), (3, 4), "float32")["kind"] == "plan"
+     assert explain_document(
+         op="matmul", left_shape=(2, 3), right_shape=(3, 4), dtype="float32"
+@@ -709,6 +714,127 @@ def test_snapshot_import_rejects_duplicate_provider_ids():
+     )
+ 
+ 
++_EMPTY_REGISTERED_COLLECTION_CASES = (
++    (
++        "portable.preconditions={}",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)].__setitem__(
++            "preconditions", {}
++        ),
++    ),
++    (
++        "portable.threads={}",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)].__setitem__(
++            "threads", {}
++        ),
++    ),
++    (
++        "portable.pack={}",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)].__setitem__(
++            "pack", {}
++        ),
++    ),
++    (
++        "aocl.preconditions={}",
++        lambda document: document["providers"][_provider_index(document, AOCL_LPGEMM_BF16_PROVIDER_ID)].__setitem__(
++            "preconditions", {}
++        ),
++    ),
++    (
++        "aocl.library={}",
++        lambda document: document["providers"][_provider_index(document, AOCL_LPGEMM_BF16_PROVIDER_ID)].__setitem__(
++            "library", {}
++        ),
++    ),
++    (
++        "portable.dtypes=[]",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)].__setitem__(
++            "dtypes", []
++        ),
++    ),
++    (
++        "portable.numeric_modes=[]",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)].__setitem__(
++            "numeric_modes", []
++        ),
++    ),
++    (
++        "portable.contracts={}",
++        lambda document: document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)].__setitem__(
++            "contracts", {}
++        ),
++    ),
++    (
++        "aocl.contracts={}",
++        lambda document: document["providers"][_provider_index(document, AOCL_LPGEMM_BF16_PROVIDER_ID)].__setitem__(
++            "contracts", {}
++        ),
++    ),
++    (
++        "aocl.required_features=[]",
++        lambda document: document["providers"][_provider_index(document, AOCL_LPGEMM_BF16_PROVIDER_ID)].__setitem__(
++            "required_features", []
++        ),
++    ),
++)
++
++
++@pytest.mark.parametrize(
++    "mutate",
++    [item[1] for item in _EMPTY_REGISTERED_COLLECTION_CASES],
++    ids=[item[0] for item in _EMPTY_REGISTERED_COLLECTION_CASES],
++)
++def test_snapshot_import_rejects_emptied_registered_collections(mutate):
++    details = _assert_failure(ARTIFACT_MISMATCH, lambda: import_capability_snapshot(_tampered_snapshot(mutate)))
++    assert details["reason"] == "capability_structure_mismatch"
++    assert any(
++        "non-empty" in item["detail"] or "missing registered manifest field" in item["detail"]
++        for item in details["details"]["violations"]
++    )
++
++
++def test_doctor_reports_emptied_manifest_as_fail_closed_fact():
++    document = json.loads(json.dumps(export_capability_snapshot(_host_snapshot())))
++    document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)]["preconditions"] = {}
++    document["digest"] = _forge_snapshot_digest(document)
++    # The lenient U1 from_dict boundary can still build the object; doctor is
++    # the fact surface that must flag the emptied registered manifest.
++    snapshot = CapabilitySnapshot.from_dict(document)
++    report = doctor(capability=snapshot)
++    assert report.fail_closed is True
++    failed = [
++        item["check"] for item in report.to_dict()["fail_closed_checks"] if item["status"] != "ok"
++    ]
++    assert "provider_identity" in failed
++
++
++def test_redacted_documents_are_self_verifying():
++    redacted = doctor().to_dict()
++    assert redacted["path_policy"] == "basename"
++    for row in redacted["providers"]:
++        preimage = {key: value for key, value in row.items() if key != "manifest_digest"}
++        assert row["manifest_digest"] == "sha256:" + sha256_text(preimage)
++        assert row["manifest_canonical_digest"].startswith("sha256:")
++        assert row["manifest_canonical_digest"] != row["manifest_digest"]
++    full = doctor(show_paths=True).to_dict()
++    for row in full["providers"]:
++        preimage = {key: value for key, value in row.items() if key != "manifest_digest"}
++        assert row["manifest_digest"] == "sha256:" + sha256_text(preimage)
++        assert "manifest_canonical_digest" not in row
++
++    frozen = plan_request("matmul", (2, 3), (3, 4), "float32")
++    default_plan = frozen.to_dict()
++    embedded = default_plan["capability_snapshot"]
++    preimage = {key: value for key, value in embedded.items() if key != "digest"}
++    assert embedded["digest"] == "sha256:" + sha256_text(preimage)
++    assert embedded["canonical_digest"] == default_plan["capability_digest"]
++    full_plan = frozen.to_dict(show_paths=True)
++    full_embedded = full_plan["capability_snapshot"]
++    full_preimage = {key: value for key, value in full_embedded.items() if key != "digest"}
++    assert full_embedded["digest"] == "sha256:" + sha256_text(full_preimage)
++    assert full_embedded["digest"] == full_plan["capability_digest"]
++    assert "canonical_digest" not in full_embedded
++
++
+ def test_exported_snapshot_digest_is_recomputable_from_document():
+     document = export_capability_snapshot(_host_snapshot())
+     assert document["digest"] == _forge_snapshot_digest(document)
+@@ -839,6 +965,10 @@ def test_cli_doctor_strict_exit_code_for_fail_closed_reports(tmp_path):
+     assert "fail_closed" in help_result.stdout
+     assert "status 3" in help_result.stdout
+     assert "--show-paths" in help_result.stdout
++    assert "request-level" in help_result.stdout
++    assert "1  request-level error" in help_result.stdout
++    assert "2  argparse usage error" in help_result.stdout
++    assert "3  fail_closed=true with --strict" in help_result.stdout
+ 
+ 
+ def test_cli_unregistered_contract_is_a_fact_not_a_crash(tmp_path):
+@@ -905,6 +1035,29 @@ def test_cli_malformed_snapshot_is_always_structured(tmp_path, label, raw_text):
+         assert payload["reason"] == "snapshot_file_invalid_json"
+ 
+ 
++def test_cli_emptied_manifest_is_refused_as_structured_request_error(tmp_path):
++    document = json.loads(json.dumps(export_capability_snapshot(_host_snapshot())))
++    document["providers"][_provider_index(document, PORTABLE_PROVIDER_ID)]["preconditions"] = {}
++    document["digest"] = _forge_snapshot_digest(document)
++    snapshot_path = tmp_path / "emptied.json"
++    snapshot_path.write_text(json.dumps(document), encoding="utf-8")
++
++    # Strict import refuses the emptied registered manifest, so doctor exits
++    # with the request-level structured error (rc 1); the programmatic doctor
++    # fact path is covered by test_doctor_reports_emptied_manifest_as_fail_closed_fact.
++    completed = _run_cli("doctor", "--snapshot", str(snapshot_path), "--json", cwd=tmp_path)
++    assert completed.returncode == 1, completed.stderr
++    payload = json.loads(completed.stdout)
++    assert payload["code"] == ARTIFACT_MISMATCH
++    assert payload["reason"] == "capability_structure_mismatch"
++    assert "Traceback" not in completed.stderr
++
++    strict = _run_cli(
++        "doctor", "--snapshot", str(snapshot_path), "--strict", "--json", cwd=tmp_path
++    )
++    assert strict.returncode == 1, strict.stderr
++
++
+ def test_cli_show_paths_is_an_explicit_opt_in(tmp_path):
+     default = _run_cli("doctor", "--json", cwd=tmp_path)
+     assert default.returncode == 0, default.stderr

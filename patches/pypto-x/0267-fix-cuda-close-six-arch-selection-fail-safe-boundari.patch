@@ -1,0 +1,455 @@
+From a52687ade09870af95e7341f31a6f1ceda696acd Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sun, 13 Sep 2026 13:36:15 +0800
+Subject: [PATCH 267/269] fix(cuda): close six arch-selection fail-safe
+ boundaries (r2)
+
+Address the independent 0046/0047 boundary findings:
+
+* sentinel-based constructor arguments: an explicitly supplied
+  ptx_target/ptx_version is no longer confused with a default value.
+  Explicit ptx_version must equal the pinned registry version exactly,
+  so sm_120+8.0 and sm_120+8.8 fail at construction instead of being
+  silently upgraded or failing later in compile();
+* arch= is strictly mutually exclusive with explicit
+  ptx_target/ptx_version (named 'cannot be combined' error, even when
+  the values agree); unregistered ptx_target values are rejected
+  (render_ptx remains the raw low-level entry point);
+* malformed payload arch_selection values (string/int/null/list) now
+  raise CudaPtxArtifactError instead of a raw ValueError/TypeError;
+* the encoder refuses a non-default ptx_target/ptx_version without an
+  arch_selection, so a hand-built CudaProgram cannot smuggle a native
+  header through payload version 2; the decoder cross-checks the same
+  invariant defensively and refuses v2 native headers;
+* arch_selection is cross-checked against TargetSpec.attributes['arch']
+  in validate() and in the decoder, so a re-signed target mutation is
+  refused.
+
+Default sm_80/PTX 8.0 artifacts stay byte-identical (payload digest
+verified against pristine 2d6e87c7d).  Focused CUDA suite adds 9 tests
+for these cases.
+---
+ python/pypto/compiler/targets/cuda.py             | 152 ++++++++++++++++++++++++++++++---------
+ python/tests/ut/pypto_x/test_cuda_sm120_target.py | 160 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 278 insertions(+), 34 deletions(-)
+
+diff --git a/python/pypto/compiler/targets/cuda.py b/python/pypto/compiler/targets/cuda.py
+index edab97d68..e7612fcfd 100644
+--- a/python/pypto/compiler/targets/cuda.py
++++ b/python/pypto/compiler/targets/cuda.py
+@@ -64,6 +64,9 @@ _PTX_TARGET_RE = re.compile(r"^sm_[0-9]+$")
+ _PTX_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+$")
+ _SUPPORTED_PTX_VERSIONS = frozenset(CUDA_ARCH_PTX_VERSIONS.values())
+ _ARCH_SELECTION_SOURCES = frozenset(("compiler_arch", "compiler_ptx_target", "target_attribute"))
++# Internal sentinel: distinguishes "argument not given" from "given the default
++# value" so explicit conflicts fail closed instead of being silently resolved.
++_UNSET = object()
+ 
+ 
+ class CudaPtxError(ValueError):
+@@ -1030,14 +1033,43 @@ class CudaProgram:
+         return self.gpu_program.plan_digest
+ 
+     def validate(self) -> "CudaProgram":
+-        """Re-derive target PTX and bindings before compilation/cache use."""
++        """Re-derive target PTX and bindings before compilation/cache use.
++
++        Fail-closed gates added for the cuda-sm120 boundary set:
++
++        * payload version 2 (no ``arch_selection``) is only legal for the
++          default ``sm_80`` / PTX 8.0 pair, so a hand-built ``CudaProgram``
++          cannot smuggle a native target through the v2 wire;
++        * a ``TargetSpec`` attribute ``arch`` must agree with the selection
++          block (and requires one).
++        """
+ 
+         _validate_ptx_target(self.ptx_target)
+         _validate_ptx_version(self.ptx_version)
+-        if self.arch_selection is not None:
++        target_arch = self.target.attributes.get("arch")
++        if target_arch is not None:
++            if not isinstance(target_arch, str):
++                raise CudaPtxError("TargetSpec attribute 'arch' must be a string")
++            if self.arch_selection is None:
++                raise CudaPtxError(
++                    "TargetSpec arch {!r} requires an explicit arch_selection".format(target_arch)
++                )
++        if self.arch_selection is None:
++            if (self.ptx_target, self.ptx_version) != (DEFAULT_PTX_TARGET, CUDA_PTX_VERSION):
++                raise CudaPtxError(
++                    "non-default CUDA PTX target/version ({}, {}) requires an explicit "
++                    "arch_selection".format(self.ptx_target, self.ptx_version)
++                )
++        else:
+             selection = _validate_arch_selection(mapping_copy(self.arch_selection))
+             if selection["ptx_target"] != self.ptx_target or selection["ptx_version"] != self.ptx_version:
+                 raise CudaPtxError("arch_selection does not match CUDA PTX target/version")
++            if target_arch is not None and selection["requested_arch"] != target_arch:
++                raise CudaPtxError(
++                    "arch_selection requested_arch {!r} does not match TargetSpec arch {!r}".format(
++                        selection["requested_arch"], target_arch
++                    )
++                )
+         self.gpu_program.validate()
+         expected_ptx = render_ptx(self.gpu_program, self.ptx_target, self.ptx_version)
+         if self.ptx != expected_ptx:
+@@ -1072,25 +1104,38 @@ class CudaPtxCompiler:
+         self,
+         driver: Any = None,
+         device_index: int = 0,
+-        ptx_target: str = DEFAULT_PTX_TARGET,
+-        ptx_version: str = CUDA_PTX_VERSION,
++        ptx_target: Any = _UNSET,
++        ptx_version: Any = _UNSET,
+         probe_jit: bool = False,
+         *,
+         arch: Optional[str] = None,
+     ) -> None:
+         """Explicit CUDA emitter configuration.
+ 
+-        The default remains the historical ``sm_80`` / PTX 8.0 path and emits
+-        byte-identical artifacts.  A first-class native arch can be requested
+-        explicitly either with ``arch="sm_120"``/``"sm_121"`` (resolves the
+-        required PTX ISA version) or with ``ptx_target="sm_120"`` while leaving
+-        ``ptx_version`` at its default.  A ``TargetSpec`` attribute
+-        ``arch="sm_120"`` selects the same path through :meth:`lower`.
++        Contract (sentinel-based; an explicit default value is *not* "not
++        given"):
++
++        * ``CudaPtxCompiler()`` -> ``sm_80`` / PTX 8.0, no selection, payload v2
++          (byte-identical to the historical default path).
++        * ``arch="sm_120"``/``"sm_121"`` -> the registered arch with its pinned
++          PTX ISA version, payload v3.  ``arch=`` is mutually exclusive with
++          explicit ``ptx_target``/``ptx_version`` (``cannot be combined``, even
++          when the values agree).
++        * ``ptx_target="sm_120"`` with ``ptx_version`` **not given** -> pinned
++          version 8.7, payload v3.  Giving an explicit ``ptx_version`` requires
++          it to equal the pinned registry version exactly; lower/other versions
++          are rejected here, at construction time (no late failure), and
++          unregistered targets are rejected (use :func:`render_ptx` for raw
++          low-level targets).
++        * ``TargetSpec`` attribute ``arch="sm_120"`` selects the same path via
++          :meth:`lower`; it is cross-checked against any compiler selection.
+         """
+ 
++        target_given = ptx_target is not _UNSET
++        version_given = ptx_version is not _UNSET
+         selection = None
+         if arch is not None:
+-            if ptx_target != DEFAULT_PTX_TARGET or ptx_version != CUDA_PTX_VERSION:
++            if target_given or version_given:
+                 raise CudaPtxError(
+                     "arch= cannot be combined with an explicit ptx_target/ptx_version"
+                 )
+@@ -1100,24 +1145,35 @@ class CudaPtxCompiler:
+                 "source": "compiler_arch",
+                 "requested_arch": arch,
+             }
+-        elif ptx_target != DEFAULT_PTX_TARGET and ptx_target in CUDA_ARCH_PTX_VERSIONS:
+-            minimum = CUDA_ARCH_PTX_VERSIONS[ptx_target]
+-            if ptx_version == CUDA_PTX_VERSION:
+-                # The caller selected the arch but left the PTX version at its
+-                # default; resolve the arch minimum instead of emitting a
+-                # header the driver cannot JIT.
+-                ptx_version = minimum
+-            elif _version_tuple(ptx_version) < _version_tuple(minimum):
++        elif target_given:
++            if ptx_target not in CUDA_ARCH_PTX_VERSIONS:
+                 raise CudaPtxError(
+-                    "PTX version {} does not support target {} (minimum {})".format(
+-                        ptx_version, ptx_target, minimum
++                    "unsupported CUDA arch {!r}; CudaPtxCompiler only accepts the registered "
++                    "archs {} (render_ptx remains the raw low-level entry point)".format(
++                        ptx_target, ", ".join(SUPPORTED_CUDA_ARCHS)
+                     )
+                 )
++            pinned = CUDA_ARCH_PTX_VERSIONS[ptx_target]
++            if version_given and ptx_version != pinned:
++                raise CudaPtxError(
++                    "PTX version {!r} is not the pinned version {!r} for target {!r}".format(
++                        ptx_version, pinned, ptx_target
++                    )
++                )
++            ptx_version = pinned
+             selection = {
+                 "policy": "explicit_arch",
+                 "source": "compiler_ptx_target",
+                 "requested_arch": ptx_target,
+             }
++        elif version_given:
++            raise CudaPtxError(
++                "PTX version {!r} was given without a registered arch target; the default "
++                "sm_80 path is pinned to PTX {}".format(ptx_version, CUDA_PTX_VERSION)
++            )
++        else:
++            ptx_target = DEFAULT_PTX_TARGET
++            ptx_version = CUDA_PTX_VERSION
+         _validate_ptx_target(ptx_target)
+         _validate_ptx_version(ptx_version)
+         self.driver = driver
+@@ -1334,6 +1390,17 @@ def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
+             raise CudaPtxArtifactError("payload version 3 requires arch_selection")
+     elif "arch_selection" in decoded:
+         raise CudaPtxArtifactError("payload version 2 must not carry arch_selection")
++    payload_selection = None
++    if payload_version == ARCH_SELECTION_PAYLOAD_VERSION:
++        # Type-check the payload selection before any dict()/set() use so a
++        # malformed value (string/number/null/list) reports the named artifact
++        # error instead of a raw ValueError/TypeError.
++        try:
++            payload_selection = mapping_copy(_validate_arch_selection(decoded["arch_selection"]))
++        except CudaPtxError as exc:
++            raise CudaPtxArtifactError(
++                "CUDA arch_selection payload is invalid: {}".format(exc)
++            ) from exc
+     if set(decoded) - (base_envelope | optional_envelope):
+         raise CudaPtxArtifactError("CUDA payload has unknown fields")
+     canonical = json.dumps(decoded, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+@@ -1352,10 +1419,10 @@ def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
+         if "arch_selection" not in metadata:
+             raise CudaPtxArtifactError("payload version 3 requires arch_selection metadata")
+         try:
+-            _validate_arch_selection(metadata["arch_selection"])
++            metadata_selection = mapping_copy(_validate_arch_selection(metadata["arch_selection"]))
+         except CudaPtxError as exc:
+             raise CudaPtxArtifactError("CUDA arch_selection metadata is invalid: {}".format(exc)) from exc
+-        if dict(decoded["arch_selection"]) != dict(metadata["arch_selection"]):
++        if payload_selection != metadata_selection:
+             raise CudaPtxArtifactError("CUDA arch_selection payload/metadata mismatch")
+     elif "arch_selection" in metadata:
+         raise CudaPtxArtifactError("payload version 2 must not carry arch_selection metadata")
+@@ -1397,6 +1464,28 @@ def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
+             )
+     if decoded["target"] != artifact.target.to_dict() or metadata["target_digest"] != sha256_text(decoded["target"]):
+         raise CudaPtxArtifactError("CUDA artifact target mismatch")
++    if payload_version == ARTIFACT_PAYLOAD_VERSION and (
++        decoded["ptx_target"], decoded["ptx_version"]
++    ) != (DEFAULT_PTX_TARGET, CUDA_PTX_VERSION):
++        raise CudaPtxArtifactError(
++            "payload version 2 only supports the default {} / PTX {} path".format(
++                DEFAULT_PTX_TARGET, CUDA_PTX_VERSION
++            )
++        )
++    target_arch = decoded["target"].get("attributes", {}).get("arch")
++    if target_arch is not None:
++        if not isinstance(target_arch, str):
++            raise CudaPtxArtifactError("CUDA target attribute 'arch' must be a string")
++        if payload_selection is None:
++            raise CudaPtxArtifactError(
++                "CUDA target arch {!r} requires a payload version 3 arch_selection".format(target_arch)
++            )
++        if payload_selection["requested_arch"] != target_arch:
++            raise CudaPtxArtifactError(
++                "CUDA arch_selection requested_arch {!r} does not match target arch {!r}".format(
++                    payload_selection["requested_arch"], target_arch
++                )
++            )
+     if decoded["entrypoint"] != artifact.entrypoint or metadata["entrypoint"] != artifact.entrypoint:
+         raise CudaPtxArtifactError("CUDA artifact entrypoint mismatch")
+     program = CoreProgram.from_dict(decoded["program"])
+@@ -1444,17 +1533,12 @@ def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
+             raise CudaPtxArtifactError("CUDA artifact format/ABI options mismatch")
+     elif artifact.format != DEFAULT_ARTIFACT_FORMAT or artifact.abi_version != ABI_VERSION:
+         raise CudaPtxArtifactError("CUDA artifact format/ABI mismatch")
+-    arch_selection = None
+-    if payload_version == ARCH_SELECTION_PAYLOAD_VERSION:
+-        try:
+-            arch_selection = _validate_arch_selection(frozen_mapping(decoded["arch_selection"]))
+-        except CudaPtxError as exc:
+-            raise CudaPtxArtifactError("CUDA arch_selection is invalid: {}".format(exc)) from exc
+-        if (
+-            arch_selection["ptx_target"] != decoded["ptx_target"]
+-            or arch_selection["ptx_version"] != decoded["ptx_version"]
+-        ):
+-            raise CudaPtxArtifactError("CUDA arch_selection does not match PTX target/version")
++    arch_selection = frozen_mapping(payload_selection) if payload_selection is not None else None
++    if arch_selection is not None and (
++        arch_selection["ptx_target"] != decoded["ptx_target"]
++        or arch_selection["ptx_version"] != decoded["ptx_version"]
++    ):
++        raise CudaPtxArtifactError("CUDA arch_selection does not match PTX target/version")
+     decoded_program = CudaProgram(
+         gpu_program, ptx, decoded["ptx_target"], decoded["ptx_version"],
+         frozen_mapping(decoded["device"]), frozen_mapping(decoded["jit"]),
+diff --git a/python/tests/ut/pypto_x/test_cuda_sm120_target.py b/python/tests/ut/pypto_x/test_cuda_sm120_target.py
+index 48f53c2fa..fb66ea285 100644
+--- a/python/tests/ut/pypto_x/test_cuda_sm120_target.py
++++ b/python/tests/ut/pypto_x/test_cuda_sm120_target.py
+@@ -20,6 +20,7 @@ from collections.abc import Mapping
+ import pytest
+ 
+ from pypto.compiler import Artifact
++from pypto.target._utils import sha256_text
+ from pypto.compiler.targets.cuda import (
+     ARCH_SELECTION_PAYLOAD_VERSION,
+     ARTIFACT_PAYLOAD_VERSION,
+@@ -31,6 +32,7 @@ from pypto.compiler.targets.cuda import (
+     CudaPtxArtifactError,
+     CudaPtxCompiler,
+     CudaPtxError,
++    CudaProgram,
+     _decode_cuda_artifact,
+     render_ptx,
+     resolve_cuda_arch,
+@@ -254,3 +256,161 @@ def test_default_compiler_without_selection_decodes_with_none():
+     assert decoded.arch_selection is None
+     assert decoded.ptx_target == DEFAULT_PTX_TARGET
+     assert decoded.ptx_version == "8.0"
++
++
++def test_explicit_ptx_version_must_equal_the_pinned_registry_version():
++    # D1: explicit 8.0 with ptx_target=sm_120 must be refused at construction,
++    # not silently upgraded to 8.7.
++    with pytest.raises(CudaPtxError, match="pinned version"):
++        CudaPtxCompiler(ptx_target=SM120_ARCH, ptx_version="8.0")
++    # D3: 8.8 is loadable for sm_120 but is not the pinned registry version, so
++    # it is refused at construction instead of failing later in compile().
++    with pytest.raises(CudaPtxError, match="pinned version"):
++        CudaPtxCompiler(ptx_target=SM120_ARCH, ptx_version="8.8")
++    # Positive: the pinned combinations are accepted.
++    compiler = CudaPtxCompiler(ptx_target=SM120_ARCH, ptx_version="8.7")
++    assert (compiler.ptx_target, compiler.ptx_version) == (SM120_ARCH, "8.7")
++    compiler = CudaPtxCompiler(ptx_target=SM121_ARCH, ptx_version="8.8")
++    assert (compiler.ptx_target, compiler.ptx_version) == (SM121_ARCH, "8.8")
++    with pytest.raises(CudaPtxError, match="pinned version"):
++        CudaPtxCompiler(ptx_target=SM121_ARCH, ptx_version="8.7")
++
++
++def test_arch_is_mutually_exclusive_with_explicit_target_or_version():
++    # D2: an explicitly supplied counterpart is a conflict, even when it equals
++    # a default value; "default value == not given" is no longer assumed.
++    with pytest.raises(CudaPtxError, match="cannot be combined"):
++        CudaPtxCompiler(arch=SM120_ARCH, ptx_target=SM80_ARCH)
++    with pytest.raises(CudaPtxError, match="cannot be combined"):
++        CudaPtxCompiler(arch=SM120_ARCH, ptx_version="8.0")
++    with pytest.raises(CudaPtxError, match="cannot be combined"):
++        CudaPtxCompiler(arch=SM120_ARCH, ptx_target=SM120_ARCH)
++    with pytest.raises(CudaPtxError, match="cannot be combined"):
++        CudaPtxCompiler(arch=SM120_ARCH, ptx_version="8.7")
++
++
++def test_unregistered_target_and_bare_version_are_rejected():
++    # B5: CudaPtxCompiler is registry-only; raw targets stay available through
++    # render_ptx for low-level tests.
++    with pytest.raises(CudaPtxError, match="unsupported CUDA arch"):
++        CudaPtxCompiler(ptx_target="sm_999")
++    with pytest.raises(CudaPtxError, match="without a registered arch target"):
++        CudaPtxCompiler(ptx_version="8.7")
++    compiler = CudaPtxCompiler()
++    gpu_program = compiler.lower(_program(), TARGET).gpu_program
++    assert ".target sm_999" in render_ptx(gpu_program, "sm_999", "8.0")
++
++
++@pytest.mark.parametrize("malformed", ("sm_120", 123, None, [["policy", "explicit_arch"]]))
++def test_malformed_payload_selection_is_a_named_artifact_error(malformed):
++    # D4: malformed payload arch_selection types must surface as
++    # CudaPtxArtifactError, never as a raw ValueError/TypeError.
++    artifact = _artifact(CudaPtxCompiler(arch=SM120_ARCH))
++    selection = dict(artifact.metadata["arch_selection"])
++
++    def mutate(payload, metadata):
++        payload["arch_selection"] = malformed
++        metadata["arch_selection"] = selection
++
++    mutated = _mutated(artifact, mutate)
++    with pytest.raises(CudaPtxArtifactError, match="arch_selection"):
++        _decode_cuda_artifact(mutated)
++
++
++def test_v2_payload_cannot_carry_a_native_header():
++    # D5: the encoder must force payload version 3 for any non-default target,
++    # so a hand-built CudaProgram cannot smuggle a native header through v2.
++    compiler = CudaPtxCompiler()
++    lowered = compiler.lower(_program(), TARGET)
++    native = CudaPtxCompiler(arch=SM120_ARCH)
++    native_ir = native.lower(_program(), TARGET)
++    manual = CudaProgram(
++        native_ir.gpu_program,
++        native_ir.ptx,
++        SM120_ARCH,
++        "8.7",
++        dict(lowered.device),
++        dict(lowered.jit),
++        lowered.bindings,
++        None,
++    )
++    with pytest.raises(CudaPtxError, match="requires an explicit arch_selection"):
++        manual.validate()
++    with pytest.raises(CudaPtxError, match="requires an explicit arch_selection"):
++        compiler.compile(manual)
++
++    # Decoder-side defense: a re-signed v2 payload with a native header is
++    # refused by the version-2 default-path gate.
++    artifact = _artifact(native)
++    payload = json.loads(artifact.payload.decode("utf-8"))
++    payload["artifact_payload_version"] = ARTIFACT_PAYLOAD_VERSION
++    payload.pop("arch_selection")
++    payload_bytes = json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    metadata = _plain(artifact.metadata)
++    metadata["artifact_payload_version"] = ARTIFACT_PAYLOAD_VERSION
++    metadata.pop("arch_selection")
++    metadata["payload_digest"] = hashlib.sha256(payload_bytes).hexdigest()
++    v2_native = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        payload=payload_bytes,
++        metadata=metadata,
++    )
++    with pytest.raises(CudaPtxArtifactError, match="version 2 only supports the default"):
++        _decode_cuda_artifact(v2_native)
++
++
++def test_selection_is_cross_checked_against_target_arch():
++    # D6: a re-signed TargetSpec whose arch disagrees with the selection must
++    # be refused, and the lowering side must not accept a mismatching target.
++    pristine = _artifact(CudaPtxCompiler(), TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,), "arch": SM120_ARCH}))
++    mutated_target = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,), "arch": SM121_ARCH})
++    payload = json.loads(pristine.payload.decode("utf-8"))
++    payload["target"] = mutated_target.to_dict()
++    payload_bytes = json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
++    metadata = _plain(pristine.metadata)
++    metadata["target_digest"] = sha256_text(payload["target"])
++    metadata["payload_digest"] = hashlib.sha256(payload_bytes).hexdigest()
++    mutated = Artifact(
++        format=pristine.format,
++        entrypoint=pristine.entrypoint,
++        target=mutated_target,
++        abi_version=pristine.abi_version,
++        payload=payload_bytes,
++        metadata=metadata,
++    )
++    with pytest.raises(CudaPtxArtifactError, match="does not match target arch"):
++        _decode_cuda_artifact(mutated)
++
++    compiler = CudaPtxCompiler(arch=SM120_ARCH)
++    conflicting = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,), "arch": SM121_ARCH})
++    with pytest.raises(CudaPtxError, match="conflicts"):
++        compiler.lower(_program(), conflicting)
++
++    # Hand-built selection + mismatching target attribute fails at compile.
++    lowered = CudaPtxCompiler().lower(_program(), TARGET)
++    native = CudaPtxCompiler(arch=SM120_ARCH).lower(_program(), TARGET)
++    manual = CudaProgram(
++        native.gpu_program,
++        native.ptx,
++        SM120_ARCH,
++        "8.7",
++        dict(lowered.device),
++        dict(lowered.jit),
++        lowered.bindings,
++        dict(native.arch_selection),
++    )
++    manual_with_bad_target = CudaProgram(
++        CudaPtxCompiler().lower(_program(), TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,), "arch": SM121_ARCH})).gpu_program,
++        native.ptx,
++        SM120_ARCH,
++        "8.7",
++        dict(lowered.device),
++        dict(lowered.jit),
++        lowered.bindings,
++        dict(native.arch_selection),
++    )
++    with pytest.raises(CudaPtxError):
++        manual_with_bad_target.validate()

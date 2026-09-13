@@ -552,3 +552,29 @@ GamePC 192.168.101.5（Windows + WSL2）：
 1. **禁止把 lock 里的状态字段当作"当前事实"引用**——它们是某次探测的时间快照；引用前必须看同一记录里是否有更晚的完成/覆盖记录，或直接复测。
 2. **"本机"≠"本项目可用资源"**：本项目有 GamePC（RTX 5080）、A3（SVE256）、920B 等外部资源，判断某条线是否可跑必须逐资源确认（HANDOFF §0 应列出各资源的可用性与其锁）。
 3. 同一条记录内自相矛盾（`BLOCKED_TOOLCHAIN` 与 `real_5080_driver_ptx: PASS` 并存）时，必须先解决矛盾再对外报告。
+
+## ERR-0013（2026-09-13）：验收方 harness 硬编码 `sys.path`，使"复跑"实际加载旧冻结树
+
+**状态**：已登记并已绕过。0046 的 U3 round-3 收口**改由父方自建 harness 在冻结 tip（`393d28e0f`）上判定**：10 个"清空注册 provider 集合"用例 **10/10 被拒**（`ARTIFACT_MISMATCH`/`capability_structure_mismatch`，内部校验器对同样输入 raise）。0046 已按新口径推送。
+
+### 现象
+
+U3 round-2 复检（`verify-0046-u3-r2 @ a52687ade`）报"清空注册 provider 集合仍被严格导入接受"；父方在 round-3 修复后的冻结 tip 上用**自建 harness** 实测同一批 10 个用例全部被拒。两边结论直接冲突。
+
+### 根因
+
+验收方复跑脚本（`u3_common.py` 同族，`v4_common.py` 亦然）把**自己的脚本周目录写死在 `sys.path` 最前**，并在文件头用常量 `FROZEN=` 指向它自己的冻结树：
+
+```python
+sys.path.insert(0, "/…/worktrees/_meta/pypto-x/verify-0046-u3/scripts")
+FROZEN = Path("/…/worktrees/_meta/pypto-x/verify-0046-u3")
+```
+
+因此"把 harness 复制到新目录、改掉 `FROZEN`"**无效**——`sys.path` 上的旧目录仍然优先，`import pypto` 实际来自旧冻结树，复跑结果反映的是旧树行为，而不是被验证的 tip。
+
+### 教训（与 ERR-0011 同类：证据必须能证明"跑的是哪棵树"）
+
+1. 任何"复跑/复核"结论，落库前必须先打印**实际加载树**：`python -c "import pypto; print(pypto.__file__)"`，并与 `git -C <tree> rev-parse HEAD` 对照。
+2. 复跑 harness 必须**只用显式传入的 `--tree` 参数**构造 `sys.path`（不得依赖脚本周目录或环境残留），参数与实际加载树不一致时直接报错退出。
+3. 验收报告应记录 `pypto.__file__` / tree HEAD / 脚本 `sha256`；仅凭"我改了常量"不能证明加载到了新树（本 ERRATA 与 0046 批内 `harness_caveat` 字段互为索引）。
+4. 父方已在 `_meta/pypto-x/verify-0046-u3-r2/` 旁保留自建 harness 与其原始输出，作为 round-3 收口的权威证据。

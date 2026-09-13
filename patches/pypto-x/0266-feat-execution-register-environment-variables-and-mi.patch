@@ -1,0 +1,1681 @@
+From 533e9f180ab7473d59e5a4e91cb2da90231a20fe Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sun, 13 Sep 2026 13:32:41 +0800
+Subject: [PATCH 266/269] feat(execution): register environment variables and
+ migration warnings
+
+U4 environment-variable registry slice (on top of the U3 round-2 fix):
+
+* add pypto.execution.env_registry as the single source of truth for the
+  35 frozen migration variables plus 2 U4-discovered extras, 2 runtime
+  thread variables and the registry warning switch (40 rows total);
+  every row carries name/category/meaning/default/legal_domain/
+  affects_artifact_semantics/replacement/deprecation status, consumer
+  kind, semantic scope, digest verdict and static effect evidence;
+* doctor reports the registry rows (allowlist, statuses, unregistered
+  noise) and never emits raw values; sensitive unregistered names are
+  redacted, host paths stay basename-only by default;
+* compat layer: legacy names keep working, one-time deprecation warnings
+  with declarative replacements, silence via
+  PYPTO_X_ENV_DEPRECATION_WARNINGS=0, unregistered PYPTO_X_* reads warn
+  once and show up in doctor;
+* focused tests: 16 registry tests (frozen 35 completeness, one-time
+  warnings, unregistered protection, digest invariance, doctor wiring,
+  Python 3.7 AST); discovery tests updated for registry-driven rows and
+  round-2 strictness.
+
+No numeric behavior change; execution plan/report bytes unchanged for all
+35 migration variables.  Perf: UNGATED.
+---
+ python/pypto/execution/__init__.py                     |  46 +++
+ python/pypto/execution/cli.py                          |   4 +
+ python/pypto/execution/discovery.py                    | 144 +++----
+ python/pypto/execution/env_registry.py                 | 824 +++++++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_execution_discovery.py    |  12 +-
+ python/tests/ut/pypto_x/test_execution_env_registry.py | 487 ++++++++++++++++++++++
+ 6 files changed, 1429 insertions(+), 88 deletions(-)
+
+diff --git a/python/pypto/execution/__init__.py b/python/pypto/execution/__init__.py
+index e71e73cfe..c47c68087 100644
+--- a/python/pypto/execution/__init__.py
++++ b/python/pypto/execution/__init__.py
+@@ -30,6 +30,30 @@ from .capability import (
+     host_triple,
+     portable_provider_capability,
+ )
++from .env_registry import (
++    ENV_DEPRECATION_WARNINGS,
++    ENV_REGISTRY_SCHEMA_VERSION,
++    EnvDeprecationWarning,
++    EnvVarSpec,
++    UnregisteredEnvWarning,
++    all_env_vars,
++    control_env_vars,
++    environment_rows,
++    extra_env_vars,
++    is_registered,
++    lookup_env_var,
++    migration_env_vars,
++    policy_hints_from_env,
++    read_env,
++    registered_names,
++    registry_document,
++    reset_warnings,
++    runtime_env_vars,
++    unregistered_env_names,
++    unregistered_env_rows,
++    warn_deprecations,
++    warnings_enabled,
++)
+ from .entry import (
+     GATE_REASON,
+     GUARANTEE_BASIS,
+@@ -333,8 +357,30 @@ __all__ = [
+     "resolve_view",
+     "validate_report_schema",
+     "DISCOVERY_SCHEMA_VERSION",
++    "ENV_DEPRECATION_WARNINGS",
++    "ENV_REGISTRY_SCHEMA_VERSION",
+     "ENV_VAR_REGISTRY",
+     "EXPLAIN_BOUNDARIES",
++    "EnvDeprecationWarning",
++    "EnvVarSpec",
++    "UnregisteredEnvWarning",
++    "all_env_vars",
++    "control_env_vars",
++    "environment_rows",
++    "extra_env_vars",
++    "is_registered",
++    "lookup_env_var",
++    "migration_env_vars",
++    "policy_hints_from_env",
++    "read_env",
++    "registered_names",
++    "reset_warnings",
++    "registry_document",
++    "runtime_env_vars",
++    "unregistered_env_names",
++    "unregistered_env_rows",
++    "warn_deprecations",
++    "warnings_enabled",
+     "SUPPORTED_DISCOVERY_OPS",
+     "DoctorReport",
+     "Explanation",
+diff --git a/python/pypto/execution/cli.py b/python/pypto/execution/cli.py
+index 289df6abf..d20c364ff 100644
+--- a/python/pypto/execution/cli.py
++++ b/python/pypto/execution/cli.py
+@@ -41,6 +41,7 @@ from typing import Any, Optional, Sequence
+ 
+ from pypto.target._utils import canonical_json
+ 
++from . import env_registry
+ from .discovery import (
+     doctor,
+     explain,
+@@ -221,6 +222,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
+         parser.print_help()
+         return 2
+     as_json = bool(getattr(args, "json", False))
++    # One-time deprecation/unregistered warnings for the process; silenced by
++    # PYPTO_X_ENV_DEPRECATION_WARNINGS=0.  JSON output on stdout stays clean.
++    env_registry.warn_deprecations()
+     try:
+         if command == "doctor":
+             report = doctor(
+diff --git a/python/pypto/execution/discovery.py b/python/pypto/execution/discovery.py
+index 228b616dd..e043e9bea 100644
+--- a/python/pypto/execution/discovery.py
++++ b/python/pypto/execution/discovery.py
+@@ -45,6 +45,7 @@ from .capability import (
+     host_features,
+     host_triple,
+ )
++from . import env_registry
+ from .entry import _explain as _entry_explain, capability_for_policy
+ from .errors import (
+     ArtifactMismatchError,
+@@ -509,58 +510,36 @@ def _strict_json_difference(left: Any, right: Any, path: str = "snapshot") -> Op
+     return None
+ 
+ 
+-#: Policy-related environment variables.  Only these names are read by the
+-#: doctor command; raw values are never echoed (only a typed interpretation).
+-ENV_VAR_REGISTRY = (
+-    {
+-        "name": "PYPTO_X_PORTABLE_ONLY",
+-        "class": "compat_alias",
+-        "policy_field": "profile / provider.mode",
+-        "consumed_by_execution": False,
+-        "value_kind": "flag",
+-        "source": "docs/10-architecture/0006 section 9.1",
+-    },
+-    {
+-        "name": "OMP_NUM_THREADS",
+-        "class": "provider_thread_env",
+-        "policy_field": "resources.max_threads (vendor provider thread state)",
+-        "consumed_by_execution": True,
+-        "value_kind": "integer",
+-        "source": "pinned AOCL/BLIS OpenMP thread env",
+-    },
+-    {
+-        "name": "BLIS_NUM_THREADS",
+-        "class": "provider_thread_env",
+-        "policy_field": "resources.max_threads (vendor provider thread state)",
+-        "consumed_by_execution": True,
+-        "value_kind": "integer",
+-        "source": "pinned AOCL/BLIS thread env",
+-    },
+-    {
+-        "name": "PYPTO_X_AVX512_GEMM_THREADS",
+-        "class": "legacy_not_consumed",
+-        "policy_field": "resources.max_threads",
+-        "consumed_by_execution": False,
+-        "value_kind": "integer",
+-        "source": "docs/10-architecture/0006 section 9.1 (U4 migration target)",
+-    },
+-    {
+-        "name": "PYPTO_X_VLLM_GEMM_THREADS",
+-        "class": "legacy_not_consumed",
+-        "policy_field": "resources.max_threads",
+-        "consumed_by_execution": False,
+-        "value_kind": "integer",
+-        "source": "docs/10-architecture/0006 section 9.1 (U4 migration target)",
+-    },
+-    {
+-        "name": "PYPTO_X_ASCEND_DEVICE_ID",
+-        "class": "declared_not_consumed",
+-        "policy_field": "placement.device",
+-        "consumed_by_execution": False,
+-        "value_kind": "integer",
+-        "source": "docs/10-architecture/0006 section 9.1 (no Ascend provider in this slice)",
+-    },
+-)
++#: Backwards-compatible discovery view over
++#: :mod:`pypto.execution.env_registry`.  The registry is the single source of
++#: truth; this tuple only keeps the pre-U4 discovery field names available to
++#: existing callers and tests.
++def _legacy_env_registry_view():
++    rows = []
++    for spec in env_registry.ALL_ENV_VARS:
++        domain = spec.legal_domain.lower()
++        if "0|1" in domain:
++            value_kind = "flag"
++        elif "integer" in domain:
++            value_kind = "integer"
++        else:
++            value_kind = "opaque"
++        rows.append(
++            {
++                "name": spec.name,
++                "class": spec.category,
++                "policy_field": spec.replacement,
++                "consumed_by_execution": spec.digest_status
++                == "captured_in_capability_or_policy_digest"
++                or spec.scope == "execution",
++                "value_kind": value_kind,
++                "source": spec.effect_evidence,
++            }
++        )
++    return tuple(rows)
++
++
++ENV_VAR_REGISTRY = _legacy_env_registry_view()
+ 
+ _REQUIRED_SNAPSHOT_KEYS = ("schema_version", "kind", "triple", "features", "providers", "digest")
+ 
+@@ -1186,37 +1165,9 @@ class DoctorReport:
+ 
+ 
+ def _environment_rows() -> Tuple[Mapping[str, Any], ...]:
+-    rows = []
+-    for spec in ENV_VAR_REGISTRY:
+-        raw = os.environ.get(spec["name"])
+-        if raw is None:
+-            value_kind = None
+-            interpreted = None
+-        elif spec["value_kind"] == "flag":
+-            value_kind = "flag"
+-            interpreted = raw == "1"
+-        elif spec["value_kind"] == "integer":
+-            try:
+-                interpreted = int(raw)
+-                value_kind = "integer"
+-            except (TypeError, ValueError):
+-                interpreted = None
+-                value_kind = "non_integer"
+-        else:
+-            value_kind = "opaque"
+-            interpreted = None
+-        row = {
+-            "name": spec["name"],
+-            "status": "set" if raw is not None else "unset",
+-            "class": spec["class"],
+-            "policy_field": spec["policy_field"],
+-            "consumed_by_execution": bool(spec["consumed_by_execution"]),
+-            "value_kind": value_kind,
+-            "interpreted_value": interpreted,
+-            "source": spec["source"],
+-        }
+-        rows.append(row)
+-    return tuple(rows)
++    """Doctor environment rows from the U4 registry (never raw values)."""
++
++    return env_registry.environment_rows()
+ 
+ 
+ def _provider_manifest_digest(entry: Any) -> str:
+@@ -1541,9 +1492,14 @@ def doctor(capability: Any = None, *, show_paths: bool = False) -> DoctorReport:
+     ]
+     fail_closed = any(item["status"] != "ok" for item in checks)
+     environment = {
++        "schema_version": env_registry.ENV_REGISTRY_SCHEMA_VERSION,
++        "source": "pypto.execution.env_registry",
+         "variables": [mapping_copy(item) for item in _environment_rows()],
+-        "allowlist": [spec["name"] for spec in ENV_VAR_REGISTRY],
++        "unregistered": [mapping_copy(item) for item in env_registry.unregistered_env_rows()],
++        "allowlist": list(env_registry.registered_names()),
+         "raw_values_included": False,
++        "deprecation_warnings_enabled": env_registry.warnings_enabled(),
++        "deprecation_warning_switch": env_registry.ENV_DEPRECATION_WARNINGS,
+     }
+     document = {
+         "schema_version": DISCOVERY_SCHEMA_VERSION,
+@@ -1569,6 +1525,15 @@ def doctor(capability: Any = None, *, show_paths: bool = False) -> DoctorReport:
+         "providers": provider_rows,
+         "pinned_libraries": [mapping_copy(item) for item in pinned_rows],
+         "environment": environment,
++        "env_registry": {
++            "schema_version": env_registry.ENV_REGISTRY_SCHEMA_VERSION,
++            "migration_var_count": len(env_registry.MIGRATION_ENV_VARS),
++            "extra_var_count": len(env_registry.EXTRA_ENV_VARS),
++            "runtime_var_count": len(env_registry.RUNTIME_ENV_VARS),
++            "control_var_count": len(env_registry.CONTROL_ENV_VARS),
++            "unregistered_count": len(environment["unregistered"]),
++            "new_env_policy": "new features must not add environment variables",
++        },
+         "fail_closed_checks": [dict(item) for item in checks],
+         "fail_closed": bool(fail_closed),
+         "read_only": True,
+@@ -1604,8 +1569,15 @@ def doctor(capability: Any = None, *, show_paths: bool = False) -> DoctorReport:
+             )
+             for item in pinned_rows
+         ) if pinned_rows else "pinned libraries: none in this snapshot",
+-        "environment: " + ", ".join(
+-            "{}={}".format(item["name"], item["status"]) for item in environment["variables"]
++        "environment: {} registered ({}), {} deprecated-status, {} unregistered".format(
++            len(environment["variables"]),
++            "warnings on" if environment["deprecation_warnings_enabled"] else "warnings off",
++            sum(
++                1
++                for item in environment["variables"]
++                if item["deprecation_status"] == "deprecated"
++            ),
++            len(environment["unregistered"]),
+         ),
+         "fail-closed checks: " + ", ".join(
+             "{}({})".format(item["check"], item["status"]) for item in checks
+diff --git a/python/pypto/execution/env_registry.py b/python/pypto/execution/env_registry.py
+new file mode 100644
+index 000000000..75997eae3
+--- /dev/null
++++ b/python/pypto/execution/env_registry.py
+@@ -0,0 +1,824 @@
++"""U4 environment-variable registry (P0) and compatibility layer (P1).
++
++This module is the single source of truth for the environment variables that
++the PyPTO-X project has measured and registered (the 35 variables frozen in
++``docs/10-architecture/0005-...`` section 3.2, plus the provider thread
++environment consumed by the pinned AOCL artifact and one registry control
++switch).
++
++Design rules (0006 section 9 / P5):
++
++* every registered variable has a category, meaning, default, legal domain,
++  scope, replacement target, deprecation status and an effect verdict;
++* **new features must not add environment variables** - unknown ``PYPTO_X_*``
++  names are reported (and warned about) instead of being silently honoured;
++* registered variables keep their old behavior (P1 compatibility); deprecated
++  ones emit a one-time deprecation warning through :func:`read_env` /
++  :func:`warn_deprecations`, suppressible via
++  ``PYPTO_X_ENV_DEPRECATION_WARNINGS=0``;
++* an environment variable that changes artifact bytes/semantics must be
++  captured by a policy/plan/capability digest; the registry records the
++  measured verdict per variable and the U4 audit found no execution-layer
++  semantic variable outside the digest (see ``raw/`` evidence).
++
++The module itself is standard-library only and dependency-free so it can be
++imported from lightweight contexts (for example the compiler-target path
++overrides) without importing the execution package.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import os
++import warnings
++from dataclasses import dataclass
++from typing import Any, Dict, Mapping, Optional, Tuple
++
++
++ENV_REGISTRY_SCHEMA_VERSION = 1
++
++ENV_CATEGORIES = (
++    "build_artifact_dir",
++    "toolchain_path",
++    "performance",
++    "runtime_device",
++    "model_asset",
++    "vllm_integration",
++    "dev_resource",
++    "provider_thread_env",
++    "registry_control",
++)
++
++#: Deprecation-warning switch.  ``0``/``off``/``false`` silence the one-time
++#: warnings; any other value (or unset) keeps them enabled.
++ENV_DEPRECATION_WARNINGS = "PYPTO_X_ENV_DEPRECATION_WARNINGS"
++
++DEPRECATION_STATUSES = ("deprecated", "internal", "active")
++
++DIGEST_STATUSES = (
++    "not_an_artifact_input",
++    "outside_registered_execution_providers",
++    "captured_in_capability_or_policy_digest",
++    "effect_unproven",
++)
++
++
++class EnvDeprecationWarning(UserWarning):
++    """One-time warning for a deprecated registered environment variable."""
++
++
++class UnregisteredEnvWarning(UserWarning):
++    """Warning for a ``PYPTO_X_*`` variable that is not registered."""
++
++
++@dataclass(frozen=True)
++class EnvVarSpec:
++    """One registered environment variable (registry row)."""
++
++    name: str
++    category: str
++    meaning: str
++    default: Any
++    legal_domain: str
++    scope: str
++    consumer_kind: str
++    affects_artifact_semantics: bool
++    semantic_scope: str
++    digest_status: str
++    replacement: str
++    deprecation_status: str
++    effect_evidence: str
++    effect_unproven: bool = False
++
++    def to_dict(self) -> Mapping[str, Any]:
++        document = dataclasses.asdict(self)
++        document["deprecated"] = self.deprecation_status == "deprecated"
++        return document
++
++
++def _spec(
++    name: str,
++    category: str,
++    meaning: str,
++    default: Any,
++    legal_domain: str,
++    scope: str,
++    consumer_kind: str,
++    affects_artifact_semantics: bool,
++    semantic_scope: str,
++    digest_status: str,
++    replacement: str,
++    deprecation_status: str,
++    effect_evidence: str,
++    effect_unproven: bool = False
++) -> EnvVarSpec:
++    return EnvVarSpec(
++        name=name,
++        category=category,
++        meaning=meaning,
++        default=default,
++        legal_domain=legal_domain,
++        scope=scope,
++        consumer_kind=consumer_kind,
++        affects_artifact_semantics=bool(affects_artifact_semantics),
++        semantic_scope=semantic_scope,
++        digest_status=digest_status,
++        replacement=replacement,
++        deprecation_status=deprecation_status,
++        effect_evidence=effect_evidence,
++        effect_unproven=bool(effect_unproven),
++    )
++
++
++# ---------------------------------------------------------------------------
++# The 35 measured variables from 0005 section 3.2
++# ---------------------------------------------------------------------------
++MIGRATION_ENV_VARS = (
++    # -- build / artifact directories ------------------------------------
++    _spec(
++        "PYPTO_X_AVX2_BUILD_DIR", "build_artifact_dir",
++        "Native build directory for the AVX2 compiler", "unset", "directory path",
++        "compiler", "path_override", False,
++        "selects where the AVX2 native build is emitted; the compiler call's "
++        "extra.build_dir takes precedence",
++        "not_an_artifact_input", "build.targets.avx2.dir", "deprecated",
++        "python/pypto/compiler/targets/cpu_avx2.py:2018",
++    ),
++    _spec(
++        "PYPTO_X_AVX2_ARTIFACT_DIR", "build_artifact_dir",
++        "On-disk artifact store for the AVX2 compiler", "unset", "directory path",
++        "compiler", "path_override", False,
++        "selects the artifact cache location; artifact bytes are the compiled payload",
++        "not_an_artifact_input", "artifact_store.targets.avx2.dir", "deprecated",
++        "python/pypto/compiler/targets/cpu_avx2.py:2029",
++    ),
++    _spec(
++        "PYPTO_X_AVX2_PROBE_DIR", "build_artifact_dir",
++        "Probe build directory for AVX2 host capability detection", "unset", "directory path",
++        "lowering", "path_override", False,
++        "selects the probe executable directory only",
++        "not_an_artifact_input", "capability.probe_cache.avx2.dir", "deprecated",
++        "python/pypto/lowering/cpu/x86/avx2/capabilities.py:265",
++    ),
++    _spec(
++        "PYPTO_X_AVX512_BUILD_DIR", "build_artifact_dir",
++        "Native build directory for the AVX-512 compiler", "unset", "directory path",
++        "compiler", "path_override", False,
++        "selects where the AVX-512 native build is emitted",
++        "not_an_artifact_input", "build.targets.avx512.dir", "deprecated",
++        "python/pypto/compiler/targets/cpu_avx512.py:2921",
++    ),
++    _spec(
++        "PYPTO_X_AVX512_ARTIFACT_DIR", "build_artifact_dir",
++        "On-disk artifact store for the AVX-512 compiler", "unset", "directory path",
++        "compiler", "path_override", False,
++        "selects the artifact cache location only",
++        "not_an_artifact_input", "artifact_store.targets.avx512.dir", "deprecated",
++        "python/pypto/compiler/targets/cpu_avx512.py:2932",
++    ),
++    _spec(
++        "PYPTO_X_AVX512_PROBE_DIR", "build_artifact_dir",
++        "Probe build directory for AVX-512 host capability detection", "unset", "directory path",
++        "lowering", "path_override", False,
++        "selects the probe executable directory only",
++        "not_an_artifact_input", "capability.probe_cache.avx512.dir", "deprecated",
++        "python/pypto/lowering/cpu/x86/avx512/capabilities.py:368",
++    ),
++    _spec(
++        "PYPTO_X_SVE256_BUILD_DIR", "build_artifact_dir",
++        "Native build directory for the SVE256 compiler", "unset", "directory path",
++        "compiler", "path_override", False,
++        "selects where the SVE256 native build is emitted",
++        "not_an_artifact_input", "build.targets.sve256.dir", "deprecated",
++        "python/pypto/compiler/targets/cpu_sve256.py:3501",
++    ),
++    _spec(
++        "PYPTO_X_SVE256_ARTIFACT_DIR", "build_artifact_dir",
++        "On-disk artifact store for the SVE256 compiler", "unset", "directory path",
++        "compiler", "path_override", False,
++        "selects the artifact cache location only",
++        "not_an_artifact_input", "artifact_store.targets.sve256.dir", "deprecated",
++        "python/pypto/compiler/targets/cpu_sve256.py:3512",
++    ),
++    _spec(
++        "PYPTO_X_ASCEND_BUILD_DIR", "build_artifact_dir",
++        "Ascend hook/build directory used by the CANN regression tooling", "unset", "directory path",
++        "tooling", "path_override", False,
++        "test/regression tooling path; the execution layer has no Ascend provider",
++        "outside_registered_execution_providers", "build.targets.ascend.dir", "internal",
++        "python/tests/ut/pypto_x/ascend_cann_hook.py:46",
++    ),
++    _spec(
++        "PYPTO_X_ASCEND_ARTIFACT_FORMAT", "build_artifact_dir",
++        "Artifact format selected by the Ascend hook tooling", "unset", "format string",
++        "tooling", "mode_switch", True,
++        "can select the Ascend artifact format in the hook regression path; not a "
++        "registered execution provider in U1-U3",
++        "outside_registered_execution_providers", "artifact.format (Ascend provider profile)", "internal",
++        "python/tests/ut/pypto_x/ascend_cann_hook.py:48",
++    ),
++    # -- toolchain / paths ------------------------------------------------
++    _spec(
++        "PYPTO_X_AARCH64_SYSROOT", "toolchain_path",
++        "AArch64 sysroot for SVE256 cross-compilation", "/usr/aarch64-linux-gnu", "directory path",
++        "backend", "toolchain_root", True,
++        "toolchain input; a different sysroot can produce different cross-compiled "
++        "artifact bytes, but the U1-U3 portable/AOCL execution plans never read it",
++        "outside_registered_execution_providers", "toolchain.aarch64.sysroot", "deprecated",
++        "python/pypto/backends/cpu/aarch64/sve256.py:1640; "
++        "python/pypto/lowering/cpu/aarch64/sve/capabilities.py:459",
++    ),
++    _spec(
++        "PYPTO_X_CANN_INSTALL_PATH", "toolchain_path",
++        "CANN toolkit install directory", "/usr/local/Ascend", "directory path",
++        "tooling", "toolchain_root", False,
++        "only the local CANN install script consumes it; no execution-layer provider",
++        "outside_registered_execution_providers", "toolchain.ascend.install_path", "internal",
++        "tools/cann/install_cann_toolkit_local.sh:53",
++    ),
++    _spec(
++        "PYPTO_X_CANN_META_ROOT", "toolchain_path",
++        "Evidence/package/log root for the local CANN install tooling", "unset", "directory path",
++        "tooling", "toolchain_root", False,
++        "tooling output path only",
++        "not_an_artifact_input", "evidence.ascend.cann_toolkit_root", "internal",
++        "tools/cann/install_cann_toolkit_local.sh:50",
++    ),
++    _spec(
++        "PYPTO_X_PTO_ISA_ROOT", "toolchain_path",
++        "PTO-ISA source root used by the Ascend hook regression tooling", "unset", "directory path",
++        "tooling", "toolchain_root", True,
++        "build input for the Ascend/PTO regression tooling only; not consumed by the "
++        "registered execution providers",
++        "outside_registered_execution_providers", "toolchain.pto_isa.root", "internal",
++        "python/tests/ut/pypto_x/ascend_cann_hook.py:45",
++    ),
++    _spec(
++        "PYPTO_X_PYPTO_ROOT", "toolchain_path",
++        "PyPTO source root used by portable diff drivers", "unset", "directory path",
++        "driver", "toolchain_root", False,
++        "driver/test path resolution only",
++        "not_an_artifact_input", "developer.pypto_root", "internal",
++        "python/tests/ut/pypto_x/qwen35_native_reduce_broadcast_diff.py:43",
++    ),
++    _spec(
++        "PYPTO_X_HWHIAIUSER_HOME", "toolchain_path",
++        "HwHiAiUser home directory expected by CANN tooling", "/home/HwHiAiUser", "directory path",
++        "tooling", "toolchain_root", False,
++        "local CANN install script only",
++        "not_an_artifact_input", "toolchain.ascend.hwhiaiuser_home", "internal",
++        "tools/cann/install_cann_toolkit_local.sh:52",
++    ),
++    _spec(
++        "PYPTO_X_TORCH_CACHE_DIR", "toolchain_path",
++        "Cache directory for the framework linear-kernel artifacts", "unset", "directory path",
++        "framework", "cache_dir", False,
++        "selects the J1 linear-kernel cache location; cache keys pin contract and "
++        "payload versions, so artifacts with the same key are byte-identical",
++        "not_an_artifact_input", "cache.torch_dir", "deprecated",
++        "python/pypto/framework/linear_kernel.py:1122",
++    ),
++    # -- performance ------------------------------------------------------
++    _spec(
++        "PYPTO_X_AVX512_GEMM_THREADS", "performance",
++        "Thread count for the AVX-512 GEMM path (legacy J1/J2)", "auto", "positive integer",
++        "framework", "thread_knob", False,
++        "runtime thread count for the legacy AVX-512 path; can change reduction "
++        "scheduling/numerics there, but not artifact bytes and not the execution "
++        "plans of the registered portable/AOCL providers",
++        "outside_registered_execution_providers", "execution.resources.max_threads", "deprecated",
++        "python/pypto/backends/cpu/x86/avx512.py:479",
++    ),
++    _spec(
++        "PYPTO_X_AVX512_WEIGHT_CACHE", "performance",
++        "Enable the packed-weight cache for the AVX-512 path", "unset", "0|1",
++        "framework", "mode_switch", False,
++        "cache on/off only; cached packed weights are keyed by the packed contract",
++        "not_an_artifact_input", "cache.weight_pack.enabled", "deprecated",
++        "python/pypto/backends/cpu/x86/avx512.py:508",
++    ),
++    _spec(
++        "PYPTO_X_VLLM_GEMM_THREADS", "performance",
++        "Thread count used by the vLLM plugin GEMM path", "auto", "positive integer",
++        "vllm", "thread_knob", False,
++        "runtime thread count of the vLLM plugin path; not consumed by the "
++        "execution-layer resolver or providers",
++        "outside_registered_execution_providers", "execution.resources.max_threads", "deprecated",
++        "python/pypto_x_vllm/plugin.py:377",
++    ),
++    # -- runtime / device -------------------------------------------------
++    _spec(
++        "PYPTO_X_ASCEND_DEVICE_ID", "runtime_device",
++        "Ascend device id used by the CANN hook runner", "0", "non-negative integer",
++        "tooling", "device_selector", False,
++        "selects the Ascend device for the hook regression tooling; the execution "
++        "layer has no Ascend provider",
++        "outside_registered_execution_providers", "target.device_id / placement.device", "deprecated",
++        "python/tests/ut/pypto_x/ascend_cann_hook.py:47",
++    ),
++    _spec(
++        "PYPTO_X_ASCEND_HOOKS", "runtime_device",
++        "Enable injected Ascend runtime hooks for regression tests", "unset", "0|1",
++        "backend", "injection", True,
++        "can change the Ascend adapter execution path in the hook regression path; "
++        "not a registered execution provider in U1-U3",
++        "outside_registered_execution_providers", "Ascend provider/plugin registry", "internal",
++        "python/pypto/backends/ascend/adapter.py:48",
++    ),
++    _spec(
++        "PYPTO_X_SVE_QEMU_CPU", "runtime_device",
++        "QEMU cpu model used by SVE256 tests", "unset", "QEMU cpu model string",
++        "test", "test_selector", False,
++        "test-only QEMU selector; cannot change portable/AOCL artifact bytes",
++        "not_an_artifact_input", "target.qemu.cpu", "internal",
++        "python/pypto/backends/cpu/aarch64/sve256.py:1636; python/pypto/lowering/cpu/aarch64/sve/capabilities.py:457",
++    ),
++    _spec(
++        "PYPTO_X_SVE_TEST_MODE", "runtime_device",
++        "SVE256 test mode (host reference vs native path)", "unset", "mode string",
++        "test", "test_selector", True,
++        "selects the host-reference path in SVE256 tests; test-only, no registered "
++        "execution provider",
++        "outside_registered_execution_providers", "validation.mode", "internal",
++        "python/tests/ut/pypto_x/test_cpu_sve256_indexing.py:37; python/tests/ut/pypto_x/test_cpu_sve256_int8_layout.py:57",
++    ),
++    _spec(
++        "PYPTO_X_PORTABLE_ONLY", "runtime_device",
++        "Portable-only import/bootstrap mode (no native loader)", "unset", "0|1",
++        "import", "mode_switch", False,
++        "changes the import surface (native loader disabled) and is the compat alias "
++        "for ExecutionPolicy(profile=portable, provider.mode=portable); it does not "
++        "change portable/AOCL artifact bytes or plan digests",
++        "not_an_artifact_input", "ExecutionPolicy(profile='portable', provider.mode='portable')", "deprecated",
++        "python/pypto/__init__.py:22; python/pypto/frontend/__init__.py",
++    ),
++    # -- model assets -----------------------------------------------------
++    _spec(
++        "PYPTO_X_QWEN35_ASSET_DIR", "model_asset",
++        "Qwen3.5 asset directory (singular legacy spelling)", "unset", "directory path",
++        "test", "asset_dir", False,
++        "test fixture asset path only; no artifact bytes",
++        "not_an_artifact_input", "assets.models.qwen35.asset_dir", "deprecated",
++        "python/tests/ut/pypto_x/qwen35_weight_fixture.py:27",
++    ),
++    _spec(
++        "PYPTO_X_QWEN35_ASSETS_DIR", "model_asset",
++        "Qwen3.5 asset directory (plural canonical spelling)", "unset", "directory path",
++        "driver", "asset_dir", False,
++        "reference/driver asset path only; no artifact bytes",
++        "not_an_artifact_input", "assets.models.qwen35.assets_dir", "deprecated",
++        "tools/qwen35_reference/run_reference.py:83",
++    ),
++    _spec(
++        "PYPTO_X_QWEN35_WEIGHTED_WORKTREE", "model_asset",
++        "Worktree containing weighted execution evidence", "unset", "directory path",
++        "driver", "asset_dir", False,
++        "evidence-driver path only",
++        "not_an_artifact_input", "assets.models.qwen35.weighted_worktree", "deprecated",
++        "python/tests/ut/pypto_x/qwen35_weighted_execution_evidence.py:120",
++    ),
++    # -- vLLM integration -------------------------------------------------
++    _spec(
++        "PYPTO_X_VLLM_ENABLE", "vllm_integration",
++        "Enable the vLLM plugin injection surface", "unset", "0|1",
++        "vllm", "plugin_switch", False,
++        "enables the vLLM plugin; does not change execution-layer artifacts",
++        "outside_registered_execution_providers", "integration.vllm.enable", "deprecated",
++        "python/pypto_x_vllm/plugin.py:54",
++    ),
++    _spec(
++        "PYPTO_X_VLLM_GATE_JSON", "vllm_integration",
++        "Path to the vLLM shape-gate table JSON", "unset", "file path",
++        "vllm", "gate_table", False,
++        "selects which gate table the plugin reads; the table itself is versioned",
++        "outside_registered_execution_providers", "integration.vllm.gate_json", "deprecated",
++        "python/pypto_x_vllm/plugin.py:53",
++    ),
++    _spec(
++        "PYPTO_X_VLLM_LOG", "vllm_integration",
++        "Log path for the vLLM plugin", "unset", "file path",
++        "vllm", "log_path", False,
++        "logging output only",
++        "not_an_artifact_input", "integration.vllm.log", "deprecated",
++        "python/pypto_x_vllm/plugin.py:52",
++    ),
++    _spec(
++        "PYPTO_X_TORCH_FALLBACK_WARNINGS", "vllm_integration",
++        "Emit warnings when the torch bridge falls back", "unset", "0|1",
++        "framework", "logging", False,
++        "observability switch only",
++        "not_an_artifact_input", "observability.fallback_warnings", "deprecated",
++        "python/pypto/framework/torch_ops.py:101",
++    ),
++    # -- developer / resource ---------------------------------------------
++    _spec(
++        "PYPTO_X_LOCAL_HEAVY_RUNNER", "dev_resource",
++        "Heavy-runner script used by local resource-locked tests", "unset", "file path",
++        "developer", "infra_path", False,
++        "developer infrastructure path; never enters an artifact",
++        "not_an_artifact_input", "developer.resource.runner", "internal",
++        "scripts/vendor/run_heavy_with_retry.sh:39",
++    ),
++    _spec(
++        "PYPTO_X_RESOURCE_LOCK_ROOT", "dev_resource",
++        "Cross-project resource-lock root", "unset", "directory path",
++        "developer", "infra_path", False,
++        "developer infrastructure path; never enters an artifact",
++        "not_an_artifact_input", "developer.resource.lock_root", "internal",
++        "python/tests/ut/pypto_x/qwen35_weighted_execution_evidence.py:123",
++    ),
++    _spec(
++        "PYPTO_X_RESOURCE_USAGE_DIR", "dev_resource",
++        "Resource-usage log directory", "unset", "directory path",
++        "developer", "infra_path", False,
++        "developer infrastructure path; never enters an artifact",
++        "not_an_artifact_input", "developer.resource.usage_dir", "internal",
++        "python/tests/ut/pypto_x/qwen35_weighted_execution_evidence.py:153",
++    ),
++)
++
++#: Process thread environment consumed by the pinned AOCL/BLIS artifact.  Not
++#: part of the 35 project variables, but the resolver probe captures it in the
++#: capability snapshot digest.
++RUNTIME_ENV_VARS = (
++    _spec(
++        "OMP_NUM_THREADS", "provider_thread_env",
++        "OpenMP thread count captured by the pinned AOCL/BLIS library at load",
++        "unset", "positive integer", "execution", "thread_env", False,
++        "AOCL capability probe captures default_threads; the capability snapshot "
++        "digest (and therefore the plan digest) changes with it",
++        "captured_in_capability_or_policy_digest",
++        "ExecutionPolicy(resources.max_threads=N)", "active",
++        "python/pypto/execution/provider_aocl.py:228,246",
++    ),
++    _spec(
++        "BLIS_NUM_THREADS", "provider_thread_env",
++        "BLIS thread count captured by the pinned AOCL library at load",
++        "unset", "positive integer", "execution", "thread_env", False,
++        "AOCL capability probe captures default_threads; the capability snapshot "
++        "digest (and therefore the plan digest) changes with it",
++        "captured_in_capability_or_policy_digest",
++        "ExecutionPolicy(resources.max_threads=N)", "active",
++        "python/pypto/execution/provider_aocl.py:228,246",
++    ),
++)
++
++#: Registry control switch, kept outside the 35 measured project variables.
++CONTROL_ENV_VARS = (
++    _spec(
++        ENV_DEPRECATION_WARNINGS, "registry_control",
++        "Silence the one-time environment deprecation warnings", "unset", "0|1",
++        "registry", "warning_switch", False,
++        "warning output only; never enters an artifact",
++        "not_an_artifact_input", "none (registry switch)", "internal",
++        "python/pypto/execution/env_registry.py",
++    ),
++)
++
++#: Variables discovered by the U4 read-scan *after* the 0005 section 3.2
++#: inventory was frozen (they were added by later W8/C8 work).  They are
++#: registered here instead of being left as silent unregistered reads.
++EXTRA_ENV_VARS = (
++    _spec(
++        "PYPTO_X_OP_BENCH_AOCL_LIB", "toolchain_path",
++        "AOCL shared-library override for the op-bench provider", "unset", "file path",
++        "tooling", "library_override", True,
++        "selects the library the op-bench AOCL provider loads; the execution "
++        "layer's pinned AOCL provider does not read it",
++        "outside_registered_execution_providers",
++        "op-bench --aocl-lib / provider plugin config", "internal",
++        "python/pypto/op_bench/provider_aocl.py:50",
++    ),
++    _spec(
++        "PYPTO_X_SVE_W8A8_DECODE_MEMO", "performance",
++        "Enable the SVE256 W8A8 decode memo cache", "1", "0|1",
++        "backend", "cache_switch", False,
++        "memo on/off only; a memo hit re-hashes the on-disk ELF against the "
++        "decode-time digest before use (fail-closed), so artifact bytes are unchanged",
++        "not_an_artifact_input", "cache.sve256_w8a8_memo.enabled", "internal",
++        "python/pypto/backends/cpu/aarch64/sve256.py:1670-1675",
++    ),
++)
++
++ALL_ENV_VARS = MIGRATION_ENV_VARS + EXTRA_ENV_VARS + RUNTIME_ENV_VARS + CONTROL_ENV_VARS
++
++_BY_NAME = {spec.name: spec for spec in ALL_ENV_VARS}
++_MIGRATION_NAMES = tuple(spec.name for spec in MIGRATION_ENV_VARS)
++_WARNED: Dict[str, str] = {}
++
++
++def migration_env_vars() -> Tuple[EnvVarSpec, ...]:
++    """The 35 registered project variables from 0005 section 3.2."""
++
++    return MIGRATION_ENV_VARS
++
++
++def extra_env_vars() -> Tuple[EnvVarSpec, ...]:
++    """Registered variables discovered after the frozen 0005 inventory."""
++
++    return EXTRA_ENV_VARS
++
++
++def runtime_env_vars() -> Tuple[EnvVarSpec, ...]:
++    return RUNTIME_ENV_VARS
++
++
++def control_env_vars() -> Tuple[EnvVarSpec, ...]:
++    return CONTROL_ENV_VARS
++
++
++def all_env_vars() -> Tuple[EnvVarSpec, ...]:
++    return ALL_ENV_VARS
++
++
++def registered_names() -> Tuple[str, ...]:
++    return tuple(sorted(_BY_NAME))
++
++
++def lookup_env_var(name: str) -> EnvVarSpec:
++    """Return the registry row for ``name`` or raise a structured error."""
++
++    if not isinstance(name, str) or not name.strip():
++        raise ValueError("environment variable name must be a non-empty string")
++    spec = _BY_NAME.get(name.strip())
++    if spec is None:
++        raise KeyError(name.strip())
++    return spec
++
++
++def is_registered(name: str) -> bool:
++    return isinstance(name, str) and name.strip() in _BY_NAME
++
++
++def warnings_enabled(environ: Optional[Mapping[str, str]] = None) -> bool:
++    environment = os.environ if environ is None else environ
++    value = environment.get(ENV_DEPRECATION_WARNINGS)
++    if value is None:
++        return True
++    return str(value).strip().lower() not in ("0", "off", "false", "no")
++
++
++def _value_kind(spec: EnvVarSpec, raw: str) -> Tuple[Optional[str], Any]:
++    if raw is None:
++        return None, None
++    domain = spec.legal_domain.lower()
++    if "0|1" in domain or "flag" in domain:
++        return "flag", raw.strip() == "1"
++    if "integer" in domain:
++        try:
++            return "integer", int(raw)
++        except (TypeError, ValueError):
++            return "non_integer", None
++    if "directory" in domain or "path" in domain or "file" in domain or "root" in domain:
++        return "path", None
++    return "string", None
++
++
++def environment_rows(environ: Optional[Mapping[str, str]] = None) -> Tuple[Mapping[str, Any], ...]:
++    """Doctor-facing rows; raw values are never included."""
++
++    environment = os.environ if environ is None else environ
++    rows = []
++    for spec in ALL_ENV_VARS:
++        raw = environment.get(spec.name)
++        value_kind, interpreted = _value_kind(spec, raw)
++        rows.append(
++            {
++                "name": spec.name,
++                "category": spec.category,
++                "scope": spec.scope,
++                "consumer_kind": spec.consumer_kind,
++                "status": "set" if raw is not None else "unset",
++                "deprecation_status": spec.deprecation_status,
++                "replacement": spec.replacement,
++                "affects_artifact_semantics": spec.affects_artifact_semantics,
++                "semantic_scope": spec.semantic_scope,
++                "digest_status": spec.digest_status,
++                "effect_unproven": spec.effect_unproven,
++                "value_kind": value_kind,
++                "interpreted_value": interpreted,
++            }
++        )
++    return tuple(rows)
++
++
++_SENSITIVE_NAME_PARTS = ("secret", "token", "password", "passwd", "credential", "api_key", "apikey")
++
++
++def _safe_unregistered_name(name: str) -> str:
++    lowered = name.lower()
++    if any(part in lowered for part in _SENSITIVE_NAME_PARTS):
++        return "<redacted-unregistered-name>"
++    return name
++
++
++def _unregistered_risk(name: str) -> str:
++    upper = name.upper()
++    if any(suffix in upper for suffix in ("_HOOKS", "_MODE", "_FORMAT", "_THREADS", "_DEVICE_ID", "_ENABLE")):
++        return "behavior_or_numeric_risk"
++    if any(suffix in upper for suffix in ("_DIR", "_PATH", "_ROOT", "_HOME", "_LOG", "_CACHE")):
++        return "path_or_cache_risk"
++    return "unknown_risk"
++
++
++def unregistered_env_rows(environ: Optional[Mapping[str, str]] = None) -> Tuple[Mapping[str, Any], ...]:
++    """Rows for unregistered ``PYPTO_X_*`` variables (names only, no values)."""
++
++    environment = os.environ if environ is None else environ
++    rows = []
++    for name in sorted(environment):
++        if not name.startswith("PYPTO_X_"):
++            continue
++        if is_registered(name):
++            continue
++        rows.append(
++            {
++                "name": _safe_unregistered_name(name),
++                "risk": _unregistered_risk(name),
++                "status": "unregistered",
++                "policy": "not honored by the execution layer; register or remove it",
++            }
++        )
++    return tuple(rows)
++
++
++def unregistered_env_names(environ: Optional[Mapping[str, str]] = None) -> Tuple[str, ...]:
++    environment = os.environ if environ is None else environ
++    return tuple(
++        sorted(name for name in environment if name.startswith("PYPTO_X_") and not is_registered(name))
++    )
++
++
++def _emit_once(name: str, message: str, category: type) -> bool:
++    if name in _WARNED:
++        return False
++    _WARNED[name] = message
++    warnings.warn(message, category, stacklevel=3)
++    return True
++
++
++def reset_warnings() -> None:
++    """Forget the one-time warning state (used by tests and long-lived tools)."""
++
++    _WARNED.clear()
++
++
++def warn_deprecations(environ: Optional[Mapping[str, str]] = None) -> Tuple[str, ...]:
++    """Emit one warning per set deprecated/unregistered variable.
++
++    Returns the names that produced a warning this call.  Warnings can be
++    silenced with ``PYPTO_X_ENV_DEPRECATION_WARNINGS=0``.
++    """
++
++    environment = os.environ if environ is None else environ
++    if not warnings_enabled(environment):
++        return ()
++    emitted = []
++    for spec in ALL_ENV_VARS:
++        if spec.deprecation_status != "deprecated" or environment.get(spec.name) is None:
++            continue
++        message = (
++            "environment variable {} is deprecated; use {} instead "
++            "(0006 section 9; registry status={})".format(
++                spec.name, spec.replacement, spec.deprecation_status
++            )
++        )
++        if _emit_once("deprecated:" + spec.name, message, EnvDeprecationWarning):
++            emitted.append(spec.name)
++    for name in unregistered_env_names(environment):
++        message = (
++            "unregistered PYPTO_X_* environment variable {} is set; the execution "
++            "layer does not honor it. Register it in pypto.execution.env_registry "
++            "or remove it (0006 section 9: new features must not add env vars).".format(
++                _safe_unregistered_name(name)
++            )
++        )
++        if _emit_once("unregistered:" + name, message, UnregisteredEnvWarning):
++            emitted.append(name)
++    return tuple(emitted)
++
++
++def read_env(
++    name: str,
++    default: Optional[str] = None,
++    environ: Optional[Mapping[str, str]] = None
++) -> Optional[str]:
++    """Compatibility reader for registered variables.
++
++    The returned value is exactly ``environ[name]`` (old behavior unchanged).
++    Deprecated variables emit a one-time deprecation warning; unknown
++    ``PYPTO_X_*`` names are warned about as unregistered.  Non-project names
++    (for example ``OMP_NUM_THREADS``) are read without warnings.
++    """
++
++    environment = os.environ if environ is None else environ
++    raw = environment.get(name, default)
++    if not warnings_enabled(environment):
++        return raw
++    spec = _BY_NAME.get(name)
++    if spec is not None:
++        if spec.deprecation_status == "deprecated" and environment.get(name) is not None:
++            _emit_once(
++                "deprecated:" + name,
++                "environment variable {} is deprecated; use {} instead "
++                "(0006 section 9; registry status={})".format(
++                    name, spec.replacement, spec.deprecation_status
++                ),
++                EnvDeprecationWarning,
++            )
++        return raw
++    if isinstance(name, str) and name.startswith("PYPTO_X_"):
++        _emit_once(
++            "unregistered:" + name,
++            "unregistered PYPTO_X_* environment variable {} is set; the execution "
++            "layer does not honor it. Register it in pypto.execution.env_registry "
++            "or remove it.".format(_safe_unregistered_name(name)),
++            UnregisteredEnvWarning,
++        )
++    return raw
++
++
++def policy_hints_from_env(environ: Optional[Mapping[str, str]] = None) -> Mapping[str, Any]:
++    """Declarative policy fragments equivalent to the registered compat aliases.
++
++    This only *suggests* the declaration; it never applies it implicitly, so a
++    process environment cannot silently override an explicit ``ExecutionPolicy``.
++    """
++
++    environment = os.environ if environ is None else environ
++    hints = {}
++    portable = environment.get("PYPTO_X_PORTABLE_ONLY")
++    if portable is not None:
++        hints["profile"] = "portable"
++        hints["provider"] = {"mode": "portable"}
++        hints["compat_source"] = {"PYPTO_X_PORTABLE_ONLY": portable == "1"}
++    max_threads = None
++    for name in ("PYPTO_X_AVX512_GEMM_THREADS", "PYPTO_X_VLLM_GEMM_THREADS"):
++        raw = environment.get(name)
++        if raw is None:
++            continue
++        try:
++            parsed = int(raw)
++        except (TypeError, ValueError):
++            continue
++        if parsed >= 1:
++            max_threads = parsed if max_threads is None else min(max_threads, parsed)
++    if max_threads is not None:
++        hints.setdefault("resources", {})["max_threads"] = max_threads
++    device = environment.get("PYPTO_X_ASCEND_DEVICE_ID")
++    if device is not None:
++        try:
++            hints.setdefault("placement", {})["device"] = int(device)
++        except (TypeError, ValueError):
++            pass
++    return hints
++
++
++def registry_document() -> Mapping[str, Any]:
++    """Machine-readable registry table (discovery entry point)."""
++
++    return {
++        "registry_schema_version": ENV_REGISTRY_SCHEMA_VERSION,
++        "categories": list(ENV_CATEGORIES),
++        "deprecation_statuses": list(DEPRECATION_STATUSES),
++        "digest_statuses": list(DIGEST_STATUSES),
++        "migration_var_count": len(MIGRATION_ENV_VARS),
++        "extra_var_count": len(EXTRA_ENV_VARS),
++        "runtime_var_count": len(RUNTIME_ENV_VARS),
++        "control_var_count": len(CONTROL_ENV_VARS),
++        "variables": [spec.to_dict() for spec in ALL_ENV_VARS],
++    }
++
++
++__all__ = [
++    "ALL_ENV_VARS",
++    "CONTROL_ENV_VARS",
++    "DEPRECATION_STATUSES",
++    "EXTRA_ENV_VARS",
++    "DIGEST_STATUSES",
++    "ENV_CATEGORIES",
++    "ENV_DEPRECATION_WARNINGS",
++    "ENV_REGISTRY_SCHEMA_VERSION",
++    "MIGRATION_ENV_VARS",
++    "RUNTIME_ENV_VARS",
++    "EnvDeprecationWarning",
++    "EnvVarSpec",
++    "UnregisteredEnvWarning",
++    "all_env_vars",
++    "control_env_vars",
++    "environment_rows",
++    "extra_env_vars",
++    "is_registered",
++    "lookup_env_var",
++    "migration_env_vars",
++    "policy_hints_from_env",
++    "read_env",
++    "registered_names",
++    "reset_warnings",
++    "registry_document",
++    "runtime_env_vars",
++    "unregistered_env_names",
++    "unregistered_env_rows",
++    "warn_deprecations",
++    "warnings_enabled",
++]
+diff --git a/python/tests/ut/pypto_x/test_execution_discovery.py b/python/tests/ut/pypto_x/test_execution_discovery.py
+index e52d80e27..3b3ee06a4 100644
+--- a/python/tests/ut/pypto_x/test_execution_discovery.py
++++ b/python/tests/ut/pypto_x/test_execution_discovery.py
+@@ -148,7 +148,6 @@ _FORBIDDEN_DOC_SUBSTRINGS = (
+     "apikey",
+     "token=",
+     "PRIVATE KEY",
+-    "hwhiaiuser",
+ )
+ 
+ 
+@@ -273,11 +272,17 @@ def test_doctor_reports_pinned_library_and_environment_status():
+     assert doctor_document()["kind"] == "doctor"
+ 
+ 
+-def test_doctor_never_leaks_private_access_information():
++def test_doctor_never_leaks_private_access_information(monkeypatch):
++    # Registered *names* are public (they are enumerated in 0005 section 3.2);
++    # the report must never echo their values or any credential/endpoint text.
++    marker = "u3-doctor-marker-7f3a9c"
++    monkeypatch.setenv("PYPTO_X_QWEN35_ASSETS_DIR", marker)
++    monkeypatch.setenv("PYPTO_X_TORCH_CACHE_DIR", marker)
+     text = json.dumps(doctor().to_dict(), ensure_ascii=False, sort_keys=True)
+     lowered = text.lower()
+     for needle in _FORBIDDEN_DOC_SUBSTRINGS:
+         assert needle.lower() not in lowered, "doctor leaked {!r}".format(needle)
++    assert marker not in text, "doctor leaked a raw environment value"
+ 
+ 
+ def test_doctor_does_not_execute_any_provider(monkeypatch):
+@@ -745,6 +750,9 @@ def test_cli_doctor_json_is_machine_readable_and_leak_free(tmp_path):
+     lowered = completed.stdout.lower()
+     for needle in _FORBIDDEN_DOC_SUBSTRINGS:
+         assert needle.lower() not in lowered, "CLI doctor leaked {!r}".format(needle)
++    assert document["environment"]["raw_values_included"] is False
++    for row in document["environment"]["variables"]:
++        assert "value" not in row
+ 
+ 
+ def test_cli_plan_and_explain_round_trip(tmp_path):
+diff --git a/python/tests/ut/pypto_x/test_execution_env_registry.py b/python/tests/ut/pypto_x/test_execution_env_registry.py
+new file mode 100644
+index 000000000..055cef3da
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_execution_env_registry.py
+@@ -0,0 +1,487 @@
++"""U4 environment-variable registry (P0) + compatibility layer (P1).
++
++Covers the frozen 35-variable inventory from
++``docs/10-architecture/0005-...`` section 3.2, the registry discovery API,
++the one-time deprecation/unregistered warnings, the doctor integration and
++the semantic-digest conclusions (representative experiments plus static
++"no unregistered PYPTO_X reads in the execution layer" evidence).
++
++As with the other PyPTO-X unit tests, a synthetic ``pypto`` package namespace
++is used so the upstream native initializer is never triggered.
++"""
++
++from __future__ import annotations
++
++import ast
++import json
++import os
++from pathlib import Path
++import re
++import subprocess
++import sys
++import types
++import warnings
++
++import pytest
++
++
++# The frozen inventory from docs/10-architecture/0005 section 3.2.
++FROZEN_35 = (
++    "PYPTO_X_AVX2_BUILD_DIR", "PYPTO_X_AVX2_ARTIFACT_DIR", "PYPTO_X_AVX2_PROBE_DIR",
++    "PYPTO_X_AVX512_BUILD_DIR", "PYPTO_X_AVX512_ARTIFACT_DIR", "PYPTO_X_AVX512_PROBE_DIR",
++    "PYPTO_X_SVE256_BUILD_DIR", "PYPTO_X_SVE256_ARTIFACT_DIR",
++    "PYPTO_X_ASCEND_BUILD_DIR", "PYPTO_X_ASCEND_ARTIFACT_FORMAT",
++    "PYPTO_X_AARCH64_SYSROOT", "PYPTO_X_CANN_INSTALL_PATH", "PYPTO_X_CANN_META_ROOT",
++    "PYPTO_X_PTO_ISA_ROOT", "PYPTO_X_PYPTO_ROOT", "PYPTO_X_HWHIAIUSER_HOME",
++    "PYPTO_X_TORCH_CACHE_DIR",
++    "PYPTO_X_AVX512_GEMM_THREADS", "PYPTO_X_AVX512_WEIGHT_CACHE", "PYPTO_X_VLLM_GEMM_THREADS",
++    "PYPTO_X_ASCEND_DEVICE_ID", "PYPTO_X_ASCEND_HOOKS", "PYPTO_X_SVE_QEMU_CPU",
++    "PYPTO_X_SVE_TEST_MODE", "PYPTO_X_PORTABLE_ONLY",
++    "PYPTO_X_QWEN35_ASSET_DIR", "PYPTO_X_QWEN35_ASSETS_DIR", "PYPTO_X_QWEN35_WEIGHTED_WORKTREE",
++    "PYPTO_X_VLLM_ENABLE", "PYPTO_X_VLLM_GATE_JSON", "PYPTO_X_VLLM_LOG",
++    "PYPTO_X_TORCH_FALLBACK_WARNINGS",
++    "PYPTO_X_LOCAL_HEAVY_RUNNER", "PYPTO_X_RESOURCE_LOCK_ROOT", "PYPTO_X_RESOURCE_USAGE_DIR",
++)
++
++
++def _imports():
++    package_root = Path(__file__).parents[3] / "pypto"
++    saved = {name: module for name, module in sys.modules.items() if name == "pypto" or name.startswith("pypto.")}
++    for name in list(saved):
++        del sys.modules[name]
++    package = types.ModuleType("pypto")
++    package.__path__ = [str(package_root)]
++    sys.modules["pypto"] = package
++    try:
++        from pypto.backends.cpu import HostTensor
++        from pypto.execution import (
++            ARTIFACT_MISMATCH,
++            ENV_DEPRECATION_WARNINGS,
++            ENV_REGISTRY_SCHEMA_VERSION,
++            EnvDeprecationWarning,
++            EnvVarSpec,
++            ExecutionPlan,
++            ExecutionPolicy,
++            UnregisteredEnvWarning,
++            all_env_vars,
++            control_env_vars,
++            doctor_document,
++            environment_rows,
++            execute_matmul_plan,
++            extra_env_vars,
++            is_registered,
++            lookup_env_var,
++            migration_env_vars,
++            plan_request,
++            policy_hints_from_env,
++            read_env,
++            registered_names,
++            registry_document,
++            reset_warnings,
++            runtime_env_vars,
++            unregistered_env_names,
++            unregistered_env_rows,
++            warn_deprecations,
++            warnings_enabled,
++        )
++        from pypto.execution.errors import ExecutionError
++        from pypto.execution import env_registry
++        return locals()
++    finally:
++        for name in list(sys.modules):
++            if name == "pypto" or name.startswith("pypto."):
++                del sys.modules[name]
++        sys.modules.update(saved)
++
++
++_C = _imports()
++ARTIFACT_MISMATCH = _C["ARTIFACT_MISMATCH"]
++ENV_DEPRECATION_WARNINGS = _C["ENV_DEPRECATION_WARNINGS"]
++ENV_REGISTRY_SCHEMA_VERSION = _C["ENV_REGISTRY_SCHEMA_VERSION"]
++EnvDeprecationWarning = _C["EnvDeprecationWarning"]
++EnvVarSpec = _C["EnvVarSpec"]
++ExecutionError = _C["ExecutionError"]
++ExecutionPlan = _C["ExecutionPlan"]
++ExecutionPolicy = _C["ExecutionPolicy"]
++HostTensor = _C["HostTensor"]
++UnregisteredEnvWarning = _C["UnregisteredEnvWarning"]
++all_env_vars = _C["all_env_vars"]
++control_env_vars = _C["control_env_vars"]
++doctor_document = _C["doctor_document"]
++env_registry = _C["env_registry"]
++environment_rows = _C["environment_rows"]
++execute_matmul_plan = _C["execute_matmul_plan"]
++extra_env_vars = _C["extra_env_vars"]
++is_registered = _C["is_registered"]
++lookup_env_var = _C["lookup_env_var"]
++migration_env_vars = _C["migration_env_vars"]
++plan_request = _C["plan_request"]
++policy_hints_from_env = _C["policy_hints_from_env"]
++read_env = _C["read_env"]
++registered_names = _C["registered_names"]
++registry_document = _C["registry_document"]
++reset_warnings = _C["reset_warnings"]
++runtime_env_vars = _C["runtime_env_vars"]
++unregistered_env_names = _C["unregistered_env_names"]
++unregistered_env_rows = _C["unregistered_env_rows"]
++warn_deprecations = _C["warn_deprecations"]
++warnings_enabled = _C["warnings_enabled"]
++
++REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
++PYTHON_ROOT = REPOSITORY_ROOT / "python"
++EXECUTION_DIR = PYTHON_ROOT / "pypto" / "execution"
++
++_ENV_READ_PATTERN = re.compile(
++    r'(?:environ(?:\.get)?\s*[\(\[]\s*["\']|getenv\s*\(\s*["\'])(PYPTO_X_[A-Z0-9_]+)'
++)
++
++
++@pytest.fixture(autouse=True)
++def _clean_warning_state():
++    reset_warnings()
++    yield
++    reset_warnings()
++
++
++def _run_cli(*arguments, env_overrides=None, cwd=None):
++    environment = os.environ.copy()
++    environment["PYPTO_X_PORTABLE_ONLY"] = "1"
++    environment["PYTHONPATH"] = str(PYTHON_ROOT)
++    environment[ENV_DEPRECATION_WARNINGS] = "0"
++    environment.update(env_overrides or {})
++    return subprocess.run(
++        [sys.executable, "-S", "-m", "pypto.execution.cli", *arguments],
++        cwd=str(cwd or REPOSITORY_ROOT),
++        env=environment,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++        check=False,
++    )
++
++
++def _plan_digest(env_overrides=None, tmp_path=None):
++    completed = _run_cli(
++        "plan", "--op", "matmul", "--left", "2,3", "--right", "3,4", "--dtype", "float32",
++        "--json", env_overrides=env_overrides, cwd=tmp_path,
++    )
++    assert completed.returncode == 0, completed.stderr
++    return json.loads(completed.stdout)["plan_digest"]
++
++
++# ---------------------------------------------------------------------------
++# P0 registry
++# ---------------------------------------------------------------------------
++def test_registry_covers_the_frozen_35_variables():
++    names = tuple(spec.name for spec in migration_env_vars())
++    assert len(names) == 35
++    assert set(names) == set(FROZEN_35)
++    assert len(set(names)) == 35
++    for spec in migration_env_vars():
++        assert isinstance(spec, EnvVarSpec)
++        assert spec.category in env_registry.ENV_CATEGORIES
++        assert spec.meaning
++        assert spec.legal_domain
++        assert spec.scope
++        assert spec.replacement
++        assert spec.deprecation_status in env_registry.DEPRECATION_STATUSES
++        assert spec.digest_status in env_registry.DIGEST_STATUSES
++        assert spec.effect_evidence
++
++
++def test_registry_discovery_entry_points():
++    document = registry_document()
++    assert document["registry_schema_version"] == ENV_REGISTRY_SCHEMA_VERSION
++    assert document["migration_var_count"] == 35
++    assert document["runtime_var_count"] == 2
++    assert document["control_var_count"] == 1
++    assert document["extra_var_count"] == 2
++    assert len(document["variables"]) == 40
++    spec = lookup_env_var("PYPTO_X_PORTABLE_ONLY")
++    assert spec.deprecation_status == "deprecated"
++    assert spec.replacement.startswith("ExecutionPolicy")
++    assert is_registered("PYPTO_X_PORTABLE_ONLY")
++    assert not is_registered("PYPTO_X_NOT_REGISTERED")
++    with pytest.raises(KeyError):
++        lookup_env_var("PYPTO_X_NOT_REGISTERED")
++    assert registered_names() == tuple(sorted(registered_names()))
++
++
++def test_extra_env_vars_are_registered_not_silently_read():
++    extra = {spec.name for spec in extra_env_vars()}
++    assert extra == {"PYPTO_X_OP_BENCH_AOCL_LIB", "PYPTO_X_SVE_W8A8_DECODE_MEMO"}
++    assert extra <= set(registered_names())
++    for spec in extra_env_vars():
++        assert spec.effect_evidence
++
++
++def test_execution_layer_and_python_tree_have_no_unregistered_pyp_to_x_reads():
++    registered = set(registered_names())
++    found = {}
++    for path in (PYTHON_ROOT / "pypto").rglob("*.py"):
++        if "__pycache__" in str(path):
++            continue
++        text = path.read_text(encoding="utf-8", errors="replace")
++        for match in _ENV_READ_PATTERN.finditer(text):
++            found.setdefault(match.group(1), set()).add(str(path.relative_to(REPOSITORY_ROOT)))
++    assert found, "the scan should find the known environment reads"
++    unregistered = {name: sorted(files) for name, files in found.items() if name not in registered}
++    assert not unregistered, "unregistered reads: {}".format(unregistered)
++
++
++# ---------------------------------------------------------------------------
++# P1 compatibility layer
++# ---------------------------------------------------------------------------
++def test_read_env_preserves_legacy_behavior(monkeypatch):
++    monkeypatch.setenv("PYPTO_X_AVX512_GEMM_THREADS", "4")
++    with pytest.warns(EnvDeprecationWarning):
++        assert read_env("PYPTO_X_AVX512_GEMM_THREADS") == "4"
++    monkeypatch.setenv("PYPTO_X_SVE_TEST_MODE", "host")
++    assert read_env("PYPTO_X_SVE_TEST_MODE") == "host"
++    monkeypatch.setenv("OMP_NUM_THREADS", "6")
++    assert read_env("OMP_NUM_THREADS") == "6"
++    monkeypatch.delenv("PYPTO_X_TORCH_CACHE_DIR", raising=False)
++    assert read_env("PYPTO_X_TORCH_CACHE_DIR", default="/tmp/cache") == "/tmp/cache"
++
++
++def test_deprecated_env_warns_once_and_can_be_silenced(monkeypatch):
++    monkeypatch.setenv("PYPTO_X_TORCH_CACHE_DIR", "/tmp/u4-cache")
++    with warnings.catch_warnings(record=True) as captured:
++        warnings.simplefilter("always")
++        assert read_env("PYPTO_X_TORCH_CACHE_DIR") == "/tmp/u4-cache"
++        assert read_env("PYPTO_X_TORCH_CACHE_DIR") == "/tmp/u4-cache"
++    deprecations = [item for item in captured if issubclass(item.category, EnvDeprecationWarning)]
++    assert len(deprecations) == 1
++
++    reset_warnings()
++    monkeypatch.setenv(ENV_DEPRECATION_WARNINGS, "0")
++    assert not warnings_enabled()
++    with warnings.catch_warnings(record=True) as captured:
++        warnings.simplefilter("always")
++        read_env("PYPTO_X_TORCH_CACHE_DIR")
++        read_env("PYPTO_X_TORCH_CACHE_DIR")
++    assert captured == []
++
++    # An internal-status variable never emits a user deprecation warning.
++    reset_warnings()
++    monkeypatch.delenv(ENV_DEPRECATION_WARNINGS, raising=False)
++    monkeypatch.setenv("PYPTO_X_SVE_TEST_MODE", "host")
++    with warnings.catch_warnings(record=True) as captured:
++        warnings.simplefilter("always")
++        read_env("PYPTO_X_SVE_TEST_MODE")
++    assert captured == []
++
++
++def test_warn_deprecations_is_one_time_and_reports_unregistered(monkeypatch):
++    monkeypatch.setenv("PYPTO_X_PORTABLE_ONLY", "1")
++    monkeypatch.setenv("PYPTO_X_U4_UNREGISTERED_PROBE", "1")
++    with warnings.catch_warnings(record=True) as captured:
++        warnings.simplefilter("always")
++        first = warn_deprecations()
++        second = warn_deprecations()
++    assert "PYPTO_X_PORTABLE_ONLY" in first
++    assert "PYPTO_X_U4_UNREGISTERED_PROBE" in first
++    assert second == ()
++    deprecations = [item for item in captured if issubclass(item.category, EnvDeprecationWarning)]
++    unregistered = [item for item in captured if issubclass(item.category, UnregisteredEnvWarning)]
++    assert len(deprecations) == 1
++    assert len(unregistered) == 1
++
++
++def test_policy_hints_from_env_are_declarative_only(monkeypatch):
++    monkeypatch.setenv("PYPTO_X_PORTABLE_ONLY", "1")
++    monkeypatch.setenv("PYPTO_X_AVX512_GEMM_THREADS", "6")
++    monkeypatch.setenv("PYPTO_X_VLLM_GEMM_THREADS", "3")
++    monkeypatch.setenv("PYPTO_X_ASCEND_DEVICE_ID", "2")
++    hints = policy_hints_from_env()
++    assert hints["profile"] == "portable"
++    assert hints["provider"]["mode"] == "portable"
++    assert hints["resources"]["max_threads"] == 3
++    assert hints["placement"]["device"] == 2
++    monkeypatch.delenv("PYPTO_X_PORTABLE_ONLY")
++    monkeypatch.delenv("PYPTO_X_AVX512_GEMM_THREADS")
++    monkeypatch.delenv("PYPTO_X_VLLM_GEMM_THREADS")
++    monkeypatch.delenv("PYPTO_X_ASCEND_DEVICE_ID")
++    assert policy_hints_from_env() == {}
++
++
++def test_unregistered_env_rows_are_reported_and_sensitive_names_redacted(monkeypatch):
++    monkeypatch.setenv("PYPTO_X_U4_UNREGISTERED_PROBE", "1")
++    monkeypatch.setenv("PYPTO_X_MY_SECRET_TOKEN", "super-secret-value")
++    rows = unregistered_env_rows()
++    names = [row["name"] for row in rows]
++    assert "PYPTO_X_U4_UNREGISTERED_PROBE" in names
++    assert "<redacted-unregistered-name>" in names
++    text = json.dumps(rows, sort_keys=True)
++    assert "super-secret-value" not in text
++    assert "PYPTO_X_MY_SECRET_TOKEN" not in text
++    assert "PYPTO_X_PORTABLE_ONLY" not in names
++    assert "PYPTO_X_U4_UNREGISTERED_PROBE" in unregistered_env_names()
++
++
++# ---------------------------------------------------------------------------
++# doctor integration
++# ---------------------------------------------------------------------------
++def test_doctor_environment_is_registry_driven(monkeypatch):
++    monkeypatch.setenv("PYPTO_X_PORTABLE_ONLY", "1")
++    document = doctor_document()
++    environment = document["environment"]
++    assert environment["source"] == "pypto.execution.env_registry"
++    assert environment["schema_version"] == ENV_REGISTRY_SCHEMA_VERSION
++    assert environment["raw_values_included"] is False
++    assert environment["allowlist"] == list(registered_names())
++    assert environment["deprecation_warning_switch"] == ENV_DEPRECATION_WARNINGS
++    rows = {row["name"]: row for row in environment["variables"]}
++    assert len(rows) == 40
++    assert set(rows) == set(registered_names())
++    for row in rows.values():
++        assert "value" not in row
++        assert row["status"] in ("set", "unset")
++        assert row["category"] in env_registry.ENV_CATEGORIES
++        assert row["deprecation_status"] in env_registry.DEPRECATION_STATUSES
++        assert row["digest_status"] in env_registry.DIGEST_STATUSES
++        assert isinstance(row["affects_artifact_semantics"], bool)
++        assert row["replacement"]
++    assert rows["PYPTO_X_PORTABLE_ONLY"]["status"] == "set"
++    assert rows["PYPTO_X_PORTABLE_ONLY"]["deprecation_status"] == "deprecated"
++    assert rows["PYPTO_X_PORTABLE_ONLY"]["interpreted_value"] is True
++    assert rows["BLIS_NUM_THREADS"]["digest_status"] == "captured_in_capability_or_policy_digest"
++    registry_block = document["env_registry"]
++    assert registry_block["migration_var_count"] == 35
++    assert registry_block["extra_var_count"] == 2
++    assert registry_block["runtime_var_count"] == 2
++    assert registry_block["control_var_count"] == 1
++    assert registry_block["new_env_policy"].startswith("new features must not add")
++
++
++def test_doctor_unregistered_block_and_no_value_leak(monkeypatch):
++    marker = "u4-doctor-marker-a1b2c3"
++    monkeypatch.setenv("PYPTO_X_QWEN35_ASSETS_DIR", marker)
++    monkeypatch.setenv("PYPTO_X_U4_UNREGISTERED_PROBE", marker)
++    document = doctor_document()
++    text = json.dumps(document, ensure_ascii=False, sort_keys=True)
++    assert marker not in text
++    unregistered = document["environment"]["unregistered"]
++    assert any(row["name"] == "PYPTO_X_U4_UNREGISTERED_PROBE" for row in unregistered)
++    assert document["env_registry"]["unregistered_count"] == len(unregistered)
++
++
++def test_semantic_verdicts_are_complete_and_never_unproven_without_a_marker():
++    for spec in all_env_vars():
++        assert spec.effect_evidence, spec.name
++        if spec.effect_unproven:
++            assert spec.digest_status == "effect_unproven", spec.name
++        if spec.affects_artifact_semantics:
++            assert spec.digest_status in (
++                "captured_in_capability_or_policy_digest",
++                "outside_registered_execution_providers",
++                "effect_unproven",
++            ), spec.name
++    for spec in runtime_env_vars():
++        assert spec.digest_status == "captured_in_capability_or_policy_digest"
++    for spec in migration_env_vars():
++        assert spec.digest_status != "captured_in_capability_or_policy_digest" or spec.scope == "execution"
++
++
++# ---------------------------------------------------------------------------
++# semantic digest experiments
++# ---------------------------------------------------------------------------
++def test_representative_migration_env_does_not_change_plan_digest(tmp_path):
++    baseline = _plan_digest(tmp_path=tmp_path)
++    for overrides in (
++        {"PYPTO_X_PORTABLE_ONLY": "1"},
++        {"PYPTO_X_AVX512_GEMM_THREADS": "3"},
++        {"PYPTO_X_VLLM_GEMM_THREADS": "2"},
++        {"PYPTO_X_ASCEND_ARTIFACT_FORMAT": "pypto-x.ascend.test"},
++        {"PYPTO_X_ASCEND_HOOKS": "1"},
++        {"PYPTO_X_SVE_TEST_MODE": "host"},
++        {"PYPTO_X_AARCH64_SYSROOT": "/usr/aarch64-linux-gnu"},
++        {"PYPTO_X_TORCH_CACHE_DIR": str(tmp_path / "cache")},
++        {"PYPTO_X_QWEN35_ASSETS_DIR": str(tmp_path / "assets")},
++        {"PYPTO_X_AVX512_WEIGHT_CACHE": "1"},
++    ):
++        assert _plan_digest(env_overrides=overrides, tmp_path=tmp_path) == baseline, overrides
++
++
++def test_thread_env_is_captured_in_capability_digest_and_fails_closed(tmp_path):
++    baseline = _plan_digest(tmp_path=tmp_path)
++    captured = _plan_digest(env_overrides={"BLIS_NUM_THREADS": "2"}, tmp_path=tmp_path)
++    assert captured != baseline, "BLIS_NUM_THREADS must be captured by the capability snapshot digest"
++
++    plan_path = tmp_path / "plan.json"
++    completed = _run_cli(
++        "plan", "--op", "matmul", "--left", "2,3", "--right", "3,4", "--dtype", "float32",
++        "--out", str(plan_path), "--json",
++        env_overrides={"BLIS_NUM_THREADS": "2"},
++        cwd=tmp_path,
++    )
++    assert completed.returncode == 0, completed.stderr
++    child = r'''
++import json, sys
++sys.path.insert(0, {python_root!r})
++from pypto.execution import ExecutionPlan, execute_matmul_plan
++from pypto.backends.cpu import HostTensor
++document = json.loads(open({plan_path!r}).read())
++plan = ExecutionPlan.from_dict(document["plan"])
++left = HostTensor("float32", (2, 3), [1, 2, 3, 4, 5, 6])
++right = HostTensor("float32", (3, 4), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
++try:
++    execute_matmul_plan(plan, left, right)
++except Exception as exc:
++    print(json.dumps({{"code": getattr(exc, "code", type(exc).__name__), "reason": getattr(exc, "reason", None)}}))
++'''.format(python_root=str(PYTHON_ROOT), plan_path=str(plan_path))
++    environment = os.environ.copy()
++    environment["PYPTO_X_PORTABLE_ONLY"] = "1"
++    environment[ENV_DEPRECATION_WARNINGS] = "0"
++    environment.pop("BLIS_NUM_THREADS", None)
++    environment.pop("OMP_NUM_THREADS", None)
++    completed = subprocess.run(
++        [sys.executable, "-S", "-c", child],
++        env=environment,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++        check=False,
++        cwd=str(tmp_path),
++    )
++    assert completed.returncode == 0, completed.stderr
++    result = json.loads(completed.stdout.strip().splitlines()[-1])
++    assert result["code"] == ARTIFACT_MISMATCH
++    assert result["reason"] == "capability_digest_mismatch"
++
++
++# ---------------------------------------------------------------------------
++# CLI warnings
++# ---------------------------------------------------------------------------
++def test_cli_doctor_warns_on_deprecated_env_and_switch_silences(tmp_path):
++    completed = _run_cli(
++        "doctor", "--json",
++        env_overrides={
++            "PYPTO_X_TORCH_CACHE_DIR": str(tmp_path / "cache"),
++            ENV_DEPRECATION_WARNINGS: "1",
++        },
++        cwd=tmp_path,
++    )
++    assert completed.returncode == 0, completed.stderr
++    assert "deprecated" in completed.stderr
++    assert "PYPTO_X_TORCH_CACHE_DIR" in completed.stderr
++
++    silenced = _run_cli(
++        "doctor", "--json",
++        env_overrides={
++            "PYPTO_X_TORCH_CACHE_DIR": str(tmp_path / "cache"),
++            ENV_DEPRECATION_WARNINGS: "0",
++        },
++        cwd=tmp_path,
++    )
++    assert silenced.returncode == 0
++    assert "deprecated" not in silenced.stderr
++
++
++# ---------------------------------------------------------------------------
++# source gate
++# ---------------------------------------------------------------------------
++def test_u4_sources_parse_under_python37():
++    sources = [EXECUTION_DIR / "env_registry.py", Path(__file__)]
++    for path in sources:
++        ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 7))
