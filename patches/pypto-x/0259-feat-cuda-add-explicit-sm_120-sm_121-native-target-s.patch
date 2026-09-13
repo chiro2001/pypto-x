@@ -1,0 +1,1323 @@
+From 1fdecc8dba788e6f3a7596acedc9e0d6611210b3 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sun, 13 Sep 2026 12:19:02 +0800
+Subject: [PATCH 259/264] feat(cuda): add explicit sm_120/sm_121 native target
+ selection
+
+Add first-class CUDA arch selection without changing the default path:
+
+* new CUDA_ARCH_PTX_VERSIONS registry (sm_80->8.0, sm_120->8.7,
+  sm_121->8.8, verified against ptxas 13.3.73 and the 5080 driver JIT);
+* CudaPtxCompiler(arch=...) and ptx_target=... resolve the required PTX
+  ISA version instead of emitting an unloadable header; TargetSpec
+  attribute arch='sm_120' selects the same path through lower();
+* explicit selection is recorded in the artifact payload/metadata as
+  arch_selection and covered by the payload/content digest; those
+  artifacts use payload version 3, while the default sm_80 path keeps
+  payload version 2 byte-for-byte and old artifacts keep decoding;
+* strict decode accepts only v2 (no selection) or v3 (selection
+  required and cross-checked), so old readers fail closed on v3 and
+  tampered selection blocks are rejected;
+* unit tests cover defaults, both native archs, target-attribute
+  selection, version minima, conflicts, digests and tamper cases;
+* scripts/smoke/cuda_sm120_compare.py adds the prepare/run harness for
+  the real-5080 PTX-JIT vs native-sm_120-cubin comparison.
+
+No thresholds or lock files are touched; sm_121 remains emitter-only on
+the sm_120 RTX 5080 (driver error 218 is recorded honestly).
+---
+ python/pypto/compiler/targets/__init__.py         |  16 ++
+ python/pypto/compiler/targets/cuda.py             | 221 +++++++++++++++-
+ python/tests/ut/pypto_x/test_cuda_sm120_target.py | 256 ++++++++++++++++++
+ scripts/smoke/cuda_sm120_compare.py               | 603 ++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 1085 insertions(+), 11 deletions(-)
+
+diff --git a/python/pypto/compiler/targets/__init__.py b/python/pypto/compiler/targets/__init__.py
+index ef4e8b6c6..179da606c 100644
+--- a/python/pypto/compiler/targets/__init__.py
++++ b/python/pypto/compiler/targets/__init__.py
+@@ -16,6 +16,8 @@ from .gpu import (
+     compile_gpu_common,
+ )
+ from .cuda import (
++    ARCH_SELECTION_PAYLOAD_VERSION,
++    CUDA_ARCH_PTX_VERSIONS,
+     CUDACompiler,
+     CudaCompiler,
+     CudaPtxArtifactError,
+@@ -23,8 +25,14 @@ from .cuda import (
+     CudaPtxError,
+     CudaPtxUnsupportedError,
+     CudaProgram,
++    NATIVE_CUDA_ARCHS,
++    SM120_ARCH,
++    SM121_ARCH,
++    SM80_ARCH,
++    SUPPORTED_CUDA_ARCHS,
+     compile_cuda_ptx,
+     render_ptx,
++    resolve_cuda_arch,
+ )
+ from .cuda_w8a8 import (
+     CUDA_W8A8_ARTIFACT_FORMAT,
+@@ -84,6 +92,14 @@ __all__ = [
+     "CudaProgram",
+     "compile_cuda_ptx",
+     "render_ptx",
++    "ARCH_SELECTION_PAYLOAD_VERSION",
++    "CUDA_ARCH_PTX_VERSIONS",
++    "NATIVE_CUDA_ARCHS",
++    "SM80_ARCH",
++    "SM120_ARCH",
++    "SM121_ARCH",
++    "SUPPORTED_CUDA_ARCHS",
++    "resolve_cuda_arch",
+     "CUDA_W8A8_ARTIFACT_FORMAT",
+     "CUDA_W8A8_BACKEND",
+     "CUDA_W8A8_KERNEL_VERSION",
+diff --git a/python/pypto/compiler/targets/cuda.py b/python/pypto/compiler/targets/cuda.py
+index 66bc644e8..edab97d68 100644
+--- a/python/pypto/compiler/targets/cuda.py
++++ b/python/pypto/compiler/targets/cuda.py
+@@ -34,16 +34,36 @@ from pypto.target._utils import frozen_mapping, mapping_copy, sha256_text
+ 
+ 
+ ARTIFACT_PAYLOAD_VERSION = 2
++# Explicit native arch selection is a new wire variant: payload version 3
++# carries an ``arch_selection`` block.  Version 2 artifacts (the default
++# sm_80 path) are byte-for-byte unchanged and remain readable.
++ARCH_SELECTION_PAYLOAD_VERSION = 3
+ CUDA_ARTIFACT_FORMAT = "pypto-x.cuda.ptx"
+ DEFAULT_ARTIFACT_FORMAT = CUDA_ARTIFACT_FORMAT
+ CUDA_BACKEND = "cuda.ptx"
+ CUDA_PTX_VERSION = "8.0"
+-DEFAULT_PTX_TARGET = "sm_80"
++SM80_ARCH = "sm_80"
++SM120_ARCH = "sm_120"
++SM121_ARCH = "sm_121"
++DEFAULT_PTX_TARGET = SM80_ARCH
++# Minimum PTX ISA version accepted for each first-class arch (verified on
++# GamePC: .target sm_120 needs >= 8.7, .target sm_121 needs >= 8.8).
++CUDA_ARCH_PTX_VERSIONS = {
++    SM80_ARCH: CUDA_PTX_VERSION,
++    SM120_ARCH: "8.7",
++    SM121_ARCH: "8.8",
++}
++SUPPORTED_CUDA_ARCHS = tuple(sorted(CUDA_ARCH_PTX_VERSIONS))
++# sm_121 is a first-class emitter arch, but its cubin/PTX is not loadable on
++# the sm_120 RTX 5080 (driver error 218); the compiler still emits it for a
++# matching device and records the incompatibility in metadata.
++NATIVE_CUDA_ARCHS = (SM120_ARCH, SM121_ARCH)
+ CUDA_LOWERING_VERSION = 2
+ MAX_INLINE_CONSTANT_ELEMENTS = 4096
+ _PTX_TARGET_RE = re.compile(r"^sm_[0-9]+$")
+ _PTX_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+$")
+-_SUPPORTED_PTX_VERSIONS = frozenset((CUDA_PTX_VERSION,))
++_SUPPORTED_PTX_VERSIONS = frozenset(CUDA_ARCH_PTX_VERSIONS.values())
++_ARCH_SELECTION_SOURCES = frozenset(("compiler_arch", "compiler_ptx_target", "target_attribute"))
+ 
+ 
+ class CudaPtxError(ValueError):
+@@ -78,6 +98,48 @@ def _validate_ptx_target(value: Any) -> str:
+     return value
+ 
+ 
++def _version_tuple(value: str) -> Tuple[int, int]:
++    major, minor = value.split(".", 1)
++    return int(major), int(minor)
++
++
++def resolve_cuda_arch(arch: Any) -> Tuple[str, str]:
++    """Resolve a first-class CUDA arch name to ``(ptx_target, ptx_version)``."""
++
++    if not isinstance(arch, str) or arch not in CUDA_ARCH_PTX_VERSIONS:
++        raise CudaPtxError(
++            "unsupported CUDA arch {!r}; supported archs: {}".format(
++                arch, ", ".join(SUPPORTED_CUDA_ARCHS)
++            )
++        )
++    return arch, CUDA_ARCH_PTX_VERSIONS[arch]
++
++
++def _validate_arch_selection(selection: Any) -> Mapping[str, Any]:
++    """Validate the explicit-arch selection block carried by payload version 3."""
++
++    if not isinstance(selection, Mapping):
++        raise CudaPtxError("arch_selection must be an object")
++    required = {"policy", "source", "requested_arch", "ptx_target", "ptx_version"}
++    if set(selection) != required:
++        raise CudaPtxError(
++            "arch_selection fields must be exactly {}".format(sorted(required))
++        )
++    if selection["policy"] != "explicit_arch":
++        raise CudaPtxError("arch_selection policy must be 'explicit_arch'")
++    if selection["source"] not in _ARCH_SELECTION_SOURCES:
++        raise CudaPtxError(
++            "arch_selection source must be one of {}".format(sorted(_ARCH_SELECTION_SOURCES))
++        )
++    requested = selection["requested_arch"]
++    target, version = resolve_cuda_arch(requested)
++    if selection["ptx_target"] != target or selection["ptx_version"] != version:
++        raise CudaPtxError(
++            "arch_selection target/version does not match requested arch {!r}".format(requested)
++        )
++    return selection
++
++
+ def _plain(value: Any) -> Any:
+     if isinstance(value, Mapping):
+         return {key: _plain(item) for key, item in value.items()}
+@@ -915,6 +977,13 @@ def render_ptx(gpu_program: GpuProgram, ptx_target: str = DEFAULT_PTX_TARGET, pt
+         raise TypeError("render_ptx requires GpuProgram")
+     ptx_target = _validate_ptx_target(ptx_target)
+     ptx_version = _validate_ptx_version(ptx_version)
++    minimum = CUDA_ARCH_PTX_VERSIONS.get(ptx_target)
++    if minimum is not None and _version_tuple(ptx_version) < _version_tuple(minimum):
++        raise CudaPtxError(
++            "PTX version {} does not support target {} (minimum {})".format(
++                ptx_version, ptx_target, minimum
++            )
++        )
+     try:
+         kernels = []
+         function = next(function for function in gpu_program.program.functions if function.name == gpu_program.entrypoint)
+@@ -942,6 +1011,7 @@ class CudaProgram:
+     device: Mapping[str, Any]
+     jit: Mapping[str, Any]
+     bindings: Tuple[Tuple[Mapping[str, Any], ...], ...]
++    arch_selection: Optional[Mapping[str, Any]] = None
+ 
+     @property
+     def program(self) -> CoreProgram:
+@@ -964,6 +1034,10 @@ class CudaProgram:
+ 
+         _validate_ptx_target(self.ptx_target)
+         _validate_ptx_version(self.ptx_version)
++        if self.arch_selection is not None:
++            selection = _validate_arch_selection(mapping_copy(self.arch_selection))
++            if selection["ptx_target"] != self.ptx_target or selection["ptx_version"] != self.ptx_version:
++                raise CudaPtxError("arch_selection does not match CUDA PTX target/version")
+         self.gpu_program.validate()
+         expected_ptx = render_ptx(self.gpu_program, self.ptx_target, self.ptx_version)
+         if self.ptx != expected_ptx:
+@@ -978,6 +1052,9 @@ class CudaProgram:
+             "cuda_lowering_version": CUDA_LOWERING_VERSION,
+             "ptx_target": self.ptx_target,
+             "ptx_version": self.ptx_version,
++            "arch_selection": (
++                mapping_copy(self.arch_selection) if self.arch_selection is not None else None
++            ),
+             "gpu_program": self.gpu_program.to_dict(),
+             "ptx_digest": hashlib.sha256(self.ptx.encode("utf-8")).hexdigest(),
+             "device": mapping_copy(self.device),
+@@ -998,7 +1075,49 @@ class CudaPtxCompiler:
+         ptx_target: str = DEFAULT_PTX_TARGET,
+         ptx_version: str = CUDA_PTX_VERSION,
+         probe_jit: bool = False,
++        *,
++        arch: Optional[str] = None,
+     ) -> None:
++        """Explicit CUDA emitter configuration.
++
++        The default remains the historical ``sm_80`` / PTX 8.0 path and emits
++        byte-identical artifacts.  A first-class native arch can be requested
++        explicitly either with ``arch="sm_120"``/``"sm_121"`` (resolves the
++        required PTX ISA version) or with ``ptx_target="sm_120"`` while leaving
++        ``ptx_version`` at its default.  A ``TargetSpec`` attribute
++        ``arch="sm_120"`` selects the same path through :meth:`lower`.
++        """
++
++        selection = None
++        if arch is not None:
++            if ptx_target != DEFAULT_PTX_TARGET or ptx_version != CUDA_PTX_VERSION:
++                raise CudaPtxError(
++                    "arch= cannot be combined with an explicit ptx_target/ptx_version"
++                )
++            ptx_target, ptx_version = resolve_cuda_arch(arch)
++            selection = {
++                "policy": "explicit_arch",
++                "source": "compiler_arch",
++                "requested_arch": arch,
++            }
++        elif ptx_target != DEFAULT_PTX_TARGET and ptx_target in CUDA_ARCH_PTX_VERSIONS:
++            minimum = CUDA_ARCH_PTX_VERSIONS[ptx_target]
++            if ptx_version == CUDA_PTX_VERSION:
++                # The caller selected the arch but left the PTX version at its
++                # default; resolve the arch minimum instead of emitting a
++                # header the driver cannot JIT.
++                ptx_version = minimum
++            elif _version_tuple(ptx_version) < _version_tuple(minimum):
++                raise CudaPtxError(
++                    "PTX version {} does not support target {} (minimum {})".format(
++                        ptx_version, ptx_target, minimum
++                    )
++                )
++            selection = {
++                "policy": "explicit_arch",
++                "source": "compiler_ptx_target",
++                "requested_arch": ptx_target,
++            }
+         _validate_ptx_target(ptx_target)
+         _validate_ptx_version(ptx_version)
+         self.driver = driver
+@@ -1006,10 +1125,36 @@ class CudaPtxCompiler:
+         self.ptx_target = ptx_target
+         self.ptx_version = ptx_version
+         self.probe_jit = bool(probe_jit)
++        self.arch_selection = selection
+ 
+     def lower(self, program: CoreProgram, target: TargetSpec) -> CudaProgram:
+         gpu_program = lower_gpu_common(program, target)
+-        ptx = render_ptx(gpu_program, self.ptx_target, self.ptx_version)
++        selection = None
++        ptx_target, ptx_version = self.ptx_target, self.ptx_version
++        requested_from_target = target.attributes.get("arch")
++        if requested_from_target is not None and not isinstance(requested_from_target, str):
++            raise CudaPtxError("TargetSpec attribute 'arch' must be a string")
++        if self.arch_selection is not None:
++            selection = dict(self.arch_selection)
++            if requested_from_target is not None and requested_from_target != selection["requested_arch"]:
++                raise CudaPtxError(
++                    "TargetSpec arch {!r} conflicts with compiler arch {!r}".format(
++                        requested_from_target, selection["requested_arch"]
++                    )
++                )
++        elif requested_from_target is not None:
++            ptx_target, ptx_version = resolve_cuda_arch(requested_from_target)
++            selection = {
++                "policy": "explicit_arch",
++                "source": "target_attribute",
++                "requested_arch": requested_from_target,
++            }
++        selection_record = None
++        if selection is not None:
++            selection_record = dict(selection)
++            selection_record["ptx_target"] = ptx_target
++            selection_record["ptx_version"] = ptx_version
++        ptx = render_ptx(gpu_program, ptx_target, ptx_version)
+         device = {"status": "not_probed", "index": self.device_index}
+         jit = {"status": "deferred", "info_log": "", "error_log": ""}
+         if self.driver is not None and hasattr(self.driver, "device_info"):
+@@ -1034,7 +1179,9 @@ class CudaPtxCompiler:
+                     if context is not None and hasattr(context, "close"):
+                         context.close()
+         bindings = _all_bindings(gpu_program)
+-        return CudaProgram(gpu_program, ptx, self.ptx_target, self.ptx_version, device, jit, bindings)
++        return CudaProgram(
++            gpu_program, ptx, ptx_target, ptx_version, device, jit, bindings, selection_record
++        )
+ 
+     def compile(self, target_ir: CudaProgram, options: Optional[CompileOptions] = None) -> Artifact:
+         if not isinstance(target_ir, CudaProgram):
+@@ -1047,8 +1194,14 @@ class CudaPtxCompiler:
+         program_digest = hashlib.sha256(program_json.encode("utf-8")).hexdigest()
+         target_data = target_ir.target.to_dict()
+         ptx_digest = hashlib.sha256(target_ir.ptx.encode("utf-8")).hexdigest()
++        arch_selection = (
++            _plain(target_ir.arch_selection) if target_ir.arch_selection is not None else None
++        )
++        payload_version = (
++            ARCH_SELECTION_PAYLOAD_VERSION if arch_selection is not None else ARTIFACT_PAYLOAD_VERSION
++        )
+         envelope = {
+-            "artifact_payload_version": ARTIFACT_PAYLOAD_VERSION,
++            "artifact_payload_version": payload_version,
+             "backend": CUDA_BACKEND,
+             "cuda_lowering_version": CUDA_LOWERING_VERSION,
+             "gpu_common_backend": GPU_COMMON_BACKEND,
+@@ -1069,6 +1222,8 @@ class CudaPtxCompiler:
+             "jit": _plain(target_ir.jit),
+             "bindings": _plain(target_ir.bindings),
+         }
++        if arch_selection is not None:
++            envelope["arch_selection"] = arch_selection
+         if options is not None:
+             envelope["compile_options"] = {
+                 "artifact_format": options.artifact_format,
+@@ -1082,7 +1237,7 @@ class CudaPtxCompiler:
+         payload_digest = hashlib.sha256(payload).hexdigest()
+         metadata = {
+             "backend": CUDA_BACKEND,
+-            "artifact_payload_version": ARTIFACT_PAYLOAD_VERSION,
++            "artifact_payload_version": payload_version,
+             "cuda_lowering_version": CUDA_LOWERING_VERSION,
+             "gpu_common_backend": GPU_COMMON_BACKEND,
+             "gpu_ir_version": GPU_IR_VERSION,
+@@ -1103,6 +1258,8 @@ class CudaPtxCompiler:
+             "dtypes": sorted(set(plan.dtype for plan in target_ir.gpu_program.plans)),
+             "layouts": sorted(set(plan.layout for plan in target_ir.gpu_program.plans)),
+         }
++        if arch_selection is not None:
++            metadata["arch_selection"] = arch_selection
+         if options is not None:
+             option_metadata = _plain(options.metadata)
+             reserved = set(metadata).intersection(option_metadata)
+@@ -1162,8 +1319,23 @@ def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
+         decoded = json.loads(bytes(artifact.payload).decode("utf-8"))
+     except Exception as exc:
+         raise CudaPtxArtifactError("CUDA payload is not UTF-8 JSON") from exc
+-    if not isinstance(decoded, dict) or set(decoded) - (_required_envelope() | {"compile_options"}) or not _required_envelope().issubset(decoded):
+-        raise CudaPtxArtifactError("CUDA payload has unknown or missing fields")
++    if not isinstance(decoded, dict):
++        raise CudaPtxArtifactError("CUDA payload is not a JSON object")
++    base_envelope = _required_envelope()
++    if not base_envelope.issubset(decoded):
++        raise CudaPtxArtifactError("CUDA payload is missing fields")
++    payload_version = decoded.get("artifact_payload_version")
++    if payload_version not in (ARTIFACT_PAYLOAD_VERSION, ARCH_SELECTION_PAYLOAD_VERSION):
++        raise CudaPtxArtifactError("unsupported CUDA artifact payload version")
++    optional_envelope = {"compile_options"}
++    if payload_version == ARCH_SELECTION_PAYLOAD_VERSION:
++        optional_envelope.add("arch_selection")
++        if "arch_selection" not in decoded:
++            raise CudaPtxArtifactError("payload version 3 requires arch_selection")
++    elif "arch_selection" in decoded:
++        raise CudaPtxArtifactError("payload version 2 must not carry arch_selection")
++    if set(decoded) - (base_envelope | optional_envelope):
++        raise CudaPtxArtifactError("CUDA payload has unknown fields")
+     canonical = json.dumps(decoded, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+     if canonical != bytes(artifact.payload):
+         raise CudaPtxArtifactError("CUDA payload is not canonical JSON")
+@@ -1176,6 +1348,17 @@ def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
+     }
+     if not required_metadata.issubset(metadata):
+         raise CudaPtxArtifactError("CUDA artifact metadata has unknown or missing fields")
++    if payload_version == ARCH_SELECTION_PAYLOAD_VERSION:
++        if "arch_selection" not in metadata:
++            raise CudaPtxArtifactError("payload version 3 requires arch_selection metadata")
++        try:
++            _validate_arch_selection(metadata["arch_selection"])
++        except CudaPtxError as exc:
++            raise CudaPtxArtifactError("CUDA arch_selection metadata is invalid: {}".format(exc)) from exc
++        if dict(decoded["arch_selection"]) != dict(metadata["arch_selection"]):
++            raise CudaPtxArtifactError("CUDA arch_selection payload/metadata mismatch")
++    elif "arch_selection" in metadata:
++        raise CudaPtxArtifactError("payload version 2 must not carry arch_selection metadata")
+     option_metadata = {}
+     if "compile_options" in decoded:
+         options = decoded["compile_options"]
+@@ -1185,6 +1368,8 @@ def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
+             raise CudaPtxArtifactError("CUDA compile option metadata/extra must be objects")
+         option_metadata = options["metadata"]
+     allowed_metadata = required_metadata | {"compile_options"} | set(option_metadata)
++    if payload_version == ARCH_SELECTION_PAYLOAD_VERSION:
++        allowed_metadata = allowed_metadata | {"arch_selection"}
+     if set(metadata) - allowed_metadata:
+         raise CudaPtxArtifactError("CUDA artifact metadata has unknown fields")
+     for key, value in option_metadata.items():
+@@ -1195,7 +1380,7 @@ def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
+         raise CudaPtxArtifactError("CUDA payload digest mismatch")
+     if decoded["backend"] != CUDA_BACKEND or metadata["backend"] != CUDA_BACKEND:
+         raise CudaPtxArtifactError("CUDA backend mismatch")
+-    if decoded["artifact_payload_version"] != ARTIFACT_PAYLOAD_VERSION or metadata["artifact_payload_version"] != ARTIFACT_PAYLOAD_VERSION:
++    if decoded["artifact_payload_version"] != payload_version or metadata["artifact_payload_version"] != payload_version:
+         raise CudaPtxArtifactError("unsupported CUDA artifact payload version")
+     if decoded["cuda_lowering_version"] != CUDA_LOWERING_VERSION or metadata["cuda_lowering_version"] != CUDA_LOWERING_VERSION:
+         raise CudaPtxArtifactError("unsupported CUDA lowering version")
+@@ -1259,10 +1444,22 @@ def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
+             raise CudaPtxArtifactError("CUDA artifact format/ABI options mismatch")
+     elif artifact.format != DEFAULT_ARTIFACT_FORMAT or artifact.abi_version != ABI_VERSION:
+         raise CudaPtxArtifactError("CUDA artifact format/ABI mismatch")
++    arch_selection = None
++    if payload_version == ARCH_SELECTION_PAYLOAD_VERSION:
++        try:
++            arch_selection = _validate_arch_selection(frozen_mapping(decoded["arch_selection"]))
++        except CudaPtxError as exc:
++            raise CudaPtxArtifactError("CUDA arch_selection is invalid: {}".format(exc)) from exc
++        if (
++            arch_selection["ptx_target"] != decoded["ptx_target"]
++            or arch_selection["ptx_version"] != decoded["ptx_version"]
++        ):
++            raise CudaPtxArtifactError("CUDA arch_selection does not match PTX target/version")
+     decoded_program = CudaProgram(
+         gpu_program, ptx, decoded["ptx_target"], decoded["ptx_version"],
+         frozen_mapping(decoded["device"]), frozen_mapping(decoded["jit"]),
+         tuple(tuple(frozen_mapping(item) for item in group) for group in decoded["bindings"]),
++        arch_selection,
+     )
+     try:
+         decoded_program.validate()
+@@ -1272,8 +1469,10 @@ def _decode_cuda_artifact(artifact: Artifact) -> CudaProgram:
+ 
+ 
+ __all__ = [
+-    "ARTIFACT_PAYLOAD_VERSION", "CUDA_ARTIFACT_FORMAT", "CUDA_BACKEND", "CUDA_LOWERING_VERSION",
++    "ARCH_SELECTION_PAYLOAD_VERSION", "ARTIFACT_PAYLOAD_VERSION", "CUDA_ARCH_PTX_VERSIONS",
++    "CUDA_ARTIFACT_FORMAT", "CUDA_BACKEND", "CUDA_LOWERING_VERSION", "CUDA_PTX_VERSION",
+     "CUDACompiler", "CudaCompiler", "CudaPtxArtifactError", "CudaPtxCompiler", "CudaPtxError",
+     "CudaPtxUnsupportedError", "CudaProgram", "DEFAULT_ARTIFACT_FORMAT", "DEFAULT_PTX_TARGET",
+-    "MAX_INLINE_CONSTANT_ELEMENTS", "compile_cuda_ptx", "render_ptx",
++    "MAX_INLINE_CONSTANT_ELEMENTS", "NATIVE_CUDA_ARCHS", "SM120_ARCH", "SM121_ARCH", "SM80_ARCH",
++    "SUPPORTED_CUDA_ARCHS", "compile_cuda_ptx", "render_ptx", "resolve_cuda_arch",
+ ]
+diff --git a/python/tests/ut/pypto_x/test_cuda_sm120_target.py b/python/tests/ut/pypto_x/test_cuda_sm120_target.py
+new file mode 100644
+index 000000000..48f53c2fa
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cuda_sm120_target.py
+@@ -0,0 +1,256 @@
++"""sm_120/sm_121 first-class CUDA arch selection tests (no GPU required).
++
++Contract covered here:
++  * default ``CudaPtxCompiler()`` stays sm_80 / PTX 8.0 and emits payload
++    version 2 without an ``arch_selection`` block (byte-compatible path);
++  * explicit ``arch=``/``ptx_target=``/``TargetSpec.attributes['arch']`` selects
++    a native arch, resolves the required PTX ISA version, and records the
++    selection in payload + metadata, which are covered by the artifact digest;
++  * artifacts carrying the selection use payload version 3 and fail closed on
++    any tampering; version-2 artifacts without the block still decode;
++  * PTX headers below the arch minimum are rejected at render time.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++from collections.abc import Mapping
++
++import pytest
++
++from pypto.compiler import Artifact
++from pypto.compiler.targets.cuda import (
++    ARCH_SELECTION_PAYLOAD_VERSION,
++    ARTIFACT_PAYLOAD_VERSION,
++    CUDA_ARCH_PTX_VERSIONS,
++    DEFAULT_PTX_TARGET,
++    SM120_ARCH,
++    SM121_ARCH,
++    SM80_ARCH,
++    CudaPtxArtifactError,
++    CudaPtxCompiler,
++    CudaPtxError,
++    _decode_cuda_artifact,
++    render_ptx,
++    resolve_cuda_arch,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.target import TargetSpec
++
++
++TARGET = TargetSpec("gpu", "gpu-neutral", attributes={"workgroup": (4,)})
++
++
++def _program():
++    value_type = CoreType.tensor("float32", (5,))
++    x, y, z = ValueRef("x", value_type), ValueRef("y", value_type), ValueRef("z", value_type)
++    operation = Operation("add", (x, y), (z,))
++    return CoreProgram(functions=(CoreFunction("main", (x, y), (z,), Region((operation,))),))
++
++
++def _artifact(compiler=None, target=TARGET):
++    compiler = compiler or CudaPtxCompiler()
++    return compiler.compile(compiler.lower(_program(), target))
++
++
++def test_default_arch_path_is_unchanged():
++    compiler = CudaPtxCompiler()
++    assert compiler.ptx_target == SM80_ARCH
++    assert compiler.ptx_version == "8.0"
++    assert compiler.arch_selection is None
++    artifact = _artifact(compiler)
++    assert artifact.metadata["ptx_target"] == SM80_ARCH
++    assert artifact.metadata["ptx_version"] == "8.0"
++    assert artifact.metadata["artifact_payload_version"] == ARTIFACT_PAYLOAD_VERSION
++    assert "arch_selection" not in artifact.metadata
++    payload = json.loads(artifact.payload.decode("utf-8"))
++    assert "arch_selection" not in payload
++    assert payload["artifact_payload_version"] == ARTIFACT_PAYLOAD_VERSION
++    assert artifact.payload.decode("utf-8").startswith('{"artifact_payload_version":2,')
++    assert ".version 8.0\n.target sm_80\n" in payload["ptx"]
++
++
++def test_resolve_cuda_arch_mapping():
++    assert resolve_cuda_arch(SM120_ARCH) == (SM120_ARCH, "8.7")
++    assert resolve_cuda_arch(SM121_ARCH) == (SM121_ARCH, "8.8")
++    assert resolve_cuda_arch(SM80_ARCH) == (SM80_ARCH, "8.0")
++    assert CUDA_ARCH_PTX_VERSIONS[SM120_ARCH] == "8.7"
++    with pytest.raises(CudaPtxError, match="unsupported CUDA arch"):
++        resolve_cuda_arch("sm_999")
++
++
++@pytest.mark.parametrize(
++    "arch, target, version",
++    ((SM120_ARCH, SM120_ARCH, "8.7"), (SM121_ARCH, SM121_ARCH, "8.8")),
++)
++def test_explicit_compiler_arch_selection(arch, target, version):
++    compiler = CudaPtxCompiler(arch=arch)
++    assert (compiler.ptx_target, compiler.ptx_version) == (target, version)
++    artifact = _artifact(compiler)
++    assert artifact.metadata["artifact_payload_version"] == ARCH_SELECTION_PAYLOAD_VERSION
++    selection = artifact.metadata["arch_selection"]
++    assert selection == {
++        "policy": "explicit_arch",
++        "source": "compiler_arch",
++        "requested_arch": arch,
++        "ptx_target": target,
++        "ptx_version": version,
++    }
++    payload = json.loads(artifact.payload.decode("utf-8"))
++    assert payload["arch_selection"] == selection
++    assert payload["ptx_target"] == target
++    assert payload["ptx_version"] == version
++    assert ".version {}\n.target {}\n".format(version, target) in payload["ptx"]
++    assert artifact.metadata["payload_digest"] == hashlib.sha256(artifact.payload).hexdigest()
++    assert artifact.content_digest == artifact.metadata["payload_digest"]
++    decoded = _decode_cuda_artifact(artifact)
++    assert decoded.ptx_target == target
++    assert decoded.ptx_version == version
++    assert dict(decoded.arch_selection) == selection
++
++
++def test_explicit_legacy_ptx_target_resolves_minimum_version():
++    compiler = CudaPtxCompiler(ptx_target=SM120_ARCH)
++    assert compiler.ptx_version == "8.7"
++    assert compiler.arch_selection["source"] == "compiler_ptx_target"
++    artifact = _artifact(compiler)
++    assert artifact.metadata["arch_selection"]["requested_arch"] == SM120_ARCH
++
++
++def test_version_below_arch_minimum_is_rejected():
++    # Leaving ptx_version at its default resolves the arch minimum instead of
++    # silently emitting an unloadable header; an explicitly *older* version is
++    # rejected by the renderer (and can never reach a valid artifact).
++    assert CudaPtxCompiler(ptx_target=SM120_ARCH).ptx_version == "8.7"
++    assert CudaPtxCompiler(ptx_target=SM121_ARCH).ptx_version == "8.8"
++    compiler = CudaPtxCompiler()
++    gpu_program = compiler.lower(_program(), TARGET).gpu_program
++    with pytest.raises(CudaPtxError, match="does not support target"):
++        render_ptx(gpu_program, SM121_ARCH, "8.7")
++
++
++def test_target_attribute_arch_selection():
++    target = TargetSpec(
++        "gpu", "gpu-neutral", attributes={"workgroup": (4,), "arch": SM120_ARCH}
++    )
++    artifact = _artifact(CudaPtxCompiler(), target)
++    selection = artifact.metadata["arch_selection"]
++    assert selection["source"] == "target_attribute"
++    assert selection["requested_arch"] == SM120_ARCH
++    assert (selection["ptx_target"], selection["ptx_version"]) == (SM120_ARCH, "8.7")
++    assert artifact.target.to_dict()["attributes"]["arch"] == SM120_ARCH
++    assert artifact.metadata["artifact_payload_version"] == ARCH_SELECTION_PAYLOAD_VERSION
++
++
++def test_conflicting_or_unknown_arch_selection_is_rejected():
++    with pytest.raises(CudaPtxError, match="cannot be combined"):
++        CudaPtxCompiler(arch=SM120_ARCH, ptx_target=SM121_ARCH)
++    with pytest.raises(CudaPtxError, match="unsupported CUDA arch"):
++        CudaPtxCompiler(arch="sm_999")
++    compiler = CudaPtxCompiler(arch=SM120_ARCH)
++    conflicting = TargetSpec(
++        "gpu", "gpu-neutral", attributes={"workgroup": (4,), "arch": SM121_ARCH}
++    )
++    with pytest.raises(CudaPtxError, match="conflicts"):
++        compiler.lower(_program(), conflicting)
++    with pytest.raises(CudaPtxError, match="must be a string"):
++        compiler.lower(_program(), TargetSpec("gpu", "gpu-neutral", attributes={"arch": 120}))
++
++
++def test_render_ptx_enforces_arch_minimum():
++    compiler = CudaPtxCompiler()
++    gpu_program = compiler.lower(_program(), TARGET).gpu_program
++    assert ".version 8.7\n.target sm_120\n" in render_ptx(gpu_program, SM120_ARCH, "8.7")
++    assert ".version 8.8\n.target sm_121\n" in render_ptx(gpu_program, SM121_ARCH, "8.8")
++    with pytest.raises(CudaPtxError, match="PTX version|does not support target"):
++        render_ptx(gpu_program, SM120_ARCH, "8.0")
++    with pytest.raises(CudaPtxError, match="does not support target"):
++        render_ptx(gpu_program, SM121_ARCH, "8.7")
++
++
++def test_default_artifact_digest_is_stable_across_calls():
++    first = _artifact()
++    second = _artifact()
++    assert first.payload == second.payload
++    assert first.metadata["payload_digest"] == second.metadata["payload_digest"]
++    explicit = _artifact(CudaPtxCompiler(arch=SM120_ARCH))
++    assert explicit.metadata["payload_digest"] != first.metadata["payload_digest"]
++    assert explicit.content_digest != first.content_digest
++
++
++def _plain(value):
++    if isinstance(value, Mapping):
++        return {key: _plain(item) for key, item in value.items()}
++    if isinstance(value, (list, tuple)):
++        return [_plain(item) for item in value]
++    return value
++
++
++def _mutated(artifact, mutate):
++    payload = json.loads(artifact.payload.decode("utf-8"))
++    metadata = _plain(artifact.metadata)
++    mutate(payload, metadata)
++    mutated = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        payload=json.dumps(payload, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
++        metadata=metadata,
++    )
++    return mutated
++
++
++def test_arch_selection_tamper_fails_closed():
++    artifact = _artifact(CudaPtxCompiler(arch=SM120_ARCH))
++
++    def drop_selection(payload, metadata):
++        payload.pop("arch_selection")
++        metadata.pop("arch_selection")
++
++    with pytest.raises(CudaPtxArtifactError, match="arch_selection"):
++        _decode_cuda_artifact(_mutated(artifact, drop_selection))
++
++    def wrong_version(payload, metadata):
++        payload["arch_selection"]["ptx_version"] = "8.0"
++        payload["ptx_version"] = "8.0"
++        metadata["arch_selection"]["ptx_version"] = "8.0"
++        metadata["ptx_version"] = "8.0"
++
++    with pytest.raises(CudaPtxArtifactError):
++        _decode_cuda_artifact(_mutated(artifact, wrong_version))
++
++    def mismatch_source(payload, metadata):
++        payload["arch_selection"]["source"] = "tampered"
++        metadata["arch_selection"]["source"] = "tampered"
++
++    with pytest.raises(CudaPtxArtifactError, match="arch_selection"):
++        _decode_cuda_artifact(_mutated(artifact, mismatch_source))
++
++
++def test_version_2_with_arch_selection_fails_closed():
++    artifact = _artifact()
++    assert artifact.metadata["artifact_payload_version"] == ARTIFACT_PAYLOAD_VERSION
++
++    def inject_selection(payload, metadata):
++        selection = {
++            "policy": "explicit_arch",
++            "source": "compiler_arch",
++            "requested_arch": SM120_ARCH,
++            "ptx_target": SM120_ARCH,
++            "ptx_version": "8.7",
++        }
++        payload["arch_selection"] = selection
++        metadata["arch_selection"] = selection
++
++    with pytest.raises(CudaPtxArtifactError, match="arch_selection"):
++        _decode_cuda_artifact(_mutated(artifact, inject_selection))
++
++
++def test_default_compiler_without_selection_decodes_with_none():
++    artifact = _artifact()
++    decoded = _decode_cuda_artifact(artifact)
++    assert decoded.arch_selection is None
++    assert decoded.ptx_target == DEFAULT_PTX_TARGET
++    assert decoded.ptx_version == "8.0"
+diff --git a/scripts/smoke/cuda_sm120_compare.py b/scripts/smoke/cuda_sm120_compare.py
+new file mode 100644
+index 000000000..83b879e4f
+--- /dev/null
++++ b/scripts/smoke/cuda_sm120_compare.py
+@@ -0,0 +1,603 @@
++#!/usr/bin/env python3
++"""PTX-JIT vs native sm_120 cubin comparison for the PyPTO-X CUDA target.
++
++Modes
++-----
++prepare : build the C1 patch-case artifacts (add/matmul, fp32/bf16) and the
++          4096^3 performance matmuls for both the default ``sm_80`` target and
++          the explicit native ``sm_120`` target; write PTX, ptxas cubins,
++          artifact metadata and digests.  Runs anywhere (no GPU).
++run     : on the RTX 5080, load each prepared kernel through
++          ``cuModuleLoadData`` (PTX -> driver JIT; cubin -> direct) and measure
++          correctness, module-load time, launch overhead and per-launch kernel
++          time (R=21, clock warmup + assertion, pre/post GPU snapshots).
++
++The comparison uses one ctypes/libcuda code path for all three variants so the
++numbers are apples-to-apples:
++    sm80_ptx   : default sm_80 PTX, forward-JIT by the driver
++    sm120_ptx  : explicit native sm_120 PTX (new first-class arch path)
++    sm120_cubin: ptxas -arch=sm_120 cubin (arch-locked)
++
++This script never installs anything and never touches user processes.
++"""
++
++from __future__ import annotations
++
++import argparse
++import base64
++import ctypes
++import hashlib
++import json
++import math
++import statistics
++import struct
++import subprocess
++import sys
++import threading
++import time
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++if str(REPO_ROOT / "python") not in sys.path:
++    sys.path.insert(0, str(REPO_ROOT / "python"))
++
++from pypto.compiler.targets.cuda import CudaPtxCompiler  # noqa: E402
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef  # noqa: E402
++from pypto.target import TargetSpec  # noqa: E402
++
++SMALL_CASES = (
++    {"name": "add_f32_5", "kind": "add", "dtype": "float32", "shape": [5],
++     "left": [1.0, 2.0, 3.0, 4.0, 5.0], "right": [10.0, 20.0, 30.0, 40.0, 50.0],
++     "expected": [11.0, 22.0, 33.0, 44.0, 55.0]},
++    {"name": "add_bf16_5", "kind": "add", "dtype": "bf16", "shape": [5],
++     "left": [1.0, 1.0078125, 1.0, 1.0078125, 1.0], "right": [0.00390625] * 5,
++     "expected": [1.0, 1.015625, 1.0, 1.015625, 1.0]},
++    {"name": "matmul_f32_2x4x3", "kind": "matmul", "dtype": "float32",
++     "left": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "left_shape": [2, 3],
++     "right": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
++     "right_shape": [3, 4], "results_shape": [2, 4],
++     "expected": [38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0]},
++    {"name": "matmul_bf16_2x4x3", "kind": "matmul", "dtype": "bf16",
++     "left": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "left_shape": [2, 3],
++     "right": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
++     "right_shape": [3, 4], "results_shape": [2, 4],
++     "expected": [38.0, 44.0, 50.0, 56.0, 83.0, 98.0, 113.0, 128.0]},
++)
++PERF_CASES = (
++    {"name": "perf_matmul_f32_4096", "kind": "matmul", "dtype": "float32",
++     "m": 4096, "n": 4096, "k": 4096},
++    {"name": "perf_matmul_bf16_4096", "kind": "matmul", "dtype": "bf16",
++     "m": 4096, "n": 4096, "k": 4096},
++)
++ARCHS = ("sm_80", "sm_120")
++PATHS = ("sm80_ptx", "sm120_ptx", "sm120_cubin")
++
++
++# ---------------------------------------------------------------------------
++# host packing helpers
++# ---------------------------------------------------------------------------
++
++
++def _itemsize(dtype):
++    return 2 if dtype == "bf16" else 4
++
++
++def _bf16_bits(value):
++    f32 = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++    upper = f32 >> 16
++    lower = f32 & 0xFFFF
++    if lower > 0x8000 or (lower == 0x8000 and (upper & 1)):
++        upper += 1
++    return upper & 0xFFFF
++
++
++def _pack(dtype, values):
++    if dtype == "bf16":
++        return b"".join(struct.pack("<H", _bf16_bits(value)) for value in values)
++    return struct.pack("<{}f".format(len(values)), *[float(value) for value in values])
++
++
++def _unpack(dtype, raw):
++    count = len(raw) // _itemsize(dtype)
++    if dtype == "bf16":
++        return [
++            struct.unpack("<f", struct.pack("<I", struct.unpack_from("<H", raw, index * 2)[0] << 16))[0]
++            for index in range(count)
++        ]
++    return list(struct.unpack("<{}f".format(count), raw))
++
++
++def _ones(dtype, count):
++    if dtype == "bf16":
++        return b"\x80\x3f" * count
++    return b"\x00\x00\x80\x3f" * count
++
++
++def _program(case):
++    if case["kind"] == "add":
++        shape = tuple(case["shape"])
++        tensor = CoreType.tensor(case["dtype"], shape)
++        x, y, z = ValueRef("x", tensor), ValueRef("y", tensor), ValueRef("z", tensor)
++        return CoreProgram(functions=(CoreFunction("main", (x, y), (z,), Region((Operation("add", (x, y), (z,)),))),))
++    if "m" in case:
++        m, n, k = case["m"], case["n"], case["k"]
++    else:
++        m, k = case["left_shape"]
++        _, n = case["right_shape"]
++    lt, rt, mt = CoreType.tensor(case["dtype"], (m, k)), CoreType.tensor(case["dtype"], (k, n)), CoreType.tensor(case["dtype"], (m, n))
++    left, right, out = ValueRef("left", lt), ValueRef("right", rt), ValueRef("out", mt)
++    return CoreProgram(functions=(CoreFunction("main", (left, right), (out,), Region((Operation("matmul", (left, right), (out,)),))),))
++
++
++def _target(case, arch):
++    if case in SMALL_CASES:
++        attributes = {"workgroup": (4,)}
++    else:
++        attributes = {"workgroup": (256,), "tile": (64, 64)}
++    attributes = dict(attributes)
++    attributes["arch"] = arch
++    return TargetSpec("gpu", "gpu-neutral", attributes=attributes)
++
++
++def _case_spec(case):
++    if case in SMALL_CASES:
++        if case["kind"] == "add":
++            return {"left": _pack(case["dtype"], case["left"]), "right": _pack(case["dtype"], case["right"]),
++                    "expected": _pack(case["dtype"], case["expected"]),
++                    "left_shape": case["shape"], "right_shape": case["shape"], "results_shape": case["shape"]}
++        return {"left": _pack(case["dtype"], case["left"]), "right": _pack(case["dtype"], case["right"]),
++                "expected": _pack(case["dtype"], case["expected"]),
++                "left_shape": case["left_shape"], "right_shape": case["right_shape"], "results_shape": case["results_shape"]}
++    m, n, k = case["m"], case["n"], case["k"]
++    return {"left": None, "right": None, "expected": _pack(case["dtype"], [float(k)] * (m * n)),
++            "left_shape": [m, k], "right_shape": [k, n], "results_shape": [m, n],
++            "ones": True}
++
++
++# ---------------------------------------------------------------------------
++# prepare
++# ---------------------------------------------------------------------------
++
++
++def prepare(out_dir: Path, allow_missing_ptxas: bool = False):
++    out_dir.mkdir(parents=True, exist_ok=True)
++    report = {"archs": {}, "cases": {}}
++    for case in SMALL_CASES + PERF_CASES:
++        entry = {"name": case["name"], "kind": case["kind"], "dtype": case["dtype"], "variants": {}}
++        spec = _case_spec(case)
++        entry["packed"] = {
++            "left": base64.b64encode(spec["left"]).decode() if spec["left"] else None,
++            "right": base64.b64encode(spec["right"]).decode() if spec["right"] else None,
++            "expected": base64.b64encode(spec["expected"]).decode(),
++        }
++        entry["left_shape"] = spec["left_shape"]
++        entry["right_shape"] = spec["right_shape"]
++        entry["results_shape"] = spec["results_shape"]
++        entry["ones_inputs"] = bool(spec.get("ones"))
++        for arch in ARCHS:
++            compiler = CudaPtxCompiler(arch=arch)
++            target = _target(case, arch)
++            ir = compiler.lower(_program(case), target)
++            artifact = compiler.compile(ir)
++            plan = ir.gpu_program.plans[0]
++            ptx_path = out_dir / "{}.{}.ptx".format(case["name"], arch)
++            ptx_path.write_text(ir.ptx, encoding="utf-8")
++            variant = {
++                "ptx": str(ptx_path),
++                "ptx_sha256": hashlib.sha256(ptx_path.read_bytes()).hexdigest(),
++                "ptx_target": ir.ptx_target,
++                "ptx_version": ir.ptx_version,
++                "arch_selection": dict(artifact.metadata["arch_selection"]) if "arch_selection" in artifact.metadata else None,
++                "artifact_payload_version": artifact.metadata["artifact_payload_version"],
++                "artifact_payload_digest": artifact.metadata["payload_digest"],
++                "artifact_ptx_digest": artifact.metadata["ptx_digest"],
++                "grid": list(plan.geometry.grid.dims),
++                "block": list(plan.geometry.workgroup.dims),
++                "shared_bytes": plan.geometry.dynamic_workgroup_memory_bytes,
++                "param_count": 3,
++            }
++            if arch == "sm_120":
++                cubin_path = out_dir / "{}.sm_120.cubin".format(case["name"])
++                try:
++                    completed = subprocess.run(
++                        ["ptxas", "-arch=sm_120", str(ptx_path), "-o", str(cubin_path)],
++                        capture_output=True, text=True,
++                    )
++                except FileNotFoundError:
++                    completed = None
++                variant["cubin"] = str(cubin_path)
++                variant["ptxas_rc"] = completed.returncode if completed is not None else 127
++                variant["ptxas_stderr"] = (
++                    completed.stderr.strip() if completed is not None else "ptxas not found"
++                )
++                variant["cubin_bytes"] = cubin_path.stat().st_size if cubin_path.exists() else None
++                if cubin_path.exists():
++                    variant["cubin_sha256"] = hashlib.sha256(cubin_path.read_bytes()).hexdigest()
++            entry["variants"][arch] = variant
++        report["cases"][case["name"]] = entry
++    (out_dir / "cases.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
++    summary = {
++        name: {arch: {"ptx_version": case["variants"][arch]["ptx_version"],
++                      "payload_version": case["variants"][arch]["artifact_payload_version"],
++                      "arch_selection": case["variants"][arch]["arch_selection"]}
++               for arch in ARCHS}
++        for name, case in report["cases"].items()
++    }
++    print(json.dumps({"mode": "prepare", "cases": len(report["cases"]), "summary": summary}, indent=2))
++    ptxas_ok = all(
++        case["variants"]["sm_120"].get("ptxas_rc") == 0 for case in report["cases"].values()
++    )
++    missing_only = all(
++        case["variants"]["sm_120"].get("ptxas_rc") == 127 for case in report["cases"].values()
++    )
++    return 0 if ptxas_ok or (allow_missing_ptxas and missing_only) else 1
++
++
++# ---------------------------------------------------------------------------
++# run (ctypes / libcuda)
++# ---------------------------------------------------------------------------
++
++
++class _ClockSampler(threading.Thread):
++    def __init__(self, interval=0.4):
++        super().__init__(daemon=True)
++        self.interval = interval
++        self.samples = []
++        self._stop = threading.Event()
++
++    def run(self):
++        while not self._stop.is_set():
++            try:
++                out = subprocess.check_output(
++                    ["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm", "--format=csv,noheader,nounits"],
++                    stderr=subprocess.STDOUT, text=True, timeout=10,
++                ).strip()
++                sm, mx = [int(float(part)) for part in out.split(",")]
++                self.samples.append({"sm": sm, "max": mx})
++            except Exception:
++                pass
++            self._stop.wait(self.interval)
++
++    def stop(self):
++        self._stop.set()
++        self.join(timeout=10)
++
++
++class _Cuda:
++    def __init__(self):
++        lib = ctypes.CDLL("libcuda.so.1")
++        self.lib = lib
++        lib.cuInit.argtypes = [ctypes.c_uint]
++        lib.cuInit.restype = ctypes.c_int
++        if lib.cuInit(0) != 0:
++            raise RuntimeError("cuInit failed")
++        device = ctypes.c_int()
++        lib.cuDeviceGet.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_int]
++        lib.cuDeviceGet.restype = ctypes.c_int
++        if lib.cuDeviceGet(ctypes.byref(device), 0) != 0:
++            raise RuntimeError("cuDeviceGet failed")
++        context = ctypes.c_void_p()
++        creator = getattr(lib, "cuCtxCreate_v2", None) or lib.cuCtxCreate
++        creator.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint, ctypes.c_int]
++        creator.restype = ctypes.c_int
++        if creator(ctypes.byref(context), 0, device) != 0:
++            raise RuntimeError("cuCtxCreate failed")
++        self.device = device
++        lib.cuModuleLoadData.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
++        lib.cuModuleLoadData.restype = ctypes.c_int
++        lib.cuModuleGetFunction.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_char_p]
++        lib.cuModuleGetFunction.restype = ctypes.c_int
++        lib.cuModuleUnload.argtypes = [ctypes.c_void_p]
++        lib.cuModuleUnload.restype = ctypes.c_int
++        lib.cuMemAlloc_v2.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
++        lib.cuMemAlloc_v2.restype = ctypes.c_int
++        lib.cuMemFree_v2.argtypes = [ctypes.c_void_p]
++        lib.cuMemFree_v2.restype = ctypes.c_int
++        lib.cuMemcpyHtoD_v2.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
++        lib.cuMemcpyHtoD_v2.restype = ctypes.c_int
++        lib.cuMemcpyDtoH_v2.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
++        lib.cuMemcpyDtoH_v2.restype = ctypes.c_int
++        lib.cuLaunchKernel.argtypes = [
++            ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
++            ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
++            ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
++        ]
++        lib.cuLaunchKernel.restype = ctypes.c_int
++        lib.cuCtxSynchronize.restype = ctypes.c_int
++        lib.cuEventCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
++        lib.cuEventCreate.restype = ctypes.c_int
++        lib.cuEventRecord.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
++        lib.cuEventRecord.restype = ctypes.c_int
++        lib.cuEventSynchronize.argtypes = [ctypes.c_void_p]
++        lib.cuEventSynchronize.restype = ctypes.c_int
++        lib.cuEventElapsedTime.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_void_p, ctypes.c_void_p]
++        lib.cuEventElapsedTime.restype = ctypes.c_int
++        lib.cuEventDestroy_v2.argtypes = [ctypes.c_void_p]
++        lib.cuEventDestroy_v2.restype = ctypes.c_int
++
++    def check(self, operation, result):
++        if result != 0:
++            raise RuntimeError("{} failed with CUDA error {}".format(operation, result))
++
++    def load_image(self, image: bytes):
++        buffer = ctypes.create_string_buffer(image)
++        module = ctypes.c_void_p()
++        started = time.perf_counter()
++        rc = self.lib.cuModuleLoadData(ctypes.byref(module), buffer)
++        elapsed = time.perf_counter() - started
++        if rc != 0:
++            return None, elapsed, rc
++        function = ctypes.c_void_p()
++        self.check("cuModuleGetFunction", self.lib.cuModuleGetFunction(ctypes.byref(function), module, b"px_op0"))
++        return (module, function, buffer), elapsed, 0
++
++    def unload(self, loaded):
++        if loaded is not None:
++            self.lib.cuModuleUnload(loaded[0])
++
++    def alloc(self, payload: bytes):
++        pointer = ctypes.c_void_p()
++        self.check("cuMemAlloc", self.lib.cuMemAlloc_v2(ctypes.byref(pointer), max(1, len(payload))))
++        if payload:
++            self.check("cuMemcpyHtoD", self.lib.cuMemcpyHtoD_v2(pointer, ctypes.create_string_buffer(payload), len(payload)))
++        return pointer
++
++    def free(self, pointer):
++        if pointer is not None:
++            self.lib.cuMemFree_v2(pointer)
++
++    def launch(self, loaded, meta, parameters):
++        holders = [ctypes.c_uint64(pointer.value) for pointer in parameters]
++        params = (ctypes.c_void_p * len(holders))()
++        for index, holder in enumerate(holders):
++            params[index] = ctypes.cast(ctypes.byref(holder), ctypes.c_void_p)
++        grid, block = meta["grid"], meta["block"]
++        self.check(
++            "cuLaunchKernel",
++            self.lib.cuLaunchKernel(
++                loaded[1],
++                int(grid[0]), int(grid[1]), int(grid[2]),
++                int(block[0]), int(block[1]), int(block[2]),
++                int(meta["shared_bytes"]), None, params, None,
++            ),
++        )
++
++    def sync(self):
++        self.check("cuCtxSynchronize", self.lib.cuCtxSynchronize())
++
++    def timed_launch(self, loaded, meta, parameters, repeats=1):
++        start, stop = ctypes.c_void_p(), ctypes.c_void_p()
++        self.check("cuEventCreate(start)", self.lib.cuEventCreate(ctypes.byref(start), 0))
++        self.check("cuEventCreate(stop)", self.lib.cuEventCreate(ctypes.byref(stop), 0))
++        try:
++            self.check("cuEventRecord(start)", self.lib.cuEventRecord(start, None))
++            for _ in range(repeats):
++                self.launch(loaded, meta, parameters)
++            self.check("cuEventRecord(stop)", self.lib.cuEventRecord(stop, None))
++            self.check("cuEventSynchronize", self.lib.cuEventSynchronize(stop))
++            seconds = ctypes.c_float()
++            self.check("cuEventElapsedTime", self.lib.cuEventElapsedTime(ctypes.byref(seconds), start, stop))
++            return seconds.value / 1000.0 / repeats
++        finally:
++            self.lib.cuEventDestroy_v2(start)
++            self.lib.cuEventDestroy_v2(stop)
++
++
++def _fingerprint():
++    out = subprocess.check_output(
++        ["nvidia-smi",
++         "--query-gpu=name,driver_version,clocks.sm,clocks.max.sm,temperature.gpu,power.draw,memory.used",
++         "--format=csv,noheader"],
++        text=True,
++    ).strip()
++    apps = subprocess.check_output(
++        ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"],
++        text=True,
++    ).strip()
++    return {"raw": out, "compute_apps": apps, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
++
++
++def _stats(values):
++    ordered = sorted(values)
++    median = statistics.median(ordered)
++    p95 = ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
++    stdev = statistics.stdev(ordered) if len(ordered) > 1 else 0.0
++    return {"n": len(ordered), "min": ordered[0], "median": median, "p95": p95, "max": ordered[-1],
++            "stdev": stdev, "cv": stdev / median if median else 0.0,
++            "p95_over_median": p95 / median if median else 0.0}
++
++
++def run(out_dir: Path, json_out: str):
++    cases = json.loads((out_dir / "cases.json").read_text(encoding="utf-8"))
++    cuda = _Cuda()
++    fingerprint_before = _fingerprint()
++    results = {"paths": {}, "correctness": {}, "load_seconds": {}, "launch_ms": {}, "perf": {}}
++
++    # ---- correctness for the small cases -----------------------------------
++    for name in (case["name"] for case in SMALL_CASES):
++        case = cases["cases"][name]
++        expected = base64.b64decode(case["packed"]["expected"])
++        outputs = {}
++        for path in PATHS:
++            arch = "sm_80" if path == "sm80_ptx" else "sm_120"
++            variant = case["variants"][arch]
++            image = Path(variant["cubin"]).read_bytes() if path == "sm120_cubin" else Path(variant["ptx"]).read_text().encode()
++            loaded, _elapsed, rc = cuda.load_image(image)
++            if rc != 0:
++                results["correctness"][name + ":" + path] = {"match": None, "load_error": rc}
++                continue
++            left = base64.b64decode(case["packed"]["left"])
++            right = base64.b64decode(case["packed"]["right"])
++            d_left, d_right = cuda.alloc(left), cuda.alloc(right)
++            d_out = cuda.alloc(b"\x00" * len(expected))
++            try:
++                cuda.launch(loaded, variant, [d_left, d_right, d_out])
++                cuda.sync()
++                raw = ctypes.create_string_buffer(len(expected))
++                cuda.check("cuMemcpyDtoH", cuda.lib.cuMemcpyDtoH_v2(raw, d_out, len(expected)))
++                observed = _unpack(case["dtype"], raw.raw)
++                outputs[path] = observed
++                results["correctness"][name + ":" + path] = {"match": raw.raw == expected, "observed": observed}
++            finally:
++                for pointer in (d_left, d_right, d_out):
++                    cuda.free(pointer)
++                cuda.unload(loaded)
++        if len(outputs) == len(PATHS) and all(results["correctness"][name + ":" + path]["match"] for path in PATHS):
++            results["correctness"][name] = "ALL_PATHS_BIT_EXACT"
++
++    # ---- load time ---------------------------------------------------------
++    for name in tuple(case["name"] for case in SMALL_CASES[:1]) + ("perf_matmul_f32_4096",):
++        case = cases["cases"][name]
++        for path in PATHS:
++            arch = "sm_80" if path == "sm80_ptx" else "sm_120"
++            variant = case["variants"][arch]
++            image = Path(variant["cubin"]).read_bytes() if path == "sm120_cubin" else Path(variant["ptx"]).read_text().encode()
++            rounds = 7 if name == "add_f32_5" else 3
++            timings = []
++            for _ in range(rounds):
++                loaded, elapsed, rc = cuda.load_image(image)
++                timings.append({"seconds": elapsed, "rc": rc})
++                if loaded is not None:
++                    cuda.unload(loaded)
++            ok = all(entry["rc"] == 0 for entry in timings)
++            results["load_seconds"][name + ":" + path] = {
++                "rounds": rounds,
++                "median": statistics.median([entry["seconds"] for entry in timings]) if ok else None,
++                "samples": timings,
++                "status": "PASS" if ok else "LOAD_FAILED",
++            }
++
++    # ---- launch overhead (small kernel, preloaded module) ------------------
++    name = "add_f32_5"
++    case = cases["cases"][name]
++    expected = base64.b64decode(case["packed"]["expected"])
++    for path in PATHS:
++        arch = "sm_80" if path == "sm80_ptx" else "sm_120"
++        variant = case["variants"][arch]
++        image = Path(variant["cubin"]).read_bytes() if path == "sm120_cubin" else Path(variant["ptx"]).read_text().encode()
++        loaded, _elapsed, rc = cuda.load_image(image)
++        if rc != 0:
++            results["launch_ms"][path] = {"status": "LOAD_FAILED", "load_error": rc}
++            continue
++        left = base64.b64decode(case["packed"]["left"])
++        right = base64.b64decode(case["packed"]["right"])
++        d_left, d_right = cuda.alloc(left), cuda.alloc(right)
++        d_out = cuda.alloc(b"\x00" * len(expected))
++        try:
++            walls = []
++            for _ in range(51):
++                started = time.perf_counter()
++                cuda.launch(loaded, variant, [d_left, d_right, d_out])
++                walls.append((time.perf_counter() - started) * 1000.0)
++                cuda.sync()
++            kernel = [cuda.timed_launch(loaded, variant, [d_left, d_right, d_out]) for _ in range(21)]
++            results["launch_ms"][path] = {
++                "status": "PASS",
++                "host_launch_ms": _stats(walls),
++                "kernel_seconds": _stats(kernel),
++            }
++        finally:
++            for pointer in (d_left, d_right, d_out):
++                cuda.free(pointer)
++            cuda.unload(loaded)
++
++    # ---- performance: 4096^3 (R=21, warmup 5, clock warmup + samples) ------
++    sampler = _ClockSampler()
++    largest = cases["cases"]["perf_matmul_f32_4096"]
++    variant = largest["variants"]["sm_80"]
++    loaded, _elapsed, rc = cuda.load_image(Path(variant["ptx"]).read_text().encode())
++    if rc == 0:
++        m, n, k = (4096, 4096, 4096)
++        d_left = cuda.alloc(_ones("float32", m * k))
++        d_right = cuda.alloc(_ones("float32", k * n))
++        d_out = cuda.alloc(b"\x00" * (m * n * 4))
++        clock_deadline = time.perf_counter() + 3.0
++        while time.perf_counter() < clock_deadline:
++            cuda.launch(loaded, variant, [d_left, d_right, d_out])
++        cuda.sync()
++        cuda.unload(loaded)
++        cuda.free(d_left)
++        cuda.free(d_right)
++        cuda.free(d_out)
++    sampler.start()
++
++    for case in PERF_CASES:
++        name = case["name"]
++        m, n, k = case["m"], case["n"], case["k"]
++        dtype = case["dtype"]
++        expected_word = _pack(dtype, [float(k)])
++        expected_raw = expected_word * (m * n)
++        for path in PATHS:
++            arch = "sm_80" if path == "sm80_ptx" else "sm_120"
++            variant = cases["cases"][name]["variants"][arch]
++            image = Path(variant["cubin"]).read_bytes() if path == "sm120_cubin" else Path(variant["ptx"]).read_text().encode()
++            loaded, load_seconds, rc = cuda.load_image(image)
++            if rc != 0:
++                results["perf"][name + ":" + path] = {"status": "LOAD_FAILED", "load_error": rc}
++                continue
++            d_left = cuda.alloc(_ones(dtype, m * k))
++            d_right = cuda.alloc(_ones(dtype, k * n))
++            d_out = cuda.alloc(b"\x00" * (m * n * _itemsize(dtype)))
++            try:
++                for _ in range(5):
++                    cuda.launch(loaded, variant, [d_left, d_right, d_out])
++                cuda.sync()
++                raw = ctypes.create_string_buffer(len(expected_raw))
++                cuda.check("cuMemcpyDtoH", cuda.lib.cuMemcpyDtoH_v2(raw, d_out, len(expected_raw)))
++                correctness = raw.raw == expected_raw
++                kernel = []
++                for _ in range(21):
++                    kernel.append(cuda.timed_launch(loaded, variant, [d_left, d_right, d_out]))
++                results["perf"][name + ":" + path] = {
++                    "status": "PASS",
++                    "load_seconds_first": load_seconds,
++                    "correctness_exact_ones": correctness,
++                    "kernel_seconds": _stats(kernel),
++                }
++            finally:
++                for pointer in (d_left, d_right, d_out):
++                    cuda.free(pointer)
++                cuda.unload(loaded)
++
++    sampler.stop()
++    clock_values = [sample["sm"] for sample in sampler.samples]
++    clock_max = max([sample["max"] for sample in sampler.samples] or [0])
++    clock_median = statistics.median(clock_values) if clock_values else None
++    results["clock"] = {
++        "samples": len(clock_values),
++        "median_sm_mhz": clock_median,
++        "max_sm_mhz": clock_max,
++        "ratio": (clock_median / clock_max) if clock_median and clock_max else None,
++        "verdict": "VALID" if clock_median and clock_max and clock_median / clock_max >= 0.9 else "INVALID_CLOCK",
++    }
++    results["fingerprint_before"] = fingerprint_before
++    results["fingerprint_after"] = _fingerprint()
++    results["arch"] = {name: {"ptx_target": cases["cases"][name]["variants"]["sm_120"]["ptx_target"],
++                              "ptx_version": cases["cases"][name]["variants"]["sm_120"]["ptx_version"],
++                              "arch_selection": cases["cases"][name]["variants"]["sm_120"]["arch_selection"]}
++                       for name in ("add_f32_5", "perf_matmul_f32_4096")}
++    results["status"] = "PASS" if all(
++        entry.get("status") == "PASS" for entry in results["perf"].values()
++    ) and results["clock"]["verdict"] == "VALID" else "FAIL"
++    payload = json.dumps(results, indent=2, sort_keys=True)
++    if json_out:
++        Path(json_out).write_text(payload + "\n", encoding="utf-8")
++    print(payload)
++    return 0 if results["status"] == "PASS" else 1
++
++
++def main(argv=None):
++    parser = argparse.ArgumentParser(description="sm_120 PTX-JIT vs cubin comparison")
++    parser.add_argument("--mode", choices=("prepare", "run"), required=True)
++    parser.add_argument("--out-dir", default="sm120-compare")
++    parser.add_argument("--json-out", default="")
++    parser.add_argument("--allow-missing-ptxas", action="store_true")
++    args = parser.parse_args(argv)
++    out_dir = Path(args.out_dir)
++    if args.mode == "prepare":
++        return prepare(out_dir, args.allow_missing_ptxas)
++    return run(out_dir, args.json_out)
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

@@ -1,0 +1,2081 @@
+From d16152f9219b01977e58e9008df3a05908345365 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sun, 13 Sep 2026 12:22:08 +0800
+Subject: [PATCH 262/264] feat(execution): add U3 discovery commands
+ (doctor/explain/plan)
+
+task=u3-discovery
+base=port/pypto-x-integration @ 2d6e87c7d
+
+- pypto.execution.discovery: read-only doctor (host/contract/provider/pin
+  facts + fail-closed checks), explain (a view over the resolver trace for a
+  request, a frozen plan or a v4 report), plan_request (frozen plan +
+  capability snapshot, no execution) and fail-closed capability snapshot
+  export/import.
+- pypto.execution.cli + scripts/perf/execution_cli.py: doctor/explain/plan
+  argparse subcommands with --json and structured errors.
+- tests: 28 focused cases (doctor determinism/leak-free/fail-closed, explain
+  trace equality, plan replay/digest equality, snapshot tamper rejection,
+  CLI smoke, Python 3.7 AST gate).
+---
+ python/pypto/execution/__init__.py                  |   36 ++
+ python/pypto/execution/cli.py                       |  235 ++++++++
+ python/pypto/execution/discovery.py                 | 1140 +++++++++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_execution_discovery.py |  566 +++++++++++++++++++
+ scripts/perf/execution_cli.py                       |   37 ++
+ 5 files changed, 2014 insertions(+)
+
+diff --git a/python/pypto/execution/__init__.py b/python/pypto/execution/__init__.py
+index c7e781363..1ab5c9884 100644
+--- a/python/pypto/execution/__init__.py
++++ b/python/pypto/execution/__init__.py
+@@ -151,6 +151,29 @@ from .resolver import (
+     resolve_matmul,
+     resolve_qmatmul,
+ )
++from .discovery import (
++    DISCOVERY_SCHEMA_VERSION,
++    ENV_VAR_REGISTRY,
++    EXPLAIN_BOUNDARIES,
++    SUPPORTED_DISCOVERY_OPS,
++    DoctorReport,
++    Explanation,
++    PlanDocument,
++    doctor,
++    explain,
++    export_capability_snapshot,
++    import_capability_snapshot,
++    plan_request,
++)
++
++
++def cli_main(argv=None):
++    """Programmatic entry point for :mod:`pypto.execution.cli` (lazy import)."""
++
++    from .cli import main as _main
++
++    return _main(argv)
++
+ 
+ from pypto.alias import (
+     ALIAS_PROOF_STATUSES,
+@@ -306,4 +329,17 @@ __all__ = [
+     "resolve_qmatmul",
+     "resolve_view",
+     "validate_report_schema",
++    "DISCOVERY_SCHEMA_VERSION",
++    "ENV_VAR_REGISTRY",
++    "EXPLAIN_BOUNDARIES",
++    "SUPPORTED_DISCOVERY_OPS",
++    "DoctorReport",
++    "Explanation",
++    "PlanDocument",
++    "cli_main",
++    "doctor",
++    "explain",
++    "export_capability_snapshot",
++    "import_capability_snapshot",
++    "plan_request",
+ ]
+diff --git a/python/pypto/execution/cli.py b/python/pypto/execution/cli.py
+new file mode 100644
+index 000000000..87697bdf5
+--- /dev/null
++++ b/python/pypto/execution/cli.py
+@@ -0,0 +1,235 @@
++"""Command line interface for the PyPTO-X execution discovery commands (U3).
++
++Supported entry points::
++
++    python -m pypto.execution.cli doctor [--json]
++    python -m pypto.execution.cli explain --op matmul --left 2,3 --right 3,4 \
++        --dtype float32 [--policy policy.json] [--snapshot snapshot.json] [--json]
++    python -m pypto.execution.cli explain --plan plan.json [--json]
++    python -m pypto.execution.cli explain --report report.json [--json]
++    python -m pypto.execution.cli plan --op matmul --left 2,3 --right 3,4 \
++        --dtype float32 [--policy policy.json] [--snapshot snapshot.json] \
++        [--out plan.json] [--json]
++
++``scripts/perf/execution_cli.py`` is the wrapper that sets
++``PYPTO_X_PORTABLE_ONLY=1`` and puts ``python/`` on ``sys.path`` before the
++package import, mirroring the op-bench launcher.
++
++All three commands are read-only with respect to execution state: ``doctor``
++probes only pinned artifacts, ``explain`` and ``plan`` never execute a
++provider.  Structured failures exit with status 1 and print the
++``ExecutionError.to_dict()`` payload under ``--json``.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from typing import Any, Optional, Sequence
++
++from pypto.target._utils import canonical_json
++
++from .discovery import (
++    doctor,
++    explain,
++    import_capability_snapshot,
++    plan_request,
++)
++from .errors import ArtifactMismatchError, ExecutionError
++from .policy import policy_from_dict
++
++
++def _shape(value: str) -> tuple:
++    parts = [item.strip() for item in str(value).split(",") if item.strip()]
++    if not parts:
++        raise argparse.ArgumentTypeError("shape must be a comma-separated list of dimensions")
++    dimensions = []
++    for part in parts:
++        try:
++            dimension = int(part)
++        except ValueError as exc:
++            raise argparse.ArgumentTypeError("shape dimension {!r} is not an integer".format(part)) from exc
++        if dimension < 0:
++            raise argparse.ArgumentTypeError("shape dimension must be non-negative: {!r}".format(part))
++        dimensions.append(dimension)
++    return tuple(dimensions)
++
++
++def _add_common(parser: argparse.ArgumentParser) -> None:
++    parser.add_argument("--json", action="store_true", help="print the machine-readable document")
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        prog="pypto-execution",
++        description="PyPTO-X execution discovery commands (doctor / explain / plan)",
++    )
++    common = argparse.ArgumentParser(add_help=False)
++    _add_common(common)
++    sub = parser.add_subparsers(dest="command")
++
++    doctor_cmd = sub.add_parser("doctor", parents=[common], help="report host, contract, provider and pin facts")
++    doctor_cmd.add_argument("--snapshot", default=None, help="report on an imported capability snapshot instead of the local probe")
++
++    explain_cmd = sub.add_parser("explain", parents=[common], help="explain the resolver decision")
++    source = explain_cmd.add_mutually_exclusive_group()
++    source.add_argument("--plan", default=None, help="frozen plan JSON document")
++    source.add_argument("--report", default=None, help="execution report JSON document")
++    explain_cmd.add_argument("--op", default="matmul", help="matmul | qmatmul_s8s8_s32")
++    explain_cmd.add_argument("--left", type=_shape, default=None, help="left shape, e.g. 2,3")
++    explain_cmd.add_argument("--right", type=_shape, default=None, help="right shape, e.g. 3,4")
++    explain_cmd.add_argument("--dtype", default=None, help="matmul dtype (qmatmul is fixed int8)")
++    explain_cmd.add_argument("--policy", default=None, help="policy JSON document")
++    explain_cmd.add_argument("--snapshot", default=None, help="capability snapshot JSON document")
++
++    plan_cmd = sub.add_parser("plan", parents=[common], help="freeze a request into a replayable plan")
++    plan_cmd.add_argument("--op", required=True, help="matmul | qmatmul_s8s8_s32")
++    plan_cmd.add_argument("--left", type=_shape, required=True, help="left shape, e.g. 2,3")
++    plan_cmd.add_argument("--right", type=_shape, required=True, help="right shape, e.g. 3,4")
++    plan_cmd.add_argument("--dtype", default=None, help="matmul dtype (qmatmul is fixed int8)")
++    plan_cmd.add_argument("--policy", default=None, help="policy JSON document")
++    plan_cmd.add_argument("--snapshot", default=None, help="capability snapshot JSON document")
++    plan_cmd.add_argument("--out", default=None, help="write the frozen plan document to this path")
++    return parser
++
++
++def _load_json(path: str, field: str) -> Any:
++    try:
++        with open(path, "r", encoding="utf-8") as handle:
++            return json.load(handle)
++    except OSError as exc:
++        raise ArtifactMismatchError(
++            "could not read {} document {!r}: {}".format(field, path, exc),
++            field=field,
++            requested=path,
++            reason="{}_file_unreadable".format(field.replace(".", "_")),
++        ) from exc
++    except ValueError as exc:
++        raise ArtifactMismatchError(
++            "{} document {!r} is not valid JSON: {}".format(field, path, exc),
++            field=field,
++            requested=path,
++            reason="{}_file_invalid_json".format(field.replace(".", "_")),
++        ) from exc
++
++
++def _load_policy(path: Optional[str]) -> Any:
++    if not path:
++        return None
++    return policy_from_dict(_load_json(path, "policy"))
++
++
++def _load_snapshot(path: Optional[str]) -> Any:
++    if not path:
++        return None
++    return import_capability_snapshot(_load_json(path, "snapshot"))
++
++
++def _print_error(error: ExecutionError, as_json: bool) -> None:
++    if as_json:
++        print(json.dumps(error.to_dict(), ensure_ascii=False, sort_keys=True, indent=2))
++    else:
++        print("error [{}]: {} (field={}, reason={})".format(
++            error.code, error, error.field, error.reason
++        ), file=sys.stderr)
++
++
++def _print_document(document: Any, summary: str, as_json: bool) -> None:
++    if as_json:
++        print(json.dumps(document, ensure_ascii=False, sort_keys=True, indent=2))
++    else:
++        print(summary)
++
++
++def _plan_summary(plan_document: Any) -> str:
++    plan = plan_document.plan
++    selected = plan.selected
++    return "\n".join(
++        (
++            "plan digest: {}".format(plan.digest),
++            "capability digest: {}".format(plan_document.capability.digest),
++            "request: {op} {dtype} {left}x{right}->{out}".format(
++                op=plan.opcode,
++                dtype=plan.dtype,
++                left=list(plan.left_shape),
++                right=list(plan.right_shape),
++                out=list(plan.output_shape),
++            ),
++            "selected provider: {} ({})".format(selected["provider"], selected["provider_version"]),
++            "implementation: {}".format(selected["implementation"]),
++            "numeric class: {} deterministic={}".format(
++                selected["numeric_class"], selected["deterministic"]
++            ),
++            "fallback chain: {}".format(list(plan.fallback_chain)),
++        )
++    )
++
++
++def main(argv: Optional[Sequence[str]] = None) -> int:
++    parser = build_parser()
++    args = parser.parse_args(list(argv) if argv is not None else None)
++    command = args.command
++    if command is None:
++        parser.print_help()
++        return 2
++    as_json = bool(getattr(args, "json", False))
++    try:
++        if command == "doctor":
++            report = doctor(capability=_load_snapshot(getattr(args, "snapshot", None)))
++            _print_document(report.to_dict(), report.summary, as_json)
++            return 0
++        if command == "explain":
++            policy = _load_policy(getattr(args, "policy", None))
++            snapshot = _load_snapshot(getattr(args, "snapshot", None))
++            plan_path = getattr(args, "plan", None)
++            report_path = getattr(args, "report", None)
++            plan_document = _load_json(plan_path, "plan") if plan_path else None
++            report_document = _load_json(report_path, "report") if report_path else None
++            explanation = explain(
++                op=args.op,
++                left_shape=args.left,
++                right_shape=args.right,
++                dtype=args.dtype,
++                policy=policy,
++                capability=snapshot,
++                plan=plan_document,
++                report=report_document,
++            )
++            _print_document(explanation.to_dict(), explanation.summary, as_json)
++            return 0
++        if command == "plan":
++            plan_document = plan_request(
++                op=args.op,
++                left_shape=args.left,
++                right_shape=args.right,
++                dtype=args.dtype,
++                policy=_load_policy(getattr(args, "policy", None)),
++                capability=_load_snapshot(getattr(args, "snapshot", None)),
++            )
++            document = plan_document.to_dict()
++            if args.out:
++                try:
++                    with open(args.out, "w", encoding="utf-8") as handle:
++                        handle.write(canonical_json(document) + "\n")
++                except OSError as exc:
++                    raise ArtifactMismatchError(
++                        "could not write plan document {!r}: {}".format(args.out, exc),
++                        field="out",
++                        requested=args.out,
++                        reason="plan_file_unwritable",
++                    ) from exc
++            _print_document(document, _plan_summary(plan_document), as_json)
++            return 0
++        parser.print_help()
++        return 2
++    except ExecutionError as exc:
++        _print_error(exc, as_json)
++        return 1
++
++
++__all__ = ["build_parser", "main"]
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/python/pypto/execution/discovery.py b/python/pypto/execution/discovery.py
+new file mode 100644
+index 000000000..16d7ce515
+--- /dev/null
++++ b/python/pypto/execution/discovery.py
+@@ -0,0 +1,1140 @@
++"""U3 discovery layer: ``doctor`` / ``explain`` / ``plan`` + snapshot I/O.
++
++The three commands expose the U1/U2 execution machinery without executing
++anything:
++
++* :func:`doctor` reports facts (host probe, registered contracts, provider
++  manifests, pinned-library fingerprints, policy-related environment status,
++  fail-closed checks) as a machine-readable, digest-carrying document plus a
++  human summary.  It is read-only, probes only the pinned artifacts and never
++  echoes raw environment values or any private endpoint/credential.
++* :func:`explain` is a view over the resolver trace (``resolution.rules``,
++  ``candidates`` with per-check records, ``rejections``, fallback chain and
++  events) for either a fresh request, a frozen plan document or a v4 report.
++  It does not re-run selection logic and does not execute.
++* :func:`plan_request` freezes a request into an ``ExecutionPlan`` and returns
++  the capability snapshot (with its digest) that was used, without executing.
++  Replaying the same snapshot + policy produces the same plan digest and is
++  accepted by ``execute_matmul_plan`` / ``execute_qmatmul_plan``.
++
++Capability snapshots are exported with :func:`export_capability_snapshot` and
++imported with the fail-closed :func:`import_capability_snapshot`, which
++requires the registered schema version, a ``sha256:`` digest and a canonical
++structure (unknown/missing/extra fields are refused, never guessed).
++
++Every discovery document is versioned with ``DISCOVERY_SCHEMA_VERSION`` and
++carries a canonical ``digest``.  No performance claim is made anywhere:
++runtime numbers remain ``UNGATED`` and are only copied from a validated
++report.
++"""
++
++from __future__ import annotations
++
++import os
++import platform
++import sys
++from dataclasses import dataclass
++from typing import Any, Mapping, Optional, Tuple
++
++from pypto.target._utils import canonical_json, mapping_copy, sha256_text
++
++from .capability import (
++    CAPABILITY_SCHEMA_VERSION,
++    CapabilitySnapshot,
++    host_features,
++    host_triple,
++)
++from .entry import _explain as _entry_explain, capability_for_policy
++from .errors import (
++    ArtifactMismatchError,
++    CapabilityUnavailableError,
++    OpContractError,
++    PolicyInvalidValueError,
++    ReportSchemaError,
++)
++from .op_registry import (
++    OP_REGISTRY_SCHEMA_VERSION,
++    get_op_definition,
++    lookup_canonical_opcode,
++    registered_opcodes,
++)
++from .plan import PLAN_SCHEMA_VERSION, ExecutionPlan
++from .policy import POLICY_SCHEMA_VERSION, ExecutionPolicy
++from .report import REPORT_SCHEMA_VERSION, validate_report_schema
++from .resolver import resolve_matmul, resolve_qmatmul
++from .provider_identity import (
++    expected_artifact_digest,
++    library_pin_errors,
++    registered_identity,
++)
++from .provider_aocl import AOCL_BLIS_TAG, AOCL_ARCH_STRING, AOCL_SHA256_PIN
++from .provider_ids import PORTABLE_PROVIDER_ID
++
++
++DISCOVERY_SCHEMA_VERSION = 1
++
++#: Request-level opcode spellings accepted by the discovery commands.
++SUPPORTED_DISCOVERY_OPS = ("matmul", "qmatmul_s8s8_s32")
++
++#: Fields that are only decidable by an actual execution, not by resolution.
++EXPLAIN_BOUNDARIES = (
++    {
++        "field": "timing.*",
++        "layer": "execution",
++        "why": "wall-clock observations from a real launch; permanently UNGATED on this host",
++    },
++    {
++        "field": "artifact.content_digest / artifact.abi_version / artifact.format",
++        "layer": "execution",
++        "why": "observed from the compiled/loaded artifact handed to the runtime",
++    },
++    {
++        "field": "dispatch.* reconciliation flags",
++        "layer": "execution",
++        "why": "compare the runtime invocation against the frozen declaration",
++    },
++    {
++        "field": "resources.parallelism.thread_state",
++        "layer": "execution",
++        "why": "recorded after the provider library is loaded and thread mode applied",
++    },
++    {
++        "field": "coverage.* runtime counts",
++        "layer": "execution",
++        "why": "count actual provider invocations/artifacts, not plan candidates",
++    },
++    {
++        "field": "gates.*",
++        "layer": "execution",
++        "why": "gate state is attached by the runtime environment, not by the resolver",
++    },
++    {
++        "field": "provider manifest runtime facts (default_threads, loaded thread state)",
++        "layer": "execution/probe",
++        "why": "probed when the provider library is loaded; an imported snapshot reports its captured facts",
++    },
++)
++
++#: Policy-related environment variables.  Only these names are read by the
++#: doctor command; raw values are never echoed (only a typed interpretation).
++ENV_VAR_REGISTRY = (
++    {
++        "name": "PYPTO_X_PORTABLE_ONLY",
++        "class": "compat_alias",
++        "policy_field": "profile / provider.mode",
++        "consumed_by_execution": False,
++        "value_kind": "flag",
++        "source": "docs/10-architecture/0006 section 9.1",
++    },
++    {
++        "name": "OMP_NUM_THREADS",
++        "class": "provider_thread_env",
++        "policy_field": "resources.max_threads (vendor provider thread state)",
++        "consumed_by_execution": True,
++        "value_kind": "integer",
++        "source": "pinned AOCL/BLIS OpenMP thread env",
++    },
++    {
++        "name": "BLIS_NUM_THREADS",
++        "class": "provider_thread_env",
++        "policy_field": "resources.max_threads (vendor provider thread state)",
++        "consumed_by_execution": True,
++        "value_kind": "integer",
++        "source": "pinned AOCL/BLIS thread env",
++    },
++    {
++        "name": "PYPTO_X_AVX512_GEMM_THREADS",
++        "class": "legacy_not_consumed",
++        "policy_field": "resources.max_threads",
++        "consumed_by_execution": False,
++        "value_kind": "integer",
++        "source": "docs/10-architecture/0006 section 9.1 (U4 migration target)",
++    },
++    {
++        "name": "PYPTO_X_VLLM_GEMM_THREADS",
++        "class": "legacy_not_consumed",
++        "policy_field": "resources.max_threads",
++        "consumed_by_execution": False,
++        "value_kind": "integer",
++        "source": "docs/10-architecture/0006 section 9.1 (U4 migration target)",
++    },
++    {
++        "name": "PYPTO_X_ASCEND_DEVICE_ID",
++        "class": "declared_not_consumed",
++        "policy_field": "placement.device",
++        "consumed_by_execution": False,
++        "value_kind": "integer",
++        "source": "docs/10-architecture/0006 section 9.1 (no Ascend provider in this slice)",
++    },
++)
++
++_REQUIRED_SNAPSHOT_KEYS = ("schema_version", "kind", "triple", "features", "providers", "digest")
++
++
++def _digest(document: Mapping[str, Any]) -> str:
++    return "sha256:" + sha256_text(document)
++
++
++def _error_details(exc: Any) -> Mapping[str, Any]:
++    if hasattr(exc, "to_dict"):
++        return dict(exc.to_dict())
++    return {"message": str(exc)}
++
++
++def _check(name: str, ok: bool, reason: str = "", details: Optional[Mapping[str, Any]] = None) -> Mapping[str, Any]:
++    return {
++        "check": name,
++        "status": "ok" if ok else "failed",
++        "reason": "" if ok else reason,
++        "details": dict(details or {}),
++    }
++
++
++# ---------------------------------------------------------------------------
++# capability snapshot export / import
++# ---------------------------------------------------------------------------
++def export_capability_snapshot(snapshot: CapabilitySnapshot) -> Mapping[str, Any]:
++    """Return the canonical, digest-carrying document of one snapshot."""
++
++    if not isinstance(snapshot, CapabilitySnapshot):
++        raise CapabilityUnavailableError(
++            "snapshot must be a CapabilitySnapshot",
++            field="snapshot",
++            requested=type(snapshot).__name__,
++            reason="not_a_capability_snapshot",
++        )
++    snapshot.verify_digest()
++    return snapshot.to_dict()
++
++
++def import_capability_snapshot(document: Mapping[str, Any]) -> CapabilitySnapshot:
++    """Fail-closed import of an exported capability snapshot.
++
++    Unlike the permissive :meth:`CapabilitySnapshot.from_dict` (a registered
++    U1 boundary used by tests), discovery imports require the exact registered
++    schema, a ``sha256:`` digest and the canonical structure emitted by
++    :func:`export_capability_snapshot`.  Extra, missing or non-canonical
++    fields are refused, never defaulted.
++    """
++
++    if not isinstance(document, Mapping):
++        raise CapabilityUnavailableError(
++            "capability snapshot document must be a mapping",
++            field="snapshot",
++            requested=type(document).__name__,
++            reason="not_a_mapping",
++        )
++    missing = [key for key in _REQUIRED_SNAPSHOT_KEYS if key not in document]
++    if missing:
++        raise ArtifactMismatchError(
++            "capability snapshot document is missing required fields",
++            field="snapshot",
++            requested=sorted(document),
++            available=list(_REQUIRED_SNAPSHOT_KEYS),
++            reason="capability_structure_missing_fields",
++            details={"missing": missing},
++        )
++    unknown = sorted(str(key) for key in document if key not in _REQUIRED_SNAPSHOT_KEYS)
++    if unknown:
++        raise ArtifactMismatchError(
++            "capability snapshot document carries unknown top-level fields",
++            field="snapshot",
++            requested=unknown,
++            available=list(_REQUIRED_SNAPSHOT_KEYS),
++            reason="capability_structure_unknown_fields",
++        )
++    schema_version = document["schema_version"]
++    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
++        raise ArtifactMismatchError(
++            "capability snapshot schema_version must be an integer",
++            field="snapshot.schema_version",
++            requested=schema_version,
++            available=CAPABILITY_SCHEMA_VERSION,
++            reason="capability_schema_version_invalid",
++        )
++    if schema_version != CAPABILITY_SCHEMA_VERSION:
++        raise ArtifactMismatchError(
++            "unsupported capability snapshot schema version",
++            field="snapshot.schema_version",
++            requested=schema_version,
++            available=CAPABILITY_SCHEMA_VERSION,
++            reason="capability_schema_version_mismatch",
++        )
++    digest = document["digest"]
++    if not isinstance(digest, str) or not digest.startswith("sha256:"):
++        raise ArtifactMismatchError(
++            "capability snapshot digest must be a sha256: string",
++            field="snapshot.digest",
++            requested=digest,
++            reason="capability_digest_invalid",
++        )
++    if not isinstance(document["kind"], str) or not document["kind"].strip():
++        raise ArtifactMismatchError(
++            "capability snapshot kind must be a non-empty string",
++            field="snapshot.kind",
++            requested=document["kind"],
++            reason="capability_structure_mismatch",
++        )
++    if not isinstance(document["triple"], str) or not document["triple"].strip():
++        raise ArtifactMismatchError(
++            "capability snapshot triple must be a non-empty string",
++            field="snapshot.triple",
++            requested=document["triple"],
++            reason="capability_structure_mismatch",
++        )
++    features = document["features"]
++    if not isinstance(features, list) or any(not isinstance(item, str) for item in features):
++        raise ArtifactMismatchError(
++            "capability snapshot features must be a list of strings",
++            field="snapshot.features",
++            requested=features,
++            reason="capability_structure_mismatch",
++        )
++    providers = document["providers"]
++    if not isinstance(providers, list) or any(not isinstance(item, Mapping) for item in providers):
++        raise ArtifactMismatchError(
++            "capability snapshot providers must be a list of mappings",
++            field="snapshot.providers",
++            requested=providers,
++            reason="capability_structure_mismatch",
++        )
++    snapshot = CapabilitySnapshot.from_dict(document)
++    snapshot.verify_digest()
++    canonical = snapshot.to_dict()
++    if dict(document) != dict(canonical):
++        raise ArtifactMismatchError(
++            "capability snapshot document is not the canonical exported structure",
++            field="snapshot",
++            reason="capability_structure_mismatch",
++            details={"expected_keys": sorted(canonical), "requested_keys": sorted(document)},
++        )
++    return snapshot
++
++
++def _coerce_snapshot(capability: Any) -> Optional[CapabilitySnapshot]:
++    if capability is None:
++        return None
++    if isinstance(capability, CapabilitySnapshot):
++        capability.verify_digest()
++        return capability
++    if isinstance(capability, Mapping):
++        return import_capability_snapshot(capability)
++    raise CapabilityUnavailableError(
++        "capability must be a CapabilitySnapshot or an exported snapshot document",
++        field="capability",
++        requested=type(capability).__name__,
++        reason="not_a_capability_snapshot",
++    )
++
++
++# ---------------------------------------------------------------------------
++# plan command
++# ---------------------------------------------------------------------------
++def _canonical_discovery_op(op: Any) -> str:
++    if not isinstance(op, str) or not op.strip():
++        raise OpContractError(
++            "op must be a non-empty string",
++            field="request.op",
++            requested=op,
++            available=list(SUPPORTED_DISCOVERY_OPS),
++            reason="invalid_op",
++        )
++    name = op.strip().lower()
++    if name == "qmatmul":
++        name = "qmatmul_s8s8_s32"
++    canonical = lookup_canonical_opcode(name)
++    if canonical not in SUPPORTED_DISCOVERY_OPS:
++        raise OpContractError(
++            "op {!r} is not covered by the discovery commands".format(op),
++            field="request.op",
++            requested=op,
++            available=list(SUPPORTED_DISCOVERY_OPS),
++            reason="opcode_not_registered",
++        )
++    return canonical
++
++
++def _resolve_request(
++    op: str,
++    left_shape: Any,
++    right_shape: Any,
++    dtype: Any,
++    policy: ExecutionPolicy,
++    capability: Optional[CapabilitySnapshot]
++) -> Any:
++    canonical = _canonical_discovery_op(op)
++    if canonical == "matmul":
++        return resolve_matmul(policy, capability, left_shape, right_shape, dtype)
++    return resolve_qmatmul(policy, capability, left_shape, right_shape)
++
++
++@dataclass(frozen=True)
++class PlanDocument:
++    """Frozen plan plus the capability snapshot it was resolved against."""
++
++    plan: ExecutionPlan
++    capability: CapabilitySnapshot
++    requested_op: str
++
++    @property
++    def plan_digest(self) -> str:
++        return self.plan.digest
++
++    @property
++    def capability_digest(self) -> str:
++        return self.capability.digest
++
++    def to_dict(self) -> Mapping[str, Any]:
++        if self.plan.capability_digest != self.capability.digest:
++            raise ArtifactMismatchError(
++                "plan capability digest does not match the returned snapshot",
++                field="plan.target.capability_digest",
++                requested=self.plan.capability_digest,
++                available=self.capability.digest,
++                reason="plan_capability_digest_mismatch",
++            )
++        return {
++            "schema_version": DISCOVERY_SCHEMA_VERSION,
++            "kind": "plan",
++            "requested_op": self.requested_op,
++            "plan": self.plan.to_dict(),
++            "plan_digest": self.plan.digest,
++            "capability_snapshot": self.capability.to_dict(),
++            "capability_digest": self.capability.digest,
++            "request": self.plan.request,
++            "resolved_policy": mapping_copy(self.plan.payload["policy"]["resolved"]),
++        }
++
++    def to_json(self) -> str:
++        return canonical_json(self.to_dict())
++
++
++def plan_request(
++    op: str,
++    left_shape: Any,
++    right_shape: Any,
++    dtype: Any = None,
++    policy: Optional[ExecutionPolicy] = None,
++    capability: Any = None
++) -> PlanDocument:
++    """Freeze one request into a plan; never executes and never re-selects."""
++
++    active_policy = policy if policy is not None else ExecutionPolicy()
++    if not isinstance(active_policy, ExecutionPolicy):
++        raise PolicyInvalidValueError(
++            "policy must be an ExecutionPolicy",
++            field="policy",
++            requested=type(active_policy).__name__,
++            reason="not_an_execution_policy",
++        )
++    snapshot = _coerce_snapshot(capability)
++    # capability_for_policy enforces the host-probe alignment and builds the
++    # local probe snapshot when the caller did not supply one.
++    active_capability = capability_for_policy(active_policy, snapshot)
++    resolution = _resolve_request(op, left_shape, right_shape, dtype, active_policy, active_capability)
++    if resolution.plan.capability_digest != active_capability.digest:
++        raise ArtifactMismatchError(
++            "resolver returned a plan for a different capability snapshot",
++            field="plan.target.capability_digest",
++            requested=resolution.plan.capability_digest,
++            available=active_capability.digest,
++            reason="plan_capability_digest_mismatch",
++        )
++    return PlanDocument(
++        plan=resolution.plan,
++        capability=active_capability,
++        requested_op=resolution.plan.opcode,
++    )
++
++
++# ---------------------------------------------------------------------------
++# explain command
++# ---------------------------------------------------------------------------
++@dataclass(frozen=True)
++class Explanation:
++    """Machine-readable explanation plus a human summary."""
++
++    document: Mapping[str, Any]
++    summary: str
++
++    @property
++    def digest(self) -> str:
++        return str(self.document["digest"])
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return mapping_copy(self.document)
++
++    def to_json(self) -> str:
++        return canonical_json(self.to_dict())
++
++
++def _plan_from_document(value: Any) -> ExecutionPlan:
++    if isinstance(value, ExecutionPlan):
++        plan = value
++    elif isinstance(value, Mapping) and value.get("kind") == "plan" and isinstance(value.get("plan"), Mapping):
++        # Accept the wrapper document emitted by the ``plan`` command; the
++        # nested plan still has to satisfy the full plan schema and digest.
++        plan = ExecutionPlan.from_dict(value["plan"])
++        if value.get("plan_digest") is not None and value["plan_digest"] != plan.digest:
++            raise ArtifactMismatchError(
++                "plan wrapper digest does not match the nested plan body",
++                field="plan.plan_digest",
++                requested=value.get("plan_digest"),
++                available=plan.digest,
++                reason="plan_digest_mismatch",
++            )
++    elif isinstance(value, Mapping):
++        plan = ExecutionPlan.from_dict(value)
++    else:
++        raise ArtifactMismatchError(
++            "plan must be an ExecutionPlan or a plan document",
++            field="plan",
++            requested=type(value).__name__,
++            reason="not_an_execution_plan",
++        )
++    plan.validate()
++    return plan
++
++
++def _plan_from_report_document(report: Any) -> Tuple[ExecutionPlan, Mapping[str, Any], str]:
++    if hasattr(report, "to_dict") and not isinstance(report, Mapping):
++        document = report.to_dict()
++    elif isinstance(report, Mapping):
++        document = dict(report)
++    else:
++        raise ReportSchemaError(
++            "report must be a report mapping or ExecutionReport",
++            field="report",
++            requested=type(report).__name__,
++            reason="report_not_a_mapping",
++        )
++    validate_report_schema(document)
++    plan_payload = document["plan_payload"]
++    embedded = mapping_copy(plan_payload["document"])
++    plan = ExecutionPlan(embedded)
++    plan.validate()
++    if plan.digest != plan_payload["digest"]:
++        raise ArtifactMismatchError(
++            "embedded plan payload digest does not match the plan body",
++            field="report.plan_payload.digest",
++            requested=plan_payload["digest"],
++            available=plan.digest,
++            reason="report_plan_payload_digest_mismatch",
++        )
++    if document["resolution"]["plan_digest"] != plan.digest:
++        raise ArtifactMismatchError(
++            "report resolution plan_digest does not match the embedded plan payload",
++            field="report.resolution.plan_digest",
++            requested=document["resolution"]["plan_digest"],
++            available=plan.digest,
++            reason="report_plan_digest_not_reconciled",
++        )
++    execution_facts = {
++        "report_schema_version": document["schema_version"],
++        "gates": mapping_copy(document["gates"]),
++        "timing": mapping_copy(document["timing"]),
++        "artifact": {
++            "kind": document["artifact"]["kind"],
++            "format": document["artifact"]["format"],
++            "content_digest": document["artifact"]["content_digest"],
++            "provider_artifact_digest": document["artifact"].get("provider_artifact_digest"),
++            "abi_version": document["artifact"]["abi_version"],
++        },
++        "dispatch": mapping_copy(document["dispatch"]),
++        "coverage": mapping_copy(document["coverage"]),
++        "capability": {
++            "snapshot_digest": document["capability"]["snapshot_digest"],
++            "kind": document["capability"]["kind"],
++            "triple": document["capability"]["triple"],
++        },
++    }
++    return plan, execution_facts, str(document["resolution"]["why"])
++
++
++def _explain_document(
++    plan: ExecutionPlan,
++    input_kind: str,
++    execution_facts: Optional[Mapping[str, Any]],
++    why: Optional[str]
++) -> Mapping[str, Any]:
++    payload = plan.payload
++    selected_provider = str(payload["selected"]["provider"])
++    fallback_used = bool(payload["fallback"].get("used", False))
++    if why is None:
++        why = _entry_explain(plan, selected_provider, fallback_used)
++    document = {
++        "schema_version": DISCOVERY_SCHEMA_VERSION,
++        "kind": "explain",
++        "input_kind": input_kind,
++        "request": mapping_copy(payload["request"]),
++        "policy_applicability": mapping_copy(payload["policy_applicability"]),
++        "requested_policy": mapping_copy(payload["policy"]["requested"]),
++        "resolved_policy": mapping_copy(payload["policy"]["resolved"]),
++        "selected": mapping_copy(payload["selected"]),
++        "numeric_guarantee": mapping_copy(payload["numeric_guarantee"]),
++        "layout_decision": mapping_copy(payload["layout_decision"]),
++        "candidates": [mapping_copy(item) for item in payload["candidates"]],
++        "rejections": [mapping_copy(item) for item in payload["resolution"]["rejections"]],
++        "tie_break": list(payload["resolution"]["tie_break"]),
++        "numeric_class_order": list(payload["resolution"]["numeric_class_order"]),
++        "fallback": mapping_copy(payload["fallback"]),
++        "rules": [mapping_copy(item) for item in payload["resolution"]["rules"]],
++        "why": str(why),
++        "boundaries": [dict(item) for item in EXPLAIN_BOUNDARIES],
++        "resolver_version": payload["resolution"]["resolver_version"],
++        "plan_digest": plan.digest,
++        "capability_digest": plan.capability_digest,
++        "contract_digest": plan.contract_digest,
++    }
++    if execution_facts is not None:
++        document["execution_facts"] = mapping_copy(execution_facts)
++    document["digest"] = _digest(document)
++    return document
++
++
++def _explanation_summary(plan: ExecutionPlan, document: Mapping[str, Any]) -> str:
++    payload = plan.payload
++    lines = [
++        "explain {op} {dtype} {left}x{right}->{out}".format(
++            op=plan.opcode,
++            dtype=plan.dtype,
++            left=list(plan.left_shape),
++            right=list(plan.right_shape),
++            out=list(plan.output_shape),
++        ),
++        "selected provider: {provider} ({version}, {implementation})".format(
++            provider=payload["selected"]["provider"],
++            version=payload["selected"]["provider_version"],
++            implementation=payload["selected"]["implementation"],
++        ),
++        "numeric guarantee: class={cls} deterministic={det} reduction_order_id={order}".format(
++            cls=plan.numeric_guarantee["class"],
++            det=plan.numeric_guarantee["deterministic"],
++            order=plan.numeric_guarantee["reduction_order_id"],
++        ),
++        "why: {why}".format(why=document["why"]),
++        "candidates: " + ", ".join(
++            "{}={}({})".format(item["id"], item["state"], item["reason"]) for item in payload["candidates"]
++        ),
++        "tie-break: " + " -> ".join(payload["resolution"]["tie_break"]),
++        "fallback: mode={mode} primary={primary} chain={chain} used={used}".format(
++            mode=payload["fallback"]["mode"],
++            primary=payload["fallback"]["primary"],
++            chain=list(payload["fallback"]["chain"]),
++            used=payload["fallback"].get("used", False),
++        ),
++        "boundaries: {count} fields are only decided at execution time (see document.boundaries)".format(
++            count=len(EXPLAIN_BOUNDARIES)
++        ),
++    ]
++    if "execution_facts" in document:
++        gates = document["execution_facts"]["gates"]
++        lines.append(
++            "execution facts: gates={status} (performance_gated={gated})".format(
++                status=gates["status"], gated=gates["performance_gated"]
++            )
++        )
++    return "\n".join(lines)
++
++
++def explain(
++    *,
++    op: str = "matmul",
++    left_shape: Any = None,
++    right_shape: Any = None,
++    dtype: Any = None,
++    policy: Optional[ExecutionPolicy] = None,
++    capability: Any = None,
++    plan: Any = None,
++    report: Any = None
++) -> Explanation:
++    """Explain provider selection from the resolver trace; never executes."""
++
++    if plan is not None and report is not None:
++        raise PolicyInvalidValueError(
++            "explain accepts either a plan or a report, not both",
++            field="input",
++            requested=["plan", "report"],
++            reason="explain_input_ambiguous",
++        )
++    if plan is not None:
++        plan_obj = _plan_from_document(plan)
++        document = _explain_document(plan_obj, "plan", None, None)
++        return Explanation(document=document, summary=_explanation_summary(plan_obj, document))
++    if report is not None:
++        plan_obj, execution_facts, why = _plan_from_report_document(report)
++        document = _explain_document(plan_obj, "report", execution_facts, why)
++        return Explanation(document=document, summary=_explanation_summary(plan_obj, document))
++    if left_shape is None or right_shape is None:
++        raise PolicyInvalidValueError(
++            "request explain needs left_shape and right_shape",
++            field="request",
++            requested={"left_shape": left_shape, "right_shape": right_shape},
++            available="--left/--right with --op/--dtype",
++            reason="explain_request_incomplete",
++        )
++    active_policy = policy if policy is not None else ExecutionPolicy()
++    if not isinstance(active_policy, ExecutionPolicy):
++        raise PolicyInvalidValueError(
++            "policy must be an ExecutionPolicy",
++            field="policy",
++            requested=type(active_policy).__name__,
++            reason="not_an_execution_policy",
++        )
++    snapshot = _coerce_snapshot(capability)
++    active_capability = capability_for_policy(active_policy, snapshot)
++    resolution = _resolve_request(op, left_shape, right_shape, dtype, active_policy, active_capability)
++    document = _explain_document(resolution.plan, "request", None, None)
++    return Explanation(
++        document=document,
++        summary=_explanation_summary(resolution.plan, document),
++    )
++
++
++# ---------------------------------------------------------------------------
++# doctor command
++# ---------------------------------------------------------------------------
++@dataclass(frozen=True)
++class DoctorReport:
++    """Read-only fact report plus fail-closed condition summary."""
++
++    document: Mapping[str, Any]
++    summary: str
++    fail_closed: bool
++
++    @property
++    def digest(self) -> str:
++        return str(self.document["digest"])
++
++    def to_dict(self) -> Mapping[str, Any]:
++        return mapping_copy(self.document)
++
++    def to_json(self) -> str:
++        return canonical_json(self.to_dict())
++
++
++def _environment_rows() -> Tuple[Mapping[str, Any], ...]:
++    rows = []
++    for spec in ENV_VAR_REGISTRY:
++        raw = os.environ.get(spec["name"])
++        if raw is None:
++            value_kind = None
++            interpreted = None
++        elif spec["value_kind"] == "flag":
++            value_kind = "flag"
++            interpreted = raw == "1"
++        elif spec["value_kind"] == "integer":
++            try:
++                interpreted = int(raw)
++                value_kind = "integer"
++            except (TypeError, ValueError):
++                interpreted = None
++                value_kind = "non_integer"
++        else:
++            value_kind = "opaque"
++            interpreted = None
++        row = {
++            "name": spec["name"],
++            "status": "set" if raw is not None else "unset",
++            "class": spec["class"],
++            "policy_field": spec["policy_field"],
++            "consumed_by_execution": bool(spec["consumed_by_execution"]),
++            "value_kind": value_kind,
++            "interpreted_value": interpreted,
++            "source": spec["source"],
++        }
++        rows.append(row)
++    return tuple(rows)
++
++
++def _provider_manifest_digest(entry: Any) -> str:
++    return "sha256:" + sha256_text(entry.to_dict())
++
++
++def _provider_identity_check(entry: Any) -> Mapping[str, Any]:
++    errors = []
++    declared = sorted(str(opcode) for opcode in entry.contracts)
++    for opcode in declared:
++        try:
++            definition = get_op_definition(opcode)
++        except Exception as exc:
++            errors.append({"field": opcode, "reason": "contract_opcode_not_registered", "details": _error_details(exc)})
++            continue
++        if entry.contract_digest(opcode) != definition.contract_digest:
++            errors.append(
++                {
++                    "field": opcode,
++                    "reason": "contract_digest_mismatch",
++                    "requested": entry.contract_digest(opcode),
++                    "available": definition.contract_digest,
++                }
++            )
++        try:
++            identity = registered_identity(entry.provider_id, opcode)
++        except Exception as exc:  # pragma: no cover - defensive
++            errors.append({"field": opcode, "reason": "provider_identity_lookup_failed", "details": _error_details(exc)})
++            continue
++        if identity is None:
++            errors.append({"field": opcode, "reason": "provider_identity_missing"})
++    compare_opcode = "matmul" if "matmul" in declared else (declared[0] if declared else None)
++    if compare_opcode is not None:
++        identity = registered_identity(entry.provider_id, compare_opcode) or {}
++        for field in ("version", "implementation", "numeric_class", "deterministic", "reduction_order_id", "artifact_kind"):
++            if getattr(entry, field) != identity.get(field):
++                errors.append(
++                    {
++                        "field": compare_opcode + "." + field,
++                        "reason": "provider_manifest_identity_mismatch",
++                        "requested": getattr(entry, field),
++                        "available": identity.get(field),
++                    }
++                )
++        if dict(entry.pack) != dict(identity.get("pack") or {}):
++            errors.append(
++                {
++                    "field": compare_opcode + ".pack",
++                    "reason": "provider_manifest_identity_mismatch",
++                    "requested": dict(entry.pack),
++                    "available": dict(identity.get("pack") or {}),
++                }
++            )
++    return _check(
++        "provider_identity",
++        not errors,
++        "provider manifest does not match the registered provider identity",
++        {"provider": entry.provider_id, "errors": errors},
++    )
++
++
++def _contract_registry_checks() -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
++    digest_errors = []
++    coverage = []
++    for opcode in registered_opcodes():
++        definition = get_op_definition(opcode)
++        recomputed = _digest(definition.contract_document)
++        if recomputed != definition.contract_digest:
++            digest_errors.append(
++                {
++                    "opcode": opcode,
++                    "reason": "contract_digest_mismatch",
++                    "requested": definition.contract_digest,
++                    "available": recomputed,
++                }
++            )
++        coverage.append({"opcode": opcode, "contract_version": definition.contract_version, "contract_digest": definition.contract_digest})
++    digest_check = _check(
++        "contract_registry_digest",
++        not digest_errors,
++        "registered contract digest does not match its own canonical document",
++        {"opcodes": coverage, "errors": digest_errors},
++    )
++    return digest_check, coverage
++
++
++def _artifact_digest_checks(snapshot: CapabilitySnapshot) -> Mapping[str, Any]:
++    errors = []
++    for entry in snapshot.providers:
++        if entry.provider_id == PORTABLE_PROVIDER_ID:
++            if entry.provider_artifact_digest is not None or entry.artifact_kind != "core_ir_artifact":
++                errors.append(
++                    {
++                        "provider": entry.provider_id,
++                        "reason": "portable_artifact_identity_mismatch",
++                        "requested": entry.provider_artifact_digest,
++                        "available": None,
++                    }
++                )
++            continue
++        expected = expected_artifact_digest(entry.provider_id, entry.library)
++        if expected is None:
++            errors.append({"provider": entry.provider_id, "reason": "provider_artifact_digest_unregistered"})
++            continue
++        if expected != entry.provider_artifact_digest:
++            errors.append(
++                {
++                    "provider": entry.provider_id,
++                    "reason": "provider_artifact_digest_mismatch",
++                    "requested": entry.provider_artifact_digest,
++                    "available": expected,
++                }
++            )
++    return _check(
++        "provider_artifact_digest",
++        not errors,
++        "provider artifact digest does not match the recomputed registered digest",
++        {"errors": errors},
++    )
++
++
++def _library_pin_checks(snapshot: CapabilitySnapshot) -> Tuple[Mapping[str, Any], Tuple[Mapping[str, Any], ...]]:
++    errors = []
++    rows = []
++    for entry in snapshot.providers:
++        if entry.provider_id == PORTABLE_PROVIDER_ID:
++            continue
++        library = entry.library
++        rows.append(
++            {
++                "provider_id": entry.provider_id,
++                "library_name": library.get("name"),
++                "path": library.get("path"),
++                "exists": library.get("size_bytes") is not None,
++                "size_bytes": library.get("size_bytes"),
++                "sha256_expected": library.get("sha256_expected"),
++                "sha256_actual": library.get("sha256"),
++                "sha256_matches": library.get("sha256") == library.get("sha256_expected"),
++                "blis_version_pin": AOCL_BLIS_TAG,
++                "blis_version_actual": library.get("blis_version"),
++                "arch_pin": AOCL_ARCH_STRING,
++                "arch_actual": library.get("arch_string"),
++                "available": bool(entry.available),
++                "reason": entry.reason,
++            }
++        )
++        if not entry.available:
++            errors.append(
++                {
++                    "provider": entry.provider_id,
++                    "reason": "provider_capability_unavailable",
++                    "detail": entry.reason or "unknown",
++                }
++            )
++            continue
++        if library.get("sha256") != AOCL_SHA256_PIN:
++            errors.append(
++                {
++                    "provider": entry.provider_id,
++                    "reason": "library_sha256_mismatch",
++                    "requested": library.get("sha256"),
++                    "available": AOCL_SHA256_PIN,
++                }
++            )
++        pin_errors = library_pin_errors(entry.provider_id, library, "doctor.providers." + entry.provider_id)
++        if pin_errors:
++            errors.extend(dict(item) for item in pin_errors)
++    return (
++        _check(
++            "pinned_library",
++            not errors,
++            "pinned library fingerprint does not match the registered pin",
++            {"errors": errors},
++        ),
++        tuple(rows),
++    )
++
++
++def _payload_abi_checks(snapshot: CapabilitySnapshot) -> Mapping[str, Any]:
++    errors = []
++    facts = []
++    for entry in snapshot.providers:
++        for opcode in sorted(str(item) for item in entry.contracts):
++            identity = registered_identity(entry.provider_id, opcode) or {}
++            fact = {
++                "provider": entry.provider_id,
++                "opcode": opcode,
++                "lowering_version": identity.get("lowering_version"),
++                "runner_version": identity.get("runner_version"),
++                "wire_version": identity.get("wire_version"),
++                "abi_version": identity.get("abi_version"),
++            }
++            facts.append(fact)
++            for field in ("lowering_version", "runner_version", "wire_version"):
++                value = fact[field]
++                if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
++                    errors.append(
++                        {
++                            "provider": entry.provider_id,
++                            "opcode": opcode,
++                            "field": field,
++                            "reason": "payload_version_unregistered",
++                            "requested": value,
++                            "available": "a positive integer",
++                        }
++                    )
++            if not isinstance(fact["abi_version"], str) or not fact["abi_version"].strip():
++                errors.append(
++                    {
++                        "provider": entry.provider_id,
++                        "opcode": opcode,
++                        "field": "abi_version",
++                        "reason": "abi_version_unregistered",
++                        "requested": fact["abi_version"],
++                        "available": "a non-empty version string",
++                    }
++                )
++    return _check(
++        "payload_abi_versions",
++        not errors,
++        "artifact payload/ABI version registration is inconsistent",
++        {"facts": facts, "errors": errors},
++    )
++
++
++def doctor(capability: Any = None) -> DoctorReport:
++    """Report host/provider/contract facts and fail-closed conditions.
++
++    Read-only: probes only the pinned artifacts embedded in the capability
++    snapshot (the real local probe by default) and never echoes raw
++    environment values.  Missing optional vendor artifacts are reported as
++    fail-closed conditions, not guessed.
++    """
++
++    imported = capability is not None
++    snapshot = _coerce_snapshot(capability)
++    if snapshot is None:
++        snapshot = CapabilitySnapshot.probe_host()
++    if not snapshot.matches_host_probe():
++        raise CapabilityUnavailableError(
++            "doctor capability snapshot does not match the probed local host",
++            field="capability",
++            requested={"kind": snapshot.kind, "triple": snapshot.triple},
++            available={"kind": "cpu", "triple": host_triple()},
++            reason="capability_does_not_match_host_probe",
++            capability_digest=snapshot.digest,
++        )
++
++    contract_check, opcode_facts = _contract_registry_checks()
++    capability_check = _check("capability_digest", True)
++    try:
++        snapshot.verify_digest()
++    except Exception as exc:
++        capability_check = _check(
++            "capability_digest",
++            False,
++            "capability snapshot digest self-check failed",
++            {"error": _error_details(exc)},
++        )
++
++    provider_rows = []
++    identity_checks = []
++    for entry in snapshot.providers:
++        row = mapping_copy(entry.to_dict())
++        row["manifest_digest"] = _provider_manifest_digest(entry)
++        provider_rows.append(row)
++        identity_checks.append(_provider_identity_check(entry))
++
++    artifact_check = _artifact_digest_checks(snapshot)
++    library_check, pinned_rows = _library_pin_checks(snapshot)
++    payload_check = _payload_abi_checks(snapshot)
++    schema_versions = {
++        "discovery_schema_version": DISCOVERY_SCHEMA_VERSION,
++        "capability_schema_version": CAPABILITY_SCHEMA_VERSION,
++        "plan_schema_version": PLAN_SCHEMA_VERSION,
++        "policy_schema_version": POLICY_SCHEMA_VERSION,
++        "report_schema_version": REPORT_SCHEMA_VERSION,
++        "op_registry_schema_version": OP_REGISTRY_SCHEMA_VERSION,
++    }
++    schema_check = _check(
++        "schema_versions_registered",
++        all(isinstance(value, int) and not isinstance(value, bool) and value > 0 for value in schema_versions.values()),
++        "one or more registered schema versions is not a positive integer",
++        {"schema_versions": schema_versions},
++    )
++
++    checks = [
++        capability_check,
++        contract_check,
++        _check(
++            "opcode_coverage",
++            bool(opcode_facts) and all(item["contract_digest"].startswith("sha256:") for item in opcode_facts),
++            "registered opcodes do not carry a canonical contract digest",
++            {"opcodes": opcode_facts},
++        ),
++        *identity_checks,
++        artifact_check,
++        library_check,
++        payload_check,
++        schema_check,
++    ]
++    fail_closed = any(item["status"] != "ok" for item in checks)
++    environment = {
++        "variables": [mapping_copy(item) for item in _environment_rows()],
++        "allowlist": [spec["name"] for spec in ENV_VAR_REGISTRY],
++        "raw_values_included": False,
++    }
++    document = {
++        "schema_version": DISCOVERY_SCHEMA_VERSION,
++        "kind": "doctor",
++        "source": "imported_snapshot" if imported else "local_probe",
++        "host": {
++            "triple": host_triple(),
++            "machine": platform.machine(),
++            "platform": platform.platform(),
++            "features": list(host_features()),
++            "python": platform.python_version(),
++            "byteorder": sys.byteorder,
++        },
++        "opcodes": opcode_facts,
++        "capability": {
++            "schema_version": snapshot.schema_version,
++            "kind": snapshot.kind,
++            "triple": snapshot.triple,
++            "features": list(snapshot.features),
++            "snapshot_digest": snapshot.digest,
++            "provider_ids": list(snapshot.provider_ids()),
++        },
++        "providers": provider_rows,
++        "pinned_libraries": [mapping_copy(item) for item in pinned_rows],
++        "environment": environment,
++        "fail_closed_checks": [dict(item) for item in checks],
++        "fail_closed": bool(fail_closed),
++        "read_only": True,
++        "probe_scope": "pinned artifacts only",
++        "digest": "",
++    }
++    document["digest"] = _digest({key: value for key, value in document.items() if key != "digest"})
++    summary_lines = [
++        "doctor source={source} fail_closed={fail}".format(
++            source=document["source"], fail=str(fail_closed).lower()
++        ),
++        "host: {triple} features={features}".format(
++            triple=document["host"]["triple"], features=list(document["host"]["features"])
++        ),
++        "opcodes: " + ", ".join(
++            "{}@{}".format(item["opcode"], item["contract_version"]) for item in opcode_facts
++        ),
++        "providers: " + ", ".join(
++            "{}({})".format(
++                item["provider_id"],
++                "available" if item["available"] else "unavailable:{}".format(item["reason"]),
++            )
++            for item in provider_rows
++        ),
++        "pinned libraries: " + ", ".join(
++            "{} sha256_match={} arch={} available={}".format(
++                item["provider_id"],
++                item["sha256_matches"],
++                item["arch_actual"],
++                item["available"],
++            )
++            for item in pinned_rows
++        ) if pinned_rows else "pinned libraries: none in this snapshot",
++        "environment: " + ", ".join(
++            "{}={}".format(item["name"], item["status"]) for item in environment["variables"]
++        ),
++        "fail-closed checks: " + ", ".join(
++            "{}({})".format(item["check"], item["status"]) for item in checks
++        ),
++        "digest: {}".format(document["digest"]),
++    ]
++    return DoctorReport(
++        document=document,
++        summary="\n".join(summary_lines),
++        fail_closed=bool(fail_closed),
++    )
++
++
++__all__ = [
++    "DISCOVERY_SCHEMA_VERSION",
++    "ENV_VAR_REGISTRY",
++    "EXPLAIN_BOUNDARIES",
++    "SUPPORTED_DISCOVERY_OPS",
++    "DoctorReport",
++    "Explanation",
++    "PlanDocument",
++    "doctor",
++    "explain",
++    "export_capability_snapshot",
++    "import_capability_snapshot",
++    "plan_request",
++]
+diff --git a/python/tests/ut/pypto_x/test_execution_discovery.py b/python/tests/ut/pypto_x/test_execution_discovery.py
+new file mode 100644
+index 000000000..9c0c57f38
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_execution_discovery.py
+@@ -0,0 +1,566 @@
++"""U3 discovery commands: doctor / explain / plan + capability snapshot I/O.
++
++Covers the command contracts frozen in ``docs/20-planning/0008`` section 7
++(U3) and the control-repo planning note for U3:
++
++* ``doctor`` is deterministic, versioned, digest-carrying, read-only, reports
++  pinned-library facts and fail-closed conditions, and never leaks private
++  access information or raw environment values;
++* ``explain`` reuses the resolver trace (rules / candidates / rejections /
++  fallback) for a request, a frozen plan and a v4 report;
++* ``plan`` freezes a request without executing, is deterministic for the same
++  policy + snapshot, and the frozen plan is accepted by
++  ``execute_matmul_plan`` with the same snapshot;
++* capability snapshot export/import round-trips and tampering is refused;
++* the CLI exposes the three subcommands with ``--json`` and structured errors.
++
++These tests use the synthetic ``pypto`` package namespace (like the other
++PyPTO-X unit tests) so they never trigger the upstream native initializer.
++"""
++
++from __future__ import annotations
++
++import ast
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++import types
++
++import pytest
++
++
++def _imports():
++    package_root = Path(__file__).parents[3] / "pypto"
++    saved = {name: module for name, module in sys.modules.items() if name == "pypto" or name.startswith("pypto.")}
++    for name in list(saved):
++        del sys.modules[name]
++    package = types.ModuleType("pypto")
++    package.__path__ = [str(package_root)]
++    sys.modules["pypto"] = package
++    try:
++        import pypto.execution.providers as providers_module
++        from pypto.backends.cpu import HostTensor
++        from pypto.execution.provider_aocl import AOCL_ARCH_STRING
++        from pypto.execution import (
++            ARTIFACT_MISMATCH,
++            AOCL_LPGEMM_BF16_PROVIDER_ID,
++            AOCL_PROVIDER_VERSION,
++            CAPABILITY_UNAVAILABLE,
++            DISCOVERY_SCHEMA_VERSION,
++            ENV_VAR_REGISTRY,
++            EXPLAIN_BOUNDARIES,
++            OP_CONTRACT_INVALID,
++            POLICY_INVALID_VALUE,
++            PORTABLE_PROVIDER_ID,
++            REPORT_SCHEMA_INVALID,
++            CapabilitySnapshot,
++            DoctorReport,
++            ExecutionPlan,
++            ExecutionPolicy,
++            Explanation,
++            PlanDocument,
++            ProviderCapability,
++            doctor,
++            execute_matmul,
++            execute_matmul_plan,
++            explain,
++            export_capability_snapshot,
++            get_op_definition,
++            host_features,
++            host_triple,
++            import_capability_snapshot,
++            plan_request,
++            portable_provider_capability,
++            resolve_matmul,
++            validate_report_schema,
++        )
++        from pypto.execution.errors import ExecutionError
++        from pypto.target._utils import sha256_text
++        return locals()
++    finally:
++        for name in list(sys.modules):
++            if name == "pypto" or name.startswith("pypto."):
++                del sys.modules[name]
++        sys.modules.update(saved)
++
++
++_C = _imports()
++ARTIFACT_MISMATCH = _C["ARTIFACT_MISMATCH"]
++AOCL_ARCH_STRING = _C["AOCL_ARCH_STRING"]
++AOCL_LPGEMM_BF16_PROVIDER_ID = _C["AOCL_LPGEMM_BF16_PROVIDER_ID"]
++AOCL_PROVIDER_VERSION = _C["AOCL_PROVIDER_VERSION"]
++CAPABILITY_UNAVAILABLE = _C["CAPABILITY_UNAVAILABLE"]
++DISCOVERY_SCHEMA_VERSION = _C["DISCOVERY_SCHEMA_VERSION"]
++ENV_VAR_REGISTRY = _C["ENV_VAR_REGISTRY"]
++EXPLAIN_BOUNDARIES = _C["EXPLAIN_BOUNDARIES"]
++ExecutionError = _C["ExecutionError"]
++ExecutionPlan = _C["ExecutionPlan"]
++ExecutionPolicy = _C["ExecutionPolicy"]
++HostTensor = _C["HostTensor"]
++OP_CONTRACT_INVALID = _C["OP_CONTRACT_INVALID"]
++POLICY_INVALID_VALUE = _C["POLICY_INVALID_VALUE"]
++PORTABLE_PROVIDER_ID = _C["PORTABLE_PROVIDER_ID"]
++ProviderCapability = _C["ProviderCapability"]
++REPORT_SCHEMA_INVALID = _C["REPORT_SCHEMA_INVALID"]
++CapabilitySnapshot = _C["CapabilitySnapshot"]
++DoctorReport = _C["DoctorReport"]
++Explanation = _C["Explanation"]
++PlanDocument = _C["PlanDocument"]
++doctor = _C["doctor"]
++execute_matmul = _C["execute_matmul"]
++execute_matmul_plan = _C["execute_matmul_plan"]
++explain = _C["explain"]
++export_capability_snapshot = _C["export_capability_snapshot"]
++get_op_definition = _C["get_op_definition"]
++host_features = _C["host_features"]
++host_triple = _C["host_triple"]
++import_capability_snapshot = _C["import_capability_snapshot"]
++sha256_text = _C["sha256_text"]
++plan_request = _C["plan_request"]
++resolve_matmul = _C["resolve_matmul"]
++validate_report_schema = _C["validate_report_schema"]
++portable_provider_capability = _C["portable_provider_capability"]
++providers_module = _C["providers_module"]
++
++REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
++PYTHON_ROOT = REPOSITORY_ROOT / "python"
++EXECUTION_DIR = PYTHON_ROOT / "pypto" / "execution"
++
++_FORBIDDEN_DOC_SUBSTRINGS = (
++    "a2-910b",
++    "A2-910B",
++    "192.168.",
++    "ssh ",
++    "/.ssh",
++    "identity_file",
++    "password",
++    "passwd",
++    "secret",
++    "api_key",
++    "apikey",
++    "token=",
++    "PRIVATE KEY",
++    "hwhiaiuser",
++)
++
++
++def _assert_failure(error_code, callable_):
++    with pytest.raises(ExecutionError) as excinfo:
++        callable_()
++    assert excinfo.value.code == error_code, excinfo.value.to_dict()
++    return excinfo.value.to_dict()
++
++
++def _portable_policy():
++    return ExecutionPolicy.portable()
++
++
++def _host_snapshot():
++    return CapabilitySnapshot.probe_host()
++
++
++def _replace_provider(snapshot, provider_id, **overrides):
++    entries = []
++    for entry in snapshot.providers:
++        if entry.provider_id == provider_id:
++            document = dict(entry.to_dict())
++            document.update(overrides)
++            entries.append(ProviderCapability.from_dict(document))
++        else:
++            entries.append(entry)
++    return CapabilitySnapshot(
++        kind=snapshot.kind,
++        triple=snapshot.triple,
++        features=snapshot.features,
++        providers=tuple(entries),
++    )
++
++
++def _patch_portable_execute(monkeypatch):
++    calls = []
++
++    def recorder(self, plan, left, right, output, capability):
++        calls.append(plan.digest)
++        raise AssertionError("discovery command executed a provider")
++
++    monkeypatch.setattr(providers_module.PROVIDERS[PORTABLE_PROVIDER_ID], "execute", recorder.__get__(providers_module.PROVIDERS[PORTABLE_PROVIDER_ID]))
++    return calls
++
++
++def _run_cli(*arguments, cwd=None):
++    environment = os.environ.copy()
++    environment["PYPTO_X_PORTABLE_ONLY"] = "1"
++    environment["PYTHONPATH"] = str(PYTHON_ROOT)
++    return subprocess.run(
++        [sys.executable, "-S", "-m", "pypto.execution.cli", *arguments],
++        cwd=str(cwd or REPOSITORY_ROOT),
++        env=environment,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        text=True,
++        check=False,
++    )
++
++
++# ---------------------------------------------------------------------------
++# doctor
++# ---------------------------------------------------------------------------
++def test_doctor_document_is_deterministic_versioned_and_read_only():
++    first = doctor()
++    second = doctor()
++    assert isinstance(first, DoctorReport)
++    assert first.digest == second.digest
++    assert first.digest.startswith("sha256:")
++    document = first.to_dict()
++    assert document["schema_version"] == DISCOVERY_SCHEMA_VERSION
++    assert document["kind"] == "doctor"
++    assert document["read_only"] is True
++    assert document["probe_scope"] == "pinned artifacts only"
++    assert document["source"] == "local_probe"
++    assert document["capability"]["triple"] == host_triple()
++    assert document["capability"]["features"] == list(host_features())
++    assert [item["opcode"] for item in document["opcodes"]] == ["matmul", "qmatmul_s8s8_s32"]
++    for item in document["opcodes"]:
++        definition = get_op_definition(item["opcode"])
++        assert item["contract_digest"] == definition.contract_digest
++    provider_ids = [item["provider_id"] for item in document["providers"]]
++    assert provider_ids == sorted(provider_ids)
++    assert PORTABLE_PROVIDER_ID in provider_ids
++    for item in document["providers"]:
++        assert item["manifest_digest"].startswith("sha256:")
++    assert isinstance(document["fail_closed"], bool)
++    assert all(item["status"] in ("ok", "failed") for item in document["fail_closed_checks"])
++    # The digest is over the canonical document without the digest field.
++    without_digest = dict(document)
++    without_digest.pop("digest")
++    assert document["digest"] == "sha256:" + sha256_text(without_digest)
++
++
++def test_doctor_reports_pinned_library_and_environment_status():
++    report = doctor()
++    document = report.to_dict()
++    pinned = document["pinned_libraries"]
++    assert pinned, "the local probe should list pinned vendor libraries"
++    for item in pinned:
++        assert item["library_name"]
++        assert item["sha256_expected"].startswith("c7d74a31")
++        assert item["blis_version_pin"] == "5.3.2"
++        assert item["arch_pin"] == AOCL_ARCH_STRING
++        assert item["path"]
++    environment = document["environment"]
++    assert environment["raw_values_included"] is False
++    names = [item["name"] for item in environment["variables"]]
++    assert names == [spec["name"] for spec in ENV_VAR_REGISTRY]
++    for row in environment["variables"]:
++        assert row["status"] in ("set", "unset")
++        assert "value" not in row, "raw environment values must never be echoed"
++    assert document["fail_closed"] in (True, False)
++
++
++def test_doctor_never_leaks_private_access_information():
++    text = json.dumps(doctor().to_dict(), ensure_ascii=False, sort_keys=True)
++    lowered = text.lower()
++    for needle in _FORBIDDEN_DOC_SUBSTRINGS:
++        assert needle.lower() not in lowered, "doctor leaked {!r}".format(needle)
++
++
++def test_doctor_does_not_execute_any_provider(monkeypatch):
++    calls = _patch_portable_execute(monkeypatch)
++    report = doctor()
++    assert isinstance(report, DoctorReport)
++    assert calls == []
++    explain(op="matmul", left_shape=(2, 3), right_shape=(3, 4), dtype="float32")
++    plan_request("matmul", (2, 3), (3, 4), "float32")
++    assert calls == []
++
++
++def test_doctor_reports_fail_closed_for_missing_or_tampered_pinned_library():
++    snapshot = _host_snapshot()
++    tampered = _replace_provider(
++        snapshot,
++        AOCL_LPGEMM_BF16_PROVIDER_ID,
++        available=False,
++        reason="library_not_found",
++        library=dict(snapshot.provider(AOCL_LPGEMM_BF16_PROVIDER_ID).library),
++    )
++    report = doctor(capability=tampered)
++    document = report.to_dict()
++    assert document["source"] == "imported_snapshot"
++    assert document["fail_closed"] is True
++    statuses = {item["check"]: item["status"] for item in document["fail_closed_checks"]}
++    assert statuses["pinned_library"] == "failed"
++    assert any(
++        item["provider_id"] == AOCL_LPGEMM_BF16_PROVIDER_ID and item["available"] is False
++        for item in document["pinned_libraries"]
++    )
++
++
++def test_doctor_imported_snapshot_must_match_the_local_host():
++    foreign = CapabilitySnapshot(
++        kind="cpu",
++        triple="aarch64-linux-gnu",
++        features=(),
++        providers=(portable_provider_capability(),),
++    )
++    details = _assert_failure(CAPABILITY_UNAVAILABLE, lambda: doctor(capability=foreign))
++    assert details["reason"] == "capability_does_not_match_host_probe"
++
++
++# ---------------------------------------------------------------------------
++# explain
++# ---------------------------------------------------------------------------
++def test_explain_request_is_a_view_of_the_resolver_trace():
++    policy = _portable_policy()
++    snapshot = _host_snapshot()
++    resolution = resolve_matmul(policy, snapshot, (2, 3), (3, 4), "float32")
++    explanation = explain(
++        op="matmul", left_shape=(2, 3), right_shape=(3, 4), dtype="float32",
++        policy=policy, capability=snapshot,
++    )
++    document = explanation.to_dict()
++    assert document["kind"] == "explain"
++    assert document["input_kind"] == "request"
++    assert document["plan_digest"] == resolution.plan.digest
++    assert document["capability_digest"] == snapshot.digest
++    assert document["selected"]["provider"] == resolution.plan.selected_provider
++    trace_candidates = [item.to_dict() for item in resolution.candidates]
++    assert document["candidates"] == trace_candidates
++    assert document["rejections"] == [dict(item) for item in resolution.rejections]
++    assert document["rules"] == [dict(item) for item in resolution.rules]
++    assert document["tie_break"] == list(resolution.plan.payload["resolution"]["tie_break"])
++    assert document["fallback"] == dict(resolution.plan.payload["fallback"])
++    assert document["why"]
++    assert document["boundaries"] == [dict(item) for item in EXPLAIN_BOUNDARIES]
++    assert "execution_facts" not in document
++    # A digest is present and recomputable.
++    without_digest = dict(document)
++    without_digest.pop("digest")
++    assert document["digest"] == "sha256:" + sha256_text(without_digest)
++
++
++def test_explain_plan_and_report_reuse_the_frozen_trace():
++    policy = _portable_policy()
++    snapshot = _host_snapshot()
++    frozen = plan_request("matmul", (2, 3), (3, 4), "float32", policy=policy, capability=snapshot)
++    from_request = explain(
++        op="matmul", left_shape=(2, 3), right_shape=(3, 4), dtype="float32",
++        policy=policy, capability=snapshot,
++    )
++    from_plan = explain(plan=frozen.plan.to_dict())
++    assert from_plan.to_dict()["input_kind"] == "plan"
++    assert from_plan.to_dict()["plan_digest"] == frozen.plan_digest
++    assert from_plan.to_dict()["candidates"] == from_request.to_dict()["candidates"]
++    assert from_plan.to_dict()["selected"] == from_request.to_dict()["selected"]
++
++    left = HostTensor("float32", (2, 3), [1, 2, 3, 4, 5, 6])
++    right = HostTensor("float32", (3, 4), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
++    output, report = execute_matmul_plan(
++        ExecutionPlan.from_dict(frozen.plan.to_dict()), left, right, capability=snapshot
++    )
++    assert output.tolist() == [[38.0, 44.0, 50.0, 56.0], [83.0, 98.0, 113.0, 128.0]]
++    from_report = explain(report=report.to_dict())
++    document = from_report.to_dict()
++    assert document["input_kind"] == "report"
++    assert document["plan_digest"] == report.plan_digest
++    assert document["execution_facts"]["gates"]["status"] == "UNGATED"
++    assert document["execution_facts"]["artifact"]["content_digest"].startswith("sha256:")
++    assert document["execution_facts"]["dispatch"]["declaration_match"] is True
++    assert any(item["field"] == "timing.*" for item in document["boundaries"])
++
++
++def test_explain_rejects_tampered_plan_and_report():
++    frozen = plan_request("matmul", (2, 3), (3, 4), "float32").plan
++    tampered = frozen.to_dict()
++    tampered["selected"]["provider"] = AOCL_LPGEMM_BF16_PROVIDER_ID
++    _assert_failure(ARTIFACT_MISMATCH, lambda: explain(plan=tampered))
++    report_document = dict(_validated_report_document())
++    report_document["resolution"] = dict(report_document["resolution"])
++    report_document["resolution"]["plan_digest"] = "sha256:" + "0" * 64
++    _assert_failure(REPORT_SCHEMA_INVALID, lambda: explain(report=report_document))
++
++
++def _validated_report_document():
++    left = HostTensor("float32", (2, 3), [1, 2, 3, 4, 5, 6])
++    right = HostTensor("float32", (3, 4), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
++    _, report = execute_matmul(left, right, _portable_policy(), capability=_host_snapshot())
++    document = report.to_dict()
++    validate_report_schema(document)
++    return document
++
++
++# ---------------------------------------------------------------------------
++# plan
++# ---------------------------------------------------------------------------
++def test_plan_is_replayable_deterministic_and_never_executes(monkeypatch):
++    calls = _patch_portable_execute(monkeypatch)
++    policy = _portable_policy()
++    snapshot = _host_snapshot()
++    first = plan_request("matmul", (2, 3), (3, 4), "float32", policy=policy, capability=snapshot)
++    second = plan_request("matmul", (2, 3), (3, 4), "float32", policy=policy, capability=snapshot)
++    assert isinstance(first, PlanDocument)
++    assert first.plan_digest == second.plan_digest
++    assert first.capability_digest == snapshot.digest
++    assert first.to_dict()["kind"] == "plan"
++    assert first.to_dict()["capability_digest"] == snapshot.digest
++    assert first.to_dict()["plan_digest"] == first.plan.digest
++    assert calls == [], "plan_request must not execute"
++
++    round_trip = import_capability_snapshot(export_capability_snapshot(snapshot))
++    replayed = plan_request("matmul", (2, 3), (3, 4), "float32", policy=policy, capability=round_trip)
++    assert replayed.plan_digest == first.plan_digest
++
++
++def test_plan_document_from_cli_is_accepted_by_execute_matmul_plan():
++    frozen = plan_request("matmul", (2, 3), (3, 4), "float32")
++    plan = ExecutionPlan.from_dict(json.loads(json.dumps(frozen.to_dict()["plan"])))
++    left = HostTensor("float32", (2, 3), [1, 2, 3, 4, 5, 6])
++    right = HostTensor("float32", (3, 4), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
++    output, report = execute_matmul_plan(plan, left, right, capability=frozen.capability)
++    assert report.plan_digest == plan.digest
++    assert output.tolist()[0][0] == 38.0
++
++
++def test_plan_request_supports_qmatmul_and_rejects_unknown_ops():
++    frozen = plan_request("qmatmul_s8s8_s32", (2, 3), (3, 4))
++    assert frozen.plan.opcode == "qmatmul_s8s8_s32"
++    assert frozen.plan.dtype == "int8"
++    # The discovery spelling alias qmatmul maps to the canonical opcode.
++    aliased = plan_request("qmatmul", (2, 3), (3, 4))
++    assert aliased.plan.opcode == "qmatmul_s8s8_s32"
++    _assert_failure(OP_CONTRACT_INVALID, lambda: plan_request("add", (2, 3), (3, 4), "float32"))
++
++
++def test_plan_request_matmul_requires_a_dtype():
++    _assert_failure(OP_CONTRACT_INVALID, lambda: plan_request("matmul", (2, 3), (3, 4)))
++
++
++# ---------------------------------------------------------------------------
++# capability snapshot export / import
++# ---------------------------------------------------------------------------
++def test_snapshot_export_import_round_trip():
++    snapshot = _host_snapshot()
++    document = export_capability_snapshot(snapshot)
++    assert document["digest"] == snapshot.digest
++    assert document["schema_version"] == 2
++    parsed = json.loads(json.dumps(document))
++    imported = import_capability_snapshot(parsed)
++    assert imported.digest == snapshot.digest
++    assert imported.to_dict() == document
++    assert imported.provider_ids() == snapshot.provider_ids()
++
++
++@pytest.mark.parametrize(
++    "mutate",
++    (
++        lambda document: document.pop("digest"),
++        lambda document: document.update(digest="sha256:" + "0" * 64),
++        lambda document: document.update(schema_version=1),
++        lambda document: document.update(unknown_field=True),
++        lambda document: document["providers"].append({"provider_id": "rogue", "version": "v"}),
++        lambda document: document.update(features=[1, 2]),
++        lambda document: document.update(providers="not-a-list"),
++        lambda document: document.pop("kind"),
++    ),
++)
++def test_snapshot_import_is_fail_closed(mutate):
++    document = json.loads(json.dumps(export_capability_snapshot(_host_snapshot())))
++    mutate(document)
++    details = _assert_failure(ARTIFACT_MISMATCH, lambda: import_capability_snapshot(document))
++    assert details["reason"]
++
++
++def test_snapshot_import_rejects_non_mapping():
++    _assert_failure(CAPABILITY_UNAVAILABLE, lambda: import_capability_snapshot(["not", "a", "mapping"]))
++
++
++def test_tampered_snapshot_is_rejected_at_plan_replay():
++    snapshot = _host_snapshot()
++    tampered = _replace_provider(
++        snapshot,
++        PORTABLE_PROVIDER_ID,
++        version="portable.cpu.scalar.v1.evil",
++    )
++    # A fully re-digested snapshot is self-consistent, so import succeeds ...
++    imported = import_capability_snapshot(export_capability_snapshot(tampered))
++    assert imported.digest == tampered.digest != snapshot.digest
++    # ... but a plan frozen against the real snapshot refuses it.
++    frozen = plan_request("matmul", (2, 3), (3, 4), "float32", capability=snapshot)
++    left = HostTensor("float32", (2, 3), [1, 2, 3, 4, 5, 6])
++    right = HostTensor("float32", (3, 4), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
++    details = _assert_failure(
++        ARTIFACT_MISMATCH,
++        lambda: execute_matmul_plan(frozen.plan, left, right, capability=imported),
++    )
++    assert details["reason"] == "capability_digest_mismatch"
++
++
++# ---------------------------------------------------------------------------
++# CLI
++# ---------------------------------------------------------------------------
++def test_cli_doctor_json_is_machine_readable_and_leak_free(tmp_path):
++    completed = _run_cli("doctor", "--json", cwd=tmp_path)
++    assert completed.returncode == 0, completed.stderr
++    document = json.loads(completed.stdout)
++    assert document["kind"] == "doctor"
++    assert document["digest"].startswith("sha256:")
++    lowered = completed.stdout.lower()
++    for needle in _FORBIDDEN_DOC_SUBSTRINGS:
++        assert needle.lower() not in lowered, "CLI doctor leaked {!r}".format(needle)
++
++
++def test_cli_plan_and_explain_round_trip(tmp_path):
++    plan_path = tmp_path / "plan.json"
++    planned = _run_cli(
++        "plan", "--op", "matmul", "--left", "2,3", "--right", "3,4",
++        "--dtype", "float32", "--out", str(plan_path), "--json",
++        cwd=tmp_path,
++    )
++    assert planned.returncode == 0, planned.stderr
++    plan_document = json.loads(planned.stdout)
++    assert plan_document["kind"] == "plan"
++    assert plan_path.exists()
++    on_disk = json.loads(plan_path.read_text(encoding="utf-8"))
++    assert on_disk["plan_digest"] == plan_document["plan_digest"]
++
++    explained = _run_cli("explain", "--plan", str(plan_path), "--json", cwd=tmp_path)
++    assert explained.returncode == 0, explained.stderr
++    explanation = json.loads(explained.stdout)
++    assert explanation["kind"] == "explain"
++    assert explanation["input_kind"] == "plan"
++    assert explanation["plan_digest"] == plan_document["plan_digest"]
++
++    request_explain = _run_cli(
++        "explain", "--op", "matmul", "--left", "2,3", "--right", "3,4", "--dtype", "float32",
++        cwd=tmp_path,
++    )
++    assert request_explain.returncode == 0, request_explain.stderr
++    assert "selected provider" in request_explain.stdout
++
++
++def test_cli_fails_closed_with_structured_error(tmp_path):
++    completed = _run_cli(
++        "plan", "--op", "add", "--left", "2,3", "--right", "3,4", "--dtype", "float32",
++        "--json", cwd=tmp_path,
++    )
++    assert completed.returncode == 1
++    error = json.loads(completed.stdout)
++    assert error["code"] == OP_CONTRACT_INVALID
++    assert error["reason"] == "opcode_not_registered"
++
++    bad_snapshot = tmp_path / "snapshot.json"
++    bad_snapshot.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
++    completed = _run_cli("doctor", "--snapshot", str(bad_snapshot), "--json", cwd=tmp_path)
++    assert completed.returncode == 1
++    error = json.loads(completed.stdout)
++    assert error["code"] == ARTIFACT_MISMATCH
++
++
++# ---------------------------------------------------------------------------
++# source gate
++# ---------------------------------------------------------------------------
++def test_discovery_sources_parse_under_python37():
++    sources = [EXECUTION_DIR / "discovery.py", EXECUTION_DIR / "cli.py", Path(__file__)]
++    for path in sources:
++        ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 7))
+diff --git a/scripts/perf/execution_cli.py b/scripts/perf/execution_cli.py
+new file mode 100644
+index 000000000..6c0dea893
+--- /dev/null
++++ b/scripts/perf/execution_cli.py
+@@ -0,0 +1,37 @@
++#!/usr/bin/env python3
++"""U3 execution discovery CLI wrapper.
++
++Sets ``PYPTO_X_PORTABLE_ONLY=1`` and puts this worktree's ``python/`` on
++``sys.path`` before importing :mod:`pypto`, then delegates to
++:func:`pypto.execution.cli.main` (the same entry point as
++``python -m pypto.execution.cli``).
++
++Examples::
++
++    python3 scripts/perf/execution_cli.py doctor
++    python3 scripts/perf/execution_cli.py doctor --json
++    python3 scripts/perf/execution_cli.py explain --op matmul \
++        --left 1,1024,7168 --right 7168,7168 --dtype bf16 --json
++    python3 scripts/perf/execution_cli.py plan --op matmul \
++        --left 2,3 --right 3,4 --dtype float32 --out /tmp/plan.json --json
++
++All commands are read-only with respect to execution state and never run a
++provider.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++WORKTREE = os.path.abspath(os.path.join(HERE, "..", ".."))
++
++os.environ.setdefault("PYPTO_X_PORTABLE_ONLY", "1")
++if os.path.join(WORKTREE, "python") not in sys.path:
++    sys.path.insert(0, os.path.join(WORKTREE, "python"))
++
++from pypto.execution.cli import main  # noqa: E402
++
++if __name__ == "__main__":
++    raise SystemExit(main())
