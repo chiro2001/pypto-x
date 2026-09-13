@@ -46,24 +46,36 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
                      sha256_expected, sha256_actual, sha256_matches,
                      blis_version_pin, blis_version_actual, arch_pin, arch_actual,
                      available, reason}],
- environment: {allowlist: [...], raw_values_included: false,
-               variables: [{name, status, class, policy_field,
-                            consumed_by_execution, value_kind, interpreted_value, source}]},
+ environment: {schema_version, source: "pypto.execution.env_registry",
+               variables: [{name, category, status, value_kind, interpreted_value, ...}],
+               unregistered: [{name, risk, status, policy}],
+               allowlist: [...], raw_values_included: false,
+               deprecation_warnings_enabled, deprecation_warning_switch},
+ env_registry: {schema_version, migration_var_count, extra_var_count,
+                runtime_var_count, control_var_count, unregistered_count, new_env_policy},
  fail_closed_checks: [{check, status: ok|failed, reason, details}],
  fail_closed: bool, read_only: true, probe_scope: "pinned artifacts only",
- digest}
+ path_policy: "basename"|"full", digest}
 ```
 
-- `environment` 只包含登记过的与策略相关的变量名；**不输出原始值**，只输出
-  `set/unset` 与类型化解释（flag / integer / non_integer）。
+- `environment` 由 `pypto.execution.env_registry` 驱动（U4，40 行 = 35 迁移 + 2 extras +
+  2 线程 + 1 控制开关）；**不输出原始值**，只输出 `set/unset` 与类型化解释
+  （flag / integer / non_integer）；未登记 `PYPTO_X_*` 只列名称/风险（敏感名脱敏）。
 - `pinned_libraries` 来自 provider manifest 内嵌的已 pin 事实；本地 probe 只探测已 pin
   的 AOCL 路径，不探测未 pin 的库。
-- `fail_closed_checks` 覆盖：capability digest 自检、契约 digest 自检、已登记 opcode
-  覆盖、provider 与 registered identity 一致、provider artifact digest 可复算、
-  pinned library 存在/sha256/arch/符号/ABI、payload/ABI 版本登记、schema 版本。
+- **路径隐私**：`provider.library.path` 与 `pinned_libraries[].path` 默认只给 basename
+  （sha256/arch 仍在各自字段），`--show-paths` / `show_paths=True` 才输出完整 host 绝对
+  路径；`path_policy` 记录本次输出采用哪种口径，并进入 `digest`。
+- `fail_closed_checks` 有 **8 个不同 check name**（capability digest 自检、契约 digest
+  自检、已登记 opcode 覆盖、provider 与 registered identity 一致、provider artifact
+  digest 可复算、pinned library 存在/sha256/arch/符号/ABI、payload/ABI 版本登记、schema
+  版本）；provider identity / payload 行按 provider 展开，所以行数 ≥ 8（本机 11 行）。
+- 自洽快照里出现**未注册 opcode**（例如 portable 里多出 `add`）或未知 provider identity
+  时，doctor 把它作为 `fail_closed=true` 的事实列出（默认 rc 0、`--strict` rc 3），不得抛
+  异常；导入本身仍是结构校验（未注册 opcode 结构合法即可导入）。
 - `fail_closed=true` 表示存在失败条件（例如库缺失）。doctor 默认是事实报告：退出码 0，
   条件在 `fail_closed_checks` 与人类摘要中显式列出（避免 CI 在缺少非必需 pin 库的机器上
-  误报）；加 `--strict` 时 `fail_closed=true` 退出码为 2。导入快照非法等**请求级**错误
+  误报）；加 `--strict` 时 `fail_closed=true` 退出码为 3。导入快照非法等**请求级**错误
   始终结构化报错（退出码 1）。详见 §3.5。
 
 ### 2.2 `explain`
@@ -87,7 +99,8 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
   `plan_payload.document` 取回冻结 plan。
 - `boundaries` 列出只有执行层能定的字段：`timing.*`、`artifact.content_digest/
   abi_version/format`、`dispatch.*` 对账、`resources.parallelism.thread_state`、
-  `coverage.*`、`gates.*`、provider 加载期事实。此命令不执行，不产生这些值。
+  `coverage.*`、`gates.*`、provider 加载期事实，以及 report 输入的 `why`
+  （未锚定说明层副本，explain 原样呈现但不背书，见 §3.8）。此命令不执行，不产生这些值。
 
 ### 2.3 `plan`
 
@@ -95,24 +108,40 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
 {schema_version, kind: "plan", requested_op,
  plan: {plan payload + plan_digest}, plan_digest,
  capability_snapshot: {schema + digest}, capability_digest,
- request, resolved_policy}
+ request, resolved_policy, path_policy, digest}
 ```
 
 - 只调 resolver（纯函数），不执行 provider。
 - 同 `(policy, capability snapshot, request)` ⇒ 同 `plan_digest`；导入/导出的 snapshot
   round-trip 后 plan digest 不变；冻结 plan + 同一 snapshot 可被
   `execute_matmul_plan` / `execute_qmatmul_plan` 接受。
+- wrapper 顶层携带 canonical `digest`（覆盖 wrapper 去掉自身后的全部字段，含
+  `capability_snapshot` 与 `path_policy`）；`explain --plan <wrapper>` 会复算该 digest，
+  不符即 `ARTIFACT_MISMATCH/plan_wrapper_digest_mismatch`。
+- `capability_snapshot.providers[].library.path` 默认只给 basename；`--show-paths` 显示
+  完整路径（两种输出各自自洽，`plan_digest` 不变）。
 
 ### 2.4 capability snapshot 导出/导入
 
 - `export_capability_snapshot` 返回 `CapabilitySnapshot.to_dict()`（含 digest）。
+- **digest 可自证**：`digest == sha256(canonical_json(export_document 去掉 digest))`
+  （preimage 使用与导出文档相同的 `schema_version` 键，不再改名成
+  `capability_schema_version`）。
 - `import_capability_snapshot` 为严格导入：要求登记的 `schema_version`（int，恰为 2）、
   必需的顶层字段（`schema_version/kind/triple/features/providers/digest`）、
-  `sha256:` digest、类型检查，并要求文档与 `to_dict()` 的规范结构逐字段相等；未知
-  字段、缺字段、非规范结构、digest 不符均 fail-closed（`ARTIFACT_MISMATCH` /
-  `CAPABILITY_UNAVAILABLE`），不做默认填充。
+  `sha256:` digest，并按登记 schema **递归类型严格**校验所有嵌套字段：拒绝
+  `bool`↔`int`、`int`↔`float` 混淆、未知/缺失嵌套键、重复 `provider_id`、以及已知 opcode
+  与本地 `OpDefinition.contract_digest` 不符的 `contracts`；之后再做一次类型严格的规范
+  结构相等检查。未知/缺字段/非规范结构/digest 不符均 fail-closed
+  （`ARTIFACT_MISMATCH` / `CAPABILITY_UNAVAILABLE`），不做默认填充。
+- CLI 读取 JSON 时用 `object_pairs_hook` 拒绝任意层级的重复键，并拒绝
+  `NaN/Infinity/-Infinity`；解析失败同样转成结构化错误文档（rc 1，无 traceback）。
+  `import_capability_snapshot` 作为库 API 只接收已解析的 mapping，重复键需在调用方解析层
+  拦截。
 - `CapabilitySnapshot.from_dict` 的宽松行为（缺 digest 默认接受）保留为 U1 登记边界，
   仅严格导入路径受上述要求约束。
+- 自洽但引用**未注册 opcode**的 snapshot 结构上仍可导入；doctor 将其报告为
+  `fail_closed=true` 的事实（见 §2.1），resolver 只会按请求的已登记 opcode 工作。
 
 ## 3. 边界与未做项
 
@@ -130,14 +159,20 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
 
 - 默认：`doctor` 是事实报告，无论 `fail_closed` 与否都退出码 0；`fail_closed_checks`、
   `fail_closed` 字段与人类摘要完整列出条件，便于 CI/脚本自行判定。
-- `--strict`：当 `fail_closed=true` 时退出码 **2**（报告仍会正常打印；`--json` 下文档仍可
-  解析），便于需要"缺库即失败"的流水线。请求级错误（非法 snapshot、读文件失败等）在两种
-  模式下都退出码 1。退出码 2 在 CLI `--help` 中写明。
+- `--strict`：当 `fail_closed=true` 时退出码 **3**（报告仍会正常打印；`--json` 下文档仍可
+  解析），便于需要"缺库即失败"的流水线。
+- argparse 用法错误保持 conventional 退出码 **2**（与 strict-fail-closed 的 3 不同，
+  无需读输出即可区分）；请求级错误（非法 snapshot、读文件失败、结构化解析失败等）在
+  default/`--strict` 两种模式下都退出码 **1**，`--json` 时 stdout 必为可解析的
+  `ExecutionError` 文档、stderr 无 traceback。三个码均在 CLI `--help` 与本节写明。
 
 ### 3.6 跨主机静态规划（接受为边界）
 
 - `plan` / `explain` 使用的 snapshot 必须与本机 probe 对齐（`kind=cpu` 且 triple 等于本机
   探测 triple），否则 `CAPABILITY_UNAVAILABLE`；`doctor --snapshot` 同样只接受本机对齐快照。
+- 对齐口径就是 `kind + triple`：**同 triple、更弱 features / 更少 provider 的 snapshot
+  会被接受**（显式测试钉住）。这是"快照是本机事实的子集"的直接后果，不额外声明能力；
+  解析器只会从快照里列出的 provider 中选，缺失 provider 自然成为候选拒绝项。
 - 为什么不做跨主机：已登记 provider 都在本机执行，其 version/pin/library/thread 事实来自
   本机 probe 与已 pin 产物；用一份外部快照在本机解析会让 plan 声明一个本机无法验证或执行的
   target，属于 0006 §2.1 "声明=执行" 的反面，因此本切片宁可拒绝也不假装支持。
@@ -147,8 +182,18 @@ capability、§5 解析、§8 报告与可发现性、§13.5 单一真源）。
 - U1 语义保留：`CapabilitySnapshot.from_dict` 允许缺 `digest`/`triple` 等字段并按默认值
   重建（这是 U1 已登记的兼容边界）。
 - 发现层的严格导入路径不受影响：`import_capability_snapshot` 在调用 `from_dict` **之前**
-  先做必需字段/未知字段/类型/schema/digest 检查，之后再做规范结构逐字段相等检查。
+  先做必需字段/未知字段/递归类型/schema/digest 检查，之后再做类型严格的规范结构逐字段相等
+  检查。
 - 当前宽松路径的调用方：生产代码里只有 `import_capability_snapshot` 一处（且先经过严格
   检查）；直接以宽松方式调用的是 U1 回归测试
   `python/tests/ut/pypto_x/test_execution_matmul.py::test_capability_digest_mismatch_and_contract_mismatch_fail_closed`。
   resolver / plan / report / entry 均不经过该宽松默认路径。
+
+### 3.8 report `resolution.why` 未锚定（接受为边界）
+
+- v4 report 可携带 `resolution.why`；它来自执行层解释格式器，是**说明层副本**，v4 schema
+  不对其内容做锚定/attestation（已在 `binding_verify` 的残留清单登记）。
+- `explain(report=...)` 按契约原样呈现该字符串，并在 `boundaries` 中列出
+  `why (report input)` 条目，明确"explain 不为其背书"；不把它当作执行事实，也不因它改变
+  provider 选择或 plan/report 对账。
+- 测试 `test_explain_echoes_report_why_without_endorsing_it` 钉住该行为。
