@@ -1,0 +1,3564 @@
+From 2f0b31d0f63a27ea513c917d945c53c63689442c Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sun, 13 Sep 2026 16:25:18 +0800
+Subject: [PATCH 271/274] feat(avx2): native iota/compare/where
+ position-control plane (payload 7)
+
+- add the PXIO/PXCP/PXWH v1 descriptor wire with fnv1a64 digests; bump
+  ARTIFACT_PAYLOAD_VERSION 6->7 and NATIVE_ABI_MARKER pypto-x.cpu.avx2:7->:8
+- execute iota/compare/where inside the compiled AVX2 object (scalar
+  descriptor loop mirroring the accepted SVE256 v5 plane, plus AVX2 fast
+  paths for fully contiguous f32 compare/where); no host pre-expansion
+- per-plan native/fallback metadata with explicit reasons and truthful
+  position_control_fallback semantics; the vector-common host reference
+  stays the bitwise semantic truth for every fallback
+- tests: raw-bit differential matrix (f32/bf16/int/uint/bool; sNaN, qNaN,
+  +/-0, +/-inf, subnormal, integer extremes), payload/ABI strictness,
+  Qwen3.5 decode/prefill and attention corpus zero drift
+- refresh the previous AVX2 payload/ABI version assertions to 7/:8
+
+(cherry picked from commit 460f58506e92b3c696dbaa9af5a2ef254f78177a)
+---
+ python/pypto/backends/cpu/x86/avx2.py                    |  358 +++++++++
+ python/pypto/compiler/targets/cpu_avx2.py                |  936 ++++++++++++++++++++++-
+ python/tests/ut/pypto_x/test_cpu_avx2_broadcast.py       |   16 +-
+ python/tests/ut/pypto_x/test_cpu_avx2_layout.py          |   16 +-
+ python/tests/ut/pypto_x/test_cpu_avx2_packed.py          |   14 +-
+ python/tests/ut/pypto_x/test_cpu_avx2_position_native.py | 1368 ++++++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_qwen35_avx2_parity.py       |   19 +-
+ python/tests/ut/pypto_x/test_qwen35_position_control.py  |   10 +-
+ python/tests/ut/pypto_x/test_w8a8_avx2.py                |    6 +-
+ scripts/perf/avx2_position_microbench.py                 |  491 ++++++++++++
+ 10 files changed, 3187 insertions(+), 47 deletions(-)
+
+diff --git a/python/pypto/backends/cpu/x86/avx2.py b/python/pypto/backends/cpu/x86/avx2.py
+index 10674c1c3..4ac7c080a 100644
+--- a/python/pypto/backends/cpu/x86/avx2.py
++++ b/python/pypto/backends/cpu/x86/avx2.py
+@@ -30,6 +30,8 @@ from pypto.compiler.targets.cpu_avx2 import (
+     PACKED_CAST_MODE,
+     PACKED_EMBEDDING_MODE,
+     PACKED_TRANSPOSE_MODE,
++    POSITION_CONTROL_MAX_RANK,
++    POSITION_CONTROL_MODE,
+     W8A8_DEQUANTIZE_MODE,
+     W8A8_DEQUANTIZE_S8_KERNEL,
+     W8A8_EPILOGUE_KERNEL,
+@@ -38,10 +40,13 @@ from pypto.compiler.targets.cpu_avx2 import (
+     W8A8_QMATMUL_MODE,
+     W8A8_QUANTIZE_MODE,
+     _execution_metadata,
++    _position_control_descriptor_digest,
+     broadcast_native_contract,
+     layout_native_contract,
+     layout_native_fallback_reason,
+     packed_kernel_contract,
++    position_control_native_contract,
++    position_control_native_fallback_reason,
+     w8a8_kernel_contract,
+ )
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation
+@@ -635,6 +640,194 @@ def _call_broadcast(
+     function(source.pointer, destination.pointer, strides, shape, rank, destination.count)
+ 
+ 
++# --------------------------------------------------------------------------
++# Native position-control plane (payload 7: iota/compare/where).
++#
++# The descriptor comes from ``position_control_native_contract`` -- the same
++# predicate that produced the artifact metadata and the load-time execution
++# table -- so a declared kernel is exactly the kernel dispatched here.  The
++# scalar C kernel/descriptor loop is the accepted SVE256 v5 pattern; the f32
++# compare/where kernels additionally take an AVX2 fast path when every operand
++# is contiguous with the output shape.
++# --------------------------------------------------------------------------
++
++_POSITION_CONTROL_DESCRIPTOR_CACHE: Dict[str, Tuple[Any, ...]] = {}
++_POSITION_CONTROL_DESCRIPTOR_CACHE_LIMIT = 4096
++_POSITION_CONTROL_DESCRIPTOR_CACHE_LOCK = threading.RLock()
++_POSITION_CONTROL_NATIVE_STATS: Dict[str, int] = {
++    "kernel_calls": 0,
++    "iota_calls": 0,
++    "compare_calls": 0,
++    "where_calls": 0,
++    "descriptor_cache_hits": 0,
++    "descriptor_cache_misses": 0,
++    "descriptor_rejections": 0,
++    "explicit_host_fallbacks": 0,
++}
++
++
++def position_control_native_stats() -> Mapping[str, int]:
++    """Snapshot the native position-control plane counters (diagnostics)."""
++
++    return dict(_POSITION_CONTROL_NATIVE_STATS)
++
++
++def reset_position_control_native_stats() -> None:
++    """Zero the native position-control plane counters (tests only)."""
++
++    for key in _POSITION_CONTROL_NATIVE_STATS:
++        _POSITION_CONTROL_NATIVE_STATS[key] = 0
++
++
++def _position_control_arrays(contract: Mapping[str, Any]):
++    """Return the cached ctypes argument arrays for one descriptor digest."""
++
++    digest = contract.get("descriptor_digest")
++    if not isinstance(digest, str) or not digest:
++        raise CpuAvx2ArtifactError("AVX2 position-control descriptor digest is missing")
++    with _POSITION_CONTROL_DESCRIPTOR_CACHE_LOCK:
++        cached = _POSITION_CONTROL_DESCRIPTOR_CACHE.get(digest)
++        if cached is not None:
++            _POSITION_CONTROL_NATIVE_STATS["descriptor_cache_hits"] += 1
++            return cached
++        rank = int(contract["rank"])
++        if rank < 0 or rank > POSITION_CONTROL_MAX_RANK:
++            raise CpuAvx2ExecutionError(
++                "AVX2 position-control rank {} is outside the descriptor domain".format(rank)
++            )
++        kind = contract["kind"]
++        if kind == "iota":
++            arrays = ()
++        elif kind == "compare":
++            arrays = (
++                (ctypes.c_int64 * rank)(*[int(value) for value in contract["left_strides"]]),
++                (ctypes.c_int64 * rank)(*[int(value) for value in contract["right_strides"]]),
++                (ctypes.c_size_t * rank)(*[int(value) for value in contract["output_shape"]]),
++            )
++        elif kind == "where":
++            arrays = (
++                (ctypes.c_int64 * rank)(
++                    *[int(value) for value in contract["condition_strides"]]
++                ),
++                (ctypes.c_int64 * rank)(*[int(value) for value in contract["true_strides"]]),
++                (ctypes.c_int64 * rank)(*[int(value) for value in contract["false_strides"]]),
++                (ctypes.c_size_t * rank)(*[int(value) for value in contract["output_shape"]]),
++            )
++        else:
++            raise CpuAvx2ArtifactError(
++                "unsupported AVX2 position-control descriptor kind {!r}".format(kind)
++            )
++        if len(_POSITION_CONTROL_DESCRIPTOR_CACHE) >= _POSITION_CONTROL_DESCRIPTOR_CACHE_LIMIT:
++            _POSITION_CONTROL_DESCRIPTOR_CACHE.pop(
++                next(iter(_POSITION_CONTROL_DESCRIPTOR_CACHE))
++            )
++        _POSITION_CONTROL_DESCRIPTOR_CACHE[digest] = arrays
++        _POSITION_CONTROL_NATIVE_STATS["descriptor_cache_misses"] += 1
++        return arrays
++
++
++def _call_position_control(
++    module: Any,
++    contract: Mapping[str, Any],
++    inputs: Sequence[_NativeBuffer],
++    destination: _NativeBuffer,
++) -> int:
++    """Invoke the declared position-control kernel and return its status."""
++
++    kind = contract["kind"]
++    arrays = _position_control_arrays(contract)
++    if kind == "iota":
++        dtype = canonical_dtype(contract["dtype"])
++        function = _status_symbol(
++            module,
++            "ptx_avx2_{}".format(contract["kernel"]),
++            [
++                _pointer(dtype),
++                ctypes.c_int64,
++                ctypes.c_int64,
++                ctypes.c_size_t,
++                ctypes.c_size_t,
++                ctypes.c_size_t,
++            ],
++        )
++        return function(
++            destination.pointer,
++            int(contract["start"]),
++            int(contract["step"]),
++            destination.count,
++            int(contract["inner_stride"]),
++            int(contract["dimension"]),
++        )
++    if kind == "compare":
++        dtype = canonical_dtype(contract["dtype"])
++        left_strides, right_strides, output_shape = arrays
++        function = _status_symbol(
++            module,
++            "ptx_avx2_{}".format(contract["kernel"]),
++            [
++                _pointer(dtype),
++                _pointer(dtype),
++                _pointer("bool"),
++                ctypes.POINTER(ctypes.c_int64),
++                ctypes.POINTER(ctypes.c_int64),
++                ctypes.POINTER(ctypes.c_size_t),
++                ctypes.c_size_t,
++                ctypes.c_size_t,
++                ctypes.c_uint32,
++            ],
++        )
++        return function(
++            inputs[0].pointer,
++            inputs[1].pointer,
++            destination.pointer,
++            left_strides,
++            right_strides,
++            output_shape,
++            int(contract["rank"]),
++            destination.count,
++            int(contract["predicate_code"]),
++        )
++    if kind == "where":
++        dtype = canonical_dtype(contract["dtype"])
++        (
++            condition_strides,
++            true_strides,
++            false_strides,
++            output_shape,
++        ) = arrays
++        function = _status_symbol(
++            module,
++            "ptx_avx2_{}".format(contract["kernel"]),
++            [
++                _pointer("bool"),
++                _pointer(dtype),
++                _pointer(dtype),
++                _pointer(dtype),
++                ctypes.POINTER(ctypes.c_int64),
++                ctypes.POINTER(ctypes.c_int64),
++                ctypes.POINTER(ctypes.c_int64),
++                ctypes.POINTER(ctypes.c_size_t),
++                ctypes.c_size_t,
++                ctypes.c_size_t,
++            ],
++        )
++        return function(
++            inputs[0].pointer,
++            inputs[1].pointer,
++            inputs[2].pointer,
++            destination.pointer,
++            condition_strides,
++            true_strides,
++            false_strides,
++            output_shape,
++            int(contract["rank"]),
++            destination.count,
++        )
++    raise CpuAvx2ArtifactError(
++        "unsupported AVX2 position-control kind {!r}".format(kind)
++    )
++
++
+ def _call_matmul(
+     module: Any,
+     dtype: str,
+@@ -1873,6 +2066,12 @@ class Avx2Runtime:
+         if broadcast is not None:
+             environment.update(self._execute_broadcast(broadcast, operation, plan, inputs, module))
+             return
++        position = position_control_native_contract(operation, plan)
++        if position is not None:
++            environment.update(
++                self._execute_position_control(position, operation, plan, inputs, module)
++            )
++            return
+         layout = layout_native_contract(operation, plan)
+         if layout is not None:
+             mode = layout["mode"]
+@@ -1889,6 +2088,10 @@ class Avx2Runtime:
+             return
+         if layout_native_fallback_reason(operation, plan) is not None:
+             _LAYOUT_NATIVE_STATS["explicit_host_fallbacks"] += 1
++        if name in ("iota", "compare", "where") and position_control_native_fallback_reason(
++            operation, plan
++        ) is not None:
++            _POSITION_CONTROL_NATIVE_STATS["explicit_host_fallbacks"] += 1
+         output_ref = operation.outputs[0]
+         dtype = canonical_dtype(output_ref.type.dtype)
+         native_float = dtype in ("float32", "bf16")
+@@ -2093,6 +2296,159 @@ class Avx2Runtime:
+         _call_broadcast(module, dtype, source, destination, input_strides, output_shape, rank)
+         return {output_ref.name: _RuntimeValue(output_ref.type, destination)}
+ 
++    def _execute_position_control(
++        self,
++        contract: Mapping[str, Any],
++        operation: Operation,
++        plan: Any,
++        inputs: Sequence[_RuntimeValue],
++        module: Any,
++    ) -> Mapping[str, _RuntimeValue]:
++        """Run one native AVX2 iota/compare/where descriptor.
++
++        The contract comes from :func:`position_control_native_contract`, the
++        same predicate that produced the artifact metadata, and the load path
++        re-validates the whole execution table.  A native position-control
++        artifact can therefore never silently fall back here, and a fallback
++        artifact never declares this mode.  The condition/selected buffers
++        stay raw: the kernel walks the descriptor and writes the destination
++        directly, so no per-element Python list is materialized.
++        """
++
++        if contract.get("mode") != POSITION_CONTROL_MODE:
++            raise CpuAvx2ArtifactError(
++                "unsupported AVX2 position-control mode {!r}".format(contract.get("mode"))
++            )
++        self_check = dict(contract)
++        advertised = self_check.pop("descriptor_digest", None)
++        if advertised != _position_control_descriptor_digest(self_check):
++            _POSITION_CONTROL_NATIVE_STATS["descriptor_rejections"] += 1
++            raise CpuAvx2ArtifactError("AVX2 position-control descriptor digest mismatch")
++        kind = contract.get("kind")
++        outputs = list(operation.outputs)
++        if len(outputs) != 1:
++            raise CpuAvx2ArtifactError(
++                "AVX2 native position control requires exactly one output"
++            )
++        output_ref = outputs[0]
++        dtype = canonical_dtype(output_ref.type.dtype)
++        if kind == "iota":
++            if inputs:
++                raise CpuAvx2ArtifactError("AVX2 native iota takes no tensor inputs")
++            if dtype != contract.get("dtype"):
++                raise CpuAvx2ArtifactError(
++                    "AVX2 native iota output dtype disagrees with the contract"
++                )
++            count = int(contract["output_elements"])
++            if count != int(plan.element_count):
++                raise CpuAvx2ArtifactError(
++                    "AVX2 native iota output count disagrees with the plan"
++                )
++            destination = _buffer_alloc(dtype, count, output_ref.name)
++            status = _call_position_control(module, contract, (), destination)
++            if status != 0:
++                _POSITION_CONTROL_NATIVE_STATS["descriptor_rejections"] += 1
++                raise CpuAvx2ExecutionError(
++                    "AVX2 native iota kernel rejected the descriptor (status {})".format(status)
++                )
++            _POSITION_CONTROL_NATIVE_STATS["iota_calls"] += 1
++        elif kind == "compare":
++            if len(inputs) != 2:
++                raise CpuAvx2ArtifactError("AVX2 native compare requires two inputs")
++            for label, value, expected in (
++                ("left", inputs[0], int(contract["left_elements"])),
++                ("right", inputs[1], int(contract["right_elements"])),
++            ):
++                if (
++                    canonical_dtype(value.type.dtype) != contract.get("dtype")
++                    or value.buffer.dtype != contract.get("dtype")
++                ):
++                    raise CpuAvx2ArtifactError(
++                        "AVX2 native compare {} dtype disagrees with the contract".format(label)
++                    )
++                if value.buffer.count != expected:
++                    raise CpuAvx2ExecutionError(
++                        "AVX2 native compare {} element count does not match the descriptor".format(
++                            label
++                        )
++                    )
++            if dtype != "bool":
++                raise CpuAvx2ArtifactError("AVX2 native compare output must be bool")
++            count = int(contract["output_elements"])
++            if count != int(plan.element_count):
++                raise CpuAvx2ArtifactError(
++                    "AVX2 native compare output count disagrees with the plan"
++                )
++            destination = _buffer_alloc("bool", count, output_ref.name)
++            status = _call_position_control(
++                module, contract, (inputs[0].buffer, inputs[1].buffer), destination
++            )
++            if status != 0:
++                _POSITION_CONTROL_NATIVE_STATS["descriptor_rejections"] += 1
++                raise CpuAvx2ExecutionError(
++                    "AVX2 native compare kernel rejected the descriptor (status {})".format(status)
++                )
++            _POSITION_CONTROL_NATIVE_STATS["compare_calls"] += 1
++        elif kind == "where":
++            if len(inputs) != 3:
++                raise CpuAvx2ArtifactError("AVX2 native where requires three inputs")
++            if (
++                canonical_dtype(inputs[0].type.dtype) != "bool"
++                or inputs[0].buffer.dtype != "bool"
++            ):
++                raise CpuAvx2ArtifactError(
++                    "AVX2 native where condition must be a bool buffer"
++                )
++            if inputs[0].buffer.count != int(contract["condition_elements"]):
++                raise CpuAvx2ExecutionError(
++                    "AVX2 native where condition element count does not match the descriptor"
++                )
++            for label, value, expected in (
++                ("input", inputs[1], int(contract["true_elements"])),
++                ("other", inputs[2], int(contract["false_elements"])),
++            ):
++                if (
++                    canonical_dtype(value.type.dtype) != contract.get("dtype")
++                    or value.buffer.dtype != contract.get("dtype")
++                ):
++                    raise CpuAvx2ArtifactError(
++                        "AVX2 native where {} dtype disagrees with the contract".format(label)
++                    )
++                if value.buffer.count != expected:
++                    raise CpuAvx2ExecutionError(
++                        "AVX2 native where {} element count does not match the descriptor".format(
++                            label
++                        )
++                    )
++            if dtype != contract.get("dtype"):
++                raise CpuAvx2ArtifactError(
++                    "AVX2 native where output dtype disagrees with the contract"
++                )
++            count = int(contract["output_elements"])
++            if count != int(plan.element_count):
++                raise CpuAvx2ArtifactError(
++                    "AVX2 native where output count disagrees with the plan"
++                )
++            destination = _buffer_alloc(dtype, count, output_ref.name)
++            status = _call_position_control(
++                module,
++                contract,
++                (inputs[0].buffer, inputs[1].buffer, inputs[2].buffer),
++                destination,
++            )
++            if status != 0:
++                _POSITION_CONTROL_NATIVE_STATS["descriptor_rejections"] += 1
++                raise CpuAvx2ExecutionError(
++                    "AVX2 native where kernel rejected the descriptor (status {})".format(status)
++                )
++            _POSITION_CONTROL_NATIVE_STATS["where_calls"] += 1
++        else:
++            raise CpuAvx2ArtifactError(
++                "unsupported AVX2 position-control kind {!r}".format(kind)
++            )
++        _POSITION_CONTROL_NATIVE_STATS["kernel_calls"] += 1
++        return {output_ref.name: _RuntimeValue(output_ref.type, destination)}
++
+     def _split_geometry(self, split: Any, output_index: int) -> Tuple[int, int, int, int, int]:
+         axis = int(split.axis)
+         outer = 1
+@@ -2561,4 +2917,6 @@ __all__ = [
+     "CpuAvx2UnavailableError",
+     "LoadedAvx2Artifact",
+     "launch_avx2",
++    "position_control_native_stats",
++    "reset_position_control_native_stats",
+ ]
+diff --git a/python/pypto/compiler/targets/cpu_avx2.py b/python/pypto/compiler/targets/cpu_avx2.py
+index 88c24d71a..1413ee01d 100644
+--- a/python/pypto/compiler/targets/cpu_avx2.py
++++ b/python/pypto/compiler/targets/cpu_avx2.py
+@@ -8,6 +8,7 @@ import os
+ from pathlib import Path
+ import shutil
+ import stat
++import struct
+ import subprocess
+ import tempfile
+ from typing import Any, Mapping, Optional
+@@ -22,6 +23,9 @@ from pypto.lowering.cpu import (
+     W8A8_QUANTIZE_OPCODE,
+     canonical_dtype,
+     canonical_operation_name,
++    comparison_predicate_for_operation,
++    element_count,
++    iota_spec,
+     static_shape,
+ )
+ from pypto.lowering.cpu.x86.avx2 import (
+@@ -46,16 +50,21 @@ from pypto.target._utils import mapping_copy, sha256_bytes, sha256_text
+ # f32/bf16/int8); payload 4 described every one of those operations as
+ # host_reference.  Payload 6 adds the native broadcast plane for f32/bf16 and
+ # moves broadcast out of the host pre-expansion boundary; payload 5 declared
+-# every broadcast plan as host_reference.  Old payloads are rejected
+-# fail-closed because their execution-mode table cannot describe the new
+-# native plane.
+-ARTIFACT_PAYLOAD_VERSION = 6
++# every broadcast plan as host_reference.  Payload 7 adds the native
++# position-control plane (iota/compare/where) with the PXIO/PXCP/PXWH
++# descriptor wire; payload 6 declared iota/compare as host_reference and
++# pre-expanded every where plan.  Old payloads are rejected fail-closed
++# because their execution-mode table cannot describe the new native plane,
++# and the native ABI marker is bumped so a new object can never be paired
++# with payload-6 metadata.
++ARTIFACT_PAYLOAD_VERSION = 7
+ DEFAULT_ARTIFACT_FORMAT = "pypto-x.cpu.avx2"
+ #: Native shared-object ABI marker.  ``:4`` added the W8A8 widening kernels;
+-#: ``:5`` adds the quantize/epilogue kernels and the int8 transpose; ``:6``
+-#: adds the PXLD-v2 native layout / split / concat kernels; ``:7`` adds the
+-#: native f32/bf16 broadcast kernels.
+-NATIVE_ABI_MARKER = "pypto-x.cpu.avx2:7"
++#: ``:5`` added the quantize/epilogue kernels and the int8 transpose; ``:6``
++#: added the PXLD-v2 native layout / split / concat kernels; ``:7`` added the
++#: native f32/bf16 broadcast kernels; ``:8`` adds the native
++#: iota/compare/where position-control kernels.
++NATIVE_ABI_MARKER = "pypto-x.cpu.avx2:8"
+ 
+ 
+ _NATIVE_SOURCE = r'''
+@@ -81,7 +90,7 @@ _NATIVE_SOURCE = r'''
+ __attribute__((visibility("default"))) const char *ptx_avx2_variant = PTX_VARIANT;
+ __attribute__((visibility("default"))) const char *ptx_avx2_source_digest = PTX_SOURCE_DIGEST;
+ __attribute__((visibility("default"))) const unsigned int ptx_avx2_feature_mask = PTX_FEATURE_MASK;
+-__attribute__((visibility("default"))) const char *ptx_avx2_abi = "pypto-x.cpu.avx2:7";
++__attribute__((visibility("default"))) const char *ptx_avx2_abi = "pypto-x.cpu.avx2:8";
+ 
+ static inline __m256 ptx_binary_f32(int op, __m256 a, __m256 b) {
+     if (op == 0) return _mm256_add_ps(a, b);
+@@ -1181,6 +1190,405 @@ void ptx_avx2_broadcast_bf16(const uint16_t *input, uint16_t *output,
+         }
+     }
+ }
++
++/* -------------------------------------------------------------------------
++ * Native position-control plane (artifact payload version 7).
++ *
++ * iota/compare/where are driven by the same rank-sized schedules as the
++ * accepted SVE256 v5 control wire (PXIO/PXCP/PXWH).  The descriptor loop is
++ * scalar (the accepted SVE256 reference plane is scalar as well); the fully
++ * contiguous f32 compare path and the contiguous f32 where select use AVX2
++ * intrinsics because those are the shapes that dominate Qwen mask/select
++ * traffic.  Semantics mirror the vector-common host reference exactly:
++ *   - compare: ordered predicates are false for NaN, != is true for NaN,
++ *     -0.0 == 0.0, and bool operands are Python truthiness (any non-zero
++ *     byte is True);
++ *   - where: only a zero condition byte selects the false branch, the chosen
++ *     f32/bf16 value gets the host reference's Python-float round-trip
++ *     quieting, and every other dtype is copied bit for bit.
++ * ---------------------------------------------------------------------- */
++#define PTX_AVX2_POSITION_MAX_RANK 16U
++
++static int ptx_avx2_position_u64_mul(uint64_t left, uint64_t right,
++                                     uint64_t *result) {
++    if (left != 0U && right > UINT64_MAX / left) return -1;
++    *result = left * right;
++    return 0;
++}
++
++/* 1 when ``strides`` is the row-major contiguous schedule of ``shape``. */
++static int ptx_avx2_position_contiguous(const int64_t *strides,
++                                        const size_t *shape, uint32_t rank) {
++    uint64_t expected = 1U;
++    uint32_t axis = rank;
++    while (axis > 0U) {
++        --axis;
++        if (strides[axis] != (int64_t)expected) return 0;
++        if (ptx_avx2_position_u64_mul(expected, (uint64_t)shape[axis],
++                                      &expected) != 0)
++            return 0;
++    }
++    return 1;
++}
++
++static uint64_t ptx_avx2_position_offset(const size_t *coordinates,
++                                         const int64_t *strides, uint32_t rank) {
++    uint64_t offset = 0U;
++    uint32_t axis;
++    for (axis = 0U; axis < rank; ++axis)
++        offset += (uint64_t)coordinates[axis] * (uint64_t)strides[axis];
++    return offset;
++}
++
++/* Advance the row-major odometer; returns 0 when the output domain is done. */
++static int ptx_avx2_position_advance(size_t *coordinates, const size_t *shape,
++                                     uint32_t rank) {
++    uint32_t axis = rank;
++    while (axis > 0U) {
++        --axis;
++        coordinates[axis] += 1U;
++        if (coordinates[axis] < shape[axis]) return 1;
++        coordinates[axis] = 0U;
++    }
++    return 0;
++}
++
++/* comparison: -1 left<right, 0 equal, 1 left>right, 2 unordered (NaN). */
++static int ptx_avx2_position_float_comparison(float left, float right) {
++    if (left < right) return -1;
++    if (left > right) return 1;
++    if (left == right) return 0;
++    return 2;
++}
++
++static int ptx_avx2_position_predicate(uint32_t predicate, int comparison) {
++    if (predicate == 0U) return comparison == 0; /* eq: false for NaN */
++    if (predicate == 1U) return comparison != 0; /* ne: true for NaN */
++    if (comparison > 1) return 0;                /* NaN fails ordered forms */
++    if (predicate == 2U) return comparison < 0;  /* lt */
++    if (predicate == 3U) return comparison <= 0; /* le */
++    if (predicate == 4U) return comparison > 0;  /* gt */
++    return comparison >= 0;                      /* ge */
++}
++
++static inline float ptx_avx2_position_quiet_f32(float value) {
++    uint32_t bits;
++    memcpy(&bits, &value, sizeof(bits));
++    bits = ptx_avx2_layout_quiet_nan_f32(bits);
++    memcpy(&value, &bits, sizeof(value));
++    return value;
++}
++
++static inline __m256 ptx_avx2_position_quiet_f32_vec(__m256 value) {
++    __m256i bits = _mm256_castps_si256(value);
++    __m256i exponent = _mm256_and_si256(bits, _mm256_set1_epi32(0x7f800000));
++    __m256i mantissa = _mm256_and_si256(bits, _mm256_set1_epi32(0x007fffff));
++    __m256i is_nan = _mm256_and_si256(
++        _mm256_cmpeq_epi32(exponent, _mm256_set1_epi32(0x7f800000)),
++        _mm256_cmpgt_epi32(mantissa, _mm256_setzero_si256()));
++    bits = _mm256_or_si256(
++        bits, _mm256_and_si256(is_nan, _mm256_set1_epi32(0x00400000)));
++    return _mm256_castsi256_ps(bits);
++}
++
++/* ---- iota ------------------------------------------------------------- */
++#define PTX_AVX2_POSITION_IOTA(SUFFIX, TYPE, FITS)                                 \
++__attribute__((visibility("default")))                                             \
++int ptx_avx2_iota_##SUFFIX(TYPE *output, int64_t start, int64_t step,               \
++                           size_t output_count, size_t inner_stride,                \
++                           size_t dimension) {                                      \
++    size_t index;                                                                   \
++    if (output_count != 0U &&                                                       \
++        (output == NULL || dimension == 0U || inner_stride == 0U ||                 \
++         inner_stride > output_count))                                              \
++        return -1;                                                                  \
++    for (index = 0U; index < output_count; ++index) {                               \
++        uint64_t coordinate = (index / inner_stride) % dimension;                   \
++        int64_t delta = 0, value = 0;                                               \
++        if (__builtin_mul_overflow((int64_t)coordinate, step, &delta) != 0 ||       \
++            __builtin_add_overflow(start, delta, &value) != 0 ||                    \
++            !(FITS))                                                                \
++            return -1;                                                              \
++        output[index] = (TYPE)value;                                                \
++    }                                                                               \
++    return 0;                                                                       \
++}
++
++PTX_AVX2_POSITION_IOTA(i32, int32_t,
++                       value >= (-2147483647 - 1) && value <= 2147483647)
++PTX_AVX2_POSITION_IOTA(i64, int64_t, 1)
++
++/* ---- compare ---------------------------------------------------------- */
++#define PTX_AVX2_POSITION_COMPARE_INT(SUFFIX, TYPE)                                \
++__attribute__((visibility("default")))                                             \
++int ptx_avx2_compare_##SUFFIX(const TYPE *left, const TYPE *right,                 \
++                              uint8_t *output,                                     \
++                              const int64_t *left_strides,                         \
++                              const int64_t *right_strides,                        \
++                              const size_t *output_shape, size_t rank,             \
++                              size_t output_count, uint32_t predicate) {           \
++    size_t coordinates[PTX_AVX2_POSITION_MAX_RANK];                                \
++    size_t index;                                                                  \
++    if (rank > PTX_AVX2_POSITION_MAX_RANK || predicate > 5U) return -1;            \
++    if (output_count != 0U &&                                                      \
++        (left == NULL || right == NULL || output == NULL))                         \
++        return -1;                                                                 \
++    for (index = 0U; index < rank; ++index) coordinates[index] = 0U;               \
++    for (index = 0U; index < output_count; ++index) {                              \
++        TYPE a = left[ptx_avx2_position_offset(coordinates, left_strides,          \
++                                               (uint32_t)rank)];                   \
++        TYPE b = right[ptx_avx2_position_offset(coordinates, right_strides,        \
++                                                (uint32_t)rank)];                  \
++        int comparison = a < b ? -1 : (a > b ? 1 : 0);                             \
++        output[index] = (uint8_t)(                                                 \
++            ptx_avx2_position_predicate(predicate, comparison) ? 1U : 0U);         \
++        if (!ptx_avx2_position_advance(coordinates, output_shape,                  \
++                                       (uint32_t)rank))                            \
++            break;                                                                 \
++    }                                                                              \
++    return 0;                                                                      \
++}
++
++PTX_AVX2_POSITION_COMPARE_INT(i8, int8_t)
++PTX_AVX2_POSITION_COMPARE_INT(i16, int16_t)
++PTX_AVX2_POSITION_COMPARE_INT(i32, int32_t)
++PTX_AVX2_POSITION_COMPARE_INT(i64, int64_t)
++PTX_AVX2_POSITION_COMPARE_INT(u8, uint8_t)
++PTX_AVX2_POSITION_COMPARE_INT(u16, uint16_t)
++PTX_AVX2_POSITION_COMPARE_INT(u32, uint32_t)
++PTX_AVX2_POSITION_COMPARE_INT(u64, uint64_t)
++
++__attribute__((visibility("default")))
++int ptx_avx2_compare_bf16(const uint16_t *left, const uint16_t *right,
++                          uint8_t *output, const int64_t *left_strides,
++                          const int64_t *right_strides,
++                          const size_t *output_shape, size_t rank,
++                          size_t output_count, uint32_t predicate) {
++    size_t coordinates[PTX_AVX2_POSITION_MAX_RANK];
++    size_t index;
++    if (rank > PTX_AVX2_POSITION_MAX_RANK || predicate > 5U) return -1;
++    if (output_count != 0U &&
++        (left == NULL || right == NULL || output == NULL))
++        return -1;
++    for (index = 0U; index < rank; ++index) coordinates[index] = 0U;
++    for (index = 0U; index < output_count; ++index) {
++        float a = ptx_bf16_to_f32(left[ptx_avx2_position_offset(
++            coordinates, left_strides, (uint32_t)rank)]);
++        float b = ptx_bf16_to_f32(right[ptx_avx2_position_offset(
++            coordinates, right_strides, (uint32_t)rank)]);
++        int comparison = ptx_avx2_position_float_comparison(a, b);
++        output[index] = (uint8_t)(
++            ptx_avx2_position_predicate(predicate, comparison) ? 1U : 0U);
++        if (!ptx_avx2_position_advance(coordinates, output_shape,
++                                       (uint32_t)rank))
++            break;
++    }
++    return 0;
++}
++
++__attribute__((visibility("default")))
++int ptx_avx2_compare_bool(const uint8_t *left, const uint8_t *right,
++                          uint8_t *output, const int64_t *left_strides,
++                          const int64_t *right_strides,
++                          const size_t *output_shape, size_t rank,
++                          size_t output_count, uint32_t predicate) {
++    size_t coordinates[PTX_AVX2_POSITION_MAX_RANK];
++    size_t index;
++    if (rank > PTX_AVX2_POSITION_MAX_RANK || predicate > 5U) return -1;
++    if (output_count != 0U &&
++        (left == NULL || right == NULL || output == NULL))
++        return -1;
++    for (index = 0U; index < rank; ++index) coordinates[index] = 0U;
++    for (index = 0U; index < output_count; ++index) {
++        int a = left[ptx_avx2_position_offset(coordinates, left_strides,
++                                              (uint32_t)rank)] != 0U;
++        int b = right[ptx_avx2_position_offset(coordinates, right_strides,
++                                               (uint32_t)rank)] != 0U;
++        int comparison = a < b ? -1 : (a > b ? 1 : 0);
++        output[index] = (uint8_t)(
++            ptx_avx2_position_predicate(predicate, comparison) ? 1U : 0U);
++        if (!ptx_avx2_position_advance(coordinates, output_shape,
++                                       (uint32_t)rank))
++            break;
++    }
++    return 0;
++}
++
++__attribute__((visibility("default")))
++int ptx_avx2_compare_f32(const float *left, const float *right,
++                         uint8_t *output, const int64_t *left_strides,
++                         const int64_t *right_strides,
++                         const size_t *output_shape, size_t rank,
++                         size_t output_count, uint32_t predicate) {
++    size_t coordinates[PTX_AVX2_POSITION_MAX_RANK];
++    size_t index;
++    if (rank > PTX_AVX2_POSITION_MAX_RANK || predicate > 5U) return -1;
++    if (output_count != 0U &&
++        (left == NULL || right == NULL || output == NULL))
++        return -1;
++    if (ptx_avx2_position_contiguous(left_strides, output_shape,
++                                     (uint32_t)rank) &&
++        ptx_avx2_position_contiguous(right_strides, output_shape,
++                                     (uint32_t)rank)) {
++        index = 0U;
++        while (index + 8U <= output_count) {
++            __m256 a = _mm256_loadu_ps(left + index);
++            __m256 b = _mm256_loadu_ps(right + index);
++            __m256 mask;
++            uint32_t bits;
++            switch (predicate) {
++            case 0U: mask = _mm256_cmp_ps(a, b, _CMP_EQ_OQ); break;
++            case 1U: mask = _mm256_cmp_ps(a, b, _CMP_NEQ_UQ); break;
++            case 2U: mask = _mm256_cmp_ps(a, b, _CMP_LT_OQ); break;
++            case 3U: mask = _mm256_cmp_ps(a, b, _CMP_LE_OQ); break;
++            case 4U: mask = _mm256_cmp_ps(a, b, _CMP_GT_OQ); break;
++            default: mask = _mm256_cmp_ps(a, b, _CMP_GE_OQ); break;
++            }
++            bits = (uint32_t)_mm256_movemask_ps(mask);
++            output[index + 0U] = (uint8_t)((bits >> 0U) & 1U);
++            output[index + 1U] = (uint8_t)((bits >> 1U) & 1U);
++            output[index + 2U] = (uint8_t)((bits >> 2U) & 1U);
++            output[index + 3U] = (uint8_t)((bits >> 3U) & 1U);
++            output[index + 4U] = (uint8_t)((bits >> 4U) & 1U);
++            output[index + 5U] = (uint8_t)((bits >> 5U) & 1U);
++            output[index + 6U] = (uint8_t)((bits >> 6U) & 1U);
++            output[index + 7U] = (uint8_t)((bits >> 7U) & 1U);
++            index += 8U;
++        }
++        for (; index < output_count; ++index) {
++            int comparison =
++                ptx_avx2_position_float_comparison(left[index], right[index]);
++            output[index] = (uint8_t)(
++                ptx_avx2_position_predicate(predicate, comparison) ? 1U : 0U);
++        }
++        return 0;
++    }
++    for (index = 0U; index < rank; ++index) coordinates[index] = 0U;
++    for (index = 0U; index < output_count; ++index) {
++        float a = left[ptx_avx2_position_offset(coordinates, left_strides,
++                                                (uint32_t)rank)];
++        float b = right[ptx_avx2_position_offset(coordinates, right_strides,
++                                                 (uint32_t)rank)];
++        int comparison = ptx_avx2_position_float_comparison(a, b);
++        output[index] = (uint8_t)(
++            ptx_avx2_position_predicate(predicate, comparison) ? 1U : 0U);
++        if (!ptx_avx2_position_advance(coordinates, output_shape,
++                                       (uint32_t)rank))
++            break;
++    }
++    return 0;
++}
++
++/* ---- where ------------------------------------------------------------ */
++#define PTX_AVX2_POSITION_COPY_PLAIN(value) (value)
++#define PTX_AVX2_POSITION_NORMALIZE_BOOL(value) ((value) != 0U ? (uint8_t)1U : (uint8_t)0U)
++
++#define PTX_AVX2_POSITION_WHERE(SUFFIX, TYPE, SELECT)                              \
++__attribute__((visibility("default")))                                             \
++int ptx_avx2_where_##SUFFIX(const uint8_t *condition, const TYPE *true_data,       \
++                            const TYPE *false_data, TYPE *output,                  \
++                            const int64_t *condition_strides,                      \
++                            const int64_t *true_strides,                           \
++                            const int64_t *false_strides,                          \
++                            const size_t *output_shape, size_t rank,               \
++                            size_t output_count) {                                 \
++    size_t coordinates[PTX_AVX2_POSITION_MAX_RANK];                                \
++    size_t index;                                                                  \
++    if (rank > PTX_AVX2_POSITION_MAX_RANK) return -1;                              \
++    if (output_count != 0U &&                                                      \
++        (condition == NULL || true_data == NULL || false_data == NULL ||           \
++         output == NULL))                                                          \
++        return -1;                                                                 \
++    for (index = 0U; index < rank; ++index) coordinates[index] = 0U;               \
++    for (index = 0U; index < output_count; ++index) {                              \
++        uint64_t condition_offset = ptx_avx2_position_offset(                      \
++            coordinates, condition_strides, (uint32_t)rank);                       \
++        uint64_t true_offset = ptx_avx2_position_offset(                           \
++            coordinates, true_strides, (uint32_t)rank);                            \
++        uint64_t false_offset = ptx_avx2_position_offset(                          \
++            coordinates, false_strides, (uint32_t)rank);                           \
++        TYPE selected = condition[condition_offset] != 0U                          \
++                            ? true_data[true_offset]                               \
++                            : false_data[false_offset];                            \
++        output[index] = (TYPE)(SELECT(selected));                                  \
++        if (!ptx_avx2_position_advance(coordinates, output_shape,                  \
++                                       (uint32_t)rank))                            \
++            break;                                                                 \
++    }                                                                              \
++    return 0;                                                                      \
++}
++
++__attribute__((visibility("default")))
++int ptx_avx2_where_f32(const uint8_t *condition, const float *true_data,
++                       const float *false_data, float *output,
++                       const int64_t *condition_strides,
++                       const int64_t *true_strides,
++                       const int64_t *false_strides,
++                       const size_t *output_shape, size_t rank,
++                       size_t output_count) {
++    size_t coordinates[PTX_AVX2_POSITION_MAX_RANK];
++    size_t index;
++    if (rank > PTX_AVX2_POSITION_MAX_RANK) return -1;
++    if (output_count != 0U &&
++        (condition == NULL || true_data == NULL || false_data == NULL ||
++         output == NULL))
++        return -1;
++    if (ptx_avx2_position_contiguous(condition_strides, output_shape,
++                                     (uint32_t)rank) &&
++        ptx_avx2_position_contiguous(true_strides, output_shape,
++                                     (uint32_t)rank) &&
++        ptx_avx2_position_contiguous(false_strides, output_shape,
++                                     (uint32_t)rank)) {
++        index = 0U;
++        while (index + 8U <= output_count) {
++            __m128i bytes =
++                _mm_loadl_epi64((const __m128i *)(condition + index));
++            __m256i lanes = _mm256_cvtepu8_epi32(bytes);
++            __m256i nonzero = _mm256_xor_si256(
++                _mm256_cmpeq_epi32(lanes, _mm256_setzero_si256()),
++                _mm256_set1_epi32(-1));
++            __m256 selected = _mm256_blendv_ps(
++                _mm256_loadu_ps(false_data + index),
++                _mm256_loadu_ps(true_data + index),
++                _mm256_castsi256_ps(nonzero));
++            _mm256_storeu_ps(output + index,
++                             ptx_avx2_position_quiet_f32_vec(selected));
++            index += 8U;
++        }
++        for (; index < output_count; ++index) {
++            output[index] = ptx_avx2_position_quiet_f32(
++                condition[index] != 0U ? true_data[index] : false_data[index]);
++        }
++        return 0;
++    }
++    for (index = 0U; index < rank; ++index) coordinates[index] = 0U;
++    for (index = 0U; index < output_count; ++index) {
++        uint64_t condition_offset = ptx_avx2_position_offset(
++            coordinates, condition_strides, (uint32_t)rank);
++        uint64_t true_offset = ptx_avx2_position_offset(
++            coordinates, true_strides, (uint32_t)rank);
++        uint64_t false_offset = ptx_avx2_position_offset(
++            coordinates, false_strides, (uint32_t)rank);
++        output[index] = ptx_avx2_position_quiet_f32(
++            condition[condition_offset] != 0U ? true_data[true_offset]
++                                              : false_data[false_offset]);
++        if (!ptx_avx2_position_advance(coordinates, output_shape,
++                                       (uint32_t)rank))
++            break;
++    }
++    return 0;
++}
++
++PTX_AVX2_POSITION_WHERE(bf16, uint16_t, ptx_avx2_layout_quiet_nan_bf16)
++PTX_AVX2_POSITION_WHERE(i8, int8_t, PTX_AVX2_POSITION_COPY_PLAIN)
++PTX_AVX2_POSITION_WHERE(u8, uint8_t, PTX_AVX2_POSITION_COPY_PLAIN)
++PTX_AVX2_POSITION_WHERE(i16, int16_t, PTX_AVX2_POSITION_COPY_PLAIN)
++PTX_AVX2_POSITION_WHERE(u16, uint16_t, PTX_AVX2_POSITION_COPY_PLAIN)
++PTX_AVX2_POSITION_WHERE(i32, int32_t, PTX_AVX2_POSITION_COPY_PLAIN)
++PTX_AVX2_POSITION_WHERE(u32, uint32_t, PTX_AVX2_POSITION_COPY_PLAIN)
++PTX_AVX2_POSITION_WHERE(i64, int64_t, PTX_AVX2_POSITION_COPY_PLAIN)
++PTX_AVX2_POSITION_WHERE(u64, uint64_t, PTX_AVX2_POSITION_COPY_PLAIN)
++PTX_AVX2_POSITION_WHERE(bool, uint8_t, PTX_AVX2_POSITION_NORMALIZE_BOOL)
+ '''
+ 
+ 
+@@ -1511,6 +1919,450 @@ def broadcast_native_fallback_reason(operation: Any, plan: Any) -> Optional[str]
+     return _broadcast_decision(operation, plan)[1]
+ 
+ 
++#: Native position-control plane (artifact payload version 7).
++#:
++#: ``iota``/``compare``/``where`` are described by the same rank-sized
++#: broadcast schedules as the accepted SVE256 v5 control wire
++#: (PXIO/PXCP/PXWH) and executed by the compiled AVX2 object, so the host
++#: never materializes a per-element Python list.  The runtime dispatch and
++#: the artifact metadata share the two predicates below, so a declared kernel
++#: is exactly the kernel the executor runs and every uncovered plan carries an
++#: explicit host-reference reason.  ``compare``/``where`` reproduce the host
++#: reference verbatim: ordered comparisons are false for NaN, ``ne`` is true
++#: for NaN, bool operands are Python truthiness (any non-zero byte is True),
++#: only a zero condition byte selects the false branch, and f32/bf16 selections
++#: are bit-copied after the same Python-float round-trip quieting the host
++#: reference applies.
++POSITION_CONTROL_MODE = "native_avx2_position_control"
++POSITION_CONTROL_WIRE = "v1:pxio-pxcp-pxwh+fnv1a64"
++POSITION_CONTROL_KERNEL_VERSION = 1
++POSITION_CONTROL_MAX_RANK = 16
++POSITION_CONTROL_OPERATIONS = frozenset(("iota", "compare", "where"))
++#: Every dtype the AVX2 lowering admits for these operations.  ``iota`` is
++#: narrowed to int32/int64 by :func:`iota_spec`; ``compare`` admits every
++#: admitted operands dtype (ordered bool stays rejected by the shared
++#: validator); ``where`` requires a bool condition and one common value dtype.
++POSITION_CONTROL_VALUE_DTYPES = (
++    "float32",
++    "bf16",
++    "int8",
++    "uint8",
++    "int16",
++    "uint16",
++    "int32",
++    "uint32",
++    "int64",
++    "uint64",
++)
++POSITION_CONTROL_DTYPE_SUFFIX = {
++    "float32": "f32",
++    "bf16": "bf16",
++    "bool": "bool",
++    "int8": "i8",
++    "uint8": "u8",
++    "int16": "i16",
++    "uint16": "u16",
++    "int32": "i32",
++    "uint32": "u32",
++    "int64": "i64",
++    "uint64": "u64",
++}
++#: Wire dtype codes mirror the SVE256 control wire (``PTX_DTYPE_*`` in
++#: cpu_sve256.py), so a PXCP/PXWH descriptor digest means the same dtype on
++#: both ISAs.
++POSITION_CONTROL_DTYPE_CODES = {
++    "float32": 0,
++    "bf16": 1,
++    "int32": 4,
++    "int64": 5,
++    "bool": 6,
++    "int8": 7,
++    "uint8": 8,
++    "int16": 9,
++    "uint16": 10,
++    "uint32": 11,
++    "uint64": 12,
++}
++POSITION_CONTROL_PREDICATE_CODES = {"eq": 0, "ne": 1, "lt": 2, "le": 3, "gt": 4, "ge": 5}
++_POSITION_CONTROL_WIRE_VERSION = 1
++_FNV1A64_OFFSET = 0xCBF29CE484222325
++_FNV1A64_PRIME = 0x100000001B3
++_FNV1A64_MASK = 0xFFFFFFFFFFFFFFFF
++
++
++def _fnv1a64(data: bytes) -> int:
++    value = _FNV1A64_OFFSET
++    for byte in data:
++        value ^= int(byte)
++        value = (value * _FNV1A64_PRIME) & _FNV1A64_MASK
++    return value
++
++
++def _position_u64_bytes(values) -> bytes:
++    return struct.pack("<{}Q".format(len(values)), *[int(value) & _FNV1A64_MASK for value in values])
++
++
++def _position_control_descriptor_bytes(contract: Mapping[str, Any]) -> bytes:
++    """Return the canonical PXIO/PXCP/PXWH descriptor wire for one contract.
++
++    The digest is a strict decoder aid: the runtime re-derives this exact byte
++    string from the CoreProgram and refuses a contract whose advertised
++    ``descriptor_digest`` (fnv1a64) does not match.  ``mode``/``kernel`` are
++    dispatch metadata, not descriptor content, so they are not part of the
++    wire.
++    """
++
++    kind = contract.get("kind")
++    if kind == "iota":
++        header = struct.pack(
++            "<4sIIIII",
++            b"PXIO",
++            _POSITION_CONTROL_WIRE_VERSION,
++            int(contract["axis"]),
++            POSITION_CONTROL_DTYPE_CODES[contract["dtype"]],
++            int(contract["rank"]),
++            0,
++        )
++        return header + _position_u64_bytes(
++            (
++                contract["output_elements"],
++                contract["start"],
++                contract["step"],
++                contract["inner_stride"],
++                contract["dimension"],
++            )
++        )
++    if kind == "compare":
++        header = struct.pack(
++            "<4sIIIIII",
++            b"PXCP",
++            _POSITION_CONTROL_WIRE_VERSION,
++            int(contract["rank"]),
++            POSITION_CONTROL_DTYPE_CODES[contract["dtype"]],
++            POSITION_CONTROL_DTYPE_CODES[contract["dtype"]],
++            int(contract["predicate_code"]),
++            0,
++        )
++        return (
++            header
++            + _position_u64_bytes(
++                (
++                    contract["left_elements"],
++                    contract["right_elements"],
++                    contract["output_elements"],
++                )
++            )
++            + _position_u64_bytes(contract["left_strides"])
++            + _position_u64_bytes(contract["right_strides"])
++            + _position_u64_bytes(contract["output_shape"])
++        )
++    if kind == "where":
++        header = struct.pack(
++            "<4sIIIII",
++            b"PXWH",
++            _POSITION_CONTROL_WIRE_VERSION,
++            int(contract["rank"]),
++            POSITION_CONTROL_DTYPE_CODES[contract["value_dtype"]],
++            POSITION_CONTROL_DTYPE_CODES["bool"],
++            0,
++        )
++        return (
++            header
++            + _position_u64_bytes(
++                (
++                    contract["condition_elements"],
++                    contract["true_elements"],
++                    contract["false_elements"],
++                    contract["output_elements"],
++                )
++            )
++            + _position_u64_bytes(contract["condition_strides"])
++            + _position_u64_bytes(contract["true_strides"])
++            + _position_u64_bytes(contract["false_strides"])
++            + _position_u64_bytes(contract["output_shape"])
++        )
++    raise ValueError("unknown position-control descriptor kind {!r}".format(kind))
++
++
++def _position_control_descriptor_digest(contract: Mapping[str, Any]) -> str:
++    return "fnv1a64:{:016x}".format(_fnv1a64(_position_control_descriptor_bytes(contract)))
++
++
++def _position_control_output_shape(plan: Any, operation: str):
++    try:
++        shape = tuple(int(dimension) for dimension in plan.shape)
++    except (TypeError, ValueError):
++        return None, "{} output shape is not statically known".format(operation)
++    if any(dimension < 0 for dimension in shape):
++        return None, "{} output shape contains a negative dimension".format(operation)
++    return shape, None
++
++
++def _position_control_source_layout(value_type: Any, output_shape, context: str):
++    """Return ``(element_strides, element_count, reason)`` for one source.
++
++    Scalars contribute one storage element and all-zero output strides.  Tensor
++    sources must broadcast with the standard trailing-singleton rule and are
++    addressed by output-rank element strides.
++    """
++
++    kind = getattr(value_type, "kind", None)
++    if kind == "scalar":
++        return tuple(0 for _ in output_shape), 1, None
++    if kind not in _PACKED_TENSOR_KINDS:
++        return (
++            None,
++            None,
++            "{} kind {!r} is not a native AVX2 position-control tensor/scalar".format(
++                context, kind
++            ),
++        )
++    try:
++        shape = tuple(int(dimension) for dimension in value_type.shape)
++    except (TypeError, ValueError):
++        return None, None, "{} shape is not statically known".format(context)
++    if any(dimension < 0 for dimension in shape):
++        return None, None, "{} shape contains a negative dimension".format(context)
++    rank_delta = len(output_shape) - len(shape)
++    if rank_delta < 0:
++        return (
++            None,
++            None,
++            "{} rank {} exceeds output rank {}".format(context, len(shape), len(output_shape)),
++        )
++    contiguous = _contiguous_element_strides(shape)
++    strides = [0] * rank_delta
++    for axis, dimension in enumerate(shape):
++        output_dimension = output_shape[rank_delta + axis]
++        if dimension == 1:
++            strides.append(0)
++        elif dimension == output_dimension:
++            strides.append(contiguous[axis])
++        else:
++            return (
++                None,
++                None,
++                "{} dimension {} on axis {} is neither 1 nor equal to output dimension {}".format(
++                    context, dimension, axis, output_dimension
++                ),
++            )
++    return tuple(strides), element_count(shape), None
++
++
++def _position_control_iota(operation: Any, plan: Any):
++    if len(operation.inputs) != 0 or len(operation.outputs) != 1:
++        return None, "iota requires exactly one output and no inputs"
++    output_type = operation.outputs[0].type
++    try:
++        axis, start, step = iota_spec(output_type, operation.attributes, "AVX2 iota")
++    except Exception as exc:  # noqa: BLE001 - the shared validator already ran
++        return None, "iota schedule is invalid: {}".format(exc)
++    try:
++        dtype = canonical_dtype(plan.dtype)
++    except (TypeError, ValueError) as exc:
++        return None, "iota output dtype is not statically known: {}".format(exc)
++    if dtype not in ("int32", "int64"):
++        return None, "dtype {} is not in the native AVX2 iota dtype set (int32/int64)".format(dtype)
++    shape, reason = _position_control_output_shape(plan, "iota")
++    if shape is None:
++        return None, reason
++    if len(shape) > POSITION_CONTROL_MAX_RANK:
++        return None, "iota rank {} exceeds the native AVX2 position-control max rank {}".format(
++            len(shape), POSITION_CONTROL_MAX_RANK
++        )
++    inner_stride = 1
++    for dimension in shape[axis + 1:]:
++        inner_stride *= dimension
++    return (
++        {
++            "kind": "iota",
++            "kernel": "iota_{}".format(POSITION_CONTROL_DTYPE_SUFFIX[dtype]),
++            "dtype": dtype,
++            "axis": int(axis),
++            "start": int(start),
++            "step": int(step),
++            "rank": len(shape),
++            "output_shape": list(shape),
++            "output_elements": element_count(shape),
++            "inner_stride": int(inner_stride),
++            "dimension": int(shape[axis]),
++        },
++        None,
++    )
++
++
++def _position_control_compare(operation: Any, plan: Any):
++    if len(operation.inputs) != 2 or len(operation.outputs) != 1:
++        return None, "compare requires exactly two inputs and one output"
++    output_type = operation.outputs[0].type
++    try:
++        output_dtype = canonical_dtype(output_type.dtype)
++    except (TypeError, ValueError) as exc:
++        return None, "compare output dtype is not statically known: {}".format(exc)
++    if output_dtype != "bool":
++        return None, "compare output dtype {} is not bool".format(output_dtype)
++    try:
++        predicate = comparison_predicate_for_operation(
++            operation.name, operation.attributes, "AVX2 compare"
++        )
++    except Exception as exc:  # noqa: BLE001 - the shared validator already ran
++        return None, "compare predicate is invalid: {}".format(exc)
++    left_type, right_type = operation.inputs[0].type, operation.inputs[1].type
++    try:
++        left_dtype = canonical_dtype(left_type.dtype)
++        right_dtype = canonical_dtype(right_type.dtype)
++    except (TypeError, ValueError) as exc:
++        return None, "compare operand dtype is not statically known: {}".format(exc)
++    if left_dtype != right_dtype:
++        return None, "compare operands must share one dtype ({} vs {})".format(
++            left_dtype, right_dtype
++        )
++    if left_dtype != "bool" and left_dtype not in POSITION_CONTROL_VALUE_DTYPES:
++        return None, "dtype {} is not in the native AVX2 compare dtype set".format(left_dtype)
++    if left_dtype == "bool" and predicate not in ("eq", "ne"):
++        return None, "ordered bool comparison is not a native AVX2 compare"
++    shape, reason = _position_control_output_shape(plan, "compare")
++    if shape is None:
++        return None, reason
++    if len(shape) > POSITION_CONTROL_MAX_RANK:
++        return None, "compare rank {} exceeds the native AVX2 position-control max rank {}".format(
++            len(shape), POSITION_CONTROL_MAX_RANK
++        )
++    left_strides, left_elements, reason = _position_control_source_layout(
++        left_type, shape, "compare left"
++    )
++    if left_strides is None:
++        return None, reason
++    right_strides, right_elements, reason = _position_control_source_layout(
++        right_type, shape, "compare right"
++    )
++    if right_strides is None:
++        return None, reason
++    return (
++        {
++            "kind": "compare",
++            "kernel": "compare_{}".format(POSITION_CONTROL_DTYPE_SUFFIX[left_dtype])
++            if left_dtype != "bool"
++            else "compare_bool",
++            "dtype": left_dtype,
++            "predicate": predicate,
++            "predicate_code": POSITION_CONTROL_PREDICATE_CODES[predicate],
++            "rank": len(shape),
++            "output_shape": list(shape),
++            "left_strides": list(left_strides),
++            "right_strides": list(right_strides),
++            "left_elements": int(left_elements),
++            "right_elements": int(right_elements),
++            "output_elements": element_count(shape),
++        },
++        None,
++    )
++
++
++def _position_control_where(operation: Any, plan: Any):
++    if len(operation.inputs) != 3 or len(operation.outputs) != 1:
++        return None, "where requires exactly three inputs and one output"
++    condition_type, true_type, false_type = (ref.type for ref in operation.inputs)
++    try:
++        condition_dtype = canonical_dtype(condition_type.dtype)
++        value_dtype = canonical_dtype(true_type.dtype)
++        false_dtype = canonical_dtype(false_type.dtype)
++        output_dtype = canonical_dtype(operation.outputs[0].type.dtype)
++    except (TypeError, ValueError) as exc:
++        return None, "where operand dtype is not statically known: {}".format(exc)
++    if condition_dtype != "bool":
++        return None, "where condition dtype {} is not bool".format(condition_dtype)
++    if false_dtype != value_dtype or output_dtype != value_dtype:
++        return None, "where selected values and output must share one dtype ({} vs {} vs {})".format(
++            value_dtype, false_dtype, output_dtype
++        )
++    if value_dtype != "bool" and value_dtype not in POSITION_CONTROL_VALUE_DTYPES:
++        return None, "dtype {} is not in the native AVX2 where dtype set".format(value_dtype)
++    shape, reason = _position_control_output_shape(plan, "where")
++    if shape is None:
++        return None, reason
++    if len(shape) > POSITION_CONTROL_MAX_RANK:
++        return None, "where rank {} exceeds the native AVX2 position-control max rank {}".format(
++            len(shape), POSITION_CONTROL_MAX_RANK
++        )
++    layout = []
++    for value_type, label in (
++        (condition_type, "where condition"),
++        (true_type, "where input"),
++        (false_type, "where other"),
++    ):
++        strides, elements, reason = _position_control_source_layout(value_type, shape, label)
++        if strides is None:
++            return None, reason
++        layout.append((tuple(strides), int(elements)))
++    (condition_strides, condition_elements), (true_strides, true_elements), (
++        false_strides,
++        false_elements,
++    ) = layout
++    return (
++        {
++            "kind": "where",
++            "kernel": "where_{}".format(POSITION_CONTROL_DTYPE_SUFFIX[value_dtype]),
++            "condition_dtype": "bool",
++            "value_dtype": value_dtype,
++            "dtype": value_dtype,
++            "rank": len(shape),
++            "output_shape": list(shape),
++            "condition_strides": list(condition_strides),
++            "true_strides": list(true_strides),
++            "false_strides": list(false_strides),
++            "condition_elements": condition_elements,
++            "true_elements": true_elements,
++            "false_elements": false_elements,
++            "output_elements": element_count(shape),
++        },
++        None,
++    )
++
++
++_POSITION_CONTROL_HANDLERS = {
++    "iota": _position_control_iota,
++    "compare": _position_control_compare,
++    "where": _position_control_where,
++}
++
++
++def _position_control_decision(operation: Any, plan: Any):
++    """Return ``(contract, fallback_reason)`` for one position-control plan.
++
++    Exactly one element of the pair is non-``None`` for an iota/compare/where
++    plan and both are ``None`` for every other operation.  ``contract`` always
++    carries ``mode`` and the fnv1a64 ``descriptor_digest``.
++    """
++
++    if operation is None or plan is None:
++        return None, None
++    name = canonical_operation_name(operation.name)
++    if name not in POSITION_CONTROL_OPERATIONS:
++        return None, None
++    if name != plan.operation:
++        return None, "plan operation {!r} does not match {!r}".format(plan.operation, name)
++    contract, reason = _POSITION_CONTROL_HANDLERS[name](operation, plan)
++    if contract is None:
++        return None, reason
++    contract = dict(contract)
++    contract["mode"] = POSITION_CONTROL_MODE
++    contract["descriptor_digest"] = _position_control_descriptor_digest(contract)
++    return contract, None
++
++
++def position_control_native_contract(operation: Any, plan: Any) -> Optional[dict]:
++    """Describe the native AVX2 position-control kernel for one plan, or ``None``."""
++
++    return _position_control_decision(operation, plan)[0]
++
++
++def position_control_native_fallback_reason(operation: Any, plan: Any) -> Optional[str]:
++    """Return why one iota/compare/where plan stays on the host reference, or ``None``."""
++
++    return _position_control_decision(operation, plan)[1]
++
++
+ #: Native layout / split / concat descriptor plane (artifact payload version
+ #: 5).  The runtime and the artifact metadata share the two predicates below,
+ #: so a declared native layout kernel is exactly the kernel the executor runs.
+@@ -1832,6 +2684,8 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+     native_operations = []
+     math_fallback = []
+     position_operations = []
++    position_native_operations = []
++    position_fallbacks = []
+     host_operations = []
+     packed_operations = []
+     packed_names = []
+@@ -1855,6 +2709,7 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+         packed = packed_kernel_contract(operation, plan)
+         broadcast = broadcast_native_contract(operation, plan)
+         layout = layout_native_contract(operation, plan)
++        position = position_control_native_contract(operation, plan)
+         if w8a8 is not None:
+             mode = w8a8["mode"]
+             if name not in w8a8_names:
+@@ -1905,6 +2760,26 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+                 }
+             )
+             native_helpers.add("ptx_avx2_{}".format(layout["kernel"]))
++        elif position is not None:
++            mode = position["mode"]
++            # Keep one entry per plan: the SVE256 reference plane records
++            # duplicates too, so the list is an auditable per-plan census.
++            position_operations.append(name)
++            if name not in native_operations:
++                native_operations.append(name)
++            position_native_operations.append(
++                {
++                    "operation_index": plan.operation_index,
++                    "operation": name,
++                    "mode": mode,
++                    "kind": position["kind"],
++                    "kernel": position["kernel"],
++                    "dtype": position.get("dtype", position.get("value_dtype")),
++                    "rank": position["rank"],
++                    "descriptor_digest": position["descriptor_digest"],
++                }
++            )
++            native_helpers.add("ptx_avx2_{}".format(position["kernel"]))
+         elif name in ("exp", "rsqrt", "sigmoid", "silu", "softplus"):
+             mode = "native_scalar_math_lane"
+             if name not in math_fallback:
+@@ -1914,9 +2789,19 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+         elif name in ("identity", "add", "sub", "mul", "div", "neg", "reduce_sum", "reduce_max", "reduce_mean", "matmul") and dtype in ("float32", "bf16"):
+             mode = "native_avx2"
+             native_operations.append(name)
+-        elif name in ("compare", "iota"):
++        elif name in POSITION_CONTROL_OPERATIONS:
+             mode = "host_reference"
+             position_operations.append(name)
++            host_operations.append(name)
++            reason = position_control_native_fallback_reason(operation, plan)
++            position_fallbacks.append(
++                {
++                    "operation_index": plan.operation_index,
++                    "operation": name,
++                    "reason": reason
++                    or "plan is not covered by the native AVX2 position-control plane",
++                }
++            )
+         elif name in ("constant",):
+             mode = "host_materialize"
+         else:
+@@ -1956,12 +2841,22 @@ def _execution_metadata(target_ir: Avx2Program) -> dict:
+         "native_broadcast_operations": broadcast_operations,
+         "native_broadcast_fallback_operations": broadcast_fallbacks,
+         "native_helper_symbols": sorted(native_helpers),
+-        "host_preexpanded_operations": [
+-            name for name in ("where",)
+-            if any(plan.operation == name for plan in target_ir.plans)
+-        ],
++        # Position control is fully native in payload 7: iota/compare/where
++        # keep raw storage plus a rank-sized descriptor, so no operand is
++        # pre-expanded into a Python list.  A plan that cannot be covered by
++        # the native plane is recorded per operation in
++        # ``native_position_control_fallback_operations`` and still runs
++        # through the vector-common host reference (which performs its own
++        # indexing), never through a hidden pre-expansion step.
++        "host_preexpanded_operations": [],
+         "position_control_operations": position_operations,
+-        "position_control_fallback": "host_reference",
++        "position_control_fallback": "native" if not position_fallbacks else "host_reference",
++        "position_control_mode": POSITION_CONTROL_MODE,
++        "position_control_descriptor_wire": POSITION_CONTROL_WIRE,
++        "position_control_kernel_version": POSITION_CONTROL_KERNEL_VERSION,
++        "position_control_max_rank": POSITION_CONTROL_MAX_RANK,
++        "native_position_control_operations": position_native_operations,
++        "native_position_control_fallback_operations": position_fallbacks,
+         "host_reference_operations": host_operations,
+         "layout_plan_version": 2,
+         "layout_operations": _layout_metadata(target_ir),
+@@ -2334,6 +3229,15 @@ __all__ = [
+     "PACKED_EMBEDDING_MODE",
+     "PACKED_KERNEL_VERSION",
+     "PACKED_TRANSPOSE_MODE",
++    "POSITION_CONTROL_DTYPE_CODES",
++    "POSITION_CONTROL_DTYPE_SUFFIX",
++    "POSITION_CONTROL_KERNEL_VERSION",
++    "POSITION_CONTROL_MAX_RANK",
++    "POSITION_CONTROL_MODE",
++    "POSITION_CONTROL_OPERATIONS",
++    "POSITION_CONTROL_PREDICATE_CODES",
++    "POSITION_CONTROL_VALUE_DTYPES",
++    "POSITION_CONTROL_WIRE",
+     "W8A8_DEQUANTIZE_MODE",
+     "W8A8_DEQUANTIZE_S8_KERNEL",
+     "W8A8_EPILOGUE_KERNEL",
+@@ -2348,5 +3252,7 @@ __all__ = [
+     "broadcast_native_fallback_reason",
+     "compile_cpu_avx2",
+     "packed_kernel_contract",
++    "position_control_native_contract",
++    "position_control_native_fallback_reason",
+     "w8a8_kernel_contract",
+ ]
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx2_broadcast.py b/python/tests/ut/pypto_x/test_cpu_avx2_broadcast.py
+index e42b2c8b9..a6d064714 100644
+--- a/python/tests/ut/pypto_x/test_cpu_avx2_broadcast.py
++++ b/python/tests/ut/pypto_x/test_cpu_avx2_broadcast.py
+@@ -742,15 +742,15 @@ def test_metadata_and_runtime_share_the_broadcast_predicate():
+ 
+ 
+ def test_payload_version_and_abi_marker_are_bumped(tmp_path):
+-    assert ARTIFACT_PAYLOAD_VERSION == 6
+-    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:7"
++    assert ARTIFACT_PAYLOAD_VERSION == 7
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:8"
+     program = _broadcast_program("float32", (1, 5, 1), (1, 5, 8))
+     _target_ir, artifact = _compile(program, tmp_path, "marker")
+-    assert artifact.metadata["artifact_payload_version"] == 6
++    assert artifact.metadata["artifact_payload_version"] == 7
+     assert artifact.metadata["native_broadcast_mode"] == BROADCAST_MODE
+     native_bytes = Path(artifact.path).read_bytes()
+-    assert b"pypto-x.cpu.avx2:7" in native_bytes
+-    assert b"pypto-x.cpu.avx2:6" not in native_bytes
++    assert b"pypto-x.cpu.avx2:8" in native_bytes
++    assert b"pypto-x.cpu.avx2:7" not in native_bytes
+ 
+ 
+ def test_payload_version_participates_in_the_artifact_cache_key(tmp_path):
+@@ -791,7 +791,7 @@ def test_stale_payload_and_metadata_tampering_fail_closed(tmp_path):
+     program = _broadcast_program("float32", (1, 5, 1), (1, 5, 8))
+     _target_ir, artifact = _compile(program, tmp_path, "stale")
+     original = dict(artifact.metadata)
+-    for tamper in (5, 7):
++    for tamper in (5, 6, 8):
+         metadata = dict(original)
+         metadata["artifact_payload_version"] = tamper
+         object.__setattr__(artifact, "metadata", metadata)
+@@ -820,8 +820,8 @@ def test_stale_payload_and_metadata_tampering_fail_closed(tmp_path):
+ def test_old_abi_marker_artifact_fails_closed(tmp_path):
+     program = _broadcast_program("float32", (1, 5, 1), (1, 5, 8))
+     _target_ir, artifact = _compile(program, tmp_path, "legacy-marker")
+-    current_marker = b"pypto-x.cpu.avx2:7"
+-    legacy_marker = b"pypto-x.cpu.avx2:6"
++    current_marker = b"pypto-x.cpu.avx2:8"
++    legacy_marker = b"pypto-x.cpu.avx2:7"
+     native_bytes = Path(artifact.path).read_bytes()
+     assert current_marker in native_bytes
+     legacy_bytes = native_bytes.replace(current_marker, legacy_marker)
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx2_layout.py b/python/tests/ut/pypto_x/test_cpu_avx2_layout.py
+index 8922cc02e..a4e028317 100644
+--- a/python/tests/ut/pypto_x/test_cpu_avx2_layout.py
++++ b/python/tests/ut/pypto_x/test_cpu_avx2_layout.py
+@@ -570,14 +570,14 @@ def test_layout_native_metadata_declares_the_executed_kernel(tmp_path):
+ 
+ 
+ def test_payload_and_abi_marker_are_bumped(tmp_path):
+-    assert ARTIFACT_PAYLOAD_VERSION == 6
+-    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:7"
++    assert ARTIFACT_PAYLOAD_VERSION == 7
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:8"
+     program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
+     _target_ir, artifact = _compile(program, tmp_path, "marker")
+-    assert artifact.metadata["artifact_payload_version"] == 6
++    assert artifact.metadata["artifact_payload_version"] == 7
+     native_bytes = open(artifact.path, "rb").read()
+-    assert b"pypto-x.cpu.avx2:7" in native_bytes
+-    assert b"pypto-x.cpu.avx2:6" not in native_bytes
++    assert b"pypto-x.cpu.avx2:8" in native_bytes
++    assert b"pypto-x.cpu.avx2:7" not in native_bytes
+ 
+ 
+ def test_pxld_wire_is_byte_identical_to_avx512():
+@@ -1170,7 +1170,7 @@ def test_payload_version_tampering_fails_closed(tmp_path):
+     runtime = _runtime()
+     program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
+     _target_ir, artifact = _compile(program, tmp_path, "payload")
+-    for tamper in (5, 7):
++    for tamper in (5, 6, 8):
+         metadata = dict(artifact.metadata)
+         metadata["artifact_payload_version"] = tamper
+         object.__setattr__(artifact, "metadata", metadata)
+@@ -1245,8 +1245,8 @@ def test_descriptor_digest_mismatch_at_dispatch_fails_closed(tmp_path, monkeypat
+ def test_old_abi_marker_artifact_fails_closed(tmp_path):
+     program = _layout_program("reshape", (3, 5), (5, 3), {"shape": [5, 3]}, "float32")
+     _target_ir, artifact = _compile(program, tmp_path, "legacy-marker")
+-    current_marker = b"pypto-x.cpu.avx2:7"
+-    legacy_marker = b"pypto-x.cpu.avx2:6"
++    current_marker = b"pypto-x.cpu.avx2:8"
++    legacy_marker = b"pypto-x.cpu.avx2:7"
+     native_bytes = open(artifact.path, "rb").read()
+     assert current_marker in native_bytes
+     legacy_bytes = native_bytes.replace(current_marker, legacy_marker)
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx2_packed.py b/python/tests/ut/pypto_x/test_cpu_avx2_packed.py
+index baf730997..72931f88f 100644
+--- a/python/tests/ut/pypto_x/test_cpu_avx2_packed.py
++++ b/python/tests/ut/pypto_x/test_cpu_avx2_packed.py
+@@ -223,16 +223,16 @@ def test_avx2_payload_and_abi_versions_are_bumped():
+     # Payload 3 / ABI :4 add the W8A8 widening kernels (contract 0002 C3);
+     # payload 5 / ABI :6 add the native PXLD-v2 layout/split/concat plane;
+     # payload 6 / ABI :7 add the native f32/bf16 broadcast plane.
+-    assert ARTIFACT_PAYLOAD_VERSION == 6
+-    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:7"
++    assert ARTIFACT_PAYLOAD_VERSION == 7
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:8"
+ 
+ 
+ def test_avx2_native_object_carries_the_new_abi_marker(tmp_path):
+     _, artifact = _compile_avx2(_cast_program("bf16", "float32", (4,)), tmp_path, name="marker")
+     native_bytes = Path(artifact.path).read_bytes()
+-    assert b"pypto-x.cpu.avx2:7" in native_bytes
+-    assert b"pypto-x.cpu.avx2:6" not in native_bytes
+-    assert artifact.metadata["artifact_payload_version"] == 6
++    assert b"pypto-x.cpu.avx2:8" in native_bytes
++    assert b"pypto-x.cpu.avx2:7" not in native_bytes
++    assert artifact.metadata["artifact_payload_version"] == 7
+ 
+ 
+ # --------------------------------------------------------------------------
+@@ -640,8 +640,8 @@ def test_avx2_missing_or_tampered_packed_metadata_fails_closed(tmp_path):
+ def test_avx2_old_abi_marker_artifact_fails_closed(tmp_path):
+     program = _cast_program("bf16", "float32", (10,))
+     _, artifact = _compile_avx2(program, tmp_path, name="legacy-marker")
+-    current_marker = b"pypto-x.cpu.avx2:7"
+-    legacy_marker = b"pypto-x.cpu.avx2:6"
++    current_marker = b"pypto-x.cpu.avx2:8"
++    legacy_marker = b"pypto-x.cpu.avx2:7"
+     native_bytes = Path(artifact.path).read_bytes()
+     assert current_marker in native_bytes
+     legacy_bytes = native_bytes.replace(current_marker, legacy_marker)
+diff --git a/python/tests/ut/pypto_x/test_cpu_avx2_position_native.py b/python/tests/ut/pypto_x/test_cpu_avx2_position_native.py
+new file mode 100644
+index 000000000..45d117717
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_cpu_avx2_position_native.py
+@@ -0,0 +1,1368 @@
++"""AVX2 native position-control plane (avx2-position-native).
++
++``iota``/``compare``/``where`` used to be declared ``host_reference`` (with
++``where`` additionally pre-expanded) in the AVX2 artifact.  Payload 7 executes
++all three inside the compiled AVX2 object through the PXIO/PXCP/PXWH
++descriptor wire.
++
++Semantic source of truth: the *vector-common host reference*, which is exactly
++what the previous AVX2 fallback ran.  Every native result is compared bitwise
++(full output buffer sha256) against ``avx2_runtime._reference_operation`` on the
++same raw bits, and the raw-bit corpora deliberately include signaling/quiet
++NaN, +/-0, infinities, subnormals and signed/unsigned integer extremes.  The
++oracle never imports the kernel under test.
++
++The plan predicate is shared by artifact metadata and runtime dispatch, so the
++fail-closed cases (rank above the native maximum, unsupported dtype, malformed
++schedules) are asserted at both the metadata and the execution level, and the
++metadata must never advertise ``native`` for a plan that fell back.
++"""
++
++from __future__ import annotations
++
++import ctypes
++import hashlib
++from pathlib import Path
++import shutil
++import struct
++import subprocess
++import types
++
++import pytest
++
++from pypto.abi import LaunchRequest, TensorDesc
++from pypto.backends.cpu import CpuScalarRuntime, HostTensor
++from pypto.backends.cpu.x86 import (
++    Avx2Runtime,
++    CpuAvx2ArtifactError,
++)
++from pypto.backends.cpu.x86 import avx2 as avx2_runtime
++from pypto.compiler import Artifact, CompileOptions
++from pypto.compiler.targets.cpu import CpuScalarCompiler
++from pypto.compiler.targets.cpu_avx2 import (
++    ARTIFACT_PAYLOAD_VERSION,
++    NATIVE_ABI_MARKER,
++    POSITION_CONTROL_MAX_RANK,
++    POSITION_CONTROL_MODE,
++    POSITION_CONTROL_WIRE,
++    Avx2Compiler,
++    position_control_native_contract,
++    position_control_native_fallback_reason,
++)
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu import element_count
++from pypto.target import TargetSpec
++
++
++AVX2_TARGET = TargetSpec(
++    "cpu", "x86_64-linux-gnu", features=("avx", "avx2", "osxsave", "ymm"), attributes={"lane_count": 8}
++)
++SCALAR_TARGET = TargetSpec("cpu", "x86_64-linux-gnu")
++
++_PREDICATES = ("eq", "ne", "lt", "le", "gt", "ge")
++_CTYPES = {
++    "float32": ctypes.c_float,
++    "bf16": ctypes.c_uint16,
++    "int8": ctypes.c_int8,
++    "uint8": ctypes.c_uint8,
++    "int16": ctypes.c_int16,
++    "uint16": ctypes.c_uint16,
++    "int32": ctypes.c_int32,
++    "uint32": ctypes.c_uint32,
++    "int64": ctypes.c_int64,
++    "uint64": ctypes.c_uint64,
++    "bool": ctypes.c_bool,
++}
++_ITEMSIZE = {
++    "float32": 4,
++    "bf16": 2,
++    "int8": 1,
++    "uint8": 1,
++    "int16": 2,
++    "uint16": 2,
++    "int32": 4,
++    "uint32": 4,
++    "int64": 8,
++    "uint64": 8,
++    "bool": 1,
++}
++
++#: Raw-bit corpora.  f32 sNaN payloads keep the quiet bit clear so the host
++#: reference's Python-float round trip (and the native kernel) must quiet them.
++_F32_BITS = (
++    0x7F800001,  # signaling NaN, positive payload
++    0xFF800001,  # signaling NaN, negative payload
++    0x7FC00001,  # quiet NaN with payload
++    0xFFC12345,
++    0x7F800000,  # +inf
++    0xFF800000,  # -inf
++    0x80000000,  # -0.0
++    0x00000000,  # +0.0
++    0x7F7FFFFF,  # max finite
++    0xFF7FFFFF,  # min finite
++    0x00000001,  # subnormal
++    0x80000001,
++    0x3F800000,  # 1.0
++    0xBF800000,  # -1.0
++)
++_BF16_BITS = (
++    0x7F81,
++    0xFF81,
++    0x7FC1,
++    0xFFC1,
++    0x7F80,
++    0xFF80,
++    0x8000,
++    0x0000,
++    0x7F7F,
++    0xFF7F,
++    0x0001,
++    0x8001,
++    0x3F80,
++    0xBF80,
++)
++_COMPARE_BITS = {
++    "float32": _F32_BITS,
++    "bf16": _BF16_BITS,
++    "int8": (-128, -127, -1, 0, 1, 127),
++    "uint8": (0, 1, 127, 128, 254, 255),
++    "int16": (-(1 << 15), -1, 0, 1, (1 << 15) - 1),
++    "uint16": (0, 1, (1 << 15), (1 << 16) - 1),
++    "int32": (-(1 << 31), -(1 << 30), -1, 0, 1, (1 << 31) - 1),
++    "uint32": (0, 1, (1 << 31), (1 << 32) - 1),
++    "int64": (-(1 << 63), -(1 << 62), -1, 0, 1, (1 << 63) - 1),
++    "uint64": (0, 1, (1 << 63), (1 << 64) - 1),
++    "bool": (0, 1, 2, 255),
++}
++
++
++# ---------------------------------------------------------------------------
++# raw buffer helpers
++# ---------------------------------------------------------------------------
++
++
++def _raw_array(dtype, bits):
++    if dtype == "float32":
++        array = (ctypes.c_uint32 * len(bits))()
++        for index, value in enumerate(bits):
++            ctypes.memmove(
++                ctypes.addressof(array) + 4 * index,
++                struct.pack("<I", int(value) & 0xFFFFFFFF),
++                4,
++            )
++        return array, ctypes.cast(array, ctypes.POINTER(ctypes.c_float))
++    if dtype == "bool":
++        # Keep the raw byte; c_bool would normalize 2/255 to 1 and hide the
++        # Python-truthiness contract under test.
++        array = (ctypes.c_uint8 * len(bits))(*[int(value) & 0xFF for value in bits])
++        return array, ctypes.cast(array, ctypes.POINTER(ctypes.c_uint8))
++    ctype = _CTYPES[dtype]
++    array = (ctype * len(bits))(*[int(value) for value in bits])
++    return array, ctypes.cast(array, ctypes.POINTER(ctype))
++
++
++def _array_bytes(dtype, array):
++    if not ctypes.sizeof(array):
++        return b""
++    return ctypes.string_at(ctypes.addressof(array), ctypes.sizeof(array))
++
++
++def _scalar_value(dtype, bit):
++    if dtype == "float32":
++        return struct.unpack("<f", struct.pack("<I", int(bit) & 0xFFFFFFFF))[0]
++    if dtype == "bf16":
++        return struct.unpack("<f", struct.pack("<I", (int(bit) & 0xFFFF) << 16))[0]
++    if dtype == "bool":
++        return bool(bit)
++    return int(bit)
++
++
++def _descriptor(dtype, shape, array, readonly=False):
++    if ctypes.sizeof(array):
++        return TensorDesc(
++            dtype,
++            shape,
++            device="cpu",
++            address=ctypes.addressof(array),
++            readonly=readonly,
++        )
++    # Zero-length buffers must not advertise a null address; pass the array as
++    # the descriptor handle instead.
++    return TensorDesc(dtype, shape, device="cpu", handle=array, readonly=readonly)
++
++
++def _native_buffer(dtype, bits):
++    array, pointer = _raw_array(dtype, bits)
++    return avx2_runtime._NativeBuffer(dtype, len(bits), pointer, array, True)
++
++
++def _buffer_bytes(buffer):
++    if not buffer.count:
++        return b""
++    return ctypes.string_at(
++        ctypes.cast(buffer.pointer, ctypes.c_void_p), buffer.count * _ITEMSIZE[buffer.dtype]
++    )
++
++
++def _runtime():
++    runtime = Avx2Runtime()
++    if not runtime.is_available():
++        pytest.skip("host lacks AVX2/YMM capability: {}".format(runtime.availability().to_dict()))
++    return runtime
++
++
++def _compile_avx2(program, directory, name):
++    compiler = Avx2Compiler()
++    target_ir = compiler.lower(program, AVX2_TARGET)
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format="pypto-x.cpu.avx2",
++            extra={"build_dir": str(Path(directory) / name)},
++        ),
++    )
++    return target_ir, artifact
++
++
++def _compile_scalar(program):
++    compiler = CpuScalarCompiler()
++    return compiler.compile(compiler.lower(program, SCALAR_TARGET))
++
++
++def _reference_environment(program, target_ir, input_buffers, context):
++    """Run every operation through the vector-common host reference."""
++
++    function = program.functions[0]
++    environment = {}
++    for parameter, buffer in zip(function.parameters, input_buffers):
++        environment[parameter.name] = avx2_runtime._RuntimeValue(parameter.type, buffer)
++    for operation, plan in zip(function.body.operations, target_ir.plans):
++        inputs = [environment[ref.name] for ref in operation.inputs]
++        environment.update(
++            avx2_runtime._reference_operation(operation, plan, inputs, context)
++        )
++    return environment
++
++
++def _differential(program, input_specs, output_specs, directory, name):
++    """Launch native and host-reference with identical raw bits.
++
++    ``input_specs``/``output_specs`` are ``(dtype, shape, bits_or_count)``
++    tuples; a ``()`` shape marks a scalar parameter and its single bit is
++    routed through ``LaunchRequest.scalars``.
++    """
++
++    target_ir, artifact = _compile_avx2(program, directory, name)
++    function = program.functions[0]
++    tensor_arrays = []
++    tensor_buffers = []
++    scalars = {}
++    for (dtype, shape, bits), parameter in zip(input_specs, function.parameters):
++        array, pointer = _raw_array(dtype, bits)
++        buffer = avx2_runtime._NativeBuffer(dtype, len(bits), pointer, array, True)
++        tensor_buffers.append(buffer)
++        if shape == ():
++            scalars[parameter.name] = _scalar_value(dtype, bits[0])
++        else:
++            tensor_arrays.append((dtype, shape, array))
++    outputs = []
++    output_arrays = []
++    for dtype, shape, count in output_specs:
++        array, _pointer = _raw_array(dtype, [0] * count)
++        outputs.append((dtype, shape, array))
++        output_arrays.append(array)
++    _runtime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[
++                _descriptor(dtype, shape, array, readonly=True)
++                for dtype, shape, array in tensor_arrays
++            ],
++            outputs=[
++                _descriptor(dtype, shape, array) for dtype, shape, array in outputs
++            ],
++            scalars=scalars,
++        )
++    )
++    native = [_array_bytes(dtype, array) for dtype, _shape, array in outputs]
++    environment = _reference_environment(program, target_ir, tensor_buffers, name)
++    reference = [
++        _buffer_bytes(environment[ref.name].buffer) for ref in function.returns
++    ]
++    return target_ir, artifact, native, reference
++
++
++def _assert_bitwise(native, reference):
++    assert len(native) == len(reference)
++    for index, (actual, expected) in enumerate(zip(native, reference)):
++        assert actual == expected, "output {} differs:\n  native {}\n  ref    {}".format(
++            index, actual.hex(), expected.hex()
++        )
++
++
++def _plain_json(value):
++    """Convert frozen metadata into plain JSON containers (no key iteration)."""
++
++    if isinstance(value, dict):
++        return {str(key): _plain_json(item) for key, item in value.items()}
++    if hasattr(value, "items"):
++        return {str(key): _plain_json(item) for key, item in value.items()}
++    if isinstance(value, (tuple, list)):
++        return [_plain_json(item) for item in value]
++    return value
++
++
++def _assert_native_metadata(artifact, kinds):
++    metadata = artifact.metadata
++    assert metadata["artifact_payload_version"] == ARTIFACT_PAYLOAD_VERSION == 7
++    assert metadata["position_control_fallback"] == "native"
++    assert metadata["position_control_mode"] == POSITION_CONTROL_MODE
++    assert metadata["position_control_descriptor_wire"] == POSITION_CONTROL_WIRE
++    assert tuple(metadata["native_position_control_fallback_operations"]) == ()
++    assert tuple(metadata["host_preexpanded_operations"]) == ()
++    entries = metadata["native_position_control_operations"]
++    assert entries, "expected at least one native position-control entry"
++    for entry in entries:
++        assert entry["mode"] == POSITION_CONTROL_MODE
++        assert entry["kind"] in kinds
++        assert "ptx_avx2_{}".format(entry["kernel"]) in tuple(
++            metadata["native_helper_symbols"]
++        )
++        assert entry["descriptor_digest"].startswith("fnv1a64:")
++        mode = next(
++            item["mode"]
++            for item in metadata["execution_modes"]
++            if item["operation_index"] == entry["operation_index"]
++        )
++        assert mode == POSITION_CONTROL_MODE
++    return entries
++
++
++# ---------------------------------------------------------------------------
++# program builders
++# ---------------------------------------------------------------------------
++
++
++def _iota_program(dtype, shape, axis, start, step):
++    output = ValueRef("out", CoreType.tensor(dtype, tuple(shape)))
++    operation = Operation(
++        "iota", (), (output,), {"axis": axis, "start": start, "step": step}
++    )
++    return CoreProgram(
++        functions=(CoreFunction("iota", (), (output,), Region((operation,))),)
++    )
++
++
++def _compare_matrix_program(dtype, n, predicates=_PREDICATES):
++    left = ValueRef("left", CoreType.tensor(dtype, (n, 1)))
++    right = ValueRef("right", CoreType.tensor(dtype, (1, n)))
++    outputs = []
++    operations = []
++    for predicate in predicates:
++        output = ValueRef("out_{}".format(predicate), CoreType.tensor("bool", (n, n)))
++        outputs.append(output)
++        operations.append(Operation(predicate, (left, right), (output,), {}))
++    return CoreProgram(
++        functions=(
++            CoreFunction(
++                "compare_matrix",
++                (left, right),
++                tuple(outputs),
++                Region(tuple(operations)),
++            ),
++        )
++    )
++
++
++def _compare_flat_program(dtype, n, predicate="le"):
++    left = ValueRef("left", CoreType.tensor(dtype, (n,)))
++    right = ValueRef("right", CoreType.tensor(dtype, (n,)))
++    output = ValueRef("out", CoreType.tensor("bool", (n,)))
++    operation = Operation(predicate, (left, right), (output,), {})
++    return CoreProgram(
++        functions=(CoreFunction("compare_flat", (left, right), (output,), Region((operation,))),)
++    )
++
++
++def _where_program(dtype, condition_type, true_type, false_type, output_type):
++    condition = ValueRef("cond", condition_type)
++    true_value = ValueRef("true", true_type)
++    false_value = ValueRef("false", false_type)
++    output = ValueRef("out", output_type)
++    operation = Operation("where", (condition, true_value, false_value), (output,), {})
++    return CoreProgram(
++        functions=(
++            CoreFunction(
++                "where",
++                (condition, true_value, false_value),
++                (output,),
++                Region((operation,)),
++            ),
++        )
++    )
++
++
++def _tensor(dtype, shape):
++    return CoreType.tensor(dtype, tuple(shape))
++
++
++def _scalar(dtype):
++    return CoreType.scalar(dtype)
++
++
++# ---------------------------------------------------------------------------
++# iota
++# ---------------------------------------------------------------------------
++
++
++_IOTA_CASES = (
++    ("int32", (4,), 0, 0, 1),
++    ("int32", (3, 4), -1, -5, -2),
++    ("int32", (3, 4), 1, 7, 2),
++    ("int32", (2, 3, 4), 1, -20, 3),
++    ("int32", (0, 4), 1, 7, 3),
++    ("int32", (2, 0, 3), 1, -3, 1),
++    ("int32", (4,), 0, 2147483644, 1),
++    ("int32", (4,), 0, -2147483648, 1),
++    ("int64", (2, 3), 1, 5, -3),
++    ("int64", (2, 2, 3), 2, -(2**62), 2**60),
++    ("int64", (3,), 0, (1 << 63) - 4, 1),
++    ("int64", (3,), 0, -(1 << 63), 1),
++)
++
++
++@pytest.mark.parametrize("dtype,shape,axis,start,step", _IOTA_CASES)
++def test_iota_is_bit_exact_against_the_host_reference(
++    dtype, shape, axis, start, step, tmp_path
++):
++    program = _iota_program(dtype, shape, axis, start, step)
++    count = element_count(shape)
++    target_ir, artifact, native, reference = _differential(
++        program,
++        [],
++        [(dtype, shape, count)],
++        tmp_path,
++        "iota-{}-{}".format(dtype, "-".join(str(d) for d in shape)),
++    )
++    _assert_bitwise(native, reference)
++    entries = _assert_native_metadata(artifact, ("iota",))
++    assert entries[0]["kernel"] in ("iota_i32", "iota_i64")
++    contract = position_control_native_contract(
++        program.functions[0].body.operations[0], target_ir.plans[0]
++    )
++    assert contract is not None
++    assert contract["axis"] >= 0
++    assert contract["output_elements"] == count
++
++
++def test_iota_native_matches_the_scalar_runtime_on_normal_values(tmp_path):
++    for dtype, shape, axis, start, step in (
++        ("int32", (3, 4), -1, -5, -2),
++        ("int64", (2, 3), 1, 100, -7),
++    ):
++        program = _iota_program(dtype, shape, axis, start, step)
++        _target_ir, artifact = _compile_avx2(
++            program, tmp_path, "iota-scalar-{}-{}".format(dtype, axis)
++        )
++        scalar_artifact = _compile_scalar(program)
++        native_output = HostTensor.zeros(dtype, shape)
++        scalar_output = HostTensor.zeros(dtype, shape)
++        _runtime().launch(
++            LaunchRequest(artifact, inputs=[], outputs=[native_output.descriptor()])
++        )
++        CpuScalarRuntime().launch(
++            LaunchRequest(scalar_artifact, inputs=[], outputs=[scalar_output.descriptor()])
++        )
++        assert native_output.flat() == scalar_output.flat()
++
++
++def test_iota_sequence_outside_the_declared_dtype_is_rejected_before_codegen():
++    """The host contract rejects (never wraps) an out-of-range iota schedule."""
++
++    from pypto.lowering.cpu.vector import CpuVectorValidationError
++
++    program = _iota_program("int32", (4,), 0, 2147483646, 1)
++    with pytest.raises(CpuVectorValidationError):
++        Avx2Compiler().lower(program, AVX2_TARGET)
++    # The shared iota validator is the same object the host reference uses.
++    program64 = _iota_program("int64", (4,), 0, (1 << 63) - 3, 1)
++    with pytest.raises(CpuVectorValidationError):
++        Avx2Compiler().lower(program64, AVX2_TARGET)
++
++
++# ---------------------------------------------------------------------------
++# compare
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize("dtype", tuple(_COMPARE_BITS))
++def test_compare_full_pair_matrix_is_bit_exact(dtype, tmp_path):
++    bits = list(_COMPARE_BITS[dtype])
++    n = len(bits)
++    predicates = ("eq", "ne") if dtype == "bool" else _PREDICATES
++    program = _compare_matrix_program(dtype, n, predicates)
++    _target_ir, artifact, native, reference = _differential(
++        program,
++        [(dtype, (n, 1), bits), (dtype, (1, n), bits)],
++        [("bool", (n, n), n * n) for _ in predicates],
++        tmp_path,
++        "compare-matrix-{}".format(dtype),
++    )
++    _assert_bitwise(native, reference)
++    _assert_native_metadata(artifact, ("compare",))
++
++
++def test_compare_flat_contiguous_bytes_are_bit_exact_for_f32_and_bf16(tmp_path):
++    """The f32 kernel's AVX2 fast path needs vector-, tail- and empty sizes."""
++
++    for dtype, bits in (("float32", _F32_BITS), ("bf16", _BF16_BITS)):
++        for predicate in _PREDICATES:
++            for n in (0, 1, 7, 8, 9, 32):
++                values = [bits[index % len(bits)] for index in range(n)]
++                program = _compare_flat_program(dtype, n, predicate)
++                _target_ir, _artifact, native, reference = _differential(
++                    program,
++                    [(dtype, (n,), values), (dtype, (n,), list(reversed(values)))],
++                    [("bool", (n,), n)],
++                    tmp_path,
++                    "compare-flat-{}-{}-{}".format(dtype, predicate, n),
++                )
++                _assert_bitwise(native, reference)
++
++
++def test_compare_scalar_and_bool_truthiness_contract(tmp_path):
++    """Scalar operands and non-0/1 bool bytes follow Python truthiness."""
++
++    # tensor <= scalar -> output shape is the tensor broadcast shape
++    left = ValueRef("left", CoreType.tensor("int32", (4, 1)))
++    right = ValueRef("right", CoreType.scalar("int32"))
++    output = ValueRef("out_le", CoreType.tensor("bool", (4, 1)))
++    operation = Operation("le", (left, right), (output,), {})
++    program = CoreProgram(
++        functions=(CoreFunction("compare_scalar", (left, right), (output,), Region((operation,))),)
++    )
++    _target_ir, artifact, native, reference = _differential(
++        program,
++        [("int32", (4, 1), [1, 2, 3, 4]), ("int32", (), [2])],
++        [("bool", (4, 1), 4)],
++        tmp_path,
++        "compare-scalar",
++    )
++    _assert_bitwise(native, reference)
++    _assert_native_metadata(artifact, ("compare",))
++
++    # bool raw bytes: 0x02/0xFF are True, so eq/ne must normalize them.
++    program = _compare_matrix_program("bool", 4, ("eq", "ne"))
++    _target_ir, artifact, native, reference = _differential(
++        program,
++        [("bool", (4, 1), [0, 1, 2, 255]), ("bool", (1, 4), [0, 1, 2, 255])],
++        [("bool", (4, 4), 16), ("bool", (4, 4), 16)],
++        tmp_path,
++        "compare-bool-bytes",
++    )
++    _assert_bitwise(native, reference)
++    assert native[0][6] == 1  # bool(1) == bool(2) -> both True
++    assert native[1][6] == 0  # bool(1) != bool(2) -> both True -> False
++
++
++# ---------------------------------------------------------------------------
++# where
++# ---------------------------------------------------------------------------
++
++
++_WHERE_VALUE_BITS = {
++    "float32": _F32_BITS,
++    "bf16": _BF16_BITS,
++    "int8": (-128, -1, 0, 1, 127),
++    "uint8": (0, 1, 128, 255),
++    "int16": (-(1 << 15), 0, 1, (1 << 15) - 1),
++    "uint16": (0, 1, (1 << 16) - 1),
++    "int32": (-(1 << 31), -1, 0, 1, (1 << 31) - 1),
++    "uint32": (0, 1, (1 << 32) - 1),
++    "int64": (-(1 << 63), -1, 0, 1, (1 << 63) - 1),
++    "uint64": (0, 1, (1 << 64) - 1),
++    "bool": (0, 1, 2, 255),
++}
++
++
++@pytest.mark.parametrize("dtype", tuple(_WHERE_VALUE_BITS))
++def test_where_broadcast_and_select_are_bit_exact(dtype, tmp_path):
++    bits = list(_WHERE_VALUE_BITS[dtype])
++    n = len(bits)
++    condition_bits = [0, 1, 2, 255] * (n // 4 + 1)
++    condition_bits = condition_bits[:n]
++    # cond (n,1) x input (1,n) x other (n,1) -> output (n,n)
++    program = _where_program(
++        dtype,
++        _tensor("bool", (n, 1)),
++        _tensor(dtype, (1, n)),
++        _tensor(dtype, (n, 1)),
++        _tensor(dtype, (n, n)),
++    )
++    _target_ir, artifact, native, reference = _differential(
++        program,
++        [
++            ("bool", (n, 1), condition_bits),
++            (dtype, (1, n), bits),
++            (dtype, (n, 1), list(reversed(bits))),
++        ],
++        [(dtype, (n, n), n * n)],
++        tmp_path,
++        "where-broadcast-{}".format(dtype),
++    )
++    _assert_bitwise(native, reference)
++    _assert_native_metadata(artifact, ("where",))
++
++
++@pytest.mark.parametrize("dtype", ("float32", "bf16"))
++def test_where_snan_quieting_and_signed_zero_are_bit_exact(dtype, tmp_path):
++    """Only the selected branch is round-tripped; sNaN is quieted, -0 kept."""
++
++    if dtype == "float32":
++        sNaN, qNaN, neg_zero, pos_zero, inf = 0x7F800001, 0x7FC00001, 0x80000000, 0x00000000, 0x7F800000
++    else:
++        sNaN, qNaN, neg_zero, pos_zero, inf = 0x7F81, 0x7FC1, 0x8000, 0x0000, 0x7F80
++    true_bits = [sNaN, sNaN, qNaN, neg_zero, pos_zero, inf]
++    false_bits = [qNaN, sNaN, sNaN, pos_zero, neg_zero, inf]
++    condition = [1, 0, 1, 1, 1, 0]
++    program = _where_program(
++        dtype, _tensor("bool", (6,)), _tensor(dtype, (6,)), _tensor(dtype, (6,)), _tensor(dtype, (6,))
++    )
++    _target_ir, _artifact, native, reference = _differential(
++        program,
++        [("bool", (6,), condition), (dtype, (6,), true_bits), (dtype, (6,), false_bits)],
++        [(dtype, (6,), 6)],
++        tmp_path,
++        "where-snan-{}".format(dtype),
++    )
++    _assert_bitwise(native, reference)
++    quiet_bit = 0x00400000 if dtype == "float32" else 0x0040
++    assert native[0] == reference[0]
++    # Selected sNaN must have the quiet bit set; the unselected sNaN must not
++    # leak into the output.
++    if dtype == "float32":
++        selected = [struct.unpack("<I", native[0][4 * i:4 * i + 4])[0] for i in range(6)]
++    else:
++        selected = list(struct.unpack("<6H", native[0]))
++    assert selected[0] & quiet_bit
++    assert selected[1] & quiet_bit  # false branch held an sNaN too
++    assert selected[2] & quiet_bit  # the unselected branch is never touched
++    assert selected[3] == neg_zero
++    assert selected[4] == pos_zero
++    assert selected[5] == inf
++
++
++def test_where_simd_contiguous_path_and_scalar_operands(tmp_path):
++    """Equal-shape f32 where takes the AVX2 blend path; scalar branches work."""
++
++    bits = [
++        0x7F800001, 0xFF800001, 0x80000000, 0x00000000,
++        0x00000001, 0x7F7FFFFF, 0xBF800000, 0x3F800000,
++        0x7FC00001, 0x7F800000, 0xFF800000, 0x40000000,
++        0x40400000, 0x40800000, 0x40A00000, 0x40C00000,
++        0x40E00000,
++    ]
++    n = len(bits)
++    condition = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]
++    program = _where_program(
++        "float32", _tensor("bool", (n,)), _tensor("float32", (n,)), _tensor("float32", (n,)), _tensor("float32", (n,))
++    )
++    _target_ir, artifact, native, reference = _differential(
++        program,
++        [
++            ("bool", (n,), condition),
++            ("float32", (n,), bits),
++            ("float32", (n,), list(reversed(bits))),
++        ],
++        [("float32", (n,), n)],
++        tmp_path,
++        "where-simd",
++    )
++    _assert_bitwise(native, reference)
++    _assert_native_metadata(artifact, ("where",))
++
++    # scalar false branch: cond (n) x true (n) x other scalar.  A scalar NaN is
++    # unreachable through LaunchRequest (scalars must be finite), so this pins
++    # the finite-scalar broadcast descriptor instead.
++    scalar_program = _where_program(
++        "float32", _tensor("bool", (n,)), _tensor("float32", (n,)), _scalar("float32"), _tensor("float32", (n,))
++    )
++    _target_ir, artifact, native, reference = _differential(
++        scalar_program,
++        [
++            ("bool", (n,), condition),
++            ("float32", (n,), bits),
++            ("float32", (), [0x41100000]),
++        ],
++        [("float32", (n,), n)],
++        tmp_path,
++        "where-scalar-branch",
++    )
++    _assert_bitwise(native, reference)
++    assert artifact.metadata["position_control_fallback"] == "native"
++
++
++def test_where_condition_must_be_bool_and_nan_truthiness_is_documented(tmp_path):
++    """The validator forbids non-bool conditions; raw bytes keep truthiness.
++
++    ``bool(float('nan')) is True`` in the host reference, but the frozen
++    contract rejects a non-bool condition before codegen, so a NaN condition
++    cannot reach either executor.  The reachable edge case is a non-0/1 bool
++    byte, which both paths treat as True (Python truthiness).
++    """
++
++    from pypto.lowering.cpu.vector import CpuVectorValidationError
++
++    program = _where_program(
++        "float32", _tensor("float32", (4,)), _tensor("float32", (4,)), _tensor("float32", (4,)), _tensor("float32", (4,))
++    )
++    with pytest.raises(CpuVectorValidationError, match="condition must have bool"):
++        Avx2Compiler().lower(program, AVX2_TARGET)
++
++    program = _where_program(
++        "float32", _tensor("bool", (4,)), _tensor("float32", (4,)), _tensor("float32", (4,)), _tensor("float32", (4,))
++    )
++    _target_ir, _artifact, native, reference = _differential(
++        program,
++        [
++            ("bool", (4,), [0, 1, 2, 255]),
++            ("float32", (4,), [0x3F800000] * 4),
++            ("float32", (4,), [0x40000000] * 4),
++        ],
++        [("float32", (4,), 4)],
++        tmp_path,
++        "where-truthiness",
++    )
++    _assert_bitwise(native, reference)
++    # 0 selects the false branch; any non-zero byte (1/2/255) selects true.
++    assert native[0][0:4] == _buffer_bytes(_native_buffer("float32", [0x40000000]))
++    assert native[0][4:8] == _buffer_bytes(_native_buffer("float32", [0x3F800000]))
++    assert native[0][8:12] == native[0][4:8]
++    assert native[0][12:16] == native[0][4:8]
++
++
++# ---------------------------------------------------------------------------
++# metadata truthfulness, coverage boundary and dispatch identity
++# ---------------------------------------------------------------------------
++
++
++def test_metadata_declares_every_covered_operation_native(tmp_path):
++    # One program with all three operations in dependency order.
++    mask = ValueRef("mask", CoreType.tensor("bool", (2, 3)))
++    true_value = ValueRef("true", CoreType.tensor("int64", (2, 3)))
++    false_value = ValueRef("false", CoreType.tensor("int64", (2, 3)))
++    selected = ValueRef("selected", CoreType.tensor("int64", (2, 3)))
++    positions = ValueRef("positions", CoreType.tensor("int64", (2, 3)))
++    compared = ValueRef("compared", CoreType.tensor("bool", (2, 3)))
++    operations = (
++        Operation("iota", (), (positions,), {"axis": 1, "start": 3, "step": 2}),
++        Operation("where", (mask, true_value, false_value), (selected,), {}),
++        Operation("ge", (positions, selected), (compared,), {}),
++    )
++    program = CoreProgram(
++        functions=(
++            CoreFunction(
++                "position",
++                (mask, true_value, false_value),
++                (positions, selected, compared),
++                Region(operations),
++            ),
++        )
++    )
++    target_ir, artifact = _compile_avx2(program, tmp_path, "mixed")
++    assert [plan.operation for plan in target_ir.plans] == ["iota", "where", "compare"]
++    assert tuple(artifact.metadata["position_control_operations"]) == (
++        "iota",
++        "where",
++        "compare",
++    )
++    entries = _assert_native_metadata(artifact, ("iota", "where", "compare"))
++    assert sorted(entry["kind"] for entry in entries) == ["compare", "iota", "where"]
++    assert tuple(artifact.metadata["host_reference_operations"]) == ()
++
++
++@pytest.mark.parametrize("operation_name", ("iota", "compare", "where"))
++def test_rank_above_the_native_maximum_falls_back_with_an_explicit_reason(
++    operation_name, tmp_path
++):
++    rank = POSITION_CONTROL_MAX_RANK + 1
++    shape = (1,) * (rank - 1) + (2,)
++    if operation_name == "iota":
++        program = _iota_program("int32", shape, rank - 1, 0, 1)
++        inputs = []
++        outputs = [("int32", shape, element_count(shape))]
++    elif operation_name == "compare":
++        left = ValueRef("left", CoreType.tensor("int32", shape))
++        right = ValueRef("right", CoreType.tensor("int32", shape))
++        output = ValueRef("out", CoreType.tensor("bool", shape))
++        operation = Operation("lt", (left, right), (output,), {})
++        program = CoreProgram(
++            functions=(CoreFunction("c", (left, right), (output,), Region((operation,))),)
++        )
++        inputs = [("int32", shape, [0] * element_count(shape)), ("int32", shape, [1] * element_count(shape))]
++        outputs = [("bool", shape, element_count(shape))]
++    else:
++        condition = ValueRef("cond", CoreType.tensor("bool", shape))
++        true_value = ValueRef("true", CoreType.tensor("int32", shape))
++        false_value = ValueRef("false", CoreType.tensor("int32", shape))
++        output = ValueRef("out", CoreType.tensor("int32", shape))
++        operation = Operation("where", (condition, true_value, false_value), (output,), {})
++        program = CoreProgram(
++            functions=(
++                CoreFunction("w", (condition, true_value, false_value), (output,), Region((operation,))),
++            )
++        )
++        inputs = [
++            ("bool", shape, [1] * element_count(shape)),
++            ("int32", shape, [0] * element_count(shape)),
++            ("int32", shape, [1] * element_count(shape)),
++        ]
++        outputs = [("int32", shape, element_count(shape))]
++
++    _target_ir, artifact, native, reference = _differential(
++        program, inputs, outputs, tmp_path, "fallback-{}".format(operation_name)
++    )
++    _assert_bitwise(native, reference)
++    metadata = artifact.metadata
++    assert metadata["position_control_fallback"] == "host_reference"
++    fallbacks = metadata["native_position_control_fallback_operations"]
++    assert len(fallbacks) == 1
++    fallback = dict(fallbacks[0])
++    assert fallback["operation"] == operation_name
++    assert fallback["reason"] == (
++        "{} rank {} exceeds the native AVX2 position-control max rank {}".format(
++            operation_name, rank, POSITION_CONTROL_MAX_RANK
++        )
++    )
++    assert tuple(metadata["native_position_control_operations"]) == ()
++    assert metadata["execution_modes"][0]["mode"] == "host_reference"
++    assert operation_name in tuple(metadata["host_reference_operations"])
++
++
++def test_predicate_never_claims_an_uncovered_dtype_or_shape():
++    """Defense in depth: the shared predicate itself fails closed."""
++
++    def fake_operation(name, input_dtypes, input_shapes=None):
++        if input_shapes is None:
++            input_shapes = tuple((4,) for _ in input_dtypes)
++        return types.SimpleNamespace(
++            name=name,
++            inputs=tuple(
++                types.SimpleNamespace(
++                    type=types.SimpleNamespace(kind="tensor", dtype=dtype, shape=shape)
++                )
++                for dtype, shape in zip(input_dtypes, input_shapes)
++            ),
++            outputs=(
++                types.SimpleNamespace(
++                    type=types.SimpleNamespace(kind="tensor", dtype="bool", shape=(4,))
++                ),
++            ),
++            attributes={"predicate": "lt"},
++        )
++
++    plan = types.SimpleNamespace(operation="compare", dtype="bool", shape=(4,), element_count=4)
++    operation = fake_operation("lt", ("float16", "float16"))
++    assert position_control_native_contract(operation, plan) is None
++    assert position_control_native_fallback_reason(operation, plan) == (
++        "dtype float16 is not in the native AVX2 compare dtype set"
++    )
++
++    mixed = fake_operation("lt", ("float32", "bf16"))
++    assert position_control_native_contract(mixed, plan) is None
++    assert position_control_native_fallback_reason(mixed, plan) == (
++        "compare operands must share one dtype (float32 vs bf16)"
++    )
++
++    # A scalar plan (rank 0) is covered; a rank above the maximum is not.
++    scalar_plan = types.SimpleNamespace(
++        operation="compare", dtype="bool", shape=(), element_count=1
++    )
++    scalar_operation = fake_operation("lt", ("int32", "int32"), ((), ()))
++    contract = position_control_native_contract(scalar_operation, scalar_plan)
++    assert contract is not None and contract["rank"] == 0
++    assert contract["left_strides"] == [] and contract["right_strides"] == []
++
++    rank = POSITION_CONTROL_MAX_RANK + 1
++    high_plan = types.SimpleNamespace(
++        operation="compare", dtype="bool", shape=(1,) * rank, element_count=1
++    )
++    high_operation = fake_operation("lt", ("int32", "int32"), ((1,) * rank, (1,) * rank))
++    assert position_control_native_contract(high_operation, high_plan) is None
++    assert position_control_native_fallback_reason(high_operation, high_plan) == (
++        "compare rank {} exceeds the native AVX2 position-control max rank {}".format(
++            rank, POSITION_CONTROL_MAX_RANK
++        )
++    )
++
++
++def test_declared_kernel_is_the_dispatched_kernel_spy(tmp_path, monkeypatch):
++    runtime = _runtime()
++    calls = []
++    original = avx2_runtime._call_position_control
++
++    def spy(module, contract, inputs, destination):
++        calls.append(
++            (
++                contract["kind"],
++                contract["kernel"],
++                int(contract["output_elements"]),
++                destination.count,
++            )
++        )
++        return original(module, contract, inputs, destination)
++
++    monkeypatch.setattr(avx2_runtime, "_call_position_control", spy)
++    program = _iota_program("int64", (2, 3), 1, 4, -1)
++    _target_ir, artifact = _compile_avx2(program, tmp_path, "spy-iota")
++    output = HostTensor.zeros("int64", (2, 3))
++    runtime.launch(LaunchRequest(artifact, inputs=[], outputs=[output.descriptor()]))
++    declared = [entry["kernel"] for entry in artifact.metadata["native_position_control_operations"]]
++    assert [call[1] for call in calls] == declared == ["iota_i64"]
++    assert calls[0][2] == calls[0][3] == 6
++
++    compare = _compare_matrix_program("f32".replace("f32", "float32"), 3, ("le",))
++    _target_ir, artifact = _compile_avx2(compare, tmp_path, "spy-compare")
++    left = HostTensor("float32", (3, 1), [0.0, 1.0, 2.0])
++    right = HostTensor("float32", (1, 3), [2.0, 1.0, 0.0])
++    output = HostTensor.zeros("bool", (3, 3))
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[left.descriptor(readonly=True), right.descriptor(readonly=True)],
++            outputs=[output.descriptor()],
++        )
++    )
++    declared = [entry["kernel"] for entry in artifact.metadata["native_position_control_operations"]]
++    assert [call[1] for call in calls[1:]] == declared == ["compare_f32"]
++    assert output.flat() == (True, True, True, True, True, False, True, False, False)
++
++    where = _where_program(
++        "bf16", _tensor("bool", (3,)), _tensor("bf16", (3,)), _tensor("bf16", (3,)), _tensor("bf16", (3,))
++    )
++    _target_ir, artifact = _compile_avx2(where, tmp_path, "spy-where")
++    condition = HostTensor("bool", (3,), [True, False, True])
++    true_value = HostTensor("bf16", (3,), [1.0, 2.0, 3.0])
++    false_value = HostTensor("bf16", (3,), [4.0, 5.0, 6.0])
++    output = HostTensor.zeros("bf16", (3,))
++    runtime.launch(
++        LaunchRequest(
++            artifact,
++            inputs=[
++                condition.descriptor(readonly=True),
++                true_value.descriptor(readonly=True),
++                false_value.descriptor(readonly=True),
++            ],
++            outputs=[output.descriptor()],
++        )
++    )
++    declared = [entry["kernel"] for entry in artifact.metadata["native_position_control_operations"]]
++    assert [call[1] for call in calls[2:]] == declared == ["where_bf16"]
++    assert output.flat() == (1.0, 5.0, 3.0)
++
++
++def test_native_object_exports_every_declared_symbol(tmp_path):
++    nm = shutil.which("nm")
++    if nm is None:
++        pytest.skip("nm is not available")
++    program = _iota_program("int64", (2, 2), 0, 0, 1)
++    _target_ir, artifact = _compile_avx2(program, tmp_path, "symbols")
++    result = subprocess.run(
++        [nm, "-D", "--defined-only", artifact.path],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        universal_newlines=True,
++        check=False,
++    )
++    assert result.returncode == 0, result.stdout
++    assert "ptx_avx2_iota_i64" in result.stdout
++    assert "ptx_avx2_compare_f32" in result.stdout
++    assert "ptx_avx2_where_f32" in result.stdout
++    for symbol in artifact.metadata["native_helper_symbols"]:
++        if symbol.startswith("ptx_avx2_iota_") or symbol.startswith("ptx_avx2_compare_") or symbol.startswith("ptx_avx2_where_"):
++            assert symbol in result.stdout
++
++
++# ---------------------------------------------------------------------------
++# payload / wire strictness
++# ---------------------------------------------------------------------------
++
++
++def test_payload_version_and_abi_marker_are_bumped(tmp_path):
++    assert ARTIFACT_PAYLOAD_VERSION == 7
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:8"
++    program = _iota_program("int32", (2,), 0, 0, 1)
++    _target_ir, artifact = _compile_avx2(program, tmp_path, "marker")
++    assert artifact.metadata["artifact_payload_version"] == 7
++    native_bytes = Path(artifact.path).read_bytes()
++    assert b"pypto-x.cpu.avx2:8" in native_bytes
++    assert b"pypto-x.cpu.avx2:7" not in native_bytes
++
++
++def test_new_reader_rejects_the_old_host_reference_payload_shape(tmp_path):
++    """A payload-7 reader must fail closed on payload-6 style metadata."""
++
++    runtime = _runtime()
++    program = _iota_program("int64", (3,), 0, 1, 2)
++    _target_ir, artifact = _compile_avx2(program, tmp_path, "old-shape")
++    original = dict(artifact.metadata)
++
++    def tamper(label, mutate, match):
++        metadata = _plain_json(original)
++        mutate(metadata)
++        object.__setattr__(artifact, "metadata", metadata)
++        try:
++            with pytest.raises(CpuAvx2ArtifactError, match=match):
++                runtime.load(artifact)
++        finally:
++            object.__setattr__(artifact, "metadata", original)
++
++    # Payload 6 declared iota as host_reference and had no position-control key.
++    tamper(
++        "payload6",
++        lambda m: m.__setitem__("artifact_payload_version", 6),
++        "payload version",
++    )
++    tamper(
++        "old fallback declaration",
++        lambda m: m.__setitem__("position_control_fallback", "host_reference"),
++        "position_control_fallback",
++    )
++    tamper(
++        "missing native entries",
++        lambda m: m.__setitem__("native_position_control_operations", []),
++        "native_position_control_operations",
++    )
++    tamper(
++        "old pre-expansion",
++        lambda m: m.__setitem__("host_preexpanded_operations", ["where"]),
++        "host_preexpanded_operations",
++    )
++    tamper(
++        "old wire",
++        lambda m: m.__setitem__("position_control_descriptor_wire", "v5:pxio-pxcp-pxbd-pxwh+fnv1a64"),
++        "position_control_descriptor_wire",
++    )
++
++
++def test_old_reader_gate_rejects_the_new_payload_and_abi_marker(tmp_path):
++    """Freeze the payload-6 reader gates this slice must fail closed against.
++
++    The baseline (393d28e0f) decoder is
++    ``if metadata.get("artifact_payload_version") != 6: raise`` plus
++    ``if native_abi != "pypto-x.cpu.avx2:7": raise``.  Both constants are
++    frozen here so a future reader/writer drift is caught.
++    """
++
++    baseline_payload_version = 6
++    baseline_abi_marker = "pypto-x.cpu.avx2:7"
++    program = _iota_program("int32", (2,), 0, 0, 1)
++    _target_ir, artifact = _compile_avx2(program, tmp_path, "old-reader")
++    assert artifact.metadata["artifact_payload_version"] != baseline_payload_version
++    assert NATIVE_ABI_MARKER != baseline_abi_marker
++    native_bytes = Path(artifact.path).read_bytes()
++    assert baseline_abi_marker.encode("ascii") not in native_bytes
++    # The old reader's gate rejects both the new payload number and the new
++    # object because the metadata can never be rewritten to the old pair.
++    assert not (artifact.metadata["artifact_payload_version"] == baseline_payload_version)
++    assert NATIVE_ABI_MARKER.encode("ascii") in native_bytes
++
++
++def test_old_abi_marker_artifact_fails_closed(tmp_path):
++    program = _iota_program("int64", (3,), 0, 1, 2)
++    _target_ir, artifact = _compile_avx2(program, tmp_path, "legacy-marker")
++    current_marker = b"pypto-x.cpu.avx2:8"
++    legacy_marker = b"pypto-x.cpu.avx2:7"
++    native_bytes = Path(artifact.path).read_bytes()
++    assert current_marker in native_bytes
++    legacy_bytes = native_bytes.replace(current_marker, legacy_marker)
++    assert len(legacy_bytes) == len(native_bytes)
++    legacy_dir = tmp_path / "legacy-artifacts"
++    legacy_dir.mkdir()
++    legacy_path = legacy_dir / Path(artifact.path).name
++    legacy_path.write_bytes(legacy_bytes)
++    metadata = dict(artifact.metadata)
++    metadata["native_digest"] = hashlib.sha256(legacy_bytes).hexdigest()
++    legacy_artifact = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        path=str(legacy_path),
++        metadata=metadata,
++    )
++    with pytest.raises(CpuAvx2ArtifactError, match="safety marker"):
++        _runtime().load(legacy_artifact)
++
++
++def test_single_byte_tampering_of_the_native_object_fails_closed(tmp_path):
++    program = _iota_program("int64", (3,), 0, 1, 2)
++    _target_ir, artifact = _compile_avx2(program, tmp_path, "tamper")
++    tampered_dir = tmp_path / "tampered"
++    tampered_dir.mkdir()
++    tampered_path = tampered_dir / Path(artifact.path).name
++    native_bytes = bytearray(Path(artifact.path).read_bytes())
++    # Flip one bit inside the executable body.
++    native_bytes[len(native_bytes) // 2] ^= 0x01
++    tampered_path.write_bytes(bytes(native_bytes))
++    tampered = Artifact(
++        format=artifact.format,
++        entrypoint=artifact.entrypoint,
++        target=artifact.target,
++        abi_version=artifact.abi_version,
++        path=str(tampered_path),
++        metadata=dict(artifact.metadata),
++    )
++    with pytest.raises(CpuAvx2ArtifactError, match="digest"):
++        _runtime().load(tampered)
++
++
++def test_descriptor_digest_and_fallback_list_are_self_verifying(tmp_path):
++    """A tampered descriptor digest is rejected at load (shared predicate)."""
++
++    runtime = _runtime()
++    program = _iota_program("int64", (3,), 0, 1, 2)
++    _target_ir, artifact = _compile_avx2(program, tmp_path, "digest-tamper")
++    metadata = _plain_json(artifact.metadata)
++    entries = [dict(entry) for entry in metadata["native_position_control_operations"]]
++    digest = entries[0]["descriptor_digest"]
++    entries[0]["descriptor_digest"] = digest[:-1] + ("0" if digest[-1] != "0" else "1")
++    metadata["native_position_control_operations"] = entries
++    object.__setattr__(artifact, "metadata", metadata)
++    with pytest.raises(CpuAvx2ArtifactError, match="native_position_control_operations"):
++        runtime.load(artifact)
++
++
++def test_payload_version_participates_in_the_artifact_cache_key(tmp_path):
++    program = _iota_program("int32", (2,), 0, 0, 1)
++    _target_ir, artifact = _compile_avx2(program, tmp_path, "cache-key")
++    current_key = artifact.cache_key
++    metadata = dict(artifact.metadata)
++    metadata["artifact_payload_version"] = 6
++    object.__setattr__(artifact, "metadata", metadata)
++    assert artifact.cache_key != current_key
++
++
++# ---------------------------------------------------------------------------
++# Qwen3.5 corpus: native coverage and zero drift
++# ---------------------------------------------------------------------------
++
++
++@pytest.mark.parametrize(
++    "steps,past_length,index_dtype",
++    ((1, 5, "int64"), (5, 0, "int64"), (1, 5, "int32"), (5, 0, "int32")),
++)
++def test_qwen35_position_control_graph_is_fully_native_and_bit_exact(
++    steps, past_length, index_dtype, tmp_path
++):
++    from pypto.portable.qwen35 import build_qwen35_position_control
++
++    program = build_qwen35_position_control(
++        1, steps, past_length=past_length, index_dtype=index_dtype
++    )
++    _target_ir, artifact = _compile_avx2(
++        program, tmp_path, "qwen-pos-{}-{}-{}".format(index_dtype, steps, past_length)
++    )
++    assert tuple(artifact.metadata["position_control_operations"]) == (
++        "iota",
++        "iota",
++        "iota",
++        "compare",
++    )
++    entries = _assert_native_metadata(artifact, ("iota", "compare"))
++    assert sorted(entry["kind"] for entry in entries) == ["compare", "iota", "iota", "iota"]
++    assert tuple(artifact.metadata["host_reference_operations"]) == ()
++
++    mask_shape = (1, 8, steps, past_length + steps)
++    position_shape = (1, steps)
++    scalar_artifact = _compile_scalar(program)
++    native_outputs = [
++        HostTensor.zeros(index_dtype, position_shape),
++        HostTensor.zeros("bool", mask_shape),
++    ]
++    scalar_outputs = [
++        HostTensor.zeros(index_dtype, position_shape),
++        HostTensor.zeros("bool", mask_shape),
++    ]
++    _runtime().launch(
++        LaunchRequest(artifact, inputs=[], outputs=[item.descriptor() for item in native_outputs])
++    )
++    CpuScalarRuntime().launch(
++        LaunchRequest(
++            scalar_artifact, inputs=[], outputs=[item.descriptor() for item in scalar_outputs]
++        )
++    )
++    assert native_outputs[0].flat() == scalar_outputs[0].flat()
++    assert native_outputs[1].flat() == scalar_outputs[1].flat()
++    # Independent reference on identical raw bits (the pre-payload-7 path).
++    target_ir, _artifact = _compile_avx2(
++        program, tmp_path, "qwen-pos-ref-{}-{}-{}".format(index_dtype, steps, past_length)
++    )
++    environment = _reference_environment(program, target_ir, [], "qwen-position")
++    reference = [
++        _buffer_bytes(environment[ref.name].buffer) for ref in program.functions[0].returns
++    ]
++    native_bytes = []
++    for ref, output in zip(program.functions[0].returns, native_outputs):
++        dtype = ref.type.dtype
++        bits = []
++        for value in output.flat():
++            if dtype == "bool":
++                bits.append(1 if value else 0)
++            else:
++                bits.append(int(value))
++        array, _pointer = _raw_array(dtype, bits)
++        native_bytes.append(_array_bytes(dtype, array))
++    _assert_bitwise(native_bytes, reference)
++
++
++def test_qwen35_attention_where_is_native_and_bit_exact(tmp_path):
++    from pypto.portable.qwen35 import build_attention_subgraph
++
++    program = build_attention_subgraph(
++        (2, 10), (3, 9), (1, 3, 2, 5), 6, "float32", rotary_dim=6
++    )
++    target_ir, artifact = _compile_avx2(program, tmp_path, "attention")
++    kinds = {
++        entry["kind"] for entry in artifact.metadata["native_position_control_operations"]
++    }
++    assert "where" in kinds
++    assert artifact.metadata["position_control_fallback"] == "native"
++    assert tuple(artifact.metadata["native_position_control_fallback_operations"]) == ()
++    assert tuple(artifact.metadata["host_preexpanded_operations"]) == ()
++
++    q = HostTensor("float32", (2, 10), [((index * 3) % 17 - 8) * 0.1 for index in range(20)])
++    cos = HostTensor("float32", (2, 6), [0.5] * 12)
++    sin = HostTensor("float32", (2, 6), [0.25] * 12)
++    logits = HostTensor("float32", (3, 9), [((index * 5) % 19 - 9) * 0.15 for index in range(27)])
++    mask = HostTensor("bool", (3, 9), [column <= row + 1 for row in range(3) for column in range(9)])
++    kv = HostTensor("float32", (1, 3, 2, 5), [index * 0.1 - 1.0 for index in range(30)])
++    indices = HostTensor("int64", (6,), [0, 0, 1, 1, 2, 2])
++    tensors = [q, cos, sin, logits, mask, kv, indices]
++    output_specs = [
++        ("float32", (2, 10)),
++        ("float32", (3, 9)),
++        ("float32", (1, 6, 2, 5)),
++    ]
++    outputs = []
++    for dtype, shape in output_specs:
++        array, _pointer = _raw_array(dtype, [0] * element_count(shape))
++        outputs.append((dtype, shape, array))
++    _runtime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[item.descriptor(readonly=True) for item in tensors],
++            outputs=[_descriptor(dtype, shape, array) for dtype, shape, array in outputs],
++            scalars={"fill_value": -10000.0},
++        )
++    )
++    native = [_array_bytes(dtype, array) for dtype, _shape, array in outputs]
++
++    # Zero-drift oracle: the same program on the same values through the AVX2
++    # vector-common host reference (the exact pre-payload-7 execution path).
++    by_name = {
++        "q": q,
++        "cos": cos,
++        "sin": sin,
++        "logits": logits,
++        "causal_mask": mask,
++        "kv": kv,
++        "head_indices": indices,
++    }
++    buffers = []
++    for parameter in program.functions[0].parameters:
++        if parameter.type.kind == "scalar":
++            buffers.append(
++                avx2_runtime._buffer_from_values(
++                    parameter.type.dtype, [-10000.0], parameter.name
++                )
++            )
++        else:
++            host = by_name[parameter.name]
++            buffers.append(
++                avx2_runtime._buffer_from_values(
++                    parameter.type.dtype, list(host.data), parameter.name
++                )
++            )
++    environment = _reference_environment(program, target_ir, buffers, "attention")
++    reference = [
++        _buffer_bytes(environment[ref.name].buffer) for ref in program.functions[0].returns
++    ]
++    _assert_bitwise(native, reference)
++    # The masked positions are filled with the scalar fill value and then
++    # exponentiated by the softmax, so they underflow to exactly 0.0.
++    softmax = struct.unpack("<{}f".format(27), native[1])
++    assert softmax[0] > 0.0
++    assert softmax[2] == 0.0
++    assert abs(sum(softmax[0:3]) - 1.0) < 1e-5
++
++
++def test_native_path_eliminates_the_host_per_element_fallback(tmp_path, monkeypatch):
++    """Counters + a reference spy prove the Python element path is not taken."""
++
++    avx2_runtime.reset_position_control_native_stats()
++    reference_calls = []
++    original_reference = avx2_runtime._reference_operation
++
++    def spy(operation, plan, inputs, context):
++        reference_calls.append(context)
++        return original_reference(operation, plan, inputs, context)
++
++    monkeypatch.setattr(avx2_runtime, "_reference_operation", spy)
++    program = _iota_program("int64", (2, 3), 0, 4, -1)
++    _target_ir, artifact = _compile_avx2(program, tmp_path, "stats-iota")
++    output = HostTensor.zeros("int64", (2, 3))
++    _runtime().launch(LaunchRequest(artifact, inputs=[], outputs=[output.descriptor()]))
++    stats = avx2_runtime.position_control_native_stats()
++    assert stats["kernel_calls"] == 1
++    assert stats["iota_calls"] == 1
++    assert stats["explicit_host_fallbacks"] == 0
++    assert reference_calls == []
++
++    rank = POSITION_CONTROL_MAX_RANK + 1
++    shape = (1,) * (rank - 1) + (2,)
++    left = ValueRef("left", CoreType.tensor("int32", shape))
++    right = ValueRef("right", CoreType.tensor("int32", shape))
++    high_output = ValueRef("out", CoreType.tensor("bool", shape))
++    high_program = CoreProgram(
++        functions=(
++            CoreFunction(
++                "high_rank",
++                (left, right),
++                (high_output,),
++                Region((Operation("lt", (left, right), (high_output,), {}),)),
++            ),
++        )
++    )
++    _target_ir, artifact = _compile_avx2(high_program, tmp_path, "stats-fallback")
++    left_tensor = HostTensor("int32", shape, [0] * element_count(shape))
++    right_tensor = HostTensor("int32", shape, [1] * element_count(shape))
++    result = HostTensor.zeros("bool", shape)
++    _runtime().launch(
++        LaunchRequest(
++            artifact,
++            inputs=[left_tensor.descriptor(readonly=True), right_tensor.descriptor(readonly=True)],
++            outputs=[result.descriptor()],
++        )
++    )
++    stats = avx2_runtime.position_control_native_stats()
++    assert stats["kernel_calls"] == 1  # unchanged by the fallback launch
++    assert stats["explicit_host_fallbacks"] == 1
++    assert len(reference_calls) == 1
++    assert result.flat()[0:2] == (True, True)
++
++
++def test_descriptor_cache_is_bounded_and_reused(tmp_path):
++    runtime = _runtime()
++    program = _iota_program("int32", (4,), 0, 0, 1)
++    _target_ir, artifact = _compile_avx2(program, tmp_path, "cache")
++    output = HostTensor.zeros("int32", (4,))
++    with avx2_runtime._POSITION_CONTROL_DESCRIPTOR_CACHE_LOCK:
++        avx2_runtime._POSITION_CONTROL_DESCRIPTOR_CACHE.clear()
++    avx2_runtime.reset_position_control_native_stats()
++    for _ in range(3):
++        runtime.launch(LaunchRequest(artifact, inputs=[], outputs=[output.descriptor()]))
++    stats = avx2_runtime.position_control_native_stats()
++    assert stats["descriptor_cache_misses"] == 1
++    assert stats["descriptor_cache_hits"] == 2
++    assert stats["kernel_calls"] == 3
+diff --git a/python/tests/ut/pypto_x/test_qwen35_avx2_parity.py b/python/tests/ut/pypto_x/test_qwen35_avx2_parity.py
+index 296c768f4..17c51e401 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_avx2_parity.py
++++ b/python/tests/ut/pypto_x/test_qwen35_avx2_parity.py
+@@ -73,7 +73,17 @@ def test_avx2_position_softmax_and_batched_matmul_parity(tmp_path):
+     assert avx_outputs[0].flat() == scalar_outputs[0].flat() == (2, 3, 4)
+     assert avx_outputs[1].flat() == scalar_outputs[1].flat()
+     assert all(plan.iteration.compact for plan in Avx2Compiler().lower(position, AVX2_TARGET).plans)
+-    assert avx_position.metadata["position_control_fallback"] == "host_reference"
++    # avx2-position-native (payload 7): the position-control graph is executed
++    # by the compiled AVX2 object with zero per-plan fallbacks.
++    assert avx_position.metadata["position_control_fallback"] == "native"
++    assert tuple(avx_position.metadata["position_control_operations"]) == (
++        "iota",
++        "iota",
++        "iota",
++        "compare",
++    )
++    assert tuple(avx_position.metadata["native_position_control_fallback_operations"]) == ()
++    assert tuple(avx_position.metadata["host_preexpanded_operations"]) == ()
+ 
+     softmax = build_stable_softmax((2, 9), "float32")
+     avx_softmax = _compile_avx2(softmax, tmp_path / "softmax")
+@@ -128,7 +138,12 @@ def test_avx2_connected_attention_layout_indexing_and_guarded_shapes(tmp_path):
+     _launch(scalar_artifact, inputs, scalar_outputs, runtime=CpuScalarRuntime(), scalars={"fill_value": -10000.0})
+     for actual, expected in zip(avx_outputs, scalar_outputs):
+         _assert_close(actual.flat(), expected.flat())
+-    assert artifact.metadata["position_control_operations"] == ()
++    # The attention graph contains one `where` (the mask fill); payload 7
++    # executes it natively, so the position-control census is its per-plan
++    # entry and there is no host pre-expansion left.
++    assert tuple(artifact.metadata["position_control_operations"]) == ("where",)
++    assert artifact.metadata["position_control_fallback"] == "native"
++    assert tuple(artifact.metadata["host_preexpanded_operations"]) == ()
+     assert any(item["mode"] == "host_reference" for item in artifact.metadata["execution_modes"])
+ 
+ 
+diff --git a/python/tests/ut/pypto_x/test_qwen35_position_control.py b/python/tests/ut/pypto_x/test_qwen35_position_control.py
+index 4c58607e4..b60ef7d95 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_position_control.py
++++ b/python/tests/ut/pypto_x/test_qwen35_position_control.py
+@@ -1,9 +1,11 @@
+ """M1H position/control closure for Qwen3.5-0.8B.
+ 
+ The tests use only synthetic integer/boolean tensors and no checkpoint data.
+-SVE and AVX2 position/control execution are checked as explicit
+-host-reference fallbacks carried by their target artifacts; AVX-512 remains
+-closed until its later parity wave.
++SVE256 executes the position/control plane natively (payload v5 control wire);
++AVX2 executes it natively since payload 7 (avx2-position-native,
++PXIO/PXCP/PXWH v1 wire) and is characterized in
++``test_cpu_avx2_position_native.py``.  AVX-512 remained a declared
++host-reference fallback until its later parity wave.
+ """
+ 
+ from __future__ import annotations
+@@ -173,7 +175,7 @@ def test_sve_position_control_native_metadata_tamper_is_fail_closed(tmp_path):
+         Sve256Runtime(execution_mode="qemu").load(tampered)
+ 
+ 
+-def test_avx2_position_control_uses_explicit_host_reference():
++def test_avx2_position_control_lowering_plans():
+     program = build_qwen35_position_ids(1, 1, past_length=0)
+     target = TargetSpec("cpu", "x86_64-linux-gnu", features=("avx", "avx2", "osxsave", "ymm"))
+     target_ir = lower_avx2(program, target)
+diff --git a/python/tests/ut/pypto_x/test_w8a8_avx2.py b/python/tests/ut/pypto_x/test_w8a8_avx2.py
+index 8c96efce3..984e40e00 100644
+--- a/python/tests/ut/pypto_x/test_w8a8_avx2.py
++++ b/python/tests/ut/pypto_x/test_w8a8_avx2.py
+@@ -258,8 +258,8 @@ def test_w8a8_opcode_names_match_the_c1_portable_constants():
+ def test_qmatmul_metadata_declares_the_native_widening_kernel(build_dir):
+     program = _qmatmul_program((2, 3), (3, 4))
+     artifact = _compile_avx2_artifact(program, build_dir, name="metadata")
+-    assert artifact.metadata["artifact_payload_version"] == ARTIFACT_PAYLOAD_VERSION == 6
+-    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:7"
++    assert artifact.metadata["artifact_payload_version"] == ARTIFACT_PAYLOAD_VERSION == 7
++    assert NATIVE_ABI_MARKER == "pypto-x.cpu.avx2:8"
+     assert tuple(artifact.metadata["w8a8_kernel_operations"]) == (W8A8_QMATMUL_OPCODE,)
+     assert artifact.metadata["w8a8_kernel_version"] == W8A8_KERNEL_VERSION == 2
+     declared = artifact.metadata["w8a8_capability"]
+@@ -758,4 +758,4 @@ def test_objdump_primitives_are_native_avx2(carrier_artifact):
+ def test_artifact_native_bytes_digest_matches(carrier_artifact):
+     native_bytes = Path(carrier_artifact.path).read_bytes()
+     assert hashlib.sha256(native_bytes).hexdigest() == carrier_artifact.content_digest
+-    assert b"pypto-x.cpu.avx2:7" in native_bytes
++    assert b"pypto-x.cpu.avx2:8" in native_bytes
+diff --git a/scripts/perf/avx2_position_microbench.py b/scripts/perf/avx2_position_microbench.py
+new file mode 100644
+index 000000000..ec5de9a12
+--- /dev/null
++++ b/scripts/perf/avx2_position_microbench.py
+@@ -0,0 +1,491 @@
++#!/usr/bin/env python3
++"""L0-style AVX2 position-control microbench (avx2-position-native).
++
++Protocol: ``docs/PERF_MEASUREMENT_PROTOCOL.zh-CN.md`` section 2 (L0).  The
++driver constructs Core IR programs directly (no graph traversal), compiles
++them with the tree's own ``Avx2Compiler`` and times ``Avx2Runtime.launch`` on
++caller-owned buffers.  Each case reports:
++
++* ``native_seconds``  -- median of ``R`` single-launch samples (the payload-7
++  native plane), plus min/p95/max/stdev/cv and the MAD outlier screen;
++* ``reference_seconds`` -- median of ``R`` runs of the same operation chain
++  through the vector-common host reference (``_reference_operation``), i.e.
++  the exact pre-payload-7 Python element path;
++* the runtime's native-plane counters (kernel calls vs explicit host
++  fallbacks) so "the Python per-element path was eliminated" is evidenced by
++  execution counts, not only by timings.
++
++This 12 vCPU KVM guest has no cpufreq control, so every absolute number is
++permanently **UNGATED**; the driver writes no thresholds and makes no speedup
++claims.  Heavy: run through ``scripts/resource/run_local_heavy.sh``.
++"""
++
++from __future__ import annotations
++
++import argparse
++import ctypes
++import json
++import math
++import os
++import statistics
++import struct
++import sys
++import time
++
++from pypto.abi import LaunchRequest, TensorDesc
++from pypto.backends.cpu.x86 import Avx2Runtime
++from pypto.backends.cpu.x86 import avx2 as avx2_runtime
++from pypto.compiler import CompileOptions
++from pypto.compiler.targets.cpu_avx2 import Avx2Compiler
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.portable.qwen35 import build_attention_subgraph, build_qwen35_position_control
++from pypto.target import TargetSpec
++
++
++AVX2_TARGET = TargetSpec(
++    "cpu",
++    "x86_64-linux-gnu",
++    features=("avx", "avx2", "osxsave", "ymm"),
++    attributes={"lane_count": 8},
++)
++TASK = "avx2-position-native"
++EVIDENCE_KIND = "pypto-x.perf-evidence.avx2-position-native"
++
++
++def _tensor(dtype, shape):
++    return CoreType.tensor(dtype, tuple(shape))
++
++
++def _iota_program(dtype, shape, axis, start, step):
++    output = ValueRef("out", _tensor(dtype, shape))
++    return CoreProgram(
++        functions=(
++            CoreFunction(
++                "iota",
++                (),
++                (output,),
++                Region((Operation("iota", (), (output,), {"axis": axis, "start": start, "step": step}),)),
++            ),
++        )
++    )
++
++
++def _compare_program(dtype, left_shape, right_shape, output_shape, predicate):
++    left = ValueRef("left", _tensor(dtype, left_shape))
++    right = ValueRef("right", _tensor(dtype, right_shape))
++    output = ValueRef("out", _tensor("bool", output_shape))
++    return CoreProgram(
++        functions=(
++            CoreFunction(
++                "compare",
++                (left, right),
++                (output,),
++                Region((Operation(predicate, (left, right), (output,), {}),)),
++            ),
++        )
++    )
++
++
++def _where_program(dtype, condition_shape, true_shape, false_shape, output_shape):
++    condition = ValueRef("cond", _tensor("bool", condition_shape))
++    true_value = ValueRef("true", _tensor(dtype, true_shape))
++    false_value = ValueRef("false", _tensor(dtype, false_shape))
++    output = ValueRef("out", _tensor(dtype, output_shape))
++    return CoreProgram(
++        functions=(
++            CoreFunction(
++                "where",
++                (condition, true_value, false_value),
++                (output,),
++                Region((Operation("where", (condition, true_value, false_value), (output,), {}),)),
++            ),
++        )
++    )
++
++
++def _pattern(dtype, count, seed=7):
++    if dtype == "bool":
++        return [1 if (index * 7 + seed) % 3 else 0 for index in range(count)]
++    if dtype.startswith("float"):
++        return [((index * 37 + seed) % 41 - 20) * 0.125 for index in range(count)]
++    # Integer inputs in this bench are gather/embedding indices (axis length 3).
++    return [(index * 7 + seed) % 3 for index in range(count)]
++
++
++def _cases():
++    cases = []
++    cases.append(
++        (
++            "iota_i64_2x1024",
++            _iota_program("int64", (2, 1024), 1, 4, 1),
++            [],
++        )
++    )
++    cases.append(
++        (
++            "iota_i32_negstep_3x4064",
++            _iota_program("int32", (3, 4064), 1, 100000, -3),
++            [],
++        )
++    )
++    cases.append(
++        (
++            "compare_f32_flat_4096",
++            _compare_program("float32", (4096,), (4096,), (4096,), "lt"),
++            [],
++        )
++    )
++    cases.append(
++        (
++            "compare_f32_broadcast_128x128",
++            _compare_program("float32", (128, 1), (1, 128), (128, 128), "le"),
++            [],
++        )
++    )
++    cases.append(
++        (
++            "compare_i8_broadcast_64x64",
++            _compare_program("int8", (64, 1), (1, 64), (64, 64), "eq"),
++            [],
++        )
++    )
++    cases.append(
++        (
++            "where_f32_flat_4096",
++            _where_program("float32", (4096,), (4096,), (4096,), (4096,)),
++            [],
++        )
++    )
++    cases.append(
++        (
++            "where_f32_broadcast_128x128",
++            _where_program("float32", (128, 1), (1, 128), (128, 1), (128, 128)),
++            [],
++        )
++    )
++    cases.append(
++        (
++            "where_bf16_broadcast_128x128",
++            _where_program("bf16", (128, 1), (1, 128), (128, 1), (128, 128)),
++            [],
++        )
++    )
++    for name, program in (
++        (
++            "qwen_position_decode_T1_past5",
++            build_qwen35_position_control(1, 1, past_length=5, index_dtype="int64"),
++        ),
++        (
++            "qwen_position_prefill_T5",
++            build_qwen35_position_control(1, 5, past_length=0, index_dtype="int64"),
++        ),
++        (
++            "qwen_attention_where_f32",
++            build_attention_subgraph((2, 10), (3, 9), (1, 3, 2, 5), 6, "float32", rotary_dim=6),
++        ),
++    ):
++        cases.append((name, program, []))
++    return cases
++
++
++_CTYPES = {
++    "float32": ctypes.c_float,
++    "bf16": ctypes.c_uint16,
++    "int8": ctypes.c_int8,
++    "uint8": ctypes.c_uint8,
++    "int16": ctypes.c_int16,
++    "int32": ctypes.c_int32,
++    "int64": ctypes.c_int64,
++    "bool": ctypes.c_bool,
++}
++
++
++def _raw_array(dtype, values):
++    ctype = _CTYPES[dtype]
++    if dtype == "float32":
++        array = (ctypes.c_uint32 * len(values))()
++        for index, value in enumerate(values):
++            ctypes.memmove(
++                ctypes.addressof(array) + 4 * index,
++                struct.pack("<I", int(value) & 0xFFFFFFFF),
++                4,
++            )
++        return array
++    if dtype == "bool":
++        return (ctypes.c_uint8 * len(values))(*[1 if value else 0 for value in values])
++    if dtype == "bf16":
++        def _bf16_bits(value):
++            bits = struct.unpack("<I", struct.pack("<f", float(value)))[0]
++            if (bits & 0x7F800000) == 0x7F800000:
++                return (bits >> 16) & 0xFFFF
++            rounding = 0x7FFF + ((bits >> 16) & 1)
++            return ((bits + rounding) >> 16) & 0xFFFF
++
++        return (ctype * len(values))(*[_bf16_bits(value) for value in values])
++    return (ctype * len(values))(*[int(value) for value in values])
++
++
++def _descriptor(dtype, shape, array, readonly=False):
++    if ctypes.sizeof(array):
++        return TensorDesc(
++            dtype, shape, device="cpu", address=ctypes.addressof(array), readonly=readonly
++        )
++    return TensorDesc(dtype, shape, device="cpu", handle=array, readonly=readonly)
++
++
++def _build_inputs(program):
++    arrays = []
++    descriptors = []
++    scalars = {}
++    for parameter in program.functions[0].parameters:
++        if parameter.type.kind == "scalar":
++            scalars[parameter.name] = -10000.0
++            continue
++        shape = tuple(int(dimension) for dimension in parameter.type.shape)
++        count = math.prod(shape) if shape else 1
++        dtype = parameter.type.dtype
++        array = _raw_array(dtype, _pattern(dtype, count))
++        arrays.append(array)
++        descriptors.append(_descriptor(dtype, shape, array, readonly=True))
++    return arrays, descriptors, scalars
++
++
++def _outputs(program):
++    arrays = []
++    descriptors = []
++    for ref in program.functions[0].returns:
++        if ref.type.kind != "tensor":
++            continue
++        shape = tuple(int(dimension) for dimension in ref.type.shape)
++        count = math.prod(shape) if shape else 1
++        array = _raw_array(ref.type.dtype, [0] * count)
++        arrays.append(array)
++        descriptors.append(_descriptor(ref.type.dtype, shape, array))
++    return arrays, descriptors
++
++
++def _stats(samples, mad_floor_seconds=1.0e-6):
++    median = statistics.median(samples)
++    deviations = [abs(value - median) for value in samples]
++    mad = statistics.median(deviations)
++    threshold = max(3.0 * 1.4826 * mad, mad_floor_seconds, 0.02 * median)
++    outliers = [value for value in deviations if value > threshold]
++    ordered = sorted(samples)
++    p95_index = min(len(ordered) - 1, max(0, math.ceil(0.95 * len(ordered)) - 1))
++    mean = statistics.fmean(samples)
++    stdev = statistics.stdev(samples) if len(samples) > 1 else 0.0
++    return {
++        "samples": [round(value, 9) for value in samples],
++        "min": min(samples),
++        "median": median,
++        "p95": ordered[p95_index],
++        "max": max(samples),
++        "mean": mean,
++        "stdev": stdev,
++        "cv": (stdev / mean) if mean else 0.0,
++        "outlier_ratio": len(outliers) / len(samples),
++    }
++
++
++def _reference_seconds(program, target_ir, input_arrays, scalars, rounds):
++    """Median seconds of the vector-common host reference chain."""
++
++    function = program.functions[0]
++    buffers = {}
++    for parameter in function.parameters:
++        if parameter.type.kind == "scalar":
++            buffers[parameter.name] = avx2_runtime._buffer_from_values(
++                parameter.type.dtype, [scalars[parameter.name]], parameter.name
++            )
++    tensor_parameters = [ref for ref in function.parameters if ref.type.kind != "scalar"]
++    for parameter, array in zip(tensor_parameters, input_arrays):
++        shape = tuple(int(dimension) for dimension in parameter.type.shape)
++        count = math.prod(shape) if shape else 1
++        pointer = ctypes.cast(
++            ctypes.addressof(array), avx2_runtime._pointer(parameter.type.dtype)
++        )
++        buffers[parameter.name] = avx2_runtime._NativeBuffer(
++            parameter.type.dtype, count, pointer, array, True
++        )
++    samples = []
++    for _ in range(rounds):
++        environment = {
++            parameter.name: avx2_runtime._RuntimeValue(parameter.type, buffers[parameter.name])
++            for parameter in function.parameters
++        }
++        started = time.perf_counter()
++        for operation, plan in zip(function.body.operations, target_ir.plans):
++            values = [environment[ref.name] for ref in operation.inputs]
++            environment.update(
++                avx2_runtime._reference_operation(operation, plan, values, "perf-reference")
++            )
++        samples.append(time.perf_counter() - started)
++    return _stats(samples)
++
++
++def _replicate(program, count):
++    """Return a program with ``count`` identical copies of a one-op function."""
++
++    function = program.functions[0]
++    source = function.body.operations[0]
++    operations = []
++    returns = []
++    for index in range(count):
++        outputs = tuple(
++            ValueRef("{}_{}".format(ref.name, index), ref.type) for ref in source.outputs
++        )
++        returns.extend(outputs)
++        operations.append(
++            Operation(source.name, tuple(function.parameters), outputs, dict(source.attributes))
++        )
++    return CoreProgram(
++        functions=(
++            CoreFunction(function.name, tuple(function.parameters), tuple(returns), Region(tuple(operations))),
++        )
++    )
++
++
++def run_case(name, program, build_root, rounds, warmup):
++    compiler = Avx2Compiler()
++    target_ir = compiler.lower(program, AVX2_TARGET)
++    build_dir = os.path.join(build_root, name)
++    os.makedirs(build_dir, exist_ok=True)
++    artifact = compiler.compile(
++        target_ir,
++        CompileOptions(
++            artifact_format="pypto-x.cpu.avx2", extra={"build_dir": build_dir}
++        ),
++    )
++    input_arrays, input_descriptors, scalars = _build_inputs(program)
++    output_arrays, output_descriptors = _outputs(program)
++    runtime = Avx2Runtime()
++    if not runtime.is_available():
++        raise RuntimeError("AVX2 is unavailable on this host")
++    request = LaunchRequest(
++        artifact,
++        inputs=input_descriptors,
++        outputs=output_descriptors,
++        scalars=scalars,
++    )
++    for _ in range(warmup):
++        runtime.launch(request)
++    avx2_runtime.reset_position_control_native_stats()
++    samples = []
++    for _ in range(rounds):
++        started = time.perf_counter()
++        runtime.launch(request)
++        samples.append(time.perf_counter() - started)
++    native_stats = dict(avx2_runtime.position_control_native_stats())
++    native = _stats(samples)
++    reference = _reference_seconds(program, target_ir, input_arrays, scalars, rounds)
++    load_samples = []
++    for _ in range(rounds):
++        started = time.perf_counter()
++        runtime.load(artifact)
++        load_samples.append(time.perf_counter() - started)
++    load_seconds = _stats(load_samples)
++
++    # L0 difference method (protocol section 2): a replicated R-op program
++    # amortizes the artifact decode/validation and dispatch overhead.
++    replicate = None
++    if len(target_ir.plans) == 1:
++        replicate_count = rounds
++        replicated = _replicate(program, replicate_count)
++        replicate_ir = compiler.lower(replicated, AVX2_TARGET)
++        replicate_dir = os.path.join(build_root, name + "__replicate")
++        os.makedirs(replicate_dir, exist_ok=True)
++        replicate_artifact = compiler.compile(
++            replicate_ir,
++            CompileOptions(
++                artifact_format="pypto-x.cpu.avx2", extra={"build_dir": replicate_dir}
++            ),
++        )
++        replicate_inputs, replicate_input_descriptors, replicate_scalars = _build_inputs(
++            replicated
++        )
++        _replicate_output_arrays, replicate_output_descriptors = _outputs(replicated)
++        replicate_request = LaunchRequest(
++            replicate_artifact,
++            inputs=replicate_input_descriptors,
++            outputs=replicate_output_descriptors,
++            scalars=replicate_scalars,
++        )
++        for _ in range(warmup):
++            runtime.launch(replicate_request)
++        replicate_samples = []
++        for _ in range(rounds):
++            started = time.perf_counter()
++            runtime.launch(replicate_request)
++            replicate_samples.append(time.perf_counter() - started)
++        replicate_stats = _stats(replicate_samples)
++        kernel_seconds = replicate_stats["median"] / replicate_count
++        dispatch_seconds = max(0.0, native["median"] - kernel_seconds)
++        replicate = {
++            "replicate_count": replicate_count,
++            "replicated_launch_seconds": replicate_stats,
++            "kernel_seconds": kernel_seconds,
++            "dispatch_seconds_estimate": dispatch_seconds,
++        }
++
++    metadata = dict(artifact.metadata)
++    return {
++        "name": name,
++        "operations": len(target_ir.plans),
++        "native_seconds": native,
++        "reference_seconds": reference,
++        "load_seconds": load_seconds,
++        "ratio_reference_over_native": (
++            reference["median"] / native["median"] if native["median"] else None
++        ),
++        "replicate": replicate,
++        "ratio_reference_over_kernel": (
++            reference["median"] / replicate["kernel_seconds"]
++            if replicate and replicate["kernel_seconds"]
++            else None
++        ),
++        "native_plane_stats": native_stats,
++        "position_control_fallback": metadata.get("position_control_fallback"),
++        "native_position_control_entries": len(
++            metadata.get("native_position_control_operations", ())
++        ),
++        "native_position_control_fallbacks": len(
++            metadata.get("native_position_control_fallback_operations", ())
++        ),
++        "artifact_native_digest": metadata.get("native_digest"),
++        "artifact_payload_version": metadata.get("artifact_payload_version"),
++    }
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--out", required=True)
++    parser.add_argument("--work-dir", required=True)
++    parser.add_argument("--rounds", type=int, default=21)
++    parser.add_argument("--warmup", type=int, default=5)
++    parser.add_argument("--cases", default="")
++    args = parser.parse_args()
++    selected = {item for item in args.cases.split(",") if item}
++    results = []
++    for name, program, _ignored in _cases():
++        if selected and name not in selected:
++            continue
++        results.append(run_case(name, program, args.work_dir, args.rounds, args.warmup))
++    payload = {
++        "task": TASK,
++        "evidence_kind": EVIDENCE_KIND,
++        "gated": False,
++        "gating_note": "UNGATED: 12 vCPU KVM guest, no cpufreq control",
++        "python": sys.version.split()[0],
++        "rounds": args.rounds,
++        "warmup": args.warmup,
++        "host": {"online_cpus": os.cpu_count()},
++        "cases": results,
++    }
++    with open(args.out, "w", encoding="utf-8") as handle:
++        json.dump(payload, handle, indent=1, sort_keys=True)
++        handle.write("\n")
++    print("wrote {} cases to {}".format(len(results), args.out))
++
++
++if __name__ == "__main__":
++    main()

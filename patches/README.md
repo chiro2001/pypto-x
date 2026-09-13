@@ -6,9 +6,9 @@
 ```text
 上游仓库      https://gitcode.com/cann/pypto.git
 基线 base     34475e0d83c6cdc7deac2082b1b4fa81b3beb6ad
-补丁 HEAD     393d28e0f2a8d532fd4a2a0ee1715f6f88b673ac
-提交数        269
-涉及文件      428
+补丁 HEAD     0b5b5899e01e466b225747ab9966ab51b6f532a2
+提交数        274
+涉及文件      432
 补丁体积      11M
 分支（导出时） port/pypto-x-integration
 ```
