@@ -613,3 +613,20 @@ FROZEN = Path("/…/worktrees/_meta/pypto-x/verify-0046-u3")
    是否把某类另列），不能沿用上一版估计或局部小计。
 2. 同类错误在 5 天（ERR-0014 的 "+10 归因"）内出现两次 → 在**任何**写进契约/快照的计数后面附"复算口径"一句话，
    并在独立验收中把"逐项相加"列为固定攻击项。
+
+## ERR-0016（2026-09-19）：`constant` 的 66 次 unplannable 被误判为"U5 入口边界"，实为**契约缺口**（rank-0 scalar 输出未允许）
+
+**状态**：已订正（`0023` 措辞 + 本 ERRATA）；修复并入 batch 0051 的 round-2（新增 `constant` rank-0 scalar 输出契约）。
+
+### 现象与证据
+
+- batch 0051 落地时（`a2373408d`）验收口径写："`constant` 66 次是**已注册但输出为 Core IR scalar kind**，被 U5 region 预检列为 unplannable（`non_tensor_result_not_supported_by_execution_contract`），非 missing contract"，`0023 §0` 亦有同样说法。
+- U5 round-5（`a8722aeb8`）先撤掉 region 预检并让 region 能表达 scalar 结果，66 次**仍是 66**，但 reason 变为 `rank_out_of_range`：
+  `plan_operation("constant", [], dtype="float32", output_shape=[], attributes={"value":1e-06})`
+  → `OP_CONTRACT_INVALID / rank_out_of_range`（field `shape.rank.output`，available `[1,4]`）——即 batch-3 冻结的 `constant` 只允许输出 rank 1..4。
+
+### 教训
+
+1. **"哪一层拒绝"必须用最小复现证明**，不能从"上游预检先报错"推断根因；本轮先修了 region 预检，才暴露出真正的契约缺口。
+2. 一条"非契约缺口"的结论要附**绕过上游预检后的直接证据**（本例：直接 `plan_operation` 调用），否则应标为"未定位"。
+3. 与 ERR-0014/0015 同类：任何归因/计数结论都要能被独立复现的**逐层分解**支持。
