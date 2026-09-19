@@ -2,7 +2,7 @@
 
 - 任务：`u5-region-readonly`
 - 实现基线：integration tip `b643229bd`（round-2 修复已由父方 cherry-pick）；round-3 修复 commit
-  `06910f996`（分支 `work/u5-region-readonly`，未 push）
+  `241067edc`（分支 `work/u5-region-readonly`，未 push）
 - **schema**：`REGION_SCHEMA_VERSION = 2`（v1 只存在于 round-1 未发布阶段；v1 文档一律 fail-closed 拒绝）
 - 依赖：`0019`（opcode 契约第一批，已落地）、`0018`（composite 组合化，已落地）、父方提案 `0020`
 - 结论等级：**实现完成（只读）**。未做执行、未做 v5 报告、未做动态 shape、未做性能声明；本机数字一律 UNGATED
@@ -70,7 +70,9 @@ digest 会在两次 revision 之间悄悄改变含义；而 `boundary` 由 SSA �
 | exit 不是 region 内算子的结果 | `region_exit_output_not_produced_by_region` |
 | 前向引用/自引用（闭环、逆拓扑） | Core IR verify 或 `region_cycle_detected` |
 | 边界选中 0 个算子 | `region_empty` |
-| 边界值不是 tensor（标量 entry/exit） | `region_boundary_non_tensor` |
+| 边界 entry kind 不在 {tensor, scalar} | `region_boundary_operand_kind_invalid` |
+| scalar entry 的 shape 非空 | `region_scalar_boundary_shape_invalid` |
+| scalar exit 不是 entry pass-through / 操作结果为标量 | `region_boundary_non_tensor` |
 
 所有错误都带 `code`（沿用 `OP_CONTRACT_INVALID`）、`field`、`requested`、`reason`、`details`，
 可用 `to_dict()` 机器读取。
@@ -205,6 +207,33 @@ snapshot>)` 得到的 `ExecutionPlan.digest`；`request` 字段足以在**不依
   `validate_region_plan(..., re_resolve=False)`；任何"自产不可 load"的文档在 plan 阶段就
   结构化失败（boundary 编号、iota、空选择三类问题都会在此暴露）。
 
+### 3.3 scalar 操作数的 region 表达与预检口径（round-4）
+
+- **预检口径**：region 层不再对 scalar 操作数一刀切；`_plan_region_operation` 只拒绝
+  `kind ∉ {tensor, scalar}`（`non_tensor_non_scalar_operand_not_supported`）以及
+  scalar 带非空 shape（`scalar_operand_shape_invalid`）。tensor/scalar 的操作数请求
+  **全部委托给 opcode 契约**（`plan_operation`，scalar 以 `shape=[]` + dtype 表达）；
+  契约是否接受由冻结契约文字决定：`where` 的 fill、`add`/`mul` 两侧 scalar 合法，
+  `exp`/`reduce_*` 等不接受 scalar 的 opcode 以契约 reason（例如 `rank_out_of_range`）
+  结构化拒绝——不再是 region 层的 `scalar_operand_not_supported_by_execution_contract`。
+- **如实表达**：`request.inputs[i]` 对非 tensor 操作数写 `"kind": "scalar"`、`shape: []`
+  （缺省 `kind` 表示 tensor，与单算子 plan payload 的 batch-2 约定一致）；boundary signature
+  的 `entry_inputs` 同样带 `kind`（tensor/scalar）。scalar 常量通常来自函数参数或 boundary
+  spec 声明的 mid-graph 值，因此它是 region 的 **entry input**；scalar 不能是 region 内
+  算子的结果（冻结契约只产生 tensor 结果，def-use 检查 `region_scalar_operand_from_operation`
+  拒绝）。scalar exit 只允许 `entry_pass_through`（参数原样返回），任何算子结果 exit 必须是
+  tensor。
+- **锚定**：`kind` 字段位于逐 op 条目与边界签名内，二者都进 `region_digest` preimage；
+  校验器还做语义交叉检查（operand `kind` 必须等于其 boundary entry 或 producer 的 kind）。
+  删除/改写 scalar `kind`：不重签 digest → `region_digest_mismatch`；重签后 →
+  `region_boundary_type_mismatch`（scalar entry 与默认 tensor operand 不一致）。
+- **不升 schema 版本的理由**：这是一个**加性可选字段 + 验证放松**——不含 scalar 的 v2
+  文档字段结构与语义完全不变（仍然合法、digest 不变），也不存在"旧字段被重新解释"的问题；
+  因此 `REGION_SCHEMA_VERSION` 保持 **2**，v1 仍 `region_schema_version_legacy`。
+- **实测**：三张真实 Qwen 图共 2127 次 batch-2 相关 opcode 引用（其中 batch-2 新登记 6 个
+  opcode 恰为 2119 次）现在**全部 plan 成功**，region 级 scalar 预检造成的
+  `unplannable_operations` 从 205 次降为 **0**（见 §5）。
+
 严格校验器 `validate_region_plan(document, *, policy=None, capability=None, re_resolve=False)`
 按固定顺序检查（任一失败抛 `ARTIFACT_MISMATCH`，不修复）：
 
@@ -212,6 +241,7 @@ snapshot>)` 得到的 `ExecutionPlan.digest`；`request` 字段足以在**不依
    必须为 int 且 == 2（v1 → `region_schema_version_legacy`，其他 → `region_schema_version_mismatch`）；
    类型为 bool 的 `op_count` 等一律拒绝，未知 `policy.numeric.requirement` 抛结构化
    `region_policy_invalid`（不再裸 `ValueError`）；`operations` 为空 → `region_operations_empty`；
+   operand `kind` 缺省视为 tensor，显式 scalar 必须 `shape=[]`；
 2. `boundary_signature` 结构（角色/类型/静态 shape/entry `producer_op_index=null`/exit source
    `operation_result` 用 region-local producer 编号）；
 3. **从文档自身复算 `region_digest`（完整 op 条目），再复算 `region_id`**（改一位 →
@@ -305,61 +335,56 @@ proven-bounded / portable-present）、`selected_class`、`selected_rule`、
 ## 5. 真实 Qwen 图上的缺失 contract 清单
 
 证据：`raw/qwen_region_missing_contracts.json`（脚本 `scripts/qwen_region_missing_contracts.py`；
-对三个 builder 各跑一次 `plan_region(整个 program)`；read-only）。三个图全部**结构化拒绝**——
-这是预期结果，因为 batch1 只登记了 10 个 opcode。
+对三个 builder 各跑一次 `plan_region(整个 program)`；read-only）。batch-2（`8b5246557`）之后
+三个图仍然**结构化拒绝**，但拒绝原因已经只剩"未登记 contract"：`unplannable_operations`
+三图**全部为 0**——batch-2 前由 region 层 scalar 预检造成的 205 次已归零（round-4）。
 
-| builder | ops | 缺失 contract 的 op（出现次数） | 已登记但请求不可规划 |
-|---|---|---|---|
-| `build_attention_kv_cache` \((1,8,4,256)\) | 20 | broadcast 2, concat 2, gather 2, div 1, mul 1, sub 1, transpose 1 | `where` ×1（scalar operand） |
-| `build_qwen35_gdr_recurrent_state` (1,4) | 123 | transpose 28, slice 20, mul 12, broadcast 8, add 4, sub 4, identity 2, concat 1 | — |
-| `build_qwen35_text_decoder_graph` (1,1,past=4096) | 4550 | 见下表 | `where` ×6（scalar operand）、`compare` ×1（`broadcast` 属性不在 compare 契约白名单 → `unknown_attribute`） |
+| builder | ops | 已登记 op（全部 plan 成功） | 缺失 contract（op → 次数） | unplannable |
+|---|---|---|---|---|
+| `build_attention_kv_cache` \((1,8,4,256)\) | 20 | 14 | concat 2, gather 2, div 1, sub 1 | **0** |
+| `build_qwen35_gdr_recurrent_state` (1,4) | 123 | 116 | sub 4, identity 2, concat 1 | **0** |
+| `build_qwen35_text_decoder_graph` (1,1,past=4096) | 4550 | 4152 | reduce_mean 79, concat 66, constant 66, silu 60, neg 30, sigmoid 24, split 24, sub 24, softplus 18, div 6, embedding 1 | **0** |
+| **合计** | **4693** | **4282** | **411** | **0** |
 
-全 decoder / attention / GDR 合并后的缺失 contract 频次（按出现次数排序，机器可读字段
-`missing_contract_priority`）：
+合并后缺失 contract **13 类**（按出现次数排序，机器可读字段 `missing_contract_priority`）：
 
 | 优先级 | opcode | 合并出现次数 | 覆盖图 |
 |---|---|---|---|
-| 1 | `mul` | 544 | decoder + gdr + attention |
-| 2 | `transpose` | 414 | decoder + gdr + attention |
-| 3 | `broadcast` | 360 | decoder + gdr + attention |
-| 4 | `slice` | 356 | decoder + gdr |
-| 5 | `add` | 330 | decoder + gdr |
-| 6 | `rsqrt` | 115 | decoder |
-| 7 | `reduce_mean` | 79 | decoder |
-| 8 | `concat` | 69 | decoder + gdr + attention |
-| 9 | `constant` | 66 | decoder |
-| 10 | `silu` | 60 | decoder |
-| 11 | `neg` | 30 | decoder |
-| 12 | `sub` | 29 | decoder + gdr + attention |
-| 13 | `sigmoid` | 24 | decoder |
-| 14 | `split` | 24 | decoder |
-| 15 | `softplus` | 18 | decoder |
-| 16 | `div` | 7 | decoder + attention |
-| 17 | `gather` | 2 | attention |
-| 18 | `identity` | 2 | gdr |
-| 19 | `embedding` | 1 | decoder |
+| 1 | `reduce_mean` | 79 | decoder |
+| 2 | `concat` | 69 | decoder + gdr + attention |
+| 3 | `constant` | 66 | decoder |
+| 4 | `silu` | 60 | decoder |
+| 5 | `neg` | 30 | decoder |
+| 6 | `sub` | 29 | decoder + gdr + attention |
+| 7 | `sigmoid` | 24 | decoder |
+| 8 | `split` | 24 | decoder |
+| 9 | `softplus` | 18 | decoder |
+| 10 | `div` | 7 | decoder + attention |
+| 11 | `gather` | 2 | attention |
+| 12 | `identity` | 2 | gdr |
+| 13 | `embedding` | 1 | decoder |
 
-### 5.1 batch2/3 优先级建议
+batch-2 已关闭、因此**不再出现在清单里**的两个点：`where` 的 scalar fill（7 处）与
+`compare` 的冗余 `broadcast` 属性（1 处）。batch-2 相关 opcode 引用合计 **2127 次**
+（batch-2 新登记 6 个 opcode = **2119 次**，另加 `where` 7 + `compare` 1），现在全部
+plan 成功，0 次被 region 预检或契约拒绝。
 
-1. **batch2 第一优先级：`add/sub/mul/div/neg/broadcast`**。它们合计 1270+ 次，是 decoder
-   逐元素算术主干；`mul` 单个就 544 次，没有它 attention/GDR/decoder 全部 region 不可规划。
-2. **batch2 第二优先级：`transpose/slice/concat/split/constant/identity`**（shape/数据搬运 +
-   常量）。`transpose` 414、`slice` 356、`concat` 69、`split` 24；`constant` 66 是唯一
-   "无输入产生张量"的 opcode，注册前需要决定 value 属性的 canonical 域（建议先只支持
-   标量/小 shape 的字面量）。`view`/别名语义仍需按 `0019 §6.1` 先冻结 `must_alias` 义务。
-3. **batch2 第三优先级（激活家族）：`rsqrt/silu/sigmoid/softplus/reduce_mean`**（合计 296）。
-   与 `exp` 同族，按 `deterministic_bounded`（无解析界）登记即可，不要为了"看起来精确"
-   把 libm 路径写成 exact。
-4. **batch3：`gather/embedding`（3 次）**。频次低但 attention/decoder 各自需要，属于
-   数据搬运 + index dtype 语义，单独成片。
-5. **两个当前已登记但真实图请求不可规划的点**（不是缺 contract，不应混入注册优先级）：
-   - `where` 的 fill 是 scalar operand → `0019 §8` 明确"标量操作数不在本批执行契约内"。
-     真实图要用 `where` 必须先扩展标量 operand 契约，或由前端把 fill 提升为张量；
-   - `compare` 的 Core IR 属性含 `broadcast`，而 compare 契约白名单只有 `predicate` 族
-     → `unknown_attribute`。需要决定是给 compare 契约增加 `broadcast`（语义等价于尾轴广播，
-     需契约升版）还是让构图侧不写该属性。两件事都必须单独升契约版本，不能在本切片悄悄放宽。
+### 5.1 batch3 优先级建议（更新）
 
-以上频次是**注册优先级输入**，不是执行承诺；每个 opcode 仍需按 0019 的 verifier/precision
+1. **batch3 第一优先级：`reduce_mean/concat/constant/silu`（274 次）**。`reduce_mean` 79 是
+   reduction 家族缺口（可复用 `reduce_sum` 的 axes/keepdims 与浮点误差口径）；`concat` 69、
+   `constant` 66、`silu` 60 是 decoder 的拼接/字面量/激活主干。`constant` 注册前需冻结
+   `value` 属性的 canonical 域（建议先支持标量/小 shape 字面量）；`concat` 需沿轴 shape 规则。
+2. **第二优先级：`neg/sub/sigmoid/split/softplus/div`（132 次）**。`sub/div` 与已 land 的
+   `add/mul` 同族（尾轴广播 + scalar 操作数 + 整数/浮点精度路径），可直接复用 batch-2 模板；
+   `neg` 一元逐元素；`sigmoid/softplus` 按 `deterministic_bounded`（无解析界）登记。
+   **`split` 是多输出 opcode**：当前执行契约与 region schema 都以"单输出"为前提，
+   batch3 必须先定义多输出 plan（或明确的 `getitem` 取用语义），否则会被
+   `multi_output_not_supported_by_execution_contract` 拒绝——这属于契约缺口，不是 scalar 预检。
+3. **第三优先级：`gather/identity/embedding`（5 次）**。频次低但 attention/decoder 各自需要；
+   `gather/embedding` 需要 index dtype 与别名义务；`identity` 可能落入 view 语义（`may_alias`）。
+
+以上频次是**注册优先级输入**，不是执行承诺；每个 opcode 仍需按 0019/0050 的 verifier/precision
 模式补齐契约、差分矩阵与零回归。
 
 ## 6. explain 与 CLI
@@ -439,6 +464,9 @@ python -m pypto.execution.cli explain --region-plan region.json [--snapshot snap
   `region_precision_projection_mismatch` 结构化拒绝；
 - 序列化往返（`load_region_plan` / `RegionPlan.from_dict`）digest 不变；对 boundary / 整图 /
   零输入 iota 三种产出各跑 `plan → validate(re_resolve=False) → load → explain` 往返；
+- **scalar 操作数锚定**：`where` fill / `add` / `mul` 的 scalar region 均做
+  `plan → validate → load → explain` 往返；scalar operand 的 `kind` 进 preimage（删除 →
+  `region_digest_mismatch`），重签后仍被边界交叉检查拒绝（`region_boundary_type_mismatch`）；
 - **版本拒绝**：把 round-1 的文档（schema=1，已知 digest `626cc908…`）交给 v2 解码器 →
   `region_schema_version_legacy`（`re_resolve=False/True` 都一样，先于任何语义解释）；当前 v2
   文档正常接受；重签后的"空 operations"文档 → `region_operations_empty`（不再是裸 `ValueError`）；
@@ -449,12 +477,12 @@ python -m pypto.execution.cli explain --region-plan region.json [--snapshot snap
   仍正常工作（无 `/proc/cpuinfo`、无 pinned library dlopen）；默认路径（不传 capability）
   仍按 lazy 一次性探测。
 
-### 7.3 零回归（923a72e26 → `06910f996`）
+### 7.3 零回归（923a72e26 → `241067edc`）
 
 证据：`raw/single_op_digests_923a72e26.json`、`raw/single_op_digests_tip.json`、
 `raw/single_op_digest_zero_regression.json`（同一主机、同一 capability digest `e0a9dac8…`）：
 
-| 项 | 923a72e26 | tip `06910f996` | 结论 |
+| 项 | 923a72e26 | tip `241067edc` | 结论 |
 |---|---|---|---|
 | `plan_matmul` f32 (2,3)×(3,4) | `e0d1287e…` | `e0d1287e…` | 逐字节一致 |
 | `plan_matmul` bf16 | `7e95c65c…` | `7e95c65c…` | 逐字节一致 |
@@ -471,16 +499,17 @@ iota 往返、嵌套/block 拒绝、显式 capability 无 probe）。
 
 - focused（未持锁）：`env PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=python:python/tests/ut
   python3 -m pytest -q -rs -p no:cacheprovider
-  python/tests/ut/pypto_x/test_execution_region_planning.py` → **64 passed**（约 2.4 s）；
+  python/tests/ut/pypto_x/test_execution_region_planning.py` → **67 passed**（约 3.1 s）；
   与既有 `test_execution_matmul.py` + `test_execution_ops_registry_batch1.py` +
-  `test_execution_discovery.py` 合并跑 → **307 passed**（`logs/focused_region_tests.log`、
+  `test_execution_discovery.py` 合并跑 → **310 passed**（`logs/focused_region_tests.log`、
   `logs/focused_region_plus_execution_suite.log`）。
 - 规则 8 全量（hold local lock，6 线程，命令
   `env PYPTO_X_PORTABLE_ONLY=1 PYTHONPATH=python:python/tests/ut python3 -m pytest -q -rs
-  -p no:cacheprovider python/tests/ut/pypto_x`）：**collect 2390 / passed 2380 / skipped 10 /
-  failed 0 / rc 0，耗时 22:01（1321.44 s）**（`logs/rule8_full.log`、`logs/rule8_rc.txt`、
-  `logs/rule8_elapsed_seconds.txt`、`logs/rule8_final_summary.json`）。10 个 skip 为 7 个本机无
-  CUDA driver（既有）+ 3 个 host-guarded 基线 digest 钉（batch1 的 2 个 + 本切片新增的
+  -p no:cacheprovider python/tests/ut/pypto_x`，2026-09-19 20:11:24–20:34:00）：**collect 2437 /
+  passed 2426 / skipped 11 / failed 0 / rc 0，耗时 22:11（1331.06 s）**
+  （`logs/rule8_full.log`、`logs/rule8_rc.txt`、`logs/rule8_elapsed_seconds.txt`、
+  `logs/rule8_final_summary.json`）。11 个 skip 为 7 个本机无 CUDA driver（既有）+
+  4 个 host-guarded 基线 digest 钉（batch1 的 2 个、batch2 的 1 个、本切片新增的
   `test_single_operation_digests_match_the_frozen_baseline`：heavy 锁把 `OMP_NUM_THREADS`
   设为 6，AOCL manifest 的线程事实变化导致 capability digest 不同，这是既有机制而不是本切片漂移）。
 
@@ -491,8 +520,12 @@ iota 往返、嵌套/block 拒绝、显式 capability 无 probe）。
   round-2 仅为验收要求把 `entry.capability_for_policy` 改成 **lazy probe**（显式 capability
   不再无条件 `probe_host()`），默认路径行为与 digest 逐字节不变（§7.3 重新验证）；
   `pypto/__init__.py` 未改（region API 经 `pypto.execution` 显式导入）；
-- **不支持的请求**：标量 operand（`where` fill 等）、多输出/无输出、非 tensor 结果、
-  动态/符号 shape；这些全部结构化拒绝，不静默降级；
+- **scalar 操作数（round-4）**：tensor/scalar 操作数一律委托 opcode 契约判定；scalar 以
+  `kind="scalar"` + `shape=[]` 进入逐 op 条目与边界签名（进 digest），不允许 scalar 作为
+  算子结果；scalar exit 仅允许参数 pass-through；`kind ∉ {tensor, scalar}` 的操作数仍在
+  region 层结构化拒绝（`non_tensor_non_scalar_operand_not_supported`）；
+- **仍不支持的请求**：多输出/无输出、非 tensor 结果、动态/符号 shape；这些全部结构化拒绝，
+  不静默降级；
 - **嵌套/block region 明确拒绝**：`region_nested_region_not_supported` /
   `region_block_region_not_supported`；扁平 `CoreProgram`（Qwen 三个真实图均为扁平）是唯一
   已冻结路径。round-2 前它们会被"拍平"进计划，无法表达嵌套作用域，属实现与文档不一致，现已
