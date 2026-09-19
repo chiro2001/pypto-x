@@ -1,15 +1,16 @@
 # PyPTO-X 接手文档
 
-状态：`PAUSED_BY_USER_2026_09_14_0825CST__W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_0009_0010_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q5_Q6_Q7_Q8_Q8B_Q9_Q10_N4_C6_C7_DONE_W8A8_V2_M2_DONE_VIEW_MODE_REQUIRE_STABLE_U2A_VENDOR_PROVIDER_DONE_AVX2_LAYOUT_DONE_SVE256_W8A8_THROUGHPUT_FIXED_0040_AND_0041_AND_0042_AND_0043_PUSHED_0044_PUSHED_REPORT_SCHEMA_V4_MEMO_ELF_INTEGRITY_0046_PUSHED_ALL_VERIFICATIONS_TERMINAL_U3_DISCOVERY_U4_ENV_REGISTRY_CUDA_SM120_OP_BENCH_HARDENED_0045_CUDA_REVIVED_ALL_LEGS_PASS_ERR_0013_0047_INT8_EXACT_BLOCKED_AND_X86_POSITION_NATIVE_LANDED_ERR_0014`
+状态：`0048_TO_0050_CLOSED_ALL_SLICES_VERIFIED_0046_0047_PUSHED_W8A_BF16_ALIGNED_EN_ZH_CHAT_T18_NEAR_TIE_PASS_W8H_W8I_VERIFIED_W8B_B1_B2_B3A_B3B_B3C_B5_B6_VERIFIED_W8C_C1_C2_C3_C4_C5_C6_VERIFIED_W8C_W8A8_GRAPH_PATH_VERIFIED_W8J_J1_J2_VERIFIED_ERR_0003_0004_0005_0006_0007_0008_0009_0010_KF_0001_CLOSED_A3_ONBOARDED_N1_N5_PAUSED_VENDOR_GEMM_ADOPTED_Q1_Q2_Q3_Q4_Q5_Q6_Q7_Q8_Q8B_Q9_Q10_N4_C6_C7_DONE_W8A8_V2_M2_DONE_VIEW_MODE_REQUIRE_STABLE_U2A_VENDOR_PROVIDER_DONE_AVX2_LAYOUT_DONE_SVE256_W8A8_THROUGHPUT_FIXED_0040_AND_0041_AND_0042_AND_0043_PUSHED_0044_PUSHED_REPORT_SCHEMA_V4_MEMO_ELF_INTEGRITY_0046_PUSHED_ALL_VERIFICATIONS_TERMINAL_U3_DISCOVERY_U4_ENV_REGISTRY_CUDA_SM120_OP_BENCH_HARDENED_0045_CUDA_REVIVED_ALL_LEGS_PASS_ERR_0013_0047_INT8_EXACT_BLOCKED_AND_X86_POSITION_NATIVE_LANDED_ERR_0014`
 
-> **暂停通告（2026-09-14 08:25 CST）**：用户指示「09:00 之后暂停任务」，父 agent **提前完成安全暂停**——
-> 停掉 CUDA 两个守望单元（未跑计时腿、零数字）、中断四个在飞 agent（均可续）、释放 local/gamepc 两把锁、
-> 在 `configs/development_lock.yaml` 的 `waves.W8.paused_by_user_2026_09_14` 写入了完整恢复清单。
-> 当前集成 tip `8b5246557`（clean）、控制仓与公开 main `d722018`、公开补丁集仍是 0047 的 **275** 段。
-> **恢复入口**：读该 lock 条目的 `resume_checklist`（7 步）与 `parked_work`。注意：早前「CUDA 9 点后可开始」
-> 与本次「9 点后暂停」冲突，父方按后者执行；若要跑 CUDA 计时腿，重启两个单元即可（一分钟）。
+> **0048–0050 收口通告（2026-09-19）**：冻结 `integration = 9264deb93`（tree `ec93dfb1…`）、补丁 **283**
+> （`am` 复算 283/283、复算 tree = 冻结 tree）、父方最终 gate **2426 passed / 11 skipped / 0 failed / 22:12**（collect 2437）。
+> 四切片全部独立验收 **PASS_WITH_BOUNDARIES**（composite 组合化 / opcode 契约两批 / U5 只读 region）；
+> 真实 Qwen 图缺失契约 **19→13 类**、region `unplannable` **212→0**。CUDA 计时腿已于 09-19 补跑完成：
+> **native sm_120 cubin 相对 PTX-JIT 无可测优势**（≤0.42%，UNGATED）。快照见 `docs/00-handoffs/0048-0050-*.md`；
+> 下一批候选：Tier 2 契约（`reduce_mean/concat/constant/silu/neg/sub`，注意 `split` 需先有多输出 ABI）、U5 step-2（region 执行）。
 
-最后更新：2026-09-19 20:25 CST（Asia/Shanghai；**已按用户指示恢复**：CUDA 计时腿在空闲窗口补跑完成——`status=PASS`、时钟门 VALID、三路径 kernel 时间相差 ≤0.42%（native sm_120 cubin **无可测优势**）、数字 UNGATED；CPU 线在续：batch-2 验收与 U5 round-4（scalar 预检收口）。此前：0046/0047 已收口推送（公开补丁 275 段）、0048/0049 已验 PASS_WITH_BOUNDARIES、0050 已落地待独立验收；恢复计划见 lock `resumed_by_user_2026_09_19` 与 `paused_by_user_2026_09_14`）
+
+最后更新：2026-09-19 21:10 CST（Asia/Shanghai；**0048–0050 已收口并推送**：tip `9264deb93`、补丁 283、gate 2426 passed / 0 failed / 22:12；四切片全 PASS_WITH_BOUNDARIES；CUDA 计时腿完成且 cubin 无可测优势；0018–0022 契约文档 + 0048–0050 快照 + ERRATA 15 条均已入库。此前 0046/0047 亦已推送）
 
 > **零记忆恢复（上下文压缩后）**：按顺序读 本文件 §0 → `docs/00-handoffs/ERRATA.zh-CN.md` → `docs/00-handoffs/0039-2026-09-11-a3-onboarding-ascend-bridge-sve-w8a8.zh-CN.md` → `configs/development_lock.yaml` 的 `waves.W8.in_flight_2026_09_11_batch2` 与 `pending_user_decisions_2026_09_11`。
 
