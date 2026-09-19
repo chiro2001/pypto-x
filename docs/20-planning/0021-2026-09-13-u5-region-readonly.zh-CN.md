@@ -232,7 +232,11 @@ snapshot>)` 得到的 `ExecutionPlan.digest`；`request` 字段足以在**不依
   因此 `REGION_SCHEMA_VERSION` 保持 **2**，v1 仍 `region_schema_version_legacy`。
 - **实测**：三张真实 Qwen 图共 2127 次 batch-2 相关 opcode 引用（其中 batch-2 新登记 6 个
   opcode 恰为 2119 次）现在**全部 plan 成功**，region 级 scalar 预检造成的
-  `unplannable_operations` 从 205 次降为 **0**（见 §5）。
+  `unplannable_operations` 从 **212** 次降为 **0**（见 §5）。
+
+> **精度修正（2026-09-19，由 `verify-0049-u5-region-r4` 独立复算）**：在 `8b5246557`（batch-2 已落地、scalar 委托前）实测
+> `unplannable_operations` 为 **212**（`add:scalar` 176 + `mul:scalar` 29 + `where:scalar` 7），而非本文先前写的 205——
+> 205 是作者把 `where` 的 7 次另列后的口径。round-4 后精确为 **212 → 0**。类数 19→13、六算子归零与其余结论不受影响。
 
 严格校验器 `validate_region_plan(document, *, policy=None, capability=None, re_resolve=False)`
 按固定顺序检查（任一失败抛 `ARTIFACT_MISMATCH`，不修复）：
@@ -337,7 +341,7 @@ proven-bounded / portable-present）、`selected_class`、`selected_rule`、
 证据：`raw/qwen_region_missing_contracts.json`（脚本 `scripts/qwen_region_missing_contracts.py`；
 对三个 builder 各跑一次 `plan_region(整个 program)`；read-only）。batch-2（`8b5246557`）之后
 三个图仍然**结构化拒绝**，但拒绝原因已经只剩"未登记 contract"：`unplannable_operations`
-三图**全部为 0**——batch-2 前由 region 层 scalar 预检造成的 205 次已归零（round-4）。
+三图**全部为 0**——batch-2 前由 region 层 scalar 预检造成的 **212** 次已归零（round-4；精确口径见上面勘误）。
 
 | builder | ops | 已登记 op（全部 plan 成功） | 缺失 contract（op → 次数） | unplannable |
 |---|---|---|---|---|
