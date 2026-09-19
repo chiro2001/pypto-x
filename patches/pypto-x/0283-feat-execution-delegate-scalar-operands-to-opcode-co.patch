@@ -1,0 +1,490 @@
+From 9264deb93eece5ddc7b058caf3fae0561108f0bb Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Sat, 19 Sep 2026 20:09:26 +0800
+Subject: [PATCH 283/283] feat(execution): delegate scalar operands to opcode
+ contracts in region plans
+
+Round-4 for u5-region-readonly, based on integration tip 8b5246557.
+
+* Remove the region-level blanket scalar pre-check.  Tensor and scalar
+  operands are delegated to the opcode contract: a scalar is expressed as
+  shape=[] plus dtype and the frozen contract decides (batch-2 admits the
+  where fill and the add/mul scalar sides; exp/reduce report rank_out_of_range
+  instead of the old region reason).  Other Core IR value kinds are still
+  refused with non_tensor_non_scalar_operand_not_supported, a scalar with a
+  non-empty shape with scalar_operand_shape_invalid.
+* Express scalar constants faithfully in the plan: request inputs carry
+  "kind": "scalar" (missing kind means tensor, mirroring the batch-2
+  single-op plan convention), and boundary entry_inputs may be scalar with
+  shape [].  Both live inside the region_digest preimage; def-use
+  cross-checks the operand kind against its boundary entry, a scalar cannot
+  be an operation result, and scalar exits are limited to entry
+  pass-throughs.
+* No schema bump: this is an additive optional field plus a validation
+  relaxation, existing v2 documents keep their meaning and digest, and v1
+  stays region_schema_version_legacy.  plan_region still self-validates its
+  own document before returning.
+* Real Qwen evidence: the three graphs now report unplannable_operations = 0
+  (205 scalar-precheck rejections removed); all 4282 registered-op references
+  plan, including all 2119 references to the six batch-2 opcodes and the
+  where/compare patches.  The merged missing-contract list stays 13 classes
+  (reduce_mean 79, concat 69, constant 66, silu 60, neg 30, sub 29,
+  sigmoid 24, split 24, softplus 18, div 7, gather 2, identity 2,
+  embedding 1).
+* Tests: where/add/mul scalar region round-trips, scalar boundary spec,
+  scalar kind anchoring, contract-delegation regression; 67 region tests,
+  310 with the existing execution suite.
+
+(cherry picked from commit 241067edc2c3b05dd2d7150c71dbad1cf26a902e)
+---
+ python/pypto/execution/region.py                          | 159 ++++++++++++++++++++++++++-------
+ python/tests/ut/pypto_x/test_execution_region_planning.py | 160 +++++++++++++++++++++++++++++-----
+ 2 files changed, 263 insertions(+), 56 deletions(-)
+
+diff --git a/python/pypto/execution/region.py b/python/pypto/execution/region.py
+index 9bf6ee5e2..26652cdad 100644
+--- a/python/pypto/execution/region.py
++++ b/python/pypto/execution/region.py
+@@ -1514,22 +1514,45 @@ def plan_region(
+             active_capability,
+             require_proven=bool(active_policy.numeric.require_proven_deviation_bound),
+         )
+-    for item in list(boundary["entry_inputs"]) + list(boundary["exit_outputs"]):
+-        if str(item["kind"]) != "tensor":
++    for item in boundary["entry_inputs"]:
++        kind = str(item["kind"])
++        if kind not in ("tensor", "scalar"):
+             raise OpContractError(
+-                "this slice only plans tensor region boundaries; {!r} is {!r}".format(
+-                    item["name"], item["kind"]
++                "region entry {!r} has an unsupported value kind {!r}".format(
++                    item["name"], kind
+                 ),
+                 field="region_spec",
+-                requested={
+-                    "function": item["function"],
+-                    "name": item["name"],
+-                    "kind": item["kind"],
+-                },
+-                available="tensor boundaries (scalar operands are outside the batch-1 contracts)",
+-                reason="region_boundary_non_tensor",
++                requested={"function": item["function"], "name": item["name"], "kind": kind},
++                available=["tensor", "scalar"],
++                reason="region_boundary_operand_kind_invalid",
+                 capability_digest=active_capability.digest,
+             )
++        if kind == "scalar" and list(item["shape"]) != []:
++            raise OpContractError(
++                "scalar region entry {!r} must have an empty shape".format(item["name"]),
++                field="region_spec",
++                requested={"name": item["name"], "shape": list(item["shape"])},
++                available=[],
++                reason="region_scalar_boundary_shape_invalid",
++                capability_digest=active_capability.digest,
++            )
++    for item in boundary["exit_outputs"]:
++        kind = str(item["kind"])
++        if kind == "tensor":
++            continue
++        if kind == "scalar" and str(item["source"]) == "entry_pass_through":
++            # A scalar parameter returned unchanged is a legal whole-program
++            # pass-through exit; every operation result stays a tensor.
++            continue
++        raise OpContractError(
++            "region exit {!r} cannot be a {!r} value (operation results are tensors; "
++            "scalar exits are only entry pass-throughs)".format(item["name"], kind),
++            field="region_spec",
++            requested={"function": item["function"], "name": item["name"], "kind": kind},
++            available="tensor exits, or a scalar entry pass-through",
++            reason="region_boundary_non_tensor",
++            capability_digest=active_capability.digest,
++        )
+ 
+     terms = [_term_from_record(record) for record in records]
+     region_precision = compose_region_precision(
+@@ -1633,16 +1656,30 @@ def _plan_region_operation(
+         }
+ 
+     for ref in operation.inputs:
+-        if ref.type.kind != "tensor":
++        if ref.type.kind not in ("tensor", "scalar"):
++            # Tensor and scalar operands are delegated to the opcode contract
++            # (batch-2 admits scalar operands where the frozen document says
++            # so).  Other Core IR value kinds cannot be represented by the
++            # execution contracts at all and are refused here.
+             return "unplannable", {
+                 "opcode": canonical,
+                 "raw_name": raw_name,
+-                "reason": "scalar_operand_not_supported_by_execution_contract",
++                "reason": "non_tensor_non_scalar_operand_not_supported",
+                 "index": region_index,
+                 "function": op.function,
+                 "path": op.path,
+                 "operand": {"name": ref.name, "kind": ref.type.kind},
+             }
++        if ref.type.kind == "scalar" and tuple(ref.type.shape) != ():
++            return "unplannable", {
++                "opcode": canonical,
++                "raw_name": raw_name,
++                "reason": "scalar_operand_shape_invalid",
++                "index": region_index,
++                "function": op.function,
++                "path": op.path,
++                "operand": {"name": ref.name, "shape": list(ref.type.shape)},
++            }
+     if len(operation.outputs) != 1:
+         return "unplannable", {
+             "opcode": canonical,
+@@ -1808,14 +1845,17 @@ def _request_from_operation(
+     roles = tuple(definition.input_roles or ())
+     for index, ref in enumerate(operation.inputs):
+         role = roles[index] if index < len(roles) else "operand{}".format(index)
+-        inputs.append(
+-            {
+-                "name": ref.name,
+-                "role": role,
+-                "shape": list(ref.type.shape),
+-                "dtype": ref.type.dtype,
+-            }
+-        )
++        operand = {
++            "name": ref.name,
++            "role": role,
++            "shape": list(ref.type.shape),
++            "dtype": ref.type.dtype,
++        }
++        if ref.type.kind != "tensor":
++            # Mirror the frozen single-op plan convention: ``kind`` is emitted
++            # only for non-tensor operands (a missing ``kind`` means tensor).
++            operand["kind"] = ref.type.kind
++        inputs.append(operand)
+     outputs = [
+         {"name": ref.name, "shape": list(ref.type.shape), "dtype": ref.type.dtype}
+         for ref in operation.outputs
+@@ -2499,14 +2539,32 @@ def _validate_boundary_signature(boundary: Mapping[str, Any]) -> Mapping[str, An
+                     requested=item["dtype"],
+                     reason="region_boundary_invalid",
+                 )
+-            if item["kind"] != "tensor":
++            boundary_kind = item["kind"]
++            if boundary_kind not in ("tensor", "scalar"):
+                 raise ArtifactMismatchError(
+-                    "this slice only plans tensor boundaries",
++                    "boundary entry kind must be tensor or scalar",
+                     field="region_plan.boundary_signature.{}[{}].kind".format(role, index),
+-                    requested=item["kind"],
+-                    available="tensor",
+-                    reason="region_boundary_non_tensor",
++                    requested=boundary_kind,
++                    available=["tensor", "scalar"],
++                    reason="region_boundary_operand_kind_invalid",
++                )
++            if boundary_kind == "scalar" and list(item["shape"]) != []:
++                raise ArtifactMismatchError(
++                    "a scalar boundary entry must have an empty shape",
++                    field="region_plan.boundary_signature.{}[{}].shape".format(role, index),
++                    requested=item["shape"],
++                    available=[],
++                    reason="region_scalar_boundary_shape_invalid",
+                 )
++            if role == "exit_output" and boundary_kind == "scalar":
++                if str(item.get("source")) != "entry_pass_through":
++                    raise ArtifactMismatchError(
++                        "operation results are tensors; a scalar exit must be an entry pass-through",
++                        field="region_plan.boundary_signature.exit_outputs[{}].kind".format(index),
++                        requested=boundary_kind,
++                        available=["tensor", "scalar entry_pass_through"],
++                        reason="region_boundary_non_tensor",
++                    )
+             identity = (item["function"], item["name"])
+             identity = (identity, role)
+             if identity in seen:
+@@ -3104,9 +3162,10 @@ def _validate_request(request: Any, position: int) -> Mapping[str, Any]:
+                     requested=type(item).__name__,
+                     reason="region_operation_request_invalid",
+                 )
+-            allowed = ("name", "role", "shape", "dtype") if key == "inputs" else (
++            allowed = ("name", "role", "shape", "dtype", "kind") if key == "inputs" else (
+                 "name", "shape", "dtype"
+             )
++            required = ("name", "role", "shape", "dtype") if key == "inputs" else allowed
+             unknown_operand = sorted(str(field) for field in item if str(field) not in allowed)
+             if unknown_operand:
+                 raise ArtifactMismatchError(
+@@ -3116,15 +3175,32 @@ def _validate_request(request: Any, position: int) -> Mapping[str, Any]:
+                     available=list(allowed),
+                     reason="region_operation_request_unknown_field",
+                 )
+-            if any(field not in item for field in allowed):
++            if any(field not in item for field in required):
+                 raise ArtifactMismatchError(
+                     "request {} entry is missing fields".format(key),
+                     field="region_plan.operations[{}].request.{}[{}]".format(position, key, index),
+                     requested=sorted(str(field) for field in item),
+-                    available=list(allowed),
++                    available=list(required),
+                     reason="region_operation_request_field_missing",
+                 )
+             if key == "inputs":
++                operand_kind = item.get("kind", "tensor")
++                if operand_kind not in ("tensor", "scalar"):
++                    raise ArtifactMismatchError(
++                        "request operand kind must be tensor or scalar",
++                        field="region_plan.operations[{}].request.inputs[{}].kind".format(position, index),
++                        requested=operand_kind,
++                        available=["tensor", "scalar"],
++                        reason="region_operation_request_inconsistent",
++                    )
++                if operand_kind == "scalar" and list(item["shape"]) != []:
++                    raise ArtifactMismatchError(
++                        "a scalar operand must have an empty shape",
++                        field="region_plan.operations[{}].request.inputs[{}].shape".format(position, index),
++                        requested=item["shape"],
++                        available=[],
++                        reason="region_scalar_operand_shape_invalid",
++                    )
+                 if not isinstance(item["role"], str):
+                     raise ArtifactMismatchError(
+                         "request operand role must be a string",
+@@ -3232,8 +3308,18 @@ def _validate_operation_def_use(
+     for item in operations:
+         for operand in item["request"]["inputs"]:
+             key = (item["function"], str(operand["name"]))
++            operand_kind = str(operand.get("kind", "tensor"))
+             producer = operator_outputs.get(key)
+             if producer is not None:
++                if operand_kind != "tensor":
++                    # Registered contracts only produce tensor results, so a
++                    # scalar operand can never be an operation result.
++                    raise ArtifactMismatchError(
++                        "a scalar operand cannot be produced by a region operation",
++                        field="region_plan.operations[{}].request.inputs".format(item["index"]),
++                        requested={"function": key[0], "name": key[1], "kind": operand_kind},
++                        reason="region_scalar_operand_from_operation",
++                    )
+                 if producer >= int(item["index"]):
+                     raise ArtifactMismatchError(
+                         "operation reads a value defined later or by itself",
+@@ -3257,6 +3343,7 @@ def _validate_operation_def_use(
+                 operand["dtype"],
+                 "region_plan.boundary_signature.entry_inputs",
+                 "region_boundary_type_mismatch",
++                kind=operand_kind,
+             )
+     if str(region_spec.get("kind")) == "boundary":
+         unused = sorted(set(entry_entries) - used_entries)
+@@ -3296,6 +3383,7 @@ def _validate_operation_def_use(
+                 result["dtype"],
+                 "region_plan.boundary_signature.exit_outputs",
+                 "region_boundary_type_mismatch",
++                kind="tensor",
+             )
+     for key, entry in exit_entries.items():
+         source = str(entry["source"])
+@@ -3336,6 +3424,7 @@ def _validate_operation_def_use(
+                 entry_entries[key]["dtype"],
+                 "region_plan.boundary_signature.exit_outputs",
+                 "region_boundary_type_mismatch",
++                kind=str(entry_entries[key].get("kind", "tensor")),
+             )
+ 
+ 
+@@ -3345,13 +3434,19 @@ def _check_boundary_types(
+     dtype: Any,
+     field: str,
+     reason: str,
++    kind: str = "tensor",
+ ) -> None:
+-    if list(entry["shape"]) != [int(item) for item in shape] or str(entry["dtype"]) != str(dtype):
++    entry_kind = str(entry.get("kind", "tensor"))
++    if (
++        entry_kind != kind
++        or list(entry["shape"]) != [int(item) for item in shape]
++        or str(entry["dtype"]) != str(dtype)
++    ):
+         raise ArtifactMismatchError(
+             "boundary entry does not match the operation operand/result type",
+             field=field,
+-            requested={"shape": entry["shape"], "dtype": entry["dtype"]},
+-            available={"shape": list(shape), "dtype": dtype},
++            requested={"kind": entry_kind, "shape": entry["shape"], "dtype": entry["dtype"]},
++            available={"kind": kind, "shape": list(shape), "dtype": dtype},
+             reason=reason,
+         )
+ 
+diff --git a/python/tests/ut/pypto_x/test_execution_region_planning.py b/python/tests/ut/pypto_x/test_execution_region_planning.py
+index 3078ad4c0..58cd7d112 100644
+--- a/python/tests/ut/pypto_x/test_execution_region_planning.py
++++ b/python/tests/ut/pypto_x/test_execution_region_planning.py
+@@ -605,35 +605,147 @@ def test_missing_contracts_are_aggregated_by_opcode_with_counts():
+     assert error.details["unplannable_operations"] == []
+ 
+ 
+-def test_unplannable_registered_operations_are_reported():
+-    cond = _ref("cond", "bool", (2,))
+-    x = _ref("x", "float32", (2,))
+-    fill = _scalar("fill", "float32")
+-    y = _ref("y", "float32", (2,))
+-    w = _ref("w", "float32", (2,))
+-    c = _ref("c", "bool", (2,))
+-    program = _program(
+-        (cond, x, fill, y),
+-        (
+-            _op("where", (cond, x, fill), (w,)),
+-            _op("compare", (w, y), (c,), {"predicate": "lt", "broadcast": True}),
+-        ),
+-        (c,),
+-    )
+-    error = _expected_error(OpContractError, lambda: plan_region(program))
++def test_contract_rejections_are_delegated_and_reported():
++    # ``exp`` has no scalar contract: the region planner must delegate the
++    # request to the opcode contract and report the contract's reason instead
++    # of running a region-level scalar pre-check.
++    scalar = _scalar("s", "float32")
++    e = _ref("e", "float32", (2,))
++    scalar_program = _program((scalar,), (_op("exp", (scalar,), (e,)),), (e,))
++    error = _expected_error(OpContractError, lambda: plan_region(scalar_program))
+     assert error.reason == "region_operations_unplannable"
+     reported = {
+         (item["opcode"], item["reason"])
+         for item in error.details["unplannable_operations"]
+     }
+-    # 0050-A patch B closed the ``compare.broadcast`` gap at the contract
+-    # layer, so only the U5 region entry's scalar-operand pre-check (which this
+-    # slice must not modify) still reports ``where``; the compare op planned.
+-    assert (
+-        "where",
+-        "scalar_operand_not_supported_by_execution_contract",
+-    ) in reported
+-    assert not any(opcode == "compare" for opcode, _reason in reported)
++    assert ("exp", "rank_out_of_range") in reported
++    assert not any(
++        reason == "scalar_operand_not_supported_by_execution_contract"
++        for _opcode, reason in reported
++    )
++
++    # Unknown attributes are still reported through the contract verifier.
++    x = _ref("x", "float32", (2, 3))
++    y = _ref("y", "float32", (6,))
++    attribute_program = _program(
++        (x,),
++        (_op("reshape", (x,), (y,), {"shape": [6], "bogus": 1}),),
++        (y,),
++    )
++    attribute_error = _expected_error(
++        OpContractError, lambda: plan_region(attribute_program)
++    )
++    attribute_reported = {
++        (item["opcode"], item["reason"])
++        for item in attribute_error.details["unplannable_operations"]
++    }
++    assert ("reshape", "unknown_attribute") in attribute_reported
++
++
++def _scalar_region_cases():
++    cond = _ref("cond", "bool", (2, 3))
++    x = _ref("x", "float32", (2, 3))
++    fill = _scalar("fill", "float32")
++    w = _ref("w", "float32", (2, 3))
++    where_program = _program(
++        (cond, x, fill),
++        (_op("where", (cond, x, fill), (w,)),),
++        (w,),
++    )
++    a = _ref("a", "float32", (2, 3))
++    s = _scalar("s", "float32")
++    y = _ref("y", "float32", (2, 3))
++    add_program = _program(
++        (a, s), (_op("add", (a, s), (y,)),), (y,)
++    )
++    mul_program = _program(
++        (s, a), (_op("mul", (s, a), (y,)),), (y,)
++    )
++    return {
++        "where_scalar_fill": (where_program, [2]),
++        "add_scalar_right": (add_program, [1]),
++        "mul_scalar_left": (mul_program, [0]),
++    }
++
++
++def test_scalar_operand_regions_round_trip(tmp_path):
++    for name, (program, scalar_positions) in _scalar_region_cases().items():
++        plan = plan_region(program)
++        document = plan.to_dict()
++        request = document["operations"][0]["request"]
++        for position in scalar_positions:
++            assert request["inputs"][position]["kind"] == "scalar", name
++            assert request["inputs"][position]["shape"] == [], name
++        entry_kinds = [
++            item["kind"] for item in document["boundary_signature"]["entry_inputs"]
++        ]
++        assert "scalar" in entry_kinds, name
++
++        assert validate_region_plan(
++            document, policy=plan.policy, re_resolve=False
++        ) == document, name
++        assert plan.validate() is plan, name
++        path = tmp_path / ("%s.json" % name)
++        path.write_text(canonical_json(document) + "\n", encoding="utf-8")
++        loaded = load_region_plan(path, capability=plan.capability)
++        assert loaded.digest == plan.digest, name
++        explanation = explain_region_plan(document, capability=plan.capability)
++        assert explanation.to_dict()["region_plan_digest"] == plan.digest, name
++
++
++def test_scalar_boundary_spec_round_trips(tmp_path):
++    a = _ref("a", "float32", (2, 3))
++    s = _scalar("s", "float32")
++    y = _ref("y", "float32", (2, 3))
++    program = _program((a, s), (_op("add", (a, s), (y,)),), (y,))
++    plan = plan_region(program, RegionSpec.boundary(["a", "s"], ["y"]))
++    document = plan.to_dict()
++    entries = {
++        item["name"]: item for item in document["boundary_signature"]["entry_inputs"]
++    }
++    assert entries["a"]["kind"] == "tensor"
++    assert entries["s"]["kind"] == "scalar"
++    assert entries["s"]["shape"] == []
++    assert document["operations"][0]["request"]["inputs"][1]["kind"] == "scalar"
++    assert validate_region_plan(
++        document, policy=plan.policy, re_resolve=True
++    ) == document
++    path = tmp_path / "scalar_boundary.json"
++    path.write_text(canonical_json(document) + "\n", encoding="utf-8")
++    loaded = load_region_plan(path, capability=plan.capability)
++    assert loaded.digest == plan.digest
++    assert explain_region_plan(
++        document, capability=plan.capability
++    ).to_dict()["region_plan_digest"] == plan.digest
++
++
++def test_scalar_operand_kind_is_anchored_and_cross_checked():
++    program, _positions = _scalar_region_cases()["add_scalar_right"]
++    plan = plan_region(program)
++    genuine = plan.to_dict()
++
++    # dropping the scalar ``kind`` changes the preimage -> digest mismatch
++    unsigned = json.loads(json.dumps(genuine))
++    del unsigned["operations"][0]["request"]["inputs"][1]["kind"]
++    error = _expected_error(
++        ArtifactMismatchError,
++        lambda: validate_region_plan(
++            unsigned, policy=plan.policy, capability=plan.capability, re_resolve=True
++        ),
++    )
++    assert error.reason == "region_digest_mismatch"
++
++    # even after re-signing, the scalar boundary cross-check refuses it
++    forged = json.loads(json.dumps(genuine))
++    del forged["operations"][0]["request"]["inputs"][1]["kind"]
++    _resign_region_document(forged)
++    error = _expected_error(
++        ArtifactMismatchError,
++        lambda: validate_region_plan(
++            forged, policy=plan.policy, capability=plan.capability, re_resolve=False
++        ),
++    )
++    assert error.reason == "region_boundary_type_mismatch"
+ 
+ 
+ # ---------------------------------------------------------------------------

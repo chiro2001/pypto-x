@@ -1,0 +1,1345 @@
+From 3770b2280282e01eddcba6404cab98d1cf681ed4 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Mon, 14 Sep 2026 01:53:07 +0800
+Subject: [PATCH 276/283] feat(qwen35): compose public composites from shared
+ sub-composites
+
+Add the private _compose_program primitive: a checked, dead-code-free IR
+splice of a sub-program's pure dataflow with parameter binding (CoreType
+checked) and longest-prefix SSA renaming.  Composition consumes a child
+composite's FP32 internal value so no bf16 round-trip or extra cast is
+introduced.
+
+Reuse public composites in the large builders and in the executable graph:
+
+* build_qwen35_position_control <- position_ids + causal_mask_from_positions
+* build_qwen35_gated_delta_conv_state <- causal_conv1d_state
+* build_decoder_subgraph <- rms_norm + swiglu
+* build_qwen35_attention_kv_cache <- gqa_repeat_kv x2 + batched_matmul x2
+  + causal_mask + stable_softmax
+* build_attention_subgraph <- rope_rotate_half + causal_mask
+  + stable_softmax + gqa_repeat_kv
+* build_qwen35_text_decoder_graph reuses position_control at the top and,
+  per layer, rms_norm / rope_rotate_half / batched_matmul / causal_mask /
+  stable_softmax (full attention) and causal_conv1d_state / l2_norm (GDR)
+
+Every public signature is unchanged and every CoreProgram.canonical_json()
+is byte-identical to the pre-refactor snapshot; the frozen bf16 graph digest
+66dd40770dbb41251f0f7ec9b15b75b604daddc95633aabc24d9e48ffff33c6d is kept.
+Add test_qwen35_composite_composition.py: exact structural embedding
+assertions for each composition edge plus frozen canonical digest pins.
+
+(cherry picked from commit 54d2f4ea984468579689c893eced95cc90783ba6)
+---
+ python/pypto/portable/qwen35.py                              | 681 ++++++++++++++++++-------------
+ python/tests/ut/pypto_x/test_qwen35_composite_composition.py | 465 +++++++++++++++++++++
+ 2 files changed, 857 insertions(+), 289 deletions(-)
+
+diff --git a/python/pypto/portable/qwen35.py b/python/pypto/portable/qwen35.py
+index f8ea1e382..e2ac91c8d 100644
+--- a/python/pypto/portable/qwen35.py
++++ b/python/pypto/portable/qwen35.py
+@@ -274,6 +274,148 @@ def _contract(ref: ValueRef) -> Mapping[str, Any]:
+     }
+ 
+ 
++def _compose_name(name: str, rename: Mapping[str, str]) -> str:
++    """Rewrite one sub-program SSA name with the longest matching rule.
++
++    ``rename`` maps either a complete value name or a name prefix to its
++    replacement (``{"rms_": "decoder_norm_"}``).  The longest matching key
++    wins, so an exact name always overrides a prefix rule.
++    """
++
++    best = None
++    for key in rename:
++        if (name == key or name.startswith(key)) and (best is None or len(key) > len(best)):
++            best = key
++    if best is None:
++        return name
++    return rename[best] + name[len(best):]
++
++
++def _compose_program(
++    builder: _Builder,
++    program: CoreProgram,
++    bindings: Mapping[str, ValueRef],
++    returns: Optional[Sequence[str]] = None,
++    rename: Optional[Mapping[str, str]] = None,
++) -> Tuple[ValueRef, ...]:
++    """Inline a sub-program's pure dataflow into ``builder`` (composition).
++
++    This is the composition primitive shared by every public composite that is
++    built out of smaller composites.  It performs a checked, dead-code-free
++    splice of the sub-program's operation DAG:
++
++    * every sub-function parameter must be bound to a parent ``ValueRef`` with
++      the identical ``CoreType``; parameters are never re-declared, so the
++      parent's public signature is unchanged;
++    * ``returns`` selects internal value names of the sub-program (defaults to
++      the sub-program's own returns) and only the operations reachable from
++      those values are emitted, in the sub-program's original order;
++    * ``rename`` rewrites emitted SSA names so a composed copy can meet the
++      parent's own naming contract or be instantiated more than once without a
++      duplicate-name error.  Collisions that are not resolved by ``rename``
++      fail loudly through ``_Builder._reserve``.
++
++    The emitted operations keep their opcode, operand order, attributes,
++    effect and output dtypes/shapes byte-for-byte.  A composition that is
++    numerically equivalent but not IR-identical is therefore impossible to
++    hide here.
++    """
++
++    if len(program.functions) != 1:
++        raise ValueError("composed program must contain exactly one function")
++    function = program.functions[0]
++    if function.body.blocks:
++        raise ValueError("composed function must use a direct operation region")
++    rename = dict(rename or {})
++
++    parameters = {ref.name: ref for ref in function.parameters}
++    resolvable: Dict[str, ValueRef] = {}
++    for name, ref in parameters.items():
++        if name not in bindings:
++            raise ValueError(
++                "composed parameter {!r} of {!r} has no parent binding".format(name, function.name)
++            )
++        bound = bindings[name]
++        if not isinstance(bound, ValueRef):
++            raise ValueError("binding for {!r} must be a ValueRef".format(name))
++        if bound.type != ref.type:
++            raise ValueError(
++                "binding for {!r} has type {} but the composite expects {}".format(
++                    name, bound.type.to_dict(), ref.type.to_dict()
++                )
++            )
++        resolvable[name] = bound
++
++    producers: Dict[str, Operation] = {}
++    for operation in function.body.operations:
++        for output in operation.outputs:
++            if output.name in producers:
++                raise ValueError(
++                    "composed function {!r} produces SSA name {!r} twice".format(
++                        function.name, output.name
++                    )
++                )
++            producers[output.name] = operation
++
++    selected = list(function.returns if returns is None else returns)
++    selected_names = [ref.name for ref in selected] if all(
++        isinstance(item, ValueRef) for item in selected
++    ) else list(selected)
++    for name in selected_names:
++        if name not in resolvable and name not in producers:
++            raise ValueError(
++                "composed value {!r} is neither a parameter nor an operation output".format(name)
++            )
++
++    needed: set = set()
++    pending = [name for name in selected_names if name in producers]
++    while pending:
++        name = pending.pop()
++        if name in needed:
++            continue
++        needed.add(name)
++        for input_ref in producers[name].inputs:
++            if input_ref.name in producers and input_ref.name not in needed:
++                pending.append(input_ref.name)
++
++    emitted: Dict[str, ValueRef] = {}
++    for operation in function.body.operations:
++        if not any(output.name in needed for output in operation.outputs):
++            continue
++        inputs = []
++        for input_ref in operation.inputs:
++            if input_ref.name in resolvable:
++                inputs.append(resolvable[input_ref.name])
++            elif input_ref.name in emitted:
++                inputs.append(emitted[input_ref.name])
++            else:
++                raise ValueError(
++                    "composed operation {!r} reads value {!r} that was not emitted".format(
++                        operation.name, input_ref.name
++                    )
++                )
++        output_specs = [
++            (_compose_name(output.name, rename), output.type) for output in operation.outputs
++        ]
++        if operation.effect.value != "pure":
++            raise ValueError("composed operation {!r} is not pure".format(operation.name))
++        if operation.regions:
++            raise ValueError("composed operation {!r} carries nested regions".format(operation.name))
++        new_outputs = builder.op(
++            operation.name,
++            tuple(inputs),
++            output_specs,
++            attributes=dict(operation.attributes),
++        )
++        for old, new in zip(operation.outputs, new_outputs):
++            emitted[old.name] = new
++
++    results = []
++    for name in selected_names:
++        results.append(resolvable[name] if name in resolvable else emitted[name])
++    return tuple(results)
++
++
+ def _as_f32(builder: _Builder, value: ValueRef, dtype: str, prefix: str) -> ValueRef:
+     if dtype == "float32":
+         return value
+@@ -1107,6 +1249,12 @@ def _rope_core(
+     )[0]
+ 
+ 
++def _rope_core_result_name(shape: Sequence[int], rotary_dim: int, prefix: str) -> str:
++    """SSA name of ``_rope_core``'s FP32 result for the given rope shape."""
++
++    return prefix + ("_result" if tuple(shape)[-1] == rotary_dim else "_full_result")
++
++
+ def build_rms_norm(
+     shape: Sequence[int], dtype: str = "bf16", output_dtype: Optional[str] = None
+ ) -> CoreProgram:
+@@ -1593,29 +1741,22 @@ def build_qwen35_position_control(
+     query_shape = (batch, query_heads, steps, 1)
+     key_shape = (batch, query_heads, 1, total)
+     builder = _Builder("qwen35_position_control", "position_control", position_shape)
+-    position_ids = builder.op(
+-        "iota",
+-        (),
+-        (("position_ids", _tensor(index_dtype, position_shape)),),
+-        {"axis": 1, "start": past_length, "step": 1},
+-    )[0]
+-    query_positions = builder.op(
+-        "iota",
+-        (),
+-        (("query_positions", _tensor(index_dtype, query_shape)),),
+-        {"axis": 2, "start": past_length, "step": 1},
+-    )[0]
+-    key_positions = builder.op(
+-        "iota",
+-        (),
+-        (("key_positions", _tensor(index_dtype, key_shape)),),
+-        {"axis": 3, "start": 0, "step": 1},
++    # Composition: position ids and the causal mask are the public
++    # ``position_ids`` / ``causal_mask_from_positions`` composites appended in
++    # exactly the historical order and with their own SSA names.
++    position_ids = _compose_program(
++        builder,
++        build_qwen35_position_ids(batch, steps, past_length, index_dtype),
++        {},
++        ("position_ids",),
+     )[0]
+-    causal_mask = builder.op(
+-        "compare",
+-        (key_positions, query_positions),
+-        (("causal_mask", _tensor("bool", mask_shape)),),
+-        {"predicate": "le", "broadcast": "trailing_singleton"},
++    causal_mask = _compose_program(
++        builder,
++        build_qwen35_causal_mask_from_positions(
++            batch, steps, past_length, query_heads, index_dtype
++        ),
++        {},
++        ("causal_mask",),
+     )[0]
+     return builder.finish(
+         (position_ids, causal_mask),
+@@ -2049,34 +2190,17 @@ def build_qwen35_text_decoder_graph(
+     sin = builder.parameter("sin", _tensor(dtype, (batch, qh, steps, rotary_dim)))
+     shared_weight = builder.parameter("embedding_lm_head_shared_weight", _tensor(dtype, (v, h)))
+ 
+-    # Internal position/control graph.  Position ids are returned as an
++    # Composition: the whole position-control plane is the public
++    # ``position_control`` composite (itself composed of ``position_ids`` and
++    # ``causal_mask_from_positions``).  Position ids are returned as an
+     # explicit control result (and therefore cannot be mistaken for a host
+     # supplied input); the causal mask is used directly in every full-
+     # attention softmax.
+-    position_ids = builder.op(
+-        "iota",
+-        (),
+-        (("position_ids", _tensor(index_dtype, (batch, steps))),),
+-        {"axis": 1, "start": past_length, "step": 1},
+-    )[0]
+-    query_positions = builder.op(
+-        "iota",
+-        (),
+-        (("query_positions", _tensor(index_dtype, (batch, qh, steps, 1))),),
+-        {"axis": 2, "start": past_length, "step": 1},
+-    )[0]
+-    key_positions = builder.op(
+-        "iota",
+-        (),
+-        (("key_positions", _tensor(index_dtype, (batch, qh, 1, total))),),
+-        {"axis": 3, "start": 0, "step": 1},
+-    )[0]
+-    causal_mask = builder.op(
+-        "compare",
+-        (key_positions, query_positions),
+-        (("causal_mask", _tensor("bool", (batch, qh, steps, total))),),
+-        {"predicate": "le", "broadcast": "trailing_singleton"},
+-    )[0]
++    position_ids, causal_mask = _compose_program(
++        builder,
++        build_qwen35_position_control(batch, steps, past_length, qh, index_dtype),
++        {},
++    )
+ 
+     embedded = builder.op(
+         "embedding",
+@@ -2759,27 +2883,31 @@ def _append_full_attention_graph(
+     )
+     query = _transpose(builder, query_raw, (0, 2, 1, 3), prefix + "_query_heads")
+     output_gate = _transpose(builder, gate_raw, (0, 2, 1, 3), prefix + "_output_gate")
+-    query_norm = _rms_core(
++    # Composition: q/k RMSNorm and RoPE are the public ``rms_norm`` and
++    # ``rope_rotate_half`` composites, consumed at their FP32 values.
++    query_norm = _compose_program(
+         builder,
+-        query,
+-        q_norm_weight,
+-        qk_epsilon,
+-        dtype,
+-        (batch, query_heads, steps, head_dim),
+-        prefix + "_q_norm",
+-    )
++        build_rms_norm(
++            (batch, query_heads, steps, head_dim), dtype, output_dtype="float32"
++        ),
++        {"x": query, "weight": q_norm_weight, "epsilon": qk_epsilon},
++        ("rms_scaled",),
++        {"rms_": prefix + "_q_norm_"},
++    )[0]
+     cos_f32 = _as_f32(builder, cos, dtype, prefix + "_cos")
+     sin_f32 = _as_f32(builder, sin, dtype, prefix + "_sin")
+-    query_rotated = _rope_core(
++    query_rotated = _compose_program(
+         builder,
+-        query_norm,
+-        cos_f32,
+-        sin_f32,
+-        "float32",
+-        (batch, query_heads, steps, head_dim),
+-        rotary_dim,
+-        prefix + "_q_rope",
+-    )
++        build_rope_rotate_half(
++            (batch, query_heads, steps, head_dim),
++            "float32",
++            output_dtype="float32",
++            rotary_dim=rotary_dim,
++        ),
++        {"x": query_norm, "cos": cos_f32, "sin": sin_f32},
++        (_rope_core_result_name((batch, query_heads, steps, head_dim), rotary_dim, "rope"),),
++        {"rope_": prefix + "_q_rope_"},
++    )[0]
+ 
+     current_k = linear_fn(
+         builder,
+@@ -2794,15 +2922,15 @@ def _append_full_attention_graph(
+     )
+     current_k = _reshape(builder, current_k, (batch, steps, kv_heads, head_dim), prefix + "_k_time")
+     current_k = _transpose(builder, current_k, (0, 2, 1, 3), prefix + "_k_heads")
+-    current_k = _rms_core(
++    current_k = _compose_program(
+         builder,
+-        current_k,
+-        k_norm_weight,
+-        qk_epsilon,
+-        dtype,
+-        (batch, kv_heads, steps, head_dim),
+-        prefix + "_k_norm",
+-    )
++        build_rms_norm(
++            (batch, kv_heads, steps, head_dim), dtype, output_dtype="float32"
++        ),
++        {"x": current_k, "weight": k_norm_weight, "epsilon": qk_epsilon},
++        ("rms_scaled",),
++        {"rms_": prefix + "_k_norm_"},
++    )[0]
+     cos_k = builder.op(
+         "slice",
+         (cos_f32,),
+@@ -2815,16 +2943,18 @@ def _append_full_attention_graph(
+         ((prefix + "_sin_k", _tensor("float32", (batch, kv_heads, steps, rotary_dim))),),
+         {"starts": [0], "stops": [kv_heads], "axes": [1], "steps": [1]},
+     )[0]
+-    current_k = _rope_core(
++    current_k = _compose_program(
+         builder,
+-        current_k,
+-        cos_k,
+-        sin_k,
+-        "float32",
+-        (batch, kv_heads, steps, head_dim),
+-        rotary_dim,
+-        prefix + "_k_rope",
+-    )
++        build_rope_rotate_half(
++            (batch, kv_heads, steps, head_dim),
++            "float32",
++            output_dtype="float32",
++            rotary_dim=rotary_dim,
++        ),
++        {"x": current_k, "cos": cos_k, "sin": sin_k},
++        (_rope_core_result_name((batch, kv_heads, steps, head_dim), rotary_dim, "rope"),),
++        {"rope_": prefix + "_k_rope_"},
++    )[0]
+     current_k = _cast_from_f32(builder, current_k, dtype, prefix + "_current_k")
+ 
+     current_v = linear_fn(
+@@ -2857,66 +2987,55 @@ def _append_full_attention_graph(
+     query_f32 = query_rotated
+     key_f32 = _as_f32(builder, repeated_k, dtype, prefix + "_k_cache_f32")
+     key_t = _transpose(builder, key_f32, (0, 1, 3, 2), prefix + "_k_cache_transposed")
+-    logits = builder.op(
+-        "matmul",
+-        (query_f32, key_t),
+-        ((prefix + "_qk_logits", _tensor("float32", (batch, query_heads, steps, total))),),
++    logits = _compose_program(
++        builder,
++        build_batched_matmul(
++            (batch, query_heads, steps, head_dim),
++            (batch, query_heads, head_dim, total),
++            "float32",
++        ),
++        {"left": query_f32, "right": key_t},
++        ("output",),
++        {"output": prefix + "_qk_logits"},
+     )[0]
+     scaled = builder.op(
+         "mul",
+         (logits, qk_scale),
+         ((prefix + "_qk_scaled", _tensor("float32", (batch, query_heads, steps, total))),),
+     )[0]
+-    masked = builder.op(
+-        "where",
+-        (causal_mask, scaled, fill_value),
+-        ((prefix + "_masked_logits", _tensor("float32", (batch, query_heads, steps, total))),),
+-    )[0]
+-    reduced_shape = (batch, query_heads, steps, 1)
+-    maximum = builder.op(
+-        "reduce_max",
+-        (masked,),
+-        ((prefix + "_softmax_max", _tensor("float32", reduced_shape)),),
+-        {"axis": -1, "keepdims": True},
+-    )[0]
+-    maximum_full = builder.op(
+-        "broadcast",
+-        (maximum,),
+-        ((prefix + "_softmax_max_full", _tensor("float32", (batch, query_heads, steps, total))),),
+-        {"shape": [batch, query_heads, steps, total]},
+-    )[0]
+-    shifted = builder.op(
+-        "sub",
+-        (masked, maximum_full),
+-        ((prefix + "_softmax_shifted", _tensor("float32", (batch, query_heads, steps, total))),),
+-    )[0]
+-    exponent = builder.op(
+-        "exp",
+-        (shifted,),
+-        ((prefix + "_softmax_exp", _tensor("float32", (batch, query_heads, steps, total))),),
+-    )[0]
+-    total_exp = builder.op(
+-        "reduce_sum",
+-        (exponent,),
+-        ((prefix + "_softmax_sum", _tensor("float32", reduced_shape)),),
+-        {"axis": -1, "keepdims": True},
+-    )[0]
+-    total_full = builder.op(
+-        "broadcast",
+-        (total_exp,),
+-        ((prefix + "_softmax_sum_full", _tensor("float32", (batch, query_heads, steps, total))),),
+-        {"shape": [batch, query_heads, steps, total]},
++    # Composition: masking and the stable softmax are the public
++    # ``causal_mask`` / ``stable_softmax`` composites instantiated with this
++    # layer's prefix.
++    masked = _compose_program(
++        builder,
++        build_causal_mask((batch, query_heads, steps, total), "float32"),
++        {"logits": scaled, "causal_mask": causal_mask, "fill_value": fill_value},
++        ("masked_f32",),
++        {"masked_f32": prefix + "_masked_logits"},
+     )[0]
+-    probabilities = builder.op(
+-        "div",
+-        (exponent, total_full),
+-        ((prefix + "_probabilities", _tensor("float32", (batch, query_heads, steps, total))),),
++    probabilities = _compose_program(
++        builder,
++        build_stable_softmax(
++            (batch, query_heads, steps, total), "float32", output_dtype="float32"
++        ),
++        {"logits": masked},
++        ("softmax_probabilities_f32",),
++        {
++            "softmax_probabilities_f32": prefix + "_probabilities",
++            "softmax_": prefix + "_softmax_",
++        },
+     )[0]
+     value_f32 = _as_f32(builder, repeated_v, dtype, prefix + "_v_cache_f32")
+-    context = builder.op(
+-        "matmul",
+-        (probabilities, value_f32),
+-        ((prefix + "_context", _tensor("float32", (batch, query_heads, steps, head_dim))),),
++    context = _compose_program(
++        builder,
++        build_batched_matmul(
++            (batch, query_heads, steps, total),
++            (batch, query_heads, total, head_dim),
++            "float32",
++        ),
++        {"left": probabilities, "right": value_f32},
++        ("output",),
++        {"output": prefix + "_context"},
+     )[0]
+     gate_sigmoid = builder.op(
+         "sigmoid",
+@@ -2996,18 +3115,18 @@ def _append_gdr_graph(
+     )
+     mixed = _transpose(builder, mixed, (0, 2, 1), prefix + "_qkv_conv_input")
+     conv_weight_2d = _reshape(builder, conv_weight, (conv_channels, kernel), prefix + "_conv_weight_2d")
+-    conv_output, new_conv_state = _append_causal_conv1d_state(
++    # Composition: the conv/state tail is the public ``causal_conv1d_state``
++    # composite; the emitted names are rewritten to this layer's prefix.
++    conv_output, new_conv_state = _compose_program(
+         builder,
+-        mixed,
+-        prior_conv_state,
+-        conv_weight_2d,
+-        dtype,
+-        dtype,
+-        batch,
+-        conv_channels,
+-        steps,
+-        kernel,
+-        prefix + "_causal_conv",
++        build_causal_conv1d_state((batch, conv_channels, steps), dtype, dtype, kernel),
++        {
++            "mixed_qkv": mixed,
++            "prior_state": prior_conv_state,
++            "weight": conv_weight_2d,
++        },
++        None,
++        {"conv_": prefix + "_causal_conv_"},
+     )
+     conv_time = _transpose(builder, conv_output, (0, 2, 1), prefix + "_conv_time")
+     q_raw, k_raw, v_raw = builder.op(
+@@ -3023,8 +3142,22 @@ def _append_gdr_graph(
+     query = _reshape(builder, q_raw, (batch, steps, key_heads, key_dim), prefix + "_q")
+     key = _reshape(builder, k_raw, (batch, steps, key_heads, key_dim), prefix + "_k")
+     value = _reshape(builder, v_raw, (batch, steps, value_heads, value_dim), prefix + "_v")
+-    query = _l2_core(builder, query, epsilon, dtype, (batch, steps, key_heads, key_dim), prefix + "_q_l2")
+-    key = _l2_core(builder, key, epsilon, dtype, (batch, steps, key_heads, key_dim), prefix + "_k_l2")
++    # Composition: the L2 normalizations are the public ``l2_norm``
++    # composite, consumed at its FP32 normalized value.
++    query = _compose_program(
++        builder,
++        build_l2_norm((batch, steps, key_heads, key_dim), dtype, output_dtype="float32"),
++        {"x": query, "epsilon": epsilon},
++        ("l2_normalized",),
++        {"l2_": prefix + "_q_l2_"},
++    )[0]
++    key = _compose_program(
++        builder,
++        build_l2_norm((batch, steps, key_heads, key_dim), dtype, output_dtype="float32"),
++        {"x": key, "epsilon": epsilon},
++        ("l2_normalized",),
++        {"l2_": prefix + "_k_l2_"},
++    )[0]
+     z = linear_fn(
+         builder,
+         hidden,
+@@ -3491,18 +3624,18 @@ def build_qwen35_gated_delta_conv_state(
+         (("mixed_qkv", _tensor(dtype, mixed_shape)),),
+         {"permutation": [0, 2, 1]},
+     )[0]
+-    output, new_state = _append_causal_conv1d_state(
++    # Composition: the functional Conv1D/state tail is the public
++    # ``causal_conv1d_state`` composite.  Its parameter names are bound to the
++    # parent values (``weight`` -> ``conv_weight``) and its own SSA names
++    # (``conv_*``) are preserved, so the emitted IR is unchanged.
++    output, new_state = _compose_program(
+         builder,
+-        mixed_qkv,
+-        prior_state,
+-        conv_weight,
+-        dtype,
+-        output_dtype,
+-        batch,
+-        channels,
+-        steps,
+-        kernel_size,
+-        "conv",
++        build_causal_conv1d_state(mixed_shape, dtype, output_dtype, kernel_size),
++        {
++            "mixed_qkv": mixed_qkv,
++            "prior_state": prior_state,
++            "weight": conv_weight,
++        },
+     )
+     return builder.finish(
+         (output, new_state),
+@@ -3546,37 +3679,40 @@ def build_decoder_subgraph(
+     output_dtype = _output_dtype(dtype, output_dtype)
+     input_shape = (rows, hidden)
+     projection_shape = (rows, intermediate * 2)
+-    split_shape = (rows, intermediate)
+     builder = _Builder("qwen35_decoder_subgraph", "decoder_subgraph", input_shape)
+     x = builder.parameter("x", _tensor(dtype, input_shape))
+     weight = builder.parameter("norm_weight", _tensor(dtype, (hidden,)))
+     epsilon = builder.parameter("epsilon", _scalar("float32"))
+     projection_weight = builder.parameter("projection_weight", _tensor(dtype, (hidden, intermediate * 2)))
+-    norm_f32 = _rms_core(builder, x, weight, epsilon, dtype, input_shape, "decoder_norm")
++    # Composition: the normalization is the public ``rms_norm`` composite,
++    # consumed at its FP32 scale output (its own final cast is not needed in
++    # this chain, matching the historical graph).
++    norm_f32 = _compose_program(
++        builder,
++        build_rms_norm(input_shape, dtype, output_dtype="float32"),
++        {"x": x, "weight": weight, "epsilon": epsilon},
++        ("rms_scaled",),
++        {"rms_": "decoder_norm_"},
++    )[0]
+     projection_weight_f32 = _as_f32(builder, projection_weight, dtype, "decoder_projection_weight")
+     projected = builder.op(
+         "matmul",
+         (norm_f32, projection_weight_f32),
+         (("projected", _tensor("float32", projection_shape)),),
+     )[0]
+-    gate, up = builder.op(
+-        "split",
+-        (projected,),
+-        (
+-            ("projected_gate", _tensor("float32", split_shape)),
+-            ("projected_up", _tensor("float32", split_shape)),
+-        ),
+-        {"sizes": [intermediate, intermediate], "axis": -1},
+-    )
+-    activated = builder.op(
+-        "silu",
+-        (gate,),
+-        (("projected_gate_silu", _tensor("float32", split_shape)),),
+-    )[0]
+-    result_f32 = builder.op(
+-        "mul",
+-        (activated, up),
+-        (("decoder_swiglu", _tensor("float32", split_shape)),),
++    # Composition: split + SiLU + multiply is the public ``swiglu`` composite
++    # (FP32 packed input, consumed at its FP32 product).
++    result_f32 = _compose_program(
++        builder,
++        build_swiglu(projection_shape, "float32", output_dtype="float32"),
++        {"packed": projected},
++        ("swiglu_value",),
++        {
++            "gate": "projected_gate",
++            "up": "projected_up",
++            "gate_silu": "projected_gate_silu",
++            "swiglu_value": "decoder_swiglu",
++        },
+     )[0]
+     output = _cast_from_f32(builder, result_f32, output_dtype, "output")
+     return builder.finish(
+@@ -3739,17 +3875,27 @@ def build_qwen35_attention_kv_cache(
+         (("new_v", _tensor("bf16", (batch, kv_heads, total_steps, head_dim))),),
+         {"axis": 2},
+     )[0]
+-    repeated_k = builder.op(
+-        "gather",
+-        (new_k, head_indices),
+-        (("repeated_k", _tensor("bf16", (batch, query_heads, total_steps, head_dim))),),
+-        {"axis": 1},
++    # Composition: GQA repeat-KV, causal masking and stable softmax are the
++    # public ``gqa_repeat_kv`` / ``causal_mask`` / ``stable_softmax``
++    # composites.  They are consumed at their FP32 outputs; the composites'
++    # own trailing casts are not part of this chain.
++    repeated_k = _compose_program(
++        builder,
++        build_gqa_repeat_kv(
++            (batch, kv_heads, total_steps, head_dim), query_heads, "bf16", index_dtype
++        ),
++        {"kv": new_k, "head_indices": head_indices},
++        ("output",),
++        {"output": "repeated_k"},
+     )[0]
+-    repeated_v = builder.op(
+-        "gather",
+-        (new_v, head_indices),
+-        (("repeated_v", _tensor("bf16", (batch, query_heads, total_steps, head_dim))),),
+-        {"axis": 1},
++    repeated_v = _compose_program(
++        builder,
++        build_gqa_repeat_kv(
++            (batch, kv_heads, total_steps, head_dim), query_heads, "bf16", index_dtype
++        ),
++        {"kv": new_v, "head_indices": head_indices},
++        ("output",),
++        {"output": "repeated_v"},
+     )[0]
+     query_f32 = _as_f32(builder, query, "bf16", "attention_query")
+     key_f32 = _as_f32(builder, repeated_k, "bf16", "attention_key")
+@@ -3759,66 +3905,43 @@ def build_qwen35_attention_kv_cache(
+         (("key_transposed", _tensor("float32", (batch, query_heads, head_dim, total_steps))),),
+         {"permutation": [0, 1, 3, 2]},
+     )[0]
+-    logits = builder.op(
+-        "matmul",
+-        (query_f32, key_transposed),
+-        (("qk_logits", _tensor("float32", attention_shape)),),
++    logits = _compose_program(
++        builder,
++        build_batched_matmul(
++            query_shape, (batch, query_heads, head_dim, total_steps), "float32"
++        ),
++        {"left": query_f32, "right": key_transposed},
++        ("output",),
++        {"output": "qk_logits"},
+     )[0]
+     scaled_logits = builder.op(
+         "mul",
+         (logits, qk_scale),
+         (("scaled_logits", _tensor("float32", attention_shape)),),
+     )[0]
+-    masked_logits = builder.op(
+-        "where",
+-        (causal_mask, scaled_logits, fill_value),
+-        (("masked_logits", _tensor("float32", attention_shape)),),
+-    )[0]
+-    reduced_shape = attention_shape[:-1] + (1,)
+-    maximum = builder.op(
+-        "reduce_max",
+-        (masked_logits,),
+-        (("attention_max", _tensor("float32", reduced_shape)),),
+-        {"axis": -1, "keepdims": True},
+-    )[0]
+-    maximum_full = builder.op(
+-        "broadcast",
+-        (maximum,),
+-        (("attention_max_full", _tensor("float32", attention_shape)),),
+-        {"shape": list(attention_shape)},
+-    )[0]
+-    shifted = builder.op(
+-        "sub",
+-        (masked_logits, maximum_full),
+-        (("attention_shifted", _tensor("float32", attention_shape)),),
+-    )[0]
+-    exponent = builder.op(
+-        "exp",
+-        (shifted,),
+-        (("attention_exp", _tensor("float32", attention_shape)),),
+-    )[0]
+-    total = builder.op(
+-        "reduce_sum",
+-        (exponent,),
+-        (("attention_sum", _tensor("float32", reduced_shape)),),
+-        {"axis": -1, "keepdims": True},
+-    )[0]
+-    total_full = builder.op(
+-        "broadcast",
+-        (total,),
+-        (("attention_sum_full", _tensor("float32", attention_shape)),),
+-        {"shape": list(attention_shape)},
++    masked_logits = _compose_program(
++        builder,
++        build_causal_mask(attention_shape, "float32", output_dtype="float32"),
++        {"logits": scaled_logits, "causal_mask": causal_mask, "fill_value": fill_value},
++        ("masked_f32",),
++        {"masked_f32": "masked_logits"},
+     )[0]
+-    probabilities = builder.op(
+-        "div",
+-        (exponent, total_full),
+-        (("attention_probabilities", _tensor("float32", attention_shape)),),
++    probabilities = _compose_program(
++        builder,
++        build_stable_softmax(attention_shape, "float32", output_dtype="float32"),
++        {"logits": masked_logits},
++        ("softmax_probabilities_f32",),
++        {"softmax_probabilities_f32": "attention_probabilities", "softmax_": "attention_"},
+     )[0]
+     value_f32 = _as_f32(builder, repeated_v, "bf16", "attention_value")
+-    context = builder.op(
+-        "matmul",
+-        (probabilities, value_f32),
+-        (("attention_context", _tensor("float32", query_shape)),),
++    context = _compose_program(
++        builder,
++        build_batched_matmul(
++            attention_shape, (batch, query_heads, total_steps, head_dim), "float32"
++        ),
++        {"left": probabilities, "right": value_f32},
++        ("output",),
++        {"output": "attention_context"},
+     )[0]
+     output = _cast_from_f32(builder, context, "bf16", "output")
+     return builder.finish(
+@@ -4272,63 +4395,43 @@ def build_attention_subgraph(
+     fill = builder.parameter("fill_value", _scalar(dtype))
+     kv = builder.parameter("kv", _tensor(dtype, kv_shape))
+     head_indices = builder.parameter("head_indices", _tensor(index_dtype, (query_heads,)))
+-    rotary_f32 = _rope_core(builder, q, cos, sin, dtype, rope_shape, rotary_dim, "attention_rope")
+-    logits_f32 = _as_f32(builder, logits, dtype, "attention_logits")
+-    fill_f32 = fill if dtype == "float32" else builder.op(
+-        "cast", (fill,), (("attention_fill_f32", _scalar("float32")),), {"dtype": "float32"}
+-    )[0]
+-    masked = builder.op(
+-        "where",
+-        (mask, logits_f32, fill_f32),
+-        (("attention_masked", _tensor("float32", attention_shape)),),
+-    )[0]
+-    reduced_shape = attention_shape[:-1] + (1,)
+-    maximum = builder.op(
+-        "reduce_max",
+-        (masked,),
+-        (("attention_max", _tensor("float32", reduced_shape)),),
+-        {"axis": -1, "keepdims": True},
+-    )[0]
+-    maximum_full = builder.op(
+-        "broadcast",
+-        (maximum,),
+-        (("attention_max_full", _tensor("float32", attention_shape)),),
+-        {"shape": list(attention_shape)},
+-    )[0]
+-    shifted = builder.op(
+-        "sub",
+-        (masked, maximum_full),
+-        (("attention_shifted", _tensor("float32", attention_shape)),),
+-    )[0]
+-    exponent = builder.op(
+-        "exp",
+-        (shifted,),
+-        (("attention_exp", _tensor("float32", attention_shape)),),
+-    )[0]
+-    total = builder.op(
+-        "reduce_sum",
+-        (exponent,),
+-        (("attention_sum", _tensor("float32", reduced_shape)),),
+-        {"axis": -1, "keepdims": True},
++    # Composition: every branch of this harness is a public composite.  The
++    # branches are consumed at their FP32 values where the historical graph
++    # used FP32 intermediates; the composites' own trailing casts stay with
++    # the parent (``probabilities`` / ``rotary_q``).
++    rotary_f32 = _compose_program(
++        builder,
++        build_rope_rotate_half(rope_shape, dtype, output_dtype="float32", rotary_dim=rotary_dim),
++        {"x": q, "cos": cos, "sin": sin},
++        (_rope_core_result_name(rope_shape, rotary_dim, "rope"),),
++        {"rope_": "attention_rope_"},
+     )[0]
+-    total_full = builder.op(
+-        "broadcast",
+-        (total,),
+-        (("attention_sum_full", _tensor("float32", attention_shape)),),
+-        {"shape": list(attention_shape)},
++    masked = _compose_program(
++        builder,
++        build_causal_mask(attention_shape, dtype, output_dtype="float32"),
++        {"logits": logits, "causal_mask": mask, "fill_value": fill},
++        ("masked_f32",),
++        {
++            "mask_logits_f32": "attention_logits_f32",
++            "mask_fill_f32": "attention_fill_f32",
++            "masked_f32": "attention_masked",
++        },
+     )[0]
+-    probabilities_f32 = builder.op(
+-        "div",
+-        (exponent, total_full),
+-        (("probabilities_f32", _tensor("float32", attention_shape)),),
++    probabilities_f32 = _compose_program(
++        builder,
++        build_stable_softmax(attention_shape, "float32", output_dtype="float32"),
++        {"logits": masked},
++        ("softmax_probabilities_f32",),
++        {"softmax_probabilities_f32": "probabilities_f32", "softmax_": "attention_"},
+     )[0]
+     probabilities = _cast_from_f32(builder, probabilities_f32, dtype, "probabilities")
+     rotary = _cast_from_f32(builder, rotary_f32, dtype, "rotary_q")
+-    repeated = builder.op(
+-        "gather",
+-        (kv, head_indices),
+-        (("repeated_kv", _tensor(dtype, kv_shape[:1] + (query_heads,) + kv_shape[2:])),),
+-        {"axis": 1},
++    repeated = _compose_program(
++        builder,
++        build_gqa_repeat_kv(kv_shape, query_heads, dtype, index_dtype),
++        {"kv": kv, "head_indices": head_indices},
++        ("output",),
++        {"output": "repeated_kv"},
+     )[0]
+     return builder.finish(
+         (rotary, probabilities, repeated),
+diff --git a/python/tests/ut/pypto_x/test_qwen35_composite_composition.py b/python/tests/ut/pypto_x/test_qwen35_composite_composition.py
+new file mode 100644
+index 000000000..7ac88ab91
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_qwen35_composite_composition.py
+@@ -0,0 +1,465 @@
++"""Qwen3.5 composite composition relations (batch 0048 slice A).
++
++These tests pin two things:
++
++1. the large composites are *structurally assembled* from the public small
++   composites, i.e. an exact copy of the selected sub-program dataflow can be
++   found in the parent program (same opcode, operand order, dtypes/shapes and
++   attributes, only SSA names rewritten by the documented ``rename`` rules);
++2. the composed programs keep the frozen pre-refactor IR digest byte-for-byte.
++
++The digest pins are the composition-equivalence oracle: any change that alters
++an operation, an operand, an attribute or the emission order fails here even
++when the numerical behaviour would still be inside tolerance.
++"""
++
++from __future__ import annotations
++
++import hashlib
++from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
++
++import pytest
++
++from pypto.core_ir import CoreFunction, CoreProgram, Operation
++from pypto.portable import qwen35
++from pypto.portable.qwen35 import (
++    build_attention_kv_cache,
++    build_batched_matmul,
++    build_attention_subgraph,
++    build_causal_conv1d_state,
++    build_causal_mask,
++    build_causal_mask_from_positions,
++    build_decoder_subgraph,
++    build_gqa_repeat_kv,
++    build_l2_norm,
++    build_position_ids,
++    build_qwen35_attention_kv_cache,
++    build_qwen35_gated_delta_conv_state,
++    build_qwen35_position_control,
++    build_qwen35_text_decoder_graph,
++    build_rms_norm,
++    build_rope_rotate_half,
++    build_stable_softmax,
++    build_swiglu,
++)
++
++# Frozen pre-refactor canonical digests (see contract 0018 §5).  The symbol
++# names are the labels of the batch-0048 baseline snapshot.
++FROZEN_DIGESTS = {
++    "position_control.2x3.p7.h8.int32": (
++        "1af2109e130b385a18ac15441721a6f9b11d20e2e34ec684fb9a7dd03046b848"
++    ),
++    "causal_conv1d_state.bf16.2x6x5": (
++        "00f62d13d92ad525b904c60230f50a71ca2c6749033b5be21ee4907db844fd8f"
++    ),
++    "gated_delta_conv_state.bf16.1x5.h8.c12": (
++        "713b701c6106abe1717453b5a2e6dd6eef008f8c11d6af5f117fd02740f07a89"
++    ),
++    "decoder_subgraph.bf16.2x8.i10": (
++        "33708c0d3401e74886733b5a75f52c8891dfc840dae31ba212e21e4ad1cc9bf8"
++    ),
++    "attention_kv_cache.bf16.b1.decode_t1_past5": (
++        "aa2bc3f16c6aa1a15a3a605e6865a94e47fac000b555ea278a3cf2371cb45db6"
++    ),
++    "attention_subgraph.f32": (
++        "3e0dc93ba7c477fd245e3a2cc34a5b8c6b02af333abfc7502777c76692b29400"
++    ),
++    "text_decoder.synthetic.b2.t3": (
++        "bd47d35bf9e9acdc2561a6e02be0639290231ba420469cc24644582726fc9eb4"
++    ),
++}
++
++
++def _canonical_sha256(program: CoreProgram) -> str:
++    return hashlib.sha256(program.canonical_json().encode("utf-8")).hexdigest()
++
++
++def _reachable_operations(
++    function: CoreFunction, selected: Sequence[str]
++) -> List[Operation]:
++    """Operations of ``function`` reachable from ``selected`` (program order)."""
++
++    producers: Dict[str, Operation] = {}
++    for operation in function.body.operations:
++        for output in operation.outputs:
++            producers[output.name] = operation
++    needed: set = set()
++    pending = [name for name in selected if name in producers]
++    while pending:
++        name = pending.pop()
++        if name in needed:
++            continue
++        needed.add(name)
++        for input_ref in producers[name].inputs:
++            if input_ref.name in producers and input_ref.name not in needed:
++                pending.append(input_ref.name)
++    return [
++        operation
++        for operation in function.body.operations
++        if any(output.name in needed for output in operation.outputs)
++    ]
++
++
++def _rename(name: str, rules: Mapping[str, str]) -> str:
++    best: Optional[str] = None
++    for key in rules:
++        if (name == key or name.startswith(key)) and (
++            best is None or len(key) > len(best)
++        ):
++            best = key
++    if best is None:
++        return name
++    return rules[best] + name[len(best):]
++
++
++def _expected_operation(
++    operation: Operation,
++    bindings: Mapping[str, Optional[str]],
++    rules: Mapping[str, str],
++) -> Dict[str, Any]:
++    inputs = []
++    for input_ref in operation.inputs:
++        if input_ref.name in bindings:
++            inputs.append((bindings[input_ref.name], input_ref.type.to_dict()))
++        else:
++            inputs.append((_rename(input_ref.name, rules), input_ref.type.to_dict()))
++    outputs = [
++        (_rename(output.name, rules), output.type.to_dict())
++        for output in operation.outputs
++    ]
++    return {
++        "name": operation.name,
++        "inputs": inputs,
++        "outputs": outputs,
++        "attributes": dict(operation.attributes),
++        "effect": operation.effect.value,
++    }
++
++
++def _actual_operation(operation: Operation) -> Dict[str, Any]:
++    return {
++        "name": operation.name,
++        "inputs": [(ref.name, ref.type.to_dict()) for ref in operation.inputs],
++        "outputs": [(ref.name, ref.type.to_dict()) for ref in operation.outputs],
++        "attributes": dict(operation.attributes),
++        "effect": operation.effect.value,
++    }
++
++
++def _matches(expected: Dict[str, Any], actual: Dict[str, Any]) -> bool:
++    if expected["name"] != actual["name"] or expected["effect"] != actual["effect"]:
++        return False
++    if expected["attributes"] != actual["attributes"]:
++        return False
++    if len(expected["inputs"]) != len(actual["inputs"]):
++        return False
++    for (name, dtype), (actual_name, actual_dtype) in zip(
++        expected["inputs"], actual["inputs"]
++    ):
++        if dtype != actual_dtype:
++            return False
++        if name is not None and name != actual_name:
++            return False
++    if len(expected["outputs"]) != len(actual["outputs"]):
++        return False
++    for (name, dtype), (actual_name, actual_dtype) in zip(
++        expected["outputs"], actual["outputs"]
++    ):
++        if dtype != actual_dtype or name != actual_name:
++            return False
++    return True
++
++
++def assert_embedded(
++    parent: CoreProgram,
++    child: CoreProgram,
++    bindings: Mapping[str, Optional[str]],
++    selected: Sequence[str],
++    rename: Optional[Mapping[str, str]] = None,
++) -> int:
++    """Assert an exact child dataflow window exists inside ``parent``."""
++
++    rules = dict(rename or {})
++    child_function = child.functions[0]
++    expected = [
++        _expected_operation(operation, bindings, rules)
++        for operation in _reachable_operations(child_function, selected)
++    ]
++    assert expected, "selected values {!r} reach no operation".format(tuple(selected))
++    parent_ops = list(parent.functions[0].body.operations)
++    found = None
++    for start in range(len(parent_ops) - len(expected) + 1):
++        window = parent_ops[start:start + len(expected)]
++        if all(
++            _matches(want, _actual_operation(got))
++            for want, got in zip(expected, window)
++        ):
++            if found is not None:
++                raise AssertionError("ambiguous embedded window for {}".format(selected))
++            found = start
++    assert found is not None, "child dataflow {} not found in parent".format(selected)
++    return found
++
++
++def test_position_control_is_exactly_position_ids_plus_causal_mask():
++    parent = build_qwen35_position_control(2, 3, past_length=7, index_dtype="int32")
++    positions = build_position_ids(2, 3, past_length=7, index_dtype="int32")
++    mask = build_causal_mask_from_positions(
++        2, 3, past_length=7, index_dtype="int32"
++    )
++    parent_ops = [operation.name for operation in parent.functions[0].body.operations]
++    child_ops = [
++        operation.name
++        for operation in positions.functions[0].body.operations
++    ] + [operation.name for operation in mask.functions[0].body.operations]
++    assert parent_ops == child_ops == ["iota", "iota", "iota", "compare"]
++    assert_embedded(parent, positions, {}, ("position_ids",))
++    assert_embedded(parent, mask, {}, ("causal_mask",))
++    assert [ref.name for ref in parent.functions[0].returns] == [
++        "position_ids",
++        "causal_mask",
++    ]
++
++
++def test_gated_delta_conv_state_reuses_causal_conv1d_state():
++    parent = build_qwen35_gated_delta_conv_state(1, 5, hidden=8, channels=12)
++    child = build_causal_conv1d_state((1, 12, 5))
++    start = assert_embedded(
++        parent,
++        child,
++        {
++            "mixed_qkv": "mixed_qkv",
++            "prior_state": "prior_state",
++            "weight": "conv_weight",
++        },
++        ("conv_output", "conv_new_state"),
++    )
++    # The prologue must be the in-projection path only; the whole conv tail is
++    # the composed child.
++    assert len(parent.functions[0].body.operations) == start + len(
++        child.functions[0].body.operations
++    )
++
++
++def test_decoder_subgraph_reuses_rms_norm_and_swiglu():
++    parent = build_decoder_subgraph(2, hidden=8, intermediate=10)
++    norm = build_rms_norm((2, 8), "bf16", output_dtype="float32")
++    swiglu = build_swiglu((2, 20), "float32", output_dtype="float32")
++    assert_embedded(
++        parent,
++        norm,
++        {"x": "x", "weight": "norm_weight", "epsilon": "epsilon"},
++        ("rms_scaled",),
++        {"rms_": "decoder_norm_"},
++    )
++    assert_embedded(
++        parent,
++        swiglu,
++        {"packed": "projected"},
++        ("swiglu_value",),
++        {
++            "gate": "projected_gate",
++            "up": "projected_up",
++            "gate_silu": "projected_gate_silu",
++            "swiglu_value": "decoder_swiglu",
++        },
++    )
++
++
++def test_attention_kv_cache_reuses_gqa_causal_mask_and_softmax():
++    parent = build_qwen35_attention_kv_cache(
++        (1, 8, 1, 256),
++        (1, 2, 5, 256),
++        (1, 2, 5, 256),
++        (1, 2, 1, 256),
++        (1, 2, 1, 256),
++    )
++    repeat_k = build_gqa_repeat_kv((1, 2, 6, 256), 8)
++    repeat_v = build_gqa_repeat_kv((1, 2, 6, 256), 8)
++    mask = build_causal_mask((1, 8, 1, 6), "float32", output_dtype="float32")
++    softmax = build_stable_softmax((1, 8, 1, 6), "float32", output_dtype="float32")
++    assert_embedded(
++        parent, repeat_k, {"kv": "new_k", "head_indices": "head_indices"},
++        ("output",), {"output": "repeated_k"},
++    )
++    assert_embedded(
++        parent, repeat_v, {"kv": "new_v", "head_indices": "head_indices"},
++        ("output",), {"output": "repeated_v"},
++    )
++    assert_embedded(
++        parent,
++        mask,
++        {"logits": "scaled_logits", "causal_mask": "causal_mask", "fill_value": "fill_value"},
++        ("masked_f32",),
++        {"masked_f32": "masked_logits"},
++    )
++    assert_embedded(
++        parent,
++        softmax,
++        {"logits": "masked_logits"},
++        ("softmax_probabilities_f32",),
++        {"softmax_probabilities_f32": "attention_probabilities", "softmax_": "attention_"},
++    )
++    qk = build_batched_matmul((1, 8, 1, 256), (1, 8, 256, 6), "float32")
++    pv = build_batched_matmul((1, 8, 1, 6), (1, 8, 6, 256), "float32")
++    assert_embedded(
++        parent, qk, {"left": "attention_query_f32", "right": "key_transposed"},
++        ("output",), {"output": "qk_logits"},
++    )
++    assert_embedded(
++        parent, pv, {"left": "attention_probabilities", "right": "attention_value_f32"},
++        ("output",), {"output": "attention_context"},
++    )
++
++
++def test_attention_subgraph_reuses_every_branch():
++    parent = build_attention_subgraph(
++        (1, 4, 2, 4),
++        (1, 4, 2, 5),
++        (1, 2, 4, 4),
++        query_heads=4,
++        dtype="float32",
++        index_dtype="int32",
++        rotary_dim=2,
++    )
++    rope = build_rope_rotate_half(
++        (1, 4, 2, 4), "float32", output_dtype="float32", rotary_dim=2
++    )
++    mask = build_causal_mask((1, 4, 2, 5), "float32", output_dtype="float32")
++    softmax = build_stable_softmax((1, 4, 2, 5), "float32", output_dtype="float32")
++    gqa = build_gqa_repeat_kv((1, 2, 4, 4), 4, "float32", "int32")
++    assert_embedded(
++        parent, rope, {"x": "q", "cos": "cos", "sin": "sin"},
++        (qwen35._rope_core_result_name((1, 4, 2, 4), 2, "rope"),),
++        {"rope_": "attention_rope_"},
++    )
++    assert_embedded(
++        parent,
++        mask,
++        {"logits": "logits", "causal_mask": "causal_mask", "fill_value": "fill_value"},
++        ("masked_f32",),
++        {
++            "mask_logits_f32": "attention_logits_f32",
++            "mask_fill_f32": "attention_fill_f32",
++            "masked_f32": "attention_masked",
++        },
++    )
++    assert_embedded(
++        parent, softmax, {"logits": "attention_masked"},
++        ("softmax_probabilities_f32",),
++        {"softmax_probabilities_f32": "probabilities_f32", "softmax_": "attention_"},
++    )
++    assert_embedded(
++        parent, gqa, {"kv": "kv", "head_indices": "head_indices"},
++        ("output",), {"output": "repeated_kv"},
++    )
++
++
++def test_decoder_graph_reuses_composition_plane():
++    graph = build_qwen35_text_decoder_graph(2, 3, shape_profile="synthetic_test")
++    batch, steps = graph.metadata["shape"][0], graph.metadata["shape"][1]
++    assert (batch, steps) == (2, 3)
++    query_heads = qwen35._decoder_shape_profile("synthetic_test", 8)["query_heads"]
++    control = build_qwen35_position_control(batch, steps, query_heads=query_heads)
++    assert_embedded(graph, control, {}, ("position_ids", "causal_mask"))
++    # The graph's own metadata does not carry composite manifests; the
++    # structural embedding above is the composition witness.
++
++
++def test_decoder_graph_layer_reuses_shared_composites():
++    graph = build_qwen35_text_decoder_graph(2, 3, shape_profile="synthetic_test")
++    profile = qwen35._decoder_shape_profile("synthetic_test", 8)
++    batch, steps = 2, 3
++    qh, kvh, d = profile["query_heads"], profile["kv_heads"], profile["head_dim"]
++    rotary = profile["rotary_dim"]
++    prefix = "layer_03"  # full-attention layer (indices 3/7/11/15/19/23)
++    rms_q = build_rms_norm((batch, qh, steps, d), "bf16", output_dtype="float32")
++    rope_q = build_rope_rotate_half(
++        (batch, qh, steps, d), "float32", output_dtype="float32", rotary_dim=rotary
++    )
++    mask = build_causal_mask((batch, qh, steps, steps), "float32")
++    softmax = build_stable_softmax((batch, qh, steps, steps), "float32", output_dtype="float32")
++    assert_embedded(
++        graph, rms_q, {"x": None, "weight": None, "epsilon": None},
++        ("rms_scaled",), {"rms_": prefix + "_q_norm_"},
++    )
++    assert_embedded(
++        graph, rope_q, {"x": None, "cos": None, "sin": None},
++        (qwen35._rope_core_result_name((batch, qh, steps, d), rotary, "rope"),),
++        {"rope_": prefix + "_q_rope_"},
++    )
++    assert_embedded(
++        graph, mask, {"logits": None, "causal_mask": None, "fill_value": None},
++        ("masked_f32",), {"masked_f32": prefix + "_masked_logits"},
++    )
++    assert_embedded(
++        graph, softmax, {"logits": None},
++        ("softmax_probabilities_f32",),
++        {"softmax_probabilities_f32": prefix + "_probabilities", "softmax_": prefix + "_softmax_"},
++    )
++    qk = build_batched_matmul((batch, qh, steps, d), (batch, qh, d, steps), "float32")
++    pv = build_batched_matmul((batch, qh, steps, steps), (batch, qh, steps, d), "float32")
++    assert_embedded(
++        graph, qk, {"left": None, "right": None}, ("output",),
++        {"output": prefix + "_qk_logits"},
++    )
++    assert_embedded(
++        graph, pv, {"left": None, "right": None}, ("output",),
++        {"output": prefix + "_context"},
++    )
++    prefix = "layer_00"  # GDR layer
++    l2 = build_l2_norm(
++        (batch, steps, profile["linear_key_heads"], profile["linear_key_dim"]),
++        "bf16",
++        output_dtype="float32",
++    )
++    conv = build_causal_conv1d_state(
++        (batch, 2 * profile["linear_key_heads"] * profile["linear_key_dim"]
++         + profile["linear_value_heads"] * profile["linear_value_dim"], steps),
++        "bf16",
++    )
++    assert_embedded(
++        graph, l2, {"x": None, "epsilon": None}, ("l2_normalized",),
++        {"l2_": prefix + "_q_l2_"},
++    )
++    assert_embedded(
++        graph, conv, {"mixed_qkv": None, "prior_state": None, "weight": None},
++        ("conv_output", "conv_new_state"), {"conv_": prefix + "_causal_conv_"},
++    )
++
++
++@pytest.mark.parametrize("label", sorted(FROZEN_DIGESTS))
++def test_frozen_ir_digest(label):
++    """Every composed program keeps the pre-refactor canonical digest."""
++
++    if label == "position_control.2x3.p7.h8.int32":
++        program = build_qwen35_position_control(2, 3, past_length=7, index_dtype="int32")
++    elif label == "causal_conv1d_state.bf16.2x6x5":
++        program = build_causal_conv1d_state((2, 6, 5), "bf16")
++    elif label == "gated_delta_conv_state.bf16.1x5.h8.c12":
++        program = build_qwen35_gated_delta_conv_state(1, 5, hidden=8, channels=12)
++    elif label == "decoder_subgraph.bf16.2x8.i10":
++        program = build_decoder_subgraph(2, hidden=8, intermediate=10)
++    elif label == "attention_kv_cache.bf16.b1.decode_t1_past5":
++        program = build_attention_kv_cache(
++            (1, 8, 1, 256),
++            (1, 2, 5, 256),
++            (1, 2, 5, 256),
++            (1, 2, 1, 256),
++            (1, 2, 1, 256),
++        )
++    elif label == "attention_subgraph.f32":
++        program = build_attention_subgraph(
++            (1, 4, 2, 4),
++            (1, 4, 2, 5),
++            (1, 2, 4, 4),
++            query_heads=4,
++            dtype="float32",
++            index_dtype="int32",
++            rotary_dim=2,
++        )
++    elif label == "text_decoder.synthetic.b2.t3":
++        program = build_qwen35_text_decoder_graph(2, 3, shape_profile="synthetic_test")
++    else:  # pragma: no cover - keeps the dispatch exhaustive
++        raise AssertionError("unhandled frozen digest label {!r}".format(label))
++    assert _canonical_sha256(program) == FROZEN_DIGESTS[label]

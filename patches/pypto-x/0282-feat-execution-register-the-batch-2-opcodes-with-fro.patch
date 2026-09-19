@@ -1,0 +1,3334 @@
+From 8b52465579e6b6128abb4c7e067385b79eb43edc Mon Sep 17 00:00:00 2001
+From: pypto-x agent <agent@pypto-x.local>
+Date: Mon, 14 Sep 2026 04:38:38 +0800
+Subject: [PATCH 282/283] feat(execution): register the batch-2 opcodes with
+ frozen view semantics
+
+- add OpContracts for add/mul/rsqrt/transpose/slice/broadcast on the batch-1
+  schema v3 (precision, semantics, attribute schema, view obligation):
+  * add/mul: elementwise trailing-axis broadcast + scalar operands (no implicit
+    dtype promotion); tensor-tensor broadcast lowers to an explicit
+    broadcast+elementwise program shared by the lowering cross-check and the
+    portable provider, so a legal broadcast executes instead of being refused;
+  * rsqrt: float-only reciprocal sqrt with documented 0/negative/NaN/inf and
+    subnormal semantics;
+  * transpose/slice/broadcast: view semantics frozen first - may_alias with an
+    explicit budgeted materialize path, view_mode forbid/prefer/require,
+    inplace/valid_shape rules, stride legality; view_mode=require is refused
+    with a structured ALIAS_PROOF_UNAVAILABLE and never silently materializes.
+- add the two batch-1 contract patches as strictly additive verifier-level
+  admission extensions (the frozen where/compare documents and contract
+  digests stay byte-identical): where scalar fill operands and the redundant
+  compare.broadcast declaration; existing legal requests resolve identically.
+- freeze the operation-scoped portable capability manifest per batch: batch-1
+  requests keep their ten-contract document, batch-2 requests declare sixteen,
+  the default probe and matmul/qmatmul paths are untouched.
+- extend execute_operation/providers with scalar operand handles
+  (LaunchRequest.scalars) and a structured operand_value_rejected error.
+- tests: test_execution_ops_registry_batch2.py (38) plus inventory updates;
+  python/tests/ut/pypto_x execution suites 524 passed.
+- zero default change: 12 frozen runs (matmul/qmatmul + batch-1 opcodes) keep
+  contract/capability/plan/artifact/output digests byte-identical to 41ae82a01
+  (evidence _meta/pypto-x/u-ops-registry-batch2/raw/frozen_record_*).
+- U5 missing-contract table on the three real Qwen3.5 graphs: 19 -> 13 classes,
+  mul/transpose/broadcast/slice/add/rsqrt all gone.
+
+- op_bench selftest: the unregistered-opcode injection moves from add to sub
+  (add is now registered); the inventory tests in the execution suites grow the
+  six new opcodes without touching any frozen digest.
+
+(cherry picked from commit 79e528560535e9ed12a44dfa2ab6ee0f6cb0f344)
+---
+ python/pypto/execution/capability.py                          |  45 +-
+ python/pypto/execution/entry.py                               |  35 ++
+ python/pypto/execution/layout_verify.py                       | 139 ++++-
+ python/pypto/execution/op_registry.py                         | 596 +++++++++++++++++++-
+ python/pypto/execution/operation_contracts.py                 | 735 ++++++++++++++++++++++++-
+ python/pypto/execution/provider_ids.py                        |   7 +
+ python/pypto/execution/providers.py                           |  97 +++-
+ python/pypto/execution/report.py                              |   1 +
+ python/pypto/execution/resolver.py                            |  62 ++-
+ python/pypto/op_bench/runner.py                               |   4 +-
+ python/tests/ut/pypto_x/test_execution_discovery.py           |  17 +-
+ python/tests/ut/pypto_x/test_execution_matmul.py              |  10 +-
+ python/tests/ut/pypto_x/test_execution_ops_registry_batch1.py |  15 +-
+ python/tests/ut/pypto_x/test_execution_ops_registry_batch2.py | 882 ++++++++++++++++++++++++++++++
+ python/tests/ut/pypto_x/test_execution_region_planning.py     |  21 +-
+ python/tests/ut/pypto_x/test_op_bench_framework.py            |   6 +-
+ 16 files changed, 2572 insertions(+), 100 deletions(-)
+
+diff --git a/python/pypto/execution/capability.py b/python/pypto/execution/capability.py
+index dd4e5112c..6a64ad256 100644
+--- a/python/pypto/execution/capability.py
++++ b/python/pypto/execution/capability.py
+@@ -33,7 +33,12 @@ from .manifest import (
+     ProviderCapability,
+     _normalize_features,
+ )
+-from .op_registry import get_op_definition, registered_opcodes
++from .op_registry import (
++    BATCH1_CANONICAL_OPCODES,
++    BATCH2_CANONICAL_OPCODES,
++    get_op_definition,
++    registered_opcodes,
++)
+ from .provider_aocl import aocl_provider_capabilities
+ from .provider_aocl_int8 import (
+     aocl_int8_exact_blocked_provider_capabilities,
+@@ -58,6 +63,26 @@ PORTABLE_PROVIDER_VERSION = "portable.cpu.scalar.v1"
+ # as the 0047 exact-blocked opt-in entry).
+ FROZEN_PORTABLE_CONTRACTS = ("matmul", "qmatmul_s8s8_s32")
+ 
++# Cumulative contract sets of the operation-scoped portable manifest.  A
++# request resolved in batch N must keep its capability digest byte-stable when
++# batch N+1 registers more contracts, so each batch names its cumulative set
++# explicitly instead of re-hashing ``registered_opcodes()``.  Batch-1 requests
++# therefore still see exactly the ten contracts that existed at 0048-B time.
++_BATCH1_SCOPED_CONTRACTS = tuple(
++    sorted(FROZEN_PORTABLE_CONTRACTS + tuple(BATCH1_CANONICAL_OPCODES))
++)
++_BATCH2_SCOPED_CONTRACTS = tuple(
++    sorted(set(_BATCH1_SCOPED_CONTRACTS) | set(BATCH2_CANONICAL_OPCODES))
++)
++
++
++def _scoped_contract_opcodes(opcode: str) -> Tuple[str, ...]:
++    """Frozen cumulative contract set for one generic request's manifest."""
++
++    if opcode in BATCH2_CANONICAL_OPCODES:
++        return _BATCH2_SCOPED_CONTRACTS
++    return _BATCH1_SCOPED_CONTRACTS
++
+ # Host feature names relevant to the currently registered CPU providers.  The
+ # list is intentionally explicit instead of "all /proc flags" so the
+ # capability digest stays a stable, small platform fact set.
+@@ -219,19 +244,17 @@ def operation_provider_capability(
+             "operation_provider_capability only covers generic batch-1 contracts",
+             field="opcode",
+             requested=opcode,
+-            available=(
+-                "compare",
+-                "cast",
+-                "exp",
+-                "iota",
+-                "reduce_max",
+-                "reduce_sum",
+-                "reshape",
+-                "where",
++            available=tuple(
++                name
++                for name in registered_opcodes()
++                if get_op_definition(name).verifier == "generic"
+             ),
+             reason="not_a_generic_contract",
+         )
+-    contracts = {name: get_op_definition(name).contract_digest for name in registered_opcodes()}
++    contracts = {
++        name: get_op_definition(name).contract_digest
++        for name in _scoped_contract_opcodes(definition.canonical_opcode)
++    }
+     domains = set()
+     for spec in definition.inputs:
+         domains.update(spec.dtypes)
+diff --git a/python/pypto/execution/entry.py b/python/pypto/execution/entry.py
+index 729660742..e12cc314b 100644
+--- a/python/pypto/execution/entry.py
++++ b/python/pypto/execution/entry.py
+@@ -492,7 +492,30 @@ def execute_operation(
+             reason="unsupported_operand_handle",
+         )
+     operands = tuple(inputs)
++    frozen_request = plan.payload.get("request") if isinstance(plan.payload, Mapping) else None
++    frozen_inputs = (
++        frozen_request.get("inputs") if isinstance(frozen_request, Mapping) else None
++    )
+     for index, value in enumerate(operands):
++        kind = "tensor"
++        if (
++            isinstance(frozen_inputs, list)
++            and index < len(frozen_inputs)
++            and isinstance(frozen_inputs[index], Mapping)
++        ):
++            kind = str(frozen_inputs[index].get("kind", "tensor"))
++        if kind == "scalar":
++            # Patch A / batch-2 scalar operands: a raw int/float is the natural
++            # handle; the provider casts it to the frozen dtype (range-checked).
++            if isinstance(value, bool) or not isinstance(value, (int, float)):
++                raise OpContractError(
++                    "scalar operand {} must be an int or a float".format(index),
++                    field="operand[{}]".format(index),
++                    requested=type(value).__name__,
++                    available=["int", "float"],
++                    reason="unsupported_operand_handle",
++                )
++            continue
+         if not isinstance(value, HostTensor):
+             raise OpContractError(
+                 "operation requires HostTensor operands",
+@@ -605,6 +628,17 @@ def _check_operation_operands(plan: ExecutionPlan, operands: Tuple[HostTensor, .
+         }
+     else:
+         for index, (tensor, frozen) in enumerate(zip(operands, frozen_inputs)):
++            kind = str(frozen.get("kind", "tensor"))
++            if kind == "scalar":
++                # The entry layer checked the int/float handle; the provider
++                # performs the exact, range-checked cast into the frozen dtype.
++                continue
++            if not isinstance(tensor, HostTensor):
++                mismatches["input[{}]".format(index)] = {
++                    "requested": type(tensor).__name__,
++                    "available": "HostTensor",
++                }
++                continue
+             if tuple(tensor.shape) != tuple(frozen["shape"]):
+                 mismatches["input[{}].shape".format(index)] = {
+                     "requested": list(tensor.shape),
+@@ -743,6 +777,7 @@ def _verify_plan_layout_decision(plan: ExecutionPlan, definition: Any) -> None:
+         payload["layout_decision"],
+         definition=definition,
+         layout_policy_document=policy_layout,
++        request=payload.get("request") if isinstance(payload.get("request"), Mapping) else None,
+     )
+     if not errors:
+         return
+diff --git a/python/pypto/execution/layout_verify.py b/python/pypto/execution/layout_verify.py
+index 233789652..5d088f75b 100644
+--- a/python/pypto/execution/layout_verify.py
++++ b/python/pypto/execution/layout_verify.py
+@@ -32,6 +32,7 @@ from pypto.alias import (
+     recompute_alias_proof_digest,
+     resolve_view,
+ )
++from pypto.lowering.cpu import canonical_dtype
+ 
+ from .errors import (
+     AliasProofUnavailableError,
+@@ -66,6 +67,112 @@ def matmul_view_capability() -> ViewCapability:
+     )
+ 
+ 
++_VIEW_BLOCK_KEY = "view"
++_VIEW_BYTES = {
++    "bool": 1,
++    "int8": 1,
++    "uint8": 1,
++    "int16": 2,
++    "uint16": 2,
++    "float16": 2,
++    "half": 2,
++    "bf16": 2,
++    "bfloat16": 2,
++    "int32": 4,
++    "uint32": 4,
++    "float32": 4,
++    "int64": 8,
++    "uint64": 8,
++    "float64": 8,
++}
++
++
++def definition_view_block(definition: Any) -> Optional[Mapping[str, Any]]:
++    """Return the batch-2 view contract block, or ``None`` for other contracts."""
++
++    semantics = getattr(definition, "semantics", None)
++    if not isinstance(semantics, Mapping):
++        return None
++    block = semantics.get(_VIEW_BLOCK_KEY)
++    return block if isinstance(block, Mapping) else None
++
++
++def _view_copy_bytes(
++    definition: Any, output_shape: Optional[Sequence[int]], output_dtype: Optional[str]
++) -> int:
++    """Materialize-copy size for a view-family request.
++
++    The copy byte count is part of the frozen layout decision, so it is derived
++    from the request result declaration (and is recomputed by every validator
++    from the same plan/report request block).
++    """
++
++    if definition_view_block(definition) is None:
++        return 0
++    if output_shape is None or output_dtype is None:
++        return 0
++    try:
++        shape = tuple(output_shape)
++        if any(isinstance(dim, bool) or not isinstance(dim, int) or dim < 0 for dim in shape):
++            return 0
++        dtype = canonical_dtype(str(output_dtype))
++    except Exception:  # noqa: BLE001 - malformed declarations fail digest re-derivation
++        return 0
++    count = 1
++    for dim in shape:
++        count *= int(dim)
++    return count * int(_VIEW_BYTES.get(dtype, 0))
++
++
++def definition_view_contract(
++    definition: Any,
++    *,
++    output_shape: Optional[Sequence[int]] = None,
++    output_dtype: Optional[str] = None
++) -> ViewContract:
++    """Translate an ``OpDefinition`` into the shared alias contract.
++
++    Matmul/qmatmul and the elementwise contracts keep the frozen
++    ``must_not_alias`` contract with ``allows_materialize_copy=False`` (their
++    proof digest is part of every frozen plan).  The batch-2 view/data-movement
++    family declares ``view_obligation=may_alias`` plus an explicit, budgeted
++    materialize path whose real byte count is derived from the request result.
++    """
++
++    block = definition_view_block(definition)
++    if block is None:
++        return matmul_view_contract(definition)
++    return ViewContract(
++        opcode=definition.canonical_opcode,
++        view_obligation=str(definition.view_obligation),
++        allows_materialize_copy=bool(block.get("allows_materialize_copy", False)),
++        copy_bytes=_view_copy_bytes(definition, output_shape, output_dtype),
++        max_copy_bytes=None,
++        effects=str(definition.numeric_contract.get("effects", "pure")),
++    )
++
++
++def definition_view_capability(definition: Any) -> ViewCapability:
++    """Capability facts for evaluating one contract's view obligation.
++
++    The portable trunk has no strided-view ABI, so a view-family opcode cannot
++    produce a zero-copy alias proof: ``alias_proof="unsupported"`` makes
++    ``view_mode=require`` fail closed with a structured refusal while
++    ``forbid``/``prefer`` resolve to an explicit materialize copy.
++    """
++
++    if definition_view_block(definition) is None:
++        return matmul_view_capability()
++    return ViewCapability(
++        backend="portable.cpu.scalar",
++        alias_proof="unsupported",
++        stride_class="contiguous_identity",
++        supported_view_modes=VIEW_MODES,
++        max_rank=4,
++        reason="portable_trunk_has_no_strided_view_abi",
++    )
++
++
+ def layout_intent_from_document(layout_document: Optional[Mapping[str, Any]]) -> ViewIntent:
+     """Rebuild the layout intent from a policy/report layout document.
+ 
+@@ -104,17 +211,24 @@ def _translate_resolution_error(exc: ViewResolutionError) -> ExecutionError:
+ 
+ 
+ def canonical_layout_decision(
+-    definition: Any, layout_policy_document: Optional[Mapping[str, Any]]
++    definition: Any,
++    layout_policy_document: Optional[Mapping[str, Any]],
++    *,
++    output_shape: Optional[Sequence[int]] = None,
++    output_dtype: Optional[str] = None
+ ) -> Mapping[str, Any]:
+     """Re-derive the exact layout decision for a frozen policy.
+ 
+     Raises :class:`AliasProofUnavailableError` / :class:`PolicyConflictError`
+     when the policy is not satisfiable for this contract (for example
+-    ``view_mode=require`` on ``must_not_alias``).
++    ``view_mode=require`` on ``must_not_alias`` or on a view opcode whose
++    zero-copy alias proof cannot be produced).
+     """
+ 
+-    contract = matmul_view_contract(definition)
+-    capability = matmul_view_capability()
++    contract = definition_view_contract(
++        definition, output_shape=output_shape, output_dtype=output_dtype
++    )
++    capability = definition_view_capability(definition)
+     intent = layout_intent_from_document(layout_policy_document)
+     try:
+         resolution = resolve_view(contract, capability, intent)
+@@ -313,12 +427,14 @@ def layout_decision_errors(
+     *,
+     definition: Optional[Any] = None,
+     layout_policy_document: Optional[Mapping[str, Any]] = None,
+-    runtime_alias_check: bool = False
++    runtime_alias_check: bool = False,
++    request: Optional[Mapping[str, Any]] = None
+ ) -> Tuple[Mapping[str, Any], ...]:
+     """All layout-decision refusals available at the caller's layer.
+ 
+     ``definition`` adds the registered-contract cross-check and, together with
+-    ``layout_policy_document``, the canonical re-derivation comparison.
++    ``layout_policy_document`` and the frozen ``request`` result declaration,
++    the canonical re-derivation comparison.
+     """
+ 
+     if not isinstance(decision, Mapping):
+@@ -350,7 +466,13 @@ def layout_decision_errors(
+             )
+         if layout_policy_document is not None:
+             try:
+-                expected = canonical_layout_decision(definition, layout_policy_document)
++                request_document = request if isinstance(request, Mapping) else {}
++                expected = canonical_layout_decision(
++                    definition,
++                    layout_policy_document,
++                    output_shape=request_document.get("output_shape"),
++                    output_dtype=request_document.get("output_dtype"),
++                )
+             except ExecutionError as exc:
+                 errors.append(
+                     _error(
+@@ -405,6 +527,9 @@ def raise_first_layout_error(
+ __all__ = [
+     "alias_proof_errors",
+     "canonical_layout_decision",
++    "definition_view_block",
++    "definition_view_capability",
++    "definition_view_contract",
+     "layout_decision_errors",
+     "layout_intent_from_document",
+     "layout_rule_errors",
+diff --git a/python/pypto/execution/op_registry.py b/python/pypto/execution/op_registry.py
+index a97a27811..54beba20a 100644
+--- a/python/pypto/execution/op_registry.py
++++ b/python/pypto/execution/op_registry.py
+@@ -546,9 +546,21 @@ class OpDefinition:
+         derived_type = CoreType.tensor(
+             str(info["output_dtype"]), tuple(int(dim) for dim in info["output_shape"])
+         )
++        # The verifier may have classified an operand as a scalar (patch A and
++        # the batch-2 binary/broadcast contracts).  The lowering cross-check
++        # must see the same value kind, otherwise a tensor-shaped scalar would
++        # be admitted on the ask path but rejected (or mis-read) by the
++        # reference executor.
++        lowering_inputs = tuple(input_types)
++        kinds = info.get("input_kinds")
++        if kinds is not None and len(tuple(kinds)) == len(lowering_inputs):
++            lowering_inputs = tuple(
++                CoreType.scalar(canonical_dtype(value_type.dtype)) if kind == "scalar" else value_type
++                for kind, value_type in zip(kinds, lowering_inputs)
++            )
+         verify_lowering_accepts(
+             self.canonical_opcode,
+-            tuple(input_types),
++            lowering_inputs,
+             derived_type,
+             dict(info["attributes"]),
+         )
+@@ -1133,7 +1145,8 @@ def _generic_numeric_contract(
+     integer_overflow: str,
+     reduction_order: str,
+     reduction_order_id: str,
+-    empty: str
++    empty: str,
++    aliasing: str = "inputs_readonly_outputs_distinct"
+ ) -> Mapping[str, Any]:
+     return {
+         "reference": reference_id,
+@@ -1149,7 +1162,7 @@ def _generic_numeric_contract(
+         "k_tail": "not_applicable",
+         "empty": empty,
+         "bias_epilogue": "none",
+-        "aliasing": "inputs_readonly_outputs_distinct",
++        "aliasing": aliasing,
+         "effects": "pure",
+         "quantization": None,
+     }
+@@ -1905,10 +1918,585 @@ _BATCH1_DEFINITION_BUILDERS = {
+     "reshape": _build_reshape_definition,
+ }
+ 
++
++# ---------------------------------------------------------------------------
++# 0050-A batch-2 opcodes: elementwise arithmetic + view/data movement
++# ---------------------------------------------------------------------------
++BATCH2_CANONICAL_OPCODES = (
++    "add",
++    "broadcast",
++    "mul",
++    "rsqrt",
++    "slice",
++    "transpose",
++)
++
++
++def _view_semantics_block(
++    kind: str,
++    stride_rule: str,
++    *,
++    data: str
++) -> Mapping[str, Any]:
++    """Shared ``view`` block for the batch-2 shape/data-movement family.
++
++    The three-state ``layout.view_mode`` contract is frozen here:
++
++    * the opcode is a *logical* view family member: aliasing the input storage
++      would be legal for a provider that exposes a stride descriptor
++      (``view_obligation = may_alias``), but it is not required;
++    * the portable trunk has no strided-view ABI, so it always materializes an
++      independent output row-major buffer (``forbid``/``prefer`` resolve to
++      ``materialized`` with the real copy byte count);
++    * ``view_mode=require`` demands a proven zero-copy alias proof.  The
++      portable trunk cannot produce one, so it is refused with a structured
++      ``ALIAS_PROOF_UNAVAILABLE`` — never silently downgraded to a copy.
++    """
++
++    return {
++        "family": "view_data_movement",
++        "data": data,
++        "view": {
++            "kind": kind,
++            "view_obligation": "may_alias",
++            "allows_materialize_copy": True,
++            "copy_bytes_rule": "element_count(output_shape) * dtype_size(output_dtype)",
++            "alias_policy": (
++                "input storage may be aliased by a provider that can prove a stride "
++                "descriptor; the portable trunk always materializes an independent "
++                "output buffer"
++            ),
++            "view_mode": {
++                "forbid": (
++                    "explicit independent destination; the portable provider "
++                    "materializes a copy (resolved_view_mode=materialized)"
++                ),
++                "prefer": (
++                    "a zero-copy view would be preferred, but the portable provider "
++                    "cannot prove one; an explicit budgeted materialize copy is used"
++                ),
++                "require": (
++                    "structured ALIAS_PROOF_UNAVAILABLE refusal when no zero-copy "
++                    "proof exists; never a silent downgrade to a copy"
++                ),
++            },
++            "stride": stride_rule,
++            "inplace": (
++                "inplace=true is rejected (the output must not alias an input); "
++                "absent/false only"
++            ),
++            "valid_shape": (
++                "when present, valid_shape must equal the resolved output shape; a "
++                "partial valid shape is not represented by the portable tensor ABI"
++            ),
++        },
++    }
++
++
++def _build_elementwise_binary_definition(opcode: str) -> OpDefinition:
++    from .operation_contracts import BINARY_DTYPES
++
++    precision = precision_declaration(
++        default=_exact_rule(
++            "exact_integer_elementwise",
++            "integer {0} evaluates each element with exact Python integers and "
++            "performs one range-checked output cast; an out-of-range result fails "
++            "closed, so no wraparound or saturation is observable".format(opcode),
++        ),
++        rules=(
++            _bounded_rule(
++                "float_elementwise",
++                "each element is computed once in binary64 from the exactly decoded "
++                "operands and then cast to the output dtype with one RNE step; no "
++                "analytic envelope is registered for the float path",
++                "float16/bf16/float32/float64 operands with arbitrary finite or "
++                "non-finite values",
++                "one binary64 operation and one RNE cast per element; the class is "
++                "deterministic_bounded only because no envelope is registered, and "
++                "observations are never a bound",
++                when={"input_families": ["float"]},
++            ),
++        ),
++        notes=(
++            "operands share one dtype; there is no implicit dtype promotion",
++            "a scalar operand must already carry the value dtype",
++        ),
++    )
++    semantics = {
++        "operation": "out[i] = left[i] {0} right[i] over the trailing-axis broadcast "
++                     "shape; the two operands must share exactly one dtype".format(opcode),
++        "broadcast": _BROADCAST_RULE_TEXT,
++        "scalar_operands": "a rank-0 scalar operand is admitted on either side and "
++                           "broadcasts as the identity; it must already have the "
++                           "selected dtype (insert an explicit cast to change dtype); "
++                           "two scalar operands are refused because the execution "
++                           "contract returns tensors",
++        "execution_subset": "same-shape tensor-tensor and scalar requests lower to "
++                            "one op; a tensor-tensor broadcast is lowered to an "
++                            "explicit broadcast + elementwise program re-derived from "
++                            "the frozen request, so a legal broadcast executes "
++                            "instead of being refused or re-associated",
++        "nan": "IEEE-754 propagation: NaN operands produce NaN",
++        "signed_zero": "IEEE-754 signed-zero rules of the binary64 operation are "
++                       "preserved through the output cast",
++        "inf": "+inf + -inf produces NaN; float32/bf16 overflow saturates to signed "
++               "infinity, float16 overflow fails closed, integer results fail closed",
++        "subnormal": "operands are decoded exactly to binary64; the result is cast "
++                     "with RNE to the target format (subnormal or zero on underflow)",
++        "bf16": "bf16 operands are decoded exactly and the binary64 result is rounded "
++                "to bf16 with RNE",
++        "integer_overflow": "out-of-range integer results fail closed (no wraparound, "
++                            "no saturation)",
++        "empty": "a zero-length broadcast dimension yields a zero-element output",
++        "aliasing": "output storage must be distinct from every input",
++    }
++    return _generic_definition(
++        opcode,
++        operand_specs=(
++            _spec("left", BINARY_DTYPES, role="input"),
++            _spec("right", BINARY_DTYPES, role="input"),
++        ),
++        output_spec=_spec("out", BINARY_DTYPES, role="output"),
++        input_roles=("left", "right"),
++        operand_dtypes=(BINARY_DTYPES, BINARY_DTYPES),
++        attribute_names=(),
++        attribute_schema={},
++        shape_rules=(
++            "tensor operands have rank 1..4; a scalar operand has rank 0",
++            "dtype(left) == dtype(right) == dtype(output), bool excluded",
++            _BROADCAST_SHAPE_RULE,
++            _BROADCAST_RULE_TEXT,
++        ),
++        dtype_rules=(
++            "dtype(left) == dtype(right) == dtype(output)",
++            "dtype in the portable registry excluding bool",
++            "no implicit promotion: mixed dtypes are refused",
++        ),
++        shape_rule_id="broadcast_binary_elementwise_trailing_v1",
++        result_dtype_rule={"kind": "same_as_input", "source": "left"},
++        numeric_contract=_generic_numeric_contract(
++            "portable.cpu.scalar.{}.v1".format(opcode),
++            accumulation={
++                "float16": "binary64_operation_then_single_rne_cast",
++                "float32": "binary64_operation_then_single_rne_cast",
++                "float64": "binary64_operation",
++                "integer": "exact_python_integer_operation_range_checked_cast",
++            },
++            accumulation_rounding="single_rne_cast_to_output_dtype",
++            integer_overflow="out_of_range_output_fails_closed_no_wraparound_no_saturation",
++            reduction_order="portable_output_row_major_single_pass_v1",
++            reduction_order_id="portable_output_row_major_single_pass_v1",
++            empty="zero_length_broadcast_dimension_yields_a_zero_element_output",
++        ),
++        portable_reference=_generic_portable_reference(
++            opcode,
++            "pypto.backends.cpu.runtime._binary_value",
++            "pypto.lowering.cpu._broadcast_shape",
++        ),
++        precision=precision,
++        semantics=semantics,
++    )
++
++
++def _build_add_definition() -> OpDefinition:
++    return _build_elementwise_binary_definition("add")
++
++
++def _build_mul_definition() -> OpDefinition:
++    return _build_elementwise_binary_definition("mul")
++
++
++
++def _build_rsqrt_definition() -> OpDefinition:
++    from .operation_contracts import FLOAT_DTYPE_TUPLE
++
++    precision = precision_declaration(
++        default=_bounded_rule(
++            "float_reciprocal_sqrt",
++            "each element is decoded exactly to binary64 and evaluates "
++            "1.0/sqrt(x); the binary64 result is cast to the output dtype with one "
++            "RNE step.  No analytic envelope is registered for the libm/binary64 "
++            "round trip, so the float path is deterministic_bounded",
++            "float16/bf16/float32/float64 inputs, arbitrary finite or non-finite values",
++            "1/sqrt evaluated in binary64 then one RNE cast; NaN/-inf -> NaN, "
++            "+-0 -> +inf, +inf -> +0; no analytic upper bound is registered and "
++            "observations are never a bound",
++        ),
++        rules=(),
++        notes=("float only; the zero/negative/NaN/inf semantics are contract text",),
++    )
++    semantics = {
++        "operation": "out[i] = 1.0 / sqrt(x[i]); sqrt and the reciprocal are evaluated "
++                     "with binary64 libm semantics and the result is cast once to the "
++                     "output dtype with RNE",
++        "domain": "all float16/bf16/float32/float64 values, including signed zero, "
++                  "infinities, NaN and subnormals",
++        "nan": "rsqrt(NaN) = NaN",
++        "signed_zero": "rsqrt(+0.0) = rsqrt(-0.0) = +inf (the portable runtime "
++                       "classifies both signed zeros as zero before dividing)",
++        "negative": "every negative finite value and -inf produces NaN",
++        "positive_inf": "rsqrt(+inf) = +0.0",
++        "subnormal": "subnormal inputs are handled in binary64; a reciprocal that "
++                     "overflows the target format saturates to +inf for float32/bf16 "
++                     "and fails closed for float16",
++        "overflow": "float32/bf16 results saturate to +inf; float16 +inf results fail "
++                    "closed (no silent inf)",
++        "empty": "a zero-element input yields a zero-element output",
++        "aliasing": "output storage must be distinct from the input",
++    }
++    return _generic_definition(
++        "rsqrt",
++        operand_specs=(_spec("input", FLOAT_DTYPE_TUPLE, role="input"),),
++        output_spec=_spec("out", FLOAT_DTYPE_TUPLE, role="output"),
++        input_roles=("input",),
++        operand_dtypes=(FLOAT_DTYPE_TUPLE,),
++        attribute_names=(),
++        attribute_schema={},
++        shape_rules=(
++            "rank(input), rank(output) in [1, 4]",
++            "shape(output) == shape(input)",
++            "dtype(input) == dtype(output) in {float16, bf16, float32, float64}",
++        ),
++        dtype_rules=(
++            "dtype(input) == dtype(output)",
++            "float16/bf16/float32/float64 only",
++        ),
++        shape_rule_id="unary_float_shape_preserving_v1",
++        result_dtype_rule={"kind": "same_as_input"},
++        numeric_contract=_generic_numeric_contract(
++            "portable.cpu.scalar.rsqrt.v1",
++            accumulation={
++                "float16": "binary64_reciprocal_sqrt_then_single_rne_cast",
++                "float32": "binary64_reciprocal_sqrt_then_single_rne_cast",
++                "float64": "binary64_reciprocal_sqrt",
++                "integer": "not_applicable_float_only",
++            },
++            accumulation_rounding="single_rne_cast_to_output_dtype",
++            integer_overflow="not_applicable_float_only",
++            reduction_order="portable_output_row_major_single_pass_v1",
++            reduction_order_id="portable_output_row_major_single_pass_v1",
++            empty="zero_element_input_yields_a_zero_element_output",
++        ),
++        portable_reference=_generic_portable_reference(
++            "rsqrt", "pypto.backends.cpu.runtime._math_value",
++            "pypto.backends.cpu.runtime._math_scalar"
++        ),
++        precision=precision,
++        semantics=semantics,
++    )
++
++
++def _build_transpose_definition() -> OpDefinition:
++    from .operation_contracts import VIEW_DTYPES
++
++    precision = precision_declaration(
++        default=_exact_rule(
++            "exact_axis_permutation",
++            "transpose relocates already-stored values along one axis permutation; no "
++            "arithmetic and no conversion is performed, so every value including NaN, "
++            "signed zero, subnormals and bf16 bit patterns is preserved exactly",
++        ),
++        rules=(),
++        notes=("permutation/perm/dims/axes or dim0/dim1 must describe one full permutation",),
++    )
++    semantics = {
++        "operation": "out[c] = input[c permuted by `permutation`]; the default portable "
++                     "reference materializes the output in row-major order",
++        "permutation": "a full permutation of 0..rank-1; negative axes are normalized; "
++                       "duplicates, missing axes and out-of-range axes fail closed; the "
++                       "dim0/dim1 spelling performs one axis swap",
++        "dtype": "input and output dtypes must match; every portable dtype is accepted",
++        "nan": "NaN values are relocated verbatim",
++        "signed_zero": "+0.0/-0.0 are relocated verbatim",
++        "inf": "infinities are relocated verbatim",
++        "subnormal": "subnormals are relocated verbatim",
++        "bf16": "bf16 values are relocated verbatim",
++        "integer_overflow": "not applicable: no arithmetic or conversion",
++        "empty": "a zero-element input yields a zero-element permuted output",
++        "aliasing": "output storage must be distinct from the input (inplace=true is "
++                    "refused)",
++    }
++    semantics.update(
++        _view_semantics_block(
++            "axis_permutation",
++            "the logical result is a permutation of the input strides; the portable "
++            "trunk exposes no stride descriptor and materializes a row-major copy",
++            data="pure relocation of one axis permutation",
++        )
++    )
++    return _generic_definition(
++        "transpose",
++        operand_specs=(_spec("input", VIEW_DTYPES, role="input"),),
++        output_spec=_spec("out", VIEW_DTYPES, role="output"),
++        input_roles=("input",),
++        operand_dtypes=(VIEW_DTYPES,),
++        attribute_names=(
++            "permutation", "perm", "dims", "axes", "dim0", "axis0", "dim1", "axis1",
++            "inplace", "valid_shape", "valid_shapes",
++        ),
++        attribute_schema={
++            "permutation": {"type": "sequence[int]", "required": False,
++                            "note": "one of permutation/perm/dims/axes; must be a full permutation"},
++            "perm": {"type": "sequence[int]", "required": False, "aliases": "permutation"},
++            "dims": {"type": "sequence[int]", "required": False, "aliases": "permutation"},
++            "axes": {"type": "sequence[int]", "required": False, "aliases": "permutation"},
++            "dim0": {"type": "int", "required": False},
++            "axis0": {"type": "int", "required": False, "aliases": "dim0"},
++            "dim1": {"type": "int", "required": False},
++            "axis1": {"type": "int", "required": False, "aliases": "dim1"},
++            "inplace": {"type": "bool", "required": False, "values": [False]},
++            "valid_shape": {"type": "sequence[int]", "required": False,
++                            "note": "when present it must equal the output shape"},
++            "valid_shapes": {"type": "sequence[int]", "required": False, "aliases": "valid_shape"},
++        },
++        shape_rules=(
++            "rank(input), rank(output) in [1, 4]",
++            "dtype(input) == dtype(output)",
++            "shape(output)[i] == shape(input)[permutation[i]]",
++            "inplace must be false/absent",
++        ),
++        dtype_rules=(
++            "dtype(input) == dtype(output)",
++            "dtype in the portable registry (bool included)",
++        ),
++        shape_rule_id="transpose_axis_permutation_v1",
++        result_dtype_rule={"kind": "same_as_input"},
++        numeric_contract=_generic_numeric_contract(
++            "portable.cpu.scalar.transpose.v1",
++            accumulation={
++                "float16": "none_verbatim_relocation",
++                "float32": "none_verbatim_relocation",
++                "float64": "none_verbatim_relocation",
++                "integer": "none_verbatim_relocation",
++            },
++            accumulation_rounding="none_verbatim_relocation",
++            integer_overflow="not_applicable_no_conversion",
++            reduction_order="portable_output_row_major_single_pass_v1",
++            reduction_order_id="portable_output_row_major_single_pass_v1",
++            empty="zero_element_input_yields_a_zero_element_output",
++            aliasing="may_alias",
++        ),
++        portable_reference=_generic_portable_reference(
++            "transpose", "pypto.backends.cpu.runtime._transpose_value",
++            "pypto.lowering.cpu._m1b_permutation"
++        ),
++        precision=precision,
++        semantics=semantics,
++    )
++
++
++def _build_slice_definition() -> OpDefinition:
++    from .operation_contracts import VIEW_DTYPES
++
++    precision = precision_declaration(
++        default=_exact_rule(
++            "exact_index_selection",
++            "slice selects a bounded coordinate subset per axis and relocates the "
++            "stored values verbatim; no arithmetic or conversion is performed",
++        ),
++        rules=(),
++        notes=("positive integer steps only; negative/reversed slicing fails closed",),
++    )
++    semantics = {
++        "operation": "out = input[starts:stops:steps] over the declared axes; axes not "
++                     "listed are copied in full",
++        "bounds": "start/stop are in [-dim, dim] and are normalized by adding dim once; "
++                  "out-of-range bounds fail closed; start > stop yields a zero-length axis",
++        "steps": "steps are positive integers; a non-positive or negative step is refused "
++                 "with slice_negative_step_not_supported (no reversed views)",
++        "axes": "axes must be unique and in [-rank, rank-1]; unlisted axes are identity",
++        "dtype": "input and output dtypes must match; every portable dtype is accepted",
++        "nan": "NaN values are relocated verbatim",
++        "signed_zero": "+0.0/-0.0 are relocated verbatim",
++        "inf": "infinities are relocated verbatim",
++        "subnormal": "subnormals are relocated verbatim",
++        "bf16": "bf16 values are relocated verbatim",
++        "integer_overflow": "not applicable: no arithmetic or conversion",
++        "empty": "an empty slice (start >= stop) or a zero-length source axis yields a "
++                 "zero-length output axis",
++        "aliasing": "output storage must be distinct from the input (inplace=true is "
++                    "refused)",
++    }
++    semantics.update(
++        _view_semantics_block(
++            "strided_slice",
++            "the logical result is an offset/strided view of the source; the portable "
++            "trunk exposes no stride descriptor and materializes a row-major copy",
++            data="bounded per-axis coordinate selection over stored values",
++        )
++    )
++    return _generic_definition(
++        "slice",
++        operand_specs=(_spec("input", VIEW_DTYPES, role="input"),),
++        output_spec=_spec("out", VIEW_DTYPES, role="output"),
++        input_roles=("input",),
++        operand_dtypes=(VIEW_DTYPES,),
++        attribute_names=(
++            "starts", "start", "stops", "stop", "axes", "axis", "steps", "step",
++            "inplace", "valid_shape", "valid_shapes",
++        ),
++        attribute_schema={
++            "starts": {"type": "sequence[int]", "required": True},
++            "start": {"type": "sequence[int]", "required": False, "aliases": "starts"},
++            "stops": {"type": "sequence[int]", "required": True},
++            "stop": {"type": "sequence[int]", "required": False, "aliases": "stops"},
++            "axes": {"type": "sequence[int]", "required": False,
++                     "note": "defaults to range(len(starts)); must be unique"},
++            "axis": {"type": "sequence[int]", "required": False, "aliases": "axes"},
++            "steps": {"type": "sequence[int]", "required": False,
++                      "note": "defaults to 1; positive only"},
++            "step": {"type": "sequence[int]", "required": False, "aliases": "steps"},
++            "inplace": {"type": "bool", "required": False, "values": [False]},
++            "valid_shape": {"type": "sequence[int]", "required": False,
++                            "note": "when present it must equal the output shape"},
++            "valid_shapes": {"type": "sequence[int]", "required": False, "aliases": "valid_shape"},
++        },
++        shape_rules=(
++            "rank(input), rank(output) in [1, 4]",
++            "dtype(input) == dtype(output)",
++            "shape(output)[axis] == max(0, ceil((stop-start)/step)) for each sliced axis",
++            "starts/stops/axes/steps lengths agree",
++            "inplace must be false/absent",
++        ),
++        dtype_rules=(
++            "dtype(input) == dtype(output)",
++            "dtype in the portable registry (bool included)",
++        ),
++        shape_rule_id="slice_bounded_positive_step_v1",
++        result_dtype_rule={"kind": "same_as_input"},
++        numeric_contract=_generic_numeric_contract(
++            "portable.cpu.scalar.slice.v1",
++            accumulation={
++                "float16": "none_verbatim_relocation",
++                "float32": "none_verbatim_relocation",
++                "float64": "none_verbatim_relocation",
++                "integer": "none_verbatim_relocation",
++            },
++            accumulation_rounding="none_verbatim_relocation",
++            integer_overflow="not_applicable_no_conversion",
++            reduction_order="portable_output_row_major_single_pass_v1",
++            reduction_order_id="portable_output_row_major_single_pass_v1",
++            empty="empty_slice_or_zero_length_axis_yields_a_zero_length_output_axis",
++            aliasing="may_alias",
++        ),
++        portable_reference=_generic_portable_reference(
++            "slice", "pypto.backends.cpu.runtime._slice_value",
++            "pypto.lowering.cpu._m1b_slice_spec"
++        ),
++        precision=precision,
++        semantics=semantics,
++    )
++
++
++def _build_broadcast_definition() -> OpDefinition:
++    from .operation_contracts import ALL_DTYPES
++
++    precision = precision_declaration(
++        default=_exact_rule(
++            "exact_replication",
++            "broadcast replicates an existing element along every expanded axis; the "
++            "stored values are preserved exactly and no arithmetic is performed",
++        ),
++        rules=(),
++        notes=("the declared target shape must be trailing-axis compatible with the input",),
++    )
++    semantics = {
++        "operation": "out[c] = input[projected c] with singleton/absent dimensions "
++                     "expanded; the declared target shape is authoritative",
++        "target_shape": "shape/target_shape/out_shape (or the declared output shape) "
++                        "names the result; all spellings must agree",
++        "compatibility": _BROADCAST_RULE_TEXT,
++        "scalar_input": "a rank-0 scalar input may expand to any target shape and must "
++                        "already carry the output dtype",
++        "dtype": "input and output dtypes must match; every portable dtype is accepted",
++        "nan": "NaN values are replicated verbatim",
++        "signed_zero": "+0.0/-0.0 are replicated verbatim",
++        "inf": "infinities are replicated verbatim",
++        "subnormal": "subnormals are replicated verbatim",
++        "bf16": "bf16 values are replicated verbatim",
++        "integer_overflow": "not applicable: no arithmetic or conversion",
++        "empty": "expanding a zero-length axis with a singleton stays zero-length; "
++                 "expanding a singleton source dimension to zero yields a zero-length output",
++        "aliasing": "output storage must be distinct from the input (inplace=true is "
++                    "refused)",
++    }
++    semantics.update(
++        _view_semantics_block(
++            "stride_zero_expansion",
++            "the logical result is a stride-0 broadcast view; the portable trunk "
++            "exposes no stride descriptor and materializes the replicated output",
++            data="value replication along expanded axes",
++        )
++    )
++    return _generic_definition(
++        "broadcast",
++        operand_specs=(_spec("input", ALL_DTYPES, role="input"),),
++        output_spec=_spec("out", ALL_DTYPES, role="output"),
++        input_roles=("input",),
++        operand_dtypes=(ALL_DTYPES,),
++        attribute_names=("shape", "target_shape", "out_shape", "inplace", "valid_shape", "valid_shapes"),
++        attribute_schema={
++            "shape": {"type": "sequence[int]", "required": False,
++                      "note": "must equal the declared output shape"},
++            "target_shape": {"type": "sequence[int]", "required": False, "aliases": "shape"},
++            "out_shape": {"type": "sequence[int]", "required": False, "aliases": "shape"},
++            "inplace": {"type": "bool", "required": False, "values": [False]},
++            "valid_shape": {"type": "sequence[int]", "required": False,
++                            "note": "when present it must equal the output shape"},
++            "valid_shapes": {"type": "sequence[int]", "required": False, "aliases": "valid_shape"},
++        },
++        shape_rules=(
++            "tensor input rank 1..4, scalar input rank 0; output rank 1..4",
++            "dtype(input) == dtype(output)",
++            "broadcast_shape(input_shape, output_shape) == output_shape",
++            "a declared shape/target_shape/out_shape attribute must equal the output shape",
++            "inplace must be false/absent",
++        ),
++        dtype_rules=(
++            "dtype(input) == dtype(output)",
++            "dtype in the portable registry (bool included)",
++        ),
++        shape_rule_id="broadcast_trailing_to_declared_shape_v1",
++        result_dtype_rule={"kind": "same_as_input"},
++        numeric_contract=_generic_numeric_contract(
++            "portable.cpu.scalar.broadcast.v1",
++            accumulation={
++                "float16": "none_verbatim_replication",
++                "float32": "none_verbatim_replication",
++                "float64": "none_verbatim_replication",
++                "integer": "none_verbatim_replication",
++            },
++            accumulation_rounding="none_verbatim_replication",
++            integer_overflow="not_applicable_no_conversion",
++            reduction_order="portable_output_row_major_single_pass_v1",
++            reduction_order_id="portable_output_row_major_single_pass_v1",
++            empty="singleton_to_zero_expansion_yields_a_zero_length_axis",
++            aliasing="may_alias",
++        ),
++        portable_reference=_generic_portable_reference(
++            "broadcast", "pypto.backends.cpu.runtime._broadcast_value",
++            "pypto.lowering.cpu._broadcast_shape"
++        ),
++        precision=precision,
++        semantics=semantics,
++    )
++
++
++_BATCH2_DEFINITION_BUILDERS = {
++    "add": _build_add_definition,
++    "mul": _build_mul_definition,
++    "rsqrt": _build_rsqrt_definition,
++    "transpose": _build_transpose_definition,
++    "slice": _build_slice_definition,
++    "broadcast": _build_broadcast_definition,
++}
++
++
+ OP_DEFINITIONS = {
+     MATMUL_CANONICAL_OPCODE: _build_matmul_definition(),
+     QMATMUL_CANONICAL_OPCODE: _build_qmatmul_definition(),
+     **{opcode: builder() for opcode, builder in sorted(_BATCH1_DEFINITION_BUILDERS.items())},
++    **{opcode: builder() for opcode, builder in sorted(_BATCH2_DEFINITION_BUILDERS.items())},
+ }
+ 
+ 
+@@ -1967,6 +2555,8 @@ def _registered_alias_union() -> Tuple[str, ...]:
+ 
+ 
+ __all__ = [
++    "BATCH1_CANONICAL_OPCODES",
++    "BATCH2_CANONICAL_OPCODES",
+     "MATMUL_CANONICAL_OPCODE",
+     "MATMUL_CONTRACT_VERSION",
+     "OP_DEFINITIONS",
+diff --git a/python/pypto/execution/operation_contracts.py b/python/pypto/execution/operation_contracts.py
+index 28e2f0acd..3b162f39d 100644
+--- a/python/pypto/execution/operation_contracts.py
++++ b/python/pypto/execution/operation_contracts.py
+@@ -26,7 +26,7 @@ from __future__ import annotations
+ 
+ from typing import Any, Mapping, Optional, Sequence, Tuple
+ 
+-from pypto.core_ir import CoreType, Operation
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
+ from pypto.lowering.cpu import (
+     FLOAT_DTYPES,
+     INTEGER_DTYPES,
+@@ -42,6 +42,12 @@ from pypto.lowering.cpu import (
+     reduced_shape,
+     validate_program,
+ )
++from pypto.lowering.cpu import (
++    _m1b_permutation as _lowering_permutation,
++)
++from pypto.lowering.cpu import (
++    _m1b_slice_spec as _lowering_slice_spec,
++)
+ from pypto.lowering.cpu import (
+     _normalize_axes as _lowering_normalize_axes,
+ )
+@@ -59,6 +65,42 @@ INTEGER_OR_BOOL_DTYPES = tuple(
+ )
+ FLOAT_DTYPE_TUPLE = tuple(sorted(FLOAT_DTYPES))
+ REDUCTION_DTYPES = tuple(sorted(set(ALL_DTYPES) - {"bool"}))
++# Batch-2 elementwise binary domain: every portable dtype except bool (the
++# portable lowering rejects bool for add/sub/mul/div; bool stays limited to
++# constant/identity).  The dtype domain is what the real Qwen3.5 graphs need
++# (float32/bf16) plus the integer family the shared reference can execute.
++BINARY_DTYPES = tuple(sorted(set(ALL_DTYPES) - {"bool"}))
++VIEW_DTYPES = ALL_DTYPES
++
++# ---------------------------------------------------------------------------
++# frozen batch-1 contract patches (strict admission widening only)
++# ---------------------------------------------------------------------------
++# The batch-1 contract documents of ``where`` and ``compare`` are *frozen*:
++# rewriting their ``attributes`` / ``operand_dtypes`` blocks would change the
++# contract digest and therefore every existing legal plan digest (a hard
++# constraint of the batch-2 slice).  The two patches below are therefore
++# verifier-level admission extensions, audited here instead of inside the
++# hashed document:
++#
++# * patch A: ``where`` input/other may be a rank-0 scalar operand sharing the
++#   selected-value dtype (no implicit promotion);
++# * patch B: ``compare`` accepts the redundant ``broadcast`` declaration the
++#   real decoder graph writes (``broadcast=trailing_singleton``); the shape
++#   rule already is trailing-axis broadcast, so this only admits the spelling.
++#
++# Both extensions widen the accepted request domain and never reinterpret a
++# request the frozen document already accepted.
++WHERE_SCALAR_VALUE_OPERANDS = (1, 2)
++COMPARE_EXTRA_ATTRIBUTES = ("broadcast",)
++_COMPARE_BROADCAST_CANONICAL = "trailing_singleton"
++_COMPARE_BROADCAST_ACCEPTED = {
++    True: _COMPARE_BROADCAST_CANONICAL,
++    "true": _COMPARE_BROADCAST_CANONICAL,
++    "trailing": _COMPARE_BROADCAST_CANONICAL,
++    "trailing_singleton": _COMPARE_BROADCAST_CANONICAL,
++    "auto": _COMPARE_BROADCAST_CANONICAL,
++}
++_COMPARE_BROADCAST_DISABLED = {False, "false", "none", "off"}
+ 
+ # Precision rule classes.  ``exact_contract_bound`` is a proven bound kind in
+ # ``pypto.execution.manifest.PROVEN_DEVIATION_BOUND_KINDS``; the float class
+@@ -290,7 +332,74 @@ def _require_tensor(
+     return dtype, tuple(shape)
+ 
+ 
+-def _check_attributes(operation_name: str, attributes: Mapping[str, Any], allowed: Sequence[str]) -> None:
++def _require_operand(
++    value_type: Any,
++    label: str,
++    domain: Sequence[str],
++    *,
++    allow_scalar: bool = False,
++    rank_min: int = RANK_MIN,
++    rank_max: int = RANK_MAX
++) -> Tuple[str, str, Tuple[int, ...]]:
++    """Validate one tensor-or-scalar operand; return ``(kind, dtype, shape)``.
++
++    A scalar operand is only admitted where the contract explicitly allows it
++    (patch A for ``where`` fill values, and the batch-2 elementwise binary /
++    broadcast contracts).  Scalar promotion is deliberately *absent*: the
++    scalar must already carry the value dtype, so a front-end that wants a
++    different dtype has to insert an explicit ``cast``.
++    """
++
++    if not isinstance(value_type, CoreType):
++        raise OpContractError(
++            "{} must be a CoreType".format(label),
++            field="shape." + label,
++            requested=type(value_type).__name__,
++            reason="operand_not_core_type",
++        )
++    if value_type.kind == "scalar" or (
++        allow_scalar and value_type.kind == "tensor" and len(tuple(value_type.shape)) == 0
++    ):
++        if not allow_scalar:
++            raise OpContractError(
++                "{} must be a tensor (scalar operands are not in this contract)".format(label),
++                field="kind." + label,
++                requested=value_type.kind,
++                available=["tensor"],
++                reason="operand_not_tensor",
++            )
++        try:
++            dtype = canonical_dtype(value_type.dtype)
++        except CpuScalarUnsupportedError as exc:
++            raise OpContractError(
++                "{} dtype {!r} is outside the portable dtype registry".format(label, value_type.dtype),
++                field="dtype." + label,
++                requested=value_type.dtype,
++                available=list(domain),
++                reason="dtype_outside_contract_domain",
++            ) from exc
++        if dtype not in domain:
++            raise OpContractError(
++                "{} dtype {!r} is outside the contract domain".format(label, dtype),
++                field="dtype." + label,
++                requested=dtype,
++                available=list(domain),
++                reason="dtype_outside_contract_domain",
++            )
++        return "scalar", dtype, ()
++    dtype, shape = _require_tensor(
++        value_type, label, domain, rank_min=rank_min, rank_max=rank_max
++    )
++    return "tensor", dtype, shape
++
++
++def _check_attributes(
++    operation_name: str,
++    attributes: Mapping[str, Any],
++    allowed: Sequence[str],
++    *,
++    extensions: Sequence[str] = ()
++) -> None:
+     if not isinstance(attributes, Mapping):
+         raise OpContractError(
+             "{} attributes must be a mapping".format(operation_name),
+@@ -298,13 +407,14 @@ def _check_attributes(operation_name: str, attributes: Mapping[str, Any], allowe
+             requested=type(attributes).__name__,
+             reason="attributes_not_a_mapping",
+         )
+-    unknown = sorted(set(attributes) - set(allowed))
++    effective = tuple(allowed) + tuple(extensions)
++    unknown = sorted(set(attributes) - set(effective))
+     if unknown:
+         raise OpContractError(
+             "{} does not accept unknown attributes: {}".format(operation_name, ", ".join(unknown)),
+             field="operation.attributes",
+             requested=unknown,
+-            available=sorted(allowed),
++            available=sorted(effective),
+             reason="unknown_attribute",
+         )
+ 
+@@ -456,8 +566,15 @@ def verify_where(
+     if len(input_types) != 3:
+         raise _arity_error("where", 3, len(input_types))
+     condition_dtype, condition_shape = _require_tensor(input_types[0], "condition", ("bool",))
+-    true_dtype, true_shape = _require_tensor(input_types[1], "input", ALL_DTYPES)
+-    false_dtype, false_shape = _require_tensor(input_types[2], "other", ALL_DTYPES)
++    # Patch A (batch 0050-A): the two value operands may be scalars.  The
++    # scalar must already share the selected-value dtype (no promotion) and
++    # behaves as a rank-0 trailing broadcast; the condition stays tensor-bool.
++    true_kind, true_dtype, true_shape = _require_operand(
++        input_types[1], "input", ALL_DTYPES, allow_scalar=True
++    )
++    other_kind, false_dtype, false_shape = _require_operand(
++        input_types[2], "other", ALL_DTYPES, allow_scalar=True
++    )
+     if true_dtype != false_dtype:
+         raise OpContractError(
+             "where input/other must share one dtype",
+@@ -465,7 +582,11 @@ def verify_where(
+             requested={"input": true_dtype, "other": false_dtype},
+             reason="dtype_mismatch",
+         )
+-    expected = _broadcast((condition_shape, true_shape, false_shape), "where")
++    broadcast_shapes = [condition_shape]
++    for kind, shape in ((true_kind, true_shape), (other_kind, false_shape)):
++        if kind == "tensor":
++            broadcast_shapes.append(shape)
++    expected = _broadcast(tuple(broadcast_shapes), "where")
+     output_dtype, output_shape = _declared_output(
+         declared_output_dtype,
+         declared_output_shape,
+@@ -482,6 +603,7 @@ def verify_where(
+     return {
+         "request_dtype": true_dtype,
+         "input_dtypes": [condition_dtype, true_dtype, false_dtype],
++        "input_kinds": ["tensor", true_kind, other_kind],
+         "input_shapes": [list(condition_shape), list(true_shape), list(false_shape)],
+         "output_dtype": output_dtype,
+         "output_shape": list(output_shape),
+@@ -492,6 +614,49 @@ def verify_where(
+     }
+ 
+ 
++def _compare_broadcast_attribute(attributes: Mapping[str, Any]) -> Optional[str]:
++    """Patch B: normalize the optional ``compare.broadcast`` declaration.
++
++    The batch-1 contract already derives the result shape with the
++    trailing-axis broadcast rule, so the attribute is a redundant declaration
++    that the real decoder graph writes.  ``absent`` keeps the frozen behavior
++    (and the frozen attribute document); an explicit ``trailing_singleton``
++    spelling is admitted and normalized; anything that would *narrow* the
++    rule (``false``/``none``) or names an unknown policy is refused.
++    """
++
++    if "broadcast" not in attributes:
++        return None
++    raw = attributes["broadcast"]
++    if isinstance(raw, bool):
++        candidate = _COMPARE_BROADCAST_ACCEPTED.get(raw)
++    elif isinstance(raw, str):
++        candidate = _COMPARE_BROADCAST_ACCEPTED.get(raw.strip().lower())
++    else:
++        candidate = None
++    if candidate is not None:
++        return candidate
++    disabled = raw in _COMPARE_BROADCAST_DISABLED or (
++        isinstance(raw, str) and raw.strip().lower() in _COMPARE_BROADCAST_DISABLED
++    )
++    if disabled:
++        raise OpContractError(
++            "compare broadcast={!r} is not portable: the contract always "
++            "applies the trailing-axis broadcast rule".format(raw),
++            field="operation.attributes.broadcast",
++            requested=raw,
++            available=["trailing_singleton", True],
++            reason="compare_broadcast_disabled_not_portable",
++        )
++    raise OpContractError(
++        "compare broadcast={!r} is not a recognized declaration".format(raw),
++        field="operation.attributes.broadcast",
++        requested=raw,
++        available=["trailing_singleton", True],
++        reason="compare_broadcast_invalid",
++    )
++
++
+ def verify_compare(
+     definition: Any,
+     input_types: Sequence[CoreType],
+@@ -501,7 +666,10 @@ def verify_compare(
+ ) -> Mapping[str, Any]:
+     """``compare(left, right) -> bool`` with an explicit IEEE predicate."""
+ 
+-    _check_attributes("compare", attributes, definition.attribute_names)
++    _check_attributes(
++        "compare", attributes, definition.attribute_names,
++        extensions=COMPARE_EXTRA_ATTRIBUTES,
++    )
+     if len(input_types) != 2:
+         raise _arity_error("compare", 2, len(input_types))
+     try:
+@@ -514,6 +682,7 @@ def verify_compare(
+             available=["eq", "ne", "lt", "le", "gt", "ge"],
+             reason="predicate_missing_or_invalid",
+         ) from exc
++    broadcast_declaration = _compare_broadcast_attribute(attributes)
+     left_dtype, left_shape = _require_tensor(input_types[0], "left", ALL_DTYPES)
+     right_dtype, right_shape = _require_tensor(input_types[1], "right", ALL_DTYPES)
+     if left_dtype != right_dtype:
+@@ -545,15 +714,19 @@ def verify_compare(
+         input_dtypes=(left_dtype,),
+         output_dtype=output_dtype,
+     )
++    normalized_attributes = {"predicate": predicate}
++    if broadcast_declaration is not None:
++        normalized_attributes["broadcast"] = broadcast_declaration
+     return {
+         "request_dtype": left_dtype,
+         "input_dtypes": [left_dtype, right_dtype],
++        "input_kinds": ["tensor", "tensor"],
+         "input_shapes": [list(left_shape), list(right_shape)],
+         "output_dtype": output_dtype,
+         "output_shape": list(output_shape),
+         "rank": max(len(left_shape), len(right_shape)),
+         "min_dimension": _min_dimension((left_shape, right_shape)),
+-        "attributes": {"predicate": predicate},
++        "attributes": normalized_attributes,
+         "precision": precision,
+     }
+ 
+@@ -1055,6 +1228,462 @@ def verify_reshape(
+     }
+ 
+ 
++def _require_ordered_container(
++    operation_name: str,
++    attributes: Mapping[str, Any],
++    keys: Sequence[str],
++    *,
++    allow_scalar: bool = False
++) -> None:
++    """Reject unordered attribute containers (set/generator/mapping).
++
++    A set or generator would make the attribute order (and therefore the
++    contract decision and the frozen plan attributes) depend on hash order.
++    Only ordered lists/tuples are accepted; slice bounds additionally accept a
++    single integer for a one-axis spelling.
++    """
++
++    for key in keys:
++        if key not in attributes:
++            continue
++        value = attributes[key]
++        if isinstance(value, (list, tuple)):
++            continue
++        if allow_scalar and isinstance(value, int) and not isinstance(value, bool):
++            continue
++        raise OpContractError(
++            "{} attribute {} must be an ordered list/tuple{}".format(
++                operation_name, key, " or an integer" if allow_scalar else ""
++            ),
++            field="operation.attributes." + key,
++            requested=type(value).__name__,
++            available=["list", "tuple"] + (["int"] if allow_scalar else []),
++            reason="unordered_attribute_container",
++        )
++
++
++def _view_auxiliary_attributes(
++    operation_name: str,
++    attributes: Mapping[str, Any],
++    output_shape: Sequence[int]
++) -> None:
++    """Shared ``inplace``/``valid_shape`` rules for the view/data-movement family.
++
++    The portable tensor ABI materializes one independent flat output buffer, so
++    ``inplace=true`` (output aliasing an input) is not representable and fails
++    closed.  ``valid_shape`` (when present) must equal the resolved output
++    shape; a partial valid shape is not representable and is refused instead of
++    being silently truncated.
++    """
++
++    if "inplace" in attributes:
++        inplace = attributes["inplace"]
++        if not isinstance(inplace, bool):
++            raise OpContractError(
++                "{} inplace must be a bool".format(operation_name),
++                field="operation.attributes.inplace",
++                requested=inplace,
++                reason="{}_inplace_not_bool".format(operation_name),
++            )
++        if inplace:
++            raise OpContractError(
++                "{} inplace=true is not portable: the output must not alias an input".format(
++                    operation_name
++                ),
++                field="operation.attributes.inplace",
++                requested=True,
++                available=False,
++                reason="{}_inplace_not_portable".format(operation_name),
++            )
++    for key in ("valid_shape", "valid_shapes"):
++        if key not in attributes:
++            continue
++        raw = attributes[key]
++        try:
++            values = _static_shape_tuple(raw, "output")
++        except OpContractError as exc:
++            raise OpContractError(
++                "{} {} must be a non-empty sequence of non-negative integers".format(
++                    operation_name, key
++                ),
++                field="operation.attributes." + key,
++                requested=raw,
++                reason="{}_valid_shape_invalid".format(operation_name),
++            ) from exc
++        if not values:
++            raise OpContractError(
++                "{} {} must be a non-empty sequence of non-negative integers".format(
++                    operation_name, key
++                ),
++                field="operation.attributes." + key,
++                requested=raw,
++                reason="{}_valid_shape_invalid".format(operation_name),
++            )
++        if values != tuple(output_shape):
++            raise OpContractError(
++                "{} {} is not represented by the portable tensor ABI".format(operation_name, key),
++                field="operation.attributes." + key,
++                requested=list(values),
++                available=list(output_shape),
++                reason="{}_valid_shape_not_representable".format(operation_name),
++            )
++
++
++def verify_binary_elementwise(
++    definition: Any,
++    input_types: Sequence[CoreType],
++    attributes: Mapping[str, Any],
++    declared_output_dtype: Optional[str] = None,
++    declared_output_shape: Optional[Sequence[int]] = None
++) -> Mapping[str, Any]:
++    """``add``/``mul``: elementwise binary with trailing-axis broadcast.
++
++    Scalar operands are admitted where the reference lowering supports them
++    (tensor+scalar or scalar+tensor); the scalar must carry the same dtype and
++    broadcasts as a rank-0 operand.  Two scalars would produce a scalar result,
++    which the execution contract (a tensor ABI) does not represent, so that
++    request is refused.  The full trailing-axis binary broadcast rule is
++    verified here; the portable reference executor currently only lowers the
++    same-shape tensor-tensor and scalar cases, and any other legal broadcast
++    request is refused by ``verify_lowering_accepts`` — never silently
++    materialized or re-associated.
++    """
++
++    opname = definition.canonical_opcode
++    _check_attributes(opname, attributes, definition.attribute_names)
++    if len(input_types) != 2:
++        raise _arity_error(opname, 2, len(input_types))
++    left_kind, left_dtype, left_shape = _require_operand(
++        input_types[0], "left", BINARY_DTYPES, allow_scalar=True
++    )
++    right_kind, right_dtype, right_shape = _require_operand(
++        input_types[1], "right", BINARY_DTYPES, allow_scalar=True
++    )
++    if left_dtype != right_dtype:
++        raise OpContractError(
++            "{} requires both operands to share one dtype (no implicit promotion)".format(opname),
++            field="dtype",
++            requested={"left": left_dtype, "right": right_dtype},
++            reason="dtype_mismatch",
++        )
++    tensor_shapes = [
++        shape for kind, shape in ((left_kind, left_shape), (right_kind, right_shape))
++        if kind == "tensor"
++    ]
++    if not tensor_shapes:
++        raise OpContractError(
++            "{} with two scalar operands would produce a scalar result, which the "
++            "execution contract does not represent".format(opname),
++            field="request.output",
++            requested={"left": left_kind, "right": right_kind},
++            available="at least one tensor operand",
++            reason="scalar_result_not_supported",
++        )
++    expected = _broadcast(tuple(tensor_shapes), opname)
++    output_dtype, output_shape = _declared_output(
++        declared_output_dtype,
++        declared_output_shape,
++        left_dtype,
++        expected,
++        opname,
++        BINARY_DTYPES,
++    )
++    precision = resolve_precision(
++        definition.precision,
++        input_dtypes=(left_dtype,),
++        output_dtype=output_dtype,
++    )
++    return {
++        "request_dtype": left_dtype,
++        "input_dtypes": [left_dtype, right_dtype],
++        "input_kinds": [left_kind, right_kind],
++        "input_shapes": [list(left_shape), list(right_shape)],
++        "output_dtype": output_dtype,
++        "output_shape": list(output_shape),
++        "rank": max(len(left_shape), len(right_shape)),
++        "min_dimension": _min_dimension((left_shape, right_shape)),
++        "attributes": {},
++        "precision": precision,
++    }
++
++
++def verify_rsqrt(
++    definition: Any,
++    input_types: Sequence[CoreType],
++    attributes: Mapping[str, Any],
++    declared_output_dtype: Optional[str] = None,
++    declared_output_shape: Optional[Sequence[int]] = None
++) -> Mapping[str, Any]:
++    """``rsqrt``: elementwise float reciprocal square root, shape preserving."""
++
++    _check_attributes("rsqrt", attributes, definition.attribute_names)
++    if len(input_types) != 1:
++        raise _arity_error("rsqrt", 1, len(input_types))
++    input_dtype, input_shape = _require_tensor(input_types[0], "input", FLOAT_DTYPE_TUPLE)
++    output_dtype, output_shape = _declared_output(
++        declared_output_dtype,
++        declared_output_shape,
++        input_dtype,
++        input_shape,
++        "rsqrt",
++        FLOAT_DTYPE_TUPLE,
++    )
++    precision = resolve_precision(
++        definition.precision,
++        input_dtypes=(input_dtype,),
++        output_dtype=output_dtype,
++    )
++    return {
++        "request_dtype": input_dtype,
++        "input_dtypes": [input_dtype],
++        "input_kinds": ["tensor"],
++        "input_shapes": [list(input_shape)],
++        "output_dtype": output_dtype,
++        "output_shape": list(output_shape),
++        "rank": len(input_shape),
++        "min_dimension": _min_dimension((input_shape,)),
++        "attributes": {},
++        "precision": precision,
++    }
++
++
++def verify_transpose(
++    definition: Any,
++    input_types: Sequence[CoreType],
++    attributes: Mapping[str, Any],
++    declared_output_dtype: Optional[str] = None,
++    declared_output_shape: Optional[Sequence[int]] = None
++) -> Mapping[str, Any]:
++    """``transpose``: logical permutation view of one tensor."""
++
++    _check_attributes("transpose", attributes, definition.attribute_names)
++    if len(input_types) != 1:
++        raise _arity_error("transpose", 1, len(input_types))
++    _require_ordered_container(
++        "transpose", attributes, ("permutation", "perm", "dims", "axes")
++    )
++    input_dtype, input_shape = _require_tensor(input_types[0], "input", VIEW_DTYPES)
++    try:
++        permutation = _lowering_permutation(input_shape, attributes, "transpose")
++    except CpuScalarUnsupportedError as exc:
++        raise OpContractError(
++            "transpose is outside the portable contract: {}".format(exc),
++            field="operation.attributes",
++            requested=dict(attributes),
++            reason="transpose_not_portable",
++        ) from exc
++    except CpuScalarValidationError as exc:
++        raise OpContractError(
++            "transpose permutation is invalid: {}".format(exc),
++            field="operation.attributes",
++            requested=dict(attributes),
++            available="a permutation of 0..rank-1 (negative axes normalized)",
++            reason="transpose_permutation_invalid",
++        ) from exc
++    expected_shape = tuple(input_shape[axis] for axis in permutation)
++    output_dtype, output_shape = _declared_output(
++        declared_output_dtype,
++        declared_output_shape,
++        input_dtype,
++        expected_shape,
++        "transpose",
++        VIEW_DTYPES,
++    )
++    _view_auxiliary_attributes("transpose", attributes, output_shape)
++    precision = resolve_precision(
++        definition.precision,
++        input_dtypes=(input_dtype,),
++        output_dtype=output_dtype,
++    )
++    return {
++        "request_dtype": input_dtype,
++        "input_dtypes": [input_dtype],
++        "input_kinds": ["tensor"],
++        "input_shapes": [list(input_shape)],
++        "output_dtype": output_dtype,
++        "output_shape": list(output_shape),
++        "rank": len(input_shape),
++        "min_dimension": _min_dimension((input_shape,)),
++        "attributes": {"permutation": list(permutation)},
++        "precision": precision,
++    }
++
++
++def verify_slice(
++    definition: Any,
++    input_types: Sequence[CoreType],
++    attributes: Mapping[str, Any],
++    declared_output_dtype: Optional[str] = None,
++    declared_output_shape: Optional[Sequence[int]] = None
++) -> Mapping[str, Any]:
++    """``slice``: bounded per-axis slice with positive steps only."""
++
++    _check_attributes("slice", attributes, definition.attribute_names)
++    if len(input_types) != 1:
++        raise _arity_error("slice", 1, len(input_types))
++    _require_ordered_container(
++        "slice",
++        attributes,
++        ("starts", "start", "stops", "stop", "axes", "axis", "steps", "step"),
++        allow_scalar=True,
++    )
++    input_dtype, input_shape = _require_tensor(input_types[0], "input", VIEW_DTYPES)
++    if "starts" not in attributes and "start" not in attributes:
++        raise OpContractError(
++            "slice requires starts and stops",
++            field="operation.attributes.starts",
++            requested=dict(attributes),
++            available=["starts", "stops", "axes", "steps"],
++            reason="slice_spec_missing",
++        )
++    if "stops" not in attributes and "stop" not in attributes:
++        raise OpContractError(
++            "slice requires starts and stops",
++            field="operation.attributes.stops",
++            requested=dict(attributes),
++            available=["starts", "stops", "axes", "steps"],
++            reason="slice_spec_missing",
++        )
++    try:
++        spec = _lowering_slice_spec(input_shape, attributes, "slice")
++    except CpuScalarUnsupportedError as exc:
++        raise OpContractError(
++            "slice is outside the portable contract: {}".format(exc),
++            field="operation.attributes.steps",
++            requested=dict(attributes),
++            available="positive integer steps (negative/reversed slicing is not portable)",
++            reason="slice_negative_step_not_supported",
++        ) from exc
++    except CpuScalarValidationError as exc:
++        raise OpContractError(
++            "slice specification is invalid: {}".format(exc),
++            field="operation.attributes",
++            requested=dict(attributes),
++            available="in-bounds start/stop, unique axes, starts/stops/axes/steps of equal length",
++            reason="slice_spec_invalid",
++        ) from exc
++    expected_shape = list(input_shape)
++    for axis, start, stop, step in spec:
++        expected_shape[axis] = max(0, (stop - start + step - 1) // step)
++    expected_shape = tuple(expected_shape)
++    output_dtype, output_shape = _declared_output(
++        declared_output_dtype,
++        declared_output_shape,
++        input_dtype,
++        expected_shape,
++        "slice",
++        VIEW_DTYPES,
++    )
++    _view_auxiliary_attributes("slice", attributes, output_shape)
++    precision = resolve_precision(
++        definition.precision,
++        input_dtypes=(input_dtype,),
++        output_dtype=output_dtype,
++    )
++    return {
++        "request_dtype": input_dtype,
++        "input_dtypes": [input_dtype],
++        "input_kinds": ["tensor"],
++        "input_shapes": [list(input_shape)],
++        "output_dtype": output_dtype,
++        "output_shape": list(output_shape),
++        "rank": len(input_shape),
++        "min_dimension": _min_dimension((input_shape,)),
++        "attributes": {
++            "starts": [start for _axis, start, _stop, _step in spec],
++            "stops": [stop for _axis, _start, stop, _step in spec],
++            "axes": [axis for axis, _start, _stop, _step in spec],
++            "steps": [step for _axis, _start, _stop, step in spec],
++        },
++        "precision": precision,
++    }
++
++
++def verify_broadcast(
++    definition: Any,
++    input_types: Sequence[CoreType],
++    attributes: Mapping[str, Any],
++    declared_output_dtype: Optional[str] = None,
++    declared_output_shape: Optional[Sequence[int]] = None
++) -> Mapping[str, Any]:
++    """``broadcast``: trailing-axis expansion to one declared target shape."""
++
++    _check_attributes("broadcast", attributes, definition.attribute_names)
++    if len(input_types) != 1:
++        raise _arity_error("broadcast", 1, len(input_types))
++    input_kind, input_dtype, input_shape = _require_operand(
++        input_types[0], "input", ALL_DTYPES, allow_scalar=True
++    )
++    present = [key for key in ("shape", "target_shape", "out_shape") if key in attributes]
++    declared = []
++    for key in present:
++        try:
++            declared.append(_static_shape_tuple(attributes[key], "output"))
++        except OpContractError as exc:
++            raise OpContractError(
++                "broadcast target shape attribute {} is invalid".format(key),
++                field="operation.attributes." + key,
++                requested=attributes[key],
++                reason="broadcast_target_shape_invalid",
++            ) from exc
++    if declared and any(value != declared[0] for value in declared[1:]):
++        raise OpContractError(
++            "broadcast target shape attributes conflict",
++            field="operation.attributes",
++            requested={key: attributes[key] for key in present},
++            reason="conflicting_attribute_aliases",
++        )
++    target_shape = declared[0] if declared else None
++    if target_shape is None:
++        if declared_output_shape is None:
++            raise OpContractError(
++                "broadcast requires a target shape (attribute or declared output shape)",
++                field="request.output_shape",
++                requested=None,
++                available=["shape", "target_shape", "out_shape", "output_shape"],
++                reason="broadcast_target_shape_missing",
++            )
++        target_shape = _static_shape_tuple(declared_output_shape, "output")
++    output_dtype, output_shape = _declared_output(
++        declared_output_dtype,
++        declared_output_shape,
++        input_dtype,
++        target_shape,
++        "broadcast",
++        ALL_DTYPES,
++    )
++    if input_kind == "tensor":
++        resolved = _broadcast((input_shape, output_shape), "broadcast")
++        if tuple(resolved) != tuple(output_shape):
++            raise OpContractError(
++                "broadcast input shape {} cannot be broadcast to {}".format(
++                    input_shape, output_shape
++                ),
++                field="shape.broadcast",
++                requested={"input_shape": list(input_shape), "output_shape": list(output_shape)},
++                available="trailing-axis compatible shapes",
++                reason="broadcast_shape_mismatch",
++            )
++    _view_auxiliary_attributes("broadcast", attributes, output_shape)
++    precision = resolve_precision(
++        definition.precision,
++        input_dtypes=(input_dtype,),
++        output_dtype=output_dtype,
++    )
++    return {
++        "request_dtype": input_dtype,
++        "input_dtypes": [input_dtype],
++        "input_kinds": [input_kind],
++        "input_shapes": [list(input_shape)],
++        "output_dtype": output_dtype,
++        "output_shape": list(output_shape),
++        "rank": max(len(input_shape), len(output_shape)),
++        "min_dimension": _min_dimension((input_shape,)),
++        "attributes": {"shape": list(output_shape)},
++        "precision": precision,
++    }
++
++
+ GENERIC_VERIFIERS = {
+     "where": verify_where,
+     "compare": verify_compare,
+@@ -1064,9 +1693,66 @@ GENERIC_VERIFIERS = {
+     "reduce_max": verify_reduce_max,
+     "cast": verify_cast,
+     "reshape": verify_reshape,
++    "add": verify_binary_elementwise,
++    "mul": verify_binary_elementwise,
++    "rsqrt": verify_rsqrt,
++    "transpose": verify_transpose,
++    "slice": verify_slice,
++    "broadcast": verify_broadcast,
+ }
+ 
+ 
++def build_binary_elementwise_program(
++    canonical_opcode: str,
++    input_types: Sequence[CoreType],
++    output_type: CoreType,
++    attributes: Mapping[str, Any],
++    entrypoint: Optional[str] = None
++) -> Tuple[CoreProgram, Operation]:
++    """Lower one ``add``/``mul`` request exactly as the portable executor does.
++
++    Same-shape tensor operands and scalar operands stay a single contract
++    operation.  A tensor-tensor broadcast request is lowered to an explicit
++    ``broadcast`` (one per operand whose shape differs from the result) followed
++    by the elementwise op.  The plan still declares the single contract opcode;
++    this internal program is re-derived from the frozen request and never adds
++    user-visible attributes, so a legal broadcast is executed instead of being
++    refused or mis-associated.
++    """
++
++    inputs = tuple(
++        ValueRef("in{}".format(index), value_type) for index, value_type in enumerate(input_types)
++    )
++    output = ValueRef("output", output_type)
++    output_shape = tuple(output_type.shape)
++    operations = []
++    operands = []
++    for index, value_type in enumerate(input_types):
++        shape = tuple(value_type.shape) if value_type.kind == "tensor" else ()
++        if value_type.kind == "tensor" and shape != output_shape:
++            temporary = ValueRef("_broadcast{}".format(index), output_type)
++            operations.append(
++                Operation(
++                    "broadcast",
++                    (inputs[index],),
++                    (temporary,),
++                    {"shape": list(output_shape)},
++                )
++            )
++            operands.append(temporary)
++        else:
++            operands.append(inputs[index])
++    operation = Operation(canonical_opcode, tuple(operands), (output,), dict(attributes))
++    operations.append(operation)
++    function = CoreFunction(
++        entrypoint if entrypoint is not None else canonical_opcode,
++        inputs,
++        (output,),
++        Region(tuple(operations)),
++    )
++    return CoreProgram(functions=(function,)), operation
++
++
+ def verify_lowering_accepts(
+     canonical_opcode: str,
+     input_types: Sequence[CoreType],
+@@ -1077,18 +1763,26 @@ def verify_lowering_accepts(
+ 
+     The contract layer is stricter than the lowering (attribute whitelist,
+     rank/dtype domain), but it must never accept a request the reference
+-    executor cannot lower.  Building the one-operation Core IR program and
+-    running the lowering's own validator keeps the two views coupled.
++    executor cannot lower.  Building the Core IR program and running the
++    lowering's own validator keeps the two views coupled.  ``add``/``mul``
++    requests go through :func:`build_binary_elementwise_program`, the same
++    builder the portable provider executes, so a legal tensor-tensor broadcast
++    is validated as the explicit broadcast program that will actually run.
+     """
+ 
+-    from pypto.core_ir import CoreFunction, CoreProgram, Region, ValueRef
+-
+-    inputs = tuple(
+-        ValueRef("in{}".format(index), value_type) for index, value_type in enumerate(input_types)
+-    )
+-    output = ValueRef("output", output_type)
+-    operation = Operation(canonical_opcode, inputs, (output,), dict(attributes))
+-    program = CoreProgram(functions=(CoreFunction(canonical_opcode, inputs, (output,), Region((operation,))),))
++    if canonical_opcode in ("add", "mul"):
++        program, _operation = build_binary_elementwise_program(
++            canonical_opcode, input_types, output_type, attributes
++        )
++    else:
++        inputs = tuple(
++            ValueRef("in{}".format(index), value_type) for index, value_type in enumerate(input_types)
++        )
++        output = ValueRef("output", output_type)
++        operation = Operation(canonical_opcode, inputs, (output,), dict(attributes))
++        program = CoreProgram(
++            functions=(CoreFunction(canonical_opcode, inputs, (output,), Region((operation,))),)
++        )
+     try:
+         validate_program(program)
+     except (CpuScalarError, CpuScalarUnsupportedError, CpuScalarValidationError) as exc:
+@@ -1104,6 +1798,7 @@ def verify_lowering_accepts(
+ 
+ __all__ = [
+     "ALL_DTYPES",
++    "BINARY_DTYPES",
+     "BOUNDED_BOUND_KIND",
+     "CONTRACT_REFERENCE_VERSION",
+     "EXACT_BOUND_KIND",
+@@ -1115,6 +1810,8 @@ __all__ = [
+     "RANK_MAX",
+     "RANK_MIN",
+     "REDUCTION_DTYPES",
++    "VIEW_DTYPES",
++    "build_binary_elementwise_program",
+     "precision_declaration",
+     "resolve_precision",
+     "verify_lowering_accepts",
+diff --git a/python/pypto/execution/provider_ids.py b/python/pypto/execution/provider_ids.py
+index f55a1b13f..3513b38d2 100644
+--- a/python/pypto/execution/provider_ids.py
++++ b/python/pypto/execution/provider_ids.py
+@@ -53,6 +53,13 @@ PORTABLE_GENERIC_OPCODES = (
+     "reduce_sum",
+     "reshape",
+     "where",
++    # 0050-A batch-2 additions.
++    "add",
++    "broadcast",
++    "mul",
++    "rsqrt",
++    "slice",
++    "transpose",
+ )
+ PORTABLE_IMPLEMENTATIONS = {
+     PORTABLE_MATMUL_OPCODE: "portable.cpu.scalar.matmul",
+diff --git a/python/pypto/execution/providers.py b/python/pypto/execution/providers.py
+index 7a81355c1..418f1aa23 100644
+--- a/python/pypto/execution/providers.py
++++ b/python/pypto/execution/providers.py
+@@ -23,6 +23,7 @@ from pypto.abi import LaunchRequest
+ from pypto.backends.cpu import CpuScalarRuntime, HostTensor
+ from pypto.compiler.targets.cpu import CpuScalarCompiler
+ from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.lowering.cpu import canonical_dtype
+ from pypto.target import TargetSpec
+ 
+ from .capability import (
+@@ -92,13 +93,27 @@ def build_operation_program(
+     attributes: Mapping[str, Any],
+     entrypoint: Optional[str] = None
+ ) -> Any:
+-    """Build the minimal one-operation Core IR program for a 0048-B opcode.
++    """Build the minimal Core IR program for a 0048-B opcode.
+ 
+     ``attributes`` is the normalized attribute document frozen in the plan, so
+     the compiled program is exactly the declared request (no resolver-time
+-    re-derivation of defaults).
++    re-derivation of defaults).  ``add``/``mul`` go through the shared
++    :func:`pypto.execution.operation_contracts.build_binary_elementwise_program`
++    builder so a legal tensor-tensor broadcast is lowered to an explicit
++    broadcast + elementwise program, exactly as the contract cross-check
++    validates.
+     """
+ 
++    if core_opcode in ("add", "mul"):
++        from .operation_contracts import build_binary_elementwise_program
++
++        return build_binary_elementwise_program(
++            core_opcode,
++            tuple(input_types),
++            output_type,
++            attributes,
++            entrypoint if entrypoint is not None else core_opcode,
++        )
+     inputs = tuple(
+         ValueRef("in{}".format(index), value_type)
+         for index, value_type in enumerate(input_types)
+@@ -278,16 +293,34 @@ class PortableProvider:
+                 reason="capability_does_not_match_host_probe",
+                 capability_digest=capability.digest,
+             )
+-        operand_tensors = tuple(inputs)
+-        for index, value in enumerate(operand_tensors):
+-            _check_host_tensor(value, "input[{}]".format(index))
++        frozen_inputs = plan.payload["request"]["inputs"]
++        operands = tuple(inputs)
++        input_types = []
++        tensor_operands = []
++        scalar_values = {}
++        for index, operand in enumerate(operands):
++            frozen = frozen_inputs[index] if index < len(frozen_inputs) else {"kind": "tensor"}
++            kind = str(frozen.get("kind", "tensor"))
++            if kind == "scalar":
++                if isinstance(operand, bool) or not isinstance(operand, (int, float)):
++                    raise OpContractError(
++                        "scalar operand {} must be an int or a float".format(index),
++                        field="operand.scalar[{}]".format(index),
++                        requested=type(operand).__name__,
++                        available=["int", "float"],
++                        reason="unsupported_operand_handle",
++                    )
++                input_types.append(CoreType.scalar(canonical_dtype(str(frozen["dtype"]))))
++                scalar_values["in{}".format(index)] = operand
++            else:
++                _check_host_tensor(operand, "input[{}]".format(index))
++                tensor_operands.append(operand)
++                input_types.append(CoreType.tensor(operand.dtype, tuple(operand.shape)))
+         _check_host_tensor(output, "output")
+-        _check_operation_request(plan, operand_tensors, output)
+-        _check_no_alias_any(operand_tensors, output)
++        _check_operation_request(plan, operands, output)
++        _check_no_alias_any(tuple(tensor_operands), output)
+         target = TargetSpec("cpu", capability.triple, features=capability.features)
+-        input_types = tuple(
+-            CoreType.tensor(tensor.dtype, tuple(tensor.shape)) for tensor in operand_tensors
+-        )
++        input_types = tuple(input_types)
+         output_type = CoreType.tensor(
+             str(plan.payload["request"]["output_dtype"]), tuple(plan.output_shape)
+         )
+@@ -303,11 +336,21 @@ class PortableProvider:
+         _verify_artifact_declaration(plan, definition, artifact, self, binding_mode)
+         request = LaunchRequest(
+             artifact,
+-            inputs=[tensor.descriptor(readonly=True) for tensor in operand_tensors],
++            inputs=[tensor.descriptor(readonly=True) for tensor in tensor_operands],
+             outputs=[output.descriptor()],
++            scalars=scalar_values,
+         )
+         started = time.perf_counter()
+-        CpuScalarRuntime().launch(request)
++        try:
++            CpuScalarRuntime().launch(request)
++        except (TypeError, ValueError, OverflowError) as exc:
++            raise OpContractError(
++                "portable execution rejected an operand/output value: {}".format(exc),
++                field="plan.request.inputs",
++                requested=plan.opcode,
++                available="values representable in the frozen dtypes",
++                reason="operand_value_rejected",
++            ) from exc
+         op_seconds = time.perf_counter() - started
+         return _portable_outcome(self, plan, artifact, op_seconds, output, binding_mode)
+ 
+@@ -358,7 +401,7 @@ def _portable_outcome(
+ 
+ def _check_operation_request(
+     plan: ExecutionPlan,
+-    operand_tensors: tuple,
++    operands: tuple,
+     output: HostTensor
+ ) -> None:
+     """Check the runtime operands against the frozen v3 request document."""
+@@ -366,21 +409,35 @@ def _check_operation_request(
+     request = plan.payload["request"]
+     frozen_inputs = request["inputs"]
+     mismatches = {}
+-    if len(operand_tensors) != len(frozen_inputs):
++    if len(operands) != len(frozen_inputs):
+         mismatches["inputs"] = {
+-            "requested": len(operand_tensors),
++            "requested": len(operands),
+             "available": len(frozen_inputs),
+         }
+     else:
+-        for index, (tensor, frozen) in enumerate(zip(operand_tensors, frozen_inputs)):
+-            if tuple(tensor.shape) != tuple(frozen["shape"]):
++        for index, (operand, frozen) in enumerate(zip(operands, frozen_inputs)):
++            kind = str(frozen.get("kind", "tensor"))
++            if kind == "scalar":
++                if isinstance(operand, bool) or not isinstance(operand, (int, float)):
++                    mismatches["input[{}].scalar".format(index)] = {
++                        "requested": type(operand).__name__,
++                        "available": ["int", "float"],
++                    }
++                continue
++            if not isinstance(operand, HostTensor):
++                mismatches["input[{}]".format(index)] = {
++                    "requested": type(operand).__name__,
++                    "available": "HostTensor",
++                }
++                continue
++            if tuple(operand.shape) != tuple(frozen["shape"]):
+                 mismatches["input[{}].shape".format(index)] = {
+-                    "requested": list(tensor.shape),
++                    "requested": list(operand.shape),
+                     "available": list(frozen["shape"]),
+                 }
+-            if tensor.dtype != frozen["dtype"]:
++            if operand.dtype != frozen["dtype"]:
+                 mismatches["input[{}].dtype".format(index)] = {
+-                    "requested": tensor.dtype,
++                    "requested": operand.dtype,
+                     "available": frozen["dtype"],
+                 }
+     if tuple(output.shape) != tuple(request["output_shape"]):
+diff --git a/python/pypto/execution/report.py b/python/pypto/execution/report.py
+index a2bfaf298..ba5999014 100644
+--- a/python/pypto/execution/report.py
++++ b/python/pypto/execution/report.py
+@@ -633,6 +633,7 @@ def validate_report_schema(report: Mapping[str, Any]) -> Mapping[str, Any]:
+         definition=definition,
+         layout_policy_document=policy_layout,
+         runtime_alias_check=True,
++        request=report.get("request") if isinstance(report.get("request"), Mapping) else None,
+     )
+     if layout_errors:
+         first = layout_errors[0]
+diff --git a/python/pypto/execution/resolver.py b/python/pypto/execution/resolver.py
+index 650f9ea3a..7501bb460 100644
+--- a/python/pypto/execution/resolver.py
++++ b/python/pypto/execution/resolver.py
+@@ -747,18 +747,30 @@ def _evaluate_provider(
+ 
+ 
+ def _resolve_matmul_layout(
+-    policy: ExecutionPolicy, definition: OpDefinition
++    policy: ExecutionPolicy,
++    definition: OpDefinition,
++    *,
++    output_shape: Optional[Sequence[int]] = None,
++    output_dtype: Optional[str] = None
+ ) -> Mapping[str, Any]:
+-    """Return the plan ``layout_decision`` for a matmul request.
++    """Return the plan ``layout_decision`` for one verified request.
+ 
+     The canonical derivation lives in
+     :mod:`pypto.execution.layout_verify` and is shared with the plan/report
+-    validators, so the frozen decision can be re-derived from the policy and
+-    the registered contract.  ``require`` that cannot be proved fails closed
+-    with ``ALIAS_PROOF_UNAVAILABLE`` and never degrades to a silent copy.
++    validators, so the frozen decision can be re-derived from the policy, the
++    registered contract and the frozen result declaration.  ``require`` that
++    cannot be proved fails closed with ``ALIAS_PROOF_UNAVAILABLE`` and never
++    degrades to a silent copy.  The result declaration is only consumed by the
++    batch-2 view family (materialize copy byte count); for every other contract
++    the decision is byte-identical to the pre-batch derivation.
+     """
+ 
+-    return canonical_layout_decision(definition, policy.layout.to_dict())
++    return canonical_layout_decision(
++        definition,
++        policy.layout.to_dict(),
++        output_shape=output_shape,
++        output_dtype=output_dtype,
++    )
+ 
+ 
+ @dataclass(frozen=True)
+@@ -933,7 +945,12 @@ def _resolve_binary(
+     # Layout/view intent is resolved against the shared alias-proof chain
+     # before any provider is selected.  ``require`` without a satisfying proof
+     # fails closed here and can never be degraded to a silent copy later.
+-    layout_decision = _resolve_matmul_layout(policy, definition)
++    layout_decision = _resolve_matmul_layout(
++        policy,
++        definition,
++        output_shape=spec.verify_rule_details.get("output_shape"),
++        output_dtype=spec.verify_rule_details.get("output_dtype"),
++    )
+     proof_status = layout_decision["alias_proof"]["status"]
+     rules.append(
+         _rule(
+@@ -1546,6 +1563,25 @@ def resolve_operation(
+         declared_output_shape=declared_shape,
+     )
+     request_dtype = str(info["request_dtype"])
++    input_kinds = info.get("input_kinds")
++    if input_kinds is None:
++        input_kinds = ("tensor",) * len(info["input_shapes"])
++    operands = []
++    for role, dtype, shape, kind in zip(
++        definition.input_roles, info["input_dtypes"], info["input_shapes"], input_kinds
++    ):
++        operand = {
++            "name": role,
++            "role": role,
++            "dtype": dtype,
++            "shape": list(shape),
++        }
++        if kind != "tensor":
++            # Strictly additive: absent ``kind`` keeps every frozen batch-1
++            # request (and its digest) byte-identical; a scalar operand carries
++            # the explicit marker the executor needs.
++            operand["kind"] = str(kind)
++        operands.append(operand)
+     request = {
+         "op": definition.canonical_opcode,
+         "left_shape": list(info["input_shapes"][0]) if info["input_shapes"] else [],
+@@ -1553,17 +1589,7 @@ def resolve_operation(
+         "output_shape": list(info["output_shape"]),
+         "dtype": request_dtype,
+         "output_dtype": str(info["output_dtype"]),
+-        "inputs": [
+-            {
+-                "name": role,
+-                "role": role,
+-                "dtype": dtype,
+-                "shape": list(shape),
+-            }
+-            for role, dtype, shape in zip(
+-                definition.input_roles, info["input_dtypes"], info["input_shapes"]
+-            )
+-        ],
++        "inputs": operands,
+         "attributes": mapping_copy(dict(info["attributes"])),
+     }
+     spec = _BinaryRequest(
+diff --git a/python/pypto/op_bench/runner.py b/python/pypto/op_bench/runner.py
+index 4a0e6326f..12e9a488d 100644
+--- a/python/pypto/op_bench/runner.py
++++ b/python/pypto/op_bench/runner.py
+@@ -1191,7 +1191,9 @@ def _error_injection(
+     expect_case_error("illegal_knob_threads_zero", "illegal_knob", threads=0)
+     expect_case_error("illegal_knob_layout_policy", "illegal_knob", layout_policy="non_unit_stride")
+     expect_case_error("forbidden_attribute_rejected", "attribute_not_supported", extra={"case_id": "attr", "suite": "error-injection", "attributes": {"transpose_b": True}})
+-    expect_case_error("unregistered_opcode_rejected", "opcode_not_registered", op="add")
++    # 0050-A registered add/mul/rsqrt/transpose/slice/broadcast; ``sub`` stays
++    # outside the execution registry, so the injection keeps failing closed.
++    expect_case_error("unregistered_opcode_rejected", "opcode_not_registered", op="sub")
+ 
+     # 4. schema validation: a report missing a required field must fail
+     mutated = json.loads(json.dumps(report, default=str))
+diff --git a/python/tests/ut/pypto_x/test_execution_discovery.py b/python/tests/ut/pypto_x/test_execution_discovery.py
+index b7ebbced1..7ee0b621f 100644
+--- a/python/tests/ut/pypto_x/test_execution_discovery.py
++++ b/python/tests/ut/pypto_x/test_execution_discovery.py
+@@ -227,15 +227,21 @@ def test_doctor_document_is_deterministic_versioned_and_read_only():
+     assert document["capability"]["triple"] == host_triple()
+     assert document["capability"]["features"] == list(host_features())
+     assert [item["opcode"] for item in document["opcodes"]] == [
++        "add",
++        "broadcast",
+         "cast",
+         "compare",
+         "exp",
+         "iota",
+         "matmul",
++        "mul",
+         "qmatmul_s8s8_s32",
+         "reduce_max",
+         "reduce_sum",
+         "reshape",
++        "rsqrt",
++        "slice",
++        "transpose",
+         "where",
+     ]
+     for item in document["opcodes"]:
+@@ -342,10 +348,13 @@ def test_doctor_reports_unregistered_contract_as_fail_closed_fact():
+     host = _host_snapshot()
+     portable = portable_provider_capability()
+     forged_contracts = dict(portable.contracts)
+-    forged_contracts["add"] = "sha256:" + "a" * 64
++    # ``sub`` stays unregistered after 0050-A (only add/mul/rsqrt/transpose/
++    # slice/broadcast were added), so the forged manifest still names an
++    # unknown contract.
++    forged_contracts["sub"] = "sha256:" + "a" * 64
+     injected = _replace_provider(host, PORTABLE_PROVIDER_ID, contracts=forged_contracts)
+     identity = injected.provider(PORTABLE_PROVIDER_ID)
+-    assert identity.contracts["add"] == "sha256:" + "a" * 64
++    assert identity.contracts["sub"] == "sha256:" + "a" * 64
+     report = doctor(capability=injected)
+     document = report.to_dict()
+     assert document["fail_closed"] is True
+@@ -923,7 +932,7 @@ def test_cli_plan_and_explain_round_trip(tmp_path):
+ 
+ def test_cli_fails_closed_with_structured_error(tmp_path):
+     completed = _run_cli(
+-        "plan", "--op", "add", "--left", "2,3", "--right", "3,4", "--dtype", "float32",
++        "plan", "--op", "sub", "--left", "2,3", "--right", "3,4", "--dtype", "float32",
+         "--json", cwd=tmp_path,
+     )
+     assert completed.returncode == 1
+@@ -986,7 +995,7 @@ def test_cli_unregistered_contract_is_a_fact_not_a_crash(tmp_path):
+     host = _host_snapshot()
+     portable = portable_provider_capability()
+     contracts = dict(portable.contracts)
+-    contracts["add"] = "sha256:" + "a" * 64
++    contracts["sub"] = "sha256:" + "a" * 64
+     injected = _replace_provider(host, PORTABLE_PROVIDER_ID, contracts=contracts)
+     snapshot_path = tmp_path / "snapshot.json"
+     snapshot_path.write_text(json.dumps(export_capability_snapshot(injected)), encoding="utf-8")
+diff --git a/python/tests/ut/pypto_x/test_execution_matmul.py b/python/tests/ut/pypto_x/test_execution_matmul.py
+index 3db6ca098..161dc9dd0 100644
+--- a/python/tests/ut/pypto_x/test_execution_matmul.py
++++ b/python/tests/ut/pypto_x/test_execution_matmul.py
+@@ -589,7 +589,7 @@ def test_contract_violations_fail_closed():
+     _assert_failure(OP_CONTRACT_INVALID, lambda: plan_matmul((2, 3), (2, 3), "float32"))
+     _assert_failure(OP_CONTRACT_INVALID, lambda: plan_matmul((2, 3), (3, 4), "bool"))
+     _assert_failure(OP_CONTRACT_INVALID, lambda: plan_matmul((2, 3, 4, 5, 6), (2, 3, 4, 5, 6), "float32"))
+-    _assert_failure(OP_CONTRACT_INVALID, lambda: get_op_definition("add"))
++    _assert_failure(OP_CONTRACT_INVALID, lambda: get_op_definition("sub"))
+ 
+     definition = get_op_definition("matmul")
+     left_type = CoreType.tensor("float32", (2, 3))
+@@ -791,16 +791,24 @@ def test_registry_is_a_view_of_the_core_ir_alias_table():
+     # U2b extends the registry with the W8A8 primitive contract; the matmul
+     # contract document (and digest) is unchanged.  0048-B adds the eight
+     # generic contracts without touching the frozen matmul/qmatmul documents.
++    # 0050-A adds the six batch-2 contracts without touching the frozen
++    # matmul/qmatmul documents.
+     assert registered_opcodes() == (
++        "add",
++        "broadcast",
+         "cast",
+         "compare",
+         "exp",
+         "iota",
+         "matmul",
++        "mul",
+         "qmatmul_s8s8_s32",
+         "reduce_max",
+         "reduce_sum",
+         "reshape",
++        "rsqrt",
++        "slice",
++        "transpose",
+         "where",
+     )
+ 
+diff --git a/python/tests/ut/pypto_x/test_execution_ops_registry_batch1.py b/python/tests/ut/pypto_x/test_execution_ops_registry_batch1.py
+index cf5e6a8a2..97a287eb6 100644
+--- a/python/tests/ut/pypto_x/test_execution_ops_registry_batch1.py
++++ b/python/tests/ut/pypto_x/test_execution_ops_registry_batch1.py
+@@ -71,6 +71,10 @@ BATCH1_OPS = (
+     "where",
+ )
+ ALL_OPCODES = tuple(sorted(BATCH1_OPS + ("matmul", "qmatmul_s8s8_s32")))
++# 0050-A batch-2 registrations (the batch-1 test file keeps its frozen
++# contract/plan digests; only the registry inventory assertions grow).
++BATCH2_OPS = ("add", "broadcast", "mul", "rsqrt", "slice", "transpose")
++ALL_REGISTERED_OPCODES = tuple(sorted(ALL_OPCODES + BATCH2_OPS))
+ 
+ # Frozen U1/U2 contract digests (recorded from the 923a72e26 baseline tree).
+ FROZEN_MATMUL_CONTRACT_DIGEST = (
+@@ -194,7 +198,8 @@ def run_generic(opcode, tensors, attributes=None, **kwargs):
+ # registry / contract documents
+ # ---------------------------------------------------------------------------
+ def test_registry_registers_exactly_the_batch1_contracts():
+-    assert registered_opcodes() == ALL_OPCODES
++    assert registered_opcodes() == ALL_REGISTERED_OPCODES
++    assert set(ALL_OPCODES).issubset(set(registered_opcodes()))
+     for opcode in BATCH1_OPS:
+         definition = get_op_definition(opcode)
+         assert definition.canonical_opcode == opcode
+@@ -306,15 +311,17 @@ def test_float_precision_paths_publish_no_analytic_upper_bound(opcode, inputs, o
+ # contract violation matrix
+ # ---------------------------------------------------------------------------
+ def test_unknown_opcode_and_unregistered_alias_fail_closed():
++    # ``add``/``transpose`` are registered by 0050-A; these spellings stay
++    # unregistered and must still fail closed.
+     expect_contract_error(
+-        "opcode_not_registered", lambda: plan_op("add", [(2, 3)], ["float32"])
++        "opcode_not_registered", lambda: plan_op("sub", [(2, 3), (2, 3)], ["float32", "float32"])
+     )
+     expect_contract_error(
+         "opcode_not_registered", lambda: plan_op("no.such.op", [(2, 3)], ["float32"])
+     )
+     expect_contract_error(
+         "opcode_not_registered",
+-        lambda: plan_op("transpose", [(2, 3)], ["float32"], attributes={"permutation": [1, 0]}),
++        lambda: plan_op("concat", [(2, 3), (2, 3)], ["float32", "float32"]),
+     )
+ 
+ 
+@@ -947,7 +954,7 @@ def test_doctor_lists_batch1_opcodes_with_consistent_digests():
+     from pypto.execution.discovery import doctor
+ 
+     document = doctor().to_dict()
+-    assert [item["opcode"] for item in document["opcodes"]] == list(ALL_OPCODES)
++    assert [item["opcode"] for item in document["opcodes"]] == list(ALL_REGISTERED_OPCODES)
+     for item in document["opcodes"]:
+         assert item["contract_digest"] == get_op_definition(item["opcode"]).contract_digest
+     schema_checks = [
+diff --git a/python/tests/ut/pypto_x/test_execution_ops_registry_batch2.py b/python/tests/ut/pypto_x/test_execution_ops_registry_batch2.py
+new file mode 100644
+index 000000000..df7f58803
+--- /dev/null
++++ b/python/tests/ut/pypto_x/test_execution_ops_registry_batch2.py
+@@ -0,0 +1,882 @@
++"""Batch-2 execution contracts (0050-A): elementwise + view/data movement.
++
++Covers:
++
++* the six new opcodes ``add``/``mul``/``rsqrt``/``transpose``/``slice``/
++  ``broadcast`` (registry, shape/dtype/attribute rules, execution differential,
++  precision declarations, fail-closed matrix);
++* the frozen-document contract patches: ``where`` scalar fill operands (patch
++  A) and ``compare.broadcast`` (patch B), both strictly additive;
++* the zero-default-change pin: the ten pre-batch-2 contract digests and a set
++  of legal batch-1/matmul plan points are byte-identical to the parent commit
++  ``41ae82a01`` (recorded by
++  ``_meta/pypto-x/u-ops-registry-batch2/scripts/record_batch2_zero_drift.py``);
++* the frozen view semantics: ``view_mode`` three-state behaviour, materialize
++  copy byte accounting, ``inplace``/``valid_shape`` and stride legality.
++"""
++
++from __future__ import annotations
++
++import math
++import struct
++
++import pytest
++
++from pypto.backends.cpu import HostTensor
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
++from pypto.execution import (
++    ExecutionError,
++    ExecutionPolicy,
++    NumericGuaranteeUnmetError,
++    NumericPolicy,
++    OpContractError,
++    execute_operation,
++    get_op_definition,
++    plan_operation,
++    registered_opcodes,
++    validate_report_schema,
++)
++from pypto.execution.capability import CapabilitySnapshot
++from pypto.execution.operation_contracts import (
++    BINARY_DTYPES,
++    GENERIC_VERIFIERS,
++    VIEW_DTYPES,
++)
++from pypto.execution.region import plan_region
++from pypto.lowering.cpu import OP_ALIASES
++
++
++BATCH2_OPS = ("add", "broadcast", "mul", "rsqrt", "slice", "transpose")
++FROZEN_BATCH1_OPS = (
++    "cast",
++    "compare",
++    "exp",
++    "iota",
++    "reduce_max",
++    "reduce_sum",
++    "reshape",
++    "where",
++)
++FROZEN_ALL_OPS = FROZEN_BATCH1_OPS + ("matmul", "qmatmul_s8s8_s32")
++
++# Recorded on the parent commit 41ae82a01 (same host, same capability
++# digest).  These pin the "zero default change" requirement for the ten
++# contracts frozen before 0050-A.
++FROZEN_DEFAULT_CAPABILITY_DIGEST = (
++    "sha256:e0a9dac8abc785a6a733448883cee5f1162db08e74ac5bd56cbff6f65641ad1e"
++)
++
++FROZEN_CONTRACT_DIGESTS = {
++    "cast": "sha256:644d8e0474f07b33c1a94684581b2afbab00504ac51a65187ed05b9f3f22feed",
++    "compare": "sha256:806ad35d4eff481a32e2fa3f4ea350d39827be1bb4c54167769893977fcb971d",
++    "exp": "sha256:ba6684c894dffa25d04af966ffcaddbcba275d77c7c42845380c41e52fe1cd43",
++    "iota": "sha256:9034db2008ea7696a2fc11ca171886cf832f7779e88ec01996746501d8eb0a28",
++    "matmul": "sha256:dbcd409d67f328633a6cd91d4ce5f467fe5b3146ab4566ef367e10fca374fe0d",
++    "qmatmul_s8s8_s32": "sha256:6fadd1069da0df59c6d98d7326599899a3dacf0250f9757d7cbcb3ee10a300cc",
++    "reduce_max": "sha256:505725511ff4e872797846c1261d94055e47a9bc19f97e749dfc314e711a2037",
++    "reduce_sum": "sha256:8c2f466b9bfc30c002ee467129f0b79e8ba536033024a91f8eaba0236632ce14",
++    "reshape": "sha256:cdf06ece3a9e395424d046c5c585d5c6420f39179d7f5fefbf8aa6797bba5872",
++    "where": "sha256:497383c0c903fdd2c5a0e245653d58b9ce3cb9a3e6f09b1ea146fd6eb4681e64",
++}
++
++# Parent-commit plan/output digests for legal requests (baseline script).
++FROZEN_PLAN_DIGESTS = {
++    "matmul_float32": "sha256:e0d1287e91dee4b7c9635fb573636f7de4d0cafc2de5fe8d81035c33d29814df",
++    "qmatmul_s8s8_s32": "sha256:1717a8e5e4e08b138f71131ac1667720c75174c1fa7a1ae53aff3760ac815c67",
++    "where_tensor_only": "sha256:a274cd9e2a7d01c8c06b8908f4ee5ba8ba70cc9580398fe12f23c576292c20b0",
++    "compare_no_broadcast_attribute": "sha256:b3c9032b2f8d2c39c57dcea18974b766b91bb57783291f82997b9dfc2125c325",
++    "exp_float32": "sha256:7ac27cb2a533f2645eeb69d8a0f932b42931a2e47774c57d6c808d4a512c58f9",
++    "iota_int32": "sha256:559bc849276b3c418d9f0165f22d96ab60aaddc8e3b6063bb875eb265b04b768",
++    "reduce_sum_float32": "sha256:172827625638caf6e1f59fdee807caea54faa2cd3ce0e406bf00bd7d0d727610",
++    "cast_int32_bf16": "sha256:66d92ea8802ea6bd766943bd4402c65d511e6f0444fe478dbc44cd483880a017",
++    "reshape_float32": "sha256:b6129180cc0fb0b4856af1a4299eaa3284acd1eea8d5ebd652a22d9e439a6db9",
++}
++
++
++def tensor(dtype, shape, values):
++    return HostTensor(dtype, tuple(shape), list(values))
++
++
++def plan_op(opcode, shapes, dtypes, **kwargs):
++    return plan_operation(opcode, shapes, dtypes, **kwargs).plan
++
++
++def run_op(opcode, shapes, dtypes, operands, attributes=None, **kwargs):
++    resolution = plan_operation(opcode, shapes, dtypes, attributes=attributes or {}, **kwargs)
++    output, report = execute_operation(resolution.plan, operands)
++    return resolution.plan, output, report
++
++
++def expect_reason(reason, call):
++    with pytest.raises(ExecutionError) as info:
++        call()
++    assert info.value.reason == reason, (info.value.reason, info.value)
++
++
++# ---------------------------------------------------------------------------
++# registry and zero-default-change
++# ---------------------------------------------------------------------------
++def test_registry_registers_the_six_batch2_contracts():
++    registered = set(registered_opcodes())
++    assert set(BATCH2_OPS).issubset(registered)
++    assert set(FROZEN_ALL_OPS).issubset(registered)
++    for opcode in BATCH2_OPS:
++        definition = get_op_definition(opcode)
++        assert definition.canonical_opcode == opcode
++        assert definition.contract_version == "1.0"
++        assert definition.verifier == "generic"
++        assert definition.allowed_providers == ("portable",)
++        assert definition.contract_digest.startswith("sha256:")
++        assert definition.document_schema_version == 3
++        assert definition.arity == len(definition.input_roles)
++        assert definition.precision
++        assert definition.semantics
++        assert definition.canonical_opcode in GENERIC_VERIFIERS
++        aliases = tuple(
++            sorted(name for name, canonical in OP_ALIASES.items() if canonical == opcode)
++        )
++        assert definition.core_ir_opcodes == aliases
++        module_name, symbol = definition.portable_reference["executor_symbol"].rsplit(".", 1)
++        module = __import__(module_name, fromlist=[symbol])
++        assert callable(getattr(module, symbol))
++
++
++def test_frozen_contract_digests_are_unchanged():
++    for opcode, digest in FROZEN_CONTRACT_DIGESTS.items():
++        assert get_op_definition(opcode).contract_digest == digest, opcode
++
++
++def test_frozen_legal_plan_digests_are_unchanged():
++    # Plan digests bind the host capability snapshot, whose vendor manifests
++    # carry thread facts; under the rule-8 lock environment (OMP_NUM_THREADS=6)
++    # the probe digest differs and this pin is skipped exactly like the batch-1
++    # and U5 baseline pins.  The contract digests above stay host-independent.
++    if CapabilitySnapshot.probe_host().digest != FROZEN_DEFAULT_CAPABILITY_DIGEST:
++        pytest.skip("the frozen plan digests were recorded on the baseline host probe")
++    assert plan_op("matmul", [(2, 3), (3, 4)], ["float32", "float32"]).digest == (
++        FROZEN_PLAN_DIGESTS["matmul_float32"]
++    )
++    assert plan_op("qmatmul_s8s8_s32", [(2, 3), (3, 4)], ["int8", "int8"]).digest == (
++        FROZEN_PLAN_DIGESTS["qmatmul_s8s8_s32"]
++    )
++    assert plan_op(
++        "where", [(2, 3), (2, 3), (1, 3)], ["bool", "float32", "float32"]
++    ).digest == FROZEN_PLAN_DIGESTS["where_tensor_only"]
++    assert plan_op(
++        "compare", [(2, 3), (3,)], ["float32", "float32"], attributes={"predicate": "le"}
++    ).digest == FROZEN_PLAN_DIGESTS["compare_no_broadcast_attribute"]
++    assert plan_op("exp", [(2, 3)], ["float32"]).digest == FROZEN_PLAN_DIGESTS["exp_float32"]
++    assert plan_op(
++        "iota", [], [], dtype="int32", output_shape=(8,),
++        attributes={"axis": 0, "start": 1, "step": 2},
++    ).digest == FROZEN_PLAN_DIGESTS["iota_int32"]
++    assert plan_op(
++        "reduce_sum", [(2, 3, 4)], ["float32"], attributes={"axes": [1]}
++    ).digest == FROZEN_PLAN_DIGESTS["reduce_sum_float32"]
++    assert plan_op(
++        "cast", [(2, 3)], ["int32"], output_dtype="bf16"
++    ).digest == FROZEN_PLAN_DIGESTS["cast_int32_bf16"]
++    assert plan_op(
++        "reshape", [(2, 3)], ["float32"], attributes={"shape": [6]}
++    ).digest == FROZEN_PLAN_DIGESTS["reshape_float32"]
++
++
++def test_frozen_where_and_compare_patches_do_not_change_existing_results():
++    plan, output, report = run_op(
++        "where",
++        [(2, 2), (2, 2), ()],
++        ["bool", "float32", "float32"],
++        [
++            tensor("bool", (2, 2), [True, False, True, False]),
++            tensor("float32", (2, 2), [1.0, 2.0, 3.0, 4.0]),
++            9.0,
++        ],
++    )
++    # Patch A adds the scalar marker to the frozen request, so this new request
++    # naturally has a new digest; the tensor-only request above stays frozen.
++    assert plan.payload["request"]["inputs"][2]["kind"] == "scalar"
++    assert "kind" not in plan.payload["request"]["inputs"][1]
++    assert output.data == [1.0, 9.0, 3.0, 9.0]
++
++    compare_plan, compare_output, compare_report = run_op(
++        "compare",
++        [(2, 2), (2, 2)],
++        ["float32", "float32"],
++        [tensor("float32", (2, 2), [1.0, 2.0, 3.0, 4.0]), tensor("float32", (2, 2), [2.0, 2.0, 2.0, 2.0])],
++        {"predicate": "lt", "broadcast": "trailing_singleton"},
++    )
++    assert compare_plan.payload["request"]["attributes"] == {
++        "predicate": "lt",
++        "broadcast": "trailing_singleton",
++    }
++    assert compare_output.data == [True, False, False, False]
++    validate_report_schema(report.to_dict())
++    validate_report_schema(compare_report.to_dict())
++
++
++# ---------------------------------------------------------------------------
++# patch A: where scalar fill operands
++# ---------------------------------------------------------------------------
++def test_patch_a_where_scalar_fill_accepts_tensor_and_scalar_broadcast():
++    plan, output, report = run_op(
++        "where",
++        [(2, 3), (1, 3), ()],
++        ["bool", "float32", "float32"],
++        [
++            tensor("bool", (2, 3), [True, False, True, False, True, False]),
++            tensor("float32", (1, 3), [1.0, 2.0, 3.0]),
++            7.5,
++        ],
++    )
++    assert plan.output_shape == (2, 3)
++    assert plan.output_dtype == "float32"
++    assert output.data == [1.0, 7.5, 3.0, 7.5, 2.0, 7.5]
++    kinds = [item.get("kind", "tensor") for item in plan.payload["request"]["inputs"]]
++    assert kinds == ["tensor", "tensor", "scalar"]
++    validate_report_schema(report.to_dict())
++
++
++def test_patch_a_where_scalar_fill_on_the_true_branch():
++    plan, output, _ = run_op(
++        "where",
++        [(3,), (3,), ()],
++        ["bool", "float32", "float32"],
++        [tensor("bool", (3,), [False, True, False]), tensor("float32", (3,), [1.0, 2.0, 3.0]), 5.0],
++    )
++    assert plan.payload["request"]["inputs"][2]["kind"] == "scalar"
++    assert output.data == [5.0, 2.0, 5.0]
++
++
++def test_patch_a_where_scalar_rejects_promotion_and_scalar_condition():
++    expect_reason(
++        "dtype_mismatch",
++        lambda: plan_operation(
++            "where", [(2, 2), (2, 2), ()], ["bool", "float32", "int32"]
++        ),
++    )
++    expect_reason(
++        "rank_out_of_range",
++        lambda: plan_operation(
++            "where", [(), (2, 2), (2, 2)], ["bool", "float32", "float32"]
++        ),
++    )
++
++
++def test_patch_a_where_all_scalar_values_follow_the_condition_shape():
++    plan, output, _ = run_op(
++        "where",
++        [(2,), (), ()],
++        ["bool", "float32", "float32"],
++        [tensor("bool", (2,), [True, False]), 1.0, 2.0],
++    )
++    assert output.data == [1.0, 2.0]
++    assert plan.output_shape == (2,)
++
++
++# ---------------------------------------------------------------------------
++# patch B: compare.broadcast declaration
++# ---------------------------------------------------------------------------
++def test_patch_b_compare_broadcast_accepts_and_normalizes():
++    for spelling in (True, "true", "trailing", "trailing_singleton", "auto"):
++        plan = plan_op(
++            "compare",
++            [(2, 1), (1, 3)],
++            ["float32", "float32"],
++            attributes={"predicate": "le", "broadcast": spelling},
++        )
++        assert plan.payload["request"]["attributes"] == {
++            "predicate": "le",
++            "broadcast": "trailing_singleton",
++        }
++
++
++def test_patch_b_compare_broadcast_rejects_narrowing_and_unknown_values():
++    expect_reason(
++        "compare_broadcast_disabled_not_portable",
++        lambda: plan_operation(
++            "compare",
++            [(2, 2), (2, 2)],
++            ["float32", "float32"],
++            attributes={"predicate": "eq", "broadcast": False},
++        ),
++    )
++    expect_reason(
++        "compare_broadcast_disabled_not_portable",
++        lambda: plan_operation(
++            "compare",
++            [(2, 2), (2, 2)],
++            ["float32", "float32"],
++            attributes={"predicate": "eq", "broadcast": "none"},
++        ),
++    )
++    expect_reason(
++        "compare_broadcast_invalid",
++        lambda: plan_operation(
++            "compare",
++            [(2, 2), (2, 2)],
++            ["float32", "float32"],
++            attributes={"predicate": "eq", "broadcast": "bogus"},
++        ),
++    )
++
++
++def test_patch_b_compare_absent_broadcast_keeps_the_frozen_request():
++    plan = plan_op(
++        "compare", [(2, 3), (3,)], ["float32", "float32"], attributes={"predicate": "le"}
++    )
++    assert plan.payload["request"]["attributes"] == {"predicate": "le"}
++
++
++# ---------------------------------------------------------------------------
++# add / mul
++# ---------------------------------------------------------------------------
++def test_add_and_mul_execute_same_shape_and_broadcast():
++    add_plan, add_out, _ = run_op(
++        "add",
++        [(2, 1), (1, 3)],
++        ["float32", "float32"],
++        [tensor("float32", (2, 1), [1.0, 2.0]), tensor("float32", (1, 3), [10.0, 20.0, 30.0])],
++    )
++    assert add_plan.output_shape == (2, 3)
++    assert add_out.data == [11.0, 21.0, 31.0, 12.0, 22.0, 32.0]
++
++    mul_plan, mul_out, _ = run_op(
++        "mul",
++        [(2, 3), (2, 3)],
++        ["bf16", "bf16"],
++        [tensor("bf16", (2, 3), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
++         tensor("bf16", (2, 3), [0.5, 0.5, 0.5, 0.5, 0.5, 0.5])],
++    )
++    assert mul_plan.output_shape == (2, 3)
++    assert mul_out.data == [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
++
++
++def test_binary_scalar_operands_on_either_side():
++    plan, output, _ = run_op(
++        "add", [(2, 2), ()], ["int32", "int32"],
++        [tensor("int32", (2, 2), [1, 2, 3, 4]), 10],
++    )
++    assert plan.payload["request"]["inputs"][1]["kind"] == "scalar"
++    assert output.data == [11, 12, 13, 14]
++
++    plan, output, _ = run_op(
++        "mul", [(), (2, 2)], ["float32", "float32"],
++        [2.0, tensor("float32", (2, 2), [1.0, 2.0, 3.0, 4.0])],
++    )
++    assert plan.payload["request"]["inputs"][0]["kind"] == "scalar"
++    assert output.data == [2.0, 4.0, 6.0, 8.0]
++
++
++def test_binary_rejects_two_scalars_and_bool_and_mixed_dtypes():
++    expect_reason(
++        "scalar_result_not_supported",
++        lambda: plan_operation("add", [(), ()], ["float32", "float32"]),
++    )
++    expect_reason(
++        "dtype_outside_contract_domain",
++        lambda: plan_operation("mul", [(2, 2), (2, 2)], ["bool", "bool"]),
++    )
++    expect_reason(
++        "dtype_mismatch",
++        lambda: plan_operation("add", [(2, 2), (2, 2)], ["float32", "int32"]),
++    )
++    expect_reason(
++        "broadcast_shape_mismatch",
++        lambda: plan_operation("add", [(2, 3), (4,)], ["float32", "float32"]),
++    )
++    expect_reason(
++        "unknown_attribute",
++        lambda: plan_operation(
++            "add", [(2, 2), (2, 2)], ["float32", "float32"], attributes={"alpha": 1}
++        ),
++    )
++
++
++def test_binary_integer_path_is_exact_and_fails_closed_on_overflow():
++    plan = plan_op("add", [(3,), (3,)], ["int8", "int8"])
++    assert plan.numeric_guarantee["precision"]["class"] == "exact"
++    _, output, _ = run_op(
++        "add", [(3,), (3,)], ["int8", "int8"],
++        [tensor("int8", (3,), [1, 2, 3]), tensor("int8", (3,), [4, 5, 6])],
++    )
++    assert output.data == [5, 7, 9]
++    # 127 + 1 is out of the int8 domain: the range-checked cast fails closed
++    # instead of wrapping.
++    with pytest.raises(RuntimeError):
++        run_op(
++            "add", [(1,), (1,)], ["int8", "int8"],
++            [tensor("int8", (1,), [127]), tensor("int8", (1,), [1])],
++        )
++    # An out-of-range scalar operand is refused with a structured error.
++    with pytest.raises(ExecutionError) as info:
++        run_op(
++            "add", [(1,), ()], ["int8", "int8"], [tensor("int8", (1,), [1]), 300]
++        )
++    assert info.value.reason == "operand_value_rejected"
++
++
++def test_binary_float_path_is_deterministic_bounded_and_require_proven_fails_closed():
++    plan = plan_op("mul", [(2, 2), (2, 2)], ["float32", "float32"])
++    precision = plan.numeric_guarantee["precision"]
++    assert precision["class"] == "deterministic_bounded"
++    assert precision["deviation_bound_available"] is False
++    assert precision["analytic_upper_bound"] is None
++
++    strict = ExecutionPolicy(numeric=NumericPolicy(require_proven_deviation_bound=True))
++    with pytest.raises(NumericGuaranteeUnmetError) as info:
++        plan_operation(
++            "mul", [(2, 2), (2, 2)], ["float32", "float32"], policy=strict
++        )
++    assert info.value.field == "numeric.require_proven_deviation_bound"
++    # The integer path carries an exact contract bound and stays available.
++    assert plan_operation(
++        "mul", [(2, 2), (2, 2)], ["int32", "int32"], policy=strict
++    ).plan.numeric_guarantee["precision"]["class"] == "exact"
++
++
++def test_binary_empty_broadcast_and_rank_rules():
++    plan, output, _ = run_op(
++        "add", [(0,), (1,)], ["float32", "float32"],
++        [tensor("float32", (0,), []), tensor("float32", (1,), [1.0])],
++    )
++    assert plan.output_shape == (0,)
++    assert output.data == []
++    expect_reason(
++        "rank_out_of_range",
++        lambda: plan_operation("add", [(2, 3, 4, 5, 6), (2,)], ["float32", "float32"]),
++    )
++
++
++# ---------------------------------------------------------------------------
++# rsqrt
++# ---------------------------------------------------------------------------
++def test_rsqrt_edge_semantics_and_shape_preservation():
++    plan, output, report = run_op(
++        "rsqrt",
++        [(6,)],
++        ["float32"],
++        [tensor("float32", (6,), [4.0, 0.0, -0.0, -1.0, float("nan"), float("inf")])],
++    )
++    values = output.data
++    assert values[0] == 0.5
++    assert values[1] == float("inf")
++    assert values[2] == float("inf")
++    assert values[3] != values[3]  # NaN
++    assert values[4] != values[4]  # NaN
++    assert values[5] == 0.0
++    assert plan.output_shape == (6,)
++    assert plan.numeric_guarantee["precision"]["class"] == "deterministic_bounded"
++    assert plan.numeric_guarantee["precision"]["deviation_bound_available"] is False
++    validate_report_schema(report.to_dict())
++
++
++def test_rsqrt_rejects_non_float_and_require_proven_policy():
++    expect_reason(
++        "dtype_outside_contract_domain",
++        lambda: plan_operation("rsqrt", [(2, 2)], ["int32"]),
++    )
++    expect_reason(
++        "rank_out_of_range",
++        lambda: plan_operation("rsqrt", [(2, 2, 2, 2, 2)], ["float32"]),
++    )
++    strict = ExecutionPolicy(numeric=NumericPolicy(require_proven_deviation_bound=True))
++    with pytest.raises(NumericGuaranteeUnmetError) as info:
++        plan_operation("rsqrt", [(2, 2)], ["bf16"], policy=strict)
++    assert info.value.field == "numeric.require_proven_deviation_bound"
++
++
++def test_rsqrt_float16_zero_and_subnormal_domain():
++    # rsqrt of the smallest positive float16 subnormal (2**-24) is 2**12,
++    # finite; +-0 maps to +inf and both stay representable in float16.
++    plan, output, _ = run_op(
++        "rsqrt", [(3,)], ["float16"],
++        [tensor("float16", (3,), [1.0, 0.0, 2.0 ** -24])],
++    )
++    assert output.data == [1.0, float("inf"), 4096.0]
++    assert plan.output_shape == (3,)
++
++
++# ---------------------------------------------------------------------------
++# transpose / slice / broadcast: frozen view semantics
++# ---------------------------------------------------------------------------
++def _layout(plan):
++    return plan.payload["layout_decision"]
++
++
++def test_view_family_default_policy_materializes_with_real_copy_bytes():
++    transpose = plan_op(
++        "transpose", [(2, 3)], ["bf16"], attributes={"permutation": [1, 0]}
++    )
++    decision = _layout(transpose)
++    assert decision["view_obligation"] == "may_alias"
++    assert decision["requested_view_mode"] == "forbid"
++    assert decision["resolved_view_mode"] == "materialized"
++    assert decision["layout_copy_bytes"] == 3 * 2 * 2  # (3,2) bf16 = 12 bytes
++    assert decision["materialize_allowed"] is True
++
++    slice_plan = plan_op(
++        "slice", [(4, 8)], ["float32"],
++        attributes={"starts": [1], "stops": [3], "axes": [0]},
++    )
++    assert _layout(slice_plan)["layout_copy_bytes"] == 2 * 8 * 4
++
++    broadcast_plan = plan_op(
++        "broadcast", [(3,)], ["float32"], attributes={"shape": [2, 3]}
++    )
++    assert _layout(broadcast_plan)["layout_copy_bytes"] == 2 * 3 * 4
++
++
++def test_view_family_require_view_mode_fails_closed_structured():
++    for opcode, shapes, dtypes, attributes in (
++        ("transpose", [(2, 3)], ["float32"], {"permutation": [1, 0]}),
++        ("slice", [(4, 8)], ["float32"], {"starts": [1], "stops": [3], "axes": [0]}),
++        ("broadcast", [(3,)], ["float32"], {"shape": [2, 3]}),
++    ):
++        with pytest.raises(ExecutionError) as info:
++            plan_operation(
++                opcode,
++                shapes,
++                dtypes,
++                attributes=attributes,
++                policy=ExecutionPolicy(layout={"view_mode": "require"}),
++            )
++        assert info.value.reason == "portable_trunk_has_no_strided_view_abi"
++        assert info.value.field == "layout.view_mode"
++        assert info.value.code == "ALIAS_PROOF_UNAVAILABLE"
++
++
++def test_view_family_prefer_materializes_explicitly():
++    plan = plan_op(
++        "transpose", [(2, 3)], ["float32"],
++        attributes={"permutation": [1, 0]},
++        policy=ExecutionPolicy(layout={"view_mode": "prefer"}),
++    )
++    decision = _layout(plan)
++    assert decision["resolved_view_mode"] == "materialized"
++    assert decision["materialize_allowed"] is True
++
++
++def test_view_family_forbid_materialize_copy_respects_policy_budget():
++    with pytest.raises(ExecutionError) as info:
++        plan_operation(
++            "transpose",
++            [(2, 3)],
++            ["float32"],
++            attributes={"permutation": [1, 0]},
++            policy=ExecutionPolicy(
++                layout={"view_mode": "forbid", "max_copy_bytes": 4}
++            ),
++        )
++    assert info.value.code == "ALIAS_PROOF_UNAVAILABLE"
++
++
++def test_transpose_shapes_permutation_spellings_and_execution():
++    plan, output, _ = run_op(
++        "transpose", [(2, 3)], ["int32"], [tensor("int32", (2, 3), [1, 2, 3, 4, 5, 6])],
++        {"permutation": [1, 0]},
++    )
++    assert plan.output_shape == (3, 2)
++    assert plan.payload["request"]["attributes"] == {"permutation": [1, 0]}
++    assert output.data == [1, 4, 2, 5, 3, 6]
++
++    dim_plan, dim_out, _ = run_op(
++        "transpose", [(2, 3)], ["float32"], [tensor("float32", (2, 3), [1, 2, 3, 4, 5, 6])],
++        {"dim0": 0, "dim1": 1},
++    )
++    assert dim_plan.payload["request"]["attributes"] == {"permutation": [1, 0]}
++    assert dim_out.data == [1, 4, 2, 5, 3, 6]
++
++    negative = plan_op(
++        "transpose", [(2, 3, 4)], ["float32"], attributes={"permutation": [-1, 1, 0]}
++    )
++    assert negative.output_shape == (4, 3, 2)
++
++
++def test_transpose_rejects_invalid_permutations_and_declared_shape_mismatch():
++    expect_reason(
++        "transpose_permutation_invalid",
++        lambda: plan_operation(
++            "transpose", [(2, 3)], ["float32"], attributes={"permutation": [0, 0]}
++        ),
++    )
++    expect_reason(
++        "transpose_permutation_invalid",
++        lambda: plan_operation(
++            "transpose", [(2, 3)], ["float32"], attributes={"permutation": [0, 2]}
++        ),
++    )
++    expect_reason(
++        "transpose_permutation_invalid",
++        lambda: plan_operation(
++            "transpose", [(2, 3)], ["float32"],
++            attributes={"permutation": [1, 0], "dim0": 0, "dim1": 1},
++        ),
++    )
++    expect_reason(
++        "shape_rule_violation",
++        lambda: plan_operation(
++            "transpose", [(2, 3)], ["float32"],
++            attributes={"permutation": [1, 0]}, output_shape=(2, 3),
++        ),
++    )
++    expect_reason(
++        "unordered_attribute_container",
++        lambda: plan_operation(
++            "transpose", [(2, 3)], ["float32"], attributes={"permutation": {1, 0}}
++        ),
++    )
++
++
++def test_transpose_view_auxiliary_attributes_fail_closed():
++    expect_reason(
++        "transpose_inplace_not_portable",
++        lambda: plan_operation(
++            "transpose", [(2, 3)], ["float32"],
++            attributes={"permutation": [1, 0], "inplace": True},
++        ),
++    )
++    expect_reason(
++        "transpose_valid_shape_not_representable",
++        lambda: plan_operation(
++            "transpose", [(2, 3)], ["float32"],
++            attributes={"permutation": [1, 0], "valid_shape": [2, 3]},
++        ),
++    )
++    assert plan_op(
++        "transpose", [(2, 3)], ["float32"],
++        attributes={"permutation": [1, 0], "inplace": False},
++    ).payload["request"]["attributes"] == {"permutation": [1, 0]}
++
++
++def test_slice_real_graph_shapes_and_execution():
++    plan, output, _ = run_op(
++        "slice",
++        [(1, 4, 16)],
++        ["bf16"],
++        [tensor("bf16", (1, 4, 16), list(range(64)))],
++        {"starts": [1], "stops": [2], "axes": [1], "steps": [1]},
++    )
++    assert plan.output_shape == (1, 1, 16)
++    assert output.data == list(range(16, 32))
++
++    last_axis = plan_op(
++        "slice", [(1, 6144, 5)], ["float32"],
++        attributes={"starts": [1], "stops": [5], "axes": [-1], "steps": [1]},
++    )
++    assert last_axis.output_shape == (1, 6144, 4)
++
++    negative_start = plan_op(
++        "slice", [(4, 8)], ["float32"],
++        attributes={"starts": [-2], "stops": [-1], "axes": [0]},
++    )
++    assert negative_start.output_shape == (1, 8)
++
++    empty = plan_op(
++        "slice", [(4, 8)], ["float32"],
++        attributes={"starts": [3], "stops": [1], "axes": [0]},
++    )
++    assert empty.output_shape == (0, 8)
++
++
++def test_slice_rejects_out_of_bounds_negative_step_and_unordered_attributes():
++    expect_reason(
++        "slice_spec_invalid",
++        lambda: plan_operation(
++            "slice", [(2, 3)], ["float32"],
++            attributes={"starts": [0], "stops": [5], "axes": [0]},
++        ),
++    )
++    expect_reason(
++        "slice_spec_invalid",
++        lambda: plan_operation(
++            "slice", [(2, 3)], ["float32"],
++            attributes={"starts": [0], "stops": [1], "axes": [0, 0]},
++        ),
++    )
++    expect_reason(
++        "slice_negative_step_not_supported",
++        lambda: plan_operation(
++            "slice", [(2, 3)], ["float32"],
++            attributes={"starts": [1], "stops": [0], "axes": [0], "steps": [-1]},
++        ),
++    )
++    expect_reason(
++        "slice_spec_missing",
++        lambda: plan_operation(
++            "slice", [(2, 3)], ["float32"], attributes={"starts": [0], "axes": [0]}
++        ),
++    )
++    expect_reason(
++        "unordered_attribute_container",
++        lambda: plan_operation(
++            "slice", [(2, 3)], ["float32"],
++            attributes={"starts": {0}, "stops": {1}, "axes": [0]},
++        ),
++    )
++
++
++def test_broadcast_accepts_attribute_or_declared_shape_and_executes():
++    plan, output, _ = run_op(
++        "broadcast", [(3,)], ["float32"], [tensor("float32", (3,), [1.0, 2.0, 3.0])],
++        {"shape": [2, 3]},
++    )
++    assert plan.output_shape == (2, 3)
++    assert plan.payload["request"]["attributes"] == {"shape": [2, 3]}
++    assert output.data == [1.0, 2.0, 3.0, 1.0, 2.0, 3.0]
++
++    declared = plan_op("broadcast", [(1, 1, 3)], ["float32"], output_shape=(1, 1, 3))
++    assert declared.output_shape == (1, 1, 3)
++
++    scalar_input = plan_op("broadcast", [()], ["float32"], output_shape=(2, 2))
++    assert scalar_input.output_shape == (2, 2)
++
++
++def test_broadcast_rejects_incompatible_or_missing_target_shapes():
++    expect_reason(
++        "broadcast_shape_mismatch",
++        lambda: plan_operation(
++            "broadcast", [(2, 3)], ["float32"], attributes={"shape": [3, 2]}
++        ),
++    )
++    expect_reason(
++        "broadcast_target_shape_missing",
++        lambda: plan_operation("broadcast", [(2,)], ["float32"]),
++    )
++    expect_reason(
++        "broadcast_target_shape_invalid",
++        lambda: plan_operation(
++            "broadcast", [(2,)], ["float32"], attributes={"shape": {2, 3}}
++        ),
++    )
++    expect_reason(
++        "conflicting_attribute_aliases",
++        lambda: plan_operation(
++            "broadcast", [(2,)], ["float32"],
++            attributes={"shape": [2, 3], "target_shape": [2, 4]},
++        ),
++    )
++
++
++def test_view_family_precision_is_exact_and_survives_strict_policy():
++    strict = ExecutionPolicy(numeric=NumericPolicy(require_proven_deviation_bound=True))
++    for opcode, shapes, dtypes, attributes in (
++        ("transpose", [(2, 3)], ["bf16"], {"permutation": [1, 0]}),
++        ("slice", [(4, 8)], ["float32"], {"starts": [1], "stops": [3], "axes": [0]}),
++        ("broadcast", [(3,)], ["float32"], {"shape": [2, 3]}),
++    ):
++        plan = plan_operation(
++            opcode, shapes, dtypes, attributes=attributes, policy=strict
++        ).plan
++        precision = plan.numeric_guarantee["precision"]
++        assert precision["class"] == "exact"
++        assert precision["deviation_bound_available"] is True
++
++
++def test_view_family_bit_for_bit_value_preservation():
++    nan = struct.unpack("<f", struct.pack("<I", 0x7FC0 << 16))[0]
++    source = tensor("bf16", (1, 2), [nan, -0.0])
++    for opcode, attributes in (
++        ("transpose", {"permutation": [1, 0]}),
++        ("slice", {"starts": [0], "stops": [1], "axes": [1]}),
++        ("broadcast", {"shape": [1, 2]}),
++    ):
++        _, output, _ = run_op(opcode, [(1, 2)], ["bf16"], [source], attributes)
++        assert output.data[0] != output.data[0]  # NaN preserved
++    # The negative zero must keep its sign bit through a slice.
++    _, sliced, _ = run_op(
++        "slice", [(1, 2)], ["bf16"], [source],
++        {"starts": [1], "stops": [2], "axes": [1]},
++    )
++    assert math.copysign(1.0, sliced.data[0]) == -1.0
++
++
++# ---------------------------------------------------------------------------
++# generic fail-closed matrix and region integration
++# ---------------------------------------------------------------------------
++def test_fail_closed_matrix_for_batch2_requests():
++    cases = (
++        ("opcode_not_registered", lambda: plan_operation("sub", [(2, 2)], ["float32"])),
++        ("unknown_attribute", lambda: plan_operation(
++            "rsqrt", [(2, 2)], ["float32"], attributes={"mode": "fast"}
++        )),
++        ("rank_out_of_range", lambda: plan_operation(
++            "broadcast", [(2, 3, 4, 5, 6)], ["float32"], attributes={"shape": [1, 2, 3, 4, 5]}
++        )),
++        ("shape_rule_violation", lambda: plan_operation(
++            "slice", [(2, 3)], ["float32"],
++            attributes={"starts": [0], "stops": [1], "axes": [0]},
++            output_shape=(5, 3),
++        )),
++    )
++    for reason, call in cases:
++        expect_reason(reason, call)
++
++
++def test_core_ir_generic_verification_accepts_the_patches():
++    cond = ValueRef("cond", CoreType.tensor("bool", (2, 2)))
++    x = ValueRef("x", CoreType.tensor("float32", (2, 2)))
++    fill = ValueRef("fill", CoreType.scalar("float32"))
++    w = ValueRef("w", CoreType.tensor("float32", (2, 2)))
++    where_op = Operation("where", (cond, x, fill), (w,))
++    info = get_op_definition("where").verify_operation(where_op)
++    assert info["input_kinds"] == ["tensor", "tensor", "scalar"]
++
++    left = ValueRef("left", CoreType.tensor("float32", (2, 1)))
++    right = ValueRef("right", CoreType.tensor("float32", (1, 3)))
++    out = ValueRef("out", CoreType.tensor("bool", (2, 3)))
++    compare_op = Operation(
++        "compare", (left, right), (out,),
++        {"predicate": "le", "broadcast": "trailing_singleton"},
++    )
++    info = get_op_definition("compare").verify_operation(compare_op)
++    assert info["attributes"] == {"predicate": "le", "broadcast": "trailing_singleton"}
++
++
++def test_plan_region_sees_batch2_opcodes_as_registered():
++    def ref(name, dtype, shape):
++        return ValueRef(name, CoreType.tensor(dtype, shape))
++
++    a = ref("a", "float32", (2, 3))
++    b = ref("b", "float32", (3,))
++    c = ref("c", "float32", (2, 3))
++    transposed = ref("t", "float32", (3, 2))
++    program = CoreProgram(
++        functions=(
++            CoreFunction(
++                "batch2_region",
++                (a, b),
++                (transposed,),
++                Region(
++                    (
++                        Operation("add", (a, b), (c,)),
++                        Operation("transpose", (c,), (transposed,), {"permutation": [1, 0]}),
++                    )
++                ),
++            ),
++        )
++    )
++    plan = plan_region(program)
++    assert len(plan.operations) == 2
++    assert [op["opcode"] for op in plan.operations] == ["add", "transpose"]
++
++
++def test_batch2_contract_views_are_exported_in_doctor_and_capability():
++    from pypto.execution.capability import operation_provider_capability
++    from pypto.execution.discovery import doctor
++
++    document = doctor().to_dict()
++    assert {item["opcode"] for item in document["opcodes"]} >= set(BATCH2_OPS)
++    scoped = operation_provider_capability("add")
++    assert "add" in scoped.contracts
++    assert scoped.contracts["add"] == get_op_definition("add").contract_digest
++    # Batch-1 scoped manifests stay frozen at their ten-contract registry.
++    batch1_scoped = operation_provider_capability("exp")
++    assert "add" not in batch1_scoped.contracts
++
++
++def test_binary_dtype_domain_matches_the_declared_contract():
++    assert set(BINARY_DTYPES) == set(VIEW_DTYPES) - {"bool"}
++    assert "bool" not in BINARY_DTYPES
++    for dtype in BINARY_DTYPES:
++        plan = plan_op("mul", [(2, 2), (2, 2)], [dtype, dtype])
++        assert plan.output_dtype == dtype
+diff --git a/python/tests/ut/pypto_x/test_execution_region_planning.py b/python/tests/ut/pypto_x/test_execution_region_planning.py
+index 5fdf7afbf..3078ad4c0 100644
+--- a/python/tests/ut/pypto_x/test_execution_region_planning.py
++++ b/python/tests/ut/pypto_x/test_execution_region_planning.py
+@@ -584,9 +584,9 @@ def test_missing_contracts_are_aggregated_by_opcode_with_counts():
+     program = _program(
+         (a, b),
+         (
+-            _op("add", (a, b), (s1,)),
+-            _op("add", (s1, b), (s2,)),
+-            _op("transpose", (s2,), (t,), {"permutation": [1, 0]}),
++            _op("sub", (a, b), (s1,)),
++            _op("sub", (s1, b), (s2,)),
++            _op("neg", (s2,), (t,)),
+             _op("matmul", (t, t), (c,)),
+         ),
+         (c,),
+@@ -597,10 +597,10 @@ def test_missing_contracts_are_aggregated_by_opcode_with_counts():
+     assert error.details["op_count"] == 4
+     assert error.details["missing_operation_count"] == 3
+     missing = error.details["missing_contracts"]
+-    assert [item["opcode"] for item in missing] == ["add", "transpose"]
++    assert [item["opcode"] for item in missing] == ["sub", "neg"]
+     assert missing[0]["occurrences"] == 2
+     assert missing[1]["occurrences"] == 1
+-    assert missing[0]["raw_names"] == ["add"]
++    assert missing[0]["raw_names"] == ["sub"]
+     # the registered matmul still planned: the diagnostic is not a first-error abort
+     assert error.details["unplannable_operations"] == []
+ 
+@@ -626,11 +626,14 @@ def test_unplannable_registered_operations_are_reported():
+         (item["opcode"], item["reason"])
+         for item in error.details["unplannable_operations"]
+     }
++    # 0050-A patch B closed the ``compare.broadcast`` gap at the contract
++    # layer, so only the U5 region entry's scalar-operand pre-check (which this
++    # slice must not modify) still reports ``where``; the compare op planned.
+     assert (
+         "where",
+         "scalar_operand_not_supported_by_execution_contract",
+     ) in reported
+-    assert ("compare", "unknown_attribute") in reported
++    assert not any(opcode == "compare" for opcode, _reason in reported)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -1217,14 +1220,14 @@ def test_cli_region_plan_reports_missing_contracts_with_exit_code_one(tmp_path):
+     a = _ref("a", "float32", (2, 2))
+     b = _ref("b", "float32", (2, 2))
+     s = _ref("s", "float32", (2, 2))
+-    program = _program((a, b), (_op("add", (a, b), (s,)),), (s,))
+-    program_path = tmp_path / "add.json"
++    program = _program((a, b), (_op("sub", (a, b), (s,)),), (s,))
++    program_path = tmp_path / "sub.json"
+     program_path.write_text(program.canonical_json(), encoding="utf-8")
+     result = _run_cli("plan", "--region", "program", "--program", str(program_path), "--json")
+     assert result.returncode == 1
+     document = json.loads(result.stdout)
+     assert document["reason"] == "region_contracts_missing"
+-    assert document["details"]["missing_contracts"][0]["opcode"] == "add"
++    assert document["details"]["missing_contracts"][0]["opcode"] == "sub"
+ 
+ 
+ def test_cli_region_flag_requires_a_program():
+diff --git a/python/tests/ut/pypto_x/test_op_bench_framework.py b/python/tests/ut/pypto_x/test_op_bench_framework.py
+index 6c5eaa909..91345df5c 100644
+--- a/python/tests/ut/pypto_x/test_op_bench_framework.py
++++ b/python/tests/ut/pypto_x/test_op_bench_framework.py
+@@ -216,10 +216,10 @@ def test_same_shape_same_inputs_across_providers():
+ 
+ 
+ def test_unregistered_opcode_fails_closed():
+-    # 0048-B registered reduce_sum, so the injection uses an opcode that is
+-    # still outside the execution registry.
++    # 0050-A registered add/mul/rsqrt/transpose/slice/broadcast, so the
++    # injection uses an opcode still outside the execution registry.
+     with pytest.raises(CaseError) as info:
+-        _case(op="add", shape={"left": (4, 4)}).validate()
++        _case(op="sub", shape={"left": (4, 4)}).validate()
+     assert info.value.category == "opcode_not_registered"
+ 
+ 

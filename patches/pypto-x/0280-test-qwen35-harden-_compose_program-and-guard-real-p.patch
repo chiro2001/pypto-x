@@ -1,0 +1,332 @@
+From 177e9a05fc0bb3d4f8fd0277671aa6746054746c Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Mon, 14 Sep 2026 04:56:49 +0800
+Subject: [PATCH 280/283] test(qwen35): harden _compose_program and guard real
+ parent->child calls
+
+Round-2 follow-up for the composite-composition slice, based on integration
+4521558e6.
+
+Robustness (fail closed instead of silently choosing):
+* reject bindings for parameters the composed function does not declare;
+* reject a binding whose value is not registered in the parent builder;
+* reject a composed function whose parameter name is also an operation
+  output (the parameter used to shadow the produced value silently);
+* reject empty/non-string rename keys or values and a bare string passed
+  where a returns sequence is expected.
+
+Tests:
+* five rejection tests cover those paths;
+* new _compose_program spy call-graph guard asserts the parent builders
+  really invoke the child composites with exact per-parent counts
+  (attention_kv_cache 6, attention_subgraph 4, decoder_subgraph 2,
+  gated_delta_conv_state 1, position_control 2, whole decoder graph 105)
+  and exact child histograms, so reverting a reuse back to inline fails.
+
+Equivalence is unchanged: all 59 capture_ir snapshots and every public
+CoreProgram.canonical_json() stay byte-identical to the pre-refactor
+baseline, including the frozen bf16 graph digest
+66dd40770dbb41251f0f7ec9b15b75b604daddc95633aabc24d9e48ffff33c6d.
+
+(cherry picked from commit f64a15c478fbe2864fb2c001f89123590b96c1bb)
+---
+ python/pypto/portable/qwen35.py                              |  39 ++++++
+ python/tests/ut/pypto_x/test_qwen35_composite_composition.py | 203 ++++++++++++++++++++++++++++++-
+ 2 files changed, 241 insertions(+), 1 deletion(-)
+
+diff --git a/python/pypto/portable/qwen35.py b/python/pypto/portable/qwen35.py
+index e2ac91c8d..49d6cdd92 100644
+--- a/python/pypto/portable/qwen35.py
++++ b/python/pypto/portable/qwen35.py
+@@ -315,6 +315,15 @@ def _compose_program(
+       duplicate-name error.  Collisions that are not resolved by ``rename``
+       fail loudly through ``_Builder._reserve``.
+ 
++    Every ambiguous mapping is rejected instead of silently resolved:
++
++    * bindings for parameters the composed function does not declare;
++    * a binding whose value is not registered in the parent builder;
++    * rename keys/values that are not non-empty strings;
++    * a composed function whose parameter name is also an operation output
++      (the parameter would otherwise shadow the produced value);
++    * ``returns`` passed as a bare string instead of a sequence of names.
++
+     The emitted operations keep their opcode, operand order, attributes,
+     effect and output dtypes/shapes byte-for-byte.  A composition that is
+     numerically equivalent but not IR-identical is therefore impossible to
+@@ -326,9 +335,25 @@ def _compose_program(
+     function = program.functions[0]
+     if function.body.blocks:
+         raise ValueError("composed function must use a direct operation region")
++    if isinstance(returns, str):
++        raise ValueError("composed returns must be a sequence of SSA names, not a bare string")
+     rename = dict(rename or {})
++    for key, value in rename.items():
++        if not isinstance(key, str) or not key:
++            raise ValueError("rename keys must be non-empty strings, got {!r}".format(key))
++        if not isinstance(value, str) or not value:
++            raise ValueError(
++                "rename value for {!r} must be a non-empty string, got {!r}".format(key, value)
++            )
+ 
+     parameters = {ref.name: ref for ref in function.parameters}
++    unknown_bindings = sorted(name for name in bindings if name not in parameters)
++    if unknown_bindings:
++        raise ValueError(
++            "compose of {!r} got bindings for unknown parameters: {}".format(
++                function.name, ", ".join(unknown_bindings)
++            )
++        )
+     resolvable: Dict[str, ValueRef] = {}
+     for name, ref in parameters.items():
+         if name not in bindings:
+@@ -344,6 +369,12 @@ def _compose_program(
+                     name, bound.type.to_dict(), ref.type.to_dict()
+                 )
+             )
++        if bound.name not in builder._names:
++            raise ValueError(
++                "binding for {!r} names {!r}, which is not a value of parent builder {!r}".format(
++                    name, bound.name, builder.function_name
++                )
++            )
+         resolvable[name] = bound
+ 
+     producers: Dict[str, Operation] = {}
+@@ -357,6 +388,14 @@ def _compose_program(
+                 )
+             producers[output.name] = operation
+ 
++    shadowed = sorted(set(parameters) & set(producers))
++    if shadowed:
++        raise ValueError(
++            "composed function {!r} reuses parameter names as operation outputs: {}".format(
++                function.name, ", ".join(shadowed)
++            )
++        )
++
+     selected = list(function.returns if returns is None else returns)
+     selected_names = [ref.name for ref in selected] if all(
+         isinstance(item, ValueRef) for item in selected
+diff --git a/python/tests/ut/pypto_x/test_qwen35_composite_composition.py b/python/tests/ut/pypto_x/test_qwen35_composite_composition.py
+index 7ac88ab91..023bf58ab 100644
+--- a/python/tests/ut/pypto_x/test_qwen35_composite_composition.py
++++ b/python/tests/ut/pypto_x/test_qwen35_composite_composition.py
+@@ -16,11 +16,12 @@ when the numerical behaviour would still be inside tolerance.
+ from __future__ import annotations
+ 
+ import hashlib
++from collections import Counter
+ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+ 
+ import pytest
+ 
+-from pypto.core_ir import CoreFunction, CoreProgram, Operation
++from pypto.core_ir import CoreFunction, CoreProgram, CoreType, Operation, Region, ValueRef
+ from pypto.portable import qwen35
+ from pypto.portable.qwen35 import (
+     build_attention_kv_cache,
+@@ -463,3 +464,203 @@ def test_frozen_ir_digest(label):
+     else:  # pragma: no cover - keeps the dispatch exhaustive
+         raise AssertionError("unhandled frozen digest label {!r}".format(label))
+     assert _canonical_sha256(program) == FROZEN_DIGESTS[label]
++
++
++# ---------------------------------------------------------------------------
++# Composition primitive robustness (round-2)
++# ---------------------------------------------------------------------------
++
++
++def _probe_parent(name: str = "probe_parent"):
++    return qwen35._Builder(name, "probe", (2,))
++
++
++def _float2(parent, name: str) -> ValueRef:
++    return parent.parameter(name, CoreType.tensor("float32", (2,)))
++
++
++def _scalar(parent, name: str) -> ValueRef:
++    return parent.parameter(name, CoreType.scalar("float32"))
++
++
++def test_compose_rejects_unknown_bindings():
++    parent = _probe_parent()
++    child = build_rms_norm((2,), "float32")
++    bindings = {
++        "x": _float2(parent, "x_in"),
++        "weight": _float2(parent, "w_in"),
++        "epsilon": _scalar(parent, "eps_in"),
++        "bogus": _float2(parent, "bogus_in"),
++    }
++    with pytest.raises(ValueError, match="unknown parameters: bogus"):
++        qwen35._compose_program(parent, child, bindings)
++
++
++def test_compose_rejects_foreign_binding():
++    other = _probe_parent("other_parent")
++    foreign = _float2(other, "foreign")
++    parent = _probe_parent()
++    bindings = {
++        "x": foreign,
++        "weight": _float2(parent, "w_in"),
++        "epsilon": _scalar(parent, "eps_in"),
++    }
++    with pytest.raises(ValueError, match="not a value of parent builder"):
++        qwen35._compose_program(parent, build_rms_norm((2,), "float32"), bindings)
++
++
++def test_compose_rejects_parameter_output_shadowing():
++    parameter = ValueRef("v", CoreType.tensor("float32", (2,)))
++    shadow = ValueRef("v", CoreType.tensor("float32", (2,)))
++    operation = Operation("identity", (parameter,), (shadow,))
++    function = CoreFunction(
++        "shadowed", (parameter,), (shadow,), Region((operation,))
++    )
++    program = CoreProgram(functions=(function,), metadata={})
++    parent = _probe_parent()
++    bound = _float2(parent, "v_in")
++    with pytest.raises(ValueError, match="reuses parameter names as operation outputs: v"):
++        qwen35._compose_program(parent, program, {"v": bound})
++
++
++def test_compose_rejects_bare_string_returns():
++    parent = _probe_parent()
++    bindings = {
++        "x": _float2(parent, "x_in"),
++        "weight": _float2(parent, "w_in"),
++        "epsilon": _scalar(parent, "eps_in"),
++    }
++    with pytest.raises(ValueError, match="sequence of SSA names"):
++        qwen35._compose_program(
++            parent, build_rms_norm((2,), "float32"), bindings, "rms_scaled"
++        )
++
++
++def test_compose_rejects_empty_rename_key():
++    parent = _probe_parent()
++    bindings = {
++        "x": _float2(parent, "x_in"),
++        "weight": _float2(parent, "w_in"),
++        "epsilon": _scalar(parent, "eps_in"),
++    }
++    with pytest.raises(ValueError, match="rename keys must be non-empty strings"):
++        qwen35._compose_program(
++            parent, build_rms_norm((2,), "float32"), bindings, None, {"": "probe_"}
++        )
++
++
++# ---------------------------------------------------------------------------
++# "Parent really calls the child composite" call-graph guard (round-2)
++# ---------------------------------------------------------------------------
++
++
++def _install_compose_spy(monkeypatch, calls: List[Tuple[str, str, Tuple[str, ...]]]):
++    """Record every composition edge and fail red when composition is reverted.
++
++    The spy is installed with ``raising=False`` on purpose: on a tree where
++    ``_compose_program`` does not exist (all composites inlined again) the spy
++    is still installed but never called, so the call-count assertions below
++    fail with a clear message instead of a collection error.
++    """
++
++    real = getattr(qwen35, "_compose_program", None)
++
++    def spy(builder, program, bindings, returns=None, rename=None):
++        child = program.functions[0]
++        calls.append(
++            (
++                builder.function_name,
++                child.name,
++                tuple(sorted(bindings)),
++            )
++        )
++        assert real is not None, (
++            "qwen35._compose_program is missing: the parent is inlined again"
++        )
++        assert tuple(sorted(bindings)) == tuple(
++            sorted(ref.name for ref in child.parameters)
++        ), "binding keys must cover exactly the child parameters"
++        return real(builder, program, bindings, returns, rename)
++
++    monkeypatch.setattr(qwen35, "_compose_program", spy, raising=False)
++
++
++def test_parent_builders_actually_call_compose(monkeypatch):
++    calls: List[Tuple[str, str, Tuple[str, ...]]] = []
++    _install_compose_spy(monkeypatch, calls)
++
++    build_qwen35_attention_kv_cache(
++        (1, 8, 1, 256),
++        (1, 2, 5, 256),
++        (1, 2, 5, 256),
++        (1, 2, 1, 256),
++        (1, 2, 1, 256),
++    )
++    assert len(calls) == 6, calls
++    assert Counter(child for _, child, _ in calls) == {
++        "qwen35_gqa_repeat_kv": 2,
++        "qwen35_batched_matmul": 2,
++        "qwen35_causal_mask": 1,
++        "qwen35_stable_softmax": 1,
++    }
++
++    calls.clear()
++    build_attention_subgraph(
++        (1, 2, 3, 8), (1, 4, 3, 3), (1, 2, 3, 8), query_heads=4, rotary_dim=4
++    )
++    assert Counter(child for _, child, _ in calls) == {
++        "qwen35_rope_rotate_half": 1,
++        "qwen35_causal_mask": 1,
++        "qwen35_stable_softmax": 1,
++        "qwen35_gqa_repeat_kv": 1,
++    }
++
++    calls.clear()
++    build_decoder_subgraph(2, hidden=8, intermediate=10)
++    assert Counter(child for _, child, _ in calls) == {
++        "qwen35_rms_norm": 1,
++        "qwen35_swiglu": 1,
++    }
++
++    calls.clear()
++    build_qwen35_gated_delta_conv_state(1, 5, hidden=8, channels=12)
++    assert Counter(child for _, child, _ in calls) == {"qwen35_causal_conv1d_state": 1}
++
++    calls.clear()
++    build_qwen35_position_control(2, 3, past_length=7, index_dtype="int32")
++    assert Counter(child for _, child, _ in calls) == {
++        "qwen35_position_ids": 1,
++        "qwen35_causal_mask_from_positions": 1,
++    }
++
++    calls.clear()
++    build_qwen35_text_decoder_graph(2, 3, shape_profile="synthetic_test")
++    assert len(calls) == 105, calls
++    assert Counter(child for _, child, _ in calls) == {
++        "qwen35_position_control": 1,
++        "qwen35_position_ids": 1,
++        "qwen35_causal_mask_from_positions": 1,
++        "qwen35_rms_norm": 12,
++        "qwen35_rope_rotate_half": 12,
++        "qwen35_batched_matmul": 12,
++        "qwen35_causal_mask": 6,
++        "qwen35_stable_softmax": 6,
++        "qwen35_causal_conv1d_state": 18,
++        "qwen35_l2_norm": 36,
++    }
++    graph_parent_calls = [edge for edge in calls if edge[0] == "qwen35_text_decoder"]
++    assert len(graph_parent_calls) == 103
++    assert Counter(child for _, child, _ in graph_parent_calls) == {
++        "qwen35_position_control": 1,
++        "qwen35_rms_norm": 12,
++        "qwen35_rope_rotate_half": 12,
++        "qwen35_batched_matmul": 12,
++        "qwen35_causal_mask": 6,
++        "qwen35_stable_softmax": 6,
++        "qwen35_causal_conv1d_state": 18,
++        "qwen35_l2_norm": 36,
++    }
++    assert Counter(builder_name for builder_name, _, _ in calls) == {
++        "qwen35_text_decoder": 103,
++        "qwen35_position_control": 2,
++    }

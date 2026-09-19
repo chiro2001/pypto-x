@@ -1,0 +1,1840 @@
+From b643229bdf64b6bfc91bb716ae4970f142b896d9 Mon Sep 17 00:00:00 2001
+From: Chiro <chiro2001@163.com>
+Date: Mon, 14 Sep 2026 04:55:47 +0800
+Subject: [PATCH 279/283] fix(execution): anchor region guarantees and
+ round-trip boundary/zero-input regions
+
+Round-2 fixes for verify-0049-u5-region, based on integration tip 41ae82a01.
+
+* region_digest now hashes the full per-operation entry (selected,
+  numeric_guarantee, precision/envelope projections, fallback, bound and the
+  provider metadata) instead of only the single-op plan digest; replay also
+  compares selected / numeric_guarantee / fallback field-by-field against the
+  plan_operation payload, so a rewritten guarantee is refused even after the
+  public digest is re-signed.  Forging exp's precision to exact/proven now
+  fails with region_digest_mismatch, and with a re-signed digest with
+  region_numeric_guarantee_payload_mismatch; erasing fallback events fails
+  with region_fallback_payload_mismatch.
+* Region operations are renumbered to region-local 0..N-1; boundary entry
+  inputs record source=outside_region_operation with producer_op_index=null
+  and exit producers use the region-local index.  Boundary plans now
+  validate / load / explain; a subgraph starting at a later global op also
+  round-trips.
+* Request validation is driven by the opcode contract arity, so zero-operand
+  opcodes (iota) round-trip; request.op / roles / arity are cross-checked.
+* plan_region runs validate_region_plan(re_resolve=False) on its own output
+  before returning: a self-produced document that cannot be loaded is now a
+  plan-time failure (covers boundary numbering, zero-input ops, empty
+  selections).
+* compose_region_precision derives the portable_bitwise statement from the
+  actual provider set (no hard-coded "every op portable trunk"), and the
+  is_upper_bound gate now requires reference consistency across every term,
+  including zero-bound exact terms.
+* capability_for_policy probes the host lazily: an explicitly supplied
+  capability is accepted without /proc/cpuinfo or pinned-library dlopen.
+* Nested operation regions and block regions are refused
+  (region_nested_region_not_supported / region_block_region_not_supported)
+  instead of being flattened into a plan that cannot express their scope.
+
+Single-op plan digests stay byte-identical to the 923a72e26 baseline
+(matmul f32/bf16 e0d1287e/7e95c65c, qmatmul 1717a8e5; plan_operation
+delegation unchanged).  Tests: 33 region tests (including the verifier's
+precision-forgery / iota / boundary repros as equivalents), 276 with the
+existing execution suite.
+
+(cherry picked from commit 85a1bab1b6c46f7ad8d16da191fda5e2df76cc8e)
+---
+ python/pypto/execution/entry.py                           |  50 +--
+ python/pypto/execution/region.py                          | 666 ++++++++++++++++++++++++++--------
+ python/tests/ut/pypto_x/test_execution_region_planning.py | 576 ++++++++++++++++++++++++++++-
+ 3 files changed, 1095 insertions(+), 197 deletions(-)
+
+diff --git a/python/pypto/execution/entry.py b/python/pypto/execution/entry.py
+index 61b3618f9..729660742 100644
+--- a/python/pypto/execution/entry.py
++++ b/python/pypto/execution/entry.py
+@@ -31,6 +31,7 @@ from pypto.target._utils import mapping_copy, sha256_text
+ from .binding_verify import _accumulation_for_definition, payload_difference
+ from .capability import (
+     CapabilitySnapshot,
++    host_triple,
+     policy_document_opts_into_exact_blocked,
+     policy_opts_into_exact_blocked,
+     with_exact_blocked_provider,
+@@ -82,15 +83,16 @@ def capability_for_policy(
+     """Return the capability snapshot to resolve against.
+ 
+     The registered providers execute on the local host, so the snapshot must
+-    describe the *probed* local host.  An explicit policy target is checked
+-    against the probe; it is never copied into a synthetic snapshot.
++    describe the local host.  An explicit snapshot is accepted after its digest
++    and triple are checked *without probing the host* (no ``/proc/cpuinfo``
++    read, no pinned-library ``dlopen``); only the lazy path (no caller
++    snapshot) probes the local machine.  A caller snapshot is never mutated.
+ 
+     ``opcode`` selects the request-scoped portable manifest for a 0048-B
+     generic contract.  For ``matmul``/``qmatmul`` (or ``None``) the snapshot is
+     byte-identical to the pre-batch probe.
+     """
+ 
+-    host = CapabilitySnapshot.probe_host()
+     if capability is not None:
+         if not isinstance(capability, CapabilitySnapshot):
+             raise ProviderUnavailableError(
+@@ -100,34 +102,36 @@ def capability_for_policy(
+                 reason="not_a_capability_snapshot",
+             )
+         capability.verify_digest()
+-        if not capability.matches_host_probe():
++        if capability.kind != "cpu" or capability.triple != host_triple():
+             raise CapabilityUnavailableError(
+-                "capability snapshot does not match the probed local host",
++                "capability snapshot does not match the local host",
+                 field="capability",
+                 requested={"kind": capability.kind, "triple": capability.triple},
+-                available={"kind": host.kind, "triple": host.triple},
++                available={"kind": "cpu", "triple": host_triple()},
+                 reason="capability_does_not_match_host_probe",
+                 capability_digest=capability.digest,
+             )
+         resolved = capability
+-    elif policy.target == "auto" or policy.target == "cpu":
+-        resolved = host
+-    elif policy.target in KNOWN_TARGET_KINDS:
+-        # Non-cpu kind: keep a snapshot with an explicitly unavailable
+-        # portable provider so the resolver rejects it structurally.
+-        resolved = CapabilitySnapshot.for_host(kind=policy.target)
+-    elif policy.target != host.triple:
+-        raise CapabilityUnavailableError(
+-            "target is not available on the probed local host",
+-            field="target",
+-            requested=policy.target,
+-            available=host.triple,
+-            reason="target_not_available_on_host",
+-            suggested_policy={"target": "auto"},
+-            capability_digest=host.digest,
+-        )
+     else:
+-        resolved = host
++        host = CapabilitySnapshot.probe_host()
++        if policy.target == "auto" or policy.target == "cpu":
++            resolved = host
++        elif policy.target in KNOWN_TARGET_KINDS:
++            # Non-cpu kind: keep a snapshot with an explicitly unavailable
++            # portable provider so the resolver rejects it structurally.
++            resolved = CapabilitySnapshot.for_host(kind=policy.target)
++        elif policy.target != host.triple:
++            raise CapabilityUnavailableError(
++                "target is not available on the probed local host",
++                field="target",
++                requested=policy.target,
++                available=host.triple,
++                reason="target_not_available_on_host",
++                suggested_policy={"target": "auto"},
++                capability_digest=host.digest,
++            )
++        else:
++            resolved = host
+     if policy_opts_into_exact_blocked(policy):
+         # 0047: the exact-blocked entry is added to the snapshot only for an
+         # explicit opt-in policy, so default snapshots (and their digests) stay
+diff --git a/python/pypto/execution/region.py b/python/pypto/execution/region.py
+index d115dbc9d..681ae0509 100644
+--- a/python/pypto/execution/region.py
++++ b/python/pypto/execution/region.py
+@@ -30,6 +30,7 @@ from __future__ import annotations
+ import json
+ import math
+ import os
++import re
+ from dataclasses import dataclass
+ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+ 
+@@ -117,9 +118,12 @@ _OP_KEYS = (
+     "implementation",
+     "numeric_class",
+     "selected_numeric_class",
++    "selected",
++    "numeric_guarantee",
+     "precision",
+     "envelope",
+     "fallback",
++    "fallback_used",
+     "bound",
+ )
+ 
+@@ -134,6 +138,8 @@ _REQUEST_KEYS = (
+     "outputs",
+ )
+ 
++_FLAT_BODY_PATH_RE = re.compile(r"^body\.ops\[(\d+)\]$")
++
+ _BOUNDARY_ENTRY_KEYS = (
+     "function",
+     "name",
+@@ -370,10 +376,13 @@ def _flatten_program(program: CoreProgram, function: Optional[str]) -> _FlatProg
+     """Flatten one/ all functions in declaration order into a topo inventory.
+ 
+     Core IR verifies values before use inside each region, so declaration order
+-    is a valid topological order.  Nested operation regions are walked before
+-    their parent operation (their results are not visible to the parent by
+-    construction); block operations are walked after the block arguments are
+-    bound.
++    is a valid topological order.
++
++    This slice freezes *flat* regions only.  A nested operation region or a
++    block region has scope semantics the frozen schema does not express (the
++    flattened op list would silently lose the nesting), so both are refused
++    instead of being flattened into a misleading plan.  Every real Qwen3.5
++    builder graph is flat.
+     """
+ 
+     function_names = [item.name for item in program.functions]
+@@ -396,16 +405,25 @@ def _flatten_program(program: CoreProgram, function: Optional[str]) -> _FlatProg
+     root_names: Dict[str, Dict[str, _ValueKey]] = {}
+ 
+     def walk(region: Region, fn_name: str, scope: str, visible: Mapping[str, _ValueKey], path: str) -> None:
+-        local = dict(visible)
++        if region.blocks:
++            raise OpContractError(
++                "block regions are outside the frozen flat-region schema",
++                field="region.operations",
++                requested={"function": fn_name, "blocks": len(region.blocks)},
++                available="a flat Region.operations body",
++                reason="region_block_region_not_supported",
++            )
+         for index, operation in enumerate(region.operations):
+-            for region_index, child in enumerate(operation.regions):
+-                walk(
+-                    child,
+-                    fn_name,
+-                    scope + ".ops[{}].regions[{}]".format(index, region_index),
+-                    dict(local),
+-                    path + ".ops[{}].regions[{}]".format(index, region_index),
++            if operation.regions:
++                raise OpContractError(
++                    "nested operation regions are outside the frozen flat-region schema",
++                    field="region.operations",
++                    requested={"function": fn_name, "op_index": index, "op": operation.name},
++                    available="a flat Region.operations body",
++                    reason="region_nested_region_not_supported",
+                 )
++        local = dict(visible)
++        for index, operation in enumerate(region.operations):
+             input_keys: List[_ValueKey] = []
+             for ref in operation.inputs:
+                 key = local.get(ref.name)
+@@ -443,29 +461,6 @@ def _flatten_program(program: CoreProgram, function: Optional[str]) -> _FlatProg
+                     output_keys=tuple(output_keys),
+                 )
+             )
+-        for block_index, block in enumerate(region.blocks):
+-            block_scope = scope + ".blocks[{}]".format(block_index)
+-            block_visible = dict(local)
+-            for ref in block.arguments:
+-                key = _ValueKey(fn_name, block_scope, ref.name)
+-                if key in definitions:
+-                    raise OpContractError(
+-                        "block argument {!r} collides with an existing value".format(ref.name),
+-                        field="region.blocks",
+-                        requested={"function": fn_name, "value": ref.name},
+-                        reason="region_ssa_redefinition",
+-                    )
+-                definitions[key] = ref
+-                producers[key] = None
+-                block_visible[ref.name] = key
+-            walk(
+-                Region(operations=block.operations),
+-                fn_name,
+-                block_scope,
+-                block_visible,
+-                path + ".blocks[{}]".format(block_index),
+-            )
+-
+     for core_function in functions:
+         fn_name = core_function.name
+         visible: Dict[str, _ValueKey] = {}
+@@ -743,7 +738,8 @@ def _boundary_signature(
+     spec: RegionSpec,
+     entry_keys: Sequence[_ValueKey],
+     exit_keys: Sequence[_ValueKey],
+- ) -> Mapping[str, Any]:
++    region_order: Mapping[int, int],
++) -> Mapping[str, Any]:
+     entries = []
+     for key in entry_keys:
+         ref = flat.definitions[key]
+@@ -759,8 +755,10 @@ def _boundary_signature(
+                 source = "external_value"
+             producer_index = None
+         else:
++            # The producing operation is outside the frozen region document, so
++            # it has no region-local index; ``source`` records the fact.
+             source = "outside_region_operation"
+-            producer_index = producer
++            producer_index = None
+         entries.append(
+             {
+                 "function": key.function,
+@@ -779,7 +777,7 @@ def _boundary_signature(
+         producer = flat.producers.get(key)
+         if producer is not None:
+             source = "operation_result"
+-            producer_index = producer
++            producer_index = region_order[producer]
+         elif key in set(entry_keys):
+             source = "entry_pass_through"
+             producer_index = None
+@@ -1039,23 +1037,38 @@ def _precision_view(
+ 
+ 
+ def _term_from_record(record: Mapping[str, Any]) -> RegionPrecisionTerm:
+-    bound = dict(record["bound"])
++    """Derive the composition term from the verbatim plan payload fields.
++
++    The derivation never trusts the hand-written ``bound`` projection: it is
++    recomputed from ``selected`` + ``numeric_guarantee`` so a rewritten
++    projection changes the recomposed region declaration and is refused.
++    """
++
++    selected = record["selected"]
++    numeric = record["numeric_guarantee"]
++    view = _precision_view(
++        str(selected["provider"]),
++        str(selected["numeric_class"]),
++        numeric.get("precision"),
++        numeric.get("exactness_envelope"),
++    )
+     fallback = record.get("fallback") or {}
+     return RegionPrecisionTerm(
+         index=int(record["index"]),
+         opcode=str(record["opcode"]),
+-        provider_id=str(record["provider_id"]),
+-        declared_class=str(bound["declared_class"]),
+-        provider_class=str(record.get("selected_numeric_class") or bound["declared_class"]),
+-        proven=bool(bound["proven"]),
+-        bound=bound["bound"],
+-        bound_kind=str(bound["bound_kind"]),
+-        is_upper_bound=bool(bound["is_upper_bound"]),
+-        reference=bound["reference"],
+-        fallback_used=bool(fallback.get("used", False)),
+-        fallback_degraded=bool(fallback.get("degraded", False)),
++        provider_id=str(selected["provider"]),
++        declared_class=str(view["declared_class"]),
++        provider_class=str(selected["numeric_class"]),
++        proven=bool(view["proven"]),
++        bound=view["bound"],
++        bound_kind=str(view["bound_kind"]),
++        is_upper_bound=bool(view["is_upper_bound"]),
++        reference=view["reference"],
++        fallback_used=bool(record.get("fallback_used", False)),
++        fallback_degraded=bool(fallback.get("degraded", False))
++        or bool(fallback.get("events")),
+         fallback_mode=str(fallback.get("mode") or ""),
+-        reasons=tuple(str(item) for item in (bound.get("reasons") or ())),
++        reasons=tuple(str(item) for item in (view.get("reasons") or ())),
+     )
+ 
+ 
+@@ -1132,16 +1145,43 @@ def _compose_deviation_bound(
+             "terms": rows,
+         }
+     if region_class == "portable_bitwise":
+-        return {
+-            "kind": "portable_bitwise_trunk_identity",
+-            "sum": 0,
+-            "deviation_bound_by_k": {"all_k_le_limit": 0},
+-            "is_upper_bound": True,
+-            "statement": (
++        all_portable_trunk = all(
++            term.provider_id == PORTABLE_PROVIDER_ID for term in terms
++        )
++        reasons: List[str] = []
++        if all_portable_trunk:
++            statement = (
+                 "every operation selected the portable trunk; the region output is bitwise "
+                 "identical to the sequential portable reference in the frozen topological order"
++            )
++            upper = True
++        else:
++            # Mixed providers can still be exact/bitwise individually, but the
++            # "identical to the portable trunk" claim only holds when every op
++            # actually ran on the portable trunk.  A zero sum across different
++            # references is NOT a proven common-reference bound.
++            statement = (
++                "every operation declares exact or portable-bitwise semantics; the "
++                "per-operation identities are composed in the frozen topological order "
++                "without cross-provider cancellation, but they do not share one "
++                "reference frame"
++            )
++            upper = False
++            reasons.append("not_every_operation_ran_on_the_portable_trunk")
++            references = {term.reference for term in terms if term.reference is not None}
++            if len(references) > 1:
++                reasons.append("cross_reference_bounds_not_comparable")
++        return {
++            "kind": (
++                "portable_bitwise_trunk_identity"
++                if all_portable_trunk
++                else "portable_bitwise_mixed_provider_identities"
+             ),
+-            "reasons": [],
++            "sum": 0,
++            "deviation_bound_by_k": {"all_k_le_limit": 0} if all_portable_trunk else None,
++            "is_upper_bound": bool(upper),
++            "statement": statement,
++            "reasons": reasons,
+             "terms": rows,
+         }
+     if region_class == "deterministic_bounded":
+@@ -1150,14 +1190,16 @@ def _compose_deviation_bound(
+         upper = total is not None and all(term.is_upper_bound for term in terms)
+         if total is not None and not all(term.is_upper_bound for term in terms):
+             reasons.append("some_term_is_not_a_proven_upper_bound")
+-        nonzero = [term for term in terms if _bound_is_nonzero(term.bound)]
+-        references = {term.reference for term in nonzero}
++        # Reference consistency is required for EVERY term, including exact or
++        # zero-bound terms: a sum is an upper bound only when all terms bound
++        # the deviation from the same reference frame.
++        references = {term.reference for term in terms if term.reference is not None}
+         if len(references) > 1:
+             upper = False
+             reasons.append("cross_reference_bounds_not_comparable")
+-        elif any(term.reference is None for term in nonzero):
++        if any(term.reference is None for term in terms):
+             upper = False
+-            reasons.append("nonzero_bound_has_no_reference")
++            reasons.append("bound_without_reference_present")
+         statement = (
+             "sum of the per-operation proven bounds in the frozen topological order; the sum "
+             "is an upper bound on the deviation from the common reference only when every "
+@@ -1167,7 +1209,9 @@ def _compose_deviation_bound(
+         return {
+             "kind": "sum_of_per_operation_proven_bounds",
+             "sum": total,
+-            "deviation_bound_by_k": total if isinstance(total, Mapping) else None,
++            "deviation_bound_by_k": (
++                dict(total["by_k"]) if isinstance(total, Mapping) and "by_k" in total else None
++            ),
+             "is_upper_bound": bool(upper),
+             "statement": statement,
+             "reasons": reasons,
+@@ -1426,18 +1470,22 @@ def plan_region(
+             requested=spec.to_dict(),
+             reason="region_empty",
+         )
+-    boundary = _boundary_signature(flat, spec, entry_keys, exit_keys)
+-
+     selected_set = set(selected)
+     ordered_ops = [op for op in flat.ops if op.order in selected_set]
++    # The document's ``index`` is the region-local topological position, while
++    # ``_FlatOp.order`` is the program-global flatten order used for selection.
++    region_order = {op.order: index for index, op in enumerate(ordered_ops)}
++    boundary = _boundary_signature(flat, spec, entry_keys, exit_keys, region_order)
+     records: List[Mapping[str, Any]] = []
+     missing: List[Mapping[str, Any]] = []
+     unplannable: List[Mapping[str, Any]] = []
+     numeric_failures: List[Mapping[str, Any]] = []
+     resolutions: List[ResolutionResult] = []
+ 
+-    for op in ordered_ops:
+-        kind, payload = _plan_region_operation(op, active_policy, active_capability)
++    for region_index, op in enumerate(ordered_ops):
++        kind, payload = _plan_region_operation(
++            op, active_policy, active_capability, region_index
++        )
+         if kind == "planned":
+             records.append(payload)
+             resolutions.append(payload["_resolution"])
+@@ -1493,20 +1541,7 @@ def plan_region(
+         {key: record[key] for key in _OP_KEYS if key in record}
+         for record in records
+     ]
+-    preimage = {
+-        "region_schema_version": REGION_SCHEMA_VERSION,
+-        "boundary_signature": boundary,
+-        "operations": [
+-            {
+-                "index": item["index"],
+-                "function": item["function"],
+-                "opcode": item["opcode"],
+-                "single_op_plan_digest": item["single_op_plan_digest"],
+-            }
+-            for item in operations
+-        ],
+-    }
+-    region_digest = "sha256:" + sha256_text(preimage)
++    region_digest = _recompute_region_digest(boundary, operations)
+     document = {
+         "region_schema_version": REGION_SCHEMA_VERSION,
+         "kind": REGION_KIND,
+@@ -1522,6 +1557,11 @@ def plan_region(
+         "op_count": len(operations),
+         "region_precision": region_precision,
+     }
++    # Core slice invariant: every plan_region output must pass its own
++    # structural validator before it is handed to a caller.  This catches
++    # "self-produced document cannot be loaded" regressions (boundary-local
++    # numbering, zero-operand opcodes, empty selections) at plan time.
++    validate_region_plan(document, policy=active_policy, re_resolve=False)
+     return RegionPlan(
+         document=document,
+         policy=active_policy,
+@@ -1553,7 +1593,10 @@ def _coerce_capability(capability: Optional[CapabilitySnapshot]) -> CapabilitySn
+ 
+ 
+ def _plan_region_operation(
+-    op: _FlatOp, policy: ExecutionPolicy, capability: CapabilitySnapshot
++    op: _FlatOp,
++    policy: ExecutionPolicy,
++    capability: CapabilitySnapshot,
++    region_index: int,
+ ) -> Tuple[str, Mapping[str, Any]]:
+     operation = op.operation
+     raw_name = operation.name
+@@ -1565,7 +1608,7 @@ def _plan_region_operation(
+             "raw_name": raw_name,
+             "canonical": None,
+             "reason": exc.reason or "opcode_not_registered",
+-            "index": op.order,
++            "index": region_index,
+             "function": op.function,
+             "path": op.path,
+         }
+@@ -1577,7 +1620,7 @@ def _plan_region_operation(
+             "raw_name": raw_name,
+             "canonical": canonical,
+             "reason": exc.reason or "opcode_not_registered",
+-            "index": op.order,
++            "index": region_index,
+             "function": op.function,
+             "path": op.path,
+         }
+@@ -1588,7 +1631,7 @@ def _plan_region_operation(
+                 "opcode": canonical,
+                 "raw_name": raw_name,
+                 "reason": "scalar_operand_not_supported_by_execution_contract",
+-                "index": op.order,
++                "index": region_index,
+                 "function": op.function,
+                 "path": op.path,
+                 "operand": {"name": ref.name, "kind": ref.type.kind},
+@@ -1602,7 +1645,7 @@ def _plan_region_operation(
+                 if not operation.outputs
+                 else "multi_output_not_supported_by_execution_contract"
+             ),
+-            "index": op.order,
++            "index": region_index,
+             "function": op.function,
+             "path": op.path,
+             "result_count": len(operation.outputs),
+@@ -1613,7 +1656,7 @@ def _plan_region_operation(
+             "opcode": canonical,
+             "raw_name": raw_name,
+             "reason": "non_tensor_result_not_supported_by_execution_contract",
+-            "index": op.order,
++            "index": region_index,
+             "function": op.function,
+             "path": op.path,
+             "result_kind": result.type.kind,
+@@ -1636,7 +1679,7 @@ def _plan_region_operation(
+             "opcode": canonical,
+             "raw_name": raw_name,
+             "reason": exc.reason or "numeric_guarantee_unmet",
+-            "index": op.order,
++            "index": region_index,
+             "function": op.function,
+             "path": op.path,
+             "field": exc.field,
+@@ -1647,7 +1690,7 @@ def _plan_region_operation(
+             "opcode": canonical,
+             "raw_name": raw_name,
+             "reason": exc.reason or exc.code,
+-            "index": op.order,
++            "index": region_index,
+             "function": op.function,
+             "path": op.path,
+             "field": exc.field,
+@@ -1661,7 +1704,7 @@ def _plan_region_operation(
+             "opcode": canonical,
+             "raw_name": raw_name,
+             "reason": "region_op_result_shape_mismatch",
+-            "index": op.order,
++            "index": region_index,
+             "function": op.function,
+             "path": op.path,
+             "requested": list(request["output_shape"]),
+@@ -1686,7 +1729,7 @@ def _plan_region_operation(
+                 "opcode": canonical,
+                 "raw_name": raw_name,
+                 "reason": "region_op_result_dtype_mismatch",
+-                "index": op.order,
++                "index": region_index,
+                 "function": op.function,
+                 "path": op.path,
+                 "requested": request["output_dtype"],
+@@ -1705,19 +1748,11 @@ def _plan_region_operation(
+         envelope,
+     )
+     fallback = payload.get("fallback") or {}
+-    events = [
+-        {
+-            "kind": str(item.get("kind") or ""),
+-            "from": str(item.get("from") or ""),
+-            "to": str(item.get("to") or ""),
+-            "reason": str(item.get("reason") or ""),
+-            "fallback_mode": str(item.get("fallback_mode") or ""),
+-        }
+-        for item in (fallback.get("events") or ())
+-        if isinstance(item, Mapping)
++    fallback_events = [
++        item for item in (fallback.get("events") or ()) if isinstance(item, Mapping)
+     ]
+     record = {
+-        "index": op.order,
++        "index": region_index,
+         "function": op.function,
+         "path": op.path,
+         "op_name": raw_name,
+@@ -1732,19 +1767,18 @@ def _plan_region_operation(
+         "implementation": str(selected["implementation"]),
+         "numeric_class": str(view["declared_class"]),
+         "selected_numeric_class": str(selected["numeric_class"]),
++        # Verbatim plan-payload projections: the region guarantee is anchored
++        # to these (preimage + replay field comparison), never to a hand-made
++        # summary alone.
++        "selected": mapping_copy(selected),
++        "numeric_guarantee": mapping_copy(numeric),
+         "precision": mapping_copy(precision) if isinstance(precision, Mapping) else None,
+         "envelope": mapping_copy(envelope) if isinstance(envelope, Mapping) else None,
+-        "fallback": {
+-            "mode": str(fallback.get("mode") or ""),
+-            "primary": str(fallback.get("primary") or ""),
+-            "chain": [str(item) for item in (fallback.get("chain") or ())],
+-            # The frozen plan payload records ``events``/``degraded`` but not
+-            # ``used``; a fallback substitution is exactly "events is non-empty"
+-            # (the resolver appends an event whenever selected != preferred).
+-            "used": bool(events) or bool(fallback.get("used", False)),
+-            "degraded": bool(fallback.get("degraded", False)) or bool(events),
+-            "events": events,
+-        },
++        "fallback": mapping_copy(fallback),
++        # The frozen fallback block records ``events``/``degraded`` but not
++        # ``used``; a substitution happened exactly when a fallback event was
++        # recorded (selected != preferred).
++        "fallback_used": bool(fallback_events) or bool(fallback.get("used", False)),
+         "bound": {
+             "declared_class": str(view["declared_class"]),
+             "proven": bool(view["proven"]),
+@@ -2136,14 +2170,10 @@ def _recompute_region_digest(
+                 requested=item["single_op_plan_digest"],
+                 reason="region_operation_digest_invalid",
+             )
+-        entries.append(
+-            {
+-                "index": item["index"],
+-                "function": str(item["function"]),
+-                "opcode": str(item["opcode"]),
+-                "single_op_plan_digest": item["single_op_plan_digest"],
+-            }
+-        )
++        # The full operation entry (including the verbatim selected /
++        # numeric_guarantee / fallback projections) is the Merkle leaf, so a
++        # rewritten guarantee changes the digest without any extra re-signing.
++        entries.append(dict(item))
+     preimage = {
+         "region_schema_version": REGION_SCHEMA_VERSION,
+         "boundary_signature": boundary,
+@@ -2169,6 +2199,13 @@ def validate_region_plan(
+     single-operation path).
+     """
+ 
++    if policy is not None and not isinstance(policy, ExecutionPolicy):
++        raise ArtifactMismatchError(
++            "policy must be an ExecutionPolicy",
++            field="region_plan.policy",
++            requested=type(policy).__name__,
++            reason="region_policy_invalid",
++        )
+     if not isinstance(document, Mapping):
+         raise ArtifactMismatchError(
+             "region plan must be a mapping",
+@@ -2176,7 +2213,15 @@ def validate_region_plan(
+             requested=type(document).__name__,
+             reason="region_plan_not_a_mapping",
+         )
+-    data = _json_clone(document)
++    try:
++        data = _json_clone(document)
++    except (TypeError, ValueError) as exc:
++        raise ArtifactMismatchError(
++            "region plan is not canonical-JSON serializable: {}".format(exc),
++            field="region_plan",
++            requested=type(document).__name__,
++            reason="region_plan_not_serializable",
++        ) from exc
+     unknown = sorted(str(key) for key in data if str(key) not in _TOP_LEVEL_KEYS)
+     missing = [key for key in _TOP_LEVEL_KEYS if key not in data]
+     if unknown:
+@@ -2195,7 +2240,11 @@ def validate_region_plan(
+             available=list(_TOP_LEVEL_KEYS),
+             reason="region_plan_field_missing",
+         )
+-    if data["region_schema_version"] != REGION_SCHEMA_VERSION:
++    if (
++        isinstance(data["region_schema_version"], bool)
++        or not isinstance(data["region_schema_version"], int)
++        or data["region_schema_version"] != REGION_SCHEMA_VERSION
++    ):
+         raise ArtifactMismatchError(
+             "unsupported region plan schema version",
+             field="region_plan.region_schema_version",
+@@ -2290,7 +2339,11 @@ def validate_region_plan(
+         )
+     operations = _validate_operations(data["operations"], boundary, data["region_spec"])
+     _validate_region_spec_consistency(data["region_spec"], boundary, operations)
+-    if int(data["op_count"]) != len(operations):
++    if (
++        isinstance(data["op_count"], bool)
++        or not isinstance(data["op_count"], int)
++        or data["op_count"] != len(operations)
++    ):
+         raise ArtifactMismatchError(
+             "region plan op_count does not match the operation list",
+             field="region_plan.op_count",
+@@ -2298,13 +2351,29 @@ def validate_region_plan(
+             available=len(operations),
+             reason="region_op_count_mismatch",
+         )
++    if numeric_policy.get("require_proven_deviation_bound", False) not in (True, False):
++        raise ArtifactMismatchError(
++            "region plan policy.numeric.require_proven_deviation_bound must be a bool",
++            field="region_plan.policy.numeric.require_proven_deviation_bound",
++            requested=numeric_policy.get("require_proven_deviation_bound"),
++            reason="region_policy_invalid",
++        )
++    requirement = str(numeric_policy.get("requirement", "portable"))
++    if requirement not in _REQUIREMENT_MIN_STRENGTH:
++        raise ArtifactMismatchError(
++            "region plan policy.numeric.requirement is outside the frozen vocabulary",
++            field="region_plan.policy.numeric.requirement",
++            requested=requirement,
++            available=sorted(_REQUIREMENT_MIN_STRENGTH),
++            reason="region_policy_invalid",
++        )
+     derived_terms = [_term_from_record(item) for item in operations]
+     derived_precision = compose_region_precision(
+         derived_terms,
+         require_proven_deviation_bound=bool(
+             numeric_policy.get("require_proven_deviation_bound", False)
+         ),
+-        requirement=str(numeric_policy.get("requirement", "portable")),
++        requirement=requirement,
+     )
+     if _json_clone(data["region_precision"]) != _json_clone(derived_precision):
+         raise ArtifactMismatchError(
+@@ -2583,7 +2652,14 @@ def _validate_operations(
+                 available=list(_OP_KEYS),
+                 reason="region_operation_field_missing",
+             )
+-        if int(item["index"]) != position:
++        if isinstance(item["index"], bool) or not isinstance(item["index"], int):
++            raise ArtifactMismatchError(
++                "region operation index must be an integer",
++                field="region_plan.operations[{}].index".format(position),
++                requested=item["index"],
++                reason="region_operation_index_mismatch",
++            )
++        if item["index"] != position:
+             raise ArtifactMismatchError(
+                 "region operation index is not the topological position",
+                 field="region_plan.operations[{}].index".format(position),
+@@ -2619,6 +2695,49 @@ def _validate_operations(
+                     requested=item[key],
+                     reason="region_operation_digest_invalid",
+                 )
++        try:
++            canonical_from_op_name = lookup_canonical_opcode(item["op_name"])
++        except OpContractError as exc:
++            raise ArtifactMismatchError(
++                "region operation op_name is not a registered Core IR spelling",
++                field="region_plan.operations[{}].op_name".format(position),
++                requested=item["op_name"],
++                available=sorted(registered_opcodes()),
++                reason="region_operation_opcode_mismatch",
++            ) from exc
++        if canonical_from_op_name != item["opcode"]:
++            raise ArtifactMismatchError(
++                "region operation op_name does not map to its canonical opcode",
++                field="region_plan.operations[{}].op_name".format(position),
++                requested=item["op_name"],
++                available=item["opcode"],
++                reason="region_operation_opcode_mismatch",
++            )
++        path_match = _FLAT_BODY_PATH_RE.match(item["path"])
++        if path_match is None:
++            raise ArtifactMismatchError(
++                "region operation path must be a flat body.ops[N] path",
++                field="region_plan.operations[{}].path".format(position),
++                requested=item["path"],
++                available="body.ops[<N>]",
++                reason="region_operation_path_invalid",
++            )
++        if isinstance(item["plan_schema_version"], bool) or not isinstance(
++            item["plan_schema_version"], int
++        ):
++            raise ArtifactMismatchError(
++                "region operation plan_schema_version must be an integer",
++                field="region_plan.operations[{}].plan_schema_version".format(position),
++                requested=item["plan_schema_version"],
++                reason="region_operation_field_type",
++            )
++        if not isinstance(item["fallback_used"], bool):
++            raise ArtifactMismatchError(
++                "region operation fallback_used must be a bool",
++                field="region_plan.operations[{}].fallback_used".format(position),
++                requested=item["fallback_used"],
++                reason="region_operation_fallback_invalid",
++            )
+         if item["numeric_class"] not in (
+             "exact",
+             "portable_bitwise",
+@@ -2632,11 +2751,76 @@ def _validate_operations(
+                 reason="region_numeric_class_unknown",
+             )
+         request = _validate_request(item["request"], position)
++        if request["op"] != item["opcode"]:
++            raise ArtifactMismatchError(
++                "region operation opcode does not match request.op",
++                field="region_plan.operations[{}].opcode".format(position),
++                requested=item["opcode"],
++                available=request["op"],
++                reason="region_operation_opcode_mismatch",
++            )
++        selected = item["selected"]
++        numeric = item["numeric_guarantee"]
++        if not isinstance(selected, Mapping):
++            raise ArtifactMismatchError(
++                "region operation selected payload must be a mapping",
++                field="region_plan.operations[{}].selected".format(position),
++                requested=type(selected).__name__,
++                reason="region_selected_payload_invalid",
++            )
++        if not isinstance(numeric, Mapping):
++            raise ArtifactMismatchError(
++                "region operation numeric_guarantee payload must be a mapping",
++                field="region_plan.operations[{}].numeric_guarantee".format(position),
++                requested=type(numeric).__name__,
++                reason="region_numeric_guarantee_invalid",
++            )
++        for selected_key, recorded in (
++            ("provider", item["provider_id"]),
++            ("provider_version", item["provider_version"]),
++            ("implementation", item["implementation"]),
++            ("numeric_class", item["selected_numeric_class"]),
++        ):
++            if str(selected.get(selected_key)) != recorded:
++                raise ArtifactMismatchError(
++                    "region operation {!r} does not match the verbatim selected payload".format(
++                        selected_key
++                    ),
++                    field="region_plan.operations[{}].{}".format(position, selected_key),
++                    requested=recorded,
++                    available=selected.get(selected_key),
++                    reason="region_selected_payload_mismatch",
++                )
++        if not isinstance(selected.get("deterministic"), bool):
++            raise ArtifactMismatchError(
++                "region operation selected payload must carry a deterministic bool",
++                field="region_plan.operations[{}].selected.deterministic".format(position),
++                requested=selected.get("deterministic"),
++                reason="region_selected_payload_invalid",
++            )
++        precision = numeric.get("precision")
++        envelope = numeric.get("exactness_envelope")
++        if _json_clone(item["precision"]) != _json_clone(precision):
++            raise ArtifactMismatchError(
++                "region operation precision projection does not match numeric_guarantee",
++                field="region_plan.operations[{}].precision".format(position),
++                requested=item["precision"],
++                available=precision,
++                reason="region_precision_projection_mismatch",
++            )
++        if _json_clone(item["envelope"]) != _json_clone(envelope):
++            raise ArtifactMismatchError(
++                "region operation envelope projection does not match numeric_guarantee",
++                field="region_plan.operations[{}].envelope".format(position),
++                requested=item["envelope"],
++                available=envelope,
++                reason="region_envelope_projection_mismatch",
++            )
+         view = _precision_view(
+-            item["provider_id"],
+-            item["selected_numeric_class"],
+-            item["precision"],
+-            item["envelope"],
++            str(selected["provider"]),
++            str(selected["numeric_class"]),
++            precision,
++            envelope,
+         )
+         expected_view = {
+             "declared_class": str(view["declared_class"]),
+@@ -2649,7 +2833,7 @@ def _validate_operations(
+         }
+         if _json_clone(item["bound"]) != _json_clone(expected_view):
+             raise ArtifactMismatchError(
+-                "region operation bound view does not match its precision/envelope declaration",
++                "region operation bound view does not match its numeric_guarantee declaration",
+                 field="region_plan.operations[{}].bound".format(position),
+                 requested=item["bound"],
+                 available=expected_view,
+@@ -2665,13 +2849,27 @@ def _validate_operations(
+             )
+         fallback = item["fallback"]
+         if not isinstance(fallback, Mapping) or set(fallback) != {
+-            "mode", "primary", "chain", "used", "degraded", "events"
++            "mode",
++            "chain",
++            "primary",
++            "max_steps",
++            "allow_numeric_downgrade",
++            "events",
++            "degraded",
+         }:
+             raise ArtifactMismatchError(
+                 "region operation fallback block is invalid",
+                 field="region_plan.operations[{}].fallback".format(position),
+                 requested=fallback,
+-                available=["mode", "primary", "chain", "used", "degraded", "events"],
++                available=[
++                    "mode",
++                    "chain",
++                    "primary",
++                    "max_steps",
++                    "allow_numeric_downgrade",
++                    "events",
++                    "degraded",
++                ],
+                 reason="region_operation_fallback_invalid",
+             )
+         if not isinstance(fallback["events"], list) or any(
+@@ -2683,6 +2881,22 @@ def _validate_operations(
+                 requested=fallback["events"],
+                 reason="region_operation_fallback_invalid",
+             )
++        if not isinstance(fallback["degraded"], bool):
++            raise ArtifactMismatchError(
++                "region operation fallback degraded must be a bool",
++                field="region_plan.operations[{}].fallback.degraded".format(position),
++                requested=fallback["degraded"],
++                reason="region_operation_fallback_invalid",
++            )
++        derived_fallback_used = bool(fallback["events"]) or bool(fallback.get("used", False))
++        if derived_fallback_used != item["fallback_used"]:
++            raise ArtifactMismatchError(
++                "region operation fallback_used does not match the fallback events",
++                field="region_plan.operations[{}].fallback_used".format(position),
++                requested=item["fallback_used"],
++                available=derived_fallback_used,
++                reason="region_operation_fallback_mismatch",
++            )
+         checked.append(
+             {
+                 "index": position,
+@@ -2700,12 +2914,34 @@ def _validate_operations(
+                 "implementation": str(item["implementation"]),
+                 "numeric_class": str(item["numeric_class"]),
+                 "selected_numeric_class": str(item["selected_numeric_class"]),
+-                "precision": _json_clone(item["precision"]) if item["precision"] is not None else None,
+-                "envelope": _json_clone(item["envelope"]) if item["envelope"] is not None else None,
++                "selected": _json_clone(selected),
++                "numeric_guarantee": _json_clone(numeric),
++                "precision": _json_clone(precision) if precision is not None else None,
++                "envelope": _json_clone(envelope) if envelope is not None else None,
+                 "fallback": _json_clone(fallback),
++                "fallback_used": bool(item["fallback_used"]),
+                 "bound": _json_clone(item["bound"]),
+             }
+         )
++    # Paths must follow the flattened program order inside each function (the
++    # region preserves the source order), which pins ``path`` to a monotone
++    # sequence instead of an arbitrary rewrite.
++    last_path_index: Dict[str, int] = {}
++    for item in checked:
++        path_match = _FLAT_BODY_PATH_RE.match(item["path"])
++        if path_match is None:  # pragma: no cover - checked above
++            continue
++        path_index = int(path_match.group(1))
++        previous = last_path_index.get(item["function"])
++        if previous is not None and path_index <= previous:
++            raise ArtifactMismatchError(
++                "region operation paths are not in source order",
++                field="region_plan.operations[{}].path".format(item["index"]),
++                requested=item["path"],
++                available={item["function"]: previous},
++                reason="region_operation_path_invalid",
++            )
++        last_path_index[item["function"]] = path_index
+     _validate_operation_def_use(checked, boundary, region_spec)
+     return checked
+ 
+@@ -2743,6 +2979,16 @@ def _validate_request(request: Any, position: int) -> Mapping[str, Any]:
+             requested=request["op"],
+             reason="region_operation_request_invalid",
+         )
++    try:
++        definition = get_op_definition(request["op"])
++    except OpContractError as exc:
++        raise ArtifactMismatchError(
++            "region operation opcode is not registered: {}".format(request["op"]),
++            field="region_plan.operations[{}].request.op".format(position),
++            requested=request["op"],
++            available=sorted(registered_opcodes()),
++            reason="region_opcode_not_registered",
++        ) from exc
+     if not isinstance(request["input_shapes"], list) or not isinstance(request["input_dtypes"], list):
+         raise ArtifactMismatchError(
+             "request input_shapes/input_dtypes must be arrays",
+@@ -2784,11 +3030,39 @@ def _validate_request(request: Any, position: int) -> Mapping[str, Any]:
+             requested=type(request["attributes"]).__name__,
+             reason="region_operation_request_invalid",
+         )
++    expected_input_count = len(definition.inputs)
++    expected_output_count = len(definition.outputs)
++    if len(request["inputs"]) != expected_input_count:
++        raise ArtifactMismatchError(
++            "request inputs do not match the opcode contract arity ({} expected)".format(
++                expected_input_count
++            ),
++            field="region_plan.operations[{}].request.inputs".format(position),
++            requested=len(request["inputs"]),
++            available=expected_input_count,
++            reason="region_operation_request_inconsistent",
++        )
++    if len(request["input_shapes"]) != expected_input_count:
++        raise ArtifactMismatchError(
++            "request input_shapes do not match the opcode contract arity",
++            field="region_plan.operations[{}].request.input_shapes".format(position),
++            requested=len(request["input_shapes"]),
++            available=expected_input_count,
++            reason="region_operation_request_inconsistent",
++        )
++    if len(request["outputs"]) != expected_output_count:
++        raise ArtifactMismatchError(
++            "request outputs do not match the opcode contract result count",
++            field="region_plan.operations[{}].request.outputs".format(position),
++            requested=len(request["outputs"]),
++            available=expected_output_count,
++            reason="region_operation_request_inconsistent",
++        )
+     for key in ("inputs", "outputs"):
+         items = request[key]
+-        if not isinstance(items, list) or not items:
++        if not isinstance(items, list):
+             raise ArtifactMismatchError(
+-                "request {} must be a non-empty array".format(key),
++                "request {} must be an array".format(key),
+                 field="region_plan.operations[{}].request.{}".format(position, key),
+                 requested=items,
+                 reason="region_operation_request_invalid",
+@@ -2821,13 +3095,28 @@ def _validate_request(request: Any, position: int) -> Mapping[str, Any]:
+                     available=list(allowed),
+                     reason="region_operation_request_field_missing",
+                 )
+-            if key == "inputs" and not isinstance(item["role"], str):
+-                raise ArtifactMismatchError(
+-                    "request operand role must be a string",
+-                    field="region_plan.operations[{}].request.inputs[{}].role".format(position, index),
+-                    requested=item["role"],
+-                    reason="region_operation_request_invalid",
++            if key == "inputs":
++                if not isinstance(item["role"], str):
++                    raise ArtifactMismatchError(
++                        "request operand role must be a string",
++                        field="region_plan.operations[{}].request.inputs[{}].role".format(position, index),
++                        requested=item["role"],
++                        reason="region_operation_request_invalid",
++                    )
++                contract_roles = tuple(definition.input_roles or ())
++                expected_role = (
++                    contract_roles[index]
++                    if index < len(contract_roles)
++                    else "operand{}".format(index)
+                 )
++                if item["role"] != expected_role:
++                    raise ArtifactMismatchError(
++                        "request operand role does not match the opcode contract",
++                        field="region_plan.operations[{}].request.inputs[{}].role".format(position, index),
++                        requested=item["role"],
++                        available=expected_role,
++                        reason="region_operation_request_inconsistent",
++                    )
+             if not isinstance(item["name"], str) or not item["name"]:
+                 raise ArtifactMismatchError(
+                     "request operand name must be a non-empty string",
+@@ -3038,6 +3327,81 @@ def _check_boundary_types(
+         )
+ 
+ 
++def _verify_replay_record(
++    item: Mapping[str, Any], plan: Any
++) -> None:
++    """Field-by-field replay comparison (not only the plan digest).
++
++    A tamperer can recompute the public region digest, so the guarantee fields
++    must also be compared against the plan payload the resolver actually
++    reproduces.  ``selected`` / ``numeric_guarantee`` / ``fallback`` are stored
++    verbatim in the document for exactly this purpose.
++    """
++
++    payload = plan.payload
++    selected = payload.get("selected")
++    for key, value in (
++        ("selected", selected),
++        ("numeric_guarantee", payload.get("numeric_guarantee")),
++        ("fallback", payload.get("fallback")),
++    ):
++        if _json_clone(item[key]) != _json_clone(value):
++            raise ArtifactMismatchError(
++                "region operation {} does not match the plan_operation replay payload".format(key),
++                field="region_plan.operations[{}].{}".format(item["index"], key),
++                requested=item[key],
++                available=value,
++                reason="region_{}_payload_mismatch".format(key),
++            )
++    if str(payload["contract"]["digest"]) != item["contract_digest"]:
++        raise ArtifactMismatchError(
++            "region operation contract digest does not match replay",
++            field="region_plan.operations[{}].contract_digest".format(item["index"]),
++            requested=item["contract_digest"],
++            available=payload["contract"]["digest"],
++            reason="region_contract_digest_mismatch",
++        )
++    if str(payload["contract"]["version"]) != item["contract_version"]:
++        raise ArtifactMismatchError(
++            "region operation contract version does not match replay",
++            field="region_plan.operations[{}].contract_version".format(item["index"]),
++            requested=item["contract_version"],
++            available=payload["contract"]["version"],
++            reason="region_contract_digest_mismatch",
++        )
++    if int(payload["plan_schema_version"]) != int(item["plan_schema_version"]):
++        raise ArtifactMismatchError(
++            "region operation plan schema version does not match replay",
++            field="region_plan.operations[{}].plan_schema_version".format(item["index"]),
++            requested=item["plan_schema_version"],
++            available=payload["plan_schema_version"],
++            reason="region_plan_schema_version_mismatch",
++        )
++    if not isinstance(selected, Mapping):
++        raise ArtifactMismatchError(
++            "replayed plan has no selected payload",
++            field="region_plan.operations[{}].selected".format(item["index"]),
++            requested=item["selected"],
++            available=None,
++            reason="region_selected_payload_mismatch",
++        )
++    metadata = (
++        ("provider", item["provider_id"]),
++        ("provider_version", item["provider_version"]),
++        ("implementation", item["implementation"]),
++        ("numeric_class", item["selected_numeric_class"]),
++    )
++    for key, recorded in metadata:
++        if str(selected.get(key)) != recorded:
++            raise ArtifactMismatchError(
++                "region operation provider metadata does not match replay",
++                field="region_plan.operations[{}].{}".format(item["index"], key),
++                requested=recorded,
++                available=selected.get(key),
++                reason="region_provider_metadata_mismatch",
++            )
++
++
+ def _re_resolve_document(
+     data: Mapping[str, Any],
+     policy: ExecutionPolicy,
+@@ -3082,22 +3446,7 @@ def _re_resolve_document(
+                 available=plan.digest,
+                 reason="region_op_plan_digest_mismatch",
+             )
+-        if plan.payload["contract"]["digest"] != item["contract_digest"]:
+-            raise ArtifactMismatchError(
+-                "region operation contract digest does not match replay",
+-                field="region_plan.operations[{}].contract_digest".format(item["index"]),
+-                requested=item["contract_digest"],
+-                available=plan.payload["contract"]["digest"],
+-                reason="region_contract_digest_mismatch",
+-            )
+-        if str(plan.selected_provider) != item["provider_id"]:
+-            raise ArtifactMismatchError(
+-                "region operation provider does not match replay",
+-                field="region_plan.operations[{}].provider_id".format(item["index"]),
+-                requested=item["provider_id"],
+-                available=plan.selected_provider,
+-                reason="region_provider_mismatch",
+-            )
++        _verify_replay_record(item, plan)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -3251,6 +3600,7 @@ def _replay_resolutions(
+                 available=resolution.plan.digest,
+                 reason="region_op_plan_digest_mismatch",
+             )
++        _verify_replay_record(item, resolution.plan)
+         result.append(resolution)
+     return tuple(result)
+ 
+diff --git a/python/tests/ut/pypto_x/test_execution_region_planning.py b/python/tests/ut/pypto_x/test_execution_region_planning.py
+index 0b94033ba..baf7bbfa8 100644
+--- a/python/tests/ut/pypto_x/test_execution_region_planning.py
++++ b/python/tests/ut/pypto_x/test_execution_region_planning.py
+@@ -30,13 +30,24 @@ from pathlib import Path
+ 
+ import pytest
+ 
+-from pypto.core_ir import CoreProgram, CoreFunction, CoreType, Operation, Region, ValueRef
++from pypto.core_ir import (
++    Block,
++    CoreFunction,
++    CoreProgram,
++    CoreType,
++    Operation,
++    Region,
++    ValueRef,
++)
++from pypto.execution.region import _term_from_record
++
+ from pypto.execution import (
+     AOCL_LPGEMM_F32_PROVIDER_ID,
+     AOCL_LPGEMM_INT8_EXACT_BLOCKED_PROVIDER_ID,
+     AOCL_LPGEMM_INT8_PROVIDER_ID,
+     ArtifactMismatchError,
+     CapabilitySnapshot,
++    CapabilityUnavailableError,
+     ExecutionError,
+     ExecutionPolicy,
+     FallbackPolicy,
+@@ -250,15 +261,7 @@ def _region_digest_preimage(document) -> dict:
+     return {
+         "region_schema_version": document["region_schema_version"],
+         "boundary_signature": document["boundary_signature"],
+-        "operations": [
+-            {
+-                "index": item["index"],
+-                "function": item["function"],
+-                "opcode": item["opcode"],
+-                "single_op_plan_digest": item["single_op_plan_digest"],
+-            }
+-            for item in document["operations"]
+-        ],
++        "operations": document["operations"],
+     }
+ 
+ 
+@@ -368,6 +371,42 @@ def test_tampered_region_plan_is_refused():
+         data["operations"][0]["bound"]["bound"] = 0
+         data["operations"][0]["bound"]["proven"] = True
+ 
++    def rewrite_bound_view_resigned(data):
++        rewrite_bound_view(data)
++        data["region_digest"] = "sha256:" + sha256_text(_region_digest_preimage(data))
++        data["region_id"] = "region." + data["region_digest"].split(":", 1)[1][:16]
++
++    def rewrite_precision_resigned(data):
++        # Forge the exp guarantee into an exact proven bound and re-sign the
++        # (public) Merkle digest: the verbatim payload replay must still refuse.
++        data["operations"][0]["precision"] = {
++            "class": "exact",
++            "deviation_bound_available": True,
++            "deviation_bound_kind": "exact_contract_bound",
++            "deviation_bound": 0,
++            "upper_bound": {"status": "proven", "reason": "forged"},
++            "reference": "forged_reference",
++        }
++        data["operations"][0]["numeric_guarantee"]["precision"] = data["operations"][0][
++            "precision"
++        ]
++        data["operations"][0]["numeric_class"] = "exact"
++        data["operations"][0]["bound"] = {
++            "declared_class": "exact",
++            "proven": True,
++            "bound": 0,
++            "bound_kind": "exact_contract_bound",
++            "is_upper_bound": True,
++            "reference": "forged_reference",
++            "reasons": [],
++        }
++        data["region_precision"] = compose_region_precision(
++            [_term_from_record(record) for record in data["operations"]],
++            requirement="portable",
++        )
++        data["region_digest"] = "sha256:" + sha256_text(_region_digest_preimage(data))
++        data["region_id"] = "region." + data["region_digest"].split(":", 1)[1][:16]
++
+     def rewrite_region_class(data):
+         data["region_precision"]["class"] = "exact"
+ 
+@@ -387,7 +426,9 @@ def test_tampered_region_plan_is_refused():
+         (flip_op_digest, "region_digest_mismatch"),
+         (change_boundary_source, "region_digest_mismatch"),
+         (drop_operation, "region_digest_mismatch"),
+-        (rewrite_bound_view, "region_operation_bound_mismatch"),
++        (rewrite_bound_view, "region_digest_mismatch"),
++        (rewrite_bound_view_resigned, "region_operation_bound_mismatch"),
++        (rewrite_precision_resigned, "region_numeric_guarantee_payload_mismatch"),
+         (rewrite_region_class, "region_precision_mismatch"),
+         (rewrite_region_id, "region_id_mismatch"),
+         (rewrite_policy_digest, "region_policy_digest_mismatch"),
+@@ -425,6 +466,17 @@ def test_whole_program_and_boundary_specs_select_the_expected_operations():
+         "entry_inputs": ["e"],
+         "exit_outputs": ["y"],
+     }
++    # boundary plans must self-validate and round-trip like whole-program plans
++    boundary.validate()
++    boundary_document = boundary.to_dict()
++    entry = boundary_document["boundary_signature"]["entry_inputs"][0]
++    assert entry["source"] == "outside_region_operation"
++    assert entry["producer_op_index"] is None
++    assert boundary_document["operations"][0]["index"] == 0
++    assert (
++        boundary_document["boundary_signature"]["exit_outputs"][0]["producer_op_index"]
++        == 0
++    )
+ 
+     middle = plan_region(program, RegionSpec.boundary(["x"], ["e"]))
+     assert [item["opcode"] for item in middle.operations] == ["exp"]
+@@ -817,9 +869,10 @@ def test_region_marks_a_host_fallback_with_mode_and_events():
+     plan = plan_region(program, policy=policy, capability=forced_unavailable)
+     operation = plan.operations[0]
+     assert operation["provider_id"] == "portable"
+-    assert operation["fallback"]["used"] is True
++    assert operation["fallback_used"] is True
+     assert operation["fallback"]["degraded"] is True
+     assert operation["fallback"]["mode"] == "declared"
++    assert operation["fallback"]["primary"] == AOCL_LPGEMM_F32_PROVIDER_ID
+     assert operation["fallback"]["events"][0]["from"] == AOCL_LPGEMM_F32_PROVIDER_ID
+     assert operation["fallback"]["events"][0]["to"] == "portable"
+     precision = plan.region_precision
+@@ -838,6 +891,26 @@ def test_region_marks_a_host_fallback_with_mode_and_events():
+         plan.to_dict(), capability=forced_unavailable, re_resolve=True
+     ) == plan.to_dict()
+ 
++    # A rewritten fallback (events erased) is refused even after re-signing the
++    # public region digest: the replay compares the verbatim fallback payload.
++    forged = plan.to_dict()
++    forged["operations"][0]["fallback"]["events"] = []
++    forged["operations"][0]["fallback"]["degraded"] = False
++    forged["operations"][0]["fallback_used"] = False
++    forged["region_precision"] = compose_region_precision(
++        [_term_from_record(record) for record in forged["operations"]],
++        requirement="deterministic",
++    )
++    forged["region_digest"] = "sha256:" + sha256_text(_region_digest_preimage(forged))
++    forged["region_id"] = "region." + forged["region_digest"].split(":", 1)[1][:16]
++    error = _expected_error(
++        ArtifactMismatchError,
++        lambda: validate_region_plan(
++            forged, policy=policy, capability=forced_unavailable, re_resolve=True
++        ),
++    )
++    assert error.reason == "region_fallback_payload_mismatch"
++
+ 
+ def test_best_effort_region_is_unusable_for_require_policies():
+     term = RegionPrecisionTerm(
+@@ -917,10 +990,49 @@ def test_composition_precedence_and_preimage_recomputation():
+     assert mixed["provider_ids"] == ["portable", "vendor:test"]
+     assert mixed["mixed_providers"] is True
+ 
+-    proven_only = compose_region_precision([proven, identity])
+-    assert proven_only["class"] == "deterministic_bounded"
+-    assert proven_only["deviation_bound"]["sum"] == 2
+-    assert proven_only["deviation_bound"]["is_upper_bound"] is True
++    # A zero-bound identity term with a different reference still breaks the
++    # common-reference claim: the sum must NOT be advertised as an upper bound.
++    proven_plus_identity = compose_region_precision([proven, identity])
++    assert proven_plus_identity["class"] == "deterministic_bounded"
++    assert proven_plus_identity["deviation_bound"]["sum"] == 2
++    assert proven_plus_identity["deviation_bound"]["is_upper_bound"] is False
++    assert "cross_reference_bounds_not_comparable" in proven_plus_identity[
++        "deviation_bound"
++    ]["reasons"]
++
++    same_reference = compose_region_precision(
++        [proven, dataclasses.replace(proven, index=1, opcode="matmul")]
++    )
++    assert same_reference["class"] == "deterministic_bounded"
++    assert same_reference["deviation_bound"]["sum"] == 4
++    assert same_reference["deviation_bound"]["is_upper_bound"] is True
++
++    # The verifier's F3-B counterexample: an exact zero bound with reference A
++    # plus a proven non-zero bound with reference B.
++    exact_other_reference = RegionPrecisionTerm(
++        index=2,
++        opcode="reshape",
++        provider_id="portable",
++        declared_class="exact",
++        provider_class="portable_bitwise",
++        proven=True,
++        bound=0,
++        bound_kind="exact_contract_bound",
++        is_upper_bound=True,
++        reference="reference_A",
++    )
++    bounded_other_reference = dataclasses.replace(
++        proven, index=3, provider_id="vendor:other", reference="reference_B"
++    )
++    zero_bound_cross_reference = compose_region_precision(
++        [exact_other_reference, bounded_other_reference]
++    )
++    assert zero_bound_cross_reference["class"] == "deterministic_bounded"
++    assert zero_bound_cross_reference["deviation_bound"]["sum"] == 2
++    assert zero_bound_cross_reference["deviation_bound"]["is_upper_bound"] is False
++    assert "cross_reference_bounds_not_comparable" in zero_bound_cross_reference[
++        "deviation_bound"
++    ]["reasons"]
+ 
+     cross_reference = compose_region_precision(
+         [
+@@ -1120,6 +1232,438 @@ def test_cli_region_flag_requires_a_program():
+     assert "--program" in result.stderr
+ 
+ 
++def test_boundary_roundtrip_when_subgraph_starts_late(tmp_path):
++    a = _ref("a", "float32", (2, 3))
++    t = _ref("t", "float32", (2, 3))
++    b = _ref("b", "float32", (3, 4))
++    u = _ref("u", "float32", (3, 4))
++    program = _program(
++        (a, b),
++        (
++            _op("exp", (a,), (t,)),
++            _op("exp", (b,), (u,)),
++        ),
++        (t, u),
++    )
++    plan = plan_region(program, RegionSpec.boundary(["b"], ["u"]))
++    document = plan.to_dict()
++    assert [item["opcode"] for item in plan.operations] == ["exp"]
++    # region-local renumbering: the selected op is global #1 but local #0
++    assert document["operations"][0]["index"] == 0
++    assert document["operations"][0]["path"] == "body.ops[1]"
++    entry = document["boundary_signature"]["entry_inputs"][0]
++    assert entry["name"] == "b"
++    assert entry["source"] == "function_parameter"
++    assert entry["producer_op_index"] is None
++    exit_entry = document["boundary_signature"]["exit_outputs"][0]
++    assert exit_entry["name"] == "u"
++    assert exit_entry["producer_op_index"] == 0
++    assert plan.validate() is plan
++    path = tmp_path / "boundary_late.json"
++    path.write_text(canonical_json(document) + "\n", encoding="utf-8")
++    loaded = load_region_plan(path, capability=plan.capability)
++    assert loaded.digest == plan.digest
++    explanation = explain_region_plan(document, capability=plan.capability)
++    assert explanation.to_dict()["region_plan_digest"] == plan.digest
++
++
++def test_every_plan_region_output_self_validates(tmp_path):
++    x = _ref("x", "float32", (2, 3))
++    e = _ref("e", "float32", (2, 3))
++    y = _ref("y", "float32", (6,))
++    graph = _program(
++        (x,),
++        (
++            _op("exp", (x,), (e,)),
++            _op("reshape", (e,), (y,), {"shape": [6]}),
++        ),
++        (y,),
++    )
++    iota_y = _ref("y", "int32", (8,))
++    iota_graph = _program(
++        (),
++        (_op("iota", (), (iota_y,), {"axis": 0, "start": 0, "step": 1}),),
++        (iota_y,),
++    )
++    cases = {
++        "whole_program": (graph, None),
++        "boundary_parameter_entry": (graph, RegionSpec.boundary(["x"], ["e"])),
++        "boundary_outside_producer": (graph, RegionSpec.boundary(["e"], ["y"])),
++        "zero_operand_iota": (iota_graph, None),
++    }
++    for name, (program, spec) in cases.items():
++        plan = plan_region(program, spec)
++        document = plan.to_dict()
++        assert validate_region_plan(
++            document, policy=plan.policy, re_resolve=False
++        ) == document, name
++        path = tmp_path / ("%s.json" % name)
++        path.write_text(canonical_json(document) + "\n", encoding="utf-8")
++        loaded = load_region_plan(path, capability=plan.capability)
++        assert loaded.digest == plan.digest, name
++        explained = explain_region_plan(document, capability=plan.capability)
++        assert explained.to_dict()["region_plan_digest"] == plan.digest, name
++
++    empty_error = _expected_error(
++        OpContractError, lambda: plan_region(CoreProgram(()))
++    )
++    assert empty_error.reason == "region_empty"
++
++
++
++def _resign_region_document(data):
++    data["region_digest"] = "sha256:" + sha256_text(_region_digest_preimage(data))
++    data["region_id"] = "region." + data["region_digest"].split(":", 1)[1][:16]
++    return data
++
++
++def _recompose_region_precision(data, requirement="portable"):
++    data["region_precision"] = compose_region_precision(
++        [_term_from_record(record) for record in data["operations"]],
++        requirement=requirement,
++    )
++    return data
++
++
++def _mutate_precision_forgery(data):
++    target = data["operations"][0]
++    target["precision"] = {
++        "class": "exact",
++        "deviation_bound_available": True,
++        "deviation_bound_kind": "exact_contract_bound",
++        "deviation_bound": 0,
++        "upper_bound": {"status": "proven", "reason": "forged"},
++        "reference": "forged_reference",
++    }
++    target["numeric_guarantee"]["precision"] = target["precision"]
++    target["numeric_class"] = "exact"
++    target["bound"] = {
++        "declared_class": "exact",
++        "proven": True,
++        "bound": 0,
++        "bound_kind": "exact_contract_bound",
++        "is_upper_bound": True,
++        "reference": "forged_reference",
++        "reasons": [],
++    }
++    return _recompose_region_precision(data)
++
++
++def _mutate_bound(data):
++    data["operations"][0]["bound"]["bound"] = 12345
++    return data
++
++
++def _mutate_numeric_class(data):
++    data["operations"][0]["numeric_class"] = "exact"
++    return _recompose_region_precision(data)
++
++
++def _mutate_fallback(data):
++    data["operations"][0]["fallback"]["primary"] = "vendor:forged"
++    return data
++
++
++def _mutate_selected_numeric_class(data):
++    data["operations"][0]["selected_numeric_class"] = "exact"
++    return _recompose_region_precision(data)
++
++
++def _mutate_provider_version(data):
++    data["operations"][0]["provider_version"] = "forged.version"
++    return data
++
++
++def _mutate_implementation(data):
++    data["operations"][0]["implementation"] = "forged.implementation"
++    return data
++
++
++def _mutate_contract_version(data):
++    data["operations"][0]["contract_version"] = "9.9"
++    return data
++
++
++def _mutate_plan_schema_version(data):
++    data["operations"][0]["plan_schema_version"] = 2
++    return data
++
++
++def _mutate_op_name(data):
++    data["operations"][0]["op_name"] = "forged_name"
++    return data
++
++
++def _mutate_path(data):
++    data["operations"][0]["path"] = "forged"
++    return data
++
++
++def _mutate_role(data):
++    data["operations"][0]["request"]["inputs"][0]["role"] = "forged_role"
++    return data
++
++
++def _mutate_selected_payload_provider_version(data):
++    data["operations"][0]["selected"]["provider_version"] = "forged.version"
++    return data
++
++
++def _mutate_numeric_guarantee_precision(data):
++    data["operations"][0]["numeric_guarantee"]["precision"]["class"] = "exact"
++    return data
++
++
++ANCHOR_MUTATIONS = {
++    "precision": _mutate_precision_forgery,
++    "bound": _mutate_bound,
++    "numeric_class": _mutate_numeric_class,
++    "fallback": _mutate_fallback,
++    "selected_numeric_class": _mutate_selected_numeric_class,
++    "provider_version": _mutate_provider_version,
++    "implementation": _mutate_implementation,
++    "contract_version": _mutate_contract_version,
++    "plan_schema_version": _mutate_plan_schema_version,
++    "op_name": _mutate_op_name,
++    "path": _mutate_path,
++    "role": _mutate_role,
++    "selected_payload": _mutate_selected_payload_provider_version,
++    "numeric_guarantee_precision": _mutate_numeric_guarantee_precision,
++}
++
++
++
++# ---------------------------------------------------------------------------
++# verifier round-2 regressions
++# ---------------------------------------------------------------------------
++def test_region_plan_with_zero_operand_iota_round_trips(tmp_path):
++    y = _ref("y", "int32", (8,))
++    program = _program(
++        (),
++        (_op("iota", (), (y,), {"axis": 0, "start": 0, "step": 1}),),
++        (y,),
++    )
++    plan = plan_region(program)
++    document = plan.to_dict()
++    request = document["operations"][0]["request"]
++    assert request["inputs"] == []
++    assert request["input_shapes"] == []
++    assert request["input_dtypes"] == []
++    assert plan.validate() is plan
++    path = tmp_path / "iota_region.json"
++    path.write_text(canonical_json(document) + "\n", encoding="utf-8")
++    loaded = load_region_plan(path, capability=plan.capability)
++    assert loaded.digest == plan.digest
++    explanation = explain_region_plan(document, capability=plan.capability)
++    assert explanation.to_dict()["region_plan_digest"] == plan.digest
++    assert explanation.to_dict()["operations"][0]["region_opcode"] == "iota"
++
++
++def test_plan_region_with_explicit_capability_does_not_probe_host(monkeypatch):
++    snapshot = _probe()
++
++    def explode(*args, **kwargs):
++        raise AssertionError("CapabilitySnapshot.probe_host must not be called")
++
++    monkeypatch.setattr(CapabilitySnapshot, "probe_host", classmethod(explode))
++    plan = plan_region(_matmul_program(), capability=snapshot)
++    assert plan.digest.startswith("sha256:")
++    resolution = plan_operation(
++        "matmul", [(2, 3), (3, 4)], ["float32", "float32"], capability=snapshot
++    )
++    assert resolution.plan.digest
++    # an explicitly supplied capability is still host-checked by triple only
++    other = CapabilitySnapshot.for_host(kind="cpu", triple="not-this-host")
++    error = _expected_error(
++        CapabilityUnavailableError,
++        lambda: plan_region(_matmul_program(), capability=other),
++    )
++    assert error.reason == "capability_does_not_match_host_probe"
++
++
++def test_nested_and_block_regions_are_refused():
++    x = _ref("x", "float32", (2, 3))
++    e = _ref("e", "float32", (2, 3))
++    out = _ref("out", "float32", (6,))
++    child = Region(operations=(_op("exp", (x,), (e,)),))
++    parent = Operation(
++        "reshape", inputs=(x,), outputs=(out,), attributes={"shape": [6]}, regions=(child,)
++    )
++    nested = _program((x,), (parent,), (out,))
++    nested_error = _expected_error(OpContractError, lambda: plan_region(nested))
++    assert nested_error.reason == "region_nested_region_not_supported"
++
++    block_x = _ref("x", "float32", (2, 3))
++    block_e = _ref("e", "float32", (2, 3))
++    block = Block(
++        arguments=(block_x,),
++        operations=(_op("exp", (block_x,), (block_e,)),),
++        label="b0",
++    )
++    blocked = CoreProgram(
++        (
++            CoreFunction(
++                "f",
++                parameters=(),
++                returns=(),
++                body=Region(blocks=(block,)),
++            ),
++        )
++    )
++    block_error = _expected_error(OpContractError, lambda: plan_region(blocked))
++    assert block_error.reason == "region_block_region_not_supported"
++
++
++def test_mixed_portable_bitwise_statement_matches_actual_providers():
++    snapshot = _probe()
++    if not _available(
++        with_exact_blocked_provider(snapshot),
++        AOCL_LPGEMM_INT8_EXACT_BLOCKED_PROVIDER_ID,
++    ):
++        pytest.skip("the opt-in exact-blocked vendor artifact is not available here")
++
++    a = _ref("a", "int8", (2, 3))
++    b = _ref("b", "int8", (3, 4))
++    q = _ref("q", "int32", (2, 4))
++    m1 = _ref("m1", "float32", (2, 3))
++    m2 = _ref("m2", "float32", (3, 4))
++    m3 = _ref("m3", "float32", (2, 4))
++    program = _program(
++        (a, b, m1, m2),
++        (
++            _op("qmatmul_s8s8_s32", (a, b), (q,)),
++            _op("matmul", (m1, m2), (m3,)),
++        ),
++        (q, m3),
++    )
++    policy = ExecutionPolicy(
++        profile="auto_static",
++        provider=ProviderPolicy(mode="auto"),
++        numeric=NumericPolicy(require_proven_deviation_bound=True),
++    )
++    precision = plan_region(program, policy=policy).region_precision
++    assert precision["class"] == "portable_bitwise"
++    assert precision["all_portable_trunk"] is False
++    bound = precision["deviation_bound"]
++    assert bound["is_upper_bound"] is False
++    assert "every operation selected the portable trunk" not in bound["statement"]
++    assert "not_every_operation_ran_on_the_portable_trunk" in bound["reasons"]
++    assert "cross_reference_bounds_not_comparable" in bound["reasons"]
++
++    pure = plan_region(_matmul_program()).region_precision
++    assert pure["all_portable_trunk"] is True
++    assert pure["deviation_bound"]["is_upper_bound"] is True
++    assert "portable trunk" in pure["deviation_bound"]["statement"]
++
++
++def test_malformed_region_document_types_are_structured():
++    plan = plan_region(_matmul_program())
++    genuine = plan.to_dict()
++
++    def set_op_count_bool(data):
++        data["op_count"] = True
++
++    def set_schema_bool(data):
++        data["region_schema_version"] = True
++
++    def set_unknown_requirement(data):
++        data["policy"]["numeric"]["requirement"] = "unknown-requirement"
++
++    def set_plan_schema_string(data):
++        data["operations"][0]["plan_schema_version"] = "3"
++
++    def set_plan_schema_string_resigned(data):
++        set_plan_schema_string(data)
++        data["region_digest"] = "sha256:" + sha256_text(_region_digest_preimage(data))
++        data["region_id"] = "region." + data["region_digest"].split(":", 1)[1][:16]
++
++    cases = (
++        (set_op_count_bool, "region_op_count_mismatch"),
++        (set_schema_bool, "region_schema_version_mismatch"),
++        (set_unknown_requirement, "region_policy_invalid"),
++        (set_plan_schema_string, "region_digest_mismatch"),
++        (set_plan_schema_string_resigned, "region_operation_field_type"),
++    )
++    for mutate, reason in cases:
++        forged = json.loads(json.dumps(genuine))
++        mutate(forged)
++        error = _expected_error(
++            ArtifactMismatchError,
++            lambda forged=forged: validate_region_plan(
++                forged, capability=plan.capability, re_resolve=False
++            ),
++        )
++        assert error.reason == reason, (mutate.__name__, error.reason)
++
++    error = _expected_error(
++        ArtifactMismatchError,
++        lambda: validate_region_plan(genuine, policy={"profile": "portable"}),
++    )
++    assert error.reason == "region_policy_invalid"
++
++
++@pytest.mark.parametrize("field", sorted(ANCHOR_MUTATIONS))
++def test_anchor_surface_is_covered_without_resigning(field):
++    plan = plan_region(_exp_reshape_program())
++    forged = json.loads(json.dumps(plan.to_dict()))
++    ANCHOR_MUTATIONS[field](forged)
++    error = _expected_error(
++        ArtifactMismatchError,
++        lambda forged=forged: validate_region_plan(
++            forged, capability=plan.capability, re_resolve=True
++        ),
++    )
++    assert error.reason == "region_digest_mismatch", (field, error.reason)
++
++
++@pytest.mark.parametrize(
++    "field,expected_reason",
++    (
++        ("precision", "region_numeric_guarantee_payload_mismatch"),
++        ("bound", "region_operation_bound_mismatch"),
++        ("numeric_class", "region_operation_numeric_class_mismatch"),
++        ("fallback", "region_fallback_payload_mismatch"),
++        ("selected_numeric_class", "region_selected_payload_mismatch"),
++        ("provider_version", "region_selected_payload_mismatch"),
++        ("implementation", "region_selected_payload_mismatch"),
++        ("contract_version", "region_contract_digest_mismatch"),
++        ("plan_schema_version", "region_plan_schema_version_mismatch"),
++        ("op_name", "region_operation_opcode_mismatch"),
++        ("path", "region_operation_path_invalid"),
++        ("role", "region_operation_request_inconsistent"),
++        ("selected_payload", "region_selected_payload_mismatch"),
++        ("numeric_guarantee_precision", "region_precision_projection_mismatch"),
++    ),
++)
++def test_anchor_surface_is_refused_after_resigning(field, expected_reason):
++    plan = plan_region(_exp_reshape_program())
++    forged = json.loads(json.dumps(plan.to_dict()))
++    ANCHOR_MUTATIONS[field](forged)
++    _resign_region_document(forged)
++    error = _expected_error(
++        ArtifactMismatchError,
++        lambda forged=forged: validate_region_plan(
++            forged, capability=plan.capability, re_resolve=True
++        ),
++    )
++    assert error.reason == expected_reason, (field, error.reason)
++
++
++def test_descriptive_fields_are_inside_the_digest_preimage():
++    plan = plan_region(_exp_reshape_program())
++    genuine = plan.to_dict()
++    preimage = _region_digest_preimage(genuine)
++    for field, value in (("op_name", "forged_name"), ("path", "body.ops[9]")):
++        assert field in genuine["operations"][0]
++        forged = json.loads(json.dumps(genuine))
++        forged["operations"][0][field] = value
++        assert _region_digest_preimage(forged) != preimage
++        assert (
++            "sha256:" + sha256_text(_region_digest_preimage(forged))
++            != genuine["region_digest"]
++        )
++
++
+ # ---------------------------------------------------------------------------
+ # sanity: the test module really depends on the new entry point
+ # ---------------------------------------------------------------------------
