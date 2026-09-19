@@ -26,7 +26,7 @@
 主验收指标（§8）：在 `32e42abff` 上用 U5 `plan_region` 对三个真实 Qwen3.5 图各跑一次，
 缺失契约从 **5 类 / 36 次降到 1 类 / 24 次**（只剩 `split`），`div/gather/identity/embedding`
 四个 opcode 的缺失次数全部归零；attention 与 gdr 两图变为**整图规划成功**，`unplannable` 0，
-decoder 的已登记 op 成功规划数升到 **4669**（§8.3；较 `a2373408d` 上的 4603 多出的 66 次
+decoder 的已登记 op 成功规划数升到 **4669**（§8.3；较 `a2373408d` 上的 **4591** 多出的 66 次
 是 batch3 round-2 的 `constant` scalar-kind 功劳，**不是本切片**，§8 分布表如实呈现）。
 
 ### 0.1 冻结兼容策略（关键设计决定）
@@ -311,6 +311,14 @@ layout 决策（`may_alias`/`materialized`/真实 `layout_copy_bytes`）；旧 t
 - 规范结果取 rebase 后第 7 次完成的 rc 0 全量；`raw/rule8_single_counts.json` 由
   `scripts/summarize_rule8.py` 从该次日志生成。
 
+
+> **勘误（2026-09-20，由 `verify-0052-ops-batch4` 独立复算发现）**：
+> 1) 上文若干处的算式「4669 = 4603 + 66 + 12」**不成立**；4603 是「总数减去 split 与 constant」的口径。
+>    正确算式为 **4591（a2373408d 的 planned 总数）+ 66（round-2 的 constant）+ 12（batch4）= 4669**；
+>    最终值 4669 与归因方向（constant 66 属 round-2）不变。
+> 2) 文中「17 个 frozen run」的构成易被误读为 25：实际 **17 = matmul f32/bf16（2）+ qmatmul（1）+ batch1（8）+ batch2（6）**；
+>    batch3 贡献的是 **8 个 contract digest**（属「24 个既有契约」那一侧），不额外增加 run 数。
+
 ## 8. 主验收指标（真实 Qwen3.5 三图，口径与 0021 §5 / 0022 §8 / 0023 §8 一致）
 
 证据：`raw/qwen_region_missing_contracts.json`（脚本
@@ -347,7 +355,7 @@ region JSON 保留为 `raw/qwen_region_missing_contracts_parent_a2373408d.json` 
 ### 8.3 已登记 op 的规划统计（三图合并，父树 `32e42abff`）
 
 `registered_planned_total`（region 入口对每个 op 都调用 `plan_operation`，不是首错即停）
-= **4669**：`a2373408d` 上 4603 + batch3 round-2 的 `constant` scalar-kind 66（他切片功劳）
+= **4669**：`a2373408d` 上的 **4591** + batch3 round-2 的 `constant` scalar-kind 66（他切片功劳）
 + 本切片 4 个 opcode 的真实图请求 12：
 
 | opcode | 真实图出现 | plan 成功 | 缺失 contract | unplannable（原因） |
@@ -418,7 +426,7 @@ scalar-kind 返回值与本切片的除零/index 子类异常处理合并，两�
   均 ZERO-DRIFT（§7.2）；batch3 round-2 自身导致的 digest 变化（`reduce_mean`/`constant` 及
   batch3 24-contract 视图）已重钉在本切片测试中，不冒充“逐字节不变”。
 - **以 `32e42abff` 为父树的 region**：缺失契约仍 **1 类 / 24 次（仅 `split`）**，
-  `unplannable` **0**，`registered_planned_total` **4669**（= 4603 + round-2 的 `constant` 66
+  `unplannable` **0**，`registered_planned_total` **4669**（= **4591** + round-2 的 `constant` 66
   + 本切片 12）；attention/gdr 整图 planned（§8）。
 - focused（rebase 后）：19 套件 **1000 passed / 0 failed**；rule-8 全量按锁重跑（§7.4）。
 - 本切片未触碰 integration / 其他 worktree，未 push；`pypto/__init__.py`、
