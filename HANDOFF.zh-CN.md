@@ -9,7 +9,7 @@
 > **恢复入口**：读该 lock 条目的 `resume_checklist`（7 步）与 `parked_work`。注意：早前「CUDA 9 点后可开始」
 > 与本次「9 点后暂停」冲突，父方按后者执行；若要跑 CUDA 计时腿，重启两个单元即可（一分钟）。
 
-最后更新：2026-09-14 08:25 CST（Asia/Shanghai；**用户指令 09:00 后暂停，已提前安全暂停**：integration tip `8b5246557`、公开 main `d722018`、0048/0049 已验（PASS_WITH_BOUNDARIES）、0050 已落地但独立验收被中断、CUDA 计时腿未跑（零数字）；恢复清单见 lock `paused_by_user_2026_09_14`。此前：0046/0047 已收口推送，公开补丁集 275 段）
+最后更新：2026-09-19 20:25 CST（Asia/Shanghai；**已按用户指示恢复**：CUDA 计时腿在空闲窗口补跑完成——`status=PASS`、时钟门 VALID、三路径 kernel 时间相差 ≤0.42%（native sm_120 cubin **无可测优势**）、数字 UNGATED；CPU 线在续：batch-2 验收与 U5 round-4（scalar 预检收口）。此前：0046/0047 已收口推送（公开补丁 275 段）、0048/0049 已验 PASS_WITH_BOUNDARIES、0050 已落地待独立验收；恢复计划见 lock `resumed_by_user_2026_09_19` 与 `paused_by_user_2026_09_14`）
 
 > **零记忆恢复（上下文压缩后）**：按顺序读 本文件 §0 → `docs/00-handoffs/ERRATA.zh-CN.md` → `docs/00-handoffs/0039-2026-09-11-a3-onboarding-ascend-bridge-sve-w8a8.zh-CN.md` → `configs/development_lock.yaml` 的 `waves.W8.in_flight_2026_09_11_batch2` 与 `pending_user_decisions_2026_09_11`。
 

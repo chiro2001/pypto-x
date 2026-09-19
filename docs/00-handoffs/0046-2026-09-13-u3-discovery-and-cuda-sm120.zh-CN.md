@@ -73,4 +73,7 @@
 - 补丁重导 269 个并在干净树上 `git am` 复算 269/269，复算 tree 与冻结 tree 相等。
 - **验收方 harness 陷阱**：`u3_common.py` 内 `sys.path.insert(0, "…/verify-*/scripts")` 使"复跑"实际加载**旧冻结树**，其 round-3 复跑因此报"仍接受"；父方以自建 harness 直接验证冻结 tip，10/10 拒绝。已登记为 **ERR-0013**。
 - op-bench 抖动（本批第 2 次 + 0044 1 次）已由 `27fbae5e4` 做**负载感知**加固：最多 3 对独立测量、任一对过严格判据即通过；仅当全失败且 `load1 > max(4, 0.25·nproc)` 或 `cpu PSI avg10 > 2` 才接受 ≤50% 相对漂移并打印理由；≥50% 或结构不符一律失败；锁内 `repeat=2,R=21` 严格规则不受影响。
-- 性能数字状态：本批全部 **UNGATED**（含 CUDA 计时腿的 defer）。
+- 性能数字状态：本批全部 **UNGATED**。
+- **CUDA 计时腿已于 2026-09-19 20:19–20:21 CST 补跑完成**（用户恢复信号 + GamePC 空闲；GPU-only 直接跑、不申请 gamepc 锁）：`status=PASS`、时钟门 `VALID`（median 2835 / max 3090 MHz = 0.9175）、前后指纹无外来 compute app、正确性 `ALL_PATHS_BIT_EXACT`。
+  结果：matmul f32 4096³ 三路径 median 0.059402 / 0.059175 / **0.059156 s**（sm80 PTX / sm120 PTX / sm120 cubin，极差 0.42%）、bf16 4096³ 0.039095 / 0.039037 / **0.038970 s**（极差 0.32%）→ **native sm_120 cubin 相对 PTX-JIT 无可测运行期优势**；首次加载 0.11–0.46 ms、host launch median 6 µs。证据 `_meta/pypto-x/cuda-sm120/compare/{PERF_DONE.md,PERF_SUMMARY.json,sm120-compare.json}`（数字仍标注 UNGATED）。
+
